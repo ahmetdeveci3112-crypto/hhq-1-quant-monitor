@@ -176,27 +176,32 @@ class MTFAnalyzer:
         
         return {"direction": direction, "strength": strength, "hurst": hurst, "zscore": zscore}
     
-    def get_confirmation(self, tf_signals):
+    def get_confirmation(self, tf_signals, spread_pct=0.05):
         if not tf_signals:
             return None
+        
+        # Dynamic threshold based on spread
+        required_agreement = 6 if spread_pct > 0.15 else self.min_agreement
         
         long_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'LONG')
         short_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'SHORT')
         
         total_tfs = len(tf_signals)
         
-        if long_count >= self.min_agreement:
+        if long_count >= required_agreement:
             return {
                 "action": "LONG",
                 "tf_count": long_count,
                 "total_tfs": total_tfs,
+                "required": required_agreement,
                 "confidence": long_count / total_tfs
             }
-        elif short_count >= self.min_agreement:
+        elif short_count >= required_agreement:
             return {
                 "action": "SHORT",
                 "tf_count": short_count,
                 "total_tfs": total_tfs,
+                "required": required_agreement,
                 "confidence": short_count / total_tfs
             }
         
@@ -216,6 +221,16 @@ class MTFAnalyzer:
             return 1.0
         else:
             return 0.5
+
+    def calculate_dynamic_leverage(self, confirmation):
+        if not confirmation:
+            return 25
+        
+        tf_count = confirmation.get('tf_count', 0)
+        if tf_count >= 6: return 75
+        elif tf_count >= 5: return 50
+        elif tf_count >= 4: return 35
+        else: return 25
 
 # ============================================================================
 # BACKTEST ENGINE
@@ -244,7 +259,14 @@ class BacktestEngineV3:
         return True
     
     def get_spread_params(self, spread_pct, atr):
-        """Phase 22: Get spread-adjusted SL/TP."""
+        """Phase 23: Looser trailing stops."""
+        SPREAD_MULTIPLIERS = {
+            "very_low": {"max_spread": 0.03, "trail": 0.5, "sl": 1.5, "tp": 2.5},
+            "low": {"max_spread": 0.08, "trail": 1.0, "sl": 2.0, "tp": 3.0},
+            "normal": {"max_spread": 0.15, "trail": 1.5, "sl": 2.5, "tp": 4.0},
+            "high": {"max_spread": 0.30, "trail": 2.0, "sl": 3.0, "tp": 5.0},
+            "very_high": {"max_spread": 1.0, "trail": 3.0, "sl": 4.0, "tp": 6.0}
+        }
         for level, params in SPREAD_MULTIPLIERS.items():
             if spread_pct <= params["max_spread"]:
                 return {
@@ -261,14 +283,14 @@ class BacktestEngineV3:
             "level": "very_high"
         }
     
-    def open_position(self, action, price, atr, timestamp, size_multiplier=1.0, spread_pct=0.05):
+    def open_position(self, action, price, atr, timestamp, size_multiplier=1.0, spread_pct=0.05, leverage=100):
         if not self.can_open_position(action) or self.trading_paused:
             return None
         
         spread_params = self.get_spread_params(spread_pct, atr)
         
         risk_amount = self.balance * RISK_PER_TRADE * size_multiplier
-        position_size_usd = risk_amount * LEVERAGE
+        position_size_usd = risk_amount * leverage
         position_size = position_size_usd / price
         
         if action == "LONG":
@@ -534,12 +556,17 @@ def run_backtest():
             else:
                 tf_signals['1d'] = {"direction": "NEUTRAL", "strength": 0}
         
-        # Get MTF confirmation
-        confirmation = mtf.get_confirmation(tf_signals)
+        # Simulate spread (randomly vary between 0.03% and 0.20%)
+        # In real life this would come from order book
+        simulated_spread = np.random.uniform(0.03, 0.20)
+        
+        # Get MTF confirmation with dynamic spread
+        confirmation = mtf.get_confirmation(tf_signals, spread_pct=simulated_spread)
         
         if confirmation:
             mtf_confirmed += 1
             size_mult = mtf.get_size_multiplier(confirmation)
+            leverage = mtf.calculate_dynamic_leverage(confirmation)
             
             # Open position
             engine.open_position(
@@ -548,7 +575,8 @@ def run_backtest():
                 atr=atr,
                 timestamp=timestamp,
                 size_multiplier=size_mult,
-                spread_pct=0.05
+                spread_pct=simulated_spread,
+                leverage=leverage
             )
         else:
             # Check if would have been a signal without MTF

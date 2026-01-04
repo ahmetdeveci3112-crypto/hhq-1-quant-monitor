@@ -193,11 +193,11 @@ MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
 # Wider spread multipliers for better signal quality
 SPREAD_MULTIPLIERS = {
-    "very_low": {"max_spread": 0.03, "trail": 0.3, "sl": 1.5, "tp": 2.5},
-    "low": {"max_spread": 0.08, "trail": 0.6, "sl": 2.0, "tp": 3.0},
-    "normal": {"max_spread": 0.15, "trail": 1.0, "sl": 2.5, "tp": 4.0},
-    "high": {"max_spread": 0.30, "trail": 1.5, "sl": 3.0, "tp": 5.0},
-    "very_high": {"max_spread": 1.0, "trail": 2.0, "sl": 4.0, "tp": 6.0}
+    "very_low": {"max_spread": 0.03, "trail": 0.5, "sl": 1.5, "tp": 2.5},
+    "low": {"max_spread": 0.08, "trail": 1.0, "sl": 2.0, "tp": 3.0},
+    "normal": {"max_spread": 0.15, "trail": 1.5, "sl": 2.5, "tp": 4.0},
+    "high": {"max_spread": 0.30, "trail": 2.0, "sl": 3.0, "tp": 5.0},
+    "very_high": {"max_spread": 1.0, "trail": 3.0, "sl": 4.0, "tp": 6.0}
 }
 
 def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
@@ -333,6 +333,22 @@ class MultiTimeframeAnalyzer:
             return 1.0  # Normal
         else:
             return 0.5  # Low conviction
+            
+    def calculate_dynamic_leverage(self, mtf_signal: dict) -> int:
+        """Calculate dynamic leverage based on TF agreement."""
+        if not mtf_signal:
+            return 50
+        
+        tf_count = mtf_signal.get('tf_count', 0)
+        
+        if tf_count >= 6:
+            return 100  # Maximum leverage for maximum conviction
+        elif tf_count >= 5:
+            return 75
+        elif tf_count >= 4:
+            return 50
+        else:
+            return 25   # Minimum leverage for low conviction
 
 
 # Global MTF Analyzer instance
@@ -1138,7 +1154,8 @@ class PaperTradingEngine:
                 return
 
         # Phase 17: Use dynamic settings
-        leverage = self.leverage
+        # Phase 23: Dynamic Leverage from Signal
+        leverage = signal.get('leverage', self.leverage)
         risk_per_trade = self.risk_per_trade
         
         # Position Sizing
@@ -2204,11 +2221,14 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             if mtf_confirmation and mtf_confirmation['action'] == signal['action']:
                                 # Signal confirmed by multi-timeframe analysis
                                 size_multiplier = mtf_analyzer.calculate_position_size_multiplier(mtf_confirmation)
+                                dynamic_leverage = mtf_analyzer.calculate_dynamic_leverage(mtf_confirmation)
+                                
                                 signal['sizeMultiplier'] = size_multiplier
+                                signal['leverage'] = dynamic_leverage
                                 signal['mtf_confidence'] = mtf_confirmation['confidence']
                                 signal['mtf_tf_count'] = mtf_confirmation['tf_count']
                                 
-                                logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {size_multiplier}x")
+                                logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {size_multiplier}x | Lev: {dynamic_leverage}x")
                                 
                                 # Phase 15: Cloud Paper Trading
                                 try:
