@@ -277,34 +277,40 @@ class MultiTimeframeAnalyzer:
             "zscore": zscore
         }
     
-    def get_mtf_confirmation(self, tf_signals: dict) -> dict:
-        """Check if 3+ timeframes agree on direction."""
+    def get_mtf_confirmation(self, tf_signals: dict, spread_pct: float = 0.05) -> dict:
+        """Check if timeframes agree. Dynamic threshold based on spread."""
         if not tf_signals:
             return None
+        
+        # Determine strictness based on spread
+        # High spread (>0.15%) requires stricter confirmation (6 TFs)
+        required_agreement = 6 if spread_pct > 0.15 else self.min_agreement
         
         long_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'LONG')
         short_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'SHORT')
         
         total_tfs = len(tf_signals)
         
-        if long_count >= self.min_agreement:
+        if long_count >= required_agreement:
             long_signals = [s for s in tf_signals.values() if s.get('direction') == 'LONG']
             avg_strength = np.mean([s.get('strength', 0) for s in long_signals])
             return {
                 "action": "LONG",
                 "tf_count": long_count,
                 "total_tfs": total_tfs,
+                "required_agreement": required_agreement,
                 "strength": avg_strength,
                 "confidence": long_count / total_tfs,
                 "details": tf_signals
             }
-        elif short_count >= self.min_agreement:
+        elif short_count >= required_agreement:
             short_signals = [s for s in tf_signals.values() if s.get('direction') == 'SHORT']
             avg_strength = np.mean([s.get('strength', 0) for s in short_signals])
             return {
                 "action": "SHORT",
                 "tf_count": short_count,
                 "total_tfs": total_tfs,
+                "required_agreement": required_agreement,
                 "strength": avg_strength,
                 "confidence": short_count / total_tfs,
                 "details": tf_signals
@@ -2192,8 +2198,8 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                                 else:
                                     tf_signals['1d'] = {"direction": "NEUTRAL", "strength": 0}
                             
-                            # Check MTF confirmation
-                            mtf_confirmation = mtf_analyzer.get_mtf_confirmation(tf_signals)
+                            current_spread_pct = metrics.get('spreadPct', 0.05)
+                            mtf_confirmation = mtf_analyzer.get_mtf_confirmation(tf_signals, spread_pct=current_spread_pct)
                             
                             if mtf_confirmation and mtf_confirmation['action'] == signal['action']:
                                 # Signal confirmed by multi-timeframe analysis
