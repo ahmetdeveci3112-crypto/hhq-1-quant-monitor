@@ -657,6 +657,12 @@ class PaperTradingEngine:
         self.max_positions = 1
         # Phase 19: Server-side persistent logs
         self.logs = []
+        # Phase 20: Advanced Risk Management Config
+        self.max_position_age_hours = 24
+        self.daily_drawdown_limit = 5.0  # %5 günlük kayıp limiti
+        self.emergency_sl_pct = 10.0  # %10 pozisyon başına max kayıp
+        self.current_spread_pct = 0.05  # Will be updated from WebSocket
+        self.daily_start_balance = 10000.0
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
@@ -667,6 +673,166 @@ class PaperTradingEngine:
         self.logs.append(entry)
         self.logs = self.logs[-100:]  # Keep last 100 logs
         logger.info(f"[PaperTrading] {message}")
+    
+    # =========================================================================
+    # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
+    # =========================================================================
+    
+    def get_dynamic_trail_distance(self, atr: float) -> float:
+        """Calculate trail distance based on current spread."""
+        spread = self.current_spread_pct
+        if spread < 0.05:
+            return atr * 0.5  # Tight trailing for low spread
+        elif spread < 0.15:
+            return atr * 1.0  # Normal trailing
+        else:
+            return atr * (1.0 + spread)  # Wide trailing scales with spread
+    
+    def update_progressive_sl(self, pos: dict, current_price: float, atr: float):
+        """Move SL progressively as position goes into profit."""
+        entry = pos['entryPrice']
+        
+        if pos['side'] == 'LONG':
+            profit_atr = (current_price - entry) / atr if atr > 0 else 0
+            
+            if profit_atr >= 4:
+                new_sl = entry + (2.5 * atr)
+            elif profit_atr >= 3:
+                new_sl = entry + (1.5 * atr)
+            elif profit_atr >= 2:
+                new_sl = entry + (0.5 * atr)
+            elif profit_atr >= 1:
+                new_sl = entry  # Breakeven
+            else:
+                return False  # No change
+                
+            if new_sl > pos['stopLoss']:
+                old_sl = pos['stopLoss']
+                pos['stopLoss'] = new_sl
+                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
+                return True
+                
+        elif pos['side'] == 'SHORT':
+            profit_atr = (entry - current_price) / atr if atr > 0 else 0
+            
+            if profit_atr >= 4:
+                new_sl = entry - (2.5 * atr)
+            elif profit_atr >= 3:
+                new_sl = entry - (1.5 * atr)
+            elif profit_atr >= 2:
+                new_sl = entry - (0.5 * atr)
+            elif profit_atr >= 1:
+                new_sl = entry  # Breakeven
+            else:
+                return False
+                
+            if new_sl < pos['stopLoss']:
+                old_sl = pos['stopLoss']
+                pos['stopLoss'] = new_sl
+                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
+                return True
+        
+        return False
+    
+    def check_loss_recovery(self, pos: dict, current_price: float, atr: float) -> bool:
+        """If in loss and recovering, trail to minimize loss."""
+        entry = pos['entryPrice']
+        
+        if pos['side'] == 'LONG':
+            loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
+            
+            # Only if in loss (>2%) and price is recovering
+            if loss_pct > 2:
+                if 'recovery_low' not in pos:
+                    pos['recovery_low'] = current_price
+                elif current_price < pos['recovery_low']:
+                    pos['recovery_low'] = current_price
+                    
+                # If price bounced from low by 0.3 ATR
+                if current_price > pos['recovery_low'] + (atr * 0.3):
+                    if not pos.get('recovery_mode', False):
+                        pos['recovery_mode'] = True
+                        pos['recovery_sl'] = current_price - (atr * 0.3)
+                        self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
+                    else:
+                        new_recovery_sl = current_price - (atr * 0.3)
+                        if new_recovery_sl > pos.get('recovery_sl', 0):
+                            pos['recovery_sl'] = new_recovery_sl
+                            
+                    # Check recovery SL hit
+                    if current_price <= pos['recovery_sl']:
+                        self.close_position(pos, current_price, 'RECOVERY_EXIT')
+                        return True
+                        
+        elif pos['side'] == 'SHORT':
+            loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
+            
+            if loss_pct > 2:
+                if 'recovery_high' not in pos:
+                    pos['recovery_high'] = current_price
+                elif current_price > pos['recovery_high']:
+                    pos['recovery_high'] = current_price
+                    
+                if current_price < pos['recovery_high'] - (atr * 0.3):
+                    if not pos.get('recovery_mode', False):
+                        pos['recovery_mode'] = True
+                        pos['recovery_sl'] = current_price + (atr * 0.3)
+                        self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
+                    else:
+                        new_recovery_sl = current_price + (atr * 0.3)
+                        if new_recovery_sl < pos.get('recovery_sl', float('inf')):
+                            pos['recovery_sl'] = new_recovery_sl
+                            
+                    if current_price >= pos['recovery_sl']:
+                        self.close_position(pos, current_price, 'RECOVERY_EXIT')
+                        return True
+        
+        return False
+    
+    def check_time_based_exit(self, pos: dict, current_price: float) -> bool:
+        """Close positions that are open too long."""
+        open_time = pos.get('openTime', 0)
+        age_ms = int(datetime.now().timestamp() * 1000) - open_time
+        age_hours = age_ms / (1000 * 60 * 60)
+        
+        if age_hours > self.max_position_age_hours:
+            self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f} saat açık kaldı")
+            self.close_position(pos, current_price, 'TIME_EXIT')
+            return True
+        return False
+    
+    def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
+        """Hard limit for maximum loss per position."""
+        entry = pos['entryPrice']
+        
+        if pos['side'] == 'LONG':
+            loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
+        else:
+            loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
+            
+        if loss_pct >= self.emergency_sl_pct:
+            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp limiti aşıldı")
+            self.close_position(pos, current_price, 'EMERGENCY_SL')
+            return True
+        return False
+    
+    def check_daily_drawdown(self) -> bool:
+        """Pause trading if daily loss exceeds limit."""
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_ms = int(today_start.timestamp() * 1000)
+        
+        today_trades = [t for t in self.trades if t.get('closeTime', 0) >= today_start_ms]
+        daily_pnl = sum(t.get('pnl', 0) for t in today_trades)
+        daily_pnl_pct = (daily_pnl / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+        
+        if daily_pnl_pct < -self.daily_drawdown_limit:
+            if self.enabled:
+                self.enabled = False
+                self.add_log(f"🚨 GÜNLÜK LİMİT: %{abs(daily_pnl_pct):.1f} kayıp, trading durduruldu")
+                self.save_state()
+            return True
+        return False
+        
         
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -791,21 +957,54 @@ class PaperTradingEngine:
         self.save_state()
         logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {leverage}x")
 
-    def update(self, current_price: float):
-        # Update PnL & Check Exits
+    def update(self, current_price: float, atr: float = None):
+        """Update positions with Phase 20 Advanced Risk Management."""
+        # Phase 20: Check daily drawdown first
+        if self.check_daily_drawdown():
+            return
+        
+        # Calculate ATR-like value from position if not provided
+        if atr is None:
+            atr = current_price * 0.01  # Fallback: 1% of price as ATR estimate
+        
         for pos in list(self.positions):
+            # Skip if already closed by another check
+            if pos not in self.positions:
+                continue
+                
             # Calc PnL
             if pos['side'] == 'LONG':
                 pnl = (current_price - pos['entryPrice']) * pos['size']
             else:
                 pnl = (pos['entryPrice'] - current_price) * pos['size']
             
-            pnl_percent = (pnl / pos['sizeUsd']) * 100 * 10 # Leverage 10
+            pnl_percent = (pnl / pos['sizeUsd']) * 100 * self.leverage if pos.get('sizeUsd', 0) > 0 else 0
             
             pos['unrealizedPnl'] = pnl
             pos['unrealizedPnlPercent'] = pnl_percent
             
-            # Check Trailing Activation
+            # ===== PHASE 20: RISK MANAGEMENT PRIORITY ===== 
+            
+            # 1. Emergency SL (highest priority)
+            if self.check_emergency_sl(pos, current_price):
+                continue
+            
+            # 2. Time-based exit
+            if self.check_time_based_exit(pos, current_price):
+                continue
+            
+            # 3. Progressive SL (move SL to lock profits)
+            self.update_progressive_sl(pos, current_price, atr)
+            
+            # 4. Loss Recovery Mode
+            if self.check_loss_recovery(pos, current_price, atr):
+                continue
+            
+            # ===== ORIGINAL TRAILING LOGIC (spread-aware) =====
+            
+            # Get dynamic trail distance based on current spread
+            dynamic_trail = self.get_dynamic_trail_distance(atr)
+            
             if pos['side'] == 'LONG':
                 if current_price >= pos['trailActivation']:
                     if not pos['isTrailingActive']:
@@ -813,10 +1012,10 @@ class PaperTradingEngine:
                     pos['isTrailingActive'] = True
                 
                 if pos['isTrailingActive']:
-                    new_sl = current_price - pos['trailDistance']
+                    new_sl = current_price - dynamic_trail
                     if new_sl > pos['trailingStop']:
                         pos['trailingStop'] = new_sl
-                        pos['stopLoss'] = new_sl # Update visible SL
+                        pos['stopLoss'] = new_sl
                 
                 # Check Exits
                 if current_price <= pos['stopLoss']:
@@ -831,7 +1030,7 @@ class PaperTradingEngine:
                     pos['isTrailingActive'] = True
                     
                 if pos['isTrailingActive']:
-                    new_sl = current_price + pos['trailDistance']
+                    new_sl = current_price + dynamic_trail
                     if new_sl < pos['trailingStop']:
                         pos['trailingStop'] = new_sl
                         pos['stopLoss'] = new_sl
@@ -1419,7 +1618,9 @@ class BinanceStreamer:
 
         # Phase 15: Update Paper Trading (Check SL/TP)
         if hasattr(self, 'paper_trader') and self.paper_trader:
-            self.paper_trader.update(price)
+            # Phase 20: Pass ATR for risk management
+            atr_value = self.atr if hasattr(self, 'atr') and self.atr > 0 else price * 0.01
+            self.paper_trader.update(price, atr_value)
 
     def get_metrics(self) -> dict:
         """Calculate all metrics from current data."""
@@ -1745,6 +1946,8 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             # Phase 15: Cloud Paper Trading
                             try:
                                 if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
+                                    # Phase 20: Update spread for dynamic trailing
+                                    streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
                                     streamer.paper_trader.on_signal(signal, price)
                             except Exception as pt_err:
                                 logger.error(f"Paper Trading Error: {pt_err}")
