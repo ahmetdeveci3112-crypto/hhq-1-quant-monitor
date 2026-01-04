@@ -1594,6 +1594,7 @@ class BinanceStreamer:
 
     async def connect(self):
         """Initialize CCXT exchange connection and WebSocket streams."""
+        self.running = True
         self.exchange = ccxt_async.binance({
             'enableRateLimit': True,
             'options': {
@@ -1731,6 +1732,33 @@ class BinanceStreamer:
         if self.exchange:
             await self.exchange.close()
             logger.info("Disconnected from Binance")
+
+    async def switch_symbol(self, new_symbol: str):
+        """Switch the active symbol and restart streams."""
+        if self.symbol == new_symbol:
+            return
+
+        logger.info(f"🔄 Switching symbol from {self.symbol} to {new_symbol}")
+
+        # 1. Stop current streams
+        await self.disconnect()
+
+        # 2. Update symbol state
+        self.symbol = new_symbol
+        self.raw_symbol = new_symbol.replace("/", "")
+
+        # 3. Clear data buffers
+        self.prices.clear()
+        self.highs.clear()
+        self.lows.clear()
+        self.closes.clear()
+        self.volumes.clear()
+        self.spreads.clear()
+        self.ws_order_book = {'bids': [], 'asks': []}
+
+        # 4. Restart connection
+        # connect() will set running=True
+        await self.connect()
             
     async def start_liquidation_stream(self):
         """Connect to Binance Futures liquidation WebSocket."""
@@ -2021,6 +2049,13 @@ async def paper_trading_update_settings(
     """Update cloud trading settings."""
     if symbol:
         global_paper_trader.symbol = symbol
+        # Switch Binance Streamer to new symbol
+        # Assuming binance_streamer is the global instance variable
+        if 'binance_streamer' in globals():
+            await binance_streamer.switch_symbol(symbol)
+        else:
+             logger.warning("⚠️ binance_streamer global not found, stream not switched.")
+
     if leverage:
         global_paper_trader.leverage = leverage
     if riskPerTrade:

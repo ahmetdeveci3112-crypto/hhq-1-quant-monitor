@@ -165,6 +165,26 @@ export default function App() {
     }
   }, [addLog]);
 
+  const handleChangeCoin = useCallback(async (coin: string) => {
+    setSelectedCoin(coin);
+    setShowCoinMenu(false);
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: coin })
+      });
+      const data = await res.json();
+      if (data.success) {
+        addLog(`🪙 Coin Değiştirildi: ${coin}`);
+      } else {
+        addLog(`❌ Coin değiştirilemedi: ${data.message || 'Unknown error'}`);
+      }
+    } catch (e) {
+      addLog('❌ API hatası: Coin değişim başarısız');
+    }
+  }, [addLog]);
+
   // ============================================================================
   // PAPER TRADING ENGINE
   // ============================================================================
@@ -540,10 +560,7 @@ export default function App() {
                     {COINS.map(coin => (
                       <button
                         key={coin}
-                        onClick={() => {
-                          setSelectedCoin(coin);
-                          setShowCoinMenu(false);
-                        }}
+                        onClick={() => handleChangeCoin(coin)}
                         className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
                       >
                         <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
