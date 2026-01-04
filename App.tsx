@@ -20,6 +20,7 @@ import { SMCPanel } from './components/SMCPanel';
 // Backend WebSocket URL
 // VITE_WS_URL will be provided by Vercel Environment Variables
 const BACKEND_WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+const BACKEND_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const INITIAL_STATE: SystemState = {
   hurstExponent: 0.5,
@@ -114,9 +115,46 @@ export default function App() {
     setLogs(prev => [`[${timestamp}] ${msg}`, ...prev].slice(0, 100));
   }, []);
 
-  // Phase 15: Manual close disabled in Cloud Mode
-  const handleManualClose = useCallback((_positionId: string) => {
-    addLog('⚠️ Manuel kapatma Bulut Modunda devre dışı.');
+  // Phase 16: Auto-trade enabled state
+  const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
+
+  // Phase 16: API Control Functions
+  const handleManualClose = useCallback(async (positionId: string) => {
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/paper-trading/close/${positionId}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        addLog('✅ Pozisyon kapatıldı');
+      } else {
+        addLog('❌ Pozisyon kapatma başarısız');
+      }
+    } catch (e) {
+      addLog('❌ API hatası: Pozisyon kapatılamadı');
+    }
+  }, [addLog]);
+
+  const handleReset = useCallback(async () => {
+    if (!confirm('Paper Trading sıfırlanacak. Emin misiniz?')) return;
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/paper-trading/reset`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        addLog('🔄 Paper Trading sıfırlandı: $10,000');
+      }
+    } catch (e) {
+      addLog('❌ API hatası: Sıfırlama başarısız');
+    }
+  }, [addLog]);
+
+  const handleToggleAutoTrade = useCallback(async () => {
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/paper-trading/toggle`, { method: 'POST' });
+      const data = await res.json();
+      setAutoTradeEnabled(data.enabled);
+      addLog(`🤖 Otomatik Ticaret: ${data.enabled ? 'AÇIK' : 'KAPALI'}`);
+    } catch (e) {
+      addLog('❌ API hatası: Toggle başarısız');
+    }
   }, [addLog]);
 
   // ============================================================================
@@ -397,6 +435,28 @@ export default function App() {
                   ${portfolio.balanceUsd.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
                 </span>
               </div>
+            </div>
+
+            {/* Phase 16: Paper Trading Controls */}
+            <div className="hidden md:flex items-center gap-2">
+              <button
+                onClick={handleToggleAutoTrade}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${autoTradeEnabled
+                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                    : 'bg-slate-800 text-slate-400 border border-slate-700'
+                  }`}
+                title="Otomatik Ticaret Aç/Kapat"
+              >
+                <Radio className={`w-3.5 h-3.5 ${autoTradeEnabled ? 'animate-pulse' : ''}`} />
+                {autoTradeEnabled ? 'AUTO-ON' : 'AUTO-OFF'}
+              </button>
+              <button
+                onClick={handleReset}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
+                title="Paper Trading Sıfırla"
+              >
+                🔄 Reset
+              </button>
             </div>
 
             <button

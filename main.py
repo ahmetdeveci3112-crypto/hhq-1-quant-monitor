@@ -644,6 +644,7 @@ class PaperTradingEngine:
             "totalTrades": 0, "winningTrades": 0, "losingTrades": 0, "winRate": 0.0,
             "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
         }
+        self.enabled = True  # Phase 16: Auto-trade toggle
         self.load_state()
         
     def load_state(self):
@@ -656,6 +657,7 @@ class PaperTradingEngine:
                     self.trades = data.get('trades', [])
                     self.equity_curve = data.get('equity_curve', [])
                     self.stats = data.get('stats', self.stats)
+                    self.enabled = data.get('enabled', True)
                     logger.info(f"Loaded Paper Trading State: ${self.balance:.2f}")
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
@@ -666,15 +668,41 @@ class PaperTradingEngine:
                 "balance": self.balance,
                 "positions": self.positions,
                 "trades": self.trades,
-                "equity_curve": self.equity_curve[-500:], # Optimize size
-                "stats": self.stats
+                "equity_curve": self.equity_curve[-500:],
+                "stats": self.stats,
+                "enabled": self.enabled
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
+    def reset(self):
+        """Reset paper trading to initial state."""
+        self.balance = 10000.0
+        self.positions = []
+        self.trades = []
+        self.equity_curve = [{"time": int(datetime.now().timestamp() * 1000), "balance": 10000.0, "drawdown": 0.0}]
+        self.stats = {
+            "totalTrades": 0, "winningTrades": 0, "losingTrades": 0, "winRate": 0.0,
+            "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
+        }
+        self.save_state()
+        logger.info("🔄 Paper Trading Reset to $10,000")
+
+    def close_position_by_id(self, position_id: str, current_price: float) -> bool:
+        """Close a specific position by ID."""
+        pos = next((p for p in self.positions if p['id'] == position_id), None)
+        if not pos:
+            return False
+        self.close_position(pos, current_price, 'MANUAL')
+        return True
+
     def on_signal(self, signal: Dict, current_price: float):
+        # Phase 16: Check if auto-trade is enabled
+        if not self.enabled:
+            return
+        
         # Check if max positions reached (Limit 1 for now)
         if len(self.positions) >= 1:
             return
@@ -1070,9 +1098,10 @@ class BinanceStreamer:
         # Pivot Analyzer (Phase 11)
         self.pivot_analyzer = PivotAnalyzer(left_bars=15, right_bars=15)
         
-        # Phase 15: Cloud Paper Trading Engine
-        self.paper_trader = PaperTradingEngine()
-        logger.info(f"☁️ Cloud Paper Trading Active. Balance: ${self.paper_trader.balance:.2f}")
+        # Phase 15: Cloud Paper Trading Engine (Use global instance for REST API access)
+        # Note: global_paper_trader is defined later, set in connect()
+        self.paper_trader = None  # Will be set to global_paper_trader in connect()
+        logger.info(f"☁️ Cloud Paper Trading Active.")
 
     async def connect(self):
         """Initialize CCXT exchange connection and WebSocket streams."""
@@ -1435,6 +1464,48 @@ async def health_check():
     """Health check endpoint."""
     return JSONResponse({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
+# Phase 16: Global Paper Trader for REST API access
+global_paper_trader = PaperTradingEngine()
+
+@app.get("/paper-trading/status")
+async def paper_trading_status():
+    """Get current paper trading status."""
+    return JSONResponse({
+        "balance": global_paper_trader.balance,
+        "positions": global_paper_trader.positions,
+        "stats": global_paper_trader.stats,
+        "enabled": global_paper_trader.enabled,
+        "equityCurve": global_paper_trader.equity_curve[-50:]
+    })
+
+@app.post("/paper-trading/reset")
+async def paper_trading_reset():
+    """Reset paper trading to initial state."""
+    global_paper_trader.reset()
+    return JSONResponse({"success": True, "message": "Paper trading reset to $10,000"})
+
+@app.post("/paper-trading/toggle")
+async def paper_trading_toggle():
+    """Toggle auto-trading on/off."""
+    global_paper_trader.enabled = not global_paper_trader.enabled
+    global_paper_trader.save_state()
+    status = "enabled" if global_paper_trader.enabled else "disabled"
+    return JSONResponse({"success": True, "enabled": global_paper_trader.enabled, "message": f"Auto-trading {status}"})
+
+@app.post("/paper-trading/close/{position_id}")
+async def paper_trading_close(position_id: str):
+    """Close a specific position."""
+    # Get current price from last known position
+    if global_paper_trader.positions:
+        pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
+        if pos:
+            # Use entry price as fallback (ideally we'd have live price)
+            current_price = pos.get('entryPrice', 0)
+            success = global_paper_trader.close_position_by_id(position_id, current_price)
+            if success:
+                return JSONResponse({"success": True, "message": "Position closed"})
+    return JSONResponse({"success": False, "message": "Position not found"}, status_code=404)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
@@ -1450,6 +1521,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
     try:
         await streamer.connect()
         streamer.running = True
+        streamer.paper_trader = global_paper_trader  # Phase 16: Use global instance
         
         # Fetch initial OHLCV for ATR (one-time REST call)
         try:
