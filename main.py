@@ -627,6 +627,167 @@ class WhaleDetector:
         if std == 0: return 0.0
         return (self.current_net_vol - mean) / std
 
+class PaperTradingEngine:
+    """
+    Simulates trading execution on the backend (Server-Side).
+    Persists state to JSON to survive restarts.
+    """
+    def __init__(self, state_file: str = "paper_trading_state.json"):
+        self.state_file = state_file
+        self.balance = 10000.0
+        self.initial_balance = 10000.0
+        self.positions = []
+        self.trades = []
+        self.equity_curve = [{"time": int(datetime.now().timestamp() * 1000), "balance": 10000.0, "drawdown": 0.0}]
+        self.stats = {
+            "totalTrades": 0, "winningTrades": 0, "losingTrades": 0, "winRate": 0.0,
+            "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
+        }
+        self.load_state()
+        
+    def load_state(self):
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                    self.balance = data.get('balance', 10000.0)
+                    self.positions = data.get('positions', [])
+                    self.trades = data.get('trades', [])
+                    self.equity_curve = data.get('equity_curve', [])
+                    self.stats = data.get('stats', self.stats)
+                    logger.info(f"Loaded Paper Trading State: ${self.balance:.2f}")
+            except Exception as e:
+                logger.error(f"Failed to load state: {e}")
+                
+    def save_state(self):
+        try:
+            data = {
+                "balance": self.balance,
+                "positions": self.positions,
+                "trades": self.trades,
+                "equity_curve": self.equity_curve[-500:], # Optimize size
+                "stats": self.stats
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def on_signal(self, signal: Dict, current_price: float):
+        # Check if max positions reached (Limit 1 for now)
+        if len(self.positions) >= 1:
+            return
+
+        leverage = 10
+        risk_per_trade = 0.02 # 2% risk
+        
+        # Position Sizing
+        size_mult = signal.get('sizeMultiplier', 1.0)
+        risk_amount = self.balance * risk_per_trade * size_mult
+        position_size_usd = risk_amount * leverage
+        position_size = position_size_usd / current_price
+        
+        new_position = {
+            "id": f"{int(datetime.now().timestamp())}_{signal['action']}",
+            "symbol": "SOLUSDT", # Currently hardcoded to streamer symbol
+            "side": signal['action'],
+            "entryPrice": current_price,
+            "size": position_size,
+            "sizeUsd": position_size_usd,
+            "stopLoss": signal['sl'],
+            "takeProfit": signal['tp'],
+            "trailingStop": signal['sl'],
+            "trailActivation": signal['trailActivation'],
+            "trailDistance": signal['trailDistance'],
+            "isTrailingActive": False,
+            "unrealizedPnl": 0.0,
+            "unrealizedPnlPercent": 0.0,
+            "openTime": int(datetime.now().timestamp() * 1000)
+        }
+        
+        self.positions.append(new_position)
+        self.save_state()
+        logger.info(f"🚀 OPEN POSITION: {signal['action']} @ {current_price}")
+
+    def update(self, current_price: float):
+        # Update PnL & Check Exits
+        for pos in list(self.positions):
+            # Calc PnL
+            if pos['side'] == 'LONG':
+                pnl = (current_price - pos['entryPrice']) * pos['size']
+            else:
+                pnl = (pos['entryPrice'] - current_price) * pos['size']
+            
+            pnl_percent = (pnl / pos['sizeUsd']) * 100 * 10 # Leverage 10
+            
+            pos['unrealizedPnl'] = pnl
+            pos['unrealizedPnlPercent'] = pnl_percent
+            
+            # Check Trailing Activation
+            if pos['side'] == 'LONG':
+                if current_price >= pos['trailActivation']:
+                    pos['isTrailingActive'] = True
+                
+                if pos['isTrailingActive']:
+                    new_sl = current_price - pos['trailDistance']
+                    if new_sl > pos['trailingStop']:
+                        pos['trailingStop'] = new_sl
+                        pos['stopLoss'] = new_sl # Update visible SL
+                
+                # Check Exits
+                if current_price <= pos['stopLoss']:
+                    self.close_position(pos, current_price, 'SL')
+                elif current_price >= pos['takeProfit']:
+                    self.close_position(pos, current_price, 'TP')
+                    
+            elif pos['side'] == 'SHORT':
+                if current_price <= pos['trailActivation']:
+                    pos['isTrailingActive'] = True
+                    
+                if pos['isTrailingActive']:
+                    new_sl = current_price + pos['trailDistance']
+                    if new_sl < pos['trailingStop']:
+                        pos['trailingStop'] = new_sl
+                        pos['stopLoss'] = new_sl
+                
+                # Check Exits
+                if current_price >= pos['stopLoss']:
+                    self.close_position(pos, current_price, 'SL')
+                elif current_price <= pos['takeProfit']:
+                    self.close_position(pos, current_price, 'TP')
+
+    def close_position(self, pos: Dict, exit_price: float, reason: str):
+        if pos['side'] == 'LONG':
+            pnl = (exit_price - pos['entryPrice']) * pos['size']
+        else:
+            pnl = (pos['entryPrice'] - exit_price) * pos['size']
+            
+        self.balance += pnl
+        self.positions.remove(pos)
+        
+        trade = {
+            "id": pos['id'],
+            "symbol": pos['symbol'],
+            "side": pos['side'],
+            "entryPrice": pos['entryPrice'],
+            "exitPrice": exit_price,
+            "pnl": pnl,
+            "closeTime": int(datetime.now().timestamp() * 1000),
+            "reason": reason
+        }
+        self.trades.append(trade)
+        
+        # Update Stats
+        self.stats['totalTrades'] += 1
+        self.stats['totalPnl'] += pnl
+        if pnl > 0: self.stats['winningTrades'] += 1
+        else: self.stats['losingTrades'] += 1
+        
+        self.save_state()
+        logger.info(f"✅ CLOSE POSITION: {reason} PnL: {pnl:.2f}")
+
+
+
 class SmartMoneyAnalyzer:
     """
     Analyzes Price Action for Smart Money Concepts (SMC).
@@ -907,8 +1068,11 @@ class BinanceStreamer:
         
         # Pivot Analyzer (Phase 11)
         self.pivot_analyzer = PivotAnalyzer(left_bars=15, right_bars=15)
-
         
+        # Phase 15: Cloud Paper Trading Engine
+        self.paper_trader = PaperTradingEngine()
+        logger.info(f"☁️ Cloud Paper Trading Active. Balance: ${self.paper_trader.balance:.2f}")
+
     async def connect(self):
         """Initialize CCXT exchange connection and WebSocket streams."""
         self.exchange = ccxt_async.binance({
@@ -1163,6 +1327,12 @@ class BinanceStreamer:
              )
         # For simplicity, we run detection on every price update but it only looks at closed candles
 
+        # Phase 15: Update Paper Trading (Check SL/TP)
+        if hasattr(self, 'paper_trader') and self.paper_trader:
+            self.paper_trader.update(price)
+
+    def get_metrics(self) -> dict:
+
         
     def get_metrics(self) -> dict:
         """Calculate all metrics from current data."""
@@ -1371,6 +1541,15 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             spread_pct=metrics.get('spreadPct', 0.05), # Phase 13
                             volatility_ratio=metrics.get('volatilityRatio', 1.0) # Phase 13
                         )
+                        
+                        if signal:
+                            # Phase 15: Cloud Paper Trading
+                            if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
+                                streamer.paper_trader.on_signal(signal, price)
+                            
+                            manager.last_signals[ccxt_symbol] = signal # Fix symbol usage
+                            logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
+
                     except Exception as e:
                         logger.error(f"Signal Generation Error: {e}")
                         # Ensure variables used below are at least defined if they fail
@@ -1411,6 +1590,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             "supports": active_supports,
                             "resistances": active_resistances,
                             "breakout": breakout
+                        },
+                        "portfolio": { # Phase 15: Cloud Portfolio
+                            "balance": streamer.paper_trader.balance if hasattr(streamer, 'paper_trader') else 10000,
+                            "positions": streamer.paper_trader.positions if hasattr(streamer, 'paper_trader') else [],
+                            "stats": streamer.paper_trader.stats if hasattr(streamer, 'paper_trader') else {},
+                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else []
                         }
                     }
                     

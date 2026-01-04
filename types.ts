@@ -206,6 +206,7 @@ export interface BackendUpdate {
   activePositions?: Position[];
   smc?: SMCData;
   pivots?: PivotData;
+  portfolio?: Portfolio; // Phase 15: Cloud Portfolio
 }
 
 export interface FVG {

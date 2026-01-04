@@ -81,11 +81,11 @@ export default function App() {
 
   // Paper Trading State
   const [portfolio, setPortfolio] = useState<Portfolio>({
-    balanceUsd: INITIAL_BALANCE,
-    initialBalance: INITIAL_BALANCE,
+    balanceUsd: 10000,
+    initialBalance: 10000,
     positions: [],
     trades: [],
-    equityCurve: [{ time: Date.now(), balance: INITIAL_BALANCE, drawdown: 0 }],
+    equityCurve: [{ time: Date.now(), balance: 10000, drawdown: 0 }],
     stats: INITIAL_STATS
   });
 
@@ -114,397 +114,34 @@ export default function App() {
     setLogs(prev => [`[${timestamp}] ${msg}`, ...prev].slice(0, 100));
   }, []);
 
+  // Phase 15: Manual close disabled in Cloud Mode
+  const handleManualClose = useCallback((_positionId: string) => {
+    addLog('⚠️ Manuel kapatma Bulut Modunda devre dışı.');
+  }, [addLog]);
+
   // ============================================================================
   // PAPER TRADING ENGINE
   // ============================================================================
 
-  const openPosition = useCallback((
-    signal: BackendSignal,
-    currentPrice: number
-  ) => {
-    setPortfolio(prev => {
-      // Check if we already have a position
-      if (prev.positions.length >= settings.maxPositions) {
-        return prev;
-      }
-
-      // Apply confidence-based position sizing
-      const sizeMultiplier = signal.sizeMultiplier ?? 1.0;
-      const baseRiskAmount = prev.balanceUsd * (settings.riskPerTrade / 100);
-      const adjustedRiskAmount = baseRiskAmount * sizeMultiplier;
-      const positionSizeUsd = adjustedRiskAmount * settings.leverage;
-      const positionSize = positionSizeUsd / currentPrice;
-
-      const newPosition: Position = {
-        id: generateId(),
-        symbol: selectedCoin,
-        side: signal.action,
-        entryPrice: currentPrice,
-        size: positionSize,
-        sizeUsd: positionSizeUsd,
-        stopLoss: signal.sl,
-        takeProfit: signal.tp,
-        trailingStop: signal.sl,
-        trailActivation: signal.trailActivation,
-        trailDistance: signal.trailDistance,
-        isTrailingActive: false,
-        unrealizedPnl: 0,
-        unrealizedPnlPercent: 0,
-        openTime: Date.now(),
-        tp1Hit: false,
-        sl1Hit: false
-      };
-
-      const confidenceText = signal.confidenceScore ? ` | Güven:${signal.confidenceScore}%` : '';
-      const sizeText = sizeMultiplier !== 1.0 ? ` | Boyut:${sizeMultiplier}x` : '';
-      addLog(`🚀 POZİSYON AÇILDI: ${signal.action} ${formatPrice(positionSize)} ${selectedCoin} (${formatCurrency(positionSizeUsd)}) @ $${formatPrice(currentPrice)} | SL:$${formatPrice(signal.sl)} TP:$${formatPrice(signal.tp)}${confidenceText}${sizeText}`);
-
-      return {
-        ...prev,
-        positions: [...prev.positions, newPosition]
-      };
-    });
-  }, [selectedCoin, settings, addLog]);
-
-  const closePosition = useCallback((
-    positionId: string,
-    exitPrice: number,
-    reason: 'SL' | 'TP' | 'TRAILING' | 'MANUAL' | 'SIGNAL' | 'TP1' | 'SL1',
-    amountPercentage: number = 1.0
-  ) => {
-    setPortfolio(prev => {
-      const position = prev.positions.find(p => p.id === positionId);
-      if (!position) return prev;
-
-      // Calculate PnL
-      let pnl: number;
-      if (position.side === 'LONG') {
-        pnl = (exitPrice - position.entryPrice) * position.size;
-      } else {
-        pnl = (position.entryPrice - exitPrice) * position.size;
-      }
-      const pnlPercent = (pnl / position.sizeUsd) * 100 * settings.leverage;
-
-      const newTrade: Trade = {
-        id: generateId(),
-        symbol: position.symbol,
-        side: position.side,
-        entryPrice: position.entryPrice,
-        exitPrice: exitPrice,
-        size: position.size,
-        sizeUsd: position.sizeUsd,
-        pnl: pnl,
-        pnlPercent: pnlPercent,
-        openTime: position.openTime,
-        closeTime: Date.now(),
-        closeReason: reason
-      };
-
-      const newBalance = prev.balanceUsd + pnl;
-      const newTrades = [...prev.trades, newTrade];
-
-      // Calculate stats
-      const winningTrades = newTrades.filter(t => t.pnl > 0);
-      const losingTrades = newTrades.filter(t => t.pnl <= 0);
-      const totalWins = winningTrades.reduce((sum, t) => sum + t.pnl, 0);
-      const totalLosses = Math.abs(losingTrades.reduce((sum, t) => sum + t.pnl, 0));
-
-      const newStats: PortfolioStats = {
-        totalTrades: newTrades.length,
-        winningTrades: winningTrades.length,
-        losingTrades: losingTrades.length,
-        winRate: newTrades.length > 0 ? (winningTrades.length / newTrades.length) * 100 : 0,
-        totalPnl: newBalance - prev.initialBalance,
-        totalPnlPercent: ((newBalance - prev.initialBalance) / prev.initialBalance) * 100,
-        maxDrawdown: Math.max(prev.stats.maxDrawdown, ((prev.initialBalance - newBalance) / prev.initialBalance) * 100),
-        profitFactor: totalLosses > 0 ? totalWins / totalLosses : totalWins > 0 ? 999 : 0,
-        avgWin: winningTrades.length > 0 ? totalWins / winningTrades.length : 0,
-        avgLoss: losingTrades.length > 0 ? totalLosses / losingTrades.length : 0
-      };
-
-      // Update equity curve
-      const newEquityPoint: EquityPoint = {
-        time: Date.now(),
-        balance: newBalance,
-        drawdown: newStats.maxDrawdown
-      };
-
-      const reasonText = reason === 'SL' ? 'STOP LOSS' : reason === 'TP' ? 'TAKE PROFIT' : reason === 'TRAILING' ? 'TRAILING STOP' : reason;
-      const pnlText = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
-      const percentageText = amountPercentage < 1.0 ? ` (%${amountPercentage * 100})` : '';
-      addLog(`${pnl >= 0 ? '✅' : '❌'} POZİSYON KAPANDI (${reasonText}${percentageText}): ${pnlText} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`);
-
-      let updatedPositions = prev.positions;
-      if (amountPercentage < 1.0) {
-        // Partial Close - Update Position
-        updatedPositions = prev.positions.map(p => {
-          if (p.id === positionId) {
-            return {
-              ...p,
-              size: p.size * (1 - amountPercentage),
-              sizeUsd: p.sizeUsd * (1 - amountPercentage),
-              tp1Hit: reason === 'TP1' ? true : p.tp1Hit,
-              sl1Hit: reason === 'SL1' ? true : p.sl1Hit
-            };
-          }
-          return p;
-        });
-      } else {
-        // Full Close - Remove Position
-        updatedPositions = prev.positions.filter(p => p.id !== positionId);
-      }
-
-      return {
-        ...prev,
-        balanceUsd: newBalance,
-        positions: updatedPositions,
-        trades: newTrades,
-        equityCurve: [...prev.equityCurve, newEquityPoint],
-        stats: newStats
-      };
-    });
-  }, [settings.leverage, addLog]);
-
-  const updatePositions = useCallback((currentPrice: number) => {
-    setPortfolio(prev => {
-      if (prev.positions.length === 0) return prev;
-
-      const updatedPositions = prev.positions.map(position => {
-        // Calculate unrealized PnL
-        let unrealizedPnl: number;
-        if (position.side === 'LONG') {
-          unrealizedPnl = (currentPrice - position.entryPrice) * position.size;
-        } else {
-          unrealizedPnl = (position.entryPrice - currentPrice) * position.size;
-        }
-        const unrealizedPnlPercent = (unrealizedPnl / position.sizeUsd) * 100 * settings.leverage;
-
-        // Check for trailing stop activation
-        let isTrailingActive = position.isTrailingActive;
-        let trailingStop = position.trailingStop;
-        let stopLoss = position.stopLoss;
-
-        // BREAKEVEN TRIGGER (Profit Protection)
-        // If profit > 0.5% and SL is not already at entry
-        if (unrealizedPnlPercent > 0.5 && Math.abs(stopLoss - position.entryPrice) > 0.01 && !isTrailingActive) {
-          stopLoss = position.entryPrice;
-          addLog(`🛡️ BREAKEVEN TETİKLENDİ: Stop Girişe Çekildi (${position.entryPrice})`);
-        }
-
-        if (position.side === 'LONG') {
-          if (currentPrice >= position.trailActivation && !isTrailingActive) {
-            isTrailingActive = true;
-            trailingStop = currentPrice - position.trailDistance;
-            addLog(`📈 TRAILING STOP AKTİF: $${trailingStop.toFixed(2)}`);
-          }
-          if (isTrailingActive && currentPrice - position.trailDistance > trailingStop) {
-            trailingStop = currentPrice - position.trailDistance;
-          }
-        } else {
-          if (currentPrice <= position.trailActivation && !isTrailingActive) {
-            isTrailingActive = true;
-            trailingStop = currentPrice + position.trailDistance;
-            addLog(`📉 TRAILING STOP AKTİF: $${trailingStop.toFixed(2)}`);
-          }
-          if (isTrailingActive && currentPrice + position.trailDistance < trailingStop) {
-            trailingStop = currentPrice + position.trailDistance;
-          }
-        }
-
-        return {
-          ...position,
-          unrealizedPnl,
-          unrealizedPnlPercent,
-          isTrailingActive,
-          trailingStop,
-          stopLoss: isTrailingActive ? trailingStop : stopLoss
-        };
-      });
-
-      return { ...prev, positions: updatedPositions };
-    });
-  }, [settings.leverage, addLog]);
-
-  const checkStopLossAndTakeProfit = useCallback((currentPrice: number) => {
-    portfolio.positions.forEach(position => {
-      // Calculate distances
-      const tpDist = Math.abs(position.takeProfit - position.entryPrice);
-      const slDist = Math.abs(position.stopLoss - position.entryPrice);
-
-      // RESCUE MISSION Logic:
-      // If position is open > 45 mins AND Price returns to entry (Breakeven)
-      const duration = Date.now() - position.openTime;
-      const isStale = duration > 45 * 60 * 1000; // 45 mins
-
-      if (position.side === 'LONG') {
-        const tp1Price = position.entryPrice + (tpDist * 0.5);
-        const sl1Price = position.entryPrice - (slDist * 0.5);
-
-        // Rescue Check
-        if (isStale && currentPrice >= position.entryPrice) {
-          addLog(`🚑 RESCUE MISSION: Uzun süreli pozisyon zararsız kapatıldı.`);
-          closePosition(position.id, currentPrice, 'RESCUE');
-          return;
-        }
-
-        // Check Full Stops
-        if (currentPrice <= position.stopLoss) {
-          closePosition(position.id, currentPrice, position.isTrailingActive ? 'TRAILING' : 'SL');
-        } else if (currentPrice >= position.takeProfit) {
-          closePosition(position.id, currentPrice, 'TP');
-        }
-        // Check Partial Stops (Scaling Out)
-        else if (!position.tp1Hit && currentPrice >= tp1Price) {
-          closePosition(position.id, currentPrice, 'TP1', 0.5);
-        }
-        else if (!position.sl1Hit && currentPrice <= sl1Price) {
-          closePosition(position.id, currentPrice, 'SL1', 0.5);
-        }
-
-      } else {
-        const tp1Price = position.entryPrice - (tpDist * 0.5);
-        const sl1Price = position.entryPrice + (slDist * 0.5);
-
-        // Rescue Check
-        if (isStale && currentPrice <= position.entryPrice) {
-          addLog(`🚑 RESCUE MISSION: Uzun süreli pozisyon zararsız kapatıldı.`);
-          closePosition(position.id, currentPrice, 'RESCUE');
-          return;
-        }
-
-        // Check Full Stops
-        if (currentPrice >= position.stopLoss) {
-          closePosition(position.id, currentPrice, position.isTrailingActive ? 'TRAILING' : 'SL');
-        } else if (currentPrice <= position.takeProfit) {
-          closePosition(position.id, currentPrice, 'TP');
-        }
-        // Check Partial Stops (Scaling Out)
-        else if (!position.tp1Hit && currentPrice <= tp1Price) {
-          closePosition(position.id, currentPrice, 'TP1', 0.5);
-        }
-        else if (!position.sl1Hit && currentPrice >= sl1Price) {
-          closePosition(position.id, currentPrice, 'SL1', 0.5);
-        }
-      }
-    });
-  }, [portfolio.positions, closePosition]);
-
-  const handleManualClose = useCallback((positionId: string) => {
-    closePosition(positionId, systemState.currentPrice, 'MANUAL');
-  }, [closePosition, systemState.currentPrice]);
-
-  const checkPendingOrders = useCallback((currentPrice: number) => {
-    // Check if any pending orders triggered
-    if (pendingOrders.length === 0) return;
-
-    setPendingOrders(prev => {
-      const remaining: PendingOrder[] = [];
-      const triggered: PendingOrder[] = [];
-
-      prev.forEach(order => {
-        const age = Date.now() - order.timestamp;
-
-        // Timeout (15 mins)
-        if (age > 15 * 60 * 1000) {
-          addLog(`⏰ Bekleyen emir iptal (Zaman aşımı): ${order.symbol}`);
-          return;
-        }
-
-        // Check trigger condition
-        // LONG: Price was above, drops to limit
-        // SHORT: Price was below, rises to limit
-        // Ideally we check if price crossed currentPrice vs previousPrice, but here we just check bounds
-        // to simplify: if Price is better than or equal to Limit for entry?
-        // Actually for Limit Buy (Long), Price <= Entry. For Limit Sell (Short), Price >= Entry.
-
-        let triggeredOrder = false;
-        if (order.side === 'LONG' && currentPrice <= order.entryPrice) {
-          triggeredOrder = true;
-        } else if (order.side === 'SHORT' && currentPrice >= order.entryPrice) {
-          triggeredOrder = true;
-        }
-
-        if (triggeredOrder) {
-          triggered.push(order);
-        } else {
-          remaining.push(order);
-        }
-      });
-
-      // Execute triggered
-      triggered.forEach(order => {
-        addLog(`⚡ Bekleyen Emir Tetiklendi: ${order.symbol} @ ${order.entryPrice}`);
-        // Construct BackendSignal-like object to reuse openPosition logic
-        const signal: BackendSignal = {
-          action: order.side,
-          entry: order.entryPrice,
-          sl: order.sl,
-          tp: order.tp,
-          trailActivation: order.trailActivation,
-          trailDistance: order.trailDistance,
-          reason: "PULLBACK ENTRY",
-          timestamp: Date.now(),
-          confidence: 'HIGH',
-          sizeMultiplier: order.sizeMultiplier,
-          price: currentPrice
-        };
-        openPosition(signal, currentPrice);
-      });
-
-      return remaining;
-    });
-  }, [pendingOrders, openPosition, addLog]);
-
-  const handleSignal = useCallback((signal: BackendSignal) => {
-    // Instead of opening immediately, create a Pending Limit Order (Pullback Entry)
-    const newOrder: PendingOrder = {
-      id: generateId(),
-      symbol: selectedCoin,
-      side: signal.action,
-      entryPrice: signal.entryPrice || signal.entry, // Use Pullback Price if available
-      signalPrice: signal.price || signal.entry,
-      sl: signal.sl,
-      tp: signal.tp,
-      trailActivation: signal.trailActivation,
-      trailDistance: signal.trailDistance,
-      sizeMultiplier: signal.sizeMultiplier || 1.0,
-      timestamp: Date.now(),
-      reason: signal.reason
-    };
-
-    setPendingOrders(prev => [...prev, newOrder]);
-    addLog(`⏳ BEKLEYEN EMİR: ${signal.action} @ ${newOrder.entryPrice.toFixed(2)} (Sinyal: ${signal.price?.toFixed(2)})`);
-  }, [selectedCoin, addLog]);
-
+  // No local handling logic needed for Cloud Trading
+  // Logic moved to Backend (main.py)
   // ============================================================================
   // WEBSOCKET CONNECTION
   // ============================================================================
 
   // Ref to store latest handlers to avoid WebSocket reconnection on state changes
   const wsHandlersRef = useRef({
-    addLog,
-    openPosition,
-    handleSignal,
-    checkPendingOrders,
-    updatePositions,
-    checkStopLossAndTakeProfit,
-    portfolio,
-    lastSignal: lastSignalRef.current
+    addLog
   });
 
   // Update ref on every render
   useEffect(() => {
     wsHandlersRef.current = {
       addLog,
-      openPosition,
-      handleSignal,
-      checkPendingOrders,
-      updatePositions,
-      checkStopLossAndTakeProfit,
       portfolio,
       lastSignal: lastSignalRef.current
     };
-  }, [addLog, openPosition, handleSignal, checkPendingOrders, updatePositions, checkStopLossAndTakeProfit, portfolio]);
+  }, [addLog, portfolio]);
 
   // ============================================================================
   // WEBSOCKET CONNECTION
@@ -604,22 +241,20 @@ export default function App() {
                 price: price
               }, ...prev].slice(0, 20));
 
-              // Open position if we don't have one and not at max pos
-              if (handlers.portfolio.positions.length === 0) {
-                // OLD: handlers.openPosition(signal, price);
-                // NEW: Use Handle Signal to create Pending Order logic
-                handlers.handleSignal(signal);
+              // Phase 15: Handle Portfolio Update from Backend
+              if (data.portfolio) {
+                const pf = data.portfolio as any;
+                setPortfolio({
+                  balanceUsd: pf.balance || pf.balanceUsd || 10000,
+                  initialBalance: 10000,
+                  positions: pf.positions || [],
+                  trades: [],
+                  equityCurve: pf.equityCurve || [],
+                  stats: pf.stats || INITIAL_STATS
+                });
               }
+
             }
-
-            // Update positions with current price
-            handlers.updatePositions(price);
-
-            // Check Pending Orders (Limit Entries)
-            handlers.checkPendingOrders(price);
-
-            // Check for SL/TP hits
-            handlers.checkStopLossAndTakeProfit(price);
           }
         } catch (e) {
           console.error('Parse error:', e);
