@@ -188,7 +188,7 @@ def calculate_zscore(spread_series: list, lookback: int = 20) -> float:
 # ============================================================================
 
 # Timeframes to analyze (exclude 3d+)
-MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h']
+MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 MTF_MIN_AGREEMENT = 3  # Minimum TF agreement required
 
 # Wider spread multipliers for better signal quality
@@ -2184,6 +2184,13 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                                     tf_signals['4h'] = mtf_analyzer.analyze_timeframe(closes_4h)
                                 else:
                                     tf_signals['4h'] = {"direction": "NEUTRAL", "strength": 0}
+                                
+                                # 1d: use every 96th close (15m * 96 = 1d)
+                                if len(closes_list) >= 480:
+                                    closes_1d = closes_list[::96][-20:]
+                                    tf_signals['1d'] = mtf_analyzer.analyze_timeframe(closes_1d)
+                                else:
+                                    tf_signals['1d'] = {"direction": "NEUTRAL", "strength": 0}
                             
                             # Check MTF confirmation
                             mtf_confirmation = mtf_analyzer.get_mtf_confirmation(tf_signals)
