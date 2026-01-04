@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Backend Backtest Script for DOGE
-Uses the same signal generation logic as the live system.
+Backend Backtest Script for DOGE - WITH PHASE 20 RISK MANAGEMENT
+Uses the same signal generation and risk management as the live system.
 """
 import pandas as pd
 import numpy as np
@@ -20,6 +20,11 @@ SL_ATR = 2.0
 TP_ATR = 3.0
 TRAIL_ACTIVATION_ATR = 1.5
 TRAIL_DISTANCE_ATR = 1.0
+
+# Phase 20: Risk Management
+MAX_POSITION_AGE_HOURS = 24
+EMERGENCY_SL_PCT = 10.0  # %10 max loss
+DAILY_DRAWDOWN_LIMIT = 5.0  # %5
 
 # Backtest period
 DAYS_BACK = 30
@@ -55,11 +60,10 @@ def fetch_historical_klines(symbol: str, interval: str, days: int):
             break
             
         all_klines.extend(klines)
-        current_start = klines[-1][6] + 1  # Close time + 1ms
+        current_start = klines[-1][6] + 1
         
     print(f"✅ Fetched {len(all_klines)} candles")
     
-    # Convert to DataFrame
     df = pd.DataFrame(all_klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
@@ -76,10 +80,9 @@ def fetch_historical_klines(symbol: str, interval: str, days: int):
     return df
 
 # ============================================================================
-# INDICATORS (Same as live system)
+# INDICATORS
 # ============================================================================
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculate Average True Range."""
     high = df['high']
     low = df['low']
     close = df['close']
@@ -94,7 +97,6 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 def calculate_hurst(series: pd.Series, lags: list = None) -> float:
-    """Calculate Hurst Exponent."""
     if lags is None:
         lags = range(2, min(20, len(series) // 2))
     
@@ -114,27 +116,23 @@ def calculate_hurst(series: pd.Series, lags: list = None) -> float:
         return 0.5
 
 def calculate_zscore(series: pd.Series, period: int = 20) -> pd.Series:
-    """Calculate Z-Score."""
     mean = series.rolling(window=period).mean()
     std = series.rolling(window=period).std()
     zscore = (series - mean) / std
     return zscore
 
 # ============================================================================
-# SIGNAL GENERATION (Same logic as live system)
+# SIGNAL GENERATION
 # ============================================================================
 def generate_signal(row: pd.Series, atr: float, hurst: float, zscore: float) -> dict:
-    """Generate trading signal based on current conditions."""
-    
-    # Skip if conditions not met
     if pd.isna(atr) or atr == 0:
         return None
     
     signal = None
     
-    # Mean Reversion Logic (when Hurst < 0.5)
+    # Mean Reversion Logic (Hurst < 0.45)
     if hurst < 0.45:
-        if zscore < -2.0:  # Oversold
+        if zscore < -2.0:
             signal = {
                 "action": "LONG",
                 "entry": row['close'],
@@ -142,7 +140,7 @@ def generate_signal(row: pd.Series, atr: float, hurst: float, zscore: float) -> 
                 "tp": row['close'] + (TP_ATR * atr),
                 "reason": f"MR Long: Z={zscore:.2f}, H={hurst:.2f}"
             }
-        elif zscore > 2.0:  # Overbought
+        elif zscore > 2.0:
             signal = {
                 "action": "SHORT",
                 "entry": row['close'],
@@ -151,9 +149,9 @@ def generate_signal(row: pd.Series, atr: float, hurst: float, zscore: float) -> 
                 "reason": f"MR Short: Z={zscore:.2f}, H={hurst:.2f}"
             }
     
-    # Trend Following Logic (when Hurst > 0.55)
+    # Trend Following Logic (Hurst > 0.55)
     elif hurst > 0.55:
-        if zscore > 1.5:  # Strong uptrend
+        if zscore > 1.5:
             signal = {
                 "action": "LONG",
                 "entry": row['close'],
@@ -161,7 +159,7 @@ def generate_signal(row: pd.Series, atr: float, hurst: float, zscore: float) -> 
                 "tp": row['close'] + (TP_ATR * atr),
                 "reason": f"TF Long: Z={zscore:.2f}, H={hurst:.2f}"
             }
-        elif zscore < -1.5:  # Strong downtrend
+        elif zscore < -1.5:
             signal = {
                 "action": "SHORT",
                 "entry": row['close'],
@@ -173,18 +171,82 @@ def generate_signal(row: pd.Series, atr: float, hurst: float, zscore: float) -> 
     return signal
 
 # ============================================================================
-# BACKTEST ENGINE
+# PHASE 20: BACKTEST ENGINE WITH RISK MANAGEMENT
 # ============================================================================
-class BacktestEngine:
+class BacktestEngineV2:
     def __init__(self, initial_balance: float = 10000.0):
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.position = None
         self.trades = []
         self.equity_curve = []
+        self.daily_pnl = 0
+        self.trading_paused = False
         
-    def open_position(self, signal: dict, timestamp, current_price: float):
-        if self.position is not None:
+    def get_dynamic_trail_distance(self, atr: float, spread_pct: float = 0.05) -> float:
+        """Phase 20: Spread-aware trailing."""
+        if spread_pct < 0.05:
+            return atr * 0.5
+        elif spread_pct < 0.15:
+            return atr * 1.0
+        else:
+            return atr * (1.0 + spread_pct)
+    
+    def update_progressive_sl(self, pos: dict, current_price: float, atr: float) -> bool:
+        """Phase 20: Progressive SL - lock profits."""
+        entry = pos["entry_price"]
+        
+        if pos["side"] == "LONG":
+            profit_atr = (current_price - entry) / atr if atr > 0 else 0
+            
+            if profit_atr >= 4:
+                new_sl = entry + (2.5 * atr)
+            elif profit_atr >= 3:
+                new_sl = entry + (1.5 * atr)
+            elif profit_atr >= 2:
+                new_sl = entry + (0.5 * atr)
+            elif profit_atr >= 1:
+                new_sl = entry  # Breakeven
+            else:
+                return False
+                
+            if new_sl > pos["sl"]:
+                pos["sl"] = new_sl
+                return True
+                
+        elif pos["side"] == "SHORT":
+            profit_atr = (entry - current_price) / atr if atr > 0 else 0
+            
+            if profit_atr >= 4:
+                new_sl = entry - (2.5 * atr)
+            elif profit_atr >= 3:
+                new_sl = entry - (1.5 * atr)
+            elif profit_atr >= 2:
+                new_sl = entry - (0.5 * atr)
+            elif profit_atr >= 1:
+                new_sl = entry
+            else:
+                return False
+                
+            if new_sl < pos["sl"]:
+                pos["sl"] = new_sl
+                return True
+        
+        return False
+    
+    def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
+        """Phase 20: Emergency SL at max loss."""
+        entry = pos["entry_price"]
+        
+        if pos["side"] == "LONG":
+            loss_pct = ((entry - current_price) / entry) * 100
+        else:
+            loss_pct = ((current_price - entry) / entry) * 100
+            
+        return loss_pct >= EMERGENCY_SL_PCT
+    
+    def open_position(self, signal: dict, timestamp, current_price: float, atr: float):
+        if self.position is not None or self.trading_paused:
             return
             
         risk_amount = self.balance * RISK_PER_TRADE
@@ -201,27 +263,35 @@ class BacktestEngine:
             "trail_sl": signal["sl"],
             "trail_active": False,
             "open_time": timestamp,
-            "reason": signal["reason"]
+            "reason": signal["reason"],
+            "atr": atr
         }
         
-    def update_position(self, current_price: float, high: float, low: float, timestamp):
+    def update_position(self, current_price: float, high: float, low: float, timestamp, atr: float):
         if self.position is None:
             return
             
         pos = self.position
         
-        # Calculate unrealized PnL
+        # Phase 20: Emergency SL check first
+        if self.check_emergency_sl(pos, current_price):
+            self.close_position(current_price, timestamp, "EMERGENCY_SL")
+            return
+        
+        # Phase 20: Progressive SL
+        self.update_progressive_sl(pos, current_price, atr)
+        
+        # Dynamic trailing distance
+        trail_dist = self.get_dynamic_trail_distance(atr)
+        
         if pos["side"] == "LONG":
-            pnl = (current_price - pos["entry_price"]) * pos["size"]
-            
-            # Check trailing activation
-            atr_move = (current_price - pos["entry_price"]) / (pos["entry_price"] * 0.01)  # Rough ATR estimate
-            if atr_move >= TRAIL_ACTIVATION_ATR and not pos["trail_active"]:
+            # Trailing activation
+            activation_price = pos["entry_price"] + (TRAIL_ACTIVATION_ATR * atr)
+            if current_price >= activation_price:
                 pos["trail_active"] = True
                 
-            # Update trailing stop
             if pos["trail_active"]:
-                new_sl = current_price - (TRAIL_DISTANCE_ATR * (pos["entry_price"] * 0.01))
+                new_sl = current_price - trail_dist
                 if new_sl > pos["trail_sl"]:
                     pos["trail_sl"] = new_sl
                     pos["sl"] = new_sl
@@ -233,15 +303,12 @@ class BacktestEngine:
                 self.close_position(pos["tp"], timestamp, "TP")
                 
         else:  # SHORT
-            pnl = (pos["entry_price"] - current_price) * pos["size"]
-            
-            # Trailing for shorts
-            atr_move = (pos["entry_price"] - current_price) / (pos["entry_price"] * 0.01)
-            if atr_move >= TRAIL_ACTIVATION_ATR and not pos["trail_active"]:
+            activation_price = pos["entry_price"] - (TRAIL_ACTIVATION_ATR * atr)
+            if current_price <= activation_price:
                 pos["trail_active"] = True
                 
             if pos["trail_active"]:
-                new_sl = current_price + (TRAIL_DISTANCE_ATR * (pos["entry_price"] * 0.01))
+                new_sl = current_price + trail_dist
                 if new_sl < pos["trail_sl"]:
                     pos["trail_sl"] = new_sl
                     pos["sl"] = new_sl
@@ -263,6 +330,12 @@ class BacktestEngine:
             pnl = (pos["entry_price"] - exit_price) * pos["size"]
             
         self.balance += pnl
+        self.daily_pnl += pnl
+        
+        # Phase 20: Daily drawdown check
+        daily_pnl_pct = (self.daily_pnl / self.initial_balance) * 100
+        if daily_pnl_pct < -DAILY_DRAWDOWN_LIMIT:
+            self.trading_paused = True
         
         trade = {
             "side": pos["side"],
@@ -273,7 +346,8 @@ class BacktestEngine:
             "open_time": pos["open_time"],
             "close_time": timestamp,
             "reason": reason,
-            "signal_reason": pos["reason"]
+            "signal_reason": pos["reason"],
+            "trail_active": pos["trail_active"]
         }
         self.trades.append(trade)
         self.position = None
@@ -308,6 +382,19 @@ class BacktestEngine:
         gross_loss = abs(sum(t["pnl"] for t in losses))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
         
+        # Trailing analysis
+        trail_trades = [t for t in self.trades if t["trail_active"]]
+        trail_pnl = sum(t["pnl"] for t in trail_trades)
+        
+        # Exit reason breakdown
+        exit_reasons = {}
+        for t in self.trades:
+            r = t["reason"]
+            if r not in exit_reasons:
+                exit_reasons[r] = {"count": 0, "pnl": 0}
+            exit_reasons[r]["count"] += 1
+            exit_reasons[r]["pnl"] += t["pnl"]
+        
         # Max drawdown
         peak = self.initial_balance
         max_dd = 0
@@ -329,7 +416,10 @@ class BacktestEngine:
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "profit_factor": round(profit_factor, 2),
-            "max_drawdown": round(max_dd, 2)
+            "max_drawdown": round(max_dd, 2),
+            "trailing_trades": len(trail_trades),
+            "trailing_pnl": round(trail_pnl, 2),
+            "exit_reasons": exit_reasons
         }
 
 # ============================================================================
@@ -337,35 +427,31 @@ class BacktestEngine:
 # ============================================================================
 def run_backtest():
     print("=" * 60)
-    print(f"🚀 BACKTEST: {SYMBOL}")
+    print(f"🚀 BACKTEST: {SYMBOL} (Phase 20 Risk Management)")
     print(f"📅 Period: {DAYS_BACK} days")
     print(f"⚙️  Settings: {LEVERAGE}x | SL:{SL_ATR} ATR | TP:{TP_ATR} ATR")
+    print(f"🛡️  Risk: Emergency SL:{EMERGENCY_SL_PCT}% | Daily DD:{DAILY_DRAWDOWN_LIMIT}%")
     print("=" * 60)
     
-    # Fetch data
     df = fetch_historical_klines(SYMBOL, INTERVAL, DAYS_BACK)
     
     if len(df) < 50:
         print("❌ Not enough data")
         return
     
-    # Calculate indicators
     print("📊 Calculating indicators...")
     df['atr'] = calculate_atr(df, 14)
     df['zscore'] = calculate_zscore(df['close'], 20)
     
-    # Initialize backtest engine
-    engine = BacktestEngine(INITIAL_BALANCE)
+    engine = BacktestEngineV2(INITIAL_BALANCE)
     
-    # Run backtest
-    print("🔄 Running backtest...")
+    print("🔄 Running backtest with Phase 20 risk management...")
     
     for i in range(50, len(df)):
         row = df.iloc[i]
         current_price = row['close']
         atr = row['atr']
         
-        # Calculate Hurst on rolling window
         if i >= 100:
             hurst = calculate_hurst(df['close'].iloc[i-100:i])
         else:
@@ -373,28 +459,25 @@ def run_backtest():
             
         zscore = row['zscore']
         
-        # Update existing position
-        engine.update_position(current_price, row['high'], row['low'], row['timestamp'])
+        # Update existing position with Phase 20 risk management
+        engine.update_position(current_price, row['high'], row['low'], row['timestamp'], atr)
         
         # Generate signal if no position
-        if engine.position is None:
+        if engine.position is None and not engine.trading_paused:
             signal = generate_signal(row, atr, hurst, zscore)
             if signal:
-                engine.open_position(signal, row['timestamp'], current_price)
+                engine.open_position(signal, row['timestamp'], current_price, atr)
         
-        # Record equity every 10 candles
         if i % 10 == 0:
             engine.record_equity(row['timestamp'], current_price)
     
-    # Close any open position at the end
     if engine.position:
         engine.close_position(df.iloc[-1]['close'], df.iloc[-1]['timestamp'], "END")
     
-    # Get and print results
     stats = engine.get_stats()
     
     print("\n" + "=" * 60)
-    print("📈 BACKTEST RESULTS")
+    print("📈 BACKTEST RESULTS (Phase 20)")
     print("=" * 60)
     print(f"Total Trades:    {stats['total_trades']}")
     print(f"Winning:         {stats['winning_trades']}")
@@ -409,13 +492,21 @@ def run_backtest():
     print(f"Avg Loss:        ${stats['avg_loss']}")
     print(f"Profit Factor:   {stats['profit_factor']}")
     print(f"Max Drawdown:    {stats['max_drawdown']}%")
+    print("-" * 40)
+    print(f"Trailing Trades: {stats['trailing_trades']}")
+    print(f"Trailing PnL:    ${stats['trailing_pnl']}")
     print("=" * 60)
     
-    # Print last 10 trades
+    print("\n📊 Exit Reason Breakdown:")
+    for reason, data in stats['exit_reasons'].items():
+        pnl_emoji = "✅" if data['pnl'] > 0 else "❌"
+        print(f"  {reason}: {data['count']} trades | {pnl_emoji} ${data['pnl']:.2f}")
+    
     print("\n📋 Last 10 Trades:")
     for trade in engine.trades[-10:]:
         emoji = "✅" if trade["pnl"] > 0 else "❌"
-        print(f"{emoji} {trade['side']} | Entry: ${trade['entry_price']:.6f} → Exit: ${trade['exit_price']:.6f} | PnL: ${trade['pnl']:.2f} ({trade['reason']})")
+        trail = "🔄" if trade["trail_active"] else ""
+        print(f"{emoji}{trail} {trade['side']} @ ${trade['entry_price']:.6f} → ${trade['exit_price']:.6f} | PnL: ${trade['pnl']:.2f} ({trade['reason']})")
     
     return stats, engine.trades
 

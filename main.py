@@ -184,6 +184,156 @@ def calculate_zscore(spread_series: list, lookback: int = 20) -> float:
 
 
 # ============================================================================
+# PHASE 22: MULTI-TIMEFRAME CONFIGURATION
+# ============================================================================
+
+# Timeframes to analyze (exclude 3d+)
+MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h']
+MTF_MIN_AGREEMENT = 3  # Minimum TF agreement required
+
+# Wider spread multipliers for better signal quality
+SPREAD_MULTIPLIERS = {
+    "very_low": {"max_spread": 0.03, "trail": 0.3, "sl": 1.5, "tp": 2.5},
+    "low": {"max_spread": 0.08, "trail": 0.6, "sl": 2.0, "tp": 3.0},
+    "normal": {"max_spread": 0.15, "trail": 1.0, "sl": 2.5, "tp": 4.0},
+    "high": {"max_spread": 0.30, "trail": 1.5, "sl": 3.0, "tp": 5.0},
+    "very_high": {"max_spread": 1.0, "trail": 2.0, "sl": 4.0, "tp": 6.0}
+}
+
+def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
+    """Get SL/TP/Trail based on current spread level."""
+    for level, params in SPREAD_MULTIPLIERS.items():
+        if spread_pct <= params["max_spread"]:
+            return {
+                "trail_distance": atr * params["trail"],
+                "stop_loss": atr * params["sl"],
+                "take_profit": atr * params["tp"],
+                "level": level
+            }
+    # Default to very_high
+    params = SPREAD_MULTIPLIERS["very_high"]
+    return {
+        "trail_distance": atr * params["trail"],
+        "stop_loss": atr * params["sl"],
+        "take_profit": atr * params["tp"],
+        "level": "very_high"
+    }
+
+
+class MultiTimeframeAnalyzer:
+    """
+    Phase 22: Analyze multiple timeframes for signal confirmation.
+    Only enter trades when 3+ timeframes agree.
+    """
+    
+    def __init__(self):
+        self.timeframes = MTF_CONFIRMATION_TIMEFRAMES
+        self.min_agreement = MTF_MIN_AGREEMENT
+        self.tf_signals = {}
+        self.last_update = {}
+    
+    def analyze_timeframe(self, closes: list, highs: list = None, lows: list = None) -> dict:
+        """Analyze a single timeframe and return signal."""
+        if len(closes) < 20:
+            return {"direction": "NEUTRAL", "strength": 0, "hurst": 0.5, "zscore": 0}
+        
+        # Calculate indicators
+        hurst = calculate_hurst(closes)
+        
+        # Calculate Z-Score from price spread
+        if len(closes) >= 20:
+            ma = np.mean(closes[-20:])
+            spreads = [c - ma for c in closes[-20:]]
+            zscore = calculate_zscore(spreads)
+        else:
+            zscore = 0
+        
+        # Determine direction
+        direction = "NEUTRAL"
+        strength = 0
+        
+        # Mean Reversion (Hurst < 0.45)
+        if hurst < 0.45:
+            if zscore < -2.0:
+                direction = "LONG"
+                strength = abs(zscore)
+            elif zscore > 2.0:
+                direction = "SHORT"
+                strength = abs(zscore)
+        
+        # Trend Following (Hurst > 0.55)
+        elif hurst > 0.55:
+            if zscore > 1.5:
+                direction = "LONG"
+                strength = abs(zscore)
+            elif zscore < -1.5:
+                direction = "SHORT"
+                strength = abs(zscore)
+        
+        return {
+            "direction": direction,
+            "strength": strength,
+            "hurst": hurst,
+            "zscore": zscore
+        }
+    
+    def get_mtf_confirmation(self, tf_signals: dict) -> dict:
+        """Check if 3+ timeframes agree on direction."""
+        if not tf_signals:
+            return None
+        
+        long_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'LONG')
+        short_count = sum(1 for s in tf_signals.values() if s.get('direction') == 'SHORT')
+        
+        total_tfs = len(tf_signals)
+        
+        if long_count >= self.min_agreement:
+            long_signals = [s for s in tf_signals.values() if s.get('direction') == 'LONG']
+            avg_strength = np.mean([s.get('strength', 0) for s in long_signals])
+            return {
+                "action": "LONG",
+                "tf_count": long_count,
+                "total_tfs": total_tfs,
+                "strength": avg_strength,
+                "confidence": long_count / total_tfs,
+                "details": tf_signals
+            }
+        elif short_count >= self.min_agreement:
+            short_signals = [s for s in tf_signals.values() if s.get('direction') == 'SHORT']
+            avg_strength = np.mean([s.get('strength', 0) for s in short_signals])
+            return {
+                "action": "SHORT",
+                "tf_count": short_count,
+                "total_tfs": total_tfs,
+                "strength": avg_strength,
+                "confidence": short_count / total_tfs,
+                "details": tf_signals
+            }
+        
+        return None  # Not enough agreement
+    
+    def calculate_position_size_multiplier(self, mtf_signal: dict) -> float:
+        """Calculate position size multiplier based on TF agreement."""
+        if not mtf_signal:
+            return 0.5
+        
+        tf_count = mtf_signal.get('tf_count', 0)
+        
+        if tf_count >= 5:
+            return 2.0  # Full conviction
+        elif tf_count >= 4:
+            return 1.5  # High conviction
+        elif tf_count >= 3:
+            return 1.0  # Normal
+        else:
+            return 0.5  # Low conviction
+
+
+# Global MTF Analyzer instance
+mtf_analyzer = MultiTimeframeAnalyzer()
+
+
+# ============================================================================
 # ORDER BOOK IMBALANCE
 # ============================================================================
 
@@ -654,7 +804,9 @@ class PaperTradingEngine:
         self.tp_atr = 3.0
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
-        self.max_positions = 1
+        # Phase 22: Multi-position config
+        self.max_positions = 3  # Allow up to 3 positions
+        self.allow_hedging = True  # Allow LONG + SHORT simultaneously
         # Phase 19: Server-side persistent logs
         self.logs = []
         # Phase 20: Advanced Risk Management Config
@@ -958,10 +1110,26 @@ class PaperTradingEngine:
             self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
             return
         
-        # Check if max positions reached (Limit 1 for now)
+        # Phase 22: Multi-position and hedging logic
+        action = signal.get('action', 'UNKNOWN')
+        
+        # Check total position limit
         if len(self.positions) >= self.max_positions:
             self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
             return
+        
+        # Check for same direction positions (allow max 2 same direction)
+        same_direction = [p for p in self.positions if p.get('side') == action]
+        if len(same_direction) >= 2:
+            self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {action} açılmadı")
+            return
+        
+        # If hedging is disabled, check for opposite direction
+        if not self.allow_hedging:
+            opposite_direction = [p for p in self.positions if p.get('side') != action]
+            if len(opposite_direction) > 0:
+                self.add_log(f"⚠️ Hedging kapalı, zaten ters pozisyon var")
+                return
 
         # Phase 17: Use dynamic settings
         leverage = self.leverage
