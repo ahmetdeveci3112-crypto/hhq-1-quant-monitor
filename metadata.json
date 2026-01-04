@@ -1,0 +1,5 @@
+{
+  "name": "HHQ-1 Quant Monitor",
+  "description": "A real-time dashboard for the Hierarchical Hybrid Quant-Trade System, visualizing Market Regime (Hurst), Pairs Trading (Z-Score), Liquidation Cascades, and Order Book Imbalance.",
+  "requestFramePermissions": []
+}

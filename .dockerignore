@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.DS_Store
+node_modules/
+dist/
+build/
+*.log
+verify_*.py
+main_v2.py
