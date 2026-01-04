@@ -125,6 +125,7 @@ export default function App() {
 
   // Phase 16: Auto-trade enabled state
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
+  const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
 
   // Phase 16: API Control Functions
   const handleManualClose = useCallback(async (positionId: string) => {
@@ -245,9 +246,11 @@ export default function App() {
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
         addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)} `);
+        setIsSynced(true); // Phase 27: Allow auto-save only after sync
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
         if (!selectedCoin) setSelectedCoin('BTCUSDT'); // Fallback on error
+        setIsSynced(true); // Enable anyway to allow local overrides if network fails
       }
     };
     fetchCloudState();
@@ -257,7 +260,8 @@ export default function App() {
   const settingsRef = useRef(settings);
   const coinRef = useRef(selectedCoin);
   useEffect(() => {
-    // Skip on first render
+    // Skip on first render OR if not synced yet (Phase 27)
+    if (!isSynced) return;
     if (settingsRef.current === settings && coinRef.current === selectedCoin) return;
     settingsRef.current = settings;
     coinRef.current = selectedCoin;
