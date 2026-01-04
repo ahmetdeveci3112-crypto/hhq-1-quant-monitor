@@ -1541,10 +1541,13 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                         
                         if signal:
                             # Phase 15: Cloud Paper Trading
-                            if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
-                                streamer.paper_trader.on_signal(signal, price)
+                            try:
+                                if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
+                                    streamer.paper_trader.on_signal(signal, price)
+                            except Exception as pt_err:
+                                logger.error(f"Paper Trading Error: {pt_err}")
                             
-                            manager.last_signals[ccxt_symbol] = signal # Fix symbol usage
+                            manager.last_signals[symbol] = signal
                             logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
 
                     except Exception as e:
@@ -1552,7 +1555,6 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                         # Ensure variables used below are at least defined if they fail
                         whale_z = 0
                         breakout = None
-                        streamer.pivot_analyzer.breakout = None # Reset state if needed
                     
                     # Use WhaleZ in metrics display if desired
                     metrics['whale_z'] = round(whale_z, 2)
