@@ -655,7 +655,26 @@ class PaperTradingEngine:
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
         self.max_positions = 1
+        # Phase 19: Server-side logs for UI display
+        self.server_logs = []
         self.load_state()
+    
+    def log_event(self, message: str):
+        """Add a server-side log event that will be sent to frontend."""
+        now = datetime.now()
+        timestamp = now.strftime("%H:%M:%S")
+        # Use high-precision timestamp as ID for deduplication
+        log_id = now.timestamp()
+        
+        log_entry = {
+            "id": log_id,
+            "time": timestamp, 
+            "message": message
+        }
+        self.server_logs.append(log_entry)
+        # Keep only last 50 logs
+        self.server_logs = self.server_logs[-50:]
+        logger.info(f"[SERVER LOG] {message}")
         
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -768,6 +787,8 @@ class PaperTradingEngine:
         self.positions.append(new_position)
         self.save_state()
         logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {leverage}x")
+        # Phase 19: Server log for UI
+        self.log_event(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {leverage}x | ${position_size_usd:.0f}")
 
     def update(self, current_price: float):
         # Update PnL & Check Exits
@@ -845,6 +866,9 @@ class PaperTradingEngine:
         
         self.save_state()
         logger.info(f"✅ CLOSE POSITION: {reason} PnL: {pnl:.2f}")
+        # Phase 19: Server log for UI
+        pnl_emoji = "🟢" if pnl > 0 else "🔴"
+        self.log_event(f"{pnl_emoji} POZİSYON KAPANDI: {pos['side']} {pos['symbol']} | {reason} | PnL: ${pnl:.2f}")
 
 
 
@@ -1763,7 +1787,8 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             "balance": streamer.paper_trader.balance if hasattr(streamer, 'paper_trader') else 10000,
                             "positions": streamer.paper_trader.positions if hasattr(streamer, 'paper_trader') else [],
                             "stats": streamer.paper_trader.stats if hasattr(streamer, 'paper_trader') else {},
-                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else []
+                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else [],
+                            "serverLogs": streamer.paper_trader.server_logs if hasattr(streamer, 'paper_trader') else []  # Phase 19
                         }
                     }
                     

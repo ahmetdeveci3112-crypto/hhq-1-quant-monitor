@@ -109,6 +109,7 @@ export default function App() {
   const logRef = useRef<HTMLDivElement>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSignalRef = useRef<BackendSignal | null>(null);
+  const lastLogIdRef = useRef<number>(0); // Phase 19: Track last server log ID
 
   const addLog = useCallback((msg: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -375,6 +376,22 @@ export default function App() {
                   equityCurve: pf.equityCurve || [],
                   stats: pf.stats || INITIAL_STATS
                 });
+
+                // Phase 19: Display server-side logs
+                // Phase 19: Display server-side logs with deduplication
+                if (pf.serverLogs && Array.isArray(pf.serverLogs)) {
+                  const handlers = wsHandlersRef.current;
+                  pf.serverLogs.forEach((log: { id: number; time: string; message: string }) => {
+                    // Only add logs with ID greater than last seen
+                    if (log.id && log.id > lastLogIdRef.current) {
+                      // Bypass addLog's timestamp since server send its own time
+                      // actually addLog adds local time, but server log has time in message? No.
+                      // Let's rely on addLog's local time for simplicity or use custom format
+                      handlers.addLog(`☁️ [${log.time}] ${log.message}`);
+                      lastLogIdRef.current = log.id;
+                    }
+                  });
+                }
               }
 
             }
