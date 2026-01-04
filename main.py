@@ -2103,14 +2103,24 @@ async def paper_trading_close(position_id: str):
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
+async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
     """
     WebSocket endpoint for real-time data streaming.
     """
     await websocket.accept()
-    logger.info(f"Client connected for {symbol}")
     
-    ccxt_symbol = symbol.replace("USDT", "/USDT")
+    # Phase 26 Fix: Prioritize Global Paper Trader Symbol
+    # If symbol arg is "BTCUSDT" (default) or None, check if we have a persisted symbol
+    active_symbol = symbol
+    if not active_symbol or active_symbol == "BTCUSDT":
+        if global_paper_trader.symbol and global_paper_trader.symbol != "SOLUSDT": # Avoid default if persisted is different
+             active_symbol = global_paper_trader.symbol
+        if not active_symbol:
+             active_symbol = "BTCUSDT" # Ultimate fallback
+
+    logger.info(f"Client connected. Active Symbol: {active_symbol} (Requested: {symbol}, Global: {global_paper_trader.symbol})")
+    
+    ccxt_symbol = active_symbol.replace("USDT", "/USDT")
     streamer = BinanceStreamer(ccxt_symbol)
     
     try:
