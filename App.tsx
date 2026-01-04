@@ -199,6 +199,11 @@ export default function App() {
           maxPositions: data.maxPositions ?? 1
         });
 
+        // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
+        if (data.enabled) {
+          setIsRunning(true);
+        }
+
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
         addLog(`☁️ Cloud Synced: ${symbol} | ${leverage}x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)}`);
