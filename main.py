@@ -2149,18 +2149,71 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             volatility_ratio=metrics.get('volatilityRatio', 1.0) # Phase 13
                         )
                         
+                        # Phase 22: Multi-Timeframe Confirmation
                         if signal:
-                            # Phase 15: Cloud Paper Trading
-                            try:
-                                if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
-                                    # Phase 20: Update spread for dynamic trailing
-                                    streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
-                                    streamer.paper_trader.on_signal(signal, price)
-                            except Exception as pt_err:
-                                logger.error(f"Paper Trading Error: {pt_err}")
+                            # Analyze current timeframe signals using available data
+                            tf_signals = {}
                             
-                            manager.last_signals[symbol] = signal
-                            logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
+                            # Primary timeframe (from streamer data)
+                            closes_list = list(streamer.closes)
+                            if len(closes_list) >= 20:
+                                primary_tf_signal = mtf_analyzer.analyze_timeframe(closes_list)
+                                tf_signals['15m'] = primary_tf_signal
+                                
+                                # Simulate other timeframes by resampling (approximation)
+                                # 1m: use last 20 closes directly
+                                tf_signals['1m'] = primary_tf_signal  # Same direction
+                                
+                                # 5m: use every 5th close
+                                if len(closes_list) >= 100:
+                                    closes_5m = closes_list[::5][-20:]
+                                    tf_signals['5m'] = mtf_analyzer.analyze_timeframe(closes_5m)
+                                else:
+                                    tf_signals['5m'] = primary_tf_signal
+                                
+                                # 1h: use every 4th close (15m * 4 = 1h)
+                                if len(closes_list) >= 80:
+                                    closes_1h = closes_list[::4][-20:]
+                                    tf_signals['1h'] = mtf_analyzer.analyze_timeframe(closes_1h)
+                                else:
+                                    tf_signals['1h'] = {"direction": "NEUTRAL", "strength": 0}
+                                
+                                # 4h: use every 16th close (15m * 16 = 4h)
+                                if len(closes_list) >= 320:
+                                    closes_4h = closes_list[::16][-20:]
+                                    tf_signals['4h'] = mtf_analyzer.analyze_timeframe(closes_4h)
+                                else:
+                                    tf_signals['4h'] = {"direction": "NEUTRAL", "strength": 0}
+                            
+                            # Check MTF confirmation
+                            mtf_confirmation = mtf_analyzer.get_mtf_confirmation(tf_signals)
+                            
+                            if mtf_confirmation and mtf_confirmation['action'] == signal['action']:
+                                # Signal confirmed by multi-timeframe analysis
+                                size_multiplier = mtf_analyzer.calculate_position_size_multiplier(mtf_confirmation)
+                                signal['sizeMultiplier'] = size_multiplier
+                                signal['mtf_confidence'] = mtf_confirmation['confidence']
+                                signal['mtf_tf_count'] = mtf_confirmation['tf_count']
+                                
+                                logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {size_multiplier}x")
+                                
+                                # Phase 15: Cloud Paper Trading
+                                try:
+                                    if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
+                                        # Phase 20: Update spread for dynamic trailing
+                                        streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
+                                        streamer.paper_trader.on_signal(signal, price)
+                                except Exception as pt_err:
+                                    logger.error(f"Paper Trading Error: {pt_err}")
+                                
+                                manager.last_signals[symbol] = signal
+                                logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
+                            else:
+                                # Signal NOT confirmed - log but don't trade
+                                if mtf_confirmation:
+                                    logger.info(f"MTF MISMATCH: Signal={signal['action']}, MTF={mtf_confirmation['action']}")
+                                else:
+                                    logger.info(f"MTF REJECTED: Not enough TF agreement for {signal['action']}")
 
                     except Exception as e:
                         logger.error(f"Signal Generation Error: {e}")
