@@ -1,5 +1,12 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Activity, Play, Square, Settings, Terminal, Wallet, ChevronDown, Network, AlertTriangle, Zap, BarChart3, Radio, Waves } from 'lucide-react';
+import {
+  Play, Square, RefreshCw, Settings, Activity, Wallet,
+  BarChart3, TrendingUp, TrendingDown, ArrowUpRight, ArrowDownRight,
+  AlertTriangle, CheckCircle2, XCircle, Terminal, Zap, LineChart,
+  ChevronDown, Layers, Wind, ShieldAlert, Target, Info, Network,
+  Radio, RotateCcw, Waves, Search
+} from 'lucide-react';
 import {
   MarketRegime, SystemState, TradeSignal, LiquidationEvent, OrderBookState,
   Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
@@ -208,14 +215,14 @@ export default function App() {
         // Phase 19: Load server-side logs
         if (data.logs && data.logs.length > 0) {
           const cloudLogs = data.logs.map((log: { time: string; message: string }) =>
-            `[${log.time}] ☁️ ${log.message}`
+            `[${log.time}] ☁️ ${log.message} `
           );
           setLogs(prev => [...cloudLogs.reverse(), ...prev].slice(0, 100));
         }
 
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
-        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage}x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)}`);
+        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)} `);
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
       }
@@ -244,7 +251,7 @@ export default function App() {
           trailDistanceAtr: String(settings.trailDistanceAtr),
           maxPositions: String(settings.maxPositions)
         });
-        const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
+        const res = await fetch(`${BACKEND_API_URL} /paper-trading/settings ? ${params} `, { method: 'POST' });
         if (res.ok) {
           console.log('Settings synced to cloud');
         }
@@ -354,7 +361,7 @@ export default function App() {
               }, ...prev].slice(0, 50));
 
               if (liquidation.isCascade) {
-                handlers.addLog(`🔥 LİKİDASYON CASCADE: $${(liquidation.amount / 1000).toFixed(0)}k @ ${formatPrice(liquidation.price)}`);
+                handlers.addLog(`🔥 LİKİDASYON CASCADE: $${(liquidation.amount / 1000).toFixed(0)}k @${formatPrice(liquidation.price)}`);
               }
             }
 
@@ -501,7 +508,7 @@ export default function App() {
             <div>
               <h1 className="text-lg font-bold text-white leading-tight">QuantMonitor <span className="text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span></h1>
               <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
+                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'} `}></span>
                 {isRunning ? 'System Active' : 'System Paused'}
               </div>
             </div>
@@ -510,10 +517,11 @@ export default function App() {
           <div className="h-8 w-px bg-slate-800 mx-2"></div>
 
           {/* Coin Selector */}
+          {/* Coin Selector */}
           <div className="relative">
             <button
               onClick={() => setShowCoinMenu(!showCoinMenu)}
-              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${showCoinMenu ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${showCoinMenu ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-300'} `}
             >
               <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${selectedCoin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
               <span className="font-bold text-white">{selectedCoin}</span>
@@ -521,44 +529,45 @@ export default function App() {
             </button>
 
             {/* Dropdown Menu */}
-            {showCoinMenu && (
-              <>
-                {/* Click Outside Backdrop */}
-                <div className="fixed inset-0 z-[55]" onClick={() => setShowCoinMenu(false)}></div>
+            {
+              showCoinMenu && (
+                <>
+                  {/* Click Outside Backdrop */}
+                  <div className="fixed inset-0 z-[55]" onClick={() => setShowCoinMenu(false)}></div>
 
-                {/* Menu Items */}
-                <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[60]">
-                  {COINS.map(coin => (
-                    <button
-                      key={coin}
-                      onClick={() => {
-                        setSelectedCoin(coin);
-                        setShowCoinMenu(false);
-                      }}
-                      className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
-                    >
-                      <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
-                      {coin}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
+                  {/* Menu Items */}
+                  <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[60]">
+                    {COINS.map(coin => (
+                      <button
+                        key={coin}
+                        onClick={() => {
+                          setSelectedCoin(coin);
+                          setShowCoinMenu(false);
+                        }}
+                        className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
+                      >
+                        <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
+                        {coin}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )
+            }
           </div>
         </div>
+
 
         <nav className="flex items-center bg-slate-900 rounded-lg p-1 border border-slate-800">
           <button
             onClick={() => setActiveTab('live')}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'live' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
-              }`}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'live' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
           >
             Live Trading
           </button>
           <button
             onClick={() => setActiveTab('backtest')}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'backtest' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
-              }`}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'backtest' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
           >
             Backtest Lab
           </button>
@@ -590,6 +599,15 @@ export default function App() {
           </button>
 
           <button
+            onClick={handleReset}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium text-xs bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
+            title="Sistemi Sıfırla"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            Reset
+          </button>
+
+          <button
             onClick={() => setIsRunning(!isRunning)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all shadow-lg text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
           >
@@ -604,10 +622,10 @@ export default function App() {
             <Settings className="w-4 h-4" />
           </button>
         </div>
-      </header>
+      </header >
 
       {/* Main Content */}
-      <main className="pt-24 px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+      < main className="pt-24 px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]" >
         {activeTab === 'live' ? (
           <div className="grid grid-cols-12 gap-6 h-full">
 
@@ -657,7 +675,7 @@ export default function App() {
               </div>
 
               {/* TradingView Chart */}
-              <div className="flex-1 min-h-[500px] bg-[#151921] border border-slate-800 rounded-2xl overflow-hidden shadow-xl relative">
+              <div className="flex-1 min-h-[450px] max-h-[600px] bg-[#151921] border border-slate-800 rounded-2xl overflow-hidden shadow-xl relative">
                 <iframe
                   src={`https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=BINANCE:${selectedCoin}&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC`}
                   className="w-full h-full border-0 absolute inset-0"
@@ -784,7 +802,7 @@ export default function App() {
         ) : (
           <BacktestPanel />
         )}
-      </main>
-    </div>
+      </main >
+    </div >
   );
 }
