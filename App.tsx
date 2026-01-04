@@ -561,11 +561,11 @@ export default function App() {
             {
               showCoinMenu && (
                 <>
-                  {/* Click Outside Backdrop */}
-                  <div className="fixed inset-0 z-[55]" onClick={() => setShowCoinMenu(false)}></div>
+                  {/* Click Outside Backdrop - High Z-index */}
+                  <div className="fixed inset-0 z-[9998]" onClick={() => setShowCoinMenu(false)}></div>
 
-                  {/* Menu Items */}
-                  <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[60]">
+                  {/* Menu Items - Highest Z-index */}
+                  <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[9999]">
                     {COINS.map(coin => (
                       <button
                         key={coin}
