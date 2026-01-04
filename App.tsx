@@ -278,7 +278,7 @@ export default function App() {
           trailDistanceAtr: String(settings.trailDistanceAtr),
           maxPositions: String(settings.maxPositions)
         });
-        const res = await fetch(`${BACKEND_API_URL} /paper-trading/settings ? ${params} `, { method: 'POST' });
+        const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
         if (res.ok) {
           console.log('Settings synced to cloud');
         }
