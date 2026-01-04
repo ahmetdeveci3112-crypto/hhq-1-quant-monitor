@@ -189,7 +189,7 @@ def calculate_zscore(spread_series: list, lookback: int = 20) -> float:
 
 # Timeframes to analyze (exclude 3d+)
 MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
-MTF_MIN_AGREEMENT = 3  # Minimum TF agreement required
+MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
 # Wider spread multipliers for better signal quality
 SPREAD_MULTIPLIERS = {
