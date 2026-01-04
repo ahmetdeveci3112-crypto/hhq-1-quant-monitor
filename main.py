@@ -2843,15 +2843,10 @@ async def run_backtest(request: BacktestRequest):
         }
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Backtest error: {error_msg}")
-        
-        if "451" in error_msg or "Service unavailable" in error_msg:
-             error_msg = "Binance API Geoblocking (451). Server region restricted. Try deploying to Non-US region."
-             
+        logger.error(f"Backtest error: {e}")
         return JSONResponse(
             status_code=500,
-            content={"error": error_msg}
+            content={"error": str(e)}
         )
 
 
