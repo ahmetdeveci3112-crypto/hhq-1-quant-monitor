@@ -645,6 +645,10 @@ class PaperTradingEngine:
             "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
         }
         self.enabled = True  # Phase 16: Auto-trade toggle
+        # Phase 17: Cloud Trading Settings
+        self.symbol = "SOLUSDT"
+        self.leverage = 10
+        self.risk_per_trade = 0.02  # 2%
         self.load_state()
         
     def load_state(self):
@@ -658,7 +662,11 @@ class PaperTradingEngine:
                     self.equity_curve = data.get('equity_curve', [])
                     self.stats = data.get('stats', self.stats)
                     self.enabled = data.get('enabled', True)
-                    logger.info(f"Loaded Paper Trading State: ${self.balance:.2f}")
+                    # Phase 17: Load settings
+                    self.symbol = data.get('symbol', 'SOLUSDT')
+                    self.leverage = data.get('leverage', 10)
+                    self.risk_per_trade = data.get('risk_per_trade', 0.02)
+                    logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x")
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
@@ -670,7 +678,11 @@ class PaperTradingEngine:
                 "trades": self.trades,
                 "equity_curve": self.equity_curve[-500:],
                 "stats": self.stats,
-                "enabled": self.enabled
+                "enabled": self.enabled,
+                # Phase 17: Save settings
+                "symbol": self.symbol,
+                "leverage": self.leverage,
+                "risk_per_trade": self.risk_per_trade
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
@@ -707,8 +719,9 @@ class PaperTradingEngine:
         if len(self.positions) >= 1:
             return
 
-        leverage = 10
-        risk_per_trade = 0.02 # 2% risk
+        # Phase 17: Use dynamic settings
+        leverage = self.leverage
+        risk_per_trade = self.risk_per_trade
         
         # Position Sizing
         size_mult = signal.get('sizeMultiplier', 1.0)
@@ -718,7 +731,7 @@ class PaperTradingEngine:
         
         new_position = {
             "id": f"{int(datetime.now().timestamp())}_{signal['action']}",
-            "symbol": "SOLUSDT", # Currently hardcoded to streamer symbol
+            "symbol": self.symbol,  # Phase 17: Use configured symbol
             "side": signal['action'],
             "entryPrice": current_price,
             "size": position_size,
@@ -736,7 +749,7 @@ class PaperTradingEngine:
         
         self.positions.append(new_position)
         self.save_state()
-        logger.info(f"🚀 OPEN POSITION: {signal['action']} @ {current_price}")
+        logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {leverage}x")
 
     def update(self, current_price: float):
         # Update PnL & Check Exits
@@ -1491,6 +1504,37 @@ async def paper_trading_toggle():
     global_paper_trader.save_state()
     status = "enabled" if global_paper_trader.enabled else "disabled"
     return JSONResponse({"success": True, "enabled": global_paper_trader.enabled, "message": f"Auto-trading {status}"})
+
+# Phase 17: Settings endpoints
+@app.get("/paper-trading/settings")
+async def paper_trading_get_settings():
+    """Get current cloud trading settings."""
+    return JSONResponse({
+        "symbol": global_paper_trader.symbol,
+        "leverage": global_paper_trader.leverage,
+        "riskPerTrade": global_paper_trader.risk_per_trade,
+        "enabled": global_paper_trader.enabled,
+        "balance": global_paper_trader.balance,
+        "positions": global_paper_trader.positions,
+        "stats": global_paper_trader.stats
+    })
+
+@app.post("/paper-trading/settings")
+async def paper_trading_update_settings(symbol: str = None, leverage: int = None, riskPerTrade: float = None):
+    """Update cloud trading settings."""
+    if symbol:
+        global_paper_trader.symbol = symbol
+    if leverage:
+        global_paper_trader.leverage = leverage
+    if riskPerTrade:
+        global_paper_trader.risk_per_trade = riskPerTrade
+    global_paper_trader.save_state()
+    return JSONResponse({
+        "success": True,
+        "symbol": global_paper_trader.symbol,
+        "leverage": global_paper_trader.leverage,
+        "riskPerTrade": global_paper_trader.risk_per_trade
+    })
 
 @app.post("/paper-trading/close/{position_id}")
 async def paper_trading_close(position_id: str):
