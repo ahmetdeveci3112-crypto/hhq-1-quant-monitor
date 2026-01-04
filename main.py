@@ -1516,7 +1516,9 @@ async def paper_trading_get_settings():
         "enabled": global_paper_trader.enabled,
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
-        "stats": global_paper_trader.stats
+        "stats": global_paper_trader.stats,
+        "trades": global_paper_trader.trades[-50:],  # Last 50 trades
+        "equityCurve": global_paper_trader.equity_curve[-100:]  # Last 100 points
     })
 
 @app.post("/paper-trading/settings")

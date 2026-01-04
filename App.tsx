@@ -164,49 +164,45 @@ export default function App() {
   // No local handling logic needed for Cloud Trading
   // Logic moved to Backend (main.py)
 
-  // Phase 17: Cloud Trading Settings State
-  const [cloudSymbol, setCloudSymbol] = useState('SOLUSDT');
-  const [cloudLeverage, setCloudLeverage] = useState(10);
-  const [cloudRisk, setCloudRisk] = useState(0.02);
-
   // Phase 17: Fetch cloud state on page load
   useEffect(() => {
     const fetchCloudState = async () => {
       try {
         const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
+        if (!res.ok) return;
         const data = await res.json();
-        setCloudSymbol(data.symbol || 'SOLUSDT');
-        setCloudLeverage(data.leverage || 10);
-        setCloudRisk(data.riskPerTrade || 0.02);
         setAutoTradeEnabled(data.enabled ?? true);
-        if (data.balance) {
+
+        // Load cloud portfolio state
+        if (data.balance !== undefined) {
           setPortfolio(prev => ({
             ...prev,
             balanceUsd: data.balance,
             positions: data.positions || [],
-            stats: data.stats || prev.stats
+            stats: data.stats || prev.stats,
+            trades: data.trades || prev.trades
           }));
         }
-        addLog(`☁️ Cloud Trading: ${data.symbol} | ${data.leverage}x | Risk ${(data.riskPerTrade * 100).toFixed(0)}%`);
+
+        // Update local settings from cloud to sync
+        if (data.symbol && data.leverage) {
+          setSettings(prev => ({
+            ...prev,
+            leverage: data.leverage
+          }));
+        }
+
+        const symbol = data.symbol || 'N/A';
+        const leverage = data.leverage || 0;
+        addLog(`☁️ Cloud Trading Loaded: ${symbol} | ${leverage}x | Bakiye: $${(data.balance || 0).toFixed(0)}`);
       } catch (e) {
-        addLog('⚠️ Cloud ayarları alınamadı');
+        console.log('Cloud state fetch failed:', e);
       }
     };
     fetchCloudState();
   }, [addLog]);
 
-  // Phase 17: Save cloud settings
-  const handleSaveCloudSettings = useCallback(async () => {
-    try {
-      const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?symbol=${cloudSymbol}&leverage=${cloudLeverage}&riskPerTrade=${cloudRisk}`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        addLog(`✅ Cloud ayarları güncellendi: ${data.symbol} | ${data.leverage}x`);
-      }
-    } catch (e) {
-      addLog('❌ Cloud ayarları güncellenemedi');
-    }
-  }, [cloudSymbol, cloudLeverage, cloudRisk, addLog]);
+  // (Cloud settings are now synced from existing Settings modal)
 
   // ============================================================================
   // WEBSOCKET CONNECTION
@@ -501,39 +497,6 @@ export default function App() {
                 title="Paper Trading Sıfırla"
               >
                 🔄 Reset
-              </button>
-
-              {/* Phase 17: Cloud Settings Dropdowns */}
-              <select
-                value={cloudSymbol}
-                onChange={(e) => setCloudSymbol(e.target.value)}
-                className="px-2 py-1.5 rounded-md text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700 focus:outline-none focus:border-indigo-500"
-                title="İşlem Coini"
-              >
-                {COINS.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <select
-                value={cloudLeverage}
-                onChange={(e) => setCloudLeverage(Number(e.target.value))}
-                className="px-2 py-1.5 rounded-md text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700 focus:outline-none focus:border-indigo-500"
-                title="Kaldıraç"
-              >
-                {[5, 10, 15, 20, 25, 50].map(l => <option key={l} value={l}>{l}x</option>)}
-              </select>
-              <select
-                value={cloudRisk}
-                onChange={(e) => setCloudRisk(Number(e.target.value))}
-                className="px-2 py-1.5 rounded-md text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700 focus:outline-none focus:border-indigo-500"
-                title="Risk %"
-              >
-                {[0.01, 0.02, 0.03, 0.05, 0.10].map(r => <option key={r} value={r}>{(r * 100).toFixed(0)}%</option>)}
-              </select>
-              <button
-                onClick={handleSaveCloudSettings}
-                className="flex items-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-all"
-                title="Ayarları Kaydet"
-              >
-                💾
               </button>
             </div>
 
