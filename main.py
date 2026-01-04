@@ -789,16 +789,55 @@ class PaperTradingEngine:
         
         return False
     
-    def check_time_based_exit(self, pos: dict, current_price: float) -> bool:
-        """Close positions that are open too long."""
+    def check_time_based_exit(self, pos: dict, current_price: float, atr: float = None) -> bool:
+        """Gradually liquidate positions that are open too long - close on bounces."""
         open_time = pos.get('openTime', 0)
         age_ms = int(datetime.now().timestamp() * 1000) - open_time
         age_hours = age_ms / (1000 * 60 * 60)
         
+        if atr is None:
+            atr = current_price * 0.01
+        
+        # After max_position_age_hours, start gradual liquidation
         if age_hours > self.max_position_age_hours:
-            self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f} saat açık kaldı")
-            self.close_position(pos, current_price, 'TIME_EXIT')
-            return True
+            # Mark position for gradual exit if not already
+            if not pos.get('gradual_exit_mode', False):
+                pos['gradual_exit_mode'] = True
+                pos['gradual_exit_start'] = current_price
+                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f} saat - Aşamalı tasfiye başladı")
+            
+            # For LONG: Close on bounces (price goes up then comes back)
+            if pos['side'] == 'LONG':
+                if 'gradual_high' not in pos:
+                    pos['gradual_high'] = current_price
+                elif current_price > pos['gradual_high']:
+                    pos['gradual_high'] = current_price
+                
+                # If price dropped from high by 0.3 ATR, close position
+                if pos['gradual_high'] - current_price >= atr * 0.3:
+                    self.add_log(f"📉 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
+                    self.close_position(pos, current_price, 'TIME_GRADUAL')
+                    return True
+                    
+            # For SHORT: Close when price dips then comes back
+            elif pos['side'] == 'SHORT':
+                if 'gradual_low' not in pos:
+                    pos['gradual_low'] = current_price
+                elif current_price < pos['gradual_low']:
+                    pos['gradual_low'] = current_price
+                
+                # If price rose from low by 0.3 ATR, close position
+                if current_price - pos['gradual_low'] >= atr * 0.3:
+                    self.add_log(f"📈 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
+                    self.close_position(pos, current_price, 'TIME_GRADUAL')
+                    return True
+            
+            # Hard limit: After 48 hours, force close regardless
+            if age_hours > 48:
+                self.add_log(f"🆘 48+ SAAT: Zorunlu çıkış")
+                self.close_position(pos, current_price, 'TIME_FORCE')
+                return True
+                
         return False
     
     def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
@@ -989,8 +1028,8 @@ class PaperTradingEngine:
             if self.check_emergency_sl(pos, current_price):
                 continue
             
-            # 2. Time-based exit
-            if self.check_time_based_exit(pos, current_price):
+            # 2. Time-based exit (gradual liquidation)
+            if self.check_time_based_exit(pos, current_price, atr):
                 continue
             
             # 3. Progressive SL (move SL to lock profits)
@@ -1999,7 +2038,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             "balance": streamer.paper_trader.balance if hasattr(streamer, 'paper_trader') else 10000,
                             "positions": streamer.paper_trader.positions if hasattr(streamer, 'paper_trader') else [],
                             "stats": streamer.paper_trader.stats if hasattr(streamer, 'paper_trader') else {},
-                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else []
+                            "equityCurve": streamer.paper_trader.equity_curve[-100:] if hasattr(streamer, 'paper_trader') else [],
+                            # Phase 21: Live updates
+                            "trades": streamer.paper_trader.trades[-20:] if hasattr(streamer, 'paper_trader') else [],
+                            "logs": streamer.paper_trader.logs[-30:] if hasattr(streamer, 'paper_trader') else [],
+                            "cloudSymbol": streamer.paper_trader.symbol if hasattr(streamer, 'paper_trader') else "UNKNOWN"
                         }
                     }
                     
