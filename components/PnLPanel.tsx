@@ -11,8 +11,18 @@ interface Props {
 }
 
 export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, initialBalance }) => {
-    const totalPnl = currentBalance - initialBalance;
-    const totalPnlPercent = ((currentBalance - initialBalance) / initialBalance) * 100;
+    // Safe defaults for stats to prevent .toFixed() crashes
+    const safeStats = {
+        winRate: stats?.winRate ?? 0,
+        totalTrades: stats?.totalTrades ?? 0,
+        profitFactor: stats?.profitFactor ?? 0,
+        maxDrawdown: stats?.maxDrawdown ?? 0,
+        avgWin: stats?.avgWin ?? 0,
+        avgLoss: stats?.avgLoss ?? 0
+    };
+
+    const totalPnl = (currentBalance || 0) - (initialBalance || 10000);
+    const totalPnlPercent = initialBalance ? ((currentBalance - initialBalance) / initialBalance) * 100 : 0;
     const isProfit = totalPnl >= 0;
 
     // Format data for chart
@@ -51,13 +61,13 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
                 </div>
                 <div className="text-center">
                     <div className="text-[10px] text-slate-500 uppercase">Win Rate</div>
-                    <div className={`text-sm font-mono font-bold ${stats.winRate >= 50 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                        {stats.winRate.toFixed(1)}%
+                    <div className={`text-sm font-mono font-bold ${safeStats.winRate >= 50 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                        {safeStats.winRate.toFixed(1)}%
                     </div>
                 </div>
                 <div className="text-center">
                     <div className="text-[10px] text-slate-500 uppercase">Trades</div>
-                    <div className="text-sm font-mono font-bold text-white">{stats.totalTrades}</div>
+                    <div className="text-sm font-mono font-bold text-white">{safeStats.totalTrades}</div>
                 </div>
             </div>
 
@@ -116,20 +126,20 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
             <div className="grid grid-cols-3 gap-2 p-3 border-t border-slate-800/50 bg-slate-900/50">
                 <div className="text-center">
                     <div className="text-[9px] text-slate-500 uppercase">Profit Factor</div>
-                    <div className={`text-xs font-mono font-bold ${stats.profitFactor >= 1.5 ? 'text-emerald-400' : stats.profitFactor >= 1 ? 'text-amber-400' : 'text-red-400'}`}>
-                        {stats.profitFactor.toFixed(2)}
+                    <div className={`text-xs font-mono font-bold ${safeStats.profitFactor >= 1.5 ? 'text-emerald-400' : safeStats.profitFactor >= 1 ? 'text-amber-400' : 'text-red-400'}`}>
+                        {safeStats.profitFactor.toFixed(2)}
                     </div>
                 </div>
                 <div className="text-center">
                     <div className="text-[9px] text-slate-500 uppercase">Max DD</div>
                     <div className="text-xs font-mono font-bold text-red-400">
-                        {stats.maxDrawdown.toFixed(1)}%
+                        {safeStats.maxDrawdown.toFixed(1)}%
                     </div>
                 </div>
                 <div className="text-center">
                     <div className="text-[9px] text-slate-500 uppercase">Avg Win/Loss</div>
                     <div className="text-xs font-mono font-bold text-white">
-                        ${stats.avgWin.toFixed(0)} / ${stats.avgLoss.toFixed(0)}
+                        ${safeStats.avgWin.toFixed(0)} / ${safeStats.avgLoss.toFixed(0)}
                     </div>
                 </div>
             </div>
