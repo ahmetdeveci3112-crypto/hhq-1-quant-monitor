@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 import ccxt.async_support as ccxt_async
+import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -331,8 +332,11 @@ class SignalGenerator:
         leverage: int = 10,
         basis_pct: float = 0.0,
         whale_zscore: float = 0.0,
+
         nearest_fvg: Optional[Dict] = None,
-        breakout: Optional[str] = None
+        breakout: Optional[str] = None,
+        spread_pct: float = 0.05, # Phase 13
+        volatility_ratio: float = 1.0 # Phase 13
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 9 Layers of confluence (SMC + Breakouts).
@@ -487,8 +491,10 @@ class SignalGenerator:
         if score < 75:
             return None
             
-        # DYNAMIC TRAILING SL/TP based on Hurst
+        # DYNAMIC TRAILING SL/TP based on Hurst & Volatility (Phase 13)
         # Lower Hurst = Stronger Mean Reversion = Tighter Stops, Wider Targets
+        
+        # Base Multipliers from Regime
         if hurst < 0.45: # Strong Mean Reversion
             atr_sl = 1.5
             atr_tp = 3.5
@@ -497,30 +503,56 @@ class SignalGenerator:
             atr_sl = 2.0
             atr_tp = 2.5
             trail_act = 1.5
-        else: # Trending/Random - Be careful
-            # If Breakout, we want wider TP to catch the run
+        else: # Trending/Random
             if breakout:
                 atr_sl = 2.0
-                atr_tp = 5.0 # Let winners run
+                atr_tp = 5.0
                 trail_act = 2.0
             else:
                 atr_sl = 2.5
                 atr_tp = 2.0
                 trail_act = 2.0
         
+        # Phase 13: Volatility & Spread Adjustments
+        # 1. Volatility Expansion (Don't get wicked out)
+        if volatility_ratio > 1.5:
+            atr_sl *= 1.2 # Widen SL by 20%
+            atr_tp *= 1.5 # Aim for 50% more profit
+            reasons.append(f"VolExp({volatility_ratio:.1f}x)")
+        elif volatility_ratio < 0.8:
+            atr_tp *= 0.8 # Take profit sooner in low vol
+            reasons.append("LowVol")
+            
+        # 2. Spread Protection (Buffer)
+        spread_buffer = 0.0
+        if spread_pct > 0.1:
+            spread_buffer = price * (spread_pct / 100)
+            reasons.append(f"SpreadProt({spread_pct:.2f}%)")
+        
         # Calculate IDEAL ENTRY (Pullback)
         # Aim for 0.2% better entry than current price
-        pullback_pct = 0.002 # 0.2%
+        # Phase 13: Dynamic Pullback
+        base_pullback = 0.002
+        
+        # If Spread is high, we must enter lower (Long) or higher (Short) to cover it
+        if spread_pct > 0.05:
+            base_pullback += (spread_pct / 100)
+            
+        # If Volatility is extreme, wait for deeper pullback
+        if volatility_ratio > 2.0:
+            base_pullback += 0.005 # Add 0.5% extra pullback requirement
+            
+        pullback_pct = base_pullback
         
         if signal_side == "LONG":
             ideal_entry = price * (1 - pullback_pct)
-            sl = ideal_entry - (atr * atr_sl)
+            sl = ideal_entry - (atr * atr_sl) - spread_buffer
             tp = ideal_entry + (atr * atr_tp)
             trail_activation = ideal_entry + (atr * trail_act)
             trail_dist = atr * 0.5
         else:
             ideal_entry = price * (1 + pullback_pct)
-            sl = ideal_entry + (atr * atr_sl)
+            sl = ideal_entry + (atr * atr_sl) + spread_buffer
             tp = ideal_entry - (atr * atr_tp)
             trail_activation = ideal_entry - (atr * trail_act)
             trail_dist = atr * 0.5
@@ -862,6 +894,9 @@ class BinanceStreamer:
         self.ws_ticker: Dict = {}
         self.ws_spot_ticker: Dict = {} # SPOT Monitoring
         self.ws_order_book: Dict = {'bids': [], 'asks': []}
+        
+        # Phase 13: Volatility History
+        self.atr_history: deque = deque(maxlen=200) # Store ATR values for VR calculation
         self.ws_connected: bool = False
         
         # Whale Hunter
@@ -1159,12 +1194,28 @@ class BinanceStreamer:
         # Volume Oscillator (Phase 11)
         vol_osc = calculate_volume_osc(volumes_list)
         
+        # Phase 13: Volatility History & Ratio
+        self.atr_history.append(atr)
+        avg_atr = np.mean(self.atr_history) if len(self.atr_history) > 10 else atr
+        volatility_ratio = atr / avg_atr if avg_atr > 0 else 1.0
+        
+        # Phase 13: Real-Time Spread % (Bid-Ask)
+        spread_pct = 0.05 # Default safest
+        if self.ws_order_book['bids'] and self.ws_order_book['asks']:
+            best_bid = float(self.ws_order_book['bids'][0][0])
+            best_ask = float(self.ws_order_book['asks'][0][0])
+            if best_bid > 0:
+                spread_val = best_ask - best_bid
+                spread_pct = (spread_val / best_bid) * 100
+        
         return {
             "hurst": round(hurst, 4),
             "regime": regime,
             "zScore": round(zscore, 4),
-            "spread": round(spread, 4),
+            "spread": round(spread, 4), # This is Close - SMA(20)
+            "spreadPct": round(spread_pct, 4), # This is Bid-Ask Spread
             "atr": round(atr, 2),
+            "volatilityRatio": round(volatility_ratio, 2),
             "vwap_zscore": round(vwap_zscore, 2),
             "vol_osc": round(vol_osc, 2)
         }
@@ -1316,7 +1367,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             basis_pct=basis_pct, # NEW: Spot-Futures Spread
                             whale_zscore=whale_z, # NEW: Whale Sentiment
                             nearest_fvg=nearest_fvg, # NEW: SMC Filter
-                            breakout=breakout # NEW: Phase 11 Breakout
+                            breakout=breakout, # NEW: Phase 11 Breakout
+                            spread_pct=metrics.get('spreadPct', 0.05), # Phase 13
+                            volatility_ratio=metrics.get('volatilityRatio', 1.0) # Phase 13
                         )
                     except Exception as e:
                         logger.error(f"Signal Generation Error: {e}")

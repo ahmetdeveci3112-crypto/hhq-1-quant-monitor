@@ -5,6 +5,7 @@ import {
   Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
   BackendUpdate, BackendSignal, PendingOrder
 } from './types';
+import { formatPrice, formatCurrency } from './utils';
 import { HurstPanel } from './components/HurstPanel';
 import { PairsPanel } from './components/PairsPanel';
 import { LiquidationPanel } from './components/LiquidationPanel';
@@ -45,16 +46,10 @@ const INITIAL_STATS: PortfolioStats = {
   avgLoss: 0,
 };
 
-const COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT'];
+const COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT'];
 
-// Helper for dynamic price formatting
-export const formatDynamicPrice = (price: number): string => {
-  if (!price) return '0.00';
-  if (price < 0.0001) return price.toFixed(8);
-  if (price < 1) return price.toFixed(5);
-  if (price < 100) return price.toFixed(3);
-  return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-};
+// Helper for dynamic price formatting is now in utils.ts
+
 
 // Map backend regime strings to MarketRegime enum
 const parseRegime = (regime: string): MarketRegime => {
@@ -162,7 +157,7 @@ export default function App() {
 
       const confidenceText = signal.confidenceScore ? ` | Güven:${signal.confidenceScore}%` : '';
       const sizeText = sizeMultiplier !== 1.0 ? ` | Boyut:${sizeMultiplier}x` : '';
-      addLog(`🚀 POZİSYON AÇILDI: ${signal.action} @ $${formatDynamicPrice(currentPrice)} | SL:$${signal.sl.toFixed(0)} TP:$${signal.tp.toFixed(0)}${confidenceText}${sizeText}`);
+      addLog(`🚀 POZİSYON AÇILDI: ${signal.action} ${formatPrice(positionSize)} ${selectedCoin} (${formatCurrency(positionSizeUsd)}) @ $${formatPrice(currentPrice)} | SL:$${formatPrice(signal.sl)} TP:$${formatPrice(signal.tp)}${confidenceText}${sizeText}`);
 
       return {
         ...prev,
@@ -590,7 +585,7 @@ export default function App() {
               }, ...prev].slice(0, 50));
 
               if (liquidation.isCascade) {
-                handlers.addLog(`🔥 LİKİDASYON CASCADE: $${(liquidation.amount / 1000).toFixed(0)}k @ ${formatDynamicPrice(liquidation.price)}`);
+                handlers.addLog(`🔥 LİKİDASYON CASCADE: $${(liquidation.amount / 1000).toFixed(0)}k @ ${formatPrice(liquidation.price)}`);
               }
             }
 
@@ -894,7 +889,7 @@ export default function App() {
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center">
               <span className="text-slate-500 text-xs uppercase tracking-widest block mb-2">{selectedCoin} FİYAT</span>
               <div className={`text-4xl font-mono font-bold ${systemState.currentPrice > 0 ? 'text-white' : 'text-slate-600'}`}>
-                ${formatDynamicPrice(systemState.currentPrice)}
+                ${formatPrice(systemState.currentPrice)}
               </div>
               {systemState.atr > 0 && (
                 <div className="flex justify-center items-center gap-2 mt-2">
@@ -963,7 +958,7 @@ export default function App() {
                       <span className="text-[10px] text-slate-500">{new Date(s.timestamp).toLocaleTimeString()}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="text-xs text-white font-mono">${formatDynamicPrice(s.price)}</span>
+                      <span className="text-xs text-white font-mono">${formatPrice(s.price)}</span>
                     </div>
                     <div className="text-[9px] text-slate-500 mt-1">{s.reason}</div>
                   </div>

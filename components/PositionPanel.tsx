@@ -1,6 +1,7 @@
 import React from 'react';
 import { TrendingUp, TrendingDown, X, Target, ShieldAlert, Activity } from 'lucide-react';
 import { Position } from '../types';
+import { formatPrice, formatCurrency } from '../utils';
 
 interface Props {
     positions: Position[];
@@ -72,13 +73,13 @@ export const PositionPanel: React.FC<Props> = ({ positions, currentPrice, onClos
                     <div className="bg-slate-800/50 rounded-lg p-3">
                         <div className="text-[10px] text-slate-500 uppercase mb-1">Giriş Fiyatı</div>
                         <div className="text-lg font-mono font-bold text-white">
-                            ${activePosition.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            ${formatPrice(activePosition.entryPrice)}
                         </div>
                     </div>
                     <div className="bg-slate-800/50 rounded-lg p-3">
                         <div className="text-[10px] text-slate-500 uppercase mb-1">Güncel Fiyat</div>
                         <div className="text-lg font-mono font-bold text-white">
-                            ${currentPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            ${formatPrice(currentPrice)}
                         </div>
                     </div>
                 </div>
@@ -106,7 +107,7 @@ export const PositionPanel: React.FC<Props> = ({ positions, currentPrice, onClos
                             <span>Stop Loss</span>
                         </div>
                         <div className="flex items-center gap-2">
-                            <span className="font-mono text-red-400">${activePosition.stopLoss.toFixed(2)}</span>
+                            <span className="font-mono text-red-400">${formatPrice(activePosition.stopLoss)}</span>
                             <span className="text-slate-500">({slPercent.toFixed(1)}%)</span>
                             {activePosition.isTrailingActive && (
                                 <span className="px-1.5 py-0.5 bg-amber-500/10 text-amber-400 text-[9px] rounded border border-amber-500/20">
@@ -122,7 +123,7 @@ export const PositionPanel: React.FC<Props> = ({ positions, currentPrice, onClos
                             <span>Take Profit</span>
                         </div>
                         <div className="flex items-center gap-2">
-                            <span className="font-mono text-emerald-400">${activePosition.takeProfit.toFixed(2)}</span>
+                            <span className="font-mono text-emerald-400">${formatPrice(activePosition.takeProfit)}</span>
                             <span className="text-slate-500">({tpPercent.toFixed(1)}%)</span>
                         </div>
                     </div>
@@ -154,7 +155,9 @@ export const PositionPanel: React.FC<Props> = ({ positions, currentPrice, onClos
                 <div className="grid grid-cols-2 gap-2 text-[10px]">
                     <div className="flex justify-between">
                         <span className="text-slate-500">Boyut</span>
-                        <span className="text-slate-300 font-mono">${activePosition.sizeUsd.toFixed(0)}</span>
+                        <span className="text-slate-300 font-mono">
+                            {activePosition.size.toFixed(4)} {activePosition.symbol.replace('USDT', '')} ({formatCurrency(activePosition.sizeUsd)})
+                        </span>
                     </div>
                     <div className="flex justify-between">
                         <span className="text-slate-500">Açılış</span>
