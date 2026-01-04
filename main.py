@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import os
-import uuid  # Added for unique log IDs
 import websockets
 from collections import deque
 from datetime import datetime
@@ -656,19 +655,18 @@ class PaperTradingEngine:
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
         self.max_positions = 1
-        # Phase 19: Server-side logs for UI display
-        self.server_logs = []
+        # Phase 19: Server-side persistent logs
+        self.logs = []
         self.load_state()
+        self.add_log("🚀 Paper Trading Engine başlatıldı")
     
-    def log_event(self, message: str):
-        """Add a server-side log event that will be sent to frontend."""
+    def add_log(self, message: str):
+        """Add a timestamped log entry (persisted to state)."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_id = str(uuid.uuid4())
-        log_entry = {"id": log_id, "time": timestamp, "message": message}
-        self.server_logs.append(log_entry)
-        # Keep only last 50 logs
-        self.server_logs = self.server_logs[-50:]
-        logger.info(f"[SERVER LOG] {message}")
+        entry = {"time": timestamp, "message": message, "ts": int(datetime.now().timestamp() * 1000)}
+        self.logs.append(entry)
+        self.logs = self.logs[-100:]  # Keep last 100 logs
+        logger.info(f"[PaperTrading] {message}")
         
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -691,6 +689,8 @@ class PaperTradingEngine:
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
                     self.max_positions = data.get('max_positions', 1)
+                    # Phase 19: Load logs
+                    self.logs = data.get('logs', [])
                     logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
@@ -713,7 +713,9 @@ class PaperTradingEngine:
                 "tp_atr": self.tp_atr,
                 "trail_activation_atr": self.trail_activation_atr,
                 "trail_distance_atr": self.trail_distance_atr,
-                "max_positions": self.max_positions
+                "max_positions": self.max_positions,
+                # Phase 19: Save logs
+                "logs": self.logs[-100:]
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
@@ -779,10 +781,9 @@ class PaperTradingEngine:
         }
         
         self.positions.append(new_position)
+        self.add_log(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {leverage}x | SL:${signal['sl']:.4f} TP:${signal['tp']:.4f}")
         self.save_state()
         logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {leverage}x")
-        # Phase 19: Server log for UI
-        self.log_event(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {leverage}x | ${position_size_usd:.0f}")
 
     def update(self, current_price: float):
         # Update PnL & Check Exits
@@ -858,11 +859,11 @@ class PaperTradingEngine:
         if pnl > 0: self.stats['winningTrades'] += 1
         else: self.stats['losingTrades'] += 1
         
+        # Phase 19: Log position close
+        emoji = "✅" if pnl > 0 else "❌"
+        self.add_log(f"{emoji} POZİSYON KAPANDI [{reason}]: {pos['side']} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
         self.save_state()
         logger.info(f"✅ CLOSE POSITION: {reason} PnL: {pnl:.2f}")
-        # Phase 19: Server log for UI
-        pnl_emoji = "🟢" if pnl > 0 else "🔴"
-        self.log_event(f"{pnl_emoji} POZİSYON KAPANDI: {pos['side']} {pos['symbol']} | {reason} | PnL: ${pnl:.2f}")
 
 
 
@@ -1560,7 +1561,9 @@ async def paper_trading_get_settings():
         "tpAtr": global_paper_trader.tp_atr,
         "trailActivationAtr": global_paper_trader.trail_activation_atr,
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
-        "maxPositions": global_paper_trader.max_positions
+        "maxPositions": global_paper_trader.max_positions,
+        # Phase 19: Server-side logs
+        "logs": global_paper_trader.logs[-50:]
     })
 
 @app.post("/paper-trading/settings")
@@ -1781,8 +1784,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "BTCUSDT"):
                             "balance": streamer.paper_trader.balance if hasattr(streamer, 'paper_trader') else 10000,
                             "positions": streamer.paper_trader.positions if hasattr(streamer, 'paper_trader') else [],
                             "stats": streamer.paper_trader.stats if hasattr(streamer, 'paper_trader') else {},
-                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else [],
-                            "serverLogs": streamer.paper_trader.server_logs if hasattr(streamer, 'paper_trader') else []  # Phase 19
+                            "equityCurve": streamer.paper_trader.equity_curve if hasattr(streamer, 'paper_trader') else []
                         }
                     }
                     

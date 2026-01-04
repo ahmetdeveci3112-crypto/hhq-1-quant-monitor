@@ -109,7 +109,6 @@ export default function App() {
   const logRef = useRef<HTMLDivElement>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSignalRef = useRef<BackendSignal | null>(null);
-  const processedLogIdsRef = useRef<Set<string>>(new Set()); // Phase 19: Filter duplicate logs
 
   const addLog = useCallback((msg: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -203,6 +202,14 @@ export default function App() {
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
         if (data.enabled) {
           setIsRunning(true);
+        }
+
+        // Phase 19: Load server-side logs
+        if (data.logs && data.logs.length > 0) {
+          const cloudLogs = data.logs.map((log: { time: string; message: string }) =>
+            `[${log.time}] ☁️ ${log.message}`
+          );
+          setLogs(prev => [...cloudLogs.reverse(), ...prev].slice(0, 100));
         }
 
         const symbol = data.symbol || 'N/A';
@@ -376,25 +383,6 @@ export default function App() {
                   equityCurve: pf.equityCurve || [],
                   stats: pf.stats || INITIAL_STATS
                 });
-
-                // Phase 19: Display server-side logs
-                if (pf.serverLogs && Array.isArray(pf.serverLogs)) {
-                  const handlers = wsHandlersRef.current;
-                  pf.serverLogs.forEach((log: { id?: string; time: string; message: string }) => {
-                    const logId = log.id || log.message + log.time; // Fallback for old logs
-
-                    if (!processedLogIdsRef.current.has(logId)) {
-                      processedLogIdsRef.current.add(logId);
-                      handlers.addLog(`☁️ [${log.time}] ${log.message}`);
-
-                      // Cleanup if set gets too big
-                      if (processedLogIdsRef.current.size > 1000) {
-                        const it = processedLogIdsRef.current.values();
-                        for (let i = 0; i < 500; i++) processedLogIdsRef.current.delete(it.next().value);
-                      }
-                    }
-                  });
-                }
               }
 
             }
