@@ -386,23 +386,31 @@ export default function App() {
 
                 // Phase 21: Live cloud logs update
                 if (pf.logs && pf.logs.length > 0) {
-                  // Merge new logs with existing (avoid duplicates by timestamp)
+                  // Use timestamp (ts) for more accurate deduplication
                   setLogs(prev => {
-                    const existingTs = new Set(prev.map(l => l.substring(1, 9))); // Extract time part
-                    const newLogs = pf.logs
-                      .filter((log: { time: string }) => !existingTs.has(log.time))
-                      .map((log: { time: string; message: string }) => `[${log.time}] ☁️ ${log.message}`);
-                    if (newLogs.length > 0) {
-                      return [...newLogs.reverse(), ...prev].slice(0, 100);
+                    // Extract existing timestamps from log strings (stored in data attribute)
+                    const lastCloudLog = pf.logs[pf.logs.length - 1];
+                    const lastTs = lastCloudLog?.ts || 0;
+
+                    // Check if we already have this log (by checking if last cloud log is newer)
+                    const hasNewerLogs = !prev.some(l => l.includes(lastCloudLog?.message || '___NOTFOUND___'));
+
+                    if (hasNewerLogs && lastCloudLog) {
+                      // Only add truly new logs
+                      const newLogs = pf.logs
+                        .filter((log: { message: string }) => !prev.some(p => p.includes(log.message)))
+                        .map((log: { time: string; message: string }) => `[${log.time}] ☁️ ${log.message}`);
+
+                      if (newLogs.length > 0) {
+                        return [...newLogs.reverse(), ...prev].slice(0, 100);
+                      }
                     }
                     return prev;
                   });
                 }
 
-                // Phase 21: Update selected coin from cloud
-                if (pf.cloudSymbol && pf.cloudSymbol !== 'UNKNOWN') {
-                  setSelectedCoin(pf.cloudSymbol);
-                }
+                // Phase 21: Coin sync REMOVED - user controls coin selection exclusively
+                // cloudSymbol is informational only, not used to override user's choice
               }
 
             }
