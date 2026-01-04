@@ -1146,10 +1146,30 @@ class PaperTradingEngine:
             self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {action} açılmadı")
             return
         
-        # If hedging is disabled, check for opposite direction
+        # Phase 28: Opposite Signal Exit / Trail Trigger
+        # Check for opposite direction positions
+        opposite_positions = [p for p in self.positions if p.get('side') != action]
+        
+        for pos in opposite_positions:
+            # 1. If profitable, close immediately (Reversal)
+            if pos.get('unrealizedPnl', 0) > 0:
+                self.add_log(f"🔄 SİNYAL TERSİNE DÖNDÜ: {pos['side']} pozisyonu karlı kapatılıyor.")
+                self.close_position(pos, current_price, 'SIGNAL_REVERSAL')
+                continue # Position closed, move to next
+            
+            # 2. If not profitable, activate aggressive trailing to minimize loss or BE
+            else:
+                 if not pos.get('isTrailingActive', False):
+                     self.add_log(f"🛡️ SİNYAL TERSİNE DÖNDÜ: {pos['side']} için Aggressive Trailing Aktif!")
+                     pos['isTrailingActive'] = True
+                     # Pull trailing stop closer (e.g., to entry if possible or current price +/- small buffer)
+                     # For now, just activating it ensures it starts tracking. 
+                     # We could force a tighter trail here logic if desired.
+
+        # If hedging is disabled, check for opposite direction (Check again as some might have closed above)
         if not self.allow_hedging:
-            opposite_direction = [p for p in self.positions if p.get('side') != action]
-            if len(opposite_direction) > 0:
+            remaining_opposite = [p for p in self.positions if p.get('side') != action]
+            if len(remaining_opposite) > 0:
                 self.add_log(f"⚠️ Hedging kapalı, zaten ters pozisyon var")
                 return
 
