@@ -1332,9 +1332,6 @@ class BinanceStreamer:
             self.paper_trader.update(price)
 
     def get_metrics(self) -> dict:
-
-        
-    def get_metrics(self) -> dict:
         """Calculate all metrics from current data."""
         prices_list = list(self.prices)
         spreads_list = list(self.spreads)
