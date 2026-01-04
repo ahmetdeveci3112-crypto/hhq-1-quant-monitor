@@ -73,6 +73,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'live' | 'backtest'>('live');
   const [isRunning, setIsRunning] = useState(false);
   const [selectedCoin, setSelectedCoin] = useState('BTCUSDT');
+  const [showCoinMenu, setShowCoinMenu] = useState(false);
   const [systemState, setSystemState] = useState<SystemState>(INITIAL_STATE);
   const [logs, setLogs] = useState<string[]>([]);
   const [signals, setSignals] = useState<TradeSignal[]>([]);
@@ -509,24 +510,40 @@ export default function App() {
           <div className="h-8 w-px bg-slate-800 mx-2"></div>
 
           {/* Coin Selector */}
-          <div className="relative group">
-            <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-slate-800 transition-colors">
+          <div className="relative">
+            <button
+              onClick={() => setShowCoinMenu(!showCoinMenu)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${showCoinMenu ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+            >
               <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${selectedCoin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
               <span className="font-bold text-white">{selectedCoin}</span>
-              <ChevronDown className="w-4 h-4 text-slate-500" />
+              <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform ${showCoinMenu ? 'rotate-180' : ''}`} />
             </button>
-            <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden hidden group-hover:block animate-in fade-in zoom-in-95 duration-200 z-[60]">
-              {COINS.map(coin => (
-                <button
-                  key={coin}
-                  onClick={() => setSelectedCoin(coin)}
-                  className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
-                >
-                  <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
-                  {coin}
-                </button>
-              ))}
-            </div>
+
+            {/* Dropdown Menu */}
+            {showCoinMenu && (
+              <>
+                {/* Click Outside Backdrop */}
+                <div className="fixed inset-0 z-[55]" onClick={() => setShowCoinMenu(false)}></div>
+
+                {/* Menu Items */}
+                <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[60]">
+                  {COINS.map(coin => (
+                    <button
+                      key={coin}
+                      onClick={() => {
+                        setSelectedCoin(coin);
+                        setShowCoinMenu(false);
+                      }}
+                      className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
+                    >
+                      <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
+                      {coin}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -564,8 +581,8 @@ export default function App() {
           <button
             onClick={handleToggleAutoTrade}
             className={`flex items-center gap-2 px-3 py-1.5 rounded-lg font-bold text-xs transition-all border ${autoTradeEnabled
-                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                : 'bg-slate-800 text-slate-400 border-slate-700'
+              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+              : 'bg-slate-800 text-slate-400 border-slate-700'
               }`}
           >
             <div className={`w-2 h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
@@ -749,10 +766,10 @@ export default function App() {
                     <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
                       <span className="text-slate-600 shrink-0 select-none">[{new Date().toLocaleTimeString().split(' ')[0]}]</span>
                       <span className={`${log.includes('PROFIT') || log.includes('✅') ? 'text-emerald-400' :
-                          log.includes('LOSS') || log.includes('❌') ? 'text-rose-400' :
-                            log.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
-                              log.includes('SİNYAL') ? 'text-amber-400' :
-                                'text-slate-300'
+                        log.includes('LOSS') || log.includes('❌') ? 'text-rose-400' :
+                          log.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
+                            log.includes('SİNYAL') ? 'text-amber-400' :
+                              'text-slate-300'
                         }`}>
                         {log.replace(/\[.*?\]\s*☁️?\s*/, '')}
                       </span>
