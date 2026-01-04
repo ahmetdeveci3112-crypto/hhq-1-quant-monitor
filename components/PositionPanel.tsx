@@ -4,31 +4,18 @@ import { Position } from '../types';
 import { formatPrice, formatCurrency } from '../utils';
 
 interface Props {
-    positions: Position[];
+    position: Position;
     currentPrice: number;
-    onClosePosition: (id: string) => void;
+    onClosePosition: (id: string, reason?: string) => void;
 }
 
-export const PositionPanel: React.FC<Props> = ({ positions, currentPrice, onClosePosition }) => {
-    const activePosition = positions[0]; // Only one position at a time for simplicity
-
-    if (!activePosition) {
-        return (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center gap-2 mb-3">
-                    <Activity className="w-4 h-4 text-slate-400" />
-                    <h3 className="font-semibold text-slate-300 text-sm">Aktif Pozisyon</h3>
-                </div>
-                <div className="flex flex-col items-center justify-center py-6 text-slate-600">
-                    <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center mb-3">
-                        <Target className="w-6 h-6" />
-                    </div>
-                    <p className="text-sm">Pozisyon yok</p>
-                    <p className="text-xs text-slate-700 mt-1">Sinyal bekleniyor...</p>
-                </div>
-            </div>
-        );
+export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClosePosition }) => {
+    // If no position provided (should not happen in list view but keeping safety)
+    if (!position) {
+        return null;
     }
+
+    const activePosition = position;
 
     const isLong = activePosition.side === 'LONG';
     const pnlColor = activePosition.unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400';

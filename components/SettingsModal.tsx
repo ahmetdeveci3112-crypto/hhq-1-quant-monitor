@@ -25,16 +25,23 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
             <X className="w-6 h-6" />
           </button>
         </div>
-        
+
         <div className="p-6 space-y-6">
           {/* Risk Grubu */}
           <div>
             <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4">Risk Yönetimi</h3>
             <div className="space-y-4">
-                <div>
-                    <label className="block text-sm text-slate-300 mb-2">Kaldıraç (Leverage)</label>
+              <div>
+                <label className="block text-sm text-slate-300 mb-2">Kaldıraç (Leverage)</label>
+                <div className="bg-indigo-900/30 border border-indigo-500/30 p-3 rounded-lg mb-4">
+                  <p className="text-xs text-indigo-300">
+                    ⚡ <strong>Dinamik Kaldıraç Aktif:</strong> Sistem, sinyal gücüne göre kaldıracı otomatik ayarlar (50x - 100x).
+                    Bu ayar sadece manuel işlemler için referans alınır.
+                  </p>
+                </div>
+                {/* 
                     <input 
-                        type="range" min="1" max="100" 
+                        type="range" min="1" max="125" 
                         value={localSettings.leverage}
                         onChange={e => setLocalSettings({...localSettings, leverage: parseInt(e.target.value)})}
                         className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer"
@@ -42,46 +49,47 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                     <div className="flex justify-between text-xs text-slate-500 mt-1">
                         <span>1x</span>
                         <span className="text-indigo-400 font-bold">{localSettings.leverage}x</span>
-                        <span>100x</span>
-                    </div>
+                        <span>125x</span>
+                    </div> 
+                    */}
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm text-slate-300 mb-2">Stop Loss (ATR)</label>
+                  <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
+                    <input
+                      type="number"
+                      value={localSettings.stopLossAtr}
+                      onChange={e => setLocalSettings({ ...localSettings, stopLossAtr: parseFloat(e.target.value) })}
+                      className="bg-transparent w-full text-white outline-none"
+                    />
+                    <span className="text-slate-500 text-xs ml-2">ATR</span>
+                  </div>
                 </div>
-                
-                <div className="grid grid-cols-2 gap-4">
-                    <div>
-                        <label className="block text-sm text-slate-300 mb-2">Stop Loss (ATR)</label>
-                        <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
-                            <input 
-                                type="number" 
-                                value={localSettings.stopLossAtr}
-                                onChange={e => setLocalSettings({...localSettings, stopLossAtr: parseFloat(e.target.value)})}
-                                className="bg-transparent w-full text-white outline-none"
-                            />
-                            <span className="text-slate-500 text-xs ml-2">ATR</span>
-                        </div>
-                    </div>
-                    <div>
-                        <label className="block text-sm text-slate-300 mb-2">İşlem Başı Risk %</label>
-                        <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
-                            <input 
-                                type="number" 
-                                value={localSettings.riskPerTrade}
-                                onChange={e => setLocalSettings({...localSettings, riskPerTrade: parseFloat(e.target.value)})}
-                                className="bg-transparent w-full text-white outline-none"
-                            />
-                            <span className="text-slate-500 text-xs ml-2">%</span>
-                        </div>
-                    </div>
+                <div>
+                  <label className="block text-sm text-slate-300 mb-2">İşlem Başı Risk %</label>
+                  <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
+                    <input
+                      type="number"
+                      value={localSettings.riskPerTrade}
+                      onChange={e => setLocalSettings({ ...localSettings, riskPerTrade: parseFloat(e.target.value) })}
+                      className="bg-transparent w-full text-white outline-none"
+                    />
+                    <span className="text-slate-500 text-xs ml-2">%</span>
+                  </div>
                 </div>
+              </div>
             </div>
           </div>
         </div>
 
         <div className="p-6 border-t border-slate-800 flex justify-end gap-3">
-            <button onClick={onClose} className="px-4 py-2 text-slate-400 hover:text-white font-medium">İptal</button>
-            <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition-colors">
-                <Save className="w-4 h-4" />
-                Kaydet
-            </button>
+          <button onClick={onClose} className="px-4 py-2 text-slate-400 hover:text-white font-medium">İptal</button>
+          <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition-colors">
+            <Save className="w-4 h-4" />
+            Kaydet
+          </button>
         </div>
       </div>
     </div>
