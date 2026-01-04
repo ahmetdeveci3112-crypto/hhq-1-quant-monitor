@@ -65,7 +65,11 @@ export const BacktestPanel: React.FC<Props> = ({ selectedCoin }) => {
         setError(null);
 
         try {
-            const response = await fetch('http://localhost:8000/backtest', {
+            // Convert WS URL to HTTP URL (and handle wss -> https)
+            const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+            const httpUrl = wsUrl.replace('wss://', 'https://').replace('ws://', 'http://').replace('/ws', '');
+
+            const response = await fetch(`${httpUrl}/backtest`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -335,9 +339,9 @@ export const BacktestPanel: React.FC<Props> = ({ selectedCoin }) => {
                                             <td className="px-4 py-2 font-mono text-slate-300">${trade.exitPrice.toFixed(0)}</td>
                                             <td className="px-4 py-2">
                                                 <span className={`px-1.5 py-0.5 rounded text-[10px] ${trade.closeReason === 'TP' ? 'bg-emerald-500/10 text-emerald-400' :
-                                                        trade.closeReason === 'SL' ? 'bg-red-500/10 text-red-400' :
-                                                            trade.closeReason === 'TRAILING' ? 'bg-amber-500/10 text-amber-400' :
-                                                                'bg-slate-700 text-slate-400'
+                                                    trade.closeReason === 'SL' ? 'bg-red-500/10 text-red-400' :
+                                                        trade.closeReason === 'TRAILING' ? 'bg-amber-500/10 text-amber-400' :
+                                                            'bg-slate-700 text-slate-400'
                                                     }`}>
                                                     {trade.closeReason}
                                                 </span>

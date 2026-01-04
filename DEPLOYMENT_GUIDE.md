@@ -23,7 +23,12 @@ Botun sürekli çalışması için Railway (veya Render) kullanacağız.
     *   `BINANCE_SECRET`: (Sizin Secret anahtarınız)
     *   `PORT`: `8000` (Railway genelde bunu otomatik algılar ama eklemekte fayda var).
 5.  Railway otomatik olarak `Dockerfile` dosyasını algılayacak ve build işlemine başlayacaktır.
-6.  Build tamamlandıktan sonra, Railway size bir **Domain** verecektir (Örn: `xxx-production.up.railway.app`).
+6.  **ÖNEMLİ: Domain Oluşturma**
+    *   Ekrandaki "hhq-1-quant-monitor" kutusuna tıklayın.
+    *   Açılan panelde **"Settings"** sekmesine gidin.
+    *   **"Networking"** başlığına inin (veya "Public Networking").
+    *   **"Generate Domain"** butonuna tıklayın.
+    *   Railway size rastgele bir adres verecektir (Örn: `xxx-production.up.railway.app`).
     *   **Bu URL'yi kopyalayın!** Frontend'e bunu vereceğiz.
     *   *Not: URL'nin sonuna `/ws` ekleyerek kullanacağız.* (Örn: `wss://xxx.railway.app/ws`)
 
