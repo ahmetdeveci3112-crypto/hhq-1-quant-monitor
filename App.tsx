@@ -164,7 +164,7 @@ export default function App() {
   // No local handling logic needed for Cloud Trading
   // Logic moved to Backend (main.py)
 
-  // Phase 17: Fetch cloud state on page load
+  // Phase 17 & 18: Fetch cloud state and settings on page load
   useEffect(() => {
     const fetchCloudState = async () => {
       try {
@@ -180,21 +180,28 @@ export default function App() {
             balanceUsd: data.balance,
             positions: data.positions || [],
             stats: data.stats || prev.stats,
-            trades: data.trades || prev.trades
+            trades: data.trades || prev.trades,
+            equityCurve: data.equityCurve || prev.equityCurve
           }));
         }
 
-        // Update local settings from cloud to sync
-        if (data.symbol && data.leverage) {
-          setSettings(prev => ({
-            ...prev,
-            leverage: data.leverage
-          }));
+        // Phase 18: Sync ALL settings from cloud
+        if (data.symbol) {
+          setSelectedCoin(data.symbol);
         }
+        setSettings({
+          leverage: data.leverage ?? 10,
+          stopLossAtr: data.slAtr ?? 2,
+          takeProfit: data.tpAtr ?? 3,
+          riskPerTrade: (data.riskPerTrade ?? 0.02) * 100,
+          trailActivationAtr: data.trailActivationAtr ?? 1.5,
+          trailDistanceAtr: data.trailDistanceAtr ?? 1,
+          maxPositions: data.maxPositions ?? 1
+        });
 
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
-        addLog(`☁️ Cloud Trading Loaded: ${symbol} | ${leverage}x | Bakiye: $${(data.balance || 0).toFixed(0)}`);
+        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage}x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)}`);
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
       }
@@ -202,7 +209,39 @@ export default function App() {
     fetchCloudState();
   }, [addLog]);
 
-  // (Cloud settings are now synced from existing Settings modal)
+  // Phase 18: Auto-save settings to cloud when changed (debounced)
+  const settingsRef = useRef(settings);
+  const coinRef = useRef(selectedCoin);
+  useEffect(() => {
+    // Skip on first render
+    if (settingsRef.current === settings && coinRef.current === selectedCoin) return;
+    settingsRef.current = settings;
+    coinRef.current = selectedCoin;
+
+    const saveToCloud = async () => {
+      try {
+        const params = new URLSearchParams({
+          symbol: selectedCoin,
+          leverage: String(settings.leverage),
+          riskPerTrade: String(settings.riskPerTrade / 100),
+          slAtr: String(settings.stopLossAtr),
+          tpAtr: String(settings.takeProfit),
+          trailActivationAtr: String(settings.trailActivationAtr),
+          trailDistanceAtr: String(settings.trailDistanceAtr),
+          maxPositions: String(settings.maxPositions)
+        });
+        const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
+        if (res.ok) {
+          console.log('Settings synced to cloud');
+        }
+      } catch (e) {
+        console.log('Settings sync failed:', e);
+      }
+    };
+
+    const timer = setTimeout(saveToCloud, 500);
+    return () => clearTimeout(timer);
+  }, [settings, selectedCoin]);
 
   // ============================================================================
   // WEBSOCKET CONNECTION

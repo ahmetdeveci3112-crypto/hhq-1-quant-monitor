@@ -649,6 +649,12 @@ class PaperTradingEngine:
         self.symbol = "SOLUSDT"
         self.leverage = 10
         self.risk_per_trade = 0.02  # 2%
+        # Phase 18: Full Trading Parameters
+        self.sl_atr = 2.0
+        self.tp_atr = 3.0
+        self.trail_activation_atr = 1.5
+        self.trail_distance_atr = 1.0
+        self.max_positions = 1
         self.load_state()
         
     def load_state(self):
@@ -666,7 +672,13 @@ class PaperTradingEngine:
                     self.symbol = data.get('symbol', 'SOLUSDT')
                     self.leverage = data.get('leverage', 10)
                     self.risk_per_trade = data.get('risk_per_trade', 0.02)
-                    logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x")
+                    # Phase 18: Load full trading parameters
+                    self.sl_atr = data.get('sl_atr', 2.0)
+                    self.tp_atr = data.get('tp_atr', 3.0)
+                    self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
+                    self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
+                    self.max_positions = data.get('max_positions', 1)
+                    logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
@@ -682,7 +694,13 @@ class PaperTradingEngine:
                 # Phase 17: Save settings
                 "symbol": self.symbol,
                 "leverage": self.leverage,
-                "risk_per_trade": self.risk_per_trade
+                "risk_per_trade": self.risk_per_trade,
+                # Phase 18: Save full trading parameters
+                "sl_atr": self.sl_atr,
+                "tp_atr": self.tp_atr,
+                "trail_activation_atr": self.trail_activation_atr,
+                "trail_distance_atr": self.trail_distance_atr,
+                "max_positions": self.max_positions
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
@@ -1518,11 +1536,26 @@ async def paper_trading_get_settings():
         "positions": global_paper_trader.positions,
         "stats": global_paper_trader.stats,
         "trades": global_paper_trader.trades[-50:],  # Last 50 trades
-        "equityCurve": global_paper_trader.equity_curve[-100:]  # Last 100 points
+        "equityCurve": global_paper_trader.equity_curve[-100:],  # Last 100 points
+        # Phase 18: Full trading parameters
+        "slAtr": global_paper_trader.sl_atr,
+        "tpAtr": global_paper_trader.tp_atr,
+        "trailActivationAtr": global_paper_trader.trail_activation_atr,
+        "trailDistanceAtr": global_paper_trader.trail_distance_atr,
+        "maxPositions": global_paper_trader.max_positions
     })
 
 @app.post("/paper-trading/settings")
-async def paper_trading_update_settings(symbol: str = None, leverage: int = None, riskPerTrade: float = None):
+async def paper_trading_update_settings(
+    symbol: str = None, 
+    leverage: int = None, 
+    riskPerTrade: float = None,
+    slAtr: float = None,
+    tpAtr: float = None,
+    trailActivationAtr: float = None,
+    trailDistanceAtr: float = None,
+    maxPositions: int = None
+):
     """Update cloud trading settings."""
     if symbol:
         global_paper_trader.symbol = symbol
@@ -1530,12 +1563,29 @@ async def paper_trading_update_settings(symbol: str = None, leverage: int = None
         global_paper_trader.leverage = leverage
     if riskPerTrade:
         global_paper_trader.risk_per_trade = riskPerTrade
+    # Phase 18: Full trading parameters
+    if slAtr is not None:
+        global_paper_trader.sl_atr = slAtr
+    if tpAtr is not None:
+        global_paper_trader.tp_atr = tpAtr
+    if trailActivationAtr is not None:
+        global_paper_trader.trail_activation_atr = trailActivationAtr
+    if trailDistanceAtr is not None:
+        global_paper_trader.trail_distance_atr = trailDistanceAtr
+    if maxPositions is not None:
+        global_paper_trader.max_positions = maxPositions
     global_paper_trader.save_state()
+    logger.info(f"Settings updated: {global_paper_trader.symbol} | {global_paper_trader.leverage}x | SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr}")
     return JSONResponse({
         "success": True,
         "symbol": global_paper_trader.symbol,
         "leverage": global_paper_trader.leverage,
-        "riskPerTrade": global_paper_trader.risk_per_trade
+        "riskPerTrade": global_paper_trader.risk_per_trade,
+        "slAtr": global_paper_trader.sl_atr,
+        "tpAtr": global_paper_trader.tp_atr,
+        "trailActivationAtr": global_paper_trader.trail_activation_atr,
+        "trailDistanceAtr": global_paper_trader.trail_distance_atr,
+        "maxPositions": global_paper_trader.max_positions
     })
 
 @app.post("/paper-trading/close/{position_id}")
