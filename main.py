@@ -744,12 +744,18 @@ class PaperTradingEngine:
         return True
 
     def on_signal(self, signal: Dict, current_price: float):
+        # Phase 19: Log signal received
+        action = signal.get('action', 'UNKNOWN')
+        self.add_log(f"📡 SİNYAL ALINDI: {action} @ ${current_price:.6f}")
+        
         # Phase 16: Check if auto-trade is enabled
         if not self.enabled:
+            self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
             return
         
         # Check if max positions reached (Limit 1 for now)
-        if len(self.positions) >= 1:
+        if len(self.positions) >= self.max_positions:
+            self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
             return
 
         # Phase 17: Use dynamic settings
@@ -802,6 +808,8 @@ class PaperTradingEngine:
             # Check Trailing Activation
             if pos['side'] == 'LONG':
                 if current_price >= pos['trailActivation']:
+                    if not pos['isTrailingActive']:
+                        self.add_log(f"🔄 TRAILING AKTİF: LONG @ ${current_price:.6f}")
                     pos['isTrailingActive'] = True
                 
                 if pos['isTrailingActive']:
@@ -818,6 +826,8 @@ class PaperTradingEngine:
                     
             elif pos['side'] == 'SHORT':
                 if current_price <= pos['trailActivation']:
+                    if not pos['isTrailingActive']:
+                        self.add_log(f"🔄 TRAILING AKTİF: SHORT @ ${current_price:.6f}")
                     pos['isTrailingActive'] = True
                     
                 if pos['isTrailingActive']:
@@ -1595,6 +1605,8 @@ async def paper_trading_update_settings(
         global_paper_trader.trail_distance_atr = trailDistanceAtr
     if maxPositions is not None:
         global_paper_trader.max_positions = maxPositions
+    # Phase 19: Log settings change
+    global_paper_trader.add_log(f"⚙️ AYARLAR GÜNCELLENDİ: {global_paper_trader.symbol} | {global_paper_trader.leverage}x | SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr}")
     global_paper_trader.save_state()
     logger.info(f"Settings updated: {global_paper_trader.symbol} | {global_paper_trader.leverage}x | SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr}")
     return JSONResponse({
