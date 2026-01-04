@@ -2778,9 +2778,15 @@ async def run_backtest(request: BacktestRequest):
     
     try:
         # Use synchronous CCXT for fetching historical data
+        # Use data-api.binance.vision to bypass US geoblocking for Spot data
         exchange = ccxt_sync.binance({
             'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
+            'options': {'defaultType': 'future'},
+            'urls': {
+                'api': {
+                    'public': 'https://data-api.binance.vision/api'
+                }
+            }
         })
         
         # Parse dates
@@ -2843,10 +2849,15 @@ async def run_backtest(request: BacktestRequest):
         }
         
     except Exception as e:
-        logger.error(f"Backtest error: {e}")
+        error_msg = str(e)
+        logger.error(f"Backtest error: {error_msg}")
+        
+        if "451" in error_msg or "Service unavailable" in error_msg:
+             error_msg = "Binance API Geoblocking (451). Server region restricted. Try deploying to Non-US region."
+             
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
+            content={"error": error_msg}
         )
 
 
