@@ -109,7 +109,7 @@ export default function App() {
   const logRef = useRef<HTMLDivElement>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSignalRef = useRef<BackendSignal | null>(null);
-  const lastLogIdRef = useRef<number>(0); // Phase 19: Track last server log ID
+  const processedLogIdsRef = useRef<Set<string>>(new Set()); // Phase 19: Filter duplicate logs
 
   const addLog = useCallback((msg: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -378,17 +378,20 @@ export default function App() {
                 });
 
                 // Phase 19: Display server-side logs
-                // Phase 19: Display server-side logs with deduplication
                 if (pf.serverLogs && Array.isArray(pf.serverLogs)) {
                   const handlers = wsHandlersRef.current;
-                  pf.serverLogs.forEach((log: { id: number; time: string; message: string }) => {
-                    // Only add logs with ID greater than last seen
-                    if (log.id && log.id > lastLogIdRef.current) {
-                      // Bypass addLog's timestamp since server send its own time
-                      // actually addLog adds local time, but server log has time in message? No.
-                      // Let's rely on addLog's local time for simplicity or use custom format
+                  pf.serverLogs.forEach((log: { id?: string; time: string; message: string }) => {
+                    const logId = log.id || log.message + log.time; // Fallback for old logs
+
+                    if (!processedLogIdsRef.current.has(logId)) {
+                      processedLogIdsRef.current.add(logId);
                       handlers.addLog(`☁️ [${log.time}] ${log.message}`);
-                      lastLogIdRef.current = log.id;
+
+                      // Cleanup if set gets too big
+                      if (processedLogIdsRef.current.size > 1000) {
+                        const it = processedLogIdsRef.current.values();
+                        for (let i = 0; i < 500; i++) processedLogIdsRef.current.delete(it.next().value);
+                      }
                     }
                   });
                 }

@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid  # Added for unique log IDs
 import websockets
 from collections import deque
 from datetime import datetime
@@ -661,16 +662,9 @@ class PaperTradingEngine:
     
     def log_event(self, message: str):
         """Add a server-side log event that will be sent to frontend."""
-        now = datetime.now()
-        timestamp = now.strftime("%H:%M:%S")
-        # Use high-precision timestamp as ID for deduplication
-        log_id = now.timestamp()
-        
-        log_entry = {
-            "id": log_id,
-            "time": timestamp, 
-            "message": message
-        }
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_id = str(uuid.uuid4())
+        log_entry = {"id": log_id, "time": timestamp, "message": message}
         self.server_logs.append(log_entry)
         # Keep only last 50 logs
         self.server_logs = self.server_logs[-50:]
