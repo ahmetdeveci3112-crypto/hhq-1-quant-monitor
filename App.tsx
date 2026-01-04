@@ -79,7 +79,7 @@ const generateId = (): string => {
 export default function App() {
   const [activeTab, setActiveTab] = useState<'live' | 'backtest'>('live');
   const [isRunning, setIsRunning] = useState(false);
-  const [selectedCoin, setSelectedCoin] = useState('BTCUSDT');
+  const [selectedCoin, setSelectedCoin] = useState<string | null>(null);
   const [showCoinMenu, setShowCoinMenu] = useState(false);
   const [systemState, setSystemState] = useState<SystemState>(INITIAL_STATE);
   const [logs, setLogs] = useState<string[]>([]);
@@ -216,6 +216,8 @@ export default function App() {
         // Phase 18: Sync ALL settings from cloud
         if (data.symbol) {
           setSelectedCoin(data.symbol);
+        } else {
+          setSelectedCoin('BTCUSDT'); // Fallback
         }
         setSettings({
           leverage: data.leverage ?? 10,
@@ -245,6 +247,7 @@ export default function App() {
         addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)} `);
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
+        if (!selectedCoin) setSelectedCoin('BTCUSDT'); // Fallback on error
       }
     };
     fetchCloudState();
@@ -318,6 +321,8 @@ export default function App() {
       }
       return;
     }
+
+    if (!selectedCoin) return; // Wait for coin to be loaded/synced
 
     const connectWebSocket = () => {
       // Cleanup existing connection if any
@@ -543,8 +548,8 @@ export default function App() {
               onClick={() => setShowCoinMenu(!showCoinMenu)}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${showCoinMenu ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-300'} `}
             >
-              <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${selectedCoin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
-              <span className="font-bold text-white">{selectedCoin}</span>
+              <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${(selectedCoin || 'BTCUSDT').replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
+              <span className="font-bold text-white">{selectedCoin || 'Loading...'}</span>
               <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform ${showCoinMenu ? 'rotate-180' : ''}`} />
             </button>
 
