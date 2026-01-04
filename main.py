@@ -2777,8 +2777,11 @@ async def run_backtest(request: BacktestRequest):
     logger.info(f"Starting backtest for {request.symbol} from {request.startDate} to {request.endDate}")
     
     try:
-        # Use requests for direct data fetching to bypass CCXT overhead and geoblocking
-        base_url = "https://data-api.binance.vision/api/v3/klines"
+        # Use synchronous CCXT for fetching historical data
+        exchange = ccxt_sync.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
         
         # Parse dates
         start_ts = int(datetime.strptime(request.startDate, "%Y-%m-%d").timestamp() * 1000)
@@ -2786,61 +2789,23 @@ async def run_backtest(request: BacktestRequest):
         
         logger.info(f"Backtest Date Range: {request.startDate} ({start_ts}) to {request.endDate} ({end_ts})")
         
-        # Format symbol for Spot API (e.g. BTCUSDT)
-        symbol = request.symbol.replace("/", "").upper()
-        
+        # Fetch OHLCV data
+        symbol = request.symbol.replace("USDT", "/USDT")
         all_ohlcv = []
         current_ts = start_ts
         
-        import requests
-        
         while current_ts < end_ts:
             logger.info(f"Fetching from {current_ts}...")
+            ohlcv = exchange.fetch_ohlcv(symbol, request.timeframe, since=current_ts, limit=1000)
+            if not ohlcv:
+                logger.warning("No data returned from fetch_ohlcv")
+                break
             
-            # Construct URL manually
-            params = {
-                "symbol": symbol,
-                "interval": request.timeframe,
-                "startTime": current_ts,
-                "limit": 1000
-            }
-            
-            try:
-                response = requests.get(base_url, params=params, timeout=10)
-                
-                if response.status_code != 200:
-                    logger.error(f"API Error {response.status_code}: {response.text}")
-                    break
-                    
-                data = response.json()
-                
-                if not data:
-                    logger.warning("No data returned from API")
-                    break
-                
-                # Convert strings to floats [timestamp, open, high, low, close, volume, ...]
-                ohlcv = [
-                    [
-                        item[0],           # Time
-                        float(item[1]),    # Open
-                        float(item[2]),    # High
-                        float(item[3]),    # Low
-                        float(item[4]),    # Close
-                        float(item[5])     # Volume
-                    ]
-                    for item in data
-                ]
-                
-                logger.info(f"Fetched {len(ohlcv)} candles. First: {ohlcv[0][0]}, Last: {ohlcv[-1][0]}")
-                all_ohlcv.extend(ohlcv)
-                current_ts = ohlcv[-1][0] + 1
-                
-                if len(ohlcv) < 1000:
-                    break
-                    
-            except Exception as req_err:
-                 logger.error(f"Request failed: {req_err}")
-                 break
+            logger.info(f"Fetched {len(ohlcv)} candles. First: {ohlcv[0][0]}, Last: {ohlcv[-1][0]}")
+            all_ohlcv.extend(ohlcv)
+            current_ts = ohlcv[-1][0] + 1
+            if len(ohlcv) < 1000:
+                break
         
         # Filter to date range
         all_ohlcv = [c for c in all_ohlcv if start_ts <= c[0] <= end_ts]
