@@ -370,6 +370,373 @@ mtf_analyzer = MultiTimeframeAnalyzer()
 
 
 # ============================================================================
+# PHASE 30: VOLUME PROFILE ANALYZER
+# ============================================================================
+
+class VolumeProfileAnalyzer:
+    """
+    Volume Profile analizi ile POC, VAH, VAL seviyeleri.
+    Entry/exit için önemli destek/direnç seviyeleri sağlar.
+    """
+    
+    def __init__(self, value_area_pct: float = 0.70):
+        self.value_area_pct = value_area_pct  # %70 varsayılan
+        self.poc = None  # Point of Control
+        self.vah = None  # Value Area High
+        self.val = None  # Value Area Low
+        self.profile = {}
+        self.last_update = 0
+        logger.info("VolumeProfileAnalyzer initialized")
+    
+    def calculate_profile(self, ohlcv_data: list, bins: int = 50) -> dict:
+        """
+        OHLCV verilerinden volume profile hesapla.
+        """
+        if len(ohlcv_data) < 20:
+            return {}
+        
+        # Fiyat aralığını belirle
+        all_highs = [c[2] for c in ohlcv_data]
+        all_lows = [c[3] for c in ohlcv_data]
+        all_volumes = [c[5] for c in ohlcv_data]
+        
+        price_min = min(all_lows)
+        price_max = max(all_highs)
+        price_range = price_max - price_min
+        
+        if price_range <= 0:
+            return {}
+        
+        bin_size = price_range / bins
+        
+        # Her bin için hacim topla
+        volume_profile = {}
+        for i in range(bins):
+            bin_price = price_min + (i + 0.5) * bin_size
+            volume_profile[bin_price] = 0
+        
+        for candle in ohlcv_data:
+            high, low, volume = candle[2], candle[3], candle[5]
+            # VWAP benzeri dağıtım - candle boyunca hacmi dağıt
+            candle_range = high - low
+            if candle_range <= 0:
+                continue
+            
+            for bin_price in volume_profile.keys():
+                if low <= bin_price <= high:
+                    volume_profile[bin_price] += volume / bins
+        
+        self.profile = volume_profile
+        
+        # POC - En yüksek hacimli seviye
+        if volume_profile:
+            self.poc = max(volume_profile.keys(), key=lambda x: volume_profile[x])
+        
+        # Value Area hesapla (%70 hacim)
+        total_volume = sum(volume_profile.values())
+        target_volume = total_volume * self.value_area_pct
+        
+        # POC'tan başlayarak genişle
+        sorted_bins = sorted(volume_profile.keys(), key=lambda x: abs(x - self.poc))
+        accumulated_volume = 0
+        value_area_prices = []
+        
+        for price in sorted_bins:
+            accumulated_volume += volume_profile[price]
+            value_area_prices.append(price)
+            if accumulated_volume >= target_volume:
+                break
+        
+        if value_area_prices:
+            self.vah = max(value_area_prices)
+            self.val = min(value_area_prices)
+        
+        self.last_update = datetime.now().timestamp()
+        
+        return {
+            "poc": self.poc,
+            "vah": self.vah,
+            "val": self.val,
+            "profile": volume_profile
+        }
+    
+    def get_signal_boost(self, current_price: float, signal_action: str) -> float:
+        """
+        Fiyat önemli seviyelerdeyse sinyal gücünü artır.
+        Returns: 0.0-0.3 arası boost değeri
+        """
+        if not self.poc or not self.vah or not self.val:
+            return 0.0
+        
+        # Tolerans: %0.5 fiyat
+        tolerance = current_price * 0.005
+        
+        boost = 0.0
+        
+        # LONG sinyali için
+        if signal_action == "LONG":
+            # VAL veya POC yakınında LONG = güçlü
+            if abs(current_price - self.val) < tolerance:
+                boost = 0.3  # Max boost
+            elif abs(current_price - self.poc) < tolerance:
+                boost = 0.2
+            elif current_price < self.poc:
+                boost = 0.1  # POC altında LONG iyi
+        
+        # SHORT sinyali için
+        elif signal_action == "SHORT":
+            # VAH veya POC yakınında SHORT = güçlü
+            if abs(current_price - self.vah) < tolerance:
+                boost = 0.3
+            elif abs(current_price - self.poc) < tolerance:
+                boost = 0.2
+            elif current_price > self.poc:
+                boost = 0.1  # POC üstünde SHORT iyi
+        
+        return boost
+    
+    def get_key_levels(self) -> dict:
+        """Önemli seviyeleri döndür."""
+        return {
+            "poc": self.poc,
+            "vah": self.vah,
+            "val": self.val
+        }
+
+
+# Global Volume Profile instance
+volume_profiler = VolumeProfileAnalyzer()
+
+
+# ============================================================================
+# PHASE 30: SESSION-BASED TRADING
+# ============================================================================
+
+TRADING_SESSIONS = {
+    "asia": {
+        "hours_utc": (0, 8),
+        "name": "Asya",
+        "volatility": "low",
+        "preferred_strategy": "mean_reversion",
+        "leverage_mult": 0.7,
+        "risk_mult": 0.8
+    },
+    "europe": {
+        "hours_utc": (8, 14),
+        "name": "Avrupa",
+        "volatility": "medium",
+        "preferred_strategy": "breakout",
+        "leverage_mult": 1.0,
+        "risk_mult": 1.0
+    },
+    "us": {
+        "hours_utc": (14, 22),
+        "name": "Amerika",
+        "volatility": "high",
+        "preferred_strategy": "momentum",
+        "leverage_mult": 1.2,
+        "risk_mult": 1.1
+    },
+    "overnight": {
+        "hours_utc": (22, 24),
+        "name": "Gece",
+        "volatility": "low",
+        "preferred_strategy": "avoid",
+        "leverage_mult": 0.5,
+        "risk_mult": 0.5
+    }
+}
+
+
+class SessionManager:
+    """
+    Seans bazlı trading ayarları.
+    Asia/Europe/US/Overnight session'larına göre strateji ayarla.
+    """
+    
+    def __init__(self):
+        self.sessions = TRADING_SESSIONS
+        self.current_session = None
+        self.current_config = None
+        logger.info("SessionManager initialized")
+    
+    def get_current_session(self) -> tuple:
+        """Mevcut session'ı döndür."""
+        hour_utc = datetime.utcnow().hour
+        
+        for name, config in self.sessions.items():
+            start, end = config['hours_utc']
+            if start <= hour_utc < end:
+                self.current_session = name
+                self.current_config = config
+                return name, config
+        
+        # Fallback overnight
+        self.current_session = "overnight"
+        self.current_config = self.sessions["overnight"]
+        return "overnight", self.sessions["overnight"]
+    
+    def adjust_leverage(self, base_leverage: int) -> int:
+        """Session'a göre kaldıraç ayarla."""
+        _, config = self.get_current_session()
+        adjusted = int(base_leverage * config['leverage_mult'])
+        return max(3, min(75, adjusted))
+    
+    def adjust_risk(self, base_risk: float) -> float:
+        """Session'a göre risk ayarla."""
+        _, config = self.get_current_session()
+        return base_risk * config['risk_mult']
+    
+    def should_trade(self) -> bool:
+        """Bu session'da trade yapılmalı mı?"""
+        _, config = self.get_current_session()
+        return config['preferred_strategy'] != "avoid"
+    
+    def get_session_info(self) -> dict:
+        """Session bilgisi."""
+        name, config = self.get_current_session()
+        return {
+            "session": name,
+            "name_tr": config['name'],
+            "volatility": config['volatility'],
+            "strategy": config['preferred_strategy'],
+            "leverage_mult": config['leverage_mult'],
+            "risk_mult": config['risk_mult']
+        }
+
+
+# Global Session Manager instance
+session_manager = SessionManager()
+
+
+# ============================================================================
+# PHASE 30: BTC CORRELATION FILTER
+# ============================================================================
+
+class BTCCorrelationFilter:
+    """
+    ALT coin sinyallerini BTC trendiyle filtrele.
+    BTC düşerken ALT LONG'lara dikkat, BTC yükselirken ALT SHORT'lara dikkat.
+    """
+    
+    def __init__(self):
+        self.btc_trend = "NEUTRAL"
+        self.btc_momentum = 0.0
+        self.btc_price = 0.0
+        self.btc_change_1h = 0.0
+        self.btc_change_4h = 0.0
+        self.last_update = 0
+        self.update_interval = 300  # 5 dakikada bir güncelle
+        logger.info("BTCCorrelationFilter initialized")
+    
+    async def update_btc_state(self, exchange) -> dict:
+        """BTC durumunu güncelle."""
+        now = datetime.now().timestamp()
+        
+        # Rate limiting
+        if now - self.last_update < self.update_interval:
+            return self.get_state()
+        
+        try:
+            # BTC 1H ve 4H verileri çek
+            ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
+            ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
+            
+            if ohlcv_1h and len(ohlcv_1h) >= 2:
+                current = ohlcv_1h[-1][4]  # Close
+                prev_1h = ohlcv_1h[-2][4]
+                self.btc_price = current
+                self.btc_change_1h = ((current - prev_1h) / prev_1h) * 100
+            
+            if ohlcv_4h and len(ohlcv_4h) >= 2:
+                current = ohlcv_4h[-1][4]
+                prev_4h = ohlcv_4h[-2][4]
+                self.btc_change_4h = ((current - prev_4h) / prev_4h) * 100
+            
+            # Trend belirleme
+            if self.btc_change_1h > 0.5 and self.btc_change_4h > 1.0:
+                self.btc_trend = "STRONG_BULLISH"
+                self.btc_momentum = 1.0
+            elif self.btc_change_1h > 0.2:
+                self.btc_trend = "BULLISH"
+                self.btc_momentum = 0.5
+            elif self.btc_change_1h < -0.5 and self.btc_change_4h < -1.0:
+                self.btc_trend = "STRONG_BEARISH"
+                self.btc_momentum = -1.0
+            elif self.btc_change_1h < -0.2:
+                self.btc_trend = "BEARISH"
+                self.btc_momentum = -0.5
+            else:
+                self.btc_trend = "NEUTRAL"
+                self.btc_momentum = 0.0
+            
+            self.last_update = now
+            logger.debug(f"BTC State: {self.btc_trend} | 1H: {self.btc_change_1h:.2f}% | 4H: {self.btc_change_4h:.2f}%")
+            
+        except Exception as e:
+            logger.warning(f"BTC state update failed: {e}")
+        
+        return self.get_state()
+    
+    def should_allow_signal(self, symbol: str, signal_action: str) -> tuple:
+        """
+        Sinyal izin verilmeli mi?
+        Returns: (allowed: bool, penalty: float, reason: str)
+        """
+        # BTC kendisi ise filtreleme yok
+        if 'BTC' in symbol:
+            return (True, 0.0, "BTC no filter")
+        
+        penalty = 0.0
+        reason = ""
+        
+        # BTC STRONG_BEARISH iken ALT LONG risky
+        if self.btc_trend == "STRONG_BEARISH" and signal_action == "LONG":
+            penalty = 0.3  # %30 skor düşür
+            reason = "BTC Strong Bearish - ALT LONG risky"
+        
+        # BTC BEARISH iken ALT LONG dikkat
+        elif self.btc_trend == "BEARISH" and signal_action == "LONG":
+            penalty = 0.15
+            reason = "BTC Bearish - ALT LONG caution"
+        
+        # BTC STRONG_BULLISH iken ALT SHORT risky
+        elif self.btc_trend == "STRONG_BULLISH" and signal_action == "SHORT":
+            penalty = 0.3
+            reason = "BTC Strong Bullish - ALT SHORT risky"
+        
+        # BTC BULLISH iken ALT SHORT dikkat
+        elif self.btc_trend == "BULLISH" and signal_action == "SHORT":
+            penalty = 0.15
+            reason = "BTC Bullish - ALT SHORT caution"
+        
+        # Aynı yönde ise bonus
+        elif (self.btc_trend in ["BULLISH", "STRONG_BULLISH"] and signal_action == "LONG") or \
+             (self.btc_trend in ["BEARISH", "STRONG_BEARISH"] and signal_action == "SHORT"):
+            penalty = -0.1  # Bonus (negatif penalty)
+            reason = "BTC aligned with signal"
+        
+        # Yüksek penalty ise reddet
+        allowed = penalty < 0.25
+        
+        return (allowed, penalty, reason)
+    
+    def get_state(self) -> dict:
+        """BTC durumu."""
+        return {
+            "trend": self.btc_trend,
+            "momentum": self.btc_momentum,
+            "price": self.btc_price,
+            "change_1h": round(self.btc_change_1h, 2),
+            "change_4h": round(self.btc_change_4h, 2)
+        }
+
+
+# Global BTC Correlation Filter instance
+btc_filter = BTCCorrelationFilter()
+
+
+# ============================================================================
 # PHASE 28: DYNAMIC COIN PROFILER
 # ============================================================================
 
@@ -1191,6 +1558,82 @@ class PaperTradingEngine:
         logger.info(f"[PaperTrading] {message}")
     
     # =========================================================================
+    # PHASE 30: KELLY CRITERION POSITION SIZING
+    # =========================================================================
+    
+    def calculate_kelly_fraction(self) -> float:
+        """
+        Kelly Criterion ile optimal pozisyon boyutu hesapla.
+        Kelly% = W - [(1-W) / R]
+        W = Win rate (son 20 trade)
+        R = Average Win / Average Loss
+        
+        Half-Kelly kullanılır (güvenlik için).
+        Returns: %1-%5 arası risk oranı
+        """
+        # Minimum trade sayısına ulaşmadıysa default kullan
+        if len(self.trades) < 10:
+            return self.risk_per_trade  # Default %2
+        
+        # Son 20 trade'i al
+        recent_trades = self.trades[-20:]
+        
+        wins = [t for t in recent_trades if t.get('pnl', 0) > 0]
+        losses = [t for t in recent_trades if t.get('pnl', 0) < 0]
+        
+        if not wins or not losses:
+            return self.risk_per_trade
+        
+        # Win rate hesapla
+        win_rate = len(wins) / len(recent_trades)
+        
+        # Ortalama kazanç ve kayıp
+        avg_win = np.mean([t['pnl'] for t in wins])
+        avg_loss = abs(np.mean([t['pnl'] for t in losses]))
+        
+        if avg_loss <= 0:
+            return self.risk_per_trade
+        
+        # Win/Loss ratio
+        R = avg_win / avg_loss
+        
+        # Kelly formülü
+        kelly = win_rate - ((1 - win_rate) / R)
+        
+        # Half-Kelly (daha güvenli)
+        half_kelly = kelly * 0.5
+        
+        # Sınırla: %1 - %5 arası
+        final_risk = max(0.01, min(0.05, half_kelly))
+        
+        logger.debug(f"Kelly Calculation: WR={win_rate:.2f}, R={R:.2f}, Kelly={kelly:.3f}, Final={final_risk:.3f}")
+        
+        return final_risk
+    
+    def get_kelly_stats(self) -> dict:
+        """Kelly hesaplama istatistikleri."""
+        if len(self.trades) < 10:
+            return {"status": "insufficient_data", "trades_needed": 10 - len(self.trades)}
+        
+        recent = self.trades[-20:]
+        wins = [t for t in recent if t.get('pnl', 0) > 0]
+        losses = [t for t in recent if t.get('pnl', 0) < 0]
+        
+        win_rate = len(wins) / len(recent) if recent else 0
+        avg_win = np.mean([t['pnl'] for t in wins]) if wins else 0
+        avg_loss = abs(np.mean([t['pnl'] for t in losses])) if losses else 1
+        
+        return {
+            "status": "active",
+            "sample_size": len(recent),
+            "win_rate": round(win_rate * 100, 1),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "win_loss_ratio": round(avg_win / avg_loss if avg_loss > 0 else 0, 2),
+            "kelly_fraction": round(self.calculate_kelly_fraction() * 100, 2)
+        }
+    
+    # =========================================================================
     # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
     # =========================================================================
     
@@ -1550,6 +1993,7 @@ class PaperTradingEngine:
 
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED POSITION SIZING
+        # PHASE 30: KELLY CRITERION + SESSION MANAGER
         # =====================================================================
         
         # Update BalanceProtector with current balance
@@ -1558,9 +2002,12 @@ class PaperTradingEngine:
         # Get leverage from signal (spread-based dynamic leverage)
         leverage = signal.get('leverage', self.leverage)
         
+        # Phase 30: Apply SessionManager leverage adjustment
+        session_adjusted_leverage = session_manager.adjust_leverage(leverage)
+        
         # Apply BalanceProtector leverage multiplier
         leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
-        adjusted_leverage = int(leverage * leverage_mult)
+        adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
         adjusted_leverage = max(3, min(75, adjusted_leverage))
         
         # Get size multiplier from signal and BalanceProtector
@@ -1573,11 +2020,18 @@ class PaperTradingEngine:
             final_size_mult *= 0.5  # Additional 50% reduction
             self.add_log(f"⚠️ DRAWDOWN KORUMASI: Pozisyon boyutu azaltıldı")
         
-        # Position Sizing
-        risk_per_trade = self.risk_per_trade
-        risk_amount = self.balance * risk_per_trade * final_size_mult
+        # Phase 30: Kelly Criterion position sizing
+        kelly_risk = self.calculate_kelly_fraction()
+        session_risk = session_manager.adjust_risk(kelly_risk)
+        
+        # Position Sizing with Kelly
+        risk_amount = self.balance * session_risk * final_size_mult
         position_size_usd = risk_amount * adjusted_leverage
         position_size = position_size_usd / current_price
+        
+        # Log session info
+        session_info = session_manager.get_session_info()
+        self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x")
         
         new_position = {
             "id": f"{int(datetime.now().timestamp())}_{signal['action']}",
@@ -2711,19 +3165,59 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                 signal['mtf_confidence'] = mtf_confirmation['confidence']
                                 signal['mtf_tf_count'] = mtf_confirmation['tf_count']
                                 
-                                logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {size_multiplier}x | Lev: {dynamic_leverage}x")
-                                
-                                # Phase 15: Cloud Paper Trading
+                                # =====================================================
+                                # PHASE 30: BTC CORRELATION FILTER
+                                # =====================================================
                                 try:
-                                    if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
-                                        # Phase 20: Update spread for dynamic trailing
-                                        streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
-                                        streamer.paper_trader.on_signal(signal, price)
-                                except Exception as pt_err:
-                                    logger.error(f"Paper Trading Error: {pt_err}")
+                                    await btc_filter.update_btc_state(streamer.exchange)
+                                    btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
+                                        active_symbol, signal['action']
+                                    )
+                                    
+                                    if not btc_allowed:
+                                        logger.info(f"BTC FILTER BLOCKED: {btc_reason}")
+                                        signal = None  # Block signal
+                                    elif btc_penalty != 0:
+                                        # Apply penalty/bonus to size multiplier
+                                        signal['sizeMultiplier'] *= (1 - btc_penalty)
+                                        signal['btc_adjustment'] = btc_reason
+                                        logger.info(f"BTC ADJUSTMENT: {btc_reason} | Size: {signal['sizeMultiplier']:.2f}x")
+                                except Exception as btc_err:
+                                    logger.warning(f"BTC Filter error: {btc_err}")
                                 
-                                manager.last_signals[symbol] = signal
-                                logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
+                                # =====================================================
+                                # PHASE 30: VOLUME PROFILE BOOST
+                                # =====================================================
+                                if signal:
+                                    try:
+                                        # Update volume profile if stale
+                                        if datetime.now().timestamp() - volume_profiler.last_update > 3600:  # 1 hour
+                                            ohlcv_4h = await streamer.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
+                                            if ohlcv_4h:
+                                                volume_profiler.calculate_profile(ohlcv_4h)
+                                        
+                                        vp_boost = volume_profiler.get_signal_boost(price, signal['action'])
+                                        if vp_boost > 0:
+                                            signal['sizeMultiplier'] *= (1 + vp_boost)
+                                            signal['vp_boost'] = vp_boost
+                                            logger.info(f"VP BOOST: +{vp_boost*100:.0f}% @ POC={volume_profiler.poc:.6f}")
+                                    except Exception as vp_err:
+                                        logger.warning(f"Volume Profile error: {vp_err}")
+                                
+                                if signal:
+                                    logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {signal['sizeMultiplier']:.2f}x | Lev: {dynamic_leverage}x")
+                                    
+                                    # Phase 15: Cloud Paper Trading
+                                    try:
+                                        if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
+                                            # Phase 20: Update spread for dynamic trailing
+                                            streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
+                                            streamer.paper_trader.on_signal(signal, price)
+                                    except Exception as pt_err:
+                                        logger.error(f"Paper Trading Error: {pt_err}")
+                                    
+                                    manager.last_signals[symbol] = signal
+                                    logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
                             else:
                                 # Signal NOT confirmed - log but don't trade
                                 if mtf_confirmation:
