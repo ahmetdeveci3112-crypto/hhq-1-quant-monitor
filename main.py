@@ -192,22 +192,31 @@ MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
 # Wider spread multipliers for better signal quality
+# Phase 29: Added leverage - low spread = high leverage, high spread = low leverage
 SPREAD_MULTIPLIERS = {
-    "very_low": {"max_spread": 0.03, "trail": 0.5, "sl": 1.5, "tp": 2.5},
-    "low": {"max_spread": 0.08, "trail": 1.0, "sl": 2.0, "tp": 3.0},
-    "normal": {"max_spread": 0.15, "trail": 1.5, "sl": 2.5, "tp": 4.0},
-    "high": {"max_spread": 0.30, "trail": 2.0, "sl": 3.0, "tp": 5.0},
-    "very_high": {"max_spread": 1.0, "trail": 3.0, "sl": 4.0, "tp": 6.0}
+    "very_low": {"max_spread": 0.03, "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.002},
+    "low": {"max_spread": 0.08, "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.004},
+    "normal": {"max_spread": 0.15, "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.008},
+    "high": {"max_spread": 0.30, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5, "pullback": 0.012},
+    "very_high": {"max_spread": 1.0, "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3, "pullback": 0.020}
 }
 
 def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
-    """Get SL/TP/Trail based on current spread level."""
+    """
+    Get SL/TP/Trail/Leverage based on current spread level.
+    Phase 29: Added dynamic leverage based on spread.
+    """
     for level, params in SPREAD_MULTIPLIERS.items():
         if spread_pct <= params["max_spread"]:
             return {
                 "trail_distance": atr * params["trail"],
                 "stop_loss": atr * params["sl"],
                 "take_profit": atr * params["tp"],
+                "leverage": params["leverage"],
+                "pullback": params["pullback"],
+                "sl_multiplier": params["sl"],
+                "tp_multiplier": params["tp"],
+                "trail_multiplier": params["trail"],
                 "level": level
             }
     # Default to very_high
@@ -216,6 +225,11 @@ def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
         "trail_distance": atr * params["trail"],
         "stop_loss": atr * params["sl"],
         "take_profit": atr * params["tp"],
+        "leverage": params["leverage"],
+        "pullback": params["pullback"],
+        "sl_multiplier": params["sl"],
+        "tp_multiplier": params["tp"],
+        "trail_multiplier": params["trail"],
         "level": "very_high"
     }
 
@@ -353,6 +367,296 @@ class MultiTimeframeAnalyzer:
 
 # Global MTF Analyzer instance
 mtf_analyzer = MultiTimeframeAnalyzer()
+
+
+# ============================================================================
+# PHASE 28: DYNAMIC COIN PROFILER
+# ============================================================================
+
+class CoinProfiler:
+    """
+    Coin-bazlı dinamik parametre optimizasyonu.
+    Her coin için tarihsel veri analizi yaparak optimal eşikleri hesaplar.
+    
+    Analiz Metrikleri:
+    - Ortalama ATR %
+    - Z-Score standart sapması ve 95. persentil
+    - Optimal threshold (sinyal üretim eşiği)
+    - Dinamik minimum skor
+    """
+    
+    def __init__(self):
+        self.profiles = {}  # Cache: {symbol: profile_data}
+        self.profile_expiry = 3600  # 1 saat cache süresi (saniye)
+        logger.info("CoinProfiler initialized - Dynamic parameter optimization enabled")
+    
+    async def analyze_coin(self, symbol: str, exchange) -> dict:
+        """
+        Coin için istatistiksel analiz yap ve optimal parametreleri döndür.
+        
+        Args:
+            symbol: Coin sembolü (örn. "BTC/USDT")
+            exchange: CCXT exchange instance
+            
+        Returns:
+            dict: Coin profil verileri ve optimal parametreler
+        """
+        try:
+            logger.info(f"🔍 Analyzing coin profile for {symbol}...")
+            
+            # 1. Son 500 mum verisi al (4H timeframe - ~83 gün)
+            ohlcv = await exchange.fetch_ohlcv(symbol, '4h', limit=500)
+            
+            if not ohlcv or len(ohlcv) < 100:
+                logger.warning(f"Insufficient data for {symbol}, using default profile")
+                return self._get_default_profile(symbol)
+            
+            # 2. Veriyi parse et
+            closes = np.array([float(c[4]) for c in ohlcv])
+            highs = np.array([float(c[2]) for c in ohlcv])
+            lows = np.array([float(c[3]) for c in ohlcv])
+            
+            # 3. ATR % hesapla (volatilite metriği)
+            atr_values = []
+            for i in range(14, len(closes)):
+                tr = max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i-1]),
+                    abs(lows[i] - closes[i-1])
+                )
+                atr_pct = (tr / closes[i]) * 100 if closes[i] > 0 else 0
+                atr_values.append(atr_pct)
+            
+            avg_atr_pct = np.mean(atr_values) if atr_values else 2.0
+            
+            # 4. Z-Score aralığı hesapla
+            zscore_values = []
+            for i in range(20, len(closes)):
+                sma = np.mean(closes[i-20:i])
+                spread = closes[i] - sma
+                std = np.std(closes[i-20:i])
+                zscore = spread / std if std > 0 else 0
+                zscore_values.append(abs(zscore))
+            
+            if zscore_values:
+                zscore_95th = float(np.percentile(zscore_values, 95))
+                zscore_std = float(np.std(zscore_values))
+                zscore_mean = float(np.mean(zscore_values))
+            else:
+                zscore_95th = 2.0
+                zscore_std = 0.5
+                zscore_mean = 0.8
+            
+            # 5. Optimal parametreleri hesapla
+            # Threshold: %95 persentil / 1.5 (sinyal frekansı için)
+            # Alt limit 0.8, üst limit 2.0
+            raw_threshold = zscore_95th / 1.5
+            optimal_threshold = max(0.8, min(2.0, raw_threshold))
+            
+            # Minimum skor: Volatil coinler için daha düşük
+            if avg_atr_pct > 4.0:  # Çok volatil (DOGE, SHIB, PEPE)
+                min_score = 55
+            elif avg_atr_pct > 2.5:  # Volatil (SOL, MATIC)
+                min_score = 65
+            else:  # Normal (BTC, ETH)
+                min_score = 75
+            
+            # ATR çarpanları (volatiliteye göre)
+            if avg_atr_pct > 3.0:
+                sl_atr = 1.5  # Volatil coinler için sıkı SL
+                tp_atr = 4.0  # Geniş TP
+            else:
+                sl_atr = 2.0
+                tp_atr = 3.0
+            
+            profile = {
+                'symbol': symbol,
+                'avg_atr_pct': round(avg_atr_pct, 4),
+                'zscore_95th': round(zscore_95th, 4),
+                'zscore_std': round(zscore_std, 4),
+                'zscore_mean': round(zscore_mean, 4),
+                'optimal_threshold': round(optimal_threshold, 2),
+                'min_score': min_score,
+                'sl_atr': sl_atr,
+                'tp_atr': tp_atr,
+                'data_points': len(ohlcv),
+                'updated_at': datetime.now().timestamp()
+            }
+            
+            logger.info(f"✅ Coin Profile for {symbol}: Threshold={optimal_threshold:.2f}, MinScore={min_score}, ATR%={avg_atr_pct:.2f}")
+            
+            return profile
+            
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {e}")
+            return self._get_default_profile(symbol)
+    
+    def _get_default_profile(self, symbol: str) -> dict:
+        """Varsayılan profil (analiz başarısız olursa)."""
+        return {
+            'symbol': symbol,
+            'avg_atr_pct': 2.0,
+            'zscore_95th': 2.0,
+            'zscore_std': 0.5,
+            'zscore_mean': 0.8,
+            'optimal_threshold': 1.4,
+            'min_score': 70,
+            'sl_atr': 2.0,
+            'tp_atr': 3.0,
+            'data_points': 0,
+            'updated_at': datetime.now().timestamp(),
+            'is_default': True
+        }
+    
+    async def get_or_update(self, symbol: str, exchange) -> dict:
+        """
+        Cache'den profili al veya yeni analiz yap.
+        
+        Args:
+            symbol: Coin sembolü
+            exchange: CCXT exchange instance
+            
+        Returns:
+            dict: Coin profil verileri
+        """
+        now = datetime.now().timestamp()
+        
+        # Cache'de var mı ve süresi dolmamış mı kontrol et
+        if symbol in self.profiles:
+            cached = self.profiles[symbol]
+            age = now - cached.get('updated_at', 0)
+            
+            if age < self.profile_expiry:
+                logger.debug(f"Using cached profile for {symbol} (age: {age:.0f}s)")
+                return cached
+        
+        # Yeni analiz yap
+        profile = await self.analyze_coin(symbol, exchange)
+        self.profiles[symbol] = profile
+        
+        return profile
+    
+    def get_cached(self, symbol: str) -> Optional[dict]:
+        """Cache'deki profili döndür (yoksa None)."""
+        return self.profiles.get(symbol)
+
+
+# Global CoinProfiler instance
+coin_profiler = CoinProfiler()
+
+
+# ============================================================================
+# PHASE 29: BALANCE PROTECTOR
+# ============================================================================
+
+class BalanceProtector:
+    """
+    Bakiye koruma ve büyütme odaklı karar sistemi.
+    Win rate değil, toplam bakiye büyümesi optimizasyonu.
+    
+    Prensip: Cüzdan bakiyesini korumak ve büyütmek ana hedeftir.
+    """
+    
+    def __init__(self, initial_balance: float = 10000.0):
+        self.initial_balance = initial_balance
+        self.peak_balance = initial_balance
+        self.drawdown_threshold = 5.0  # %5 drawdown'da agresif koruma
+        self.profit_lock_threshold = 10.0  # %10 karda profit locking aktif
+        self.profit_lock_ratio = 0.5  # Karın %50'sini kilitle
+        logger.info(f"BalanceProtector initialized with ${initial_balance:.2f}")
+    
+    def update_peak(self, current_balance: float):
+        """Peak balance'ı güncelle."""
+        if current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+            logger.debug(f"New peak balance: ${self.peak_balance:.2f}")
+    
+    def get_current_drawdown(self, current_balance: float) -> float:
+        """Mevcut drawdown yüzdesini hesapla."""
+        if self.peak_balance <= 0:
+            return 0.0
+        return ((self.peak_balance - current_balance) / self.peak_balance) * 100
+    
+    def get_profit_percent(self, current_balance: float) -> float:
+        """Başlangıçtan itibaren kar yüzdesini hesapla."""
+        if self.initial_balance <= 0:
+            return 0.0
+        return ((current_balance - self.initial_balance) / self.initial_balance) * 100
+    
+    def should_reduce_risk(self, current_balance: float) -> bool:
+        """Bakiye düşüşünde risk azaltılmalı mı?"""
+        drawdown = self.get_current_drawdown(current_balance)
+        return drawdown > self.drawdown_threshold
+    
+    def should_lock_profits(self, current_balance: float) -> bool:
+        """Kar kilitleme aktif edilmeli mi?"""
+        profit_pct = self.get_profit_percent(current_balance)
+        return profit_pct > self.profit_lock_threshold
+    
+    def calculate_position_size_multiplier(self, current_balance: float) -> float:
+        """
+        Bakiye durumuna göre pozisyon boyutu çarpanı.
+        
+        Returns:
+            float: 0.3 ile 1.5 arası çarpan
+        """
+        profit_pct = self.get_profit_percent(current_balance)
+        drawdown = self.get_current_drawdown(current_balance)
+        
+        # Drawdown durumunda defansif ol
+        if drawdown > 10:
+            return 0.3  # Çok defansif
+        elif drawdown > 5:
+            return 0.5  # Defansif
+        
+        # Kar durumunda
+        if profit_pct > 30:
+            return 1.5  # Çok agresif
+        elif profit_pct > 20:
+            return 1.3  # Agresif
+        elif profit_pct > 10:
+            return 1.1  # Hafif agresif
+        
+        return 1.0  # Normal
+    
+    def calculate_leverage_multiplier(self, current_balance: float) -> float:
+        """
+        Bakiye durumuna göre kaldıraç çarpanı.
+        Drawdown'da kaldıracı azalt, karda artır.
+        
+        Returns:
+            float: 0.5 ile 1.2 arası çarpan
+        """
+        drawdown = self.get_current_drawdown(current_balance)
+        profit_pct = self.get_profit_percent(current_balance)
+        
+        if drawdown > 10:
+            return 0.5  # Kaldıracı yarıya düşür
+        elif drawdown > 5:
+            return 0.7  # Kaldıracı azalt
+        
+        if profit_pct > 20:
+            return 1.2  # Kaldıracı artır
+        
+        return 1.0
+    
+    def get_protection_status(self, current_balance: float) -> dict:
+        """Koruma durumu özeti."""
+        return {
+            "initial_balance": self.initial_balance,
+            "peak_balance": self.peak_balance,
+            "current_balance": current_balance,
+            "drawdown_pct": round(self.get_current_drawdown(current_balance), 2),
+            "profit_pct": round(self.get_profit_percent(current_balance), 2),
+            "size_multiplier": self.calculate_position_size_multiplier(current_balance),
+            "leverage_multiplier": self.calculate_leverage_multiplier(current_balance),
+            "reduce_risk": self.should_reduce_risk(current_balance),
+            "lock_profits": self.should_lock_profits(current_balance)
+        }
+
+
+# Global BalanceProtector instance
+balance_protector = BalanceProtector()
 
 
 # ============================================================================
@@ -509,11 +813,12 @@ class SignalGenerator:
         nearest_fvg: Optional[Dict] = None,
         breakout: Optional[str] = None,
         spread_pct: float = 0.05, # Phase 13
-        volatility_ratio: float = 1.0 # Phase 13
+        volatility_ratio: float = 1.0, # Phase 13
+        coin_profile: Optional[Dict] = None  # Phase 28: Dynamic coin profile
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 9 Layers of confluence (SMC + Breakouts).
-        Requires Weighted Confidence Score > 75 to enter.
+        Uses coin_profile for dynamic threshold and minimum score.
         """
         now = datetime.now().timestamp()
         
@@ -521,8 +826,16 @@ class SignalGenerator:
         if now - self.last_signal_time < self.min_signal_interval:
             return None
         
-        # 1. ADAPTIVE THRESHOLD (Volatility & Leverage Based)
-        base_threshold = 1.6
+        # Phase 28: Dynamic threshold from coin profile
+        if coin_profile:
+            base_threshold = coin_profile.get('optimal_threshold', 1.6)
+            min_score_required = coin_profile.get('min_score', 75)
+            is_backtest = coin_profile.get('is_backtest', False)
+            logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
+        else:
+            base_threshold = 1.6
+            min_score_required = 75
+            is_backtest = False
         
         # Leverage Scaling:
         # 10x = 1.0x factor (No change)
@@ -530,8 +843,12 @@ class SignalGenerator:
         # 50x = 1.4x factor (+40% stricter)
         leverage_factor = 1.0 + max(0, (leverage - 10) / 100)
         
-        adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price)
-        effective_threshold = adaptive_threshold * leverage_factor
+        # In backtest mode, skip adaptive threshold to allow more signals
+        if is_backtest:
+            effective_threshold = base_threshold
+        else:
+            adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price)
+            effective_threshold = adaptive_threshold * leverage_factor
         
         # 2. CONFIDENCE SCORING SYSTEM (0-100)
         score = 0
@@ -659,85 +976,107 @@ class SignalGenerator:
                  score -= 10
                  reasons.append("FakeoutRisk")
 
-        # FINAL DECISION: Score > 75 REQUIRED
-        # This forces Z-Score + (OB OR VWAP) + MTF Aligned
-        if score < 75:
+        # FINAL DECISION: Dynamic minimum score from coin profile
+        # Phase 28: Coin-specific minimum score requirement
+        if score < min_score_required:
             return None
-            
-        # DYNAMIC TRAILING SL/TP based on Hurst & Volatility (Phase 13)
-        # Lower Hurst = Stronger Mean Reversion = Tighter Stops, Wider Targets
         
-        # Base Multipliers from Regime
-        if hurst < 0.45: # Strong Mean Reversion
-            atr_sl = 1.5
-            atr_tp = 3.5
-            trail_act = 1.0
-        elif hurst < 0.55: # Mixed
-            atr_sl = 2.0
-            atr_tp = 2.5
-            trail_act = 1.5
-        else: # Trending/Random
-            if breakout:
-                atr_sl = 2.0
-                atr_tp = 5.0
-                trail_act = 2.0
-            else:
-                atr_sl = 2.5
-                atr_tp = 2.0
-                trail_act = 2.0
+        # =====================================================================
+        # PHASE 29: SPREAD-BASED DYNAMIC PARAMETERS
+        # =====================================================================
         
-        # Phase 13: Volatility & Spread Adjustments
-        # 1. Volatility Expansion (Don't get wicked out)
+        # Get spread-adjusted parameters (includes leverage, SL/TP multipliers, pullback)
+        spread_params = get_spread_adjusted_params(spread_pct, atr)
+        
+        # Dynamic Leverage from Spread (low spread = high leverage)
+        spread_leverage = spread_params['leverage']
+        
+        # Apply BalanceProtector leverage multiplier
+        leverage_mult = balance_protector.calculate_leverage_multiplier(
+            balance_protector.peak_balance  # Use peak as proxy for current
+        )
+        final_leverage = int(spread_leverage * leverage_mult)
+        
+        # Ensure leverage bounds
+        final_leverage = max(3, min(75, final_leverage))
+        
+        # Use spread-based SL/TP multipliers (override regime-based)
+        atr_sl = spread_params['sl_multiplier']
+        atr_tp = spread_params['tp_multiplier']
+        trail_mult = spread_params['trail_multiplier']
+        
+        # Adjust based on Hurst regime (fine-tuning)
+        if hurst < 0.45:  # Strong Mean Reversion
+            atr_tp *= 1.2  # Wider TP for mean reversion
+            trail_act = atr * 1.0
+        elif hurst > 0.55:  # Trending
+            atr_tp *= 1.3  # Even wider TP for trends
+            trail_act = atr * 1.5
+        else:
+            trail_act = atr * 1.2
+        
+        # Phase 13: Volatility Adjustments (keep existing logic)
         if volatility_ratio > 1.5:
-            atr_sl *= 1.2 # Widen SL by 20%
-            atr_tp *= 1.5 # Aim for 50% more profit
+            atr_sl *= 1.2
+            atr_tp *= 1.5
             reasons.append(f"VolExp({volatility_ratio:.1f}x)")
         elif volatility_ratio < 0.8:
-            atr_tp *= 0.8 # Take profit sooner in low vol
+            atr_tp *= 0.8
             reasons.append("LowVol")
-            
-        # 2. Spread Protection (Buffer)
+        
+        # Spread Protection Buffer
         spread_buffer = 0.0
         if spread_pct > 0.1:
             spread_buffer = price * (spread_pct / 100)
             reasons.append(f"SpreadProt({spread_pct:.2f}%)")
         
-        # Calculate IDEAL ENTRY (Pullback)
-        # Aim for 0.2% better entry than current price
-        # Phase 13: Dynamic Pullback
-        base_pullback = 0.002
+        # =====================================================================
+        # PHASE 29: SPREAD-BASED PULLBACK
+        # =====================================================================
         
-        # If Spread is high, we must enter lower (Long) or higher (Short) to cover it
-        if spread_pct > 0.05:
-            base_pullback += (spread_pct / 100)
-            
-        # If Volatility is extreme, wait for deeper pullback
+        # Use spread-based pullback from parameters
+        pullback_pct = spread_params['pullback']
+        
+        # Additional pullback for extreme volatility
         if volatility_ratio > 2.0:
-            base_pullback += 0.005 # Add 0.5% extra pullback requirement
-            
-        pullback_pct = base_pullback
+            pullback_pct += 0.005  # +0.5%
+        
+        # Limit pullback to max 2.5%
+        pullback_pct = min(0.025, pullback_pct)
         
         if signal_side == "LONG":
             ideal_entry = price * (1 - pullback_pct)
             sl = ideal_entry - (atr * atr_sl) - spread_buffer
             tp = ideal_entry + (atr * atr_tp)
-            trail_activation = ideal_entry + (atr * trail_act)
-            trail_dist = atr * 0.5
+            trail_activation = ideal_entry + trail_act
+            trail_dist = atr * trail_mult
         else:
             ideal_entry = price * (1 + pullback_pct)
             sl = ideal_entry + (atr * atr_sl) + spread_buffer
             tp = ideal_entry - (atr * atr_tp)
-            trail_activation = ideal_entry - (atr * trail_act)
-            trail_dist = atr * 0.5
-            
-        # Size Multiplier based on Score
+            trail_activation = ideal_entry - trail_act
+            trail_dist = atr * trail_mult
+        
+        # =====================================================================
+        # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
+        # =====================================================================
+        
+        # Base size from score
         size_mult = 1.0
         if score >= 90: size_mult = 1.5
         elif score < 80: size_mult = 0.8
         
+        # Apply BalanceProtector adjustment
+        balance_size_mult = balance_protector.calculate_position_size_multiplier(
+            balance_protector.peak_balance
+        )
+        size_mult *= balance_size_mult
+        
         self.last_signal_time = now
         
-        reasons.append(f"LevAdj({leverage_factor:.1f}x)")
+        # Log spread level and leverage
+        reasons.append(f"Spread({spread_params['level']})")
+        reasons.append(f"Lev({final_leverage}x)")
         
         return {
             'action': signal_side,
@@ -750,7 +1089,10 @@ class SignalGenerator:
             'reason': ", ".join(reasons),
             'timestamp': now,
             'confidenceScore': score,
-            'sizeMultiplier': size_mult
+            'sizeMultiplier': size_mult,
+            'leverage': final_leverage,  # Phase 29: Dynamic leverage
+            'spreadLevel': spread_params['level'],
+            'pullbackPct': round(pullback_pct * 100, 2)
         }
 
 
@@ -1146,25 +1488,58 @@ class PaperTradingEngine:
             self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {action} açılmadı")
             return
         
-        # Phase 28: Opposite Signal Exit / Trail Trigger
-        # Check for opposite direction positions
+        # =====================================================================
+        # PHASE 29: ENHANCED OPPOSITE SIGNAL EXIT - BALANCE PROTECTION FOCUS
+        # =====================================================================
+        
         opposite_positions = [p for p in self.positions if p.get('side') != action]
         
+        # ATR for calculations (fallback to 1% of price)
+        atr_estimate = current_price * 0.01
+        
         for pos in opposite_positions:
-            # 1. If profitable, close immediately (Reversal)
-            if pos.get('unrealizedPnl', 0) > 0:
-                self.add_log(f"🔄 SİNYAL TERSİNE DÖNDÜ: {pos['side']} pozisyonu karlı kapatılıyor.")
-                self.close_position(pos, current_price, 'SIGNAL_REVERSAL')
-                continue # Position closed, move to next
+            entry = pos.get('entryPrice', current_price)
             
-            # 2. If not profitable, activate aggressive trailing to minimize loss or BE
+            # Calculate PnL percentage
+            if pos['side'] == 'LONG':
+                pnl_pct = ((current_price - entry) / entry) * 100
             else:
-                 if not pos.get('isTrailingActive', False):
-                     self.add_log(f"🛡️ SİNYAL TERSİNE DÖNDÜ: {pos['side']} için Aggressive Trailing Aktif!")
-                     pos['isTrailingActive'] = True
-                     # Pull trailing stop closer (e.g., to entry if possible or current price +/- small buffer)
-                     # For now, just activating it ensures it starts tracking. 
-                     # We could force a tighter trail here logic if desired.
+                pnl_pct = ((entry - current_price) / entry) * 100
+            
+            # 1. PROFITABLE: Close immediately to lock profit
+            if pnl_pct > 0.5:  # At least 0.5% profit
+                self.add_log(f"🔄 SİNYAL TERSİNE DÖNDÜ: {pos['side']} %{pnl_pct:.1f} karlı kapatılıyor!")
+                self.close_position(pos, current_price, 'SIGNAL_REVERSAL_PROFIT')
+                continue
+            
+            # 2. SMALL LOSS (-2% to 0.5%): Activate breakeven trailing
+            elif pnl_pct > -2:
+                if not pos.get('breakeven_mode', False):
+                    pos['breakeven_mode'] = True
+                    pos['isTrailingActive'] = True
+                    # Set tight trailing to try to close at breakeven or minimal loss
+                    if pos['side'] == 'LONG':
+                        pos['trailingStop'] = current_price - (atr_estimate * 0.3)
+                        pos['trailDistance'] = atr_estimate * 0.3
+                    else:
+                        pos['trailingStop'] = current_price + (atr_estimate * 0.3)
+                        pos['trailDistance'] = atr_estimate * 0.3
+                    self.add_log(f"🛡️ BREAKEVEN MODE: {pos['side']} %{pnl_pct:.1f} - Sıkı trailing aktif")
+            
+            # 3. LARGER LOSS (< -2%): Recovery mode with emergency SL
+            else:
+                if not pos.get('recovery_mode', False):
+                    pos['recovery_mode'] = True
+                    pos['isTrailingActive'] = True
+                    # Set emergency stop loss to prevent further losses
+                    if pos['side'] == 'LONG':
+                        # Set SL at current price minus small buffer (accept the loss)
+                        emergency_sl = current_price - (atr_estimate * 0.5)
+                        pos['stopLoss'] = max(pos.get('stopLoss', 0), emergency_sl)
+                    else:
+                        emergency_sl = current_price + (atr_estimate * 0.5)
+                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), emergency_sl)
+                    self.add_log(f"🆘 RECOVERY MODE: {pos['side']} %{pnl_pct:.1f} - Emergency SL aktif @ {pos['stopLoss']:.6f}")
 
         # If hedging is disabled, check for opposite direction (Check again as some might have closed above)
         if not self.allow_hedging:
@@ -1173,20 +1548,40 @@ class PaperTradingEngine:
                 self.add_log(f"⚠️ Hedging kapalı, zaten ters pozisyon var")
                 return
 
-        # Phase 17: Use dynamic settings
-        # Phase 23: Dynamic Leverage from Signal
+        # =====================================================================
+        # PHASE 29: BALANCE-PROTECTED POSITION SIZING
+        # =====================================================================
+        
+        # Update BalanceProtector with current balance
+        balance_protector.update_peak(self.balance)
+        
+        # Get leverage from signal (spread-based dynamic leverage)
         leverage = signal.get('leverage', self.leverage)
-        risk_per_trade = self.risk_per_trade
+        
+        # Apply BalanceProtector leverage multiplier
+        leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
+        adjusted_leverage = int(leverage * leverage_mult)
+        adjusted_leverage = max(3, min(75, adjusted_leverage))
+        
+        # Get size multiplier from signal and BalanceProtector
+        signal_size_mult = signal.get('sizeMultiplier', 1.0)
+        balance_size_mult = balance_protector.calculate_position_size_multiplier(self.balance)
+        final_size_mult = signal_size_mult * balance_size_mult
+        
+        # Check if we should reduce risk
+        if balance_protector.should_reduce_risk(self.balance):
+            final_size_mult *= 0.5  # Additional 50% reduction
+            self.add_log(f"⚠️ DRAWDOWN KORUMASI: Pozisyon boyutu azaltıldı")
         
         # Position Sizing
-        size_mult = signal.get('sizeMultiplier', 1.0)
-        risk_amount = self.balance * risk_per_trade * size_mult
-        position_size_usd = risk_amount * leverage
+        risk_per_trade = self.risk_per_trade
+        risk_amount = self.balance * risk_per_trade * final_size_mult
+        position_size_usd = risk_amount * adjusted_leverage
         position_size = position_size_usd / current_price
         
         new_position = {
             "id": f"{int(datetime.now().timestamp())}_{signal['action']}",
-            "symbol": self.symbol,  # Phase 17: Use configured symbol
+            "symbol": self.symbol,
             "side": signal['action'],
             "entryPrice": current_price,
             "size": position_size,
@@ -1199,13 +1594,15 @@ class PaperTradingEngine:
             "isTrailingActive": False,
             "unrealizedPnl": 0.0,
             "unrealizedPnlPercent": 0.0,
-            "openTime": int(datetime.now().timestamp() * 1000)
+            "openTime": int(datetime.now().timestamp() * 1000),
+            "leverage": adjusted_leverage,  # Phase 29: Store leverage
+            "spreadLevel": signal.get('spreadLevel', 'normal')  # Phase 29: Store spread level
         }
         
         self.positions.append(new_position)
-        self.add_log(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {leverage}x | SL:${signal['sl']:.4f} TP:${signal['tp']:.4f}")
+        self.add_log(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {adjusted_leverage}x | SL:${signal['sl']:.4f} TP:${signal['tp']:.4f}")
         self.save_state()
-        logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {leverage}x")
+        logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
 
     def update(self, current_price: float, atr: float = None):
         """Update positions with Phase 20 Advanced Risk Management."""
@@ -1610,7 +2007,24 @@ class BinanceStreamer:
         # Phase 15: Cloud Paper Trading Engine (Use global instance for REST API access)
         # Note: global_paper_trader is defined later, set in connect()
         self.paper_trader = None  # Will be set to global_paper_trader in connect()
+        
+        # Phase 28: Dynamic Coin Profile
+        self.coin_profile = None  # Will be loaded in connect()
+        
         logger.info(f"☁️ Cloud Paper Trading Active.")
+    
+    async def update_coin_profile(self):
+        """Load or update coin profile for dynamic parameter optimization."""
+        try:
+            if self.exchange:
+                self.coin_profile = await coin_profiler.get_or_update(self.symbol, self.exchange)
+                logger.info(f"📊 Coin profile loaded: {self.symbol} | Threshold: {self.coin_profile.get('optimal_threshold', 1.6)}")
+            else:
+                logger.warning("Exchange not connected, using default profile")
+                self.coin_profile = coin_profiler._get_default_profile(self.symbol)
+        except Exception as e:
+            logger.error(f"Failed to load coin profile: {e}")
+            self.coin_profile = coin_profiler._get_default_profile(self.symbol)
 
     async def connect(self):
         """Initialize CCXT exchange connection and WebSocket streams."""
@@ -2148,6 +2562,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
         streamer.running = True
         streamer.paper_trader = global_paper_trader  # Phase 16: Use global instance
         
+        # Phase 28: Load coin profile for dynamic optimization
+        await streamer.update_coin_profile()
+        
         # Fetch initial OHLCV for ATR (one-time REST call)
         try:
             ohlcv = await streamer.fetch_ohlcv()
@@ -2234,7 +2651,8 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             nearest_fvg=nearest_fvg, # NEW: SMC Filter
                             breakout=breakout, # NEW: Phase 11 Breakout
                             spread_pct=metrics.get('spreadPct', 0.05), # Phase 13
-                            volatility_ratio=metrics.get('volatilityRatio', 1.0) # Phase 13
+                            volatility_ratio=metrics.get('volatilityRatio', 1.0), # Phase 13
+                            coin_profile=streamer.coin_profile  # Phase 28: Dynamic optimization
                         )
                         
                         # Phase 22: Multi-Timeframe Confirmation
@@ -2553,6 +2971,27 @@ def run_backtest_simulation(
         if 'generator' not in locals():
             generator = SignalGenerator()
             generator.min_signal_interval = 0 # Disable time check for backtest 1H candles
+        
+        # Phase 29: Simulate spread based on volatility
+        # Higher volatility = higher spread (realistic simulation)
+        volatility = atr / close * 100 if close > 0 else 1.0
+        simulated_spread_pct = 0.02 + (volatility * 0.03)  # Base 0.02% + volatility adjustment
+        simulated_spread_pct = min(0.5, simulated_spread_pct)  # Cap at 0.5%
+        
+        # Volatility ratio simulation
+        volatility_ratio = volatility / 2.0 if volatility > 0 else 1.0  # Normalized to ~1.0
+        
+        # Create simulated coin profile for backtest
+        # Phase 29: More aggressive parameters for DOGE backtest
+        coin_profile = {
+            'symbol': 'backtest',
+            'optimal_threshold': 0.5,  # Very aggressive threshold for DOGE (Z > 0.5)
+            'min_score': 40,  # Lower minimum for more signals in backtest
+            'avg_atr_pct': volatility,
+            'sl_atr': 2.0,
+            'tp_atr': 3.0,
+            'is_backtest': True  # Flag to skip adaptive threshold
+        }
             
         signal_dict = generator.generate_signal(
             hurst=hurst,
@@ -2563,8 +3002,11 @@ def run_backtest_simulation(
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             leverage=leverage,
-            basis_pct=0.0, # Backtest doesn't support Spot/Basis yet
-            whale_zscore=0.0 # Backtest doesn't support Whale Flow yet
+            basis_pct=0.0,  # Backtest doesn't support Spot/Basis yet
+            whale_zscore=0.0,  # Backtest doesn't support Whale Flow yet
+            spread_pct=simulated_spread_pct,  # Phase 29: Spread simulation
+            volatility_ratio=volatility_ratio,  # Phase 29: Volatility ratio
+            coin_profile=coin_profile  # Phase 29: Coin profile
         )
         
 

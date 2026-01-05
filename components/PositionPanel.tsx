@@ -152,6 +152,23 @@ export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClose
                             {new Date(activePosition.openTime).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}
                         </span>
                     </div>
+                    {/* Phase 29: Show leverage and spread level */}
+                    {(activePosition as any).leverage && (
+                        <div className="flex justify-between">
+                            <span className="text-slate-500">Kaldıraç</span>
+                            <span className="text-indigo-400 font-mono font-bold">{(activePosition as any).leverage}x</span>
+                        </div>
+                    )}
+                    {(activePosition as any).spreadLevel && (
+                        <div className="flex justify-between">
+                            <span className="text-slate-500">Spread</span>
+                            <span className={`font-mono px-1.5 rounded ${(activePosition as any).spreadLevel === 'very_low' ? 'bg-emerald-500/20 text-emerald-400' :
+                                    (activePosition as any).spreadLevel === 'low' ? 'bg-emerald-500/10 text-emerald-300' :
+                                        (activePosition as any).spreadLevel === 'normal' ? 'bg-amber-500/10 text-amber-400' :
+                                            'bg-red-500/10 text-red-400'
+                                }`}>{(activePosition as any).spreadLevel}</span>
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

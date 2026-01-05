@@ -700,12 +700,76 @@ export default function App() {
                 </div>
               </div>
 
-              {/* TradingView Chart */}
+              {/* TradingView Chart with Trade Overlay */}
               <div className="flex-1 min-h-[450px] max-h-[600px] bg-[#151921] border border-slate-800 rounded-2xl overflow-hidden shadow-xl relative">
                 <iframe
                   src={`https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=BINANCE:${selectedCoin}&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC`}
                   className="w-full h-full border-0 absolute inset-0"
                 />
+
+                {/* Trade Markers Overlay */}
+                <div className="absolute top-2 left-2 z-10 flex flex-col gap-1.5 pointer-events-none">
+                  {/* Current Positions */}
+                  {portfolio.positions.length > 0 && (
+                    <div className="bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50">
+                      <div className="text-[10px] text-slate-400 mb-1.5 font-semibold uppercase tracking-wide">Açık Pozisyonlar</div>
+                      {portfolio.positions.map((pos, i) => (
+                        <div key={i} className="flex items-center gap-2 text-xs mb-1 last:mb-0">
+                          <span className={`w-2 h-2 rounded-full ${pos.side === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'} animate-pulse`} />
+                          <span className={`font-bold ${pos.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{pos.side}</span>
+                          <span className="text-slate-500">@</span>
+                          <span className="text-white font-mono">${formatPrice(pos.entryPrice)}</span>
+                          <span className={`ml-1 ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
+                          </span>
+                          {pos.spreadLevel && (
+                            <span className="text-[9px] bg-indigo-500/20 text-indigo-400 px-1.5 rounded ml-1">{pos.spreadLevel}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Last 3 Trades */}
+                  {portfolio.trades.length > 0 && (
+                    <div className="bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50 max-w-[280px]">
+                      <div className="text-[10px] text-slate-400 mb-1.5 font-semibold uppercase tracking-wide">Son İşlemler</div>
+                      {portfolio.trades.slice(-3).reverse().map((trade, i) => (
+                        <div key={i} className="flex items-center gap-1.5 text-[10px] mb-1 last:mb-0">
+                          <span className={`${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {trade.pnl >= 0 ? '✓' : '✗'}
+                          </span>
+                          <span className={`font-medium ${trade.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{trade.side}</span>
+                          <span className="text-slate-500">→</span>
+                          <span className={`font-mono ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
+                          </span>
+                          <span className="text-slate-600 text-[9px] ml-1">{trade.reason}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Support/Resistance Indicator */}
+                {lastSignalRef.current && (
+                  <div className="absolute top-2 right-2 z-10 bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50 pointer-events-none">
+                    <div className="text-[10px] text-slate-400 mb-1 font-semibold uppercase tracking-wide">Son Sinyal</div>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-sm font-bold ${lastSignalRef.current.action === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {lastSignalRef.current.action === 'LONG' ? '▲' : '▼'} {lastSignalRef.current.action}
+                      </span>
+                      {(lastSignalRef.current as any).spreadLevel && (
+                        <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1.5 rounded">{(lastSignalRef.current as any).spreadLevel}</span>
+                      )}
+                    </div>
+                    {(lastSignalRef.current as any).pullbackPct !== undefined && (
+                      <div className="text-[9px] text-slate-500 mt-1">
+                        Pullback: {(lastSignalRef.current as any).pullbackPct}% | Lev: {(lastSignalRef.current as any).leverage}x
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Recent Trades Table */}
@@ -806,19 +870,26 @@ export default function App() {
                   </div>
                 </div>
                 <div className="flex-1 bg-black/40 overflow-y-auto p-4 font-mono text-[10px] leading-relaxed space-y-1.5 custom-scrollbar" ref={logRef}>
-                  {logs.map((log, i) => (
-                    <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
-                      <span className="text-slate-600 shrink-0 select-none">[{new Date().toLocaleTimeString().split(' ')[0]}]</span>
-                      <span className={`${log.includes('PROFIT') || log.includes('✅') ? 'text-emerald-400' :
-                        log.includes('LOSS') || log.includes('❌') ? 'text-rose-400' :
-                          log.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
-                            log.includes('SİNYAL') ? 'text-amber-400' :
-                              'text-slate-300'
-                        }`}>
-                        {log.replace(/\[.*?\]\s*☁️?\s*/, '')}
-                      </span>
-                    </div>
-                  ))}
+                  {logs.map((log, i) => {
+                    // Extract timestamp from log string: [HH:MM:SS]
+                    const timestampMatch = log.match(/^\[(\d{1,2}:\d{2}:\d{2})\]/);
+                    const timestamp = timestampMatch ? timestampMatch[1] : '';
+                    const message = log.replace(/^\[.*?\]\s*☁️?\s*/, '');
+
+                    return (
+                      <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
+                        <span className="text-slate-600 shrink-0 select-none">[{timestamp}]</span>
+                        <span className={`${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
+                          message.includes('LOSS') || message.includes('❌') ? 'text-rose-400' :
+                            message.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
+                              message.includes('SİNYAL') || message.includes('Coin Profile') ? 'text-amber-400' :
+                                'text-slate-300'
+                          }`}>
+                          {message}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
