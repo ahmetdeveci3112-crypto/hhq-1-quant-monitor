@@ -679,9 +679,16 @@ class MultiCoinScanner:
             
         except Exception as e:
             logger.error(f"Error fetching futures symbols: {e}")
-            # Fallback to default list
-            self.coins = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
-                          'BNBUSDT', 'ADAUSDT', 'MATICUSDT', 'DOTUSDT', 'LINKUSDT']
+            # Fallback to top 30 coins by market cap (hardcoded for Railway/restricted regions)
+            self.coins = [
+                'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
+                'BNBUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
+                'MATICUSDT', 'LTCUSDT', 'ATOMUSDT', 'UNIUSDT', 'NEARUSDT',
+                'ARBUSDT', 'OPUSDT', 'APTUSDT', 'SUIUSDT', 'INJUSDT',
+                'FILUSDT', 'APTUSDT', 'LDOUSDT', 'RUNEUSDT', 'AAVEUSDT',
+                '1000PEPEUSDT', '1000SHIBUSDT', 'WIFUSDT', 'FETUSDT', 'RENDERUSDT'
+            ]
+            logger.info(f"Using fallback list of {len(self.coins)} coins")
             return self.coins
     
     def get_or_create_analyzer(self, symbol: str) -> LightweightCoinAnalyzer:
@@ -708,7 +715,73 @@ class MultiCoinScanner:
             return result
             
         except Exception as e:
-            logger.warning(f"Error fetching tickers: {e}")
+            logger.warning(f"Error fetching tickers from Binance: {e}")
+            # Fallback: Try to get data from CoinGecko (no geo restrictions)
+            return await self.fetch_ticker_data_coingecko(symbols)
+    
+    async def fetch_ticker_data_coingecko(self, symbols: list) -> dict:
+        """Fallback: Fetch ticker data from CoinGecko API (no geo restrictions)."""
+        import aiohttp
+        
+        # Map symbols to CoinGecko IDs
+        symbol_to_coingecko = {
+            'BTCUSDT': 'bitcoin', 'ETHUSDT': 'ethereum', 'SOLUSDT': 'solana',
+            'XRPUSDT': 'ripple', 'DOGEUSDT': 'dogecoin', 'BNBUSDT': 'binancecoin',
+            'ADAUSDT': 'cardano', 'AVAXUSDT': 'avalanche-2', 'DOTUSDT': 'polkadot',
+            'LINKUSDT': 'chainlink', 'MATICUSDT': 'matic-network', 'LTCUSDT': 'litecoin',
+            'ATOMUSDT': 'cosmos', 'UNIUSDT': 'uniswap', 'NEARUSDT': 'near',
+            'ARBUSDT': 'arbitrum', 'OPUSDT': 'optimism', 'APTUSDT': 'aptos',
+            'SUIUSDT': 'sui', 'INJUSDT': 'injective-protocol', 'FILUSDT': 'filecoin',
+            'LDOUSDT': 'lido-dao', 'RUNEUSDT': 'thorchain', 'AAVEUSDT': 'aave',
+            '1000PEPEUSDT': 'pepe', '1000SHIBUSDT': 'shiba-inu', 'WIFUSDT': 'dogwifhat',
+            'FETUSDT': 'fetch-ai', 'RENDERUSDT': 'render-token'
+        }
+        
+        try:
+            # Get coins we can map
+            coin_ids = [symbol_to_coingecko.get(s) for s in symbols if s in symbol_to_coingecko]
+            coin_ids = [c for c in coin_ids if c]  # Remove None
+            
+            if not coin_ids:
+                logger.warning("No coins to fetch from CoinGecko")
+                return {}
+            
+            # CoinGecko API - free, no API key needed
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(coin_ids)}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        result = {}
+                        # Reverse map CoinGecko data to symbols
+                        coingecko_to_symbol = {v: k for k, v in symbol_to_coingecko.items()}
+                        
+                        for coin_id, price_data in data.items():
+                            symbol = coingecko_to_symbol.get(coin_id)
+                            if symbol:
+                                # Format data similar to CCXT ticker
+                                price = price_data.get('usd', 0)
+                                change_pct = price_data.get('usd_24h_change', 0)
+                                volume = price_data.get('usd_24h_vol', 0)
+                                
+                                result[symbol] = {
+                                    'last': price,
+                                    'percentage': change_pct,
+                                    'quoteVolume': volume,
+                                    'high': price * 1.02,  # Approximate
+                                    'low': price * 0.98,   # Approximate
+                                }
+                        
+                        logger.info(f"Fetched {len(result)} tickers from CoinGecko fallback")
+                        return result
+                    else:
+                        logger.warning(f"CoinGecko API error: {response.status}")
+                        return {}
+                        
+        except Exception as e:
+            logger.error(f"CoinGecko fallback error: {e}")
             return {}
     
     async def scan_all_coins(self) -> list:
