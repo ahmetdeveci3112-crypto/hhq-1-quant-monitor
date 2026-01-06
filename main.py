@@ -630,6 +630,95 @@ class LightweightCoinAnalyzer:
         return None
 
 
+class BinanceWebSocketManager:
+    """
+    Binance Futures WebSocket Manager for real-time ticker data.
+    Uses !ticker@arr stream for all market tickers.
+    """
+    
+    def __init__(self):
+        self.ws = None
+        self.tickers: Dict[str, dict] = {}
+        self.running = False
+        self.connected = False
+        self.last_update = 0
+        self.ws_url = "wss://fstream.binance.com/ws/!ticker@arr"
+        self._reconnect_task = None
+        logger.info("BinanceWebSocketManager initialized")
+    
+    async def connect(self):
+        """Connect to Binance Futures WebSocket."""
+        import websockets
+        
+        while self.running:
+            try:
+                logger.info(f"Connecting to Binance WebSocket: {self.ws_url}")
+                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10) as ws:
+                    self.ws = ws
+                    self.connected = True
+                    logger.info("Connected to Binance WebSocket")
+                    
+                    async for message in ws:
+                        if not self.running:
+                            break
+                        
+                        try:
+                            data = json.loads(message)
+                            self._process_ticker_message(data)
+                        except json.JSONDecodeError:
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"Binance WebSocket error: {e}")
+                self.connected = False
+                if self.running:
+                    await asyncio.sleep(5)  # Reconnect after 5 seconds
+    
+    def _process_ticker_message(self, data: list):
+        """Process ticker array message from Binance."""
+        if not isinstance(data, list):
+            return
+            
+        for ticker in data:
+            symbol = ticker.get('s', '')  # Symbol
+            if not symbol.endswith('USDT'):
+                continue
+                
+            self.tickers[symbol] = {
+                'last': float(ticker.get('c', 0)),  # Close price
+                'percentage': float(ticker.get('P', 0)),  # Price change percent
+                'quoteVolume': float(ticker.get('q', 0)),  # Quote volume
+                'high': float(ticker.get('h', 0)),  # High
+                'low': float(ticker.get('l', 0)),  # Low
+                'timestamp': int(ticker.get('E', 0))  # Event time
+            }
+        
+        self.last_update = datetime.now().timestamp()
+    
+    def get_tickers(self, symbols: list = None) -> dict:
+        """Get current ticker data for specified symbols."""
+        if symbols is None:
+            return self.tickers
+        
+        return {s: self.tickers[s] for s in symbols if s in self.tickers}
+    
+    async def start(self):
+        """Start WebSocket connection."""
+        self.running = True
+        asyncio.create_task(self.connect())
+    
+    async def stop(self):
+        """Stop WebSocket connection."""
+        self.running = False
+        self.connected = False
+        if self.ws:
+            await self.ws.close()
+
+
+# Global WebSocket manager
+binance_ws_manager = BinanceWebSocketManager()
+
+
 class MultiCoinScanner:
     """
     Phase 31: Multi-Coin Scanner
@@ -734,26 +823,41 @@ class MultiCoinScanner:
         return self.analyzers[symbol]
     
     async def fetch_ticker_data(self, symbols: list) -> dict:
-        """Fetch ticker data for multiple symbols at once from Binance."""
+        """Fetch ticker data from WebSocket stream (instant, no API call)."""
+        global binance_ws_manager
+        
+        # Start WebSocket if not running
+        if not binance_ws_manager.running:
+            await binance_ws_manager.start()
+            # Wait a moment for initial data
+            await asyncio.sleep(2)
+        
+        # Get tickers from WebSocket cache
+        result = binance_ws_manager.get_tickers(symbols)
+        
+        if result:
+            logger.info(f"Got {len(result)} tickers from WebSocket (instant)")
+            return result
+        
+        # Fallback to REST API if WebSocket has no data yet
+        logger.warning("WebSocket has no data, falling back to REST API")
         try:
             if not self.exchange:
-                logger.warning("Exchange not initialized")
                 return {}
             
-            # Fetch all tickers at once (efficient batch request)
             tickers = await self.exchange.fetch_tickers()
             
-            result = {}
+            rest_result = {}
             for symbol in symbols:
-                ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"  # BTCUSDT -> BTC/USDT:USDT
+                ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
                 if ccxt_symbol in tickers:
-                    result[symbol] = tickers[ccxt_symbol]
+                    rest_result[symbol] = tickers[ccxt_symbol]
             
-            logger.info(f"Fetched {len(result)} tickers from Binance")
-            return result
+            logger.info(f"Fetched {len(rest_result)} tickers from REST API (fallback)")
+            return rest_result
             
         except Exception as e:
-            logger.error(f"Error fetching tickers from Binance: {e}")
+            logger.error(f"Error fetching tickers: {e}")
             return {}
     
     async def fetch_ticker_data_coingecko(self, symbols: list) -> dict:
@@ -942,7 +1046,7 @@ class MultiCoinScanner:
 
 
 # Global MultiCoinScanner instance
-multi_coin_scanner = MultiCoinScanner(max_coins=100)  # 100 for REST API stability
+multi_coin_scanner = MultiCoinScanner(max_coins=200)  # 200 with WebSocket (instant data)
 
 # ============================================================================
 # PHASE 30: SESSION-BASED TRADING
