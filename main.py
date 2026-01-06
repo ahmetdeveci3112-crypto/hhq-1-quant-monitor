@@ -942,7 +942,7 @@ class MultiCoinScanner:
 
 
 # Global MultiCoinScanner instance
-multi_coin_scanner = MultiCoinScanner(max_coins=200)
+multi_coin_scanner = MultiCoinScanner(max_coins=100)  # 100 for REST API stability
 
 # ============================================================================
 # PHASE 30: SESSION-BASED TRADING
