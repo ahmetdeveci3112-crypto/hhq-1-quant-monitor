@@ -651,10 +651,23 @@ class MultiCoinScanner:
         """Fetch all USDT perpetual contracts from Binance Futures."""
         try:
             if not self.exchange:
-                self.exchange = ccxt_async.binance({
+                # Use API keys from environment if available (fixes geo-blocking on Railway)
+                api_key = os.environ.get('BINANCE_API_KEY', '')
+                api_secret = os.environ.get('BINANCE_SECRET', '')
+                
+                exchange_config = {
                     'enableRateLimit': True,
                     'options': {'defaultType': 'future'}
-                })
+                }
+                
+                if api_key and api_secret:
+                    exchange_config['apiKey'] = api_key
+                    exchange_config['secret'] = api_secret
+                    logger.info("Using authenticated Binance API (with API key)")
+                else:
+                    logger.info("Using public Binance API (no API key)")
+                
+                self.exchange = ccxt_async.binance(exchange_config)
             
             markets = await self.exchange.load_markets()
             
@@ -855,7 +868,7 @@ class MultiCoinScanner:
 
 
 # Global MultiCoinScanner instance
-multi_coin_scanner = MultiCoinScanner(max_coins=50)
+multi_coin_scanner = MultiCoinScanner(max_coins=100)
 
 # ============================================================================
 # PHASE 30: SESSION-BASED TRADING
@@ -3363,7 +3376,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             await multi_coin_scanner.fetch_all_futures_symbols()
         
         multi_coin_scanner.running = True
-        scan_interval = 30  # Scan every 30 seconds (CoinGecko rate limit: ~10-50 req/min)
+        scan_interval = 15  # Scan every 15 seconds (with API key, rate limits are higher)
         
         # Send immediate initial message to prevent timeout
         await websocket.send_json({
