@@ -581,7 +581,7 @@ class LightweightCoinAnalyzer:
     
     def analyze(self, imbalance: float = 0) -> Optional[dict]:
         """Analyze coin and generate signal if conditions met."""
-        if len(self.prices) < 50:
+        if len(self.prices) < 20:  # Reduced from 50 to 20 for faster startup
             return None
             
         prices_list = list(self.prices)
@@ -734,12 +734,11 @@ class MultiCoinScanner:
         return self.analyzers[symbol]
     
     async def fetch_ticker_data(self, symbols: list) -> dict:
-        """Fetch ticker data for multiple symbols at once."""
+        """Fetch ticker data for multiple symbols at once from Binance."""
         try:
-            # If exchange is not available, go directly to CoinGecko fallback
             if not self.exchange:
-                logger.info("No exchange available, using CoinGecko fallback")
-                return await self.fetch_ticker_data_coingecko(symbols)
+                logger.warning("Exchange not initialized")
+                return {}
             
             # Fetch all tickers at once (efficient batch request)
             tickers = await self.exchange.fetch_tickers()
@@ -750,16 +749,12 @@ class MultiCoinScanner:
                 if ccxt_symbol in tickers:
                     result[symbol] = tickers[ccxt_symbol]
             
-            if not result:
-                logger.warning("No tickers from Binance, trying CoinGecko")
-                return await self.fetch_ticker_data_coingecko(symbols)
-                
+            logger.info(f"Fetched {len(result)} tickers from Binance")
             return result
             
         except Exception as e:
-            logger.warning(f"Error fetching tickers from Binance: {e}")
-            # Fallback: Try to get data from CoinGecko (no geo restrictions)
-            return await self.fetch_ticker_data_coingecko(symbols)
+            logger.error(f"Error fetching tickers from Binance: {e}")
+            return {}
     
     async def fetch_ticker_data_coingecko(self, symbols: list) -> dict:
         """Fallback: Fetch ticker data from CoinGecko API (no geo restrictions)."""
@@ -947,7 +942,7 @@ class MultiCoinScanner:
 
 
 # Global MultiCoinScanner instance
-multi_coin_scanner = MultiCoinScanner(max_coins=100)
+multi_coin_scanner = MultiCoinScanner(max_coins=200)
 
 # ============================================================================
 # PHASE 30: SESSION-BASED TRADING
@@ -1641,9 +1636,9 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            # RELAXED: 1.6 -> 1.2 Z-Score threshold, 75 -> 60 min score
-            base_threshold = 1.4  # Conservative: was 1.2, more selective
-            min_score_required = 68  # Conservative: was 60, more selective
+            # RELAXED settings for more signals
+            base_threshold = 1.2  # Relaxed: was 1.4, now more signals
+            min_score_required = 55  # Relaxed: was 68, now more signals
             is_backtest = False
         
         # Leverage Scaling:
