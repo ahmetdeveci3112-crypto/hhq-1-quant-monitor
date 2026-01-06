@@ -645,6 +645,10 @@ class MultiCoinScanner:
         self.last_fetch_time = 0
         self.opportunities: list = []
         self.active_signals: list = []
+        # Caching for rate limit protection
+        self.ticker_cache: dict = {}
+        self.ticker_cache_time: float = 0
+        self.cache_ttl: int = 30  # Cache valid for 30 seconds
         logger.info(f"MultiCoinScanner initialized (max_coins={max_coins})")
     
     async def fetch_all_futures_symbols(self) -> list:
@@ -741,6 +745,13 @@ class MultiCoinScanner:
     async def fetch_ticker_data_coingecko(self, symbols: list) -> dict:
         """Fallback: Fetch ticker data from CoinGecko API (no geo restrictions)."""
         import aiohttp
+        import time
+        
+        # Check cache first to prevent rate limits
+        current_time = time.time()
+        if self.ticker_cache and (current_time - self.ticker_cache_time) < self.cache_ttl:
+            logger.debug("Using cached ticker data")
+            return self.ticker_cache
         
         # Map symbols to CoinGecko IDs
         symbol_to_coingecko = {
@@ -793,14 +804,27 @@ class MultiCoinScanner:
                                     'low': price * 0.98,   # Approximate
                                 }
                         
+                        # Update cache
+                        if result:
+                            self.ticker_cache = result
+                            self.ticker_cache_time = current_time
+                        
                         logger.info(f"Fetched {len(result)} tickers from CoinGecko fallback")
                         return result
                     else:
                         logger.warning(f"CoinGecko API error: {response.status}")
+                        # Return cached data if available
+                        if self.ticker_cache:
+                            logger.info("Returning cached data due to API error")
+                            return self.ticker_cache
                         return {}
                         
         except Exception as e:
             logger.error(f"CoinGecko fallback error: {e}")
+            # Return cached data if available
+            if self.ticker_cache:
+                logger.info("Returning cached data due to exception")
+                return self.ticker_cache
             return {}
     
     async def scan_all_coins(self) -> list:
