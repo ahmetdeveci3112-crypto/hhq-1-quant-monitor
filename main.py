@@ -3556,11 +3556,26 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         multi_coin_scanner.running = True
         scan_interval = 10  # Scan every 10 seconds (Binance Futures - Amsterdam region)
         
-        # Send immediate initial message to prevent timeout
+        # Send current state immediately (important for page refresh)
+        # Build current opportunities from existing analyzers
+        current_opportunities = []
+        for symbol, analyzer in multi_coin_scanner.analyzers.items():
+            opp = analyzer.opportunity.to_dict()
+            if opp.get('price', 0) > 0:  # Only include coins with valid price
+                current_opportunities.append(opp)
+        
+        # Sort by signal score
+        current_opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
+        
+        # Get current stats
+        current_stats = multi_coin_scanner.get_scanner_stats() if multi_coin_scanner.coins else {
+            "totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0
+        }
+        
         await websocket.send_json({
             "type": "scanner_update",
-            "opportunities": [],
-            "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
+            "opportunities": current_opportunities[:100],  # Top 100 opportunities
+            "stats": current_stats,
             "portfolio": {
                 "balance": global_paper_trader.balance,
                 "positions": global_paper_trader.positions,
@@ -3570,8 +3585,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "enabled": global_paper_trader.enabled
             },
             "timestamp": datetime.now().timestamp(),
-            "message": "Scanner starting..."
+            "message": "State restored" if current_opportunities else "Scanner starting..."
         })
+        
+        logger.info(f"Sent initial state: {len(current_opportunities)} opportunities")
         
         while multi_coin_scanner.running and is_connected:
             try:
