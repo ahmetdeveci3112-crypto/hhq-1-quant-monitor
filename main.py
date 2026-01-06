@@ -3282,6 +3282,8 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Scanner WebSocket client connected")
     
+    is_connected = True
+    
     try:
         # Initialize scanner if needed
         if not multi_coin_scanner.coins:
@@ -3290,7 +3292,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         multi_coin_scanner.running = True
         scan_interval = 10  # Scan every 10 seconds
         
-        while multi_coin_scanner.running:
+        while multi_coin_scanner.running and is_connected:
             try:
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
@@ -3333,7 +3335,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 # Wait before next scan
                 await asyncio.sleep(scan_interval)
                 
+            except WebSocketDisconnect:
+                logger.info("Scanner WebSocket disconnected during loop")
+                is_connected = False
+                break
             except Exception as e:
+                if "close message" in str(e).lower() or "disconnect" in str(e).lower():
+                    logger.info("Scanner WebSocket connection closed")
+                    is_connected = False
+                    break
                 logger.error(f"Scanner loop error: {e}")
                 await asyncio.sleep(5)
                 
@@ -3343,6 +3353,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         logger.error(f"Scanner WebSocket error: {e}")
     finally:
         multi_coin_scanner.running = False
+        is_connected = False
 
 
 @app.websocket("/ws")
