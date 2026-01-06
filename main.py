@@ -696,14 +696,33 @@ class MultiCoinScanner:
             
         except Exception as e:
             logger.error(f"Error fetching futures symbols: {e}")
-            # Fallback to top 30 coins by market cap (hardcoded for Railway/restricted regions)
+            # Fallback to top 100 coins by market cap/volume
             self.coins = [
-                'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
-                'BNBUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
-                'MATICUSDT', 'LTCUSDT', 'ATOMUSDT', 'UNIUSDT', 'NEARUSDT',
-                'ARBUSDT', 'OPUSDT', 'APTUSDT', 'SUIUSDT', 'INJUSDT',
-                'FILUSDT', 'APTUSDT', 'LDOUSDT', 'RUNEUSDT', 'AAVEUSDT',
-                '1000PEPEUSDT', '1000SHIBUSDT', 'WIFUSDT', 'FETUSDT', 'RENDERUSDT'
+                # Top 20
+                'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+                'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'DOTUSDT',
+                'LINKUSDT', 'MATICUSDT', 'ICPUSDT', 'SHIBUSDT', 'LTCUSDT',
+                'BCHUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT', 'XLMUSDT',
+                # 21-40
+                'APTUSDT', 'FILUSDT', 'LDOUSDT', 'ARBUSDT', 'OPUSDT',
+                'INJUSDT', 'RNDRUSDT', 'HBARUSDT', 'VETUSDT', 'AAVEUSDT',
+                'IMXUSDT', 'MKRUSDT', 'GRTUSDT', 'THETAUSDT', 'FTMUSDT',
+                'ALGOUSDT', 'RUNEUSDT', 'EGLDUSDT', 'SNXUSDT', 'AXSUSDT',
+                # 41-60
+                'SANDUSDT', 'MANAUSDT', 'GALAUSDT', 'APEUSDT', 'CHZUSDT',
+                'CRVUSDT', 'LRCUSDT', 'ENJUSDT', 'DYDXUSDT', 'MINAUSDT',
+                'KAVAUSDT', 'COMPUSDT', 'GMTUSDT', 'ONEUSDT', 'IOTAUSDT',
+                'ZECUSDT', 'KSMUSDT', 'DASHUSDT', 'SUIUSDT', 'SEIUSDT',
+                # 61-80  
+                '1000PEPEUSDT', '1000SHIBUSDT', 'WIFUSDT', 'BONKUSDT', 'FLOKIUSDT',
+                'ORDIUSDT', 'TIAUSDT', 'FETUSDT', 'AGIXUSDT', 'OCEANUSDT',
+                'WOOUSDT', 'BLURUSDT', 'CFXUSDT', 'STXUSDT', 'ARKMUSDT',
+                'PENDLEUSDT', 'JOEUSDT', 'HOOKUSDT', 'MAGICUSDT', 'TUSDT',
+                # 81-100
+                'CKBUSDT', 'TRUUSDT', 'SSVUSDT', 'RPLUSDT', 'GMXUSDT',
+                'LEVERUSDT', 'CYBERUSDT', 'ARKUSDT', 'POLYXUSDT', 'BIGTIMEUSDT',
+                'WLDUSDT', 'LQTYUSDT', 'OXTUSDT', 'AMBUSDT', 'PHBUSDT',
+                'COMBOUSDT', 'MAVUSDT', 'XVSUSDT', 'EDUUSDT', 'IDUSDT'
             ]
             logger.info(f"Using fallback list of {len(self.coins)} coins")
             return self.coins
@@ -753,18 +772,48 @@ class MultiCoinScanner:
             logger.debug("Using cached ticker data")
             return self.ticker_cache
         
-        # Map symbols to CoinGecko IDs
+        # Map symbols to CoinGecko IDs (100 coins)
         symbol_to_coingecko = {
-            'BTCUSDT': 'bitcoin', 'ETHUSDT': 'ethereum', 'SOLUSDT': 'solana',
-            'XRPUSDT': 'ripple', 'DOGEUSDT': 'dogecoin', 'BNBUSDT': 'binancecoin',
-            'ADAUSDT': 'cardano', 'AVAXUSDT': 'avalanche-2', 'DOTUSDT': 'polkadot',
-            'LINKUSDT': 'chainlink', 'MATICUSDT': 'matic-network', 'LTCUSDT': 'litecoin',
-            'ATOMUSDT': 'cosmos', 'UNIUSDT': 'uniswap', 'NEARUSDT': 'near',
-            'ARBUSDT': 'arbitrum', 'OPUSDT': 'optimism', 'APTUSDT': 'aptos',
-            'SUIUSDT': 'sui', 'INJUSDT': 'injective-protocol', 'FILUSDT': 'filecoin',
-            'LDOUSDT': 'lido-dao', 'RUNEUSDT': 'thorchain', 'AAVEUSDT': 'aave',
+            # Top 20
+            'BTCUSDT': 'bitcoin', 'ETHUSDT': 'ethereum', 'BNBUSDT': 'binancecoin',
+            'SOLUSDT': 'solana', 'XRPUSDT': 'ripple', 'DOGEUSDT': 'dogecoin',
+            'ADAUSDT': 'cardano', 'AVAXUSDT': 'avalanche-2', 'TRXUSDT': 'tron',
+            'DOTUSDT': 'polkadot', 'LINKUSDT': 'chainlink', 'MATICUSDT': 'matic-network',
+            'ICPUSDT': 'internet-computer', 'SHIBUSDT': 'shiba-inu', 'LTCUSDT': 'litecoin',
+            'BCHUSDT': 'bitcoin-cash', 'UNIUSDT': 'uniswap', 'ATOMUSDT': 'cosmos',
+            'NEARUSDT': 'near', 'XLMUSDT': 'stellar',
+            # 21-40
+            'APTUSDT': 'aptos', 'FILUSDT': 'filecoin', 'LDOUSDT': 'lido-dao',
+            'ARBUSDT': 'arbitrum', 'OPUSDT': 'optimism', 'INJUSDT': 'injective-protocol',
+            'RNDRUSDT': 'render-token', 'HBARUSDT': 'hedera-hashgraph', 'VETUSDT': 'vechain',
+            'AAVEUSDT': 'aave', 'IMXUSDT': 'immutable-x', 'MKRUSDT': 'maker',
+            'GRTUSDT': 'the-graph', 'THETAUSDT': 'theta-token', 'FTMUSDT': 'fantom',
+            'ALGOUSDT': 'algorand', 'RUNEUSDT': 'thorchain', 'EGLDUSDT': 'elrond-erd-2',
+            'SNXUSDT': 'havven', 'AXSUSDT': 'axie-infinity',
+            # 41-60
+            'SANDUSDT': 'the-sandbox', 'MANAUSDT': 'decentraland', 'GALAUSDT': 'gala',
+            'APEUSDT': 'apecoin', 'CHZUSDT': 'chiliz', 'CRVUSDT': 'curve-dao-token',
+            'LRCUSDT': 'loopring', 'ENJUSDT': 'enjincoin', 'DYDXUSDT': 'dydx',
+            'MINAUSDT': 'mina-protocol', 'KAVAUSDT': 'kava', 'COMPUSDT': 'compound-governance-token',
+            'GMTUSDT': 'stepn', 'ONEUSDT': 'harmony', 'IOTAUSDT': 'iota',
+            'ZECUSDT': 'zcash', 'KSMUSDT': 'kusama', 'DASHUSDT': 'dash',
+            'SUIUSDT': 'sui', 'SEIUSDT': 'sei-network',
+            # 61-80
             '1000PEPEUSDT': 'pepe', '1000SHIBUSDT': 'shiba-inu', 'WIFUSDT': 'dogwifhat',
-            'FETUSDT': 'fetch-ai', 'RENDERUSDT': 'render-token'
+            'BONKUSDT': 'bonk', 'FLOKIUSDT': 'floki', 'ORDIUSDT': 'ordinals',
+            'TIAUSDT': 'celestia', 'FETUSDT': 'fetch-ai', 'AGIXUSDT': 'singularitynet',
+            'OCEANUSDT': 'ocean-protocol', 'WOOUSDT': 'woo-network', 'BLURUSDT': 'blur',
+            'CFXUSDT': 'conflux-token', 'STXUSDT': 'blockstack', 'ARKMUSDT': 'arkham',
+            'PENDLEUSDT': 'pendle', 'JOEUSDT': 'joe', 'HOOKUSDT': 'hooked-protocol',
+            'MAGICUSDT': 'magic', 'TUSDT': 'threshold-network-token',
+            # 81-100
+            'CKBUSDT': 'nervos-network', 'TRUUSDT': 'truefi', 'SSVUSDT': 'ssv-network',
+            'RPLUSDT': 'rocket-pool', 'GMXUSDT': 'gmx', 'LEVERUSDT': 'leverfi',
+            'CYBERUSDT': 'cyberconnect', 'ARKUSDT': 'ark', 'POLYXUSDT': 'polymesh',
+            'BIGTIMEUSDT': 'big-time', 'WLDUSDT': 'worldcoin-wld', 'LQTYUSDT': 'liquity',
+            'OXTUSDT': 'orchid-protocol', 'AMBUSDT': 'amber', 'PHBUSDT': 'phoenix-global',
+            'COMBOUSDT': 'furucombo', 'MAVUSDT': 'maverick-protocol', 'XVSUSDT': 'venus',
+            'EDUUSDT': 'edu-coin', 'IDUSDT': 'space-id'
         }
         
         try:
