@@ -713,8 +713,10 @@ class MultiCoinScanner:
     async def fetch_ticker_data(self, symbols: list) -> dict:
         """Fetch ticker data for multiple symbols at once."""
         try:
+            # If exchange is not available, go directly to CoinGecko fallback
             if not self.exchange:
-                return {}
+                logger.info("No exchange available, using CoinGecko fallback")
+                return await self.fetch_ticker_data_coingecko(symbols)
             
             # Fetch all tickers at once (efficient batch request)
             tickers = await self.exchange.fetch_tickers()
@@ -725,6 +727,10 @@ class MultiCoinScanner:
                 if ccxt_symbol in tickers:
                     result[symbol] = tickers[ccxt_symbol]
             
+            if not result:
+                logger.warning("No tickers from Binance, trying CoinGecko")
+                return await self.fetch_ticker_data_coingecko(symbols)
+                
             return result
             
         except Exception as e:
