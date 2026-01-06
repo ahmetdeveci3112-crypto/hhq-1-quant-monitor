@@ -5,12 +5,12 @@ import {
   BarChart3, TrendingUp, TrendingDown, ArrowUpRight, ArrowDownRight,
   AlertTriangle, CheckCircle2, XCircle, Terminal, Zap, LineChart,
   ChevronDown, Layers, Wind, ShieldAlert, Target, Info, Network,
-  Radio, RotateCcw, Waves, Search
+  Radio, RotateCcw, Waves, Search, Radar
 } from 'lucide-react';
 import {
   MarketRegime, SystemState, TradeSignal, LiquidationEvent, OrderBookState,
   Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
-  BackendUpdate, BackendSignal, PendingOrder
+  BackendUpdate, BackendSignal, PendingOrder, CoinOpportunity, ScannerStats, ScannerUpdate
 } from './types';
 import { formatPrice, formatCurrency } from './utils';
 import { HurstPanel } from './components/HurstPanel';
@@ -22,11 +22,13 @@ import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
 import { BacktestPanel } from './components/BacktestPanel';
 import { SMCPanel } from './components/SMCPanel';
+import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
+import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 
-// Backend WebSocket URL
-// Backend WebSocket URL
+// Backend WebSocket URLs
 // VITE_WS_URL will be provided by Vercel Environment Variables
 const BACKEND_WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_WS_URL?.replace('/ws', '/ws/scanner') || 'ws://localhost:8000/ws/scanner';
 const BACKEND_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const INITIAL_STATE: SystemState = {
@@ -98,6 +100,17 @@ export default function App() {
     stats: INITIAL_STATS
   });
 
+  // Phase 31: Multi-Coin Scanner State
+  const [opportunities, setOpportunities] = useState<CoinOpportunity[]>([]);
+  const [scannerStats, setScannerStats] = useState<ScannerStats>({
+    totalCoins: 0,
+    analyzedCoins: 0,
+    longSignals: 0,
+    shortSignals: 0,
+    activeSignals: 0,
+    lastUpdate: 0
+  });
+
   // Pending Orders State (Pullback Entries)
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
 
@@ -126,6 +139,46 @@ export default function App() {
   // Phase 16: Auto-trade enabled state
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
+
+  // Phase 31: Fetch initial state from backend on page load (24/7 sync)
+  useEffect(() => {
+    const fetchInitialState = async () => {
+      try {
+        const res = await fetch(`${BACKEND_API_URL}/paper-trading/status`);
+        if (res.ok) {
+          const data = await res.json();
+
+          // Sync portfolio state
+          setPortfolio({
+            balanceUsd: data.balance || 10000,
+            initialBalance: 10000,
+            positions: data.positions || [],
+            trades: data.trades || [],
+            equityCurve: data.equityCurve || [],
+            stats: data.stats || INITIAL_STATS
+          });
+
+          // Sync auto trade state
+          setAutoTradeEnabled(data.enabled);
+
+          // Sync logs
+          if (data.logs && data.logs.length > 0) {
+            const formattedLogs = data.logs.map((log: { time: string; message: string }) =>
+              `[${log.time}] ☁️ ${log.message}`
+            );
+            setLogs(formattedLogs.reverse());
+          }
+
+          setIsSynced(true);
+          console.log('📡 Initial state synced from backend');
+        }
+      } catch (e) {
+        console.error('Failed to fetch initial state:', e);
+      }
+    };
+
+    fetchInitialState();
+  }, []);
 
   // Phase 16: API Control Functions
   const handleManualClose = useCallback(async (positionId: string) => {
@@ -310,7 +363,7 @@ export default function App() {
   }, [addLog, portfolio]);
 
   // ============================================================================
-  // WEBSOCKET CONNECTION
+  // WEBSOCKET CONNECTION - PHASE 31: MULTI-COIN SCANNER
   // ============================================================================
 
   useEffect(() => {
@@ -326,130 +379,71 @@ export default function App() {
       return;
     }
 
-    if (!selectedCoin) return; // Wait for coin to be loaded/synced
-
     const connectWebSocket = () => {
       // Cleanup existing connection if any
       if (wsRef.current) {
         wsRef.current.close();
       }
 
-      const wsUrl = `${BACKEND_WS_URL}?symbol=${selectedCoin}`;
-      wsHandlersRef.current.addLog(`Bağlanıyor: ${wsUrl}`);
+      // Phase 31: Use scanner WebSocket for multi-coin scanning
+      const wsUrl = BACKEND_SCANNER_WS_URL;
+      wsHandlersRef.current.addLog(`🔍 Scanner bağlanıyor: ${wsUrl}`);
       setConnectionError(null);
 
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        wsHandlersRef.current.addLog("🟢 Python Backend Bağlandı (HHQ-1 v2.0)");
+        wsHandlersRef.current.addLog("🟢 Multi-Coin Scanner Bağlandı (Phase 31)");
         setConnectionError(null);
       };
 
       ws.onmessage = (event) => {
         const handlers = wsHandlersRef.current;
         try {
-          const data: BackendUpdate = JSON.parse(event.data);
+          const data = JSON.parse(event.data);
 
-          if (data.type === 'update') {
-            const { price, metrics, orderBook: ob, liquidation, signal } = data;
+          // Phase 31: Handle scanner update
+          if (data.type === 'scanner_update') {
+            // Update opportunities
+            if (data.opportunities) {
+              setOpportunities(data.opportunities);
+            }
 
-            // Update system state
-            setSystemState({
-              currentPrice: price,
-              hurstExponent: metrics.hurst,
-              marketRegime: parseRegime(metrics.regime),
-              zScore: metrics.zScore,
-              spread: metrics.spread,
-              atr: metrics.atr,
-              activeLiquidationCascade: !!liquidation?.isCascade,
-              whaleZ: metrics.whale_z,
-              smc: data.smc,
-              pivots: data.pivots
-            });
+            // Update scanner stats
+            if (data.stats) {
+              setScannerStats(data.stats);
+            }
 
-            // Update order book
-            if (ob) {
-              setOrderBook({
-                bids: ob.bids || [],
-                asks: ob.asks || [],
-                imbalance: ob.imbalance || 0
+            // Update portfolio from scanner
+            if (data.portfolio) {
+              const pf = data.portfolio;
+              setPortfolio({
+                balanceUsd: pf.balance || 10000,
+                initialBalance: 10000,
+                positions: pf.positions || [],
+                trades: pf.trades || [],
+                equityCurve: [],
+                stats: pf.stats || INITIAL_STATS
               });
-            }
 
-            // Handle liquidation events
-            if (liquidation) {
-              setLiquidations(prev => [{
-                id: generateId(),
-                symbol: selectedCoin,
-                side: liquidation.side === 'SELL' ? 'SATIM' : 'ALIM',
-                amountUsd: liquidation.amount,
-                price: liquidation.price,
-                timestamp: Date.now(),
-                isReal: true,
-                isCascade: liquidation.isCascade
-              }, ...prev].slice(0, 50));
-
-              if (liquidation.isCascade) {
-                handlers.addLog(`🔥 LİKİDASYON CASCADE: $${(liquidation.amount / 1000).toFixed(0)}k @${formatPrice(liquidation.price)}`);
+              // Update autoTradeEnabled
+              if (pf.enabled !== undefined) {
+                setAutoTradeEnabled(pf.enabled);
               }
-            }
 
-            // Handle trading signals from backend
-            if (signal && signal.timestamp !== lastSignalRef.current?.timestamp) {
-              lastSignalRef.current = signal;
+              // Update logs from scanner
+              if (pf.logs && pf.logs.length > 0) {
+                setLogs(prev => {
+                  const newLogs = pf.logs
+                    .filter((log: { message: string }) => !prev.some(p => p.includes(log.message)))
+                    .map((log: { time: string; message: string }) => `[${log.time}] ☁️ ${log.message}`);
 
-              // Add to signals list
-              setSignals(prev => [{
-                id: generateId(),
-                timestamp: Date.now(),
-                pair: selectedCoin,
-                type: signal.action === 'LONG' ? 'UZUN (LONG)' : 'KISA (SHORT)',
-                reason: signal.reason,
-                status: 'İŞLENDİ',
-                price: price
-              }, ...prev].slice(0, 20));
-
-              // Phase 15 & 21: Handle Portfolio Update from Backend (Live)
-              if (data.portfolio) {
-                const pf = data.portfolio as any;
-                setPortfolio({
-                  balanceUsd: pf.balance || pf.balanceUsd || 10000,
-                  initialBalance: 10000,
-                  positions: pf.positions || [],
-                  trades: pf.trades || [],
-                  equityCurve: pf.equityCurve || [],
-                  stats: pf.stats || INITIAL_STATS
+                  if (newLogs.length > 0) {
+                    return [...newLogs.reverse(), ...prev].slice(0, 100);
+                  }
+                  return prev;
                 });
-
-                // Phase 21: Live cloud logs update
-                if (pf.logs && pf.logs.length > 0) {
-                  // Use timestamp (ts) for more accurate deduplication
-                  setLogs(prev => {
-                    // Extract existing timestamps from log strings (stored in data attribute)
-                    const lastCloudLog = pf.logs[pf.logs.length - 1];
-                    const lastTs = lastCloudLog?.ts || 0;
-
-                    // Check if we already have this log (by checking if last cloud log is newer)
-                    const hasNewerLogs = !prev.some(l => l.includes(lastCloudLog?.message || '___NOTFOUND___'));
-
-                    if (hasNewerLogs && lastCloudLog) {
-                      // Only add truly new logs
-                      const newLogs = pf.logs
-                        .filter((log: { message: string }) => !prev.some(p => p.includes(log.message)))
-                        .map((log: { time: string; message: string }) => `[${log.time}] ☁️ ${log.message}`);
-
-                      if (newLogs.length > 0) {
-                        return [...newLogs.reverse(), ...prev].slice(0, 100);
-                      }
-                    }
-                    return prev;
-                  });
-                }
-
-                // Phase 21: Coin sync REMOVED - user controls coin selection exclusively
-                // cloudSymbol is informational only, not used to override user's choice
               }
-
             }
           }
         } catch (e) {
@@ -458,11 +452,9 @@ export default function App() {
       };
 
       ws.onclose = () => {
-        wsHandlersRef.current.addLog("🔴 Bağlantı kesildi.");
+        wsHandlersRef.current.addLog("🔴 Scanner bağlantısı kesildi.");
         if (isRunning) {
-          // wsHandlersRef.current.addLog("🔄 3 saniye sonra yeniden bağlanılacak...");
           reconnectTimeoutRef.current = setTimeout(() => {
-            // Check ref directly
             if (wsRef.current) return;
             connectWebSocket();
           }, 3000);
@@ -470,8 +462,8 @@ export default function App() {
       };
 
       ws.onerror = () => {
-        setConnectionError("Backend'e bağlanılamadı. Python sunucusunun çalıştığından emin olun.");
-        wsHandlersRef.current.addLog("🔴 Bağlantı Hatası! Backend aktif mi kontrol edin.");
+        setConnectionError("Scanner backend'e bağlanılamadı. Python sunucusunun çalıştığından emin olun.");
+        wsHandlersRef.current.addLog("🔴 Scanner Bağlantı Hatası!");
       };
 
       wsRef.current = ws;
@@ -483,7 +475,7 @@ export default function App() {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     };
-  }, [isRunning, selectedCoin]);
+  }, [isRunning]);
 
   // Periodic equity curve update
   useEffect(() => {
@@ -491,19 +483,27 @@ export default function App() {
 
     const interval = setInterval(() => {
       setPortfolio(prev => {
+        // Safety check for empty equityCurve
+        if (!prev.equityCurve || prev.equityCurve.length === 0) {
+          return {
+            ...prev,
+            equityCurve: [{ time: Date.now(), balance: prev.balanceUsd || 10000, drawdown: 0 }]
+          };
+        }
+
         const lastPoint = prev.equityCurve[prev.equityCurve.length - 1];
-        const currentEquity = prev.balanceUsd +
-          prev.positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
+        const currentEquity = (prev.balanceUsd || 10000) +
+          (prev.positions || []).reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
 
         // Only add new point if significant change or every minute
-        if (Math.abs(currentEquity - lastPoint.balance) > 10 ||
-          Date.now() - lastPoint.time > 60000) {
+        if (!lastPoint || Math.abs(currentEquity - (lastPoint.balance || 0)) > 10 ||
+          Date.now() - (lastPoint.time || 0) > 60000) {
           return {
             ...prev,
             equityCurve: [...prev.equityCurve, {
               time: Date.now(),
               balance: currentEquity,
-              drawdown: prev.stats.maxDrawdown
+              drawdown: prev.stats?.maxDrawdown || 0
             }].slice(-500) // Keep last 500 points
           };
         }
@@ -545,59 +545,22 @@ export default function App() {
 
           <div className="h-8 w-px bg-slate-800 mx-2"></div>
 
-          {/* Coin Selector */}
-          {/* Coin Selector */}
-          <div className="relative">
-            <button
-              onClick={() => setShowCoinMenu(!showCoinMenu)}
-              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${showCoinMenu ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-300'} `}
-            >
-              <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${(selectedCoin || 'BTCUSDT').replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
-              <span className="font-bold text-white">{selectedCoin || 'Loading...'}</span>
-              <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform ${showCoinMenu ? 'rotate-180' : ''}`} />
-            </button>
-
-            {/* Dropdown Menu */}
-            {
-              showCoinMenu && (
-                <>
-                  {/* Click Outside Backdrop - High Z-index */}
-                  <div className="fixed inset-0 z-[9998]" onClick={() => setShowCoinMenu(false)}></div>
-
-                  {/* Menu Items - Highest Z-index */}
-                  <div className="absolute top-full left-0 mt-2 w-48 bg-[#151921] border border-slate-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-[9999]">
-                    {COINS.map(coin => (
-                      <button
-                        key={coin}
-                        onClick={() => handleChangeCoin(coin)}
-                        className={`w-full text-left px-4 py-3 text-sm hover:bg-slate-800 flex items-center gap-3 ${selectedCoin === coin ? 'text-indigo-400 bg-indigo-500/10' : 'text-slate-400'}`}
-                      >
-                        <img src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${coin.replace('USDT', '').toLowerCase()}.png`} className="w-5 h-5" alt="" />
-                        {coin}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )
-            }
+          {/* Phase 31: Scanner Stats Indicator (Replaces Coin Selector) */}
+          <div className="flex items-center gap-3 px-4 py-2 bg-slate-800/50 rounded-lg border border-slate-700">
+            <Radar className="w-5 h-5 text-indigo-400 animate-pulse" />
+            <div className="flex items-center gap-4 text-xs">
+              <span className="text-slate-400">
+                <span className="font-bold text-white">{scannerStats.totalCoins}</span> Coin
+              </span>
+              <span className="text-emerald-400">
+                🟢 <span className="font-bold">{scannerStats.longSignals}</span>
+              </span>
+              <span className="text-rose-400">
+                🔴 <span className="font-bold">{scannerStats.shortSignals}</span>
+              </span>
+            </div>
           </div>
         </div>
-
-
-        <nav className="flex items-center bg-slate-900 rounded-lg p-1 border border-slate-800">
-          <button
-            onClick={() => setActiveTab('live')}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'live' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
-          >
-            Live Trading
-          </button>
-          <button
-            onClick={() => setActiveTab('backtest')}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'backtest' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
-          >
-            Backtest Lab
-          </button>
-        </nav>
 
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-6 mr-4 border-r border-slate-800 pr-6">
@@ -651,255 +614,179 @@ export default function App() {
       </header >
 
       {/* Main Content */}
-      < main className="pt-24 px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]" >
-        {activeTab === 'live' ? (
-          <div className="grid grid-cols-12 gap-6 h-full">
+      <main className="pt-24 px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+        <div className="grid grid-cols-12 gap-6 h-full">
 
-            {/* LEFT COLUMN: Market Data & Chart (8 cols) */}
-            <div className="col-span-12 lg:col-span-8 flex flex-col gap-6">
+          {/* LEFT COLUMN: Market Data & Chart (8 cols) */}
+          <div className="col-span-12 lg:col-span-8 flex flex-col gap-6">
 
-              {/* Top Row: Key Metrics Cards */}
-              <div className="grid grid-cols-4 gap-4">
-                {/* Hurst Exponent */}
-                <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                  <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Market Regime</h3>
-                  <div className="text-lg font-bold text-white mb-1">
-                    {systemState.hurstExponent > 0.55 ? 'Trending' : systemState.hurstExponent < 0.45 ? 'Mean Rev' : 'Random'}
-                  </div>
-                  <div className="text-xs font-mono text-indigo-400">H: {systemState.hurstExponent.toFixed(2)}</div>
+            {/* Top Row: Key Metrics Cards */}
+            <div className="grid grid-cols-4 gap-4">
+              {/* Hurst Exponent */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
+                <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Market Regime</h3>
+                <div className="text-lg font-bold text-white mb-1">
+                  {systemState.hurstExponent > 0.55 ? 'Trending' : systemState.hurstExponent < 0.45 ? 'Mean Rev' : 'Random'}
                 </div>
+                <div className="text-xs font-mono text-indigo-400">H: {systemState.hurstExponent.toFixed(2)}</div>
+              </div>
 
-                {/* Price & ATR */}
-                <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Current Price</h3>
-                  <div className="text-lg font-bold text-white mb-1 font-mono">${formatPrice(systemState.currentPrice)}</div>
-                  <div className="text-xs text-slate-500">ATR: <span className="text-white">${systemState.atr.toFixed(4)}</span></div>
-                </div>
+              {/* Price & ATR */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Current Price</h3>
+                <div className="text-lg font-bold text-white mb-1 font-mono">${formatPrice(systemState.currentPrice)}</div>
+                <div className="text-xs text-slate-500">ATR: <span className="text-white">${systemState.atr.toFixed(4)}</span></div>
+              </div>
 
-                {/* Spread & Z-Score */}
-                <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Spread / Z</h3>
-                  <div className="flex items-center justify-between">
-                    <div className="text-lg font-bold text-white font-mono">{systemState.spread.toFixed(2)}%</div>
-                    <div className={`text-md font-bold px-2 py-0.5 rounded ${systemState.zScore > 2 ? 'bg-emerald-500/20 text-emerald-400' : systemState.zScore < -2 ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-800 text-slate-400'}`}>
-                      Z: {systemState.zScore.toFixed(2)}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Active Positions Count */}
-                <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Active Positions</h3>
-                  <div className="flex items-center gap-3">
-                    <div className="text-2xl font-bold text-white">{portfolio.positions.length}</div>
-                    {portfolio.positions.length > 0 && (
-                      <div className="text-xs font-bold text-emerald-400 animate-pulse">● LIVE</div>
-                    )}
+              {/* Spread & Z-Score */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Spread / Z</h3>
+                <div className="flex items-center justify-between">
+                  <div className="text-lg font-bold text-white font-mono">{systemState.spread.toFixed(2)}%</div>
+                  <div className={`text-md font-bold px-2 py-0.5 rounded ${systemState.zScore > 2 ? 'bg-emerald-500/20 text-emerald-400' : systemState.zScore < -2 ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-800 text-slate-400'}`}>
+                    Z: {systemState.zScore.toFixed(2)}
                   </div>
                 </div>
               </div>
 
-              {/* TradingView Chart with Trade Overlay */}
-              <div className="flex-1 min-h-[450px] max-h-[600px] bg-[#151921] border border-slate-800 rounded-2xl overflow-hidden shadow-xl relative">
-                <iframe
-                  src={`https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=BINANCE:${selectedCoin}&interval=15&hidesidetoolbar=1&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=[]&theme=dark&style=1&timezone=Etc%2FUTC`}
-                  className="w-full h-full border-0 absolute inset-0"
-                />
-
-                {/* Trade Markers Overlay */}
-                <div className="absolute top-2 left-2 z-10 flex flex-col gap-1.5 pointer-events-none">
-                  {/* Current Positions */}
+              {/* Active Positions Count */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Active Positions</h3>
+                <div className="flex items-center gap-3">
+                  <div className="text-2xl font-bold text-white">{portfolio.positions.length}</div>
                   {portfolio.positions.length > 0 && (
-                    <div className="bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50">
-                      <div className="text-[10px] text-slate-400 mb-1.5 font-semibold uppercase tracking-wide">Açık Pozisyonlar</div>
-                      {portfolio.positions.map((pos, i) => (
-                        <div key={i} className="flex items-center gap-2 text-xs mb-1 last:mb-0">
-                          <span className={`w-2 h-2 rounded-full ${pos.side === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'} animate-pulse`} />
-                          <span className={`font-bold ${pos.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{pos.side}</span>
-                          <span className="text-slate-500">@</span>
-                          <span className="text-white font-mono">${formatPrice(pos.entryPrice)}</span>
-                          <span className={`ml-1 ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
-                          </span>
-                          {pos.spreadLevel && (
-                            <span className="text-[9px] bg-indigo-500/20 text-indigo-400 px-1.5 rounded ml-1">{pos.spreadLevel}</span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Last 3 Trades */}
-                  {portfolio.trades.length > 0 && (
-                    <div className="bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50 max-w-[280px]">
-                      <div className="text-[10px] text-slate-400 mb-1.5 font-semibold uppercase tracking-wide">Son İşlemler</div>
-                      {portfolio.trades.slice(-3).reverse().map((trade, i) => (
-                        <div key={i} className="flex items-center gap-1.5 text-[10px] mb-1 last:mb-0">
-                          <span className={`${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {trade.pnl >= 0 ? '✓' : '✗'}
-                          </span>
-                          <span className={`font-medium ${trade.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{trade.side}</span>
-                          <span className="text-slate-500">→</span>
-                          <span className={`font-mono ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
-                          </span>
-                          <span className="text-slate-600 text-[9px] ml-1">{trade.reason}</span>
-                        </div>
-                      ))}
-                    </div>
+                    <div className="text-xs font-bold text-emerald-400 animate-pulse">● LIVE</div>
                   )}
                 </div>
+              </div>
+            </div>
 
-                {/* Support/Resistance Indicator */}
-                {lastSignalRef.current && (
-                  <div className="absolute top-2 right-2 z-10 bg-black/80 backdrop-blur-sm rounded-lg px-3 py-2 border border-slate-700/50 pointer-events-none">
-                    <div className="text-[10px] text-slate-400 mb-1 font-semibold uppercase tracking-wide">Son Sinyal</div>
-                    <div className="flex items-center gap-2">
-                      <span className={`text-sm font-bold ${lastSignalRef.current.action === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {lastSignalRef.current.action === 'LONG' ? '▲' : '▼'} {lastSignalRef.current.action}
-                      </span>
-                      {(lastSignalRef.current as any).spreadLevel && (
-                        <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1.5 rounded">{(lastSignalRef.current as any).spreadLevel}</span>
-                      )}
-                    </div>
-                    {(lastSignalRef.current as any).pullbackPct !== undefined && (
-                      <div className="text-[9px] text-slate-500 mt-1">
-                        Pullback: {(lastSignalRef.current as any).pullbackPct}% | Lev: {(lastSignalRef.current as any).leverage}x
-                      </div>
+            {/* Phase 31: Opportunities Dashboard (Replaces TradingView Chart) */}
+            <OpportunitiesDashboard
+              opportunities={opportunities}
+              isLoading={isRunning && opportunities.length === 0}
+            />
+
+            {/* Recent Trades Table */}
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-bold text-white flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-indigo-500" />
+                  Recent Trades History
+                </h3>
+                <div className="text-xs text-slate-500">Last 5 Trades</div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                  <thead>
+                    <tr className="text-slate-500 border-b border-slate-800">
+                      <th className="pb-3 pl-2 font-medium">Time</th>
+                      <th className="pb-3 font-medium">Type</th>
+                      <th className="pb-3 font-medium">Entry</th>
+                      <th className="pb-3 font-medium">Exit</th>
+                      <th className="pb-3 font-medium">PnL</th>
+                      <th className="pb-3 font-medium text-right pr-2">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {portfolio.trades.slice().reverse().slice(0, 5).map((trade, i) => (
+                      <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
+                        <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString()}</td>
+                        <td className="py-3">
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
+                            {trade.side}
+                          </span>
+                        </td>
+                        <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.entryPrice)}</td>
+                        <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.exitPrice)}</td>
+                        <td className={`py-3 font-mono font-bold text-xs ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
+                        </td>
+                        <td className="py-3 text-right pr-2 text-xs text-slate-500 uppercase">{trade.closeReason}</td>
+                      </tr>
+                    ))}
+                    {portfolio.trades.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="py-8 text-center text-slate-600 italic">No trades recorded yet.</td>
+                      </tr>
                     )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT COLUMN: Positions, Logs, Analysis (4 cols) */}
+          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
+
+            {/* Active Signals Panel - Phase 31 */}
+            <ActiveSignalsPanel signals={opportunities} />
+
+            {/* Active Positions Panel */}
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col gap-4">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800/50">
+                <h3 className="font-bold text-white flex items-center gap-2">
+                  <Zap className="w-5 h-5 text-amber-500" />
+                  Active Positions
+                </h3>
+              </div>
+              <div className="flex flex-col gap-3 min-h-[100px]">
+                {portfolio.positions.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center flex-1 py-8 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
+                    <Wallet className="w-8 h-8 mb-2 opacity-30" />
+                    <span className="text-sm">No Open Positions</span>
                   </div>
+                ) : (
+                  portfolio.positions.map(pos => (
+                    <PositionPanel
+                      key={pos.id}
+                      position={pos}
+                      currentPrice={systemState.currentPrice}
+                      onClosePosition={() => handleManualClose(pos.id)}
+                    />
+                  ))
                 )}
               </div>
-
-              {/* Recent Trades Table */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="font-bold text-white flex items-center gap-2">
-                    <BarChart3 className="w-5 h-5 text-indigo-500" />
-                    Recent Trades History
-                  </h3>
-                  <div className="text-xs text-slate-500">Last 5 Trades</div>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm text-left">
-                    <thead>
-                      <tr className="text-slate-500 border-b border-slate-800">
-                        <th className="pb-3 pl-2 font-medium">Time</th>
-                        <th className="pb-3 font-medium">Type</th>
-                        <th className="pb-3 font-medium">Entry</th>
-                        <th className="pb-3 font-medium">Exit</th>
-                        <th className="pb-3 font-medium">PnL</th>
-                        <th className="pb-3 font-medium text-right pr-2">Reason</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {portfolio.trades.slice().reverse().slice(0, 5).map((trade, i) => (
-                        <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
-                          <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString()}</td>
-                          <td className="py-3">
-                            <span className={`px-2 py-0.5 rounded text-xs font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
-                              {trade.side}
-                            </span>
-                          </td>
-                          <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.entryPrice)}</td>
-                          <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.exitPrice)}</td>
-                          <td className={`py-3 font-mono font-bold text-xs ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
-                          </td>
-                          <td className="py-3 text-right pr-2 text-xs text-slate-500 uppercase">{trade.reason}</td>
-                        </tr>
-                      ))}
-                      {portfolio.trades.length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="py-8 text-center text-slate-600 italic">No trades recorded yet.</td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
             </div>
 
-            {/* RIGHT COLUMN: Positions, Logs, Analysis (4 cols) */}
-            <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
-
-              {/* Active Positions Panel */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col gap-4">
-                <div className="flex items-center justify-between pb-2 border-b border-slate-800/50">
-                  <h3 className="font-bold text-white flex items-center gap-2">
-                    <Zap className="w-5 h-5 text-amber-500" />
-                    Active Positions
-                  </h3>
+            {/* System Logs Terminal */}
+            <div className="flex-1 bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden min-h-[300px]">
+              <div className="px-4 py-3 border-b border-slate-800 bg-[#151921]/80 backdrop-blur flex items-center justify-between">
+                <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-indigo-400" />
+                  Live System Logs
+                </h3>
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  <span className="text-[10px] text-emerald-500 font-mono">LIVE</span>
                 </div>
-                <div className="flex flex-col gap-3 min-h-[100px]">
-                  {portfolio.positions.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center flex-1 py-8 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
-                      <Wallet className="w-8 h-8 mb-2 opacity-30" />
-                      <span className="text-sm">No Open Positions</span>
+              </div>
+              <div className="flex-1 bg-black/40 overflow-y-auto p-4 font-mono text-[10px] leading-relaxed space-y-1.5 custom-scrollbar" ref={logRef}>
+                {logs.map((log, i) => {
+                  const timestampMatch = log.match(/^\[(\d{1,2}:\d{2}:\d{2})\]/);
+                  const timestamp = timestampMatch ? timestampMatch[1] : '';
+                  const message = log.replace(/^\[.*?\]\s*☁️?\s*/, '');
+
+                  return (
+                    <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
+                      <span className="text-slate-600 shrink-0 select-none">[{timestamp}]</span>
+                      <span className={`${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
+                        message.includes('LOSS') || message.includes('❌') ? 'text-rose-400' :
+                          message.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
+                            message.includes('SİNYAL') || message.includes('Coin Profile') ? 'text-amber-400' :
+                              'text-slate-300'
+                        }`}>
+                        {message}
+                      </span>
                     </div>
-                  ) : (
-                    portfolio.positions.map(pos => (
-                      <PositionPanel
-                        key={pos.id}
-                        position={pos}
-                        currentPrice={systemState.currentPrice}
-                        onClosePosition={() => handleManualClose(pos.id)}
-                      />
-                    ))
-                  )}
-                </div>
+                  );
+                })}
               </div>
-
-              {/* Order Book / SMC Mini Panel */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-1 overflow-hidden shadow-xl h-[300px]">
-                <OrderBookPanel data={orderBook} currentPrice={systemState.currentPrice} />
-              </div>
-
-              {/* System Logs Terminal */}
-              <div className="flex-1 bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden min-h-[300px]">
-                <div className="px-4 py-3 border-b border-slate-800 bg-[#151921]/80 backdrop-blur flex items-center justify-between">
-                  <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2">
-                    <Terminal className="w-4 h-4 text-indigo-400" />
-                    Live System Logs
-                  </h3>
-                  <div className="flex items-center gap-2">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span className="text-[10px] text-emerald-500 font-mono">LIVE</span>
-                  </div>
-                </div>
-                <div className="flex-1 bg-black/40 overflow-y-auto p-4 font-mono text-[10px] leading-relaxed space-y-1.5 custom-scrollbar" ref={logRef}>
-                  {logs.map((log, i) => {
-                    // Extract timestamp from log string: [HH:MM:SS]
-                    const timestampMatch = log.match(/^\[(\d{1,2}:\d{2}:\d{2})\]/);
-                    const timestamp = timestampMatch ? timestampMatch[1] : '';
-                    const message = log.replace(/^\[.*?\]\s*☁️?\s*/, '');
-
-                    return (
-                      <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
-                        <span className="text-slate-600 shrink-0 select-none">[{timestamp}]</span>
-                        <span className={`${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
-                          message.includes('LOSS') || message.includes('❌') ? 'text-rose-400' :
-                            message.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
-                              message.includes('SİNYAL') || message.includes('Coin Profile') ? 'text-amber-400' :
-                                'text-slate-300'
-                          }`}>
-                          {message}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
             </div>
-
           </div>
-        ) : (
-          <BacktestPanel />
-        )}
-      </main >
-    </div >
+        </div>
+      </main>
+    </div>
   );
 }

@@ -509,6 +509,282 @@ volume_profiler = VolumeProfileAnalyzer()
 
 
 # ============================================================================
+# PHASE 31: MULTI-COIN SCANNER
+# ============================================================================
+
+class CoinOpportunity:
+    """Data class for coin opportunity information."""
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.price: float = 0.0
+        self.signal_score: int = 0
+        self.signal_action: str = "NONE"  # LONG/SHORT/NONE
+        self.zscore: float = 0.0
+        self.hurst: float = 0.5
+        self.spread_pct: float = 0.0
+        self.imbalance: float = 0.0
+        self.volume_24h: float = 0.0
+        self.price_change_24h: float = 0.0
+        self.last_signal_time: Optional[float] = None
+        self.atr: float = 0.0
+        self.last_update: float = 0.0
+    
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "price": self.price,
+            "signalScore": self.signal_score,
+            "signalAction": self.signal_action,
+            "zscore": round(self.zscore, 2),
+            "hurst": round(self.hurst, 2),
+            "spreadPct": round(self.spread_pct, 4),
+            "imbalance": round(self.imbalance, 2),
+            "volume24h": self.volume_24h,
+            "priceChange24h": round(self.price_change_24h, 2),
+            "lastSignalTime": self.last_signal_time,
+            "atr": self.atr,
+            "lastUpdate": self.last_update
+        }
+
+
+class LightweightCoinAnalyzer:
+    """Lightweight analyzer for a single coin in multi-coin scanning."""
+    
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.ccxt_symbol = symbol.replace("USDT", "/USDT")
+        self.prices: deque = deque(maxlen=200)
+        self.highs: deque = deque(maxlen=200)
+        self.lows: deque = deque(maxlen=200)
+        self.closes: deque = deque(maxlen=200)
+        self.volumes: deque = deque(maxlen=200)
+        self.spreads: deque = deque(maxlen=100)
+        self.opportunity = CoinOpportunity(symbol)
+        self.signal_generator = SignalGenerator()
+        self.signal_generator.min_signal_interval = 60  # 1 minute per coin in multi-scan mode
+        
+    def update_price(self, price: float, high: float = None, low: float = None, volume: float = 0):
+        """Update price data."""
+        self.prices.append(price)
+        self.closes.append(price)
+        self.highs.append(high or price)
+        self.lows.append(low or price)
+        self.volumes.append(volume)
+        
+        if len(self.closes) >= 20:
+            ma = np.mean(list(self.closes)[-20:])
+            spread = price - ma
+            self.spreads.append(spread)
+            
+        self.opportunity.price = price
+        self.opportunity.last_update = datetime.now().timestamp()
+    
+    def analyze(self, imbalance: float = 0) -> Optional[dict]:
+        """Analyze coin and generate signal if conditions met."""
+        if len(self.prices) < 50:
+            return None
+            
+        prices_list = list(self.prices)
+        highs_list = list(self.highs)
+        lows_list = list(self.lows)
+        closes_list = list(self.closes)
+        
+        # Calculate metrics
+        hurst = calculate_hurst(prices_list)
+        zscore = calculate_zscore(list(self.spreads)) if len(self.spreads) >= 20 else 0
+        atr = calculate_atr(highs_list, lows_list, closes_list)
+        
+        self.opportunity.hurst = hurst
+        self.opportunity.zscore = zscore
+        self.opportunity.atr = atr
+        self.opportunity.imbalance = imbalance
+        
+        # Simple spread calculation
+        if atr > 0 and self.opportunity.price > 0:
+            spread_pct = (atr / self.opportunity.price) * 100 * 0.1
+            self.opportunity.spread_pct = spread_pct
+        
+        # Generate signal
+        signal = self.signal_generator.generate_signal(
+            hurst=hurst,
+            zscore=zscore,
+            imbalance=imbalance,
+            price=self.opportunity.price,
+            atr=atr,
+            spread_pct=self.opportunity.spread_pct
+        )
+        
+        if signal:
+            self.opportunity.signal_score = signal.get('confidenceScore', 0)
+            self.opportunity.signal_action = signal.get('action', 'NONE')
+            self.opportunity.last_signal_time = datetime.now().timestamp()
+            return signal
+        else:
+            # Decay signal score over time if no new signal
+            if self.opportunity.last_signal_time:
+                elapsed = datetime.now().timestamp() - self.opportunity.last_signal_time
+                if elapsed > 300:  # 5 minutes
+                    self.opportunity.signal_score = 0
+                    self.opportunity.signal_action = "NONE"
+            
+        return None
+
+
+class MultiCoinScanner:
+    """
+    Phase 31: Multi-Coin Scanner
+    Scans all Binance Futures perpetual contracts for trading opportunities.
+    """
+    
+    def __init__(self, max_coins: int = 100):
+        self.max_coins = max_coins
+        self.coins: list = []
+        self.analyzers: Dict[str, LightweightCoinAnalyzer] = {}
+        self.running = False
+        self.exchange = None
+        self.last_fetch_time = 0
+        self.opportunities: list = []
+        self.active_signals: list = []
+        logger.info(f"MultiCoinScanner initialized (max_coins={max_coins})")
+    
+    async def fetch_all_futures_symbols(self) -> list:
+        """Fetch all USDT perpetual contracts from Binance Futures."""
+        try:
+            if not self.exchange:
+                self.exchange = ccxt_async.binance({
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'future'}
+                })
+            
+            markets = await self.exchange.load_markets()
+            
+            # Filter for USDT perpetual contracts only
+            symbols = []
+            for symbol, market in markets.items():
+                if (market.get('quote') == 'USDT' and 
+                    market.get('linear', False) and 
+                    market.get('active', True) and
+                    ':USDT' in symbol):
+                    # Convert to simple format: BTC/USDT:USDT -> BTCUSDT
+                    base = market.get('base', '')
+                    if base:
+                        symbols.append(f"{base}USDT")
+            
+            # Sort by some criteria (we'll use alphabetical for now, can add volume later)
+            symbols = sorted(list(set(symbols)))[:self.max_coins]
+            
+            logger.info(f"Fetched {len(symbols)} USDT perpetual contracts")
+            self.coins = symbols
+            return symbols
+            
+        except Exception as e:
+            logger.error(f"Error fetching futures symbols: {e}")
+            # Fallback to default list
+            self.coins = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
+                          'BNBUSDT', 'ADAUSDT', 'MATICUSDT', 'DOTUSDT', 'LINKUSDT']
+            return self.coins
+    
+    def get_or_create_analyzer(self, symbol: str) -> LightweightCoinAnalyzer:
+        """Get existing analyzer or create new one."""
+        if symbol not in self.analyzers:
+            self.analyzers[symbol] = LightweightCoinAnalyzer(symbol)
+        return self.analyzers[symbol]
+    
+    async def fetch_ticker_data(self, symbols: list) -> dict:
+        """Fetch ticker data for multiple symbols at once."""
+        try:
+            if not self.exchange:
+                return {}
+            
+            # Fetch all tickers at once (efficient batch request)
+            tickers = await self.exchange.fetch_tickers()
+            
+            result = {}
+            for symbol in symbols:
+                ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"  # BTCUSDT -> BTC/USDT:USDT
+                if ccxt_symbol in tickers:
+                    result[symbol] = tickers[ccxt_symbol]
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Error fetching tickers: {e}")
+            return {}
+    
+    async def scan_all_coins(self) -> list:
+        """Scan all coins and return opportunities."""
+        if not self.coins:
+            await self.fetch_all_futures_symbols()
+        
+        # Fetch all ticker data at once
+        tickers = await self.fetch_ticker_data(self.coins)
+        
+        opportunities = []
+        signals = []
+        
+        for symbol, ticker in tickers.items():
+            try:
+                analyzer = self.get_or_create_analyzer(symbol)
+                
+                # Update price data from ticker
+                price = ticker.get('last', 0)
+                high = ticker.get('high', price)
+                low = ticker.get('low', price)
+                volume = ticker.get('baseVolume', 0)
+                
+                if price <= 0:
+                    continue
+                
+                analyzer.update_price(price, high, low, volume)
+                analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
+                analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
+                
+                # Analyze for signal
+                signal = analyzer.analyze()
+                
+                if signal:
+                    signal['symbol'] = symbol
+                    signals.append(signal)
+                
+                opportunities.append(analyzer.opportunity.to_dict())
+                
+            except Exception as e:
+                logger.debug(f"Error analyzing {symbol}: {e}")
+                continue
+        
+        # Sort by signal score (highest first)
+        opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
+        
+        self.opportunities = opportunities
+        self.active_signals = signals
+        
+        return opportunities
+    
+    def get_scanner_stats(self) -> dict:
+        """Get overall scanner statistics."""
+        long_count = sum(1 for o in self.opportunities if o.get('signalAction') == 'LONG')
+        short_count = sum(1 for o in self.opportunities if o.get('signalAction') == 'SHORT')
+        
+        return {
+            "totalCoins": len(self.coins),
+            "analyzedCoins": len(self.opportunities),
+            "longSignals": long_count,
+            "shortSignals": short_count,
+            "activeSignals": len(self.active_signals),
+            "lastUpdate": datetime.now().timestamp()
+        }
+    
+    async def close(self):
+        """Cleanup resources."""
+        if self.exchange:
+            await self.exchange.close()
+            self.exchange = None
+
+
+# Global MultiCoinScanner instance
+multi_coin_scanner = MultiCoinScanner(max_coins=50)
+
+# ============================================================================
 # PHASE 30: SESSION-BASED TRADING
 # ============================================================================
 
@@ -1131,11 +1407,11 @@ class SignalGenerator:
     
     def __init__(self):
         self.last_signal_time: float = 0
-        self.min_signal_interval: float = 30.0  # Minimum 30 seconds between signals
+        self.min_signal_interval: float = 15.0  # RELAXED: 30s -> 15s for more signals
         self.liquidation_threshold: float = 100000  # $100k for cascade detection
         self.recent_liquidations: deque = deque(maxlen=50)
         self.leverage: int = 10 # Default Leverage
-        logger.info(f"SignalGenerator Initialized. Leverage: {self.leverage}")
+        logger.info(f"SignalGenerator Initialized (RELAXED). Leverage: {self.leverage}")
         
     def check_liquidation_cascade(self) -> tuple[bool, float]:
         """
@@ -1200,8 +1476,9 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            base_threshold = 1.6
-            min_score_required = 75
+            # RELAXED: 1.6 -> 1.2 Z-Score threshold, 75 -> 60 min score
+            base_threshold = 1.4  # Conservative: was 1.2, more selective
+            min_score_required = 68  # Conservative: was 60, more selective
             is_backtest = False
         
         # Leverage Scaling:
@@ -1231,25 +1508,25 @@ class SignalGenerator:
             return None # Fail fast
             
         # Layer 2: Order Book Imbalance (Confirmation) - Max 20 pts
-        # Must align with signal direction (>5%)
+        # RELAXED: 5% -> 3% threshold for easier confirmation
         ob_aligned = False
-        if signal_side == "LONG" and imbalance > 5:
+        if signal_side == "LONG" and imbalance > 3:
             score += 20
             ob_aligned = True
             reasons.append(f"OB({imbalance:.1f}%)")
-        elif signal_side == "SHORT" and imbalance < -5:
+        elif signal_side == "SHORT" and imbalance < -3:
             score += 20
             ob_aligned = True
             reasons.append(f"OB({imbalance:.1f}%)")
             
         # Layer 3: VWAP Z-Score (Mean Reversion Check) - Max 20 pts
-        # If we are Longing (Price < Mean), Price should be < VWAP too
+        # RELAXED: 1.0 -> 0.7 threshold for easier confirmation
         vwap_aligned = False
-        if signal_side == "LONG" and vwap_zscore < -1.0:
+        if signal_side == "LONG" and vwap_zscore < -0.7:
             score += 20
             vwap_aligned = True
             reasons.append(f"VWAP({vwap_zscore:.1f})")
-        elif signal_side == "SHORT" and vwap_zscore > 1.0:
+        elif signal_side == "SHORT" and vwap_zscore > 0.7:
             score += 20
             vwap_aligned = True
             reasons.append(f"VWAP({vwap_zscore:.1f})")
@@ -2876,12 +3153,14 @@ global_paper_trader = PaperTradingEngine()
 
 @app.get("/paper-trading/status")
 async def paper_trading_status():
-    """Get current paper trading status."""
+    """Get current paper trading status - used for initial UI sync."""
     return JSONResponse({
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
+        "trades": global_paper_trader.trades[-20:],  # Last 20 trades
         "stats": global_paper_trader.stats,
         "enabled": global_paper_trader.enabled,
+        "logs": global_paper_trader.logs[-30:],  # Last 30 logs
         "equityCurve": global_paper_trader.equity_curve[-50:]
     })
 
@@ -2988,6 +3267,82 @@ async def paper_trading_close(position_id: str):
             if success:
                 return JSONResponse({"success": True, "message": "Position closed"})
     return JSONResponse({"success": False, "message": "Position not found"}, status_code=404)
+
+
+# ============================================================================
+# PHASE 31: MULTI-COIN SCANNER WEBSOCKET ENDPOINT
+# ============================================================================
+
+@app.websocket("/ws/scanner")
+async def scanner_websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for multi-coin scanning.
+    Streams opportunities from all Binance Futures perpetual contracts.
+    """
+    await websocket.accept()
+    logger.info("Scanner WebSocket client connected")
+    
+    try:
+        # Initialize scanner if needed
+        if not multi_coin_scanner.coins:
+            await multi_coin_scanner.fetch_all_futures_symbols()
+        
+        multi_coin_scanner.running = True
+        scan_interval = 10  # Scan every 10 seconds
+        
+        while multi_coin_scanner.running:
+            try:
+                # Scan all coins
+                opportunities = await multi_coin_scanner.scan_all_coins()
+                stats = multi_coin_scanner.get_scanner_stats()
+                
+                # Process signals for paper trading
+                for signal in multi_coin_scanner.active_signals:
+                    symbol = signal.get('symbol', 'UNKNOWN')
+                    price = signal.get('price', 0)
+                    
+                    # Update paper trader symbol temporarily for this signal
+                    old_symbol = global_paper_trader.symbol
+                    global_paper_trader.symbol = symbol
+                    global_paper_trader.on_signal(signal, price)
+                    global_paper_trader.symbol = old_symbol
+                    
+                    logger.info(f"📡 SCANNER SIGNAL: {symbol} {signal.get('action')} Score:{signal.get('confidenceScore')}")
+                
+                # Clear processed signals
+                multi_coin_scanner.active_signals = []
+                
+                # Send update to client
+                update_data = {
+                    "type": "scanner_update",
+                    "opportunities": opportunities[:50],  # Top 50 by score
+                    "stats": stats,
+                    "portfolio": {
+                        "balance": global_paper_trader.balance,
+                        "positions": global_paper_trader.positions,
+                        "trades": global_paper_trader.trades[-20:],
+                        "stats": global_paper_trader.stats,
+                        "logs": global_paper_trader.logs[-30:],
+                        "enabled": global_paper_trader.enabled
+                    },
+                    "timestamp": datetime.now().timestamp()
+                }
+                
+                await websocket.send_json(update_data)
+                
+                # Wait before next scan
+                await asyncio.sleep(scan_interval)
+                
+            except Exception as e:
+                logger.error(f"Scanner loop error: {e}")
+                await asyncio.sleep(5)
+                
+    except WebSocketDisconnect:
+        logger.info("Scanner WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"Scanner WebSocket error: {e}")
+    finally:
+        multi_coin_scanner.running = False
 
 
 @app.websocket("/ws")

@@ -221,3 +221,47 @@ export interface SMCData {
   fvgs: FVG[];
   structure: string;
 }
+
+// =============================================================================
+// PHASE 31: MULTI-COIN SCANNER TYPES
+// =============================================================================
+
+export interface CoinOpportunity {
+  symbol: string;
+  price: number;
+  signalScore: number;
+  signalAction: 'LONG' | 'SHORT' | 'NONE';
+  zscore: number;
+  hurst: number;
+  spreadPct: number;
+  imbalance: number;
+  volume24h: number;
+  priceChange24h: number;
+  lastSignalTime: number | null;
+  atr: number;
+  lastUpdate: number;
+}
+
+export interface ScannerStats {
+  totalCoins: number;
+  analyzedCoins: number;
+  longSignals: number;
+  shortSignals: number;
+  activeSignals: number;
+  lastUpdate: number;
+}
+
+export interface ScannerUpdate {
+  type: 'scanner_update';
+  opportunities: CoinOpportunity[];
+  stats: ScannerStats;
+  portfolio: {
+    balance: number;
+    positions: Position[];
+    trades: Trade[];
+    stats: PortfolioStats;
+    logs: { time: string; message: string; ts: number }[];
+    enabled: boolean;
+  };
+  timestamp: number;
+}
