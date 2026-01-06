@@ -3363,7 +3363,24 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             await multi_coin_scanner.fetch_all_futures_symbols()
         
         multi_coin_scanner.running = True
-        scan_interval = 10  # Scan every 10 seconds
+        scan_interval = 30  # Scan every 30 seconds (CoinGecko rate limit: ~10-50 req/min)
+        
+        # Send immediate initial message to prevent timeout
+        await websocket.send_json({
+            "type": "scanner_update",
+            "opportunities": [],
+            "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
+            "portfolio": {
+                "balance": global_paper_trader.balance,
+                "positions": global_paper_trader.positions,
+                "trades": global_paper_trader.trades[-20:],
+                "stats": global_paper_trader.stats,
+                "logs": global_paper_trader.logs[-30:],
+                "enabled": global_paper_trader.enabled
+            },
+            "timestamp": datetime.now().timestamp(),
+            "message": "Scanner starting..."
+        })
         
         while multi_coin_scanner.running and is_connected:
             try:
