@@ -648,7 +648,7 @@ class MultiCoinScanner:
         # Caching for rate limit protection
         self.ticker_cache: dict = {}
         self.ticker_cache_time: float = 0
-        self.cache_ttl: int = 30  # Cache valid for 30 seconds
+        self.cache_ttl: int = 10  # Cache valid for 10 seconds (Binance optimized)
         logger.info(f"MultiCoinScanner initialized (max_coins={max_coins})")
     
     async def fetch_all_futures_symbols(self) -> list:
@@ -3406,7 +3406,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             await multi_coin_scanner.fetch_all_futures_symbols()
         
         multi_coin_scanner.running = True
-        scan_interval = 15  # Scan every 15 seconds (with API key, rate limits are higher)
+        scan_interval = 10  # Scan every 10 seconds (Binance Futures - Amsterdam region)
         
         # Send immediate initial message to prevent timeout
         await websocket.send_json({

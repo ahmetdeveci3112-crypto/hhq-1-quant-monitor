@@ -111,6 +111,10 @@ export default function App() {
     lastUpdate: 0
   });
 
+  // Connection and update status
+  const [lastUpdateTime, setLastUpdateTime] = useState<Date | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+
   // Pending Orders State (Pullback Entries)
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
 
@@ -395,6 +399,7 @@ export default function App() {
       ws.onopen = () => {
         wsHandlersRef.current.addLog("🟢 Multi-Coin Scanner Bağlandı (Phase 31)");
         setConnectionError(null);
+        setIsConnected(true);
       };
 
       ws.onmessage = (event) => {
@@ -445,6 +450,9 @@ export default function App() {
                 });
               }
             }
+
+            // Update last update time
+            setLastUpdateTime(new Date());
           }
         } catch (e) {
           console.error('Parse error:', e);
@@ -453,6 +461,7 @@ export default function App() {
 
       ws.onclose = () => {
         wsHandlersRef.current.addLog("🔴 Scanner bağlantısı kesildi.");
+        setIsConnected(false);
         if (isRunning) {
           reconnectTimeoutRef.current = setTimeout(() => {
             if (wsRef.current) return;
@@ -547,7 +556,10 @@ export default function App() {
 
           {/* Phase 31: Scanner Stats Indicator (Replaces Coin Selector) */}
           <div className="flex items-center gap-3 px-4 py-2 bg-slate-800/50 rounded-lg border border-slate-700">
-            <Radar className="w-5 h-5 text-indigo-400 animate-pulse" />
+            <div className="relative">
+              <Radar className={`w-5 h-5 ${isConnected ? 'text-indigo-400 animate-pulse' : 'text-slate-500'}`} />
+              <span className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
+            </div>
             <div className="flex items-center gap-4 text-xs">
               <span className="text-slate-400">
                 <span className="font-bold text-white">{scannerStats.totalCoins}</span> Coin
@@ -558,6 +570,11 @@ export default function App() {
               <span className="text-rose-400">
                 🔴 <span className="font-bold">{scannerStats.shortSignals}</span>
               </span>
+              {lastUpdateTime && (
+                <span className="text-slate-500 border-l border-slate-700 pl-3">
+                  Son: {lastUpdateTime.toLocaleTimeString('tr-TR')}
+                </span>
+              )}
             </div>
           </div>
         </div>
