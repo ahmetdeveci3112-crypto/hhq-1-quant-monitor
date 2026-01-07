@@ -562,6 +562,49 @@ class LightweightCoinAnalyzer:
         self.opportunity = CoinOpportunity(symbol)
         self.signal_generator = SignalGenerator()
         self.signal_generator.min_signal_interval = 60  # 1 minute per coin in multi-scan mode
+        self.is_preloaded = False  # Track if historical data is loaded
+    
+    def preload_historical_data(self, ohlcv_data: list):
+        """
+        Preload historical OHLCV data for immediate Z-Score/Hurst calculation.
+        
+        Args:
+            ohlcv_data: List of OHLCV candles [[timestamp, open, high, low, close, volume], ...]
+        """
+        if not ohlcv_data or len(ohlcv_data) < 20:
+            return
+        
+        # Clear existing data
+        self.prices.clear()
+        self.highs.clear()
+        self.lows.clear()
+        self.closes.clear()
+        self.volumes.clear()
+        self.spreads.clear()
+        
+        # Load historical data
+        for candle in ohlcv_data:
+            try:
+                _, open_price, high, low, close, volume = candle
+                self.prices.append(close)
+                self.closes.append(close)
+                self.highs.append(high)
+                self.lows.append(low)
+                self.volumes.append(volume)
+                
+                # Calculate spread for Z-Score
+                if len(self.closes) >= 20:
+                    ma = np.mean(list(self.closes)[-20:])
+                    spread = close - ma
+                    self.spreads.append(spread)
+            except Exception:
+                continue
+        
+        if len(self.prices) > 0:
+            self.opportunity.price = self.prices[-1]
+            self.opportunity.last_update = datetime.now().timestamp()
+            self.is_preloaded = True
+            logger.debug(f"{self.symbol}: Preloaded {len(self.prices)} candles, {len(self.spreads)} spreads")
         
     def update_price(self, price: float, high: float = None, low: float = None, volume: float = 0):
         """Update price data."""
@@ -1037,6 +1080,57 @@ class MultiCoinScanner:
             "activeSignals": len(self.active_signals),
             "lastUpdate": datetime.now().timestamp()
         }
+    
+    async def preload_all_coins(self, top_n: int = 50):
+        """
+        Preload historical OHLCV data for top N coins at startup.
+        This enables immediate Z-Score/Hurst calculation without waiting for data to accumulate.
+        
+        Args:
+            top_n: Number of top coins to preload (default 50 to balance speed and coverage)
+        """
+        if not self.coins:
+            await self.fetch_all_futures_symbols()
+        
+        if not self.exchange:
+            logger.warning("No exchange available for OHLCV preloading")
+            return
+        
+        # Preload top N coins (most traded/popular)
+        priority_coins = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
+                         'BNBUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT']
+        
+        coins_to_preload = priority_coins + [c for c in self.coins[:top_n] if c not in priority_coins]
+        coins_to_preload = coins_to_preload[:top_n]
+        
+        logger.info(f"Starting OHLCV preload for {len(coins_to_preload)} coins...")
+        
+        preloaded_count = 0
+        failed_count = 0
+        
+        for symbol in coins_to_preload:
+            try:
+                # Fetch 5-minute candles (last 100 = ~8 hours of data)
+                ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+                ohlcv = await self.exchange.fetch_ohlcv(ccxt_symbol, '5m', limit=100)
+                
+                if ohlcv and len(ohlcv) >= 20:
+                    analyzer = self.get_or_create_analyzer(symbol)
+                    analyzer.preload_historical_data(ohlcv)
+                    preloaded_count += 1
+                else:
+                    failed_count += 1
+                    
+            except Exception as e:
+                logger.debug(f"Failed to preload {symbol}: {e}")
+                failed_count += 1
+                continue
+            
+            # Small delay to avoid rate limits (respect Binance API limits)
+            if preloaded_count % 10 == 0:
+                await asyncio.sleep(0.5)
+        
+        logger.info(f"OHLCV preload complete: {preloaded_count} success, {failed_count} failed")
     
     async def close(self):
         """Cleanup resources."""
@@ -3552,6 +3646,9 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Initialize scanner if needed
         if not multi_coin_scanner.coins:
             await multi_coin_scanner.fetch_all_futures_symbols()
+            # Preload historical OHLCV data for top 50 coins (enables immediate Z-Score/Hurst calculation)
+            logger.info("Preloading historical data for immediate Z-Score/Hurst calculation...")
+            await multi_coin_scanner.preload_all_coins(top_n=50)
         
         multi_coin_scanner.running = True
         scan_interval = 10  # Scan every 10 seconds (Binance Futures - Amsterdam region)
