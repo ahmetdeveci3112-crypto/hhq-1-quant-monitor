@@ -26,6 +26,7 @@ import ccxt.async_support as ccxt_async
 import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,7 +38,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0")
+# Forward declaration for background scanner
+background_scanner_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: start background scanner on startup."""
+    global background_scanner_task
+    
+    logger.info("🚀 Starting 24/7 Background Scanner...")
+    
+    # Start background scanner as asyncio task (will be defined later)
+    background_scanner_task = asyncio.create_task(background_scanner_loop())
+    
+    yield  # App is running
+    
+    # Shutdown: stop scanner
+    logger.info("🛑 Shutting down Background Scanner...")
+    if background_scanner_task:
+        background_scanner_task.cancel()
+        try:
+            await background_scanner_task
+        except asyncio.CancelledError:
+            pass
+
+app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0", lifespan=lifespan)
 
 # CORS for React Frontend
 app.add_middleware(
@@ -1138,9 +1163,128 @@ class MultiCoinScanner:
             await self.exchange.close()
             self.exchange = None
 
-
 # Global MultiCoinScanner instance
 multi_coin_scanner = MultiCoinScanner(max_coins=200)  # 200 with WebSocket (instant data)
+
+
+# ============================================================================
+# 24/7 BACKGROUND SCANNER LOOP
+# ============================================================================
+
+async def background_scanner_loop():
+    """
+    24/7 Background scanner that runs independently of frontend connections.
+    Scans all coins, generates signals, and executes paper trades automatically.
+    """
+    logger.info("🔄 Background Scanner Loop started - running 24/7")
+    
+    scan_interval = 10  # Scan every 10 seconds
+    
+    # Wait for app to fully initialize
+    await asyncio.sleep(3)
+    
+    try:
+        # Initialize scanner
+        if not multi_coin_scanner.coins:
+            await multi_coin_scanner.fetch_all_futures_symbols()
+            logger.info("Starting background OHLCV preload for Z-Score/Hurst calculation...")
+            await multi_coin_scanner.preload_all_coins(top_n=30)
+        
+        multi_coin_scanner.running = True
+        
+        while True:
+            try:
+                # Scan all coins
+                opportunities = await multi_coin_scanner.scan_all_coins()
+                stats = multi_coin_scanner.get_scanner_stats()
+                
+                # Process signals for paper trading (only if enabled)
+                if global_paper_trader.enabled:
+                    for signal in multi_coin_scanner.active_signals:
+                        try:
+                            symbol = signal.get('symbol', 'UNKNOWN')
+                            price = signal.get('price', 0)
+                            
+                            # Update paper trader symbol temporarily for this signal
+                            old_symbol = global_paper_trader.symbol
+                            global_paper_trader.symbol = symbol
+                            
+                            # Get latest ATR from analyzer
+                            if symbol in multi_coin_scanner.analyzers:
+                                analyzer = multi_coin_scanner.analyzers[symbol]
+                                current_atr = analyzer.opportunity.atr
+                                signal['atr'] = current_atr
+                            
+                            # Execute trade
+                            await process_signal_for_paper_trading(signal, price)
+                            
+                            # Restore symbol
+                            global_paper_trader.symbol = old_symbol
+                            
+                        except Exception as sig_error:
+                            logger.debug(f"Signal processing error for {symbol}: {sig_error}")
+                            continue
+                
+                # Log periodic status (every 5 minutes = 30 iterations)
+                if int(datetime.now().timestamp()) % 300 < scan_interval:
+                    long_count = stats.get('longSignals', 0)
+                    short_count = stats.get('shortSignals', 0)
+                    logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count}")
+                
+                await asyncio.sleep(scan_interval)
+                
+            except Exception as loop_error:
+                logger.error(f"Background scanner loop error: {loop_error}")
+                await asyncio.sleep(5)  # Wait before retry
+                
+    except asyncio.CancelledError:
+        logger.info("Background Scanner Loop cancelled")
+        multi_coin_scanner.running = False
+    except Exception as e:
+        logger.error(f"Background scanner fatal error: {e}")
+        multi_coin_scanner.running = False
+
+
+async def process_signal_for_paper_trading(signal: dict, price: float):
+    """Process a signal for paper trading execution."""
+    if not global_paper_trader.enabled:
+        return
+    
+    action = signal.get('action', 'NONE')
+    if action == 'NONE':
+        return
+    
+    symbol = signal.get('symbol', global_paper_trader.symbol)
+    atr = signal.get('atr', 0)
+    
+    # Check if we already have a position in this symbol
+    existing_position = None
+    for pos in global_paper_trader.positions:
+        if pos.get('symbol') == symbol:
+            existing_position = pos
+            break
+    
+    # Don't open new position if we already have one in this symbol
+    if existing_position:
+        return
+    
+    # Check max positions
+    if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
+        return
+    
+    # Execute trade
+    try:
+        await global_paper_trader.open_position(
+            side=action,
+            price=price,
+            atr=atr,
+            signal=signal,
+            symbol=symbol
+        )
+        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f}")
+    except Exception as e:
+        logger.error(f"Auto-trade execution error: {e}")
+
 
 # ============================================================================
 # PHASE 30: SESSION-BASED TRADING
@@ -3634,26 +3778,16 @@ async def paper_trading_close(position_id: str):
 @app.websocket("/ws/scanner")
 async def scanner_websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for multi-coin scanning.
-    Streams opportunities from all Binance Futures perpetual contracts.
+    WebSocket endpoint for streaming scanner updates to frontend.
+    Scanner runs 24/7 in background - this just streams the current state.
     """
     await websocket.accept()
     logger.info("Scanner WebSocket client connected")
     
     is_connected = True
+    stream_interval = 5  # Stream updates every 5 seconds (scanner runs every 10s in background)
     
     try:
-        # Initialize scanner if needed
-        if not multi_coin_scanner.coins:
-            await multi_coin_scanner.fetch_all_futures_symbols()
-            # Start preload as background task (non-blocking to avoid health check timeout)
-            logger.info("Starting background OHLCV preload for Z-Score/Hurst calculation...")
-            asyncio.create_task(multi_coin_scanner.preload_all_coins(top_n=30))  # Reduced to 30 for faster startup
-        
-        multi_coin_scanner.running = True
-        scan_interval = 10  # Scan every 10 seconds (Binance Futures - Amsterdam region)
-        
-        # Send current state immediately (important for page refresh)
         # Build current opportunities from existing analyzers
         current_opportunities = []
         for symbol, analyzer in multi_coin_scanner.analyzers.items():
@@ -3687,32 +3821,23 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         
         logger.info(f"Sent initial state: {len(current_opportunities)} opportunities")
         
-        while multi_coin_scanner.running and is_connected:
+        # Stream updates loop (scanner is running in background)
+        while is_connected:
             try:
-                # Scan all coins
-                opportunities = await multi_coin_scanner.scan_all_coins()
+                # Get latest opportunities from background scanner (no scanning here)
+                opportunities = []
+                for symbol, analyzer in multi_coin_scanner.analyzers.items():
+                    opp = analyzer.opportunity.to_dict()
+                    if opp.get('price', 0) > 0:
+                        opportunities.append(opp)
+                
+                opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
                 stats = multi_coin_scanner.get_scanner_stats()
-                
-                # Process signals for paper trading
-                for signal in multi_coin_scanner.active_signals:
-                    symbol = signal.get('symbol', 'UNKNOWN')
-                    price = signal.get('price', 0)
-                    
-                    # Update paper trader symbol temporarily for this signal
-                    old_symbol = global_paper_trader.symbol
-                    global_paper_trader.symbol = symbol
-                    global_paper_trader.on_signal(signal, price)
-                    global_paper_trader.symbol = old_symbol
-                    
-                    logger.info(f"📡 SCANNER SIGNAL: {symbol} {signal.get('action')} Score:{signal.get('confidenceScore')}")
-                
-                # Clear processed signals
-                multi_coin_scanner.active_signals = []
                 
                 # Send update to client
                 update_data = {
                     "type": "scanner_update",
-                    "opportunities": opportunities[:50],  # Top 50 by score
+                    "opportunities": opportunities[:50],
                     "stats": stats,
                     "portfolio": {
                         "balance": global_paper_trader.balance,
@@ -3726,12 +3851,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 }
                 
                 await websocket.send_json(update_data)
-                
-                # Wait before next scan
-                await asyncio.sleep(scan_interval)
+                await asyncio.sleep(stream_interval)
                 
             except WebSocketDisconnect:
-                logger.info("Scanner WebSocket disconnected during loop")
+                logger.info("Scanner WebSocket disconnected during streaming")
                 is_connected = False
                 break
             except Exception as e:
@@ -3747,7 +3870,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Scanner WebSocket error: {e}")
     finally:
-        multi_coin_scanner.running = False
+        # NOTE: Scanner continues running in background - we don't stop it here
         is_connected = False
 
 
