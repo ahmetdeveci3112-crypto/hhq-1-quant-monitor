@@ -26,10 +26,15 @@ import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 
 // Backend WebSocket URLs
-// VITE_WS_URL will be provided by Vercel Environment Variables
-const BACKEND_WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
-const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_WS_URL?.replace('/ws', '/ws/scanner') || 'ws://localhost:8000/ws/scanner';
-const BACKEND_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Production: fly.io backend, Development: localhost
+const isProduction = window.location.hostname !== 'localhost' && !window.location.hostname.includes('127.0.0.1');
+const FLY_IO_BACKEND = 'wss://hhq-1-quant-monitor.fly.dev';
+const LOCAL_BACKEND = 'ws://localhost:8000';
+
+// Use Vercel env variables (VITE_BACKEND_WS_URL, VITE_BACKEND_API_URL) or fallback to auto-detection
+const BACKEND_WS_URL = import.meta.env.VITE_BACKEND_WS_URL || (isProduction ? `${FLY_IO_BACKEND}/ws` : `${LOCAL_BACKEND}/ws`);
+const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_BACKEND_WS_URL?.replace('/ws', '/ws/scanner') || (isProduction ? `${FLY_IO_BACKEND}/ws/scanner` : `${LOCAL_BACKEND}/ws/scanner`);
+const BACKEND_API_URL = import.meta.env.VITE_BACKEND_API_URL || (isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000');
 
 const INITIAL_STATE: SystemState = {
   hurstExponent: 0.5,
