@@ -8,20 +8,13 @@ import {
   Radio, RotateCcw, Waves, Search, Radar
 } from 'lucide-react';
 import {
-  MarketRegime, SystemState, TradeSignal, LiquidationEvent, OrderBookState,
-  Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
-  BackendUpdate, BackendSignal, PendingOrder, CoinOpportunity, ScannerStats, ScannerUpdate
+  MarketRegime, Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
+  BackendSignal, CoinOpportunity, ScannerStats
 } from './types';
 import { formatPrice, formatCurrency } from './utils';
-import { HurstPanel } from './components/HurstPanel';
-import { PairsPanel } from './components/PairsPanel';
-import { LiquidationPanel } from './components/LiquidationPanel';
-import { OrderBookPanel } from './components/OrderBookPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
-import { BacktestPanel } from './components/BacktestPanel';
-import { SMCPanel } from './components/SMCPanel';
 import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 
@@ -35,16 +28,6 @@ const LOCAL_BACKEND = 'ws://localhost:8000';
 const BACKEND_WS_URL = import.meta.env.VITE_BACKEND_WS_URL || (isProduction ? `${FLY_IO_BACKEND}/ws` : `${LOCAL_BACKEND}/ws`);
 const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_BACKEND_WS_URL?.replace('/ws', '/ws/scanner') || (isProduction ? `${FLY_IO_BACKEND}/ws/scanner` : `${LOCAL_BACKEND}/ws/scanner`);
 const BACKEND_API_URL = import.meta.env.VITE_BACKEND_API_URL || (isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000');
-
-const INITIAL_STATE: SystemState = {
-  hurstExponent: 0.5,
-  zScore: 0,
-  spread: 120,
-  atr: 0,
-  activeLiquidationCascade: false,
-  marketRegime: MarketRegime.RANDOM_WALK,
-  currentPrice: 0,
-};
 
 const INITIAL_BALANCE = 10000;
 
@@ -61,38 +44,10 @@ const INITIAL_STATS: PortfolioStats = {
   avgLoss: 0,
 };
 
-const COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT'];
-
-// Helper for dynamic price formatting is now in utils.ts
-
-
-// Map backend regime strings to MarketRegime enum
-const parseRegime = (regime: string): MarketRegime => {
-  switch (regime) {
-    case 'TREND TAKİBİ':
-      return MarketRegime.TREND_FOLLOWING;
-    case 'ORTALAMAYA DÖNÜŞ':
-      return MarketRegime.MEAN_REVERSION;
-    default:
-      return MarketRegime.RANDOM_WALK;
-  }
-};
-
-// Generate unique ID
-const generateId = (): string => {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2);
-};
-
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'live' | 'backtest'>('live');
   const [isRunning, setIsRunning] = useState(false);
   const [selectedCoin, setSelectedCoin] = useState<string | null>(null);
-  const [showCoinMenu, setShowCoinMenu] = useState(false);
-  const [systemState, setSystemState] = useState<SystemState>(INITIAL_STATE);
   const [logs, setLogs] = useState<string[]>([]);
-  const [signals, setSignals] = useState<TradeSignal[]>([]);
-  const [liquidations, setLiquidations] = useState<LiquidationEvent[]>([]);
-  const [orderBook, setOrderBook] = useState<OrderBookState>({ bids: [], asks: [], imbalance: 0 });
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Paper Trading State
@@ -642,33 +597,31 @@ export default function App() {
           {/* LEFT COLUMN: Market Data & Chart (8 cols) */}
           <div className="col-span-12 lg:col-span-8 flex flex-col gap-6">
 
-            {/* Top Row: Key Metrics Cards */}
+            {/* Top Row: Scanner Stats Cards */}
             <div className="grid grid-cols-4 gap-4">
-              {/* Hurst Exponent */}
+              {/* Total Coins Scanned */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
                 <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Market Regime</h3>
-                <div className="text-lg font-bold text-white mb-1">
-                  {systemState.hurstExponent > 0.55 ? 'Trending' : systemState.hurstExponent < 0.45 ? 'Mean Rev' : 'Random'}
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Coins Scanned</h3>
+                <div className="text-2xl font-bold text-white mb-1">{scannerStats.totalCoins}</div>
+                <div className="text-xs font-mono text-indigo-400">Analyzed: {scannerStats.analyzedCoins}</div>
+              </div>
+
+              {/* Long Signals */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-emerald-500/30 transition-colors">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Long Signals</h3>
+                <div className="flex items-center gap-2">
+                  <div className="text-2xl font-bold text-emerald-400">{scannerStats.longSignals}</div>
+                  {scannerStats.longSignals > 0 && <span className="text-emerald-500">🟢</span>}
                 </div>
-                <div className="text-xs font-mono text-indigo-400">H: {systemState.hurstExponent.toFixed(2)}</div>
               </div>
 
-              {/* Price & ATR */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Current Price</h3>
-                <div className="text-lg font-bold text-white mb-1 font-mono">${formatPrice(systemState.currentPrice)}</div>
-                <div className="text-xs text-slate-500">ATR: <span className="text-white">${systemState.atr.toFixed(4)}</span></div>
-              </div>
-
-              {/* Spread & Z-Score */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Spread / Z</h3>
-                <div className="flex items-center justify-between">
-                  <div className="text-lg font-bold text-white font-mono">{systemState.spread.toFixed(2)}%</div>
-                  <div className={`text-md font-bold px-2 py-0.5 rounded ${systemState.zScore > 2 ? 'bg-emerald-500/20 text-emerald-400' : systemState.zScore < -2 ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-800 text-slate-400'}`}>
-                    Z: {systemState.zScore.toFixed(2)}
-                  </div>
+              {/* Short Signals */}
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-rose-500/30 transition-colors">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Short Signals</h3>
+                <div className="flex items-center gap-2">
+                  <div className="text-2xl font-bold text-rose-400">{scannerStats.shortSignals}</div>
+                  {scannerStats.shortSignals > 0 && <span className="text-rose-500">🔴</span>}
                 </div>
               </div>
 
