@@ -1225,6 +1225,78 @@ async def background_scanner_loop():
                             logger.debug(f"Signal processing error for {symbol}: {sig_error}")
                             continue
                 
+                # =====================================================================
+                # PHASE 32: UPDATE OPEN POSITIONS WITH REAL-TIME PRICES
+                # =====================================================================
+                for pos in list(global_paper_trader.positions):
+                    try:
+                        pos_symbol = pos.get('symbol', '')
+                        
+                        # Find current price for this position from scanner data
+                        current_price = None
+                        for opp in opportunities:
+                            if opp.get('symbol') == pos_symbol:
+                                current_price = opp.get('price', 0)
+                                break
+                        
+                        if current_price and current_price > 0:
+                            # Calculate unrealized PnL
+                            entry_price = pos.get('entryPrice', current_price)
+                            size = pos.get('size', 0)
+                            size_usd = pos.get('sizeUsd', 0)
+                            leverage = pos.get('leverage', 1)
+                            
+                            if pos['side'] == 'LONG':
+                                pnl = (current_price - entry_price) * size
+                            else:
+                                pnl = (entry_price - current_price) * size
+                            
+                            pnl_percent = (pnl / size_usd) * 100 * leverage if size_usd > 0 else 0
+                            
+                            pos['unrealizedPnl'] = round(pnl, 2)
+                            pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
+                            pos['currentPrice'] = current_price  # Store for frontend
+                            
+                            # Check SL/TP
+                            sl = pos.get('stopLoss', 0)
+                            tp = pos.get('takeProfit', 0)
+                            trailing_stop = pos.get('trailingStop', sl)
+                            
+                            # SL Hit
+                            if pos['side'] == 'LONG' and current_price <= trailing_stop:
+                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                continue
+                            elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                continue
+                            
+                            # TP Hit
+                            if pos['side'] == 'LONG' and current_price >= tp:
+                                global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                continue
+                            elif pos['side'] == 'SHORT' and current_price <= tp:
+                                global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                continue
+                            
+                            # Update trailing stop if in profit
+                            trail_activation = pos.get('trailActivation', entry_price)
+                            trail_distance = pos.get('trailDistance', 0)
+                            
+                            if pos['side'] == 'LONG' and current_price > trail_activation:
+                                new_trailing = current_price - trail_distance
+                                if new_trailing > trailing_stop:
+                                    pos['trailingStop'] = new_trailing
+                                    pos['isTrailingActive'] = True
+                            elif pos['side'] == 'SHORT' and current_price < trail_activation:
+                                new_trailing = current_price + trail_distance
+                                if new_trailing < trailing_stop:
+                                    pos['trailingStop'] = new_trailing
+                                    pos['isTrailingActive'] = True
+                                    
+                    except Exception as pos_error:
+                        logger.debug(f"Position update error: {pos_error}")
+                        continue
+                
                 # Log periodic status (every 5 minutes = 30 iterations)
                 if int(datetime.now().timestamp()) % 300 < scan_interval:
                     long_count = stats.get('longSignals', 0)
