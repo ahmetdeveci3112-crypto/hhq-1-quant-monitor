@@ -3646,9 +3646,9 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Initialize scanner if needed
         if not multi_coin_scanner.coins:
             await multi_coin_scanner.fetch_all_futures_symbols()
-            # Preload historical OHLCV data for top 50 coins (enables immediate Z-Score/Hurst calculation)
-            logger.info("Preloading historical data for immediate Z-Score/Hurst calculation...")
-            await multi_coin_scanner.preload_all_coins(top_n=50)
+            # Start preload as background task (non-blocking to avoid health check timeout)
+            logger.info("Starting background OHLCV preload for Z-Score/Hurst calculation...")
+            asyncio.create_task(multi_coin_scanner.preload_all_coins(top_n=30))  # Reduced to 30 for faster startup
         
         multi_coin_scanner.running = True
         scan_interval = 10  # Scan every 10 seconds (Binance Futures - Amsterdam region)
