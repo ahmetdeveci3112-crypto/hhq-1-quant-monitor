@@ -122,9 +122,16 @@ export default function App() {
           // Sync auto trade state
           setAutoTradeEnabled(data.enabled);
 
-          // Auto-start scanner if backend has trading enabled
-          if (data.enabled) {
-            setIsRunning(true);
+          // Fetch scanner running status
+          try {
+            const scannerRes = await fetch(`${BACKEND_API_URL}/scanner/status`);
+            if (scannerRes.ok) {
+              const scannerData = await scannerRes.json();
+              setIsRunning(scannerData.running);
+            }
+          } catch {
+            // If scanner status fails, default to running if trading is enabled
+            setIsRunning(data.enabled);
           }
 
           // Sync logs
@@ -184,6 +191,20 @@ export default function App() {
       addLog('❌ API hatası: Toggle başarısız');
     }
   }, [addLog]);
+
+  const handleToggleScanner = useCallback(async () => {
+    try {
+      const endpoint = isRunning ? '/scanner/stop' : '/scanner/start';
+      const res = await fetch(`${BACKEND_API_URL}${endpoint}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setIsRunning(data.running);
+        addLog(`🔄 Scanner: ${data.running ? 'BAŞLATILDI' : 'DURDURULDU'}`);
+      }
+    } catch (e) {
+      addLog('❌ API hatası: Scanner kontrolü başarısız');
+    }
+  }, [addLog, isRunning]);
 
   // ============================================================================
   // PAPER TRADING ENGINE
@@ -556,7 +577,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setIsRunning(!isRunning)}
+            onClick={handleToggleScanner}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all shadow-lg text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
           >
             {isRunning ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}

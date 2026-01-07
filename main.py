@@ -3680,6 +3680,40 @@ async def paper_trading_toggle():
     status = "enabled" if global_paper_trader.enabled else "disabled"
     return JSONResponse({"success": True, "enabled": global_paper_trader.enabled, "message": f"Auto-trading {status}"})
 
+@app.post("/scanner/start")
+async def scanner_start():
+    """Start the background scanner."""
+    global background_scanner_task
+    
+    if multi_coin_scanner.running:
+        return JSONResponse({"success": True, "running": True, "message": "Scanner already running"})
+    
+    # Start scanner
+    multi_coin_scanner.running = True
+    
+    # Restart background task if needed
+    if background_scanner_task is None or background_scanner_task.done():
+        background_scanner_task = asyncio.create_task(background_scanner_loop())
+    
+    logger.info("🚀 Scanner started via API")
+    return JSONResponse({"success": True, "running": True, "message": "Scanner started"})
+
+@app.post("/scanner/stop")
+async def scanner_stop():
+    """Stop the background scanner."""
+    multi_coin_scanner.running = False
+    logger.info("🛑 Scanner stopped via API")
+    return JSONResponse({"success": True, "running": False, "message": "Scanner stopped"})
+
+@app.get("/scanner/status")
+async def scanner_status():
+    """Get scanner running status."""
+    return JSONResponse({
+        "running": multi_coin_scanner.running,
+        "totalCoins": len(multi_coin_scanner.coins),
+        "analyzedCoins": len(multi_coin_scanner.analyzers)
+    })
+
 # Phase 17: Settings endpoints
 @app.get("/paper-trading/settings")
 async def paper_trading_get_settings():
