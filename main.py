@@ -2461,45 +2461,70 @@ class PaperTradingEngine:
         if atr <= 0:
             atr = price * 0.01
         
-        # Calculate SL/TP based on ATR
-        if side == 'LONG':
-            sl = price - (atr * self.sl_atr)
-            tp = price + (atr * self.tp_atr)
-            trail_activation = price + (atr * self.trail_activation_atr)
-            trail_distance = atr * self.trail_distance_atr
+        # =========================================================================
+        # PHASE 32: USE SIGNAL'S PRE-CALCULATED VALUES (PULLBACK ENTRY)
+        # =========================================================================
+        
+        # Use entry price from signal (includes pullback calculation) or fall back to current price
+        entry_price = signal.get('entryPrice', price) if signal else price
+        
+        # Use SL/TP from signal (already calculated with spread-based parameters) or calculate fallback
+        if signal and 'sl' in signal and 'tp' in signal:
+            sl = signal['sl']
+            tp = signal['tp']
+            trail_activation = signal.get('trailActivation', entry_price + atr if side == 'LONG' else entry_price - atr)
+            trail_distance = signal.get('trailDistance', atr * self.trail_distance_atr)
         else:
-            sl = price + (atr * self.sl_atr)
-            tp = price - (atr * self.tp_atr)
-            trail_activation = price - (atr * self.trail_activation_atr)
-            trail_distance = atr * self.trail_distance_atr
+            # Fallback calculation
+            if side == 'LONG':
+                sl = entry_price - (atr * self.sl_atr)
+                tp = entry_price + (atr * self.tp_atr)
+                trail_activation = entry_price + (atr * self.trail_activation_atr)
+                trail_distance = atr * self.trail_distance_atr
+            else:
+                sl = entry_price + (atr * self.sl_atr)
+                tp = entry_price - (atr * self.tp_atr)
+                trail_activation = entry_price - (atr * self.trail_activation_atr)
+                trail_distance = atr * self.trail_distance_atr
         
-        # Phase 30: Apply SessionManager leverage adjustment
-        session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
-        
-        # Apply BalanceProtector leverage multiplier
-        leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
-        adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
-        adjusted_leverage = max(3, min(75, adjusted_leverage))
+        # Use leverage from signal (spread-adjusted) or calculate
+        if signal and 'leverage' in signal:
+            adjusted_leverage = signal['leverage']
+        else:
+            # Phase 30: Apply SessionManager leverage adjustment
+            session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
+            
+            # Apply BalanceProtector leverage multiplier
+            leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
+            adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
+            adjusted_leverage = max(3, min(75, adjusted_leverage))
         
         # Phase 30: Kelly Criterion position sizing
         kelly_risk = self.calculate_kelly_fraction()
         session_risk = session_manager.adjust_risk(kelly_risk)
         
-        # Position Sizing with Kelly
-        risk_amount = self.balance * session_risk
+        # Use size multiplier from signal if available
+        size_mult = signal.get('sizeMultiplier', 1.0) if signal else 1.0
+        
+        # Position Sizing with Kelly and signal multiplier
+        risk_amount = self.balance * session_risk * size_mult
         position_size_usd = risk_amount * adjusted_leverage
-        position_size = position_size_usd / price
+        position_size = position_size_usd / entry_price
         
-        # Log session info
+        # Get pullback info for logging
+        pullback_pct = signal.get('pullbackPct', 0) if signal else 0
+        spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
+        
+        # Log session info with pullback
         session_info = session_manager.get_session_info()
-        self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x")
+        self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x | Pullback: {pullback_pct}%")
         
-        # Create position
+        # Create position with ideal entry price
         new_position = {
             "id": f"{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
             "side": side,
-            "entryPrice": price,
+            "entryPrice": entry_price,  # Uses pullback-adjusted price
             "size": position_size,
             "sizeUsd": position_size_usd,
             "stopLoss": sl,
@@ -2512,13 +2537,13 @@ class PaperTradingEngine:
             "unrealizedPnlPercent": 0.0,
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": adjusted_leverage,
-            "spreadLevel": signal.get('spreadLevel', 'normal') if signal else 'normal'
+            "spreadLevel": spread_level
         }
         
         self.positions.append(new_position)
-        self.add_log(f"🚀 POZİSYON AÇILDI: {side} {trade_symbol} @ ${price:.4f} | {adjusted_leverage}x | SL:${sl:.4f} TP:${tp:.4f}")
+        self.add_log(f"🚀 POZİSYON AÇILDI: {side} {trade_symbol} @ ${entry_price:.4f} (Pullback: {pullback_pct}%) | {adjusted_leverage}x | SL:${sl:.4f} TP:${tp:.4f}")
         self.save_state()
-        logger.info(f"🚀 AUTO-TRADE OPEN: {side} {trade_symbol} @ {price} | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
+        logger.info(f"🚀 AUTO-TRADE OPEN: {side} {trade_symbol} @ {entry_price} (Pullback: {pullback_pct}%) | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
         
         return new_position
     
