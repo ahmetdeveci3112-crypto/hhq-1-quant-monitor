@@ -75,9 +75,6 @@ export default function App() {
   const [lastUpdateTime, setLastUpdateTime] = useState<Date | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
-  // Pending Orders State (Pullback Entries)
-  const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
-
   // Settings Modal
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<SystemSettings>({
@@ -124,6 +121,11 @@ export default function App() {
 
           // Sync auto trade state
           setAutoTradeEnabled(data.enabled);
+
+          // Auto-start scanner if backend has trading enabled
+          if (data.enabled) {
+            setIsRunning(true);
+          }
 
           // Sync logs
           if (data.logs && data.logs.length > 0) {
@@ -180,26 +182,6 @@ export default function App() {
       addLog(`🤖 Otomatik Ticaret: ${data.enabled ? 'AÇIK' : 'KAPALI'}`);
     } catch (e) {
       addLog('❌ API hatası: Toggle başarısız');
-    }
-  }, [addLog]);
-
-  const handleChangeCoin = useCallback(async (coin: string) => {
-    setSelectedCoin(coin);
-    setShowCoinMenu(false);
-    try {
-      const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: coin })
-      });
-      const data = await res.json();
-      if (data.success) {
-        addLog(`🪙 Coin Değiştirildi: ${coin}`);
-      } else {
-        addLog(`❌ Coin değiştirilemedi: ${data.message || 'Unknown error'}`);
-      }
-    } catch (e) {
-      addLog('❌ API hatası: Coin değişim başarısız');
     }
   }, [addLog]);
 
@@ -717,7 +699,7 @@ export default function App() {
                     <PositionPanel
                       key={pos.id}
                       position={pos}
-                      currentPrice={systemState.currentPrice}
+                      currentPrice={pos.entryPrice}  // Use position's entry price
                       onClosePosition={() => handleManualClose(pos.id)}
                     />
                   ))
