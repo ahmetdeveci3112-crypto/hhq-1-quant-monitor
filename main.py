@@ -2742,6 +2742,9 @@ class PaperTradingEngine:
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
                     self.max_positions = data.get('max_positions', 1)
+                    # Phase 32: Load algorithm sensitivity settings
+                    self.z_score_threshold = data.get('z_score_threshold', 1.2)
+                    self.min_confidence_score = data.get('min_confidence_score', 55)
                     # Phase 19: Load logs
                     self.logs = data.get('logs', [])
                     logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
@@ -2767,6 +2770,9 @@ class PaperTradingEngine:
                 "trail_activation_atr": self.trail_activation_atr,
                 "trail_distance_atr": self.trail_distance_atr,
                 "max_positions": self.max_positions,
+                # Phase 32: Save algorithm sensitivity settings
+                "z_score_threshold": self.z_score_threshold,
+                "min_confidence_score": self.min_confidence_score,
                 # Phase 19: Save logs
                 "logs": self.logs[-100:]
             }
@@ -2785,6 +2791,8 @@ class PaperTradingEngine:
             "totalTrades": 0, "winningTrades": 0, "losingTrades": 0, "winRate": 0.0,
             "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
         }
+        # Phase 32: Clear old logs on reset
+        self.logs = []
         self.save_state()
         logger.info("🔄 Paper Trading Reset to $10,000")
 
