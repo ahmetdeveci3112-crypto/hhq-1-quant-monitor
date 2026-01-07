@@ -2514,16 +2514,23 @@ class PaperTradingEngine:
             self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
             return None
         
-        # Check for existing position in same symbol
-        for pos in self.positions:
-            if pos.get('symbol') == trade_symbol:
-                self.add_log(f"⚠️ {trade_symbol} için zaten açık pozisyon var")
-                return None
+        # =========================================================================
+        # PHASE 33: POSITION SCALING LOGIC
+        # =========================================================================
+        # Same coin + same direction: Allow up to 3 scale-in entries
+        # Different coins: No direction limit (only total max_positions applies)
         
-        # Check same direction limit
-        same_direction = [p for p in self.positions if p.get('side') == side]
-        if len(same_direction) >= 2:
-            self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {side} açılmadı")
+        # Count entries for this specific coin and direction
+        same_coin_same_dir = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') == side]
+        
+        if len(same_coin_same_dir) >= 3:
+            self.add_log(f"⚠️ {trade_symbol} {side} için zaten 3 giriş yapıldı, scale-in limiti")
+            return None
+        
+        # Check if we already have opposite position in same coin (hedging check)
+        same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
+        if same_coin_opposite and not self.allow_hedging:
+            self.add_log(f"⚠️ {trade_symbol} için ters pozisyon var, hedging kapalı")
             return None
         
         # Log signal received
@@ -2919,11 +2926,8 @@ class PaperTradingEngine:
             self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
             return
         
-        # Check for same direction positions (allow max 2 same direction)
-        same_direction = [p for p in self.positions if p.get('side') == action]
-        if len(same_direction) >= 2:
-            self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {action} açılmadı")
-            return
+        # PHASE 33: Position scaling is handled in open_position method
+        # This method is mainly for opposite signal exit logic
         
         # =====================================================================
         # PHASE 29: ENHANCED OPPOSITE SIGNAL EXIT - BALANCE PROTECTION FOCUS
