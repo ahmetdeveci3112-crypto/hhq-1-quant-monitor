@@ -84,7 +84,9 @@ export default function App() {
     riskPerTrade: 2,
     trailActivationAtr: 1.5,
     trailDistanceAtr: 1,
-    maxPositions: 1
+    maxPositions: 1,
+    zScoreThreshold: 1.2,
+    minConfidenceScore: 55
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -247,7 +249,9 @@ export default function App() {
           riskPerTrade: (data.riskPerTrade ?? 0.02) * 100,
           trailActivationAtr: data.trailActivationAtr ?? 1.5,
           trailDistanceAtr: data.trailDistanceAtr ?? 1,
-          maxPositions: data.maxPositions ?? 1
+          maxPositions: data.maxPositions ?? 1,
+          zScoreThreshold: data.zScoreThreshold ?? 1.2,
+          minConfidenceScore: data.minConfidenceScore ?? 55
         });
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
@@ -296,7 +300,9 @@ export default function App() {
           tpAtr: String(settings.takeProfit),
           trailActivationAtr: String(settings.trailActivationAtr),
           trailDistanceAtr: String(settings.trailDistanceAtr),
-          maxPositions: String(settings.maxPositions)
+          maxPositions: String(settings.maxPositions),
+          zScoreThreshold: String(settings.zScoreThreshold),
+          minConfidenceScore: String(settings.minConfidenceScore)
         });
         const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
         if (res.ok) {

@@ -125,6 +125,9 @@ export interface SystemSettings {
   trailActivationAtr: number;
   trailDistanceAtr: number;
   maxPositions: number;
+  // Algorithm sensitivity settings
+  zScoreThreshold: number;      // Min Z-Score for signal (1.0-2.5, lower = more signals)
+  minConfidenceScore: number;   // Min confidence score (40-80, lower = more signals)
 }
 
 // =============================================================================

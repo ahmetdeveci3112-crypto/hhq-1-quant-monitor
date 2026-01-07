@@ -1978,9 +1978,9 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            # RELAXED settings for more signals
-            base_threshold = 1.2  # Relaxed: was 1.4, now more signals
-            min_score_required = 55  # Relaxed: was 68, now more signals
+            # Use global paper trader settings for algorithm sensitivity
+            base_threshold = global_paper_trader.z_score_threshold if 'global_paper_trader' in globals() else 1.2
+            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
             is_backtest = False
         
         # Leverage Scaling:
@@ -2317,6 +2317,9 @@ class PaperTradingEngine:
         # Phase 22: Multi-position config
         self.max_positions = 3  # Allow up to 3 positions
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
+        # Algorithm sensitivity settings (can be adjusted via API)
+        self.z_score_threshold = 1.2  # Min Z-Score for signal
+        self.min_confidence_score = 55  # Min confidence score for signal
         # Phase 19: Server-side persistent logs
         self.logs = []
         # Phase 20: Advanced Risk Management Config
@@ -3726,15 +3729,17 @@ async def paper_trading_get_settings():
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
         "stats": global_paper_trader.stats,
-        "trades": global_paper_trader.trades[-50:],  # Last 50 trades
-        "equityCurve": global_paper_trader.equity_curve[-100:],  # Last 100 points
-        # Phase 18: Full trading parameters
+        "trades": global_paper_trader.trades[-50:],
+        "equityCurve": global_paper_trader.equity_curve[-100:],
         "slAtr": global_paper_trader.sl_atr,
         "tpAtr": global_paper_trader.tp_atr,
         "trailActivationAtr": global_paper_trader.trail_activation_atr,
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
         "maxPositions": global_paper_trader.max_positions,
-        # Phase 19: Server-side logs
+        # Algorithm sensitivity settings
+        "zScoreThreshold": global_paper_trader.z_score_threshold,
+        "minConfidenceScore": global_paper_trader.min_confidence_score,
+        # Server-side logs
         "logs": global_paper_trader.logs[-50:]
     })
 
@@ -3747,7 +3752,9 @@ async def paper_trading_update_settings(
     tpAtr: float = None,
     trailActivationAtr: float = None,
     trailDistanceAtr: float = None,
-    maxPositions: int = None
+    maxPositions: int = None,
+    zScoreThreshold: float = None,
+    minConfidenceScore: int = None
 ):
     """Update cloud trading settings."""
     if symbol:
@@ -3774,10 +3781,16 @@ async def paper_trading_update_settings(
         global_paper_trader.trail_distance_atr = trailDistanceAtr
     if maxPositions is not None:
         global_paper_trader.max_positions = maxPositions
-    # Phase 19: Log settings change
-    global_paper_trader.add_log(f"⚙️ AYARLAR GÜNCELLENDİ: {global_paper_trader.symbol} | {global_paper_trader.leverage}x | SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr}")
+    # Algorithm sensitivity settings
+    if zScoreThreshold is not None:
+        global_paper_trader.z_score_threshold = zScoreThreshold
+    if minConfidenceScore is not None:
+        global_paper_trader.min_confidence_score = minConfidenceScore
+    
+    # Log settings change (simplified)
+    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold}")
     global_paper_trader.save_state()
-    logger.info(f"Settings updated: {global_paper_trader.symbol} | {global_paper_trader.leverage}x | SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr}")
+    logger.info(f"Settings updated: Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_confidence_score}")
     return JSONResponse({
         "success": True,
         "symbol": global_paper_trader.symbol,
@@ -3787,7 +3800,9 @@ async def paper_trading_update_settings(
         "tpAtr": global_paper_trader.tp_atr,
         "trailActivationAtr": global_paper_trader.trail_activation_atr,
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
-        "maxPositions": global_paper_trader.max_positions
+        "maxPositions": global_paper_trader.max_positions,
+        "zScoreThreshold": global_paper_trader.z_score_threshold,
+        "minConfidenceScore": global_paper_trader.min_confidence_score
     })
 
 @app.post("/paper-trading/close/{position_id}")
