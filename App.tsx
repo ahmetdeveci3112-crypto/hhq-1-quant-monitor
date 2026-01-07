@@ -84,7 +84,7 @@ export default function App() {
     riskPerTrade: 2,
     trailActivationAtr: 1.5,
     trailDistanceAtr: 1,
-    maxPositions: 1,
+    maxPositions: 5,
     zScoreThreshold: 1.2,
     minConfidenceScore: 55
   });
@@ -551,7 +551,9 @@ export default function App() {
           <div className="hidden sm:flex items-center gap-3 md:gap-6 mr-2 md:mr-4 border-r border-slate-800 pr-2 md:pr-6">
             <div className="text-right">
               <div className="text-[10px] md:text-xs text-slate-500 mb-0.5">Balance</div>
-              <div className="text-xs md:text-sm font-mono font-bold text-white">{formatCurrency(portfolio.balanceUsd)}</div>
+              <div className="text-xs md:text-sm font-mono font-bold text-white">
+                {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+              </div>
             </div>
             <div className="hidden md:block text-right">
               <div className="text-xs text-slate-500 mb-0.5">24h PnL</div>

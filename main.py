@@ -2387,7 +2387,7 @@ class PaperTradingEngine:
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
         # Phase 22: Multi-position config
-        self.max_positions = 3  # Allow up to 3 positions
+        self.max_positions = 5  # Allow up to 5 positions
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
         # Algorithm sensitivity settings (can be adjusted via API)
         self.z_score_threshold = 1.2  # Min Z-Score for signal
@@ -2838,7 +2838,7 @@ class PaperTradingEngine:
                     self.tp_atr = data.get('tp_atr', 3.0)
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
-                    self.max_positions = data.get('max_positions', 3)
+                    self.max_positions = data.get('max_positions', 5)
                     # Phase 32: Load algorithm sensitivity settings
                     self.z_score_threshold = data.get('z_score_threshold', 1.2)
                     self.min_confidence_score = data.get('min_confidence_score', 55)
