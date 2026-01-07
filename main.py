@@ -2416,6 +2416,113 @@ class PaperTradingEngine:
         }
     
     # =========================================================================
+    # ASYNC OPEN_POSITION FOR AUTO-TRADING
+    # =========================================================================
+    
+    async def open_position(self, side: str, price: float, atr: float, signal: dict, symbol: str = None):
+        """
+        Open a new position for auto-trading from background scanner.
+        
+        Args:
+            side: 'LONG' or 'SHORT'
+            price: Current price
+            atr: Average True Range value
+            signal: Signal dict with optional parameters
+            symbol: Symbol to trade (defaults to self.symbol)
+        """
+        if not self.enabled:
+            self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
+            return None
+        
+        # Use provided symbol or default
+        trade_symbol = symbol if symbol else self.symbol
+        
+        # Check position limits
+        if len(self.positions) >= self.max_positions:
+            self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
+            return None
+        
+        # Check for existing position in same symbol
+        for pos in self.positions:
+            if pos.get('symbol') == trade_symbol:
+                self.add_log(f"⚠️ {trade_symbol} için zaten açık pozisyon var")
+                return None
+        
+        # Check same direction limit
+        same_direction = [p for p in self.positions if p.get('side') == side]
+        if len(same_direction) >= 2:
+            self.add_log(f"⚠️ Aynı yönde zaten 2 pozisyon var, yeni {side} açılmadı")
+            return None
+        
+        # Log signal received
+        self.add_log(f"📡 SİNYAL ALINDI: {side} {trade_symbol} @ ${price:.6f}")
+        
+        # ATR fallback
+        if atr <= 0:
+            atr = price * 0.01
+        
+        # Calculate SL/TP based on ATR
+        if side == 'LONG':
+            sl = price - (atr * self.sl_atr)
+            tp = price + (atr * self.tp_atr)
+            trail_activation = price + (atr * self.trail_activation_atr)
+            trail_distance = atr * self.trail_distance_atr
+        else:
+            sl = price + (atr * self.sl_atr)
+            tp = price - (atr * self.tp_atr)
+            trail_activation = price - (atr * self.trail_activation_atr)
+            trail_distance = atr * self.trail_distance_atr
+        
+        # Phase 30: Apply SessionManager leverage adjustment
+        session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
+        
+        # Apply BalanceProtector leverage multiplier
+        leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
+        adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
+        adjusted_leverage = max(3, min(75, adjusted_leverage))
+        
+        # Phase 30: Kelly Criterion position sizing
+        kelly_risk = self.calculate_kelly_fraction()
+        session_risk = session_manager.adjust_risk(kelly_risk)
+        
+        # Position Sizing with Kelly
+        risk_amount = self.balance * session_risk
+        position_size_usd = risk_amount * adjusted_leverage
+        position_size = position_size_usd / price
+        
+        # Log session info
+        session_info = session_manager.get_session_info()
+        self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x")
+        
+        # Create position
+        new_position = {
+            "id": f"{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
+            "symbol": trade_symbol,
+            "side": side,
+            "entryPrice": price,
+            "size": position_size,
+            "sizeUsd": position_size_usd,
+            "stopLoss": sl,
+            "takeProfit": tp,
+            "trailingStop": sl,
+            "trailActivation": trail_activation,
+            "trailDistance": trail_distance,
+            "isTrailingActive": False,
+            "unrealizedPnl": 0.0,
+            "unrealizedPnlPercent": 0.0,
+            "openTime": int(datetime.now().timestamp() * 1000),
+            "leverage": adjusted_leverage,
+            "spreadLevel": signal.get('spreadLevel', 'normal') if signal else 'normal'
+        }
+        
+        self.positions.append(new_position)
+        self.add_log(f"🚀 POZİSYON AÇILDI: {side} {trade_symbol} @ ${price:.4f} | {adjusted_leverage}x | SL:${sl:.4f} TP:${tp:.4f}")
+        self.save_state()
+        logger.info(f"🚀 AUTO-TRADE OPEN: {side} {trade_symbol} @ {price} | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
+        
+        return new_position
+    
+    # =========================================================================
     # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
     # =========================================================================
     
