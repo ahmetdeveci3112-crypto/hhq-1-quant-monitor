@@ -27,7 +27,7 @@ const getCoinIcon = (symbol: string): string => {
 export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals }) => {
     // Filter only active signals and sort by score
     const activeSignals = signals
-        .filter(s => s.signalAction !== 'NONE' && s.signalScore >= 60)
+        .filter(s => s.signalAction !== 'NONE' && s.signalScore >= 45)
         .sort((a, b) => b.signalScore - a.signalScore)
         .slice(0, 10);
 

@@ -506,25 +506,23 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="fixed top-0 left-0 right-0 h-16 bg-[#0B0E14]/80 backdrop-blur-md border-b border-slate-800 z-50 px-6 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <Waves className="w-6 h-6 text-white" />
+      <header className="fixed top-0 left-0 right-0 h-14 md:h-16 bg-[#0B0E14]/80 backdrop-blur-md border-b border-slate-800 z-50 px-3 md:px-6 flex items-center justify-between">
+        <div className="flex items-center gap-2 md:gap-4">
+          <div className="flex items-center gap-2 md:gap-3">
+            <div className="w-8 h-8 md:w-10 md:h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+              <Waves className="w-5 h-5 md:w-6 md:h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-lg font-bold text-white leading-tight">QuantMonitor <span className="text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span></h1>
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'} `}></span>
-                {isRunning ? 'System Active' : 'System Paused'}
+              <h1 className="text-sm md:text-lg font-bold text-white leading-tight">QuantMonitor <span className="hidden sm:inline text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span></h1>
+              <div className="flex items-center gap-1 md:gap-2 text-[10px] md:text-xs text-slate-500">
+                <span className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
+                {isRunning ? 'Active' : 'Paused'}
               </div>
             </div>
           </div>
 
-          <div className="h-8 w-px bg-slate-800 mx-2"></div>
-
-          {/* Phase 31: Scanner Stats Indicator (Replaces Coin Selector) */}
-          <div className="flex items-center gap-3 px-4 py-2 bg-slate-800/50 rounded-lg border border-slate-700">
+          {/* Scanner Stats - Hidden on mobile */}
+          <div className="hidden lg:flex items-center gap-3 px-4 py-2 bg-slate-800/50 rounded-lg border border-slate-700 ml-4">
             <div className="relative">
               <Radar className={`w-5 h-5 ${isConnected ? 'text-indigo-400 animate-pulse' : 'text-slate-500'}`} />
               <span className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
@@ -548,13 +546,14 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex items-center gap-6">
-          <div className="flex items-center gap-6 mr-4 border-r border-slate-800 pr-6">
+        <div className="flex items-center gap-2 md:gap-4">
+          {/* Balance - Hidden on small mobile */}
+          <div className="hidden sm:flex items-center gap-3 md:gap-6 mr-2 md:mr-4 border-r border-slate-800 pr-2 md:pr-6">
             <div className="text-right">
-              <div className="text-xs text-slate-500 mb-0.5">Wallet Balance</div>
-              <div className="text-sm font-mono font-bold text-white">{formatCurrency(portfolio.balanceUsd)}</div>
+              <div className="text-[10px] md:text-xs text-slate-500 mb-0.5">Balance</div>
+              <div className="text-xs md:text-sm font-mono font-bold text-white">{formatCurrency(portfolio.balanceUsd)}</div>
             </div>
-            <div className="text-right">
+            <div className="hidden md:block text-right">
               <div className="text-xs text-slate-500 mb-0.5">24h PnL</div>
               <div className={`text-sm font-mono font-bold ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                 {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)}
@@ -564,50 +563,50 @@ export default function App() {
 
           <button
             onClick={handleToggleAutoTrade}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg font-bold text-xs transition-all border ${autoTradeEnabled
+            className={`flex items-center gap-1 md:gap-2 px-2 md:px-3 py-1.5 rounded-lg font-bold text-[10px] md:text-xs transition-all border ${autoTradeEnabled
               ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
               : 'bg-slate-800 text-slate-400 border-slate-700'
               }`}
           >
-            <div className={`w-2 h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
-            {autoTradeEnabled ? 'AUTO ON' : 'AUTO OFF'}
+            <div className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
+            <span className="hidden sm:inline">{autoTradeEnabled ? 'AUTO ON' : 'AUTO OFF'}</span>
           </button>
 
           <button
             onClick={handleReset}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium text-xs bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
+            className="hidden sm:flex items-center gap-1.5 px-2 md:px-3 py-1.5 rounded-lg font-medium text-xs bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
             title="Sistemi Sıfırla"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            Reset
+            <span className="hidden md:inline">Reset</span>
           </button>
 
           <button
             onClick={handleToggleScanner}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all shadow-lg text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
+            className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-bold transition-all shadow-lg text-xs md:text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
           >
-            {isRunning ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+            {isRunning ? <Square className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" /> : <Play className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" />}
             {isRunning ? 'Stop' : 'Start'}
           </button>
 
           <button
             onClick={() => setShowSettings(true)}
-            className="w-9 h-9 rounded-lg flex items-center justify-center bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700 transition-all"
+            className="w-8 h-8 md:w-9 md:h-9 rounded-lg flex items-center justify-center bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700 transition-all"
           >
             <Settings className="w-4 h-4" />
           </button>
         </div>
-      </header >
+      </header>
 
       {/* Main Content */}
-      <main className="pt-24 px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
-        <div className="grid grid-cols-12 gap-6 h-full">
+      <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-6 h-full">
 
-          {/* LEFT COLUMN: Market Data & Chart (8 cols) */}
-          <div className="col-span-12 lg:col-span-8 flex flex-col gap-6">
+          {/* LEFT COLUMN: Market Data & Chart */}
+          <div className="lg:col-span-8 flex flex-col gap-4 md:gap-6">
 
             {/* Top Row: Scanner Stats Cards */}
-            <div className="grid grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4">
               {/* Total Coins Scanned */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
                 <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
@@ -701,8 +700,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN: Positions, Logs, Analysis (4 cols) */}
-          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
+          {/* RIGHT COLUMN: Positions, Logs, Analysis */}
+          <div className="lg:col-span-4 flex flex-col gap-4 md:gap-6">
 
             {/* Active Signals Panel - Phase 31 */}
             <ActiveSignalsPanel signals={opportunities} />
@@ -713,23 +712,34 @@ export default function App() {
                 <h3 className="font-bold text-white flex items-center gap-2">
                   <Zap className="w-5 h-5 text-amber-500" />
                   Active Positions
+                  {portfolio.positions.length > 0 && (
+                    <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full">
+                      {portfolio.positions.length}
+                    </span>
+                  )}
                 </h3>
               </div>
-              <div className="flex flex-col gap-3 min-h-[100px]">
+              <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto custom-scrollbar">
                 {portfolio.positions.length === 0 ? (
                   <div className="flex flex-col items-center justify-center flex-1 py-8 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
                     <Wallet className="w-8 h-8 mb-2 opacity-30" />
                     <span className="text-sm">No Open Positions</span>
                   </div>
                 ) : (
-                  portfolio.positions.map(pos => (
-                    <PositionPanel
-                      key={pos.id}
-                      position={pos}
-                      currentPrice={pos.entryPrice}  // Use position's entry price
-                      onClosePosition={() => handleManualClose(pos.id)}
-                    />
-                  ))
+                  portfolio.positions.map(pos => {
+                    // Get current price from opportunities for this symbol
+                    const opportunity = opportunities.find(o => o.symbol === pos.symbol);
+                    const currentPrice = opportunity?.price || pos.entryPrice;
+
+                    return (
+                      <PositionPanel
+                        key={pos.id}
+                        position={pos}
+                        currentPrice={currentPrice}
+                        onClosePosition={() => handleManualClose(pos.id)}
+                      />
+                    );
+                  })
                 )}
               </div>
             </div>
