@@ -326,7 +326,9 @@ export default function App() {
           trailDistanceAtr: String(settings.trailDistanceAtr),
           maxPositions: String(settings.maxPositions),
           zScoreThreshold: String(settings.zScoreThreshold),
-          minConfidenceScore: String(settings.minConfidenceScore)
+          minConfidenceScore: String(settings.minConfidenceScore),
+          entryTightness: String(settings.entryTightness),
+          exitTightness: String(settings.exitTightness)
         });
         const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
         if (res.ok) {

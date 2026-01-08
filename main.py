@@ -2884,6 +2884,9 @@ class PaperTradingEngine:
         # Algorithm sensitivity settings (can be adjusted via API)
         self.z_score_threshold = 1.2  # Min Z-Score for signal
         self.min_confidence_score = 55  # Min confidence score for signal
+        # Phase 36: Entry/Exit tightness settings
+        self.entry_tightness = 1.0  # 0.5-2.0: Pullback multiplier
+        self.exit_tightness = 1.0   # 0.5-2.0: SL/TP multiplier
         # Phase 19: Server-side persistent logs
         self.logs = []
         # Phase 20: Advanced Risk Management Config
@@ -3425,6 +3428,9 @@ class PaperTradingEngine:
                     # Phase 32: Load algorithm sensitivity settings
                     self.z_score_threshold = data.get('z_score_threshold', 1.2)
                     self.min_confidence_score = data.get('min_confidence_score', 55)
+                    # Phase 36: Load entry/exit tightness
+                    self.entry_tightness = data.get('entry_tightness', 1.0)
+                    self.exit_tightness = data.get('exit_tightness', 1.0)
                     # Phase 19: Load logs
                     self.logs = data.get('logs', [])
                     logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
@@ -3453,6 +3459,9 @@ class PaperTradingEngine:
                 # Phase 32: Save algorithm sensitivity settings
                 "z_score_threshold": self.z_score_threshold,
                 "min_confidence_score": self.min_confidence_score,
+                # Phase 36: Save entry/exit tightness
+                "entry_tightness": self.entry_tightness,
+                "exit_tightness": self.exit_tightness,
                 # Phase 19: Save logs
                 "logs": self.logs[-100:]
             }
@@ -4546,7 +4555,9 @@ async def paper_trading_update_settings(
     trailDistanceAtr: float = None,
     maxPositions: int = None,
     zScoreThreshold: float = None,
-    minConfidenceScore: int = None
+    minConfidenceScore: int = None,
+    entryTightness: float = None,
+    exitTightness: float = None
 ):
     """Update cloud trading settings."""
     if symbol:
@@ -4578,11 +4589,16 @@ async def paper_trading_update_settings(
         global_paper_trader.z_score_threshold = zScoreThreshold
     if minConfidenceScore is not None:
         global_paper_trader.min_confidence_score = minConfidenceScore
+    # Phase 36: Entry/Exit tightness settings
+    if entryTightness is not None:
+        global_paper_trader.entry_tightness = entryTightness
+    if exitTightness is not None:
+        global_paper_trader.exit_tightness = exitTightness
     
     # Log settings change (simplified)
     global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MaxPos:{global_paper_trader.max_positions}")
     global_paper_trader.save_state()
-    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_confidence_score}")
+    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} Entry:{global_paper_trader.entry_tightness} Exit:{global_paper_trader.exit_tightness}")
     return JSONResponse({
         "success": True,
         "symbol": global_paper_trader.symbol,
@@ -4594,7 +4610,9 @@ async def paper_trading_update_settings(
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
         "maxPositions": global_paper_trader.max_positions,
         "zScoreThreshold": global_paper_trader.z_score_threshold,
-        "minConfidenceScore": global_paper_trader.min_confidence_score
+        "minConfidenceScore": global_paper_trader.min_confidence_score,
+        "entryTightness": global_paper_trader.entry_tightness,
+        "exitTightness": global_paper_trader.exit_tightness
     })
 
 
