@@ -2445,9 +2445,12 @@ class SignalGenerator:
         
         self.last_signal_time = now
         
-        # Log spread level and leverage
+        # Log spread level and leverage with ATR% for debugging
         reasons.append(f"Spread({spread_params['level']})")
         reasons.append(f"Lev({final_leverage}x)")
+        
+        # Debug: Log the actual ATR% value and what level it maps to
+        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% → Level={spread_params['level']} → Lev={spread_leverage}x (after BalProt: {final_leverage}x)")
         
         return {
             'action': signal_side,
