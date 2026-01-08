@@ -691,6 +691,7 @@ export default function App() {
                   <thead>
                     <tr className="text-slate-500 border-b border-slate-800">
                       <th className="pb-3 pl-2 font-medium">Time</th>
+                      <th className="pb-3 font-medium">Coin</th>
                       <th className="pb-3 font-medium">Type</th>
                       <th className="pb-3 font-medium">Entry</th>
                       <th className="pb-3 font-medium">Exit</th>
@@ -701,9 +702,12 @@ export default function App() {
                   <tbody>
                     {portfolio.trades.slice().reverse().slice(0, 5).map((trade, i) => (
                       <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
-                        <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString()}</td>
+                        <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</td>
                         <td className="py-3">
-                          <span className={`px-2 py-0.5 rounded text-xs font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
+                          <span className="text-xs font-bold text-white">{trade.symbol?.replace('USDT', '') || 'N/A'}</span>
+                        </td>
+                        <td className="py-3">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
                             {trade.side}
                           </span>
                         </td>
@@ -712,12 +716,12 @@ export default function App() {
                         <td className={`py-3 font-mono font-bold text-xs ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                           {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
                         </td>
-                        <td className="py-3 text-right pr-2 text-xs text-slate-500 uppercase">{trade.closeReason}</td>
+                        <td className="py-3 text-right pr-2 text-[10px] text-slate-500 uppercase">{trade.closeReason}</td>
                       </tr>
                     ))}
                     {portfolio.trades.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="py-8 text-center text-slate-600 italic">No trades recorded yet.</td>
+                        <td colSpan={7} className="py-8 text-center text-slate-600 italic">No trades recorded yet.</td>
                       </tr>
                     )}
                   </tbody>
