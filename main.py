@@ -38,29 +38,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Forward declaration for background scanner
+# Forward declaration for background tasks
 background_scanner_task = None
+position_updater_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: start background scanner on startup."""
-    global background_scanner_task
+    """Application lifespan: start background scanner and position updater on startup."""
+    global background_scanner_task, position_updater_task
     
     logger.info("🚀 Starting 24/7 Background Scanner...")
     
-    # Start background scanner as asyncio task (will be defined later)
+    # Start background scanner as asyncio task (scans all coins every 10 seconds)
     background_scanner_task = asyncio.create_task(background_scanner_loop())
+    
+    # Start position updater task (updates open positions every 2 seconds)
+    position_updater_task = asyncio.create_task(position_price_update_loop())
     
     yield  # App is running
     
-    # Shutdown: stop scanner
-    logger.info("🛑 Shutting down Background Scanner...")
-    if background_scanner_task:
-        background_scanner_task.cancel()
-        try:
-            await background_scanner_task
-        except asyncio.CancelledError:
-            pass
+    # Shutdown: stop all tasks
+    logger.info("🛑 Shutting down Background Tasks...")
+    for task in [background_scanner_task, position_updater_task]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0", lifespan=lifespan)
 
@@ -216,23 +221,31 @@ def calculate_zscore(spread_series: list, lookback: int = 20) -> float:
 MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
-# Wider spread multipliers for better signal quality
-# Phase 29: Added leverage - low spread = high leverage, high spread = low leverage
-SPREAD_MULTIPLIERS = {
-    "very_low": {"max_spread": 0.03, "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.002},
-    "low": {"max_spread": 0.08, "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.004},
-    "normal": {"max_spread": 0.15, "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.008},
-    "high": {"max_spread": 0.30, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5, "pullback": 0.012},
-    "very_high": {"max_spread": 1.0, "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3, "pullback": 0.020}
+# Volatility-based parameters using ATR as percentage of price
+# Phase 35: Use ATR% for proper volatility classification
+# Low volatility = tighter stops, higher leverage | High volatility = wider stops, lower leverage
+VOLATILITY_LEVELS = {
+    "very_low":  {"max_atr_pct": 1.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},
+    "low":       {"max_atr_pct": 2.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},
+    "normal":    {"max_atr_pct": 3.5,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.010},
+    "high":      {"max_atr_pct": 5.0,  "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.015},
+    "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.020}
 }
 
-def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
+def get_volatility_adjusted_params(volatility_pct: float, atr: float) -> dict:
     """
-    Get SL/TP/Trail/Leverage based on current spread level.
-    Phase 29: Added dynamic leverage based on spread.
+    Get SL/TP/Trail/Leverage based on volatility (ATR as % of price).
+    Phase 35: Using ATR percentage for proper volatility classification.
+    
+    Args:
+        volatility_pct: ATR as percentage of price (e.g., 2.5 for 2.5%)
+        atr: Absolute ATR value for calculating distances
+        
+    Returns:
+        dict with trail_distance, stop_loss, take_profit, leverage, pullback, level
     """
-    for level, params in SPREAD_MULTIPLIERS.items():
-        if spread_pct <= params["max_spread"]:
+    for level, params in VOLATILITY_LEVELS.items():
+        if volatility_pct <= params["max_atr_pct"]:
             return {
                 "trail_distance": atr * params["trail"],
                 "stop_loss": atr * params["sl"],
@@ -245,7 +258,7 @@ def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
                 "level": level
             }
     # Default to very_high
-    params = SPREAD_MULTIPLIERS["very_high"]
+    params = VOLATILITY_LEVELS["very_high"]
     return {
         "trail_distance": atr * params["trail"],
         "stop_loss": atr * params["sl"],
@@ -257,6 +270,12 @@ def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
         "trail_multiplier": params["trail"],
         "level": "very_high"
     }
+
+# Backwards compatibility alias
+def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
+    """Alias for get_volatility_adjusted_params for backwards compatibility."""
+    return get_volatility_adjusted_params(spread_pct, atr)
+
 
 
 class MultiTimeframeAnalyzer:
@@ -667,15 +686,12 @@ class LightweightCoinAnalyzer:
         self.opportunity.atr = atr
         self.opportunity.imbalance = imbalance
         
-        # Simple spread calculation from ATR (volatility proxy)
-        # Lower ATR = tighter spread, Higher ATR = wider spread
+        # Phase 35: Calculate volatility as ATR percentage of price
+        # This is the TRUE volatility measure - no artificial capping
+        # BTC typically ~1.5%, SOL ~2.5%, DOGE ~4%, meme coins 5%+
         if atr > 0 and self.opportunity.price > 0:
-            # ATR as % of price gives volatility, use as spread proxy
-            # Typical crypto spread: 0.01% to 0.5%
-            spread_pct = (atr / self.opportunity.price) * 100
-            # Scale down to realistic spread range (0.01 - 0.5)
-            spread_pct = min(0.5, max(0.01, spread_pct * 0.5))
-            self.opportunity.spread_pct = spread_pct
+            volatility_pct = (atr / self.opportunity.price) * 100
+            self.opportunity.spread_pct = volatility_pct  # Store actual volatility %
         
         # Generate signal
         signal = self.signal_generator.generate_signal(
@@ -1327,6 +1343,131 @@ async def background_scanner_loop():
         logger.error(f"Background scanner fatal error: {e}")
         multi_coin_scanner.running = False
 
+
+# ============================================================================
+# PHASE 35: HIGH-FREQUENCY POSITION PRICE UPDATER
+# ============================================================================
+
+async def position_price_update_loop():
+    """
+    High-frequency position price updater.
+    Runs every 2 seconds to update prices ONLY for coins with open positions.
+    This is 5x faster than the main scanner loop for critical position monitoring.
+    """
+    logger.info("⚡ Position Price Updater started - 2s interval")
+    
+    update_interval = 2  # Update every 2 seconds for fast SL/TP/trailing reactions
+    
+    # Wait for app to fully initialize
+    await asyncio.sleep(5)
+    
+    try:
+        while True:
+            try:
+                # Skip if no open positions
+                if not global_paper_trader.positions:
+                    await asyncio.sleep(update_interval)
+                    continue
+                
+                # Get unique symbols with open positions
+                position_symbols = list(set(p.get('symbol', '') for p in global_paper_trader.positions if p.get('symbol')))
+                
+                if not position_symbols:
+                    await asyncio.sleep(update_interval)
+                    continue
+                
+                # Get instant prices from WebSocket (no API call needed)
+                tickers = binance_ws_manager.get_tickers(position_symbols)
+                
+                if not tickers:
+                    await asyncio.sleep(update_interval)
+                    continue
+                
+                # Update each open position with real-time price
+                for pos in list(global_paper_trader.positions):
+                    try:
+                        symbol = pos.get('symbol', '')
+                        ticker = tickers.get(symbol)
+                        
+                        if not ticker:
+                            continue
+                        
+                        current_price = ticker.get('last', 0)
+                        if current_price <= 0:
+                            continue
+                        
+                        # Calculate unrealized PnL
+                        entry_price = pos.get('entryPrice', current_price)
+                        size = pos.get('size', 0)
+                        size_usd = pos.get('sizeUsd', 0)
+                        leverage = pos.get('leverage', 1)
+                        
+                        if pos['side'] == 'LONG':
+                            pnl = (current_price - entry_price) * size
+                        else:
+                            pnl = (entry_price - current_price) * size
+                        
+                        pnl_percent = (pnl / size_usd) * 100 * leverage if size_usd > 0 else 0
+                        
+                        # Update position data
+                        pos['unrealizedPnl'] = round(pnl, 6)
+                        pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
+                        pos['currentPrice'] = current_price
+                        
+                        # Check SL/TP exits
+                        sl = pos.get('stopLoss', 0)
+                        tp = pos.get('takeProfit', 0)
+                        trailing_stop = pos.get('trailingStop', sl)
+                        
+                        # SL Hit Check
+                        if pos['side'] == 'LONG' and current_price <= trailing_stop:
+                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                            logger.info(f"⚡ Fast SL triggered: LONG {symbol} @ ${current_price:.6f}")
+                            continue
+                        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                            logger.info(f"⚡ Fast SL triggered: SHORT {symbol} @ ${current_price:.6f}")
+                            continue
+                        
+                        # TP Hit Check
+                        if pos['side'] == 'LONG' and current_price >= tp:
+                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                            logger.info(f"⚡ Fast TP triggered: LONG {symbol} @ ${current_price:.6f}")
+                            continue
+                        elif pos['side'] == 'SHORT' and current_price <= tp:
+                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                            logger.info(f"⚡ Fast TP triggered: SHORT {symbol} @ ${current_price:.6f}")
+                            continue
+                        
+                        # Update trailing stop if in profit
+                        trail_activation = pos.get('trailActivation', entry_price)
+                        trail_distance = pos.get('trailDistance', 0)
+                        
+                        if pos['side'] == 'LONG' and current_price > trail_activation:
+                            new_trailing = current_price - trail_distance
+                            if new_trailing > trailing_stop:
+                                pos['trailingStop'] = new_trailing
+                                pos['isTrailingActive'] = True
+                        elif pos['side'] == 'SHORT' and current_price < trail_activation:
+                            new_trailing = current_price + trail_distance
+                            if new_trailing < trailing_stop:
+                                pos['trailingStop'] = new_trailing
+                                pos['isTrailingActive'] = True
+                                
+                    except Exception as pos_error:
+                        logger.debug(f"Position update error for {symbol}: {pos_error}")
+                        continue
+                
+                await asyncio.sleep(update_interval)
+                
+            except Exception as loop_error:
+                logger.error(f"Position updater loop error: {loop_error}")
+                await asyncio.sleep(update_interval)
+                
+    except asyncio.CancelledError:
+        logger.info("Position Price Updater cancelled")
+    except Exception as e:
+        logger.error(f"Position updater fatal error: {e}")
 
 async def process_signal_for_paper_trading(signal: dict, price: float):
     """Process a signal for paper trading execution."""
