@@ -4004,9 +4004,9 @@ async def paper_trading_update_settings(
         global_paper_trader.min_confidence_score = minConfidenceScore
     
     # Log settings change (simplified)
-    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold}")
+    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MaxPos:{global_paper_trader.max_positions}")
     global_paper_trader.save_state()
-    logger.info(f"Settings updated: Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_confidence_score}")
+    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_confidence_score}")
     return JSONResponse({
         "success": True,
         "symbol": global_paper_trader.symbol,
@@ -4023,17 +4023,32 @@ async def paper_trading_update_settings(
 
 @app.post("/paper-trading/close/{position_id}")
 async def paper_trading_close(position_id: str):
-    """Close a specific position."""
-    # Get current price from last known position
-    if global_paper_trader.positions:
-        pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
-        if pos:
-            # Use entry price as fallback (ideally we'd have live price)
-            current_price = pos.get('entryPrice', 0)
-            success = global_paper_trader.close_position_by_id(position_id, current_price)
-            if success:
-                return JSONResponse({"success": True, "message": "Position closed"})
-    return JSONResponse({"success": False, "message": "Position not found"}, status_code=404)
+    """Close a specific position with real-time price."""
+    pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
+    if not pos:
+        return JSONResponse({"success": False, "message": "Position not found"}, status_code=404)
+    
+    # Get current price - priority: 1) stored currentPrice 2) scanner opportunities 3) entryPrice fallback
+    current_price = pos.get('currentPrice', 0)
+    
+    if not current_price or current_price <= 0:
+        # Try to get from scanner opportunities
+        symbol = pos.get('symbol', '')
+        for opp in multi_coin_scanner.current_opportunities:
+            if opp.get('symbol') == symbol:
+                current_price = opp.get('price', 0)
+                break
+    
+    if not current_price or current_price <= 0:
+        current_price = pos.get('entryPrice', 0)
+        logger.warning(f"Using entry price for close (no live price available): {position_id}")
+    
+    if current_price > 0:
+        success = global_paper_trader.close_position_by_id(position_id, current_price)
+        if success:
+            return JSONResponse({"success": True, "message": f"Position closed at ${current_price:.6f}"})
+    
+    return JSONResponse({"success": False, "message": "Could not get current price"}, status_code=500)
 
 
 # ============================================================================
