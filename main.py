@@ -2849,7 +2849,15 @@ class PaperTradingEngine:
     Simulates trading execution on the backend (Server-Side).
     Persists state to JSON to survive restarts.
     """
-    def __init__(self, state_file: str = "paper_trading_state.json"):
+    def __init__(self, state_file: str = None):
+        # Use persistent volume path on Fly.io, fallback to local for development
+        if state_file is None:
+            if os.path.exists("/data"):
+                state_file = "/data/paper_trading_state.json"
+                logger.info("📁 Using persistent volume: /data/paper_trading_state.json")
+            else:
+                state_file = "paper_trading_state.json"
+                logger.info("📁 Using local storage: paper_trading_state.json")
         self.state_file = state_file
         self.balance = 10000.0
         self.initial_balance = 10000.0
