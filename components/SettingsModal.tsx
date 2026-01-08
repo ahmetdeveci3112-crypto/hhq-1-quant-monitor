@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Save, Zap, TrendingUp } from 'lucide-react';
+import { X, Save, Zap, TrendingUp, Target, LogOut } from 'lucide-react';
 import { SystemSettings } from '../types';
 
 interface Props {
@@ -26,7 +26,29 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
     return { label: 'Çok Muhafazakar', color: 'text-indigo-400', desc: 'Çok az sinyal, en yüksek kalite' };
   };
 
+  // Entry tightness level helper
+  const getEntryLevel = () => {
+    const t = localSettings.entryTightness;
+    if (t <= 0.6) return { label: 'Çok Sıkı', color: 'text-rose-500', desc: 'Fiyat çok yakınsa gir, az pozisyon' };
+    if (t <= 0.8) return { label: 'Sıkı', color: 'text-orange-400', desc: 'Fiyat yakınsa gir' };
+    if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart pullback' };
+    if (t <= 1.6) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Daha geniş pullback' };
+    return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'En geniş pullback, çok pozisyon' };
+  };
+
+  // Exit tightness level helper
+  const getExitLevel = () => {
+    const t = localSettings.exitTightness;
+    if (t <= 0.6) return { label: 'Çok Hızlı', color: 'text-rose-500', desc: 'Hızlı çıkış, küçük SL/TP' };
+    if (t <= 0.8) return { label: 'Hızlı', color: 'text-orange-400', desc: 'Erken çıkış' };
+    if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP' };
+    if (t <= 1.6) return { label: 'Sabırlı', color: 'text-blue-400', desc: 'Daha geniş SL/TP' };
+    return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'En geniş SL/TP, uzun tutma' };
+  };
+
   const sensitivity = getSensitivityLevel();
+  const entryLevel = getEntryLevel();
+  const exitLevel = getExitLevel();
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -39,20 +61,20 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
         </div>
 
         <div className="p-6 space-y-6">
-          {/* Algorithm Sensitivity Section */}
+          {/* Signal Algorithm Sensitivity Section */}
           <div>
             <h3 className="text-sm font-semibold text-indigo-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <Zap className="w-4 h-4" />
-              Algoritma Hassasiyeti
+              1. Sinyal Algoritması
             </h3>
 
             {/* Sensitivity Indicator */}
-            <div className={`bg-slate-800/50 border border-slate-700 rounded-lg p-4 mb-4`}>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-sm text-slate-400">Mevcut Seviye:</span>
-                <span className={`font-bold ${sensitivity.color}`}>{sensitivity.label}</span>
+            <div className={`bg-slate-800/50 border border-slate-700 rounded-lg p-3 mb-4`}>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-slate-400">Mevcut Seviye:</span>
+                <span className={`font-bold text-sm ${sensitivity.color}`}>{sensitivity.label}</span>
               </div>
-              <p className="text-xs text-slate-500">{sensitivity.desc}</p>
+              <p className="text-[10px] text-slate-500">{sensitivity.desc}</p>
             </div>
 
             <div className="space-y-4">
@@ -71,9 +93,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                   onChange={e => setLocalSettings({ ...localSettings, zScoreThreshold: parseFloat(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                 />
-                <div className="flex justify-between text-xs text-slate-500 mt-1">
-                  <span>Düşük (Daha Fazla Sinyal)</span>
-                  <span>Yüksek (Daha Az Sinyal)</span>
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                  <span>Fazla Sinyal</span>
+                  <span>Az Sinyal</span>
                 </div>
               </div>
 
@@ -92,10 +114,84 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                   onChange={e => setLocalSettings({ ...localSettings, minConfidenceScore: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                 />
-                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                   <span>40 (Gevşek)</span>
                   <span>85 (Sıkı)</span>
                 </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Entry Algorithm Section */}
+          <div>
+            <h3 className="text-sm font-semibold text-amber-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <Target className="w-4 h-4" />
+              2. Giriş Algoritması (Pullback)
+            </h3>
+
+            {/* Entry Indicator */}
+            <div className={`bg-slate-800/50 border border-slate-700 rounded-lg p-3 mb-4`}>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-slate-400">Giriş Modu:</span>
+                <span className={`font-bold text-sm ${entryLevel.color}`}>{entryLevel.label}</span>
+              </div>
+              <p className="text-[10px] text-slate-500">{entryLevel.desc}</p>
+            </div>
+
+            <div>
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-sm text-slate-300">Giriş Sıkılığı</label>
+                <span className="text-sm font-mono text-amber-400">{localSettings.entryTightness.toFixed(1)}x</span>
+              </div>
+              <input
+                type="range"
+                min="0.5"
+                max="2.0"
+                step="0.1"
+                value={localSettings.entryTightness}
+                onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                <span>0.5x (Sıkı = Az Pozisyon)</span>
+                <span>2.0x (Gevşek = Çok Pozisyon)</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Exit Algorithm Section */}
+          <div>
+            <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <LogOut className="w-4 h-4" />
+              3. Çıkış Algoritması (SL/TP)
+            </h3>
+
+            {/* Exit Indicator */}
+            <div className={`bg-slate-800/50 border border-slate-700 rounded-lg p-3 mb-4`}>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-slate-400">Çıkış Modu:</span>
+                <span className={`font-bold text-sm ${exitLevel.color}`}>{exitLevel.label}</span>
+              </div>
+              <p className="text-[10px] text-slate-500">{exitLevel.desc}</p>
+            </div>
+
+            <div>
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-sm text-slate-300">Çıkış Sıkılığı</label>
+                <span className="text-sm font-mono text-rose-400">{localSettings.exitTightness.toFixed(1)}x</span>
+              </div>
+              <input
+                type="range"
+                min="0.5"
+                max="2.0"
+                step="0.1"
+                value={localSettings.exitTightness}
+                onChange={e => setLocalSettings({ ...localSettings, exitTightness: parseFloat(e.target.value) })}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                <span>0.5x (Hızlı = Küçük SL/TP)</span>
+                <span>2.0x (Sabırlı = Geniş SL/TP)</span>
               </div>
             </div>
           </div>
@@ -109,7 +205,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
 
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm text-slate-300 mb-2">Stop Loss (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Stop Loss (ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -118,14 +214,14 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                     max="5"
                     value={localSettings.stopLossAtr}
                     onChange={e => setLocalSettings({ ...localSettings, stopLossAtr: parseFloat(e.target.value) })}
-                    className="bg-transparent w-full text-white outline-none"
+                    className="bg-transparent w-full text-white outline-none text-sm"
                   />
                   <span className="text-slate-500 text-xs ml-2">ATR</span>
                 </div>
               </div>
 
               <div>
-                <label className="block text-sm text-slate-300 mb-2">Take Profit (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Take Profit (ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -134,14 +230,14 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                     max="10"
                     value={localSettings.takeProfit}
                     onChange={e => setLocalSettings({ ...localSettings, takeProfit: parseFloat(e.target.value) })}
-                    className="bg-transparent w-full text-white outline-none"
+                    className="bg-transparent w-full text-white outline-none text-sm"
                   />
                   <span className="text-slate-500 text-xs ml-2">ATR</span>
                 </div>
               </div>
 
               <div>
-                <label className="block text-sm text-slate-300 mb-2">Maks. Pozisyon</label>
+                <label className="block text-xs text-slate-300 mb-1">Maks. Pozisyon</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -149,14 +245,14 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                     max="10"
                     value={localSettings.maxPositions}
                     onChange={e => setLocalSettings({ ...localSettings, maxPositions: parseInt(e.target.value) })}
-                    className="bg-transparent w-full text-white outline-none"
+                    className="bg-transparent w-full text-white outline-none text-sm"
                   />
                   <span className="text-slate-500 text-xs ml-2">adet</span>
                 </div>
               </div>
 
               <div>
-                <label className="block text-sm text-slate-300 mb-2">İşlem Başı Risk</label>
+                <label className="block text-xs text-slate-300 mb-1">İşlem Başı Risk</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -165,7 +261,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                     max="5"
                     value={localSettings.riskPerTrade}
                     onChange={e => setLocalSettings({ ...localSettings, riskPerTrade: parseFloat(e.target.value) })}
-                    className="bg-transparent w-full text-white outline-none"
+                    className="bg-transparent w-full text-white outline-none text-sm"
                   />
                   <span className="text-slate-500 text-xs ml-2">%</span>
                 </div>

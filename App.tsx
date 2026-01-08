@@ -86,7 +86,9 @@ export default function App() {
     trailDistanceAtr: 1,
     maxPositions: 5,
     zScoreThreshold: 1.2,
-    minConfidenceScore: 55
+    minConfidenceScore: 55,
+    entryTightness: 1.0,
+    exitTightness: 1.0
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -208,6 +210,26 @@ export default function App() {
     }
   }, [addLog, isRunning]);
 
+  // Phase 36: Market Order from Signal Card
+  const handleMarketOrder = useCallback(async (symbol: string, side: 'LONG' | 'SHORT', price: number) => {
+    try {
+      addLog(`🛒 Market Order: ${side} ${symbol} @ $${price.toFixed(4)}`);
+      const res = await fetch(`${BACKEND_API_URL}/paper-trading/market-order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, side, price })
+      });
+      const data = await res.json();
+      if (data.success) {
+        addLog(`✅ Market Order Başarılı: ${side} ${symbol}`);
+      } else {
+        addLog(`❌ Market Order Hata: ${data.error || 'Bilinmeyen hata'}`);
+      }
+    } catch (e) {
+      addLog('❌ API hatası: Market Order başarısız');
+    }
+  }, [addLog]);
+
   // ============================================================================
   // PAPER TRADING ENGINE
   // ============================================================================
@@ -251,7 +273,9 @@ export default function App() {
           trailDistanceAtr: data.trailDistanceAtr ?? 1,
           maxPositions: data.maxPositions ?? 1,
           zScoreThreshold: data.zScoreThreshold ?? 1.2,
-          minConfidenceScore: data.minConfidenceScore ?? 55
+          minConfidenceScore: data.minConfidenceScore ?? 55,
+          entryTightness: data.entryTightness ?? 1.0,
+          exitTightness: data.exitTightness ?? 1.0
         });
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
@@ -744,7 +768,7 @@ export default function App() {
             </div>
 
             {/* Active Signals Panel - Phase 31 */}
-            <ActiveSignalsPanel signals={opportunities} />
+            <ActiveSignalsPanel signals={opportunities} onMarketOrder={handleMarketOrder} />
 
             {/* System Logs Terminal - Fixed height container with scroll */}
             <div className="bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden h-[250px]">

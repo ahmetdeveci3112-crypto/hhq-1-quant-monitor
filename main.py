@@ -4597,6 +4597,88 @@ async def paper_trading_update_settings(
         "minConfidenceScore": global_paper_trader.min_confidence_score
     })
 
+
+# Phase 36: Market Order from Signal Card
+@app.post("/paper-trading/market-order")
+async def paper_trading_market_order(request: Request):
+    """Open a market order from a signal card (manual entry)."""
+    try:
+        data = await request.json()
+        symbol = data.get('symbol')
+        side = data.get('side')  # LONG or SHORT
+        price = float(data.get('price', 0))
+        
+        if not symbol or not side or price <= 0:
+            return JSONResponse({"success": False, "error": "Missing symbol, side, or price"}, status_code=400)
+        
+        # Check if we have room for more positions
+        if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
+            return JSONResponse({"success": False, "error": f"Max positions ({global_paper_trader.max_positions}) reached"})
+        
+        # Get ATR from analyzer if available
+        atr = price * 0.02  # Default 2% of price as fallback ATR
+        if symbol in multi_coin_scanner.analyzers:
+            analyzer = multi_coin_scanner.analyzers[symbol]
+            if hasattr(analyzer.opportunity, 'atr') and analyzer.opportunity.atr > 0:
+                atr = analyzer.opportunity.atr
+        
+        # Calculate position sizing
+        balance = global_paper_trader.balance
+        risk_amount = balance * global_paper_trader.risk_per_trade
+        leverage = global_paper_trader.leverage
+        
+        # SL/TP based on ATR
+        sl_distance = atr * global_paper_trader.sl_atr
+        tp_distance = atr * global_paper_trader.tp_atr
+        
+        if side == 'LONG':
+            sl = price - sl_distance
+            tp = price + tp_distance
+        else:
+            sl = price + sl_distance
+            tp = price - tp_distance
+        
+        # Position size
+        if sl_distance > 0:
+            size = risk_amount / sl_distance
+        else:
+            size = (balance * 0.1) / price  # 10% of balance fallback
+        
+        size_usd = size * price
+        
+        # Create position
+        position = {
+            "id": f"manual_{int(datetime.now().timestamp() * 1000)}",
+            "symbol": symbol,
+            "side": side,
+            "entryPrice": price,
+            "currentPrice": price,
+            "size": size,
+            "sizeUsd": size_usd,
+            "stopLoss": sl,
+            "takeProfit": tp,
+            "trailingStop": 0,
+            "trailActivation": price + (atr * global_paper_trader.trail_activation_atr) if side == 'LONG' else price - (atr * global_paper_trader.trail_activation_atr),
+            "trailDistance": atr * global_paper_trader.trail_distance_atr,
+            "isTrailingActive": False,
+            "unrealizedPnl": 0,
+            "unrealizedPnlPercent": 0,
+            "openTime": int(datetime.now().timestamp() * 1000),
+            "leverage": leverage
+        }
+        
+        global_paper_trader.positions.append(position)
+        global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${price:.4f} | SL: ${sl:.4f} | TP: ${tp:.4f}")
+        global_paper_trader.save_state()
+        
+        logger.info(f"✅ Market Order: {side} {symbol} @ {price}")
+        return JSONResponse({"success": True, "position": position})
+        
+    except Exception as e:
+        logger.error(f"Market order error: {e}")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 @app.post("/paper-trading/close/{position_id}")
 async def paper_trading_close(position_id: str):
     """Close a specific position with real-time price."""

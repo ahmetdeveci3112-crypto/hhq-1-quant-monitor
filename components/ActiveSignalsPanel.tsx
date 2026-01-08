@@ -1,9 +1,10 @@
-import React from 'react';
-import { Zap, TrendingUp, TrendingDown, Clock, Target, Percent } from 'lucide-react';
+import React, { useState } from 'react';
+import { Zap, TrendingUp, TrendingDown, Clock, Target, Percent, ShoppingCart, Loader2 } from 'lucide-react';
 import { CoinOpportunity } from '../types';
 
 interface ActiveSignalsPanelProps {
     signals: CoinOpportunity[];
+    onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number) => Promise<void>;
 }
 
 const formatPrice = (price: number): string => {
@@ -33,12 +34,24 @@ const getSpreadInfo = (spreadPct: number): { level: string; pullback: number; le
     return { level: 'very_high', pullback: 2.0, leverage: 3 };
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder }) => {
+    const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
+
     // Filter only active signals and sort by score
     const activeSignals = signals
         .filter(s => s.signalAction !== 'NONE' && s.signalScore >= 45)
         .sort((a, b) => b.signalScore - a.signalScore)
         .slice(0, 10);
+
+    const handleMarketOrder = async (signal: CoinOpportunity) => {
+        if (!onMarketOrder) return;
+        setLoadingSymbol(signal.symbol);
+        try {
+            await onMarketOrder(signal.symbol, signal.signalAction as 'LONG' | 'SHORT', signal.price);
+        } finally {
+            setLoadingSymbol(null);
+        }
+    };
 
     return (
         <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
@@ -55,8 +68,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals 
                 )}
             </div>
 
-            {/* Signal List */}
-            <div className="space-y-2 max-h-[280px] overflow-y-auto custom-scrollbar">
+            {/* Signal List - No horizontal scroll */}
+            <div className="space-y-2 max-h-[320px] overflow-y-auto overflow-x-hidden custom-scrollbar">
                 {activeSignals.length === 0 ? (
                     <div className="text-center py-6 text-slate-500 text-sm">
                         <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
@@ -74,38 +87,40 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals 
                             ? signal.price * (1 - pullbackPct / 100)
                             : signal.price * (1 + pullbackPct / 100);
 
+                        const isLoading = loadingSymbol === signal.symbol;
+
                         return (
                             <div
                                 key={signal.symbol}
                                 className={`
-                                    p-3 rounded-lg border transition-all hover:scale-[1.01]
+                                    p-3 rounded-lg border transition-colors
                                     ${isLong
-                                        ? 'bg-emerald-500/5 border-emerald-500/30 hover:border-emerald-500/50'
-                                        : 'bg-rose-500/5 border-rose-500/30 hover:border-rose-500/50'
+                                        ? 'bg-emerald-500/5 border-emerald-500/30 hover:border-emerald-500/60'
+                                        : 'bg-rose-500/5 border-rose-500/30 hover:border-rose-500/60'
                                     }
                                 `}
                             >
                                 {/* Top Row: Symbol, Action, Score */}
                                 <div className="flex items-center justify-between mb-2">
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 min-w-0">
                                         <img
                                             src={getCoinIcon(signal.symbol)}
                                             alt={signal.symbol}
-                                            className="w-5 h-5"
+                                            className="w-5 h-5 shrink-0"
                                             onError={(e) => {
                                                 (e.target as HTMLImageElement).src = 'https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/generic.png';
                                             }}
                                         />
-                                        <span className="font-bold text-white text-xs">{signal.symbol}</span>
+                                        <span className="font-bold text-white text-xs truncate">{signal.symbol}</span>
                                         <span className={`
-                                            flex items-center gap-0.5 text-xs font-bold px-1.5 py-0.5 rounded
+                                            flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0
                                             ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}
                                         `}>
-                                            {isLong ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                                            {isLong ? <TrendingUp className="w-2.5 h-2.5" /> : <TrendingDown className="w-2.5 h-2.5" />}
                                             {signal.signalAction}
                                         </span>
                                     </div>
-                                    <div className={`text-xs font-bold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    <div className={`text-xs font-bold shrink-0 ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
                                         {signal.signalScore}/100
                                     </div>
                                 </div>
@@ -114,36 +129,61 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals 
                                 <div className="grid grid-cols-2 gap-2 mb-2">
                                     <div className="bg-black/20 rounded px-2 py-1">
                                         <div className="text-[9px] text-slate-500 uppercase">Güncel Fiyat</div>
-                                        <div className="text-xs font-mono text-white">${formatPrice(signal.price)}</div>
+                                        <div className="text-xs font-mono text-white truncate">${formatPrice(signal.price)}</div>
                                     </div>
                                     <div className="bg-black/20 rounded px-2 py-1">
                                         <div className="text-[9px] text-slate-500 uppercase flex items-center gap-1">
                                             <Target className="w-2.5 h-2.5" />
                                             Giriş Fiyatı
                                         </div>
-                                        <div className={`text-xs font-mono font-bold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                        <div className={`text-xs font-mono font-bold truncate ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
                                             ${formatPrice(entryPrice)}
                                         </div>
                                     </div>
                                 </div>
 
-                                {/* Bottom Row: Leverage, Pullback, Time */}
+                                {/* Bottom Row: Leverage, Pullback, Time, Market Order Button */}
                                 <div className="flex items-center justify-between text-[10px]">
-                                    <div className="flex items-center gap-3">
-                                        <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                        <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold shrink-0">
                                             {leverage}x
                                         </span>
-                                        <span className="flex items-center gap-1 text-amber-400">
+                                        <span className="flex items-center gap-0.5 text-amber-400 shrink-0">
                                             <Percent className="w-2.5 h-2.5" />
-                                            {pullbackPct}% pullback
+                                            {pullbackPct}%
                                         </span>
-                                        <span className="text-slate-500 capitalize">
+                                        <span className="text-slate-500 capitalize truncate hidden sm:inline">
                                             {spreadInfo.level.replace('_', ' ')}
                                         </span>
                                     </div>
-                                    <div className="flex items-center gap-1 text-slate-500">
-                                        <Clock className="w-2.5 h-2.5" />
-                                        {formatTime(signal.lastSignalTime)}
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <div className="flex items-center gap-1 text-slate-500">
+                                            <Clock className="w-2.5 h-2.5" />
+                                            {formatTime(signal.lastSignalTime)}
+                                        </div>
+                                        {onMarketOrder && (
+                                            <button
+                                                onClick={() => handleMarketOrder(signal)}
+                                                disabled={isLoading}
+                                                className={`
+                                                    flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold transition-all
+                                                    ${isLong
+                                                        ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                                                        : 'bg-rose-600 hover:bg-rose-500 text-white'
+                                                    }
+                                                    ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}
+                                                `}
+                                            >
+                                                {isLoading ? (
+                                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : (
+                                                    <>
+                                                        <ShoppingCart className="w-3 h-3" />
+                                                        Market
+                                                    </>
+                                                )}
+                                            </button>
+                                        )}
                                     </div>
                                 </div>
                             </div>
