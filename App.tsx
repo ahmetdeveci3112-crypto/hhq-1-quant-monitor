@@ -547,17 +547,17 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
-          {/* Balance - Hidden on small mobile */}
-          <div className="hidden sm:flex items-center gap-3 md:gap-6 mr-2 md:mr-4 border-r border-slate-800 pr-2 md:pr-6">
+          {/* Balance - Always visible, compact on mobile */}
+          <div className="flex items-center gap-2 md:gap-6 mr-2 md:mr-4 border-r border-slate-800 pr-2 md:pr-6">
             <div className="text-right">
-              <div className="text-[10px] md:text-xs text-slate-500 mb-0.5">Balance</div>
-              <div className="text-xs md:text-sm font-mono font-bold text-white">
+              <div className="text-[9px] md:text-xs text-slate-500">Balance</div>
+              <div className="text-[11px] md:text-sm font-mono font-bold text-white">
                 {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
               </div>
             </div>
-            <div className="hidden md:block text-right">
-              <div className="text-xs text-slate-500 mb-0.5">24h PnL</div>
-              <div className={`text-sm font-mono font-bold ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            <div className="text-right">
+              <div className="text-[9px] md:text-xs text-slate-500">PnL</div>
+              <div className={`text-[11px] md:text-sm font-mono font-bold ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                 {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)}
               </div>
             </div>
@@ -702,30 +702,27 @@ export default function App() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN: Positions, Logs, Analysis */}
+          {/* RIGHT COLUMN: Positions first (for mobile priority), then Signals, then Logs */}
           <div className="lg:col-span-4 flex flex-col gap-4 md:gap-6">
 
-            {/* Active Signals Panel - Phase 31 */}
-            <ActiveSignalsPanel signals={opportunities} />
-
-            {/* Active Positions Panel */}
-            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col gap-4">
+            {/* Active Positions Panel - FIRST for mobile priority */}
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col gap-4 order-first lg:order-none">
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/50">
                 <h3 className="font-bold text-white flex items-center gap-2">
                   <Zap className="w-5 h-5 text-amber-500" />
                   Active Positions
                   {portfolio.positions.length > 0 && (
-                    <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full">
+                    <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full animate-pulse">
                       {portfolio.positions.length}
                     </span>
                   )}
                 </h3>
               </div>
-              <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto custom-scrollbar">
+              <div className="flex flex-col gap-3 max-h-[350px] overflow-y-auto custom-scrollbar">
                 {portfolio.positions.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center flex-1 py-8 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
-                    <Wallet className="w-8 h-8 mb-2 opacity-30" />
-                    <span className="text-sm">No Open Positions</span>
+                  <div className="flex flex-col items-center justify-center flex-1 py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
+                    <Wallet className="w-6 h-6 mb-2 opacity-30" />
+                    <span className="text-xs">No Open Positions</span>
                   </div>
                 ) : (
                   portfolio.positions.map(pos => {
@@ -746,28 +743,31 @@ export default function App() {
               </div>
             </div>
 
-            {/* System Logs Terminal */}
-            <div className="flex-1 bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden min-h-[300px]">
-              <div className="px-4 py-3 border-b border-slate-800 bg-[#151921]/80 backdrop-blur flex items-center justify-between">
-                <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2">
-                  <Terminal className="w-4 h-4 text-indigo-400" />
+            {/* Active Signals Panel - Phase 31 */}
+            <ActiveSignalsPanel signals={opportunities} />
+
+            {/* System Logs Terminal - Fixed height container with scroll */}
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden h-[250px]">
+              <div className="px-4 py-2 border-b border-slate-800 bg-[#151921]/80 backdrop-blur flex items-center justify-between shrink-0">
+                <h3 className="text-xs font-bold text-slate-300 flex items-center gap-2">
+                  <Terminal className="w-3.5 h-3.5 text-indigo-400" />
                   Live System Logs
                 </h3>
                 <div className="flex items-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                  <span className="text-[10px] text-emerald-500 font-mono">LIVE</span>
+                  <span className="text-[9px] text-emerald-500 font-mono">LIVE</span>
                 </div>
               </div>
-              <div className="flex-1 bg-black/40 overflow-y-auto p-4 font-mono text-[10px] leading-relaxed space-y-1.5 custom-scrollbar" ref={logRef}>
-                {logs.map((log, i) => {
+              <div className="flex-1 bg-black/40 overflow-y-auto p-3 font-mono text-[9px] leading-relaxed space-y-1 custom-scrollbar" ref={logRef}>
+                {logs.slice(0, 30).map((log, i) => {
                   const timestampMatch = log.match(/^\[(\d{1,2}:\d{2}:\d{2})\]/);
                   const timestamp = timestampMatch ? timestampMatch[1] : '';
                   const message = log.replace(/^\[.*?\]\s*☁️?\s*/, '');
 
                   return (
                     <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
-                      <span className="text-slate-600 shrink-0 select-none">[{timestamp}]</span>
-                      <span className={`${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
+                      <span className="text-slate-600 shrink-0 select-none text-[8px]">[{timestamp}]</span>
+                      <span className={`truncate ${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
                         message.includes('LOSS') || message.includes('❌') ? 'text-rose-400' :
                           message.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
                             message.includes('SİNYAL') || message.includes('Coin Profile') ? 'text-amber-400' :
