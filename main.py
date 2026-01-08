@@ -667,9 +667,14 @@ class LightweightCoinAnalyzer:
         self.opportunity.atr = atr
         self.opportunity.imbalance = imbalance
         
-        # Simple spread calculation
+        # Simple spread calculation from ATR (volatility proxy)
+        # Lower ATR = tighter spread, Higher ATR = wider spread
         if atr > 0 and self.opportunity.price > 0:
-            spread_pct = (atr / self.opportunity.price) * 100 * 0.1
+            # ATR as % of price gives volatility, use as spread proxy
+            # Typical crypto spread: 0.01% to 0.5%
+            spread_pct = (atr / self.opportunity.price) * 100
+            # Scale down to realistic spread range (0.01 - 0.5)
+            spread_pct = min(0.5, max(0.01, spread_pct * 0.5))
             self.opportunity.spread_pct = spread_pct
         
         # Generate signal
@@ -2617,8 +2622,8 @@ class PaperTradingEngine:
         }
         
         self.pending_orders.append(pending_order)
-        self.add_log(f"📋 PENDING ORDER: {side} {trade_symbol} | Sinyal: ${price:.4f} → Giriş: ${entry_price:.4f} (Pullback: {pullback_pct}%)")
-        logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback from {price})")
+        self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
+        logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         
         return pending_order
     
