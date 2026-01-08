@@ -223,12 +223,13 @@ MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
 # Volatility-based parameters using ATR as percentage of price
 # Phase 35: Use ATR% for proper volatility classification
+# Crypto 5m ATR is typically 2-10% - adjusted thresholds accordingly
 # Low volatility = tighter stops, higher leverage | High volatility = wider stops, lower leverage
 VOLATILITY_LEVELS = {
-    "very_low":  {"max_atr_pct": 1.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},
-    "low":       {"max_atr_pct": 2.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},
-    "normal":    {"max_atr_pct": 3.5,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.010},
-    "high":      {"max_atr_pct": 5.0,  "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.015},
+    "very_low":  {"max_atr_pct": 2.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},
+    "low":       {"max_atr_pct": 4.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},
+    "normal":    {"max_atr_pct": 6.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.010},
+    "high":      {"max_atr_pct": 10.0, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.015},
     "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.020}
 }
 
