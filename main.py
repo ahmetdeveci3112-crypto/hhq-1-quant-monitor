@@ -4540,6 +4540,9 @@ async def paper_trading_get_settings():
         # Algorithm sensitivity settings
         "zScoreThreshold": global_paper_trader.z_score_threshold,
         "minConfidenceScore": global_paper_trader.min_confidence_score,
+        # Phase 36: Entry/Exit tightness
+        "entryTightness": global_paper_trader.entry_tightness,
+        "exitTightness": global_paper_trader.exit_tightness,
         # Server-side logs
         "logs": global_paper_trader.logs[-50:]
     })
