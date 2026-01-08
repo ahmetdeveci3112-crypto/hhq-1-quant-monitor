@@ -688,11 +688,11 @@ export default function App() {
                   <BarChart3 className="w-5 h-5 text-indigo-500" />
                   Recent Trades History
                 </h3>
-                <div className="text-xs text-slate-500">Last 5 Trades</div>
+                <div className="text-xs text-slate-500">{portfolio.trades.length} Trades</div>
               </div>
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto max-h-[300px] overflow-y-auto custom-scrollbar">
                 <table className="w-full text-sm text-left">
-                  <thead>
+                  <thead className="sticky top-0 bg-[#151921]">
                     <tr className="text-slate-500 border-b border-slate-800">
                       <th className="pb-3 pl-2 font-medium">Time</th>
                       <th className="pb-3 font-medium">Coin</th>
@@ -704,7 +704,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {portfolio.trades.slice().reverse().slice(0, 5).map((trade, i) => (
+                    {portfolio.trades.slice().reverse().map((trade, i) => (
                       <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
                         <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</td>
                         <td className="py-3">
