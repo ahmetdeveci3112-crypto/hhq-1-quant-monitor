@@ -2408,7 +2408,7 @@ class PaperTradingEngine:
         self.daily_start_balance = 10000.0
         # Phase 34: Pending Orders System
         self.pending_orders = []  # List of pending limit orders waiting for pullback
-        self.pending_order_timeout_seconds = 300  # 5 minutes to fill or cancel
+        self.pending_order_timeout_seconds = 1800  # 30 minutes to fill or cancel
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
@@ -2635,7 +2635,7 @@ class PaperTradingEngine:
             # Check expiration first
             if current_time > expires_at:
                 self.pending_orders.remove(order)
-                self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (5dk timeout)")
+                self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 continue
             
@@ -4114,31 +4114,43 @@ async def paper_trading_update_settings(
 @app.post("/paper-trading/close/{position_id}")
 async def paper_trading_close(position_id: str):
     """Close a specific position with real-time price."""
-    pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
-    if not pos:
-        return JSONResponse({"success": False, "message": "Position not found"}, status_code=404)
-    
-    # Get current price - priority: 1) stored currentPrice 2) scanner opportunities 3) entryPrice fallback
-    current_price = pos.get('currentPrice', 0)
-    
-    if not current_price or current_price <= 0:
-        # Try to get from scanner opportunities
-        symbol = pos.get('symbol', '')
-        for opp in multi_coin_scanner.current_opportunities:
-            if opp.get('symbol') == symbol:
-                current_price = opp.get('price', 0)
-                break
-    
-    if not current_price or current_price <= 0:
-        current_price = pos.get('entryPrice', 0)
-        logger.warning(f"Using entry price for close (no live price available): {position_id}")
-    
-    if current_price > 0:
+    try:
+        # Find position by ID
+        pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
+        if not pos:
+            logger.warning(f"Close position failed: position {position_id} not found. Active positions: {[p['id'] for p in global_paper_trader.positions]}")
+            return JSONResponse({"success": False, "message": f"Pozisyon bulunamadı: {position_id}"}, status_code=404)
+        
+        # Get current price - priority: 1) stored currentPrice 2) scanner opportunities 3) entryPrice fallback
+        current_price = pos.get('currentPrice', 0)
+        
+        if not current_price or current_price <= 0:
+            # Try to get from scanner opportunities
+            symbol = pos.get('symbol', '')
+            for opp in multi_coin_scanner.current_opportunities:
+                if opp.get('symbol') == symbol:
+                    current_price = opp.get('price', 0)
+                    break
+        
+        if not current_price or current_price <= 0:
+            # Final fallback to entry price
+            current_price = pos.get('entryPrice', 0)
+            logger.warning(f"Using entry price for close (no live price): {position_id}")
+        
+        if current_price <= 0:
+            return JSONResponse({"success": False, "message": "Güncel fiyat alınamadı"}, status_code=500)
+        
+        # Close the position
         success = global_paper_trader.close_position_by_id(position_id, current_price)
         if success:
-            return JSONResponse({"success": True, "message": f"Position closed at ${current_price:.6f}"})
-    
-    return JSONResponse({"success": False, "message": "Could not get current price"}, status_code=500)
+            return JSONResponse({"success": True, "message": f"Pozisyon kapatıldı @ ${current_price:.6f}"})
+        else:
+            logger.error(f"close_position_by_id returned False for {position_id}")
+            return JSONResponse({"success": False, "message": "Pozisyon kapatılamadı"}, status_code=500)
+            
+    except Exception as e:
+        logger.error(f"Error closing position {position_id}: {e}")
+        return JSONResponse({"success": False, "message": f"Hata: {str(e)}"}, status_code=500)
 
 
 # ============================================================================
