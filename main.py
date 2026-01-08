@@ -1297,11 +1297,17 @@ async def background_scanner_loop():
                         logger.debug(f"Position update error: {pos_error}")
                         continue
                 
+                # =====================================================================
+                # PHASE 34: CHECK PENDING ORDERS FOR EXECUTION
+                # =====================================================================
+                global_paper_trader.check_pending_orders(opportunities)
+                
                 # Log periodic status (every 5 minutes = 30 iterations)
                 if int(datetime.now().timestamp()) % 300 < scan_interval:
                     long_count = stats.get('longSignals', 0)
                     short_count = stats.get('shortSignals', 0)
-                    logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count}")
+                    pending_count = len(global_paper_trader.pending_orders)
+                    logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count} | Pending: {pending_count}")
                 
                 await asyncio.sleep(scan_interval)
                 
@@ -2400,6 +2406,9 @@ class PaperTradingEngine:
         self.emergency_sl_pct = 10.0  # %10 pozisyon başına max kayıp
         self.current_spread_pct = 0.05  # Will be updated from WebSocket
         self.daily_start_balance = 10000.0
+        # Phase 34: Pending Orders System
+        self.pending_orders = []  # List of pending limit orders waiting for pullback
+        self.pending_order_timeout_seconds = 300  # 5 minutes to fill or cancel
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
@@ -2509,122 +2518,203 @@ class PaperTradingEngine:
         # Use provided symbol or default
         trade_symbol = symbol if symbol else self.symbol
         
-        # Check position limits
-        if len(self.positions) >= self.max_positions:
-            self.add_log(f"⚠️ Max pozisyon limiti ({self.max_positions}), yeni işlem yapılmadı")
-            return None
+        # Check position + pending order limits
+        total_exposure = len(self.positions) + len(self.pending_orders)
+        if total_exposure >= self.max_positions:
+            return None  # Silently skip to avoid log spam
         
         # =========================================================================
         # PHASE 33: POSITION SCALING LOGIC
         # =========================================================================
-        # Same coin + same direction: Allow up to 3 scale-in entries
-        # Different coins: No direction limit (only total max_positions applies)
+        # Count entries for this specific coin and direction (positions + pending)
+        same_coin_same_dir_pos = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') == side]
+        same_coin_same_dir_pend = [p for p in self.pending_orders if p.get('symbol') == trade_symbol and p.get('side') == side]
         
-        # Count entries for this specific coin and direction
-        same_coin_same_dir = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') == side]
+        if len(same_coin_same_dir_pos) + len(same_coin_same_dir_pend) >= 3:
+            return None  # Silently skip scale-in limit
         
-        if len(same_coin_same_dir) >= 3:
-            self.add_log(f"⚠️ {trade_symbol} {side} için zaten 3 giriş yapıldı, scale-in limiti")
-            return None
+        # Check for existing pending order for same symbol (avoid duplicate pending)
+        existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
+        if existing_pending:
+            return None  # Already have pending order for this symbol
         
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
-            self.add_log(f"⚠️ {trade_symbol} için ters pozisyon var, hedging kapalı")
             return None
-        
-        # Log signal received
-        self.add_log(f"📡 SİNYAL ALINDI: {side} {trade_symbol} @ ${price:.6f}")
         
         # ATR fallback
         if atr <= 0:
             atr = price * 0.01
         
         # =========================================================================
-        # PHASE 32: USE SIGNAL'S PRE-CALCULATED VALUES (PULLBACK ENTRY)
+        # PHASE 34: PENDING ORDER SYSTEM (PULLBACK ENTRY)
         # =========================================================================
+        # Create a pending order that waits for price to reach pullback level
         
-        # Use entry price from signal (includes pullback calculation) or fall back to current price
-        entry_price = signal.get('entryPrice', price) if signal else price
-        
-        # Use SL/TP from signal (already calculated with spread-based parameters) or calculate fallback
-        if signal and 'sl' in signal and 'tp' in signal:
-            sl = signal['sl']
-            tp = signal['tp']
-            trail_activation = signal.get('trailActivation', entry_price + atr if side == 'LONG' else entry_price - atr)
-            trail_distance = signal.get('trailDistance', atr * self.trail_distance_atr)
+        # Get pullback entry price from signal
+        if signal and 'entryPrice' in signal:
+            entry_price = signal['entryPrice']
+            pullback_pct = signal.get('pullbackPct', 0)
         else:
-            # Fallback calculation
-            if side == 'LONG':
-                sl = entry_price - (atr * self.sl_atr)
-                tp = entry_price + (atr * self.tp_atr)
-                trail_activation = entry_price + (atr * self.trail_activation_atr)
-                trail_distance = atr * self.trail_distance_atr
-            else:
-                sl = entry_price + (atr * self.sl_atr)
-                tp = entry_price - (atr * self.tp_atr)
-                trail_activation = entry_price - (atr * self.trail_activation_atr)
-                trail_distance = atr * self.trail_distance_atr
+            # No pullback, use current price
+            entry_price = price
+            pullback_pct = 0
+        
+        # Get spread-adjusted parameters from signal
+        spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
         
         # Use leverage from signal (spread-adjusted) or calculate
         if signal and 'leverage' in signal:
             adjusted_leverage = signal['leverage']
         else:
-            # Phase 30: Apply SessionManager leverage adjustment
             session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
-            
-            # Apply BalanceProtector leverage multiplier
             leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
             adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
             adjusted_leverage = max(3, min(75, adjusted_leverage))
         
-        # Phase 30: Kelly Criterion position sizing
+        # Kelly Criterion position sizing
         kelly_risk = self.calculate_kelly_fraction()
         session_risk = session_manager.adjust_risk(kelly_risk)
-        
-        # Use size multiplier from signal if available
         size_mult = signal.get('sizeMultiplier', 1.0) if signal else 1.0
         
-        # Position Sizing with Kelly and signal multiplier
+        # Calculate SL/TP based on pullback entry price
+        if side == 'LONG':
+            sl = entry_price - (atr * self.sl_atr)
+            tp = entry_price + (atr * self.tp_atr)
+            trail_activation = entry_price + (atr * self.trail_activation_atr)
+        else:
+            sl = entry_price + (atr * self.sl_atr)
+            tp = entry_price - (atr * self.tp_atr)
+            trail_activation = entry_price - (atr * self.trail_activation_atr)
+        
+        trail_distance = atr * self.trail_distance_atr
+        
+        # Position sizing
         risk_amount = self.balance * session_risk * size_mult
         position_size_usd = risk_amount * adjusted_leverage
         position_size = position_size_usd / entry_price
         
-        # Get pullback info for logging
-        pullback_pct = signal.get('pullbackPct', 0) if signal else 0
-        spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
-        
-        # Log session info with pullback
-        session_info = session_manager.get_session_info()
-        self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x | Pullback: {pullback_pct}%")
-        
-        # Create position with ideal entry price
-        new_position = {
-            "id": f"{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
+        # Create pending order
+        pending_order = {
+            "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
             "side": side,
-            "entryPrice": entry_price,  # Uses pullback-adjusted price
+            "signalPrice": price,  # Price when signal was generated
+            "entryPrice": entry_price,  # Pullback price to wait for
+            "pullbackPct": pullback_pct,
             "size": position_size,
             "sizeUsd": position_size_usd,
             "stopLoss": sl,
             "takeProfit": tp,
-            "trailingStop": sl,
             "trailActivation": trail_activation,
             "trailDistance": trail_distance,
+            "leverage": adjusted_leverage,
+            "spreadLevel": spread_level,
+            "createdAt": int(datetime.now().timestamp() * 1000),
+            "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
+            "atr": atr
+        }
+        
+        self.pending_orders.append(pending_order)
+        self.add_log(f"📋 PENDING ORDER: {side} {trade_symbol} | Sinyal: ${price:.4f} → Giriş: ${entry_price:.4f} (Pullback: {pullback_pct}%)")
+        logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback from {price})")
+        
+        return pending_order
+    
+    def check_pending_orders(self, opportunities: list):
+        """Check all pending orders against current prices and execute or expire them."""
+        current_time = int(datetime.now().timestamp() * 1000)
+        
+        for order in list(self.pending_orders):
+            symbol = order.get('symbol', '')
+            side = order.get('side', '')
+            entry_price = order.get('entryPrice', 0)
+            expires_at = order.get('expiresAt', 0)
+            
+            # Check expiration first
+            if current_time > expires_at:
+                self.pending_orders.remove(order)
+                self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (5dk timeout)")
+                logger.info(f"Pending order expired: {order['id']}")
+                continue
+            
+            # Find current price for this symbol
+            current_price = None
+            for opp in opportunities:
+                if opp.get('symbol') == symbol:
+                    current_price = opp.get('price', 0)
+                    break
+            
+            if not current_price or current_price <= 0:
+                continue
+            
+            # Check if price reached entry level
+            should_execute = False
+            if side == 'LONG':
+                # For LONG, we want price to pull back DOWN to entry price
+                if current_price <= entry_price:
+                    should_execute = True
+            else:
+                # For SHORT, we want price to pull back UP to entry price
+                if current_price >= entry_price:
+                    should_execute = True
+            
+            if should_execute:
+                self.execute_pending_order(order, current_price)
+    
+    def execute_pending_order(self, order: dict, fill_price: float):
+        """Execute a pending order at the fill price."""
+        # Remove from pending
+        if order in self.pending_orders:
+            self.pending_orders.remove(order)
+        
+        # Recalculate SL/TP based on actual fill price
+        atr = order.get('atr', fill_price * 0.01)
+        side = order['side']
+        
+        if side == 'LONG':
+            sl = fill_price - (atr * self.sl_atr)
+            tp = fill_price + (atr * self.tp_atr)
+            trail_activation = fill_price + (atr * self.trail_activation_atr)
+        else:
+            sl = fill_price + (atr * self.sl_atr)
+            tp = fill_price - (atr * self.tp_atr)
+            trail_activation = fill_price - (atr * self.trail_activation_atr)
+        
+        # Create actual position
+        new_position = {
+            "id": order['id'].replace('PO_', 'POS_'),
+            "symbol": order['symbol'],
+            "side": order['side'],
+            "entryPrice": fill_price,
+            "size": order['size'],
+            "sizeUsd": order['sizeUsd'],
+            "stopLoss": sl,
+            "takeProfit": tp,
+            "trailingStop": sl,
+            "trailActivation": trail_activation,
+            "trailDistance": order['trailDistance'],
             "isTrailingActive": False,
             "unrealizedPnl": 0.0,
             "unrealizedPnlPercent": 0.0,
             "openTime": int(datetime.now().timestamp() * 1000),
-            "leverage": adjusted_leverage,
-            "spreadLevel": spread_level
+            "leverage": order['leverage'],
+            "spreadLevel": order['spreadLevel']
         }
         
         self.positions.append(new_position)
-        self.add_log(f"🚀 POZİSYON AÇILDI: {side} {trade_symbol} @ ${entry_price:.4f} (Pullback: {pullback_pct}%) | {adjusted_leverage}x | SL:${sl:.4f} TP:${tp:.4f}")
-        self.save_state()
-        logger.info(f"🚀 AUTO-TRADE OPEN: {side} {trade_symbol} @ {entry_price} (Pullback: {pullback_pct}%) | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
         
-        return new_position
+        # Calculate how much better than signal price we got
+        signal_price = order.get('signalPrice', fill_price)
+        if side == 'LONG':
+            improvement = ((signal_price - fill_price) / signal_price) * 100
+        else:
+            improvement = ((fill_price - signal_price) / signal_price) * 100
+        
+        self.add_log(f"✅ PENDING FILLED: {side} {order['symbol']} @ ${fill_price:.4f} | Improvement: {improvement:.2f}% | Lev: {order['leverage']}x")
+        self.save_state()
+        logger.info(f"✅ PENDING FILLED: {side} {order['symbol']} @ {fill_price} (improvement: {improvement:.2f}%)")
     
     # =========================================================================
     # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
