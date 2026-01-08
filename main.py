@@ -1222,6 +1222,14 @@ async def background_scanner_loop():
                 
                 # Process signals for paper trading (only if enabled)
                 if global_paper_trader.enabled:
+                    # Phase 36: Check Kill Switch before processing any signals
+                    if daily_kill_switch.check_and_trigger(global_paper_trader.balance):
+                        # Kill switch triggered - close all positions
+                        if global_paper_trader.positions:
+                            daily_kill_switch.panic_close_all(global_paper_trader)
+                        # Skip signal processing when kill switch is active
+                        continue
+                    
                     for signal in multi_coin_scanner.active_signals:
                         try:
                             symbol = signal.get('symbol', 'UNKNOWN')
@@ -1630,7 +1638,15 @@ class BTCCorrelationFilter:
         self.btc_change_4h = 0.0
         self.last_update = 0
         self.update_interval = 300  # 5 dakikada bir güncelle
-        logger.info("BTCCorrelationFilter initialized")
+        
+        # Phase 36: Pairs correlation
+        self.eth_price = 0.0
+        self.eth_change_1h = 0.0
+        self.spread_history = []  # Rolling spread values
+        self.spread_window = 100  # Last 100 values for Z-score
+        self.beta = 0.052  # ETH typically ~5.2% of BTC price
+        
+        logger.info("BTCCorrelationFilter initialized with Pairs Correlation")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -1732,6 +1748,91 @@ class BTCCorrelationFilter:
             "price": self.btc_price,
             "change_1h": round(self.btc_change_1h, 2),
             "change_4h": round(self.btc_change_4h, 2)
+        }
+    
+    # =========================================================================
+    # PHASE 36: BTC-ETH PAIRS CORRELATION
+    # =========================================================================
+    
+    def calculate_pairs_spread(self) -> float:
+        """
+        Calculate BTC-ETH spread using cointegration formula.
+        Spread = ETH - (β × BTC)
+        """
+        if self.btc_price <= 0 or self.eth_price <= 0:
+            return 0.0
+        
+        expected_eth = self.beta * self.btc_price
+        spread = self.eth_price - expected_eth
+        return spread
+    
+    def calculate_spread_zscore(self) -> float:
+        """
+        Calculate Z-Score of the spread for mean reversion signals.
+        Z = (Spread - μ) / σ
+        """
+        if len(self.spread_history) < 20:
+            return 0.0
+        
+        import numpy as np
+        spread_array = np.array(self.spread_history[-self.spread_window:])
+        mean = np.mean(spread_array)
+        std = np.std(spread_array)
+        
+        if std == 0:
+            return 0.0
+        
+        current_spread = self.calculate_pairs_spread()
+        zscore = (current_spread - mean) / std
+        
+        return round(zscore, 2)
+    
+    async def update_eth_price(self, exchange) -> None:
+        """Update ETH price for pairs calculation."""
+        try:
+            ohlcv = await exchange.fetch_ohlcv('ETH/USDT', '1h', limit=2)
+            if ohlcv and len(ohlcv) >= 2:
+                self.eth_price = ohlcv[-1][4]
+                prev = ohlcv[-2][4]
+                self.eth_change_1h = ((self.eth_price - prev) / prev) * 100
+                
+                # Update spread history
+                spread = self.calculate_pairs_spread()
+                self.spread_history.append(spread)
+                if len(self.spread_history) > self.spread_window * 2:
+                    self.spread_history = self.spread_history[-self.spread_window:]
+                    
+        except Exception as e:
+            logger.debug(f"ETH price update failed: {e}")
+    
+    def get_pairs_signal(self) -> Optional[str]:
+        """
+        Get pairs trading signal based on spread Z-score.
+        
+        Returns:
+            "LONG_ETH" if Z < -2 (ETH underpriced)
+            "SHORT_ETH" if Z > 2 (ETH overpriced)
+            None if no clear signal
+        """
+        zscore = self.calculate_spread_zscore()
+        
+        if zscore > 2.0:
+            return "SHORT_ETH"  # ETH overpriced relative to BTC
+        elif zscore < -2.0:
+            return "LONG_ETH"  # ETH underpriced relative to BTC
+        
+        return None
+    
+    def get_pairs_state(self) -> dict:
+        """Get pairs correlation state for UI."""
+        return {
+            "btc_price": self.btc_price,
+            "eth_price": self.eth_price,
+            "beta": self.beta,
+            "spread": round(self.calculate_pairs_spread(), 2),
+            "spread_zscore": self.calculate_spread_zscore(),
+            "pairs_signal": self.get_pairs_signal(),
+            "history_length": len(self.spread_history)
         }
 
 
@@ -2030,26 +2131,253 @@ balance_protector = BalanceProtector()
 
 
 # ============================================================================
-# ORDER BOOK IMBALANCE
+# PHASE 36: DAILY KILL SWITCH
 # ============================================================================
 
+class DailyKillSwitch:
+    """
+    Emergency kill switch for daily drawdown protection.
+    Triggers when daily PnL drops below threshold (default -5%).
+    """
+    
+    def __init__(self, daily_limit_pct: float = -5.0):
+        self.daily_limit_pct = daily_limit_pct  # Default: -5%
+        self.day_start_balance = 10000.0
+        self.last_reset_date = None
+        self.is_triggered = False
+        self.trigger_time = None
+        logger.info(f"🚨 DailyKillSwitch initialized: {daily_limit_pct}% daily limit")
+    
+    def reset_for_new_day(self, current_balance: float):
+        """Reset for new trading day (call at midnight UTC)."""
+        today = datetime.now().date()
+        if self.last_reset_date != today:
+            self.day_start_balance = current_balance
+            self.last_reset_date = today
+            self.is_triggered = False
+            self.trigger_time = None
+            logger.info(f"📅 New trading day: Starting balance ${current_balance:.2f}")
+    
+    def check_and_trigger(self, current_balance: float) -> bool:
+        """
+        Check if kill switch should trigger.
+        Returns True if we hit the daily limit.
+        """
+        # Auto-reset at new day
+        self.reset_for_new_day(current_balance)
+        
+        # Already triggered today
+        if self.is_triggered:
+            return True
+        
+        # Calculate daily PnL
+        if self.day_start_balance <= 0:
+            return False
+            
+        daily_pnl = current_balance - self.day_start_balance
+        daily_pnl_pct = (daily_pnl / self.day_start_balance) * 100
+        
+        # Check threshold
+        if daily_pnl_pct <= self.daily_limit_pct:
+            self.is_triggered = True
+            self.trigger_time = datetime.now()
+            logger.warning(f"🚨 KILL SWITCH TRIGGERED! Daily loss: {daily_pnl_pct:.2f}% (limit: {self.daily_limit_pct}%)")
+            return True
+        
+        return False
+    
+    def panic_close_all(self, paper_trader) -> int:
+        """
+        Emergency close all positions.
+        Returns number of positions closed.
+        """
+        closed_count = 0
+        for pos in list(paper_trader.positions):
+            try:
+                current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
+                paper_trader.close_position(pos, current_price, 'KILL_SWITCH')
+                closed_count += 1
+                logger.warning(f"🚨 KILL SWITCH: Closed {pos['side']} {pos['symbol']}")
+            except Exception as e:
+                logger.error(f"Kill switch close error: {e}")
+        
+        # Also cancel all pending orders
+        pending_count = len(paper_trader.pending_orders)
+        paper_trader.pending_orders.clear()
+        
+        paper_trader.add_log(f"🚨 KILL SWITCH: Closed {closed_count} positions, cancelled {pending_count} pending orders")
+        return closed_count
+    
+    def get_status(self, current_balance: float) -> dict:
+        """Get kill switch status for UI."""
+        if self.day_start_balance <= 0:
+            return {"triggered": False, "daily_pnl_pct": 0, "limit_pct": self.daily_limit_pct}
+        
+        daily_pnl = current_balance - self.day_start_balance
+        daily_pnl_pct = (daily_pnl / self.day_start_balance) * 100
+        
+        return {
+            "triggered": self.is_triggered,
+            "trigger_time": self.trigger_time.isoformat() if self.trigger_time else None,
+            "day_start_balance": self.day_start_balance,
+            "daily_pnl": round(daily_pnl, 2),
+            "daily_pnl_pct": round(daily_pnl_pct, 2),
+            "limit_pct": self.daily_limit_pct,
+            "remaining_pct": round(self.daily_limit_pct - daily_pnl_pct, 2) if not self.is_triggered else 0
+        }
+
+
+# Global DailyKillSwitch instance
+daily_kill_switch = DailyKillSwitch()
+
+
+# ============================================================================
+# PHASE 36: ORDER BOOK IMBALANCE DETECTOR
+# ============================================================================
+
+class OrderBookImbalanceDetector:
+    """
+    Detects order book imbalance (OBI) to identify buying/selling pressure.
+    
+    Formula: OBI = (Bid_Qty - Ask_Qty) / (Bid_Qty + Ask_Qty)
+    - OBI > 0.3: Strong buying pressure → LONG boost
+    - OBI < -0.3: Strong selling pressure → SHORT boost
+    """
+    
+    def __init__(self, threshold: float = 0.3, depth_levels: int = 5):
+        self.threshold = threshold  # OBI threshold for signals
+        self.depth_levels = depth_levels  # How many levels to analyze
+        self.obi_cache = {}  # symbol -> {obi, timestamp}
+        self.cache_ttl = 5  # Cache for 5 seconds
+        logger.info(f"📊 OrderBookImbalanceDetector initialized: threshold={threshold}, depth={depth_levels}")
+    
+    async def fetch_depth(self, symbol: str) -> dict:
+        """Fetch L2 depth data from Binance."""
+        try:
+            import aiohttp
+            # Convert symbol format (BTCUSDT -> BTCUSDT)
+            formatted = symbol.replace('/', '')
+            url = f"https://fapi.binance.com/fapi/v1/depth?symbol={formatted}&limit=20"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+            return {}
+        except Exception as e:
+            logger.debug(f"Depth fetch error for {symbol}: {e}")
+            return {}
+    
+    def calculate_obi(self, bids: list, asks: list) -> float:
+        """
+        Calculate Order Book Imbalance.
+        
+        Args:
+            bids: List of [price, quantity] for bids
+            asks: List of [price, quantity] for asks
+            
+        Returns:
+            OBI value between -1 and 1
+        """
+        try:
+            # Sum top N levels
+            bid_qty = sum(float(b[1]) for b in bids[:self.depth_levels]) if bids else 0
+            ask_qty = sum(float(a[1]) for a in asks[:self.depth_levels]) if asks else 0
+            
+            total = bid_qty + ask_qty
+            if total == 0:
+                return 0.0
+            
+            obi = (bid_qty - ask_qty) / total
+            return round(obi, 4)
+            
+        except Exception as e:
+            logger.debug(f"OBI calculation error: {e}")
+            return 0.0
+    
+    async def get_obi(self, symbol: str) -> float:
+        """Get OBI for symbol (with caching)."""
+        now = datetime.now().timestamp()
+        
+        # Check cache
+        if symbol in self.obi_cache:
+            cached = self.obi_cache[symbol]
+            if now - cached['timestamp'] < self.cache_ttl:
+                return cached['obi']
+        
+        # Fetch fresh data
+        depth = await self.fetch_depth(symbol)
+        if not depth:
+            return self.obi_cache.get(symbol, {}).get('obi', 0.0)
+        
+        bids = depth.get('bids', [])
+        asks = depth.get('asks', [])
+        obi = self.calculate_obi(bids, asks)
+        
+        # Update cache
+        self.obi_cache[symbol] = {
+            'obi': obi,
+            'timestamp': now,
+            'bid_qty': sum(float(b[1]) for b in bids[:self.depth_levels]) if bids else 0,
+            'ask_qty': sum(float(a[1]) for a in asks[:self.depth_levels]) if asks else 0
+        }
+        
+        return obi
+    
+    def get_signal_boost(self, symbol: str, action: str) -> tuple:
+        """
+        Get score boost based on OBI alignment with signal direction.
+        
+        Returns:
+            (boost_points: int, reason: str)
+        """
+        cached = self.obi_cache.get(symbol, {})
+        obi = cached.get('obi', 0)
+        
+        if abs(obi) < self.threshold:
+            return (0, "OBI neutral")
+        
+        # Strong buying pressure
+        if obi > self.threshold:
+            if action == "LONG":
+                return (15, f"OBI aligned +{obi:.2f}")
+            elif action == "SHORT":
+                return (-10, f"OBI opposing +{obi:.2f}")
+        
+        # Strong selling pressure
+        elif obi < -self.threshold:
+            if action == "SHORT":
+                return (15, f"OBI aligned {obi:.2f}")
+            elif action == "LONG":
+                return (-10, f"OBI opposing {obi:.2f}")
+        
+        return (0, "OBI neutral")
+    
+    def get_status(self) -> dict:
+        """Get OBI detector status for debugging."""
+        return {
+            "cached_symbols": len(self.obi_cache),
+            "threshold": self.threshold,
+            "depth_levels": self.depth_levels,
+            "top_imbalances": sorted(
+                [(s, d['obi']) for s, d in self.obi_cache.items()],
+                key=lambda x: abs(x[1]),
+                reverse=True
+            )[:10]
+        }
+
+
+# Global OBI Detector instance
+obi_detector = OrderBookImbalanceDetector()
+
+
+# Legacy function for backwards compatibility
 def calculate_imbalance(bids: list, asks: list) -> float:
     """
-    Calculate order book imbalance.
+    Calculate order book imbalance (legacy wrapper).
     Positive = Bullish, Negative = Bearish
     """
-    try:
-        bid_volume = sum(float(b[1]) for b in bids) if bids else 0
-        ask_volume = sum(float(a[1]) for a in asks) if asks else 0
-        
-        total = bid_volume + ask_volume
-        if total > 0:
-            return ((bid_volume - ask_volume) / total) * 100
-        return 0.0
-        
-    except Exception as e:
-        logger.warning(f"Imbalance calculation error: {e}")
-        return 0.0
+    return obi_detector.calculate_obi(bids, asks) * 100  # Return as percentage
 
 
 # ============================================================================
