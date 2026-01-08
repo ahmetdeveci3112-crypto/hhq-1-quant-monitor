@@ -630,6 +630,37 @@ export default function App() {
 
       {/* Main Content */}
       <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+
+        {/* Mobile-Only: Prominent Balance & PnL Cards */}
+        <div className="md:hidden grid grid-cols-2 gap-3 mb-4">
+          {/* Equity Card */}
+          <div className="bg-gradient-to-br from-indigo-600/20 to-slate-900 border border-indigo-500/30 rounded-2xl p-4 shadow-xl">
+            <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1">Equity</div>
+            <div className="text-xl font-bold text-white font-mono">
+              {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">
+              Base: {formatCurrency(portfolio.balanceUsd)}
+            </div>
+          </div>
+
+          {/* PnL Card */}
+          <div className={`bg-gradient-to-br ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'from-emerald-600/20 to-slate-900 border-emerald-500/30' : 'from-rose-600/20 to-slate-900 border-rose-500/30'} border rounded-2xl p-4 shadow-xl`}>
+            <div className="flex items-center gap-2">
+              <div className={`text-xs font-bold uppercase tracking-wider ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                Total PnL
+              </div>
+              {portfolio.positions.length > 0 && <span className="text-amber-400 animate-pulse">●</span>}
+            </div>
+            <div className={`text-xl font-bold font-mono ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">
+              {portfolio.positions.length > 0 ? `${portfolio.positions.length} açık pozisyon` : 'Tüm kapalı'}
+            </div>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-6 h-full">
 
           {/* LEFT COLUMN: Market Data & Chart */}
