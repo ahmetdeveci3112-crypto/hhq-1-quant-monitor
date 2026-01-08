@@ -573,19 +573,19 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
-          {/* Balance - Always visible, compact on mobile */}
-          <div className="flex items-center gap-2 md:gap-6 mr-2 md:mr-4 border-r border-slate-800 pr-2 md:pr-6">
+          {/* Balance - Hidden on mobile (shown in cards), visible on desktop */}
+          <div className="hidden md:flex items-center gap-6 mr-4 border-r border-slate-800 pr-6">
             <div className="text-right">
-              <div className="text-[9px] md:text-xs text-slate-500">Equity</div>
-              <div className="text-[11px] md:text-sm font-mono font-bold text-white">
+              <div className="text-xs text-slate-500">Equity</div>
+              <div className="text-sm font-mono font-bold text-white">
                 {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
               </div>
             </div>
             <div className="text-right">
-              <div className="text-[9px] md:text-xs text-slate-500">
+              <div className="text-xs text-slate-500">
                 PnL {portfolio.positions.length > 0 && <span className="text-amber-400">●</span>}
               </div>
-              <div className={`text-[11px] md:text-sm font-mono font-bold ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+              <div className={`text-sm font-mono font-bold ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                 {(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
               </div>
             </div>
@@ -807,7 +807,7 @@ export default function App() {
             </div>
 
             {/* Active Signals Panel - Phase 31 */}
-            <ActiveSignalsPanel signals={opportunities} onMarketOrder={handleMarketOrder} />
+            <ActiveSignalsPanel signals={opportunities} onMarketOrder={handleMarketOrder} entryTightness={settings.entryTightness} />
 
             {/* System Logs Terminal - Fixed height container with scroll */}
             <div className="bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden h-[250px]">

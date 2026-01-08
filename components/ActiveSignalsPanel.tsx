@@ -5,6 +5,7 @@ import { CoinOpportunity } from '../types';
 interface ActiveSignalsPanelProps {
     signals: CoinOpportunity[];
     onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number) => Promise<void>;
+    entryTightness?: number;  // 0.5-2.0 multiplier for pullback
 }
 
 const formatPrice = (price: number): string => {
@@ -26,15 +27,24 @@ const getCoinIcon = (symbol: string): string => {
 };
 
 // Calculate pullback and leverage based on spread/volatility level
-const getSpreadInfo = (spreadPct: number): { level: string; pullback: number; leverage: number } => {
-    if (spreadPct <= 2.0) return { level: 'very_low', pullback: 0.3, leverage: 50 };
-    if (spreadPct <= 4.0) return { level: 'low', pullback: 0.6, leverage: 25 };
-    if (spreadPct <= 6.0) return { level: 'normal', pullback: 1.0, leverage: 10 };
-    if (spreadPct <= 10.0) return { level: 'high', pullback: 1.5, leverage: 5 };
-    return { level: 'very_high', pullback: 2.0, leverage: 3 };
+const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level: string; pullback: number; leverage: number } => {
+    let basePullback: number;
+    let leverage: number;
+    let level: string;
+
+    if (spreadPct <= 2.0) { level = 'very_low'; basePullback = 0.3; leverage = 50; }
+    else if (spreadPct <= 4.0) { level = 'low'; basePullback = 0.6; leverage = 25; }
+    else if (spreadPct <= 6.0) { level = 'normal'; basePullback = 1.0; leverage = 10; }
+    else if (spreadPct <= 10.0) { level = 'high'; basePullback = 1.5; leverage = 5; }
+    else { level = 'very_high'; basePullback = 2.0; leverage = 3; }
+
+    // Apply entry tightness multiplier
+    const adjustedPullback = basePullback * entryTightness;
+
+    return { level, pullback: adjustedPullback, leverage };
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0 }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
 
     // Filter only active signals and sort by score
@@ -78,7 +88,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 ) : (
                     activeSignals.map((signal) => {
                         const isLong = signal.signalAction === 'LONG';
-                        const spreadInfo = getSpreadInfo(signal.spreadPct || 5);
+                        const spreadInfo = getSpreadInfo(signal.spreadPct || 5, entryTightness);
                         const pullbackPct = spreadInfo.pullback;
                         const leverage = spreadInfo.leverage;
 

@@ -3041,10 +3041,18 @@ class PaperTradingEngine:
         # =========================================================================
         # Create a pending order that waits for price to reach pullback level
         
-        # Get pullback entry price from signal
+        # Get pullback entry price from signal and apply entry_tightness
         if signal and 'entryPrice' in signal:
-            entry_price = signal['entryPrice']
-            pullback_pct = signal.get('pullbackPct', 0)
+            base_pullback_pct = signal.get('pullbackPct', 0)
+            # Apply entry_tightness: lower = tighter entry (smaller pullback), higher = looser (bigger pullback)
+            adjusted_pullback_pct = base_pullback_pct * self.entry_tightness
+            
+            # Recalculate entry price with adjusted pullback
+            if side == 'LONG':
+                entry_price = price * (1 - adjusted_pullback_pct / 100)
+            else:
+                entry_price = price * (1 + adjusted_pullback_pct / 100)
+            pullback_pct = adjusted_pullback_pct
         else:
             # No pullback, use current price
             entry_price = price
@@ -3068,16 +3076,22 @@ class PaperTradingEngine:
         size_mult = signal.get('sizeMultiplier', 1.0) if signal else 1.0
         
         # Calculate SL/TP based on pullback entry price
-        if side == 'LONG':
-            sl = entry_price - (atr * self.sl_atr)
-            tp = entry_price + (atr * self.tp_atr)
-            trail_activation = entry_price + (atr * self.trail_activation_atr)
-        else:
-            sl = entry_price + (atr * self.sl_atr)
-            tp = entry_price - (atr * self.tp_atr)
-            trail_activation = entry_price - (atr * self.trail_activation_atr)
+        # Apply exit_tightness: lower = quicker exit (smaller SL/TP), higher = hold longer (bigger SL/TP)
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness
+        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness
+        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness
         
-        trail_distance = atr * self.trail_distance_atr
+        if side == 'LONG':
+            sl = entry_price - (atr * adjusted_sl_atr)
+            tp = entry_price + (atr * adjusted_tp_atr)
+            trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
+        else:
+            sl = entry_price + (atr * adjusted_sl_atr)
+            tp = entry_price - (atr * adjusted_tp_atr)
+            trail_activation = entry_price - (atr * adjusted_trail_activation_atr)
+        
+        trail_distance = atr * adjusted_trail_distance_atr
         
         # Position sizing
         risk_amount = self.balance * session_risk * size_mult
