@@ -789,9 +789,13 @@ export default function App() {
                   </div>
                 ) : (
                   portfolio.positions.map(pos => {
-                    // Get current price from opportunities for this symbol
+                    // Get current price: 1) From position's stored currentPrice (set by backend)
+                    // 2) From opportunities list 3) Fallback to entryPrice
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
-                    const currentPrice = opportunity?.price || pos.entryPrice;
+                    const storedCurrentPrice = (pos as any).currentPrice;
+                    const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0)
+                      ? storedCurrentPrice
+                      : (opportunity?.price || pos.entryPrice);
 
                     return (
                       <PositionPanel
