@@ -2553,10 +2553,10 @@ class SignalGenerator:
         score = 0
         reasons = []
         
-        # Layer 1: Z-Score (Primary Driver) - Max 40 pts
+        # Layer 1: Z-Score (Primary Driver) - Max 50 pts (increased from 40)
         # Must be > effective_threshold to even consider
         if abs(zscore) > effective_threshold:
-            score += 40
+            score += 50  # Base score increased for better signal capture
             reasons.append(f"Z({zscore:.1f})")
             signal_side = "SHORT" if zscore > 0 else "LONG"
         else:
