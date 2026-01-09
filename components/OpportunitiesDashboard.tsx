@@ -91,8 +91,8 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 <div className="flex items-center justify-between bg-slate-800/50 rounded px-2 py-1">
                     <span className="text-slate-500">Z-Score</span>
                     <span className={`font-mono font-bold ${Math.abs(coin.zscore) > 1.5
-                            ? coin.zscore > 0 ? 'text-rose-400' : 'text-emerald-400'
-                            : 'text-slate-300'
+                        ? coin.zscore > 0 ? 'text-rose-400' : 'text-emerald-400'
+                        : 'text-slate-300'
                         }`}>
                         {coin.zscore > 0 ? '+' : ''}{coin.zscore.toFixed(2)}
                     </span>
@@ -177,7 +177,7 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
 
             {/* Coin Grid */}
             {displayCoins.length > 0 && (
-                <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
                     {displayCoins.map((coin) => (
                         <CoinCard key={coin.symbol} coin={coin} />
                     ))}

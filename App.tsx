@@ -671,36 +671,36 @@ export default function App() {
               {/* Total Coins Scanned */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
                 <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Coins Scanned</h3>
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Taranan Coin</h3>
                 <div className="text-2xl font-bold text-white mb-1">{scannerStats.totalCoins}</div>
-                <div className="text-xs font-mono text-indigo-400">Analyzed: {scannerStats.analyzedCoins}</div>
+                <div className="text-xs font-mono text-indigo-400">Analiz: {scannerStats.analyzedCoins}</div>
               </div>
 
-              {/* Long Signals */}
+              {/* Long Sinyaller */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-emerald-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Long Signals</h3>
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Long Sinyaller</h3>
                 <div className="flex items-center gap-2">
                   <div className="text-2xl font-bold text-emerald-400">{scannerStats.longSignals}</div>
                   {scannerStats.longSignals > 0 && <span className="text-emerald-500">🟢</span>}
                 </div>
               </div>
 
-              {/* Short Signals */}
+              {/* Short Sinyaller */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-rose-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Short Signals</h3>
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Short Sinyaller</h3>
                 <div className="flex items-center gap-2">
                   <div className="text-2xl font-bold text-rose-400">{scannerStats.shortSignals}</div>
                   {scannerStats.shortSignals > 0 && <span className="text-rose-500">🔴</span>}
                 </div>
               </div>
 
-              {/* Active Positions Count */}
+              {/* Aktif Pozisyon */}
               <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Active Positions</h3>
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Aktif Pozisyon</h3>
                 <div className="flex items-center gap-3">
                   <div className="text-2xl font-bold text-white">{portfolio.positions.length}</div>
                   {portfolio.positions.length > 0 && (
-                    <div className="text-xs font-bold text-emerald-400 animate-pulse">● LIVE</div>
+                    <div className="text-xs font-bold text-emerald-400 animate-pulse">● CANLI</div>
                   )}
                 </div>
               </div>
@@ -717,21 +717,21 @@ export default function App() {
               <div className="flex items-center justify-between mb-4">
                 <h3 className="font-bold text-white flex items-center gap-2">
                   <BarChart3 className="w-5 h-5 text-indigo-500" />
-                  Recent Trades History
+                  Son İşlem Geçmişi
                 </h3>
-                <div className="text-xs text-slate-500">{portfolio.trades.length} Trades</div>
+                <div className="text-xs text-slate-500">{portfolio.trades.length} İşlem</div>
               </div>
               <div className="overflow-x-auto max-h-[300px] overflow-y-auto custom-scrollbar">
                 <table className="w-full text-sm text-left">
                   <thead className="sticky top-0 bg-[#151921]">
                     <tr className="text-slate-500 border-b border-slate-800">
-                      <th className="pb-3 pl-2 font-medium">Time</th>
+                      <th className="pb-3 pl-2 font-medium">Saat</th>
                       <th className="pb-3 font-medium">Coin</th>
-                      <th className="pb-3 font-medium">Type</th>
-                      <th className="pb-3 font-medium">Entry</th>
-                      <th className="pb-3 font-medium">Exit</th>
-                      <th className="pb-3 font-medium">PnL</th>
-                      <th className="pb-3 font-medium text-right pr-2">Reason</th>
+                      <th className="pb-3 font-medium">Yön</th>
+                      <th className="pb-3 font-medium">Giriş</th>
+                      <th className="pb-3 font-medium">Çıkış</th>
+                      <th className="pb-3 font-medium">Kar/Zarar</th>
+                      <th className="pb-3 font-medium text-right pr-2">Sebep</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -751,12 +751,12 @@ export default function App() {
                         <td className={`py-3 font-mono font-bold text-xs ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                           {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
                         </td>
-                        <td className="py-3 text-right pr-2 text-[10px] text-slate-500 uppercase">{trade.closeReason}</td>
+                        <td className="py-3 text-right pr-2 text-[10px] text-slate-500 uppercase">{(trade as any).reason || trade.closeReason || '-'}</td>
                       </tr>
                     ))}
                     {portfolio.trades.length === 0 && (
                       <tr>
-                        <td colSpan={7} className="py-8 text-center text-slate-600 italic">No trades recorded yet.</td>
+                        <td colSpan={7} className="py-8 text-center text-slate-600 italic">Henüz işlem kaydı yok.</td>
                       </tr>
                     )}
                   </tbody>
@@ -773,7 +773,7 @@ export default function App() {
               <div className="flex items-center justify-between pb-2 border-b border-slate-800/50">
                 <h3 className="font-bold text-white flex items-center gap-2">
                   <Zap className="w-5 h-5 text-amber-500" />
-                  Active Positions
+                  Aktif Pozisyonlar
                   {portfolio.positions.length > 0 && (
                     <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full animate-pulse">
                       {portfolio.positions.length}
@@ -785,7 +785,7 @@ export default function App() {
                 {portfolio.positions.length === 0 ? (
                   <div className="flex flex-col items-center justify-center flex-1 py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
                     <Wallet className="w-6 h-6 mb-2 opacity-30" />
-                    <span className="text-xs">No Open Positions</span>
+                    <span className="text-xs">Açık Pozisyon Yok</span>
                   </div>
                 ) : (
                   portfolio.positions.map(pos => {
