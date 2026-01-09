@@ -2606,15 +2606,15 @@ class SignalGenerator:
         score = 0
         reasons = []
         
-        # Layer 1: Z-Score (Primary Driver) - Base 60 pts + up to 20 bonus
-        # Dynamic scoring based on Z-Score magnitude creates variety
+        # Layer 1: Z-Score (Primary Driver) - Base 45 pts + up to 10 bonus
+        # Reduced from 60+20 since VWAP and HTF layers now contribute
         if abs(zscore) > effective_threshold:
             # Base score
-            score += 60
+            score += 45
             
-            # Bonus based on Z-Score strength (0-20 pts extra)
+            # Bonus based on Z-Score strength (0-10 pts extra)
             zscore_excess = abs(zscore) - effective_threshold
-            zscore_bonus = min(20, int(zscore_excess * 10))  # Each 0.1 above threshold = +1 pt
+            zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
             score += zscore_bonus
             
             reasons.append(f"Z({zscore:.1f})")
