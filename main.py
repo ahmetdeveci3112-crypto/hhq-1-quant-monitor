@@ -1200,7 +1200,7 @@ async def background_scanner_loop():
     """
     logger.info("🔄 Background Scanner Loop started - running 24/7")
     
-    scan_interval = 10  # Scan every 10 seconds
+    scan_interval = 5  # Scan every 5 seconds (faster for position monitoring)
     
     # Wait for app to fully initialize
     await asyncio.sleep(3)
@@ -4770,7 +4770,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     logger.info("Scanner WebSocket client connected")
     
     is_connected = True
-    stream_interval = 5  # Stream updates every 5 seconds (scanner runs every 10s in background)
+    stream_interval = 2  # Stream updates every 2 seconds (faster for real-time position tracking)
     
     try:
         # Build current opportunities from existing analyzers
