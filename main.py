@@ -2553,10 +2553,17 @@ class SignalGenerator:
         score = 0
         reasons = []
         
-        # Layer 1: Z-Score (Primary Driver) - Max 60 pts
-        # Increased to 60 because other layers (VWAP, OB) don't have data sources yet
+        # Layer 1: Z-Score (Primary Driver) - Base 60 pts + up to 20 bonus
+        # Dynamic scoring based on Z-Score magnitude creates variety
         if abs(zscore) > effective_threshold:
-            score += 60  # Base score for valid Z-Score signal
+            # Base score
+            score += 60
+            
+            # Bonus based on Z-Score strength (0-20 pts extra)
+            zscore_excess = abs(zscore) - effective_threshold
+            zscore_bonus = min(20, int(zscore_excess * 10))  # Each 0.1 above threshold = +1 pt
+            score += zscore_bonus
+            
             reasons.append(f"Z({zscore:.1f})")
             signal_side = "SHORT" if zscore > 0 else "LONG"
         else:
