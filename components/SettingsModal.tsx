@@ -39,6 +39,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
   // Exit tightness level helper
   const getExitLevel = () => {
     const t = localSettings.exitTightness;
+    if (t <= 0.4) return { label: 'Ultra Hızlı', color: 'text-fuchsia-500', desc: 'Çok erken çıkış, minimum SL/TP' };
     if (t <= 0.6) return { label: 'Çok Hızlı', color: 'text-rose-500', desc: 'Hızlı çıkış, küçük SL/TP' };
     if (t <= 0.8) return { label: 'Hızlı', color: 'text-orange-400', desc: 'Erken çıkış' };
     if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP' };
@@ -182,7 +183,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
               </div>
               <input
                 type="range"
-                min="0.5"
+                min="0.3"
                 max="2.0"
                 step="0.1"
                 value={localSettings.exitTightness}
@@ -190,7 +191,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                <span>0.5x (Hızlı = Küçük SL/TP)</span>
+                <span>0.3x (Çok Hızlı = Küçük SL/TP)</span>
                 <span>2.0x (Sabırlı = Geniş SL/TP)</span>
               </div>
             </div>

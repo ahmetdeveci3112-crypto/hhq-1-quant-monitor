@@ -3173,17 +3173,25 @@ class PaperTradingEngine:
             self.pending_orders.remove(order)
         
         # Recalculate SL/TP based on actual fill price
+        # Apply exit_tightness for faster/slower exits
         atr = order.get('atr', fill_price * 0.01)
         side = order['side']
         
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness
+        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness
+        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness
+        
         if side == 'LONG':
-            sl = fill_price - (atr * self.sl_atr)
-            tp = fill_price + (atr * self.tp_atr)
-            trail_activation = fill_price + (atr * self.trail_activation_atr)
+            sl = fill_price - (atr * adjusted_sl_atr)
+            tp = fill_price + (atr * adjusted_tp_atr)
+            trail_activation = fill_price + (atr * adjusted_trail_activation_atr)
         else:
-            sl = fill_price + (atr * self.sl_atr)
-            tp = fill_price - (atr * self.tp_atr)
-            trail_activation = fill_price - (atr * self.trail_activation_atr)
+            sl = fill_price + (atr * adjusted_sl_atr)
+            tp = fill_price - (atr * adjusted_tp_atr)
+            trail_activation = fill_price - (atr * adjusted_trail_activation_atr)
+        
+        trail_distance = atr * adjusted_trail_distance_atr
         
         # Create actual position
         new_position = {
@@ -3197,7 +3205,7 @@ class PaperTradingEngine:
             "takeProfit": tp,
             "trailingStop": sl,
             "trailActivation": trail_activation,
-            "trailDistance": order['trailDistance'],
+            "trailDistance": trail_distance,
             "isTrailingActive": False,
             "unrealizedPnl": 0.0,
             "unrealizedPnlPercent": 0.0,
@@ -3234,19 +3242,30 @@ class PaperTradingEngine:
             return atr * (1.0 + spread)  # Wide trailing scales with spread
     
     def update_progressive_sl(self, pos: dict, current_price: float, atr: float):
-        """Move SL progressively as position goes into profit."""
+        """Move SL progressively as position goes into profit.
+        
+        Thresholds are multiplied by exit_tightness:
+        - Lower exit_tightness (0.3-0.5) = earlier SL moves
+        - Higher exit_tightness (1.5-2.0) = later SL moves
+        """
         entry = pos['entryPrice']
+        
+        # Apply exit_tightness to thresholds - lower = earlier activation
+        t = self.exit_tightness
         
         if pos['side'] == 'LONG':
             profit_atr = (current_price - entry) / atr if atr > 0 else 0
             
-            if profit_atr >= 4:
-                new_sl = entry + (2.5 * atr)
-            elif profit_atr >= 3:
-                new_sl = entry + (1.5 * atr)
-            elif profit_atr >= 2:
-                new_sl = entry + (0.5 * atr)
-            elif profit_atr >= 1:
+            # Thresholds scaled by exit_tightness
+            if profit_atr >= 2.5 * t:
+                new_sl = entry + (2.0 * atr)  # Lock in 2 ATR profit
+            elif profit_atr >= 2.0 * t:
+                new_sl = entry + (1.5 * atr)  # Lock in 1.5 ATR profit
+            elif profit_atr >= 1.5 * t:
+                new_sl = entry + (1.0 * atr)  # Lock in 1 ATR profit
+            elif profit_atr >= 1.0 * t:
+                new_sl = entry + (0.5 * atr)  # Lock in 0.5 ATR profit
+            elif profit_atr >= 0.5 * t:
                 new_sl = entry  # Breakeven
             else:
                 return False  # No change
@@ -3254,19 +3273,23 @@ class PaperTradingEngine:
             if new_sl > pos['stopLoss']:
                 old_sl = pos['stopLoss']
                 pos['stopLoss'] = new_sl
+                pos['trailingStop'] = new_sl  # Also update trailing stop
                 self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
                 return True
                 
         elif pos['side'] == 'SHORT':
             profit_atr = (entry - current_price) / atr if atr > 0 else 0
             
-            if profit_atr >= 4:
-                new_sl = entry - (2.5 * atr)
-            elif profit_atr >= 3:
+            # Thresholds scaled by exit_tightness
+            if profit_atr >= 2.5 * t:
+                new_sl = entry - (2.0 * atr)
+            elif profit_atr >= 2.0 * t:
                 new_sl = entry - (1.5 * atr)
-            elif profit_atr >= 2:
+            elif profit_atr >= 1.5 * t:
+                new_sl = entry - (1.0 * atr)
+            elif profit_atr >= 1.0 * t:
                 new_sl = entry - (0.5 * atr)
-            elif profit_atr >= 1:
+            elif profit_atr >= 0.5 * t:
                 new_sl = entry  # Breakeven
             else:
                 return False
@@ -3274,6 +3297,7 @@ class PaperTradingEngine:
             if new_sl < pos['stopLoss']:
                 old_sl = pos['stopLoss']
                 pos['stopLoss'] = new_sl
+                pos['trailingStop'] = new_sl  # Also update trailing stop
                 self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
                 return True
         
