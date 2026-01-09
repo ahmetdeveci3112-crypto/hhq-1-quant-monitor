@@ -608,6 +608,11 @@ class LightweightCoinAnalyzer:
         self.signal_generator = SignalGenerator()
         self.signal_generator.min_signal_interval = 60  # 1 minute per coin in multi-scan mode
         self.is_preloaded = False  # Track if historical data is loaded
+        
+        # VWAP calculation variables
+        self.vwap_numerator: float = 0.0
+        self.vwap_denominator: float = 0.0
+        self.vwap: float = 0.0
     
     def preload_historical_data(self, ohlcv_data: list):
         """
@@ -649,20 +654,44 @@ class LightweightCoinAnalyzer:
             self.opportunity.price = self.prices[-1]
             self.opportunity.last_update = datetime.now().timestamp()
             self.is_preloaded = True
-            logger.debug(f"{self.symbol}: Preloaded {len(self.prices)} candles, {len(self.spreads)} spreads")
+            
+            # Preload VWAP from historical data
+            self.vwap_numerator = 0.0
+            self.vwap_denominator = 0.0
+            for i, candle in enumerate(ohlcv_data):
+                try:
+                    _, _, high, low, close, volume = candle
+                    typical_price = (high + low + close) / 3
+                    self.vwap_numerator += typical_price * volume
+                    self.vwap_denominator += volume
+                except:
+                    continue
+            if self.vwap_denominator > 0:
+                self.vwap = self.vwap_numerator / self.vwap_denominator
+            
+            logger.debug(f"{self.symbol}: Preloaded {len(self.prices)} candles, VWAP: {self.vwap:.6f}")
         
     def update_price(self, price: float, high: float = None, low: float = None, volume: float = 0):
         """Update price data."""
         self.prices.append(price)
         self.closes.append(price)
-        self.highs.append(high or price)
-        self.lows.append(low or price)
+        h = high or price
+        l = low or price
+        self.highs.append(h)
+        self.lows.append(l)
         self.volumes.append(volume)
         
         if len(self.closes) >= 20:
             ma = np.mean(list(self.closes)[-20:])
             spread = price - ma
             self.spreads.append(spread)
+        
+        # Update VWAP (Typical Price = (H+L+C)/3)
+        typical_price = (h + l + price) / 3
+        self.vwap_numerator += typical_price * volume
+        self.vwap_denominator += volume
+        if self.vwap_denominator > 0:
+            self.vwap = self.vwap_numerator / self.vwap_denominator
             
         self.opportunity.price = price
         self.opportunity.last_update = datetime.now().timestamp()
@@ -694,14 +723,31 @@ class LightweightCoinAnalyzer:
             volatility_pct = (atr / self.opportunity.price) * 100
             self.opportunity.spread_pct = volatility_pct  # Store actual volatility %
         
-        # Generate signal
+        # Calculate VWAP Z-Score for Layer 3 scoring
+        vwap_zscore = 0.0
+        if self.vwap > 0 and len(prices_list) >= 20:
+            price_std = np.std(prices_list[-20:])
+            if price_std > 0:
+                vwap_zscore = (self.opportunity.price - self.vwap) / price_std
+        
+        # Get HTF trend from global BTC filter for Layer 4 scoring
+        htf_trend = "NEUTRAL"
+        try:
+            if 'btc_filter' in globals() and btc_filter is not None:
+                htf_trend = btc_filter.btc_trend or "NEUTRAL"
+        except:
+            pass
+        
+        # Generate signal with VWAP and HTF trend
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
             imbalance=imbalance,
             price=self.opportunity.price,
             atr=atr,
-            spread_pct=self.opportunity.spread_pct
+            spread_pct=self.opportunity.spread_pct,
+            vwap_zscore=vwap_zscore,
+            htf_trend=htf_trend
         )
         
         if signal:
@@ -1216,6 +1262,13 @@ async def background_scanner_loop():
         
         while True:
             try:
+                # Update BTC trend for HTF scoring (every scan cycle)
+                try:
+                    if multi_coin_scanner.exchange:
+                        await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+                except Exception as e:
+                    logger.debug(f"BTC filter update error: {e}")
+                
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
                 stats = multi_coin_scanner.get_scanner_stats()
