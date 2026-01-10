@@ -696,7 +696,7 @@ class LightweightCoinAnalyzer:
         self.opportunity.price = price
         self.opportunity.last_update = datetime.now().timestamp()
     
-    def analyze(self, imbalance: float = 0) -> Optional[dict]:
+    def analyze(self, imbalance: float = 0, basis_pct: float = 0.0) -> Optional[dict]:
         """Analyze coin and generate signal if conditions met."""
         if len(self.prices) < 20:  # Reduced from 50 to 20 for faster startup
             return None
@@ -738,7 +738,7 @@ class LightweightCoinAnalyzer:
         except:
             pass
         
-        # Generate signal with VWAP and HTF trend
+        # Generate signal with VWAP, HTF trend, and Basis
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
@@ -747,7 +747,8 @@ class LightweightCoinAnalyzer:
             atr=atr,
             spread_pct=self.opportunity.spread_pct,
             vwap_zscore=vwap_zscore,
-            htf_trend=htf_trend
+            htf_trend=htf_trend,
+            basis_pct=basis_pct
         )
         
         if signal:
@@ -820,12 +821,24 @@ class BinanceWebSocketManager:
             if not symbol.endswith('USDT'):
                 continue
                 
+            # Calculate simple imbalance from bid/ask quantities
+            bid_qty = float(ticker.get('B', 0))  # Best bid quantity
+            ask_qty = float(ticker.get('A', 0))  # Best ask quantity
+            imbalance = 0.0
+            if bid_qty + ask_qty > 0:
+                imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100  # -100 to +100
+                
             self.tickers[symbol] = {
                 'last': float(ticker.get('c', 0)),  # Close price
                 'percentage': float(ticker.get('P', 0)),  # Price change percent
                 'quoteVolume': float(ticker.get('q', 0)),  # Quote volume
                 'high': float(ticker.get('h', 0)),  # High
                 'low': float(ticker.get('l', 0)),  # Low
+                'bid': float(ticker.get('b', 0)),  # Best bid price
+                'ask': float(ticker.get('a', 0)),  # Best ask price
+                'bidQty': bid_qty,  # Best bid quantity
+                'askQty': ask_qty,  # Best ask quantity
+                'imbalance': imbalance,  # Simple L1 imbalance
                 'timestamp': int(ticker.get('E', 0))  # Event time
             }
         
@@ -874,6 +887,13 @@ class MultiCoinScanner:
         self.ticker_cache: dict = {}
         self.ticker_cache_time: float = 0
         self.cache_ttl: int = 10  # Cache valid for 10 seconds (Binance optimized)
+        
+        # BTC Basis tracking (Spot-Futures spread)
+        self.btc_basis_pct: float = 0.0
+        self.btc_spot_price: float = 0.0
+        self.btc_futures_price: float = 0.0
+        self.last_basis_update: float = 0
+        
         logger.info(f"MultiCoinScanner initialized (max_coins={max_coins})")
     
     async def fetch_all_futures_symbols(self) -> list:
@@ -1111,6 +1131,45 @@ class MultiCoinScanner:
                 return self.ticker_cache
             return {}
     
+    async def update_btc_basis(self):
+        """
+        Update BTC Spot-Futures basis (spread).
+        Called every minute to avoid rate limits.
+        Positive basis = Futures > Spot (bullish sentiment, good for shorts)
+        Negative basis = Futures < Spot (bearish sentiment, good for longs)
+        """
+        import aiohttp
+        import time
+        
+        now = time.time()
+        # Only update once per minute to avoid rate limits
+        if now - self.last_basis_update < 60:
+            return
+        
+        try:
+            # Get BTC Futures price from our ticker cache
+            btc_futures = self.ticker_cache.get('BTCUSDT', {})
+            self.btc_futures_price = btc_futures.get('last', 0)
+            
+            if self.btc_futures_price <= 0:
+                return
+            
+            # Fetch BTC Spot price from Binance Spot API (public, no auth needed)
+            async with aiohttp.ClientSession() as session:
+                url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+                async with session.get(url, timeout=5) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.btc_spot_price = float(data.get('price', 0))
+                        
+                        if self.btc_spot_price > 0:
+                            basis = self.btc_futures_price - self.btc_spot_price
+                            self.btc_basis_pct = (basis / self.btc_spot_price) * 100
+                            self.last_basis_update = now
+                            logger.debug(f"BTC Basis updated: {self.btc_basis_pct:.4f}% (Futures: ${self.btc_futures_price:.2f}, Spot: ${self.btc_spot_price:.2f})")
+        except Exception as e:
+            logger.debug(f"BTC basis update error: {e}")
+    
     async def scan_all_coins(self) -> list:
         """Scan all coins and return opportunities."""
         if not self.coins:
@@ -1118,6 +1177,9 @@ class MultiCoinScanner:
         
         # Fetch all ticker data at once
         tickers = await self.fetch_ticker_data(self.coins)
+        
+        # Update BTC basis (Spot-Futures spread) - once per minute
+        await self.update_btc_basis()
         
         opportunities = []
         signals = []
@@ -1131,6 +1193,7 @@ class MultiCoinScanner:
                 high = ticker.get('high', price)
                 low = ticker.get('low', price)
                 volume = ticker.get('baseVolume', 0)
+                imbalance = ticker.get('imbalance', 0)  # L1 Order Book imbalance from WebSocket
                 
                 if price <= 0:
                     continue
@@ -1138,9 +1201,10 @@ class MultiCoinScanner:
                 analyzer.update_price(price, high, low, volume)
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
+                analyzer.opportunity.imbalance = imbalance  # Store for opportunity display
                 
-                # Analyze for signal
-                signal = analyzer.analyze()
+                # Analyze for signal with BTC basis and L1 imbalance
+                signal = analyzer.analyze(imbalance=imbalance, basis_pct=self.btc_basis_pct)
                 
                 if signal:
                     signal['symbol'] = symbol
