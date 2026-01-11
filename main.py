@@ -1409,15 +1409,39 @@ async def background_scanner_loop():
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
                             
-                            # SL Hit
-                            if pos['side'] == 'LONG' and current_price <= trailing_stop:
-                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
-                                continue
-                            elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
-                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
-                                continue
+                            # =========================================================
+                            # SPIKE BYPASS: 3-Tick Confirmation for Stop Loss
+                            # SL only triggers after 3 consecutive ticks below SL level
+                            # =========================================================
+                            SL_CONFIRMATION_REQUIRED = 3  # Ticks required to confirm SL
                             
-                            # TP Hit
+                            # Initialize confirmation counter if not exists
+                            if 'slConfirmCount' not in pos:
+                                pos['slConfirmCount'] = 0
+                            
+                            # Check if price is in SL zone
+                            sl_breached = False
+                            if pos['side'] == 'LONG' and current_price <= trailing_stop:
+                                sl_breached = True
+                            elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+                                sl_breached = True
+                            
+                            if sl_breached:
+                                pos['slConfirmCount'] += 1
+                                logger.debug(f"SL breach tick {pos['slConfirmCount']}/{SL_CONFIRMATION_REQUIRED} for {pos.get('symbol', '?')}")
+                                
+                                # Only close if confirmed (3 consecutive ticks in SL zone)
+                                if pos['slConfirmCount'] >= SL_CONFIRMATION_REQUIRED:
+                                    logger.info(f"🔴 SL CONFIRMED after {SL_CONFIRMATION_REQUIRED} ticks: {pos.get('symbol', '?')}")
+                                    global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                    continue
+                            else:
+                                # Price recovered - reset counter (spike bypassed!)
+                                if pos['slConfirmCount'] > 0:
+                                    logger.debug(f"⚡ Spike bypassed for {pos.get('symbol', '?')} - price recovered")
+                                pos['slConfirmCount'] = 0
+                            
+                            # TP Hit (immediate - no confirmation needed for profits)
                             if pos['side'] == 'LONG' and current_price >= tp:
                                 global_paper_trader.close_position(pos, current_price, 'TP_HIT')
                                 continue
@@ -1540,29 +1564,44 @@ async def position_price_update_loop():
                         pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
                         pos['currentPrice'] = current_price
                         
-                        # Check SL/TP exits
+                        # Check SL/TP exits with SPIKE BYPASS
                         sl = pos.get('stopLoss', 0)
                         tp = pos.get('takeProfit', 0)
                         trailing_stop = pos.get('trailingStop', sl)
                         
-                        # SL Hit Check
-                        if pos['side'] == 'LONG' and current_price <= trailing_stop:
-                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
-                            logger.info(f"⚡ Fast SL triggered: LONG {symbol} @ ${current_price:.6f}")
-                            continue
-                        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
-                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
-                            logger.info(f"⚡ Fast SL triggered: SHORT {symbol} @ ${current_price:.6f}")
-                            continue
+                        # SPIKE BYPASS: 3-Tick Confirmation for Stop Loss
+                        SL_CONFIRMATION_REQUIRED = 3
                         
-                        # TP Hit Check
+                        if 'slConfirmCount' not in pos:
+                            pos['slConfirmCount'] = 0
+                        
+                        # Check if price is in SL zone
+                        sl_breached = False
+                        if pos['side'] == 'LONG' and current_price <= trailing_stop:
+                            sl_breached = True
+                        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+                            sl_breached = True
+                        
+                        if sl_breached:
+                            pos['slConfirmCount'] += 1
+                            if pos['slConfirmCount'] >= SL_CONFIRMATION_REQUIRED:
+                                logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f}")
+                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                continue
+                        else:
+                            # Price recovered - spike bypassed
+                            if pos['slConfirmCount'] > 0:
+                                logger.debug(f"⚡ Spike bypassed (fast): {symbol}")
+                            pos['slConfirmCount'] = 0
+                        
+                        # TP Hit Check (immediate - no confirmation for profits)
                         if pos['side'] == 'LONG' and current_price >= tp:
                             global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-                            logger.info(f"⚡ Fast TP triggered: LONG {symbol} @ ${current_price:.6f}")
+                            logger.info(f"✅ TP triggered: LONG {symbol} @ ${current_price:.6f}")
                             continue
                         elif pos['side'] == 'SHORT' and current_price <= tp:
                             global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-                            logger.info(f"⚡ Fast TP triggered: SHORT {symbol} @ ${current_price:.6f}")
+                            logger.info(f"✅ TP triggered: SHORT {symbol} @ ${current_price:.6f}")
                             continue
                         
                         # Update trailing stop if in profit
@@ -3863,11 +3902,18 @@ class PaperTradingEngine:
                         pos['trailingStop'] = new_sl
                         pos['stopLoss'] = new_sl
                 
-                # Check Exits
+                # SPIKE BYPASS: 3-Tick Confirmation for SL
+                if 'slConfirmCount' not in pos:
+                    pos['slConfirmCount'] = 0
+                
                 if current_price <= pos['stopLoss']:
-                    self.close_position(pos, current_price, 'SL')
-                elif current_price >= pos['takeProfit']:
-                    self.close_position(pos, current_price, 'TP')
+                    pos['slConfirmCount'] += 1
+                    if pos['slConfirmCount'] >= 3:
+                        self.close_position(pos, current_price, 'SL')
+                else:
+                    pos['slConfirmCount'] = 0
+                    if current_price >= pos['takeProfit']:
+                        self.close_position(pos, current_price, 'TP')
                     
             elif pos['side'] == 'SHORT':
                 if current_price <= pos['trailActivation']:
@@ -3881,11 +3927,18 @@ class PaperTradingEngine:
                         pos['trailingStop'] = new_sl
                         pos['stopLoss'] = new_sl
                 
-                # Check Exits
+                # SPIKE BYPASS: 3-Tick Confirmation for SL
+                if 'slConfirmCount' not in pos:
+                    pos['slConfirmCount'] = 0
+                
                 if current_price >= pos['stopLoss']:
-                    self.close_position(pos, current_price, 'SL')
-                elif current_price <= pos['takeProfit']:
-                    self.close_position(pos, current_price, 'TP')
+                    pos['slConfirmCount'] += 1
+                    if pos['slConfirmCount'] >= 3:
+                        self.close_position(pos, current_price, 'SL')
+                else:
+                    pos['slConfirmCount'] = 0
+                    if current_price <= pos['takeProfit']:
+                        self.close_position(pos, current_price, 'TP')
 
     def close_position(self, pos: Dict, exit_price: float, reason: str):
         if pos['side'] == 'LONG':
