@@ -387,6 +387,10 @@ async def lifespan(app: FastAPI):
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
     
+    # Start Liquidation Tracker
+    logger.info("💀 Starting Liquidation Tracker...")
+    asyncio.create_task(liquidation_tracker.start())
+    
     logger.info("🚀 Starting 24/7 Background Scanner...")
     
     # Start background scanner as asyncio task (scans all coins every 10 seconds)
@@ -1088,7 +1092,8 @@ class LightweightCoinAnalyzer:
             spread_pct=self.opportunity.spread_pct,
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
-            basis_pct=basis_pct
+            basis_pct=basis_pct,
+            symbol=self.symbol  # For liquidation cascade lookup
         )
         
         if signal:
@@ -1207,6 +1212,173 @@ class BinanceWebSocketManager:
 # Global WebSocket manager
 binance_ws_manager = BinanceWebSocketManager()
 
+
+# ============================================================================
+# LIQUIDATION CASCADE TRACKER
+# ============================================================================
+
+class LiquidationTracker:
+    """
+    Tracks real-time liquidations from Binance Futures.
+    Detects cascade events (>$100K in 30 seconds) for signal scoring.
+    
+    WebSocket: wss://fstream.binance.com/ws/!forceOrder@arr
+    """
+    
+    def __init__(self):
+        self.ws = None
+        self.running = False
+        self.connected = False
+        # symbol -> list of {timestamp, side, qty_usd}
+        self.recent_liquidations: Dict[str, list] = {}
+        self.cascade_threshold = 100000  # $100K threshold
+        self.cascade_window = 30  # 30 seconds window
+        self.total_liquidations = 0
+        logger.info("💀 LiquidationTracker initialized")
+    
+    async def connect(self):
+        """Connect to Binance Liquidation WebSocket stream."""
+        try:
+            url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+            self.ws = await websockets.connect(url, ping_interval=180, ping_timeout=30)
+            self.connected = True
+            self.running = True
+            logger.info("✅ Liquidation WebSocket connected")
+            
+            asyncio.create_task(self._listen())
+            
+        except Exception as e:
+            logger.error(f"Liquidation WebSocket connection failed: {e}")
+            self.connected = False
+    
+    async def _listen(self):
+        """Listen for liquidation events."""
+        while self.running and self.ws:
+            try:
+                msg = await asyncio.wait_for(self.ws.recv(), timeout=60)
+                data = json.loads(msg)
+                await self._process_liquidation(data)
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("Liquidation WebSocket disconnected")
+                self.connected = False
+                break
+            except Exception as e:
+                logger.debug(f"Liquidation stream error: {e}")
+    
+    async def _process_liquidation(self, data: dict):
+        """Process a liquidation event."""
+        try:
+            # Format: {"e":"forceOrder","E":timestamp,"o":{order details}}
+            if data.get('e') != 'forceOrder':
+                return
+            
+            order = data.get('o', {})
+            symbol = order.get('s', '')  # e.g., "BTCUSDT"
+            side = order.get('S', '')  # "BUY" or "SELL"
+            qty = float(order.get('q', 0))  # Original quantity
+            price = float(order.get('p', 0))  # Price
+            
+            usd_value = qty * price
+            now = datetime.now().timestamp()
+            
+            # Store liquidation
+            if symbol not in self.recent_liquidations:
+                self.recent_liquidations[symbol] = []
+            
+            self.recent_liquidations[symbol].append({
+                'timestamp': now,
+                'side': side,
+                'usd': usd_value
+            })
+            
+            self.total_liquidations += 1
+            
+            # Cleanup old entries (keep last 60 seconds)
+            cutoff = now - 60
+            for sym in list(self.recent_liquidations.keys()):
+                self.recent_liquidations[sym] = [
+                    l for l in self.recent_liquidations[sym] 
+                    if l['timestamp'] > cutoff
+                ]
+                if not self.recent_liquidations[sym]:
+                    del self.recent_liquidations[sym]
+            
+            # Log significant liquidations
+            if usd_value > 50000:
+                logger.info(f"💀 LIQD: {symbol} {side} ${usd_value:,.0f}")
+                
+        except Exception as e:
+            logger.debug(f"Liquidation processing error: {e}")
+    
+    def get_cascade_score(self, symbol: str, signal_side: str) -> tuple:
+        """
+        Calculate cascade score for a symbol.
+        
+        Returns: (score, reason)
+        - Score: 0-15 points
+        - Reason: Description for logging
+        """
+        now = datetime.now().timestamp()
+        cutoff = now - self.cascade_window
+        
+        if symbol not in self.recent_liquidations:
+            return 0, ""
+        
+        # Calculate total liquidation value in window
+        longs_liq = 0  # BUY = closing a short (short squeezed)
+        shorts_liq = 0  # SELL = closing a long (long liquidated)
+        
+        for liq in self.recent_liquidations[symbol]:
+            if liq['timestamp'] > cutoff:
+                if liq['side'] == 'BUY':
+                    longs_liq += liq['usd']
+                else:
+                    shorts_liq += liq['usd']
+        
+        # Logic:
+        # If LONG signal and lots of shorts being liquidated (BUY orders) = bullish cascade
+        # If SHORT signal and lots of longs being liquidated (SELL orders) = bearish cascade
+        
+        if signal_side == "LONG" and longs_liq > self.cascade_threshold:
+            # Short squeeze happening - bullish
+            return 15, f"LIQD(short-squeeze ${longs_liq:,.0f})"
+        elif signal_side == "SHORT" and shorts_liq > self.cascade_threshold:
+            # Long liquidation cascade - bearish
+            return 15, f"LIQD(long-cascade ${shorts_liq:,.0f})"
+        
+        # Partial points for smaller cascades
+        relevant_liq = longs_liq if signal_side == "LONG" else shorts_liq
+        if relevant_liq > 50000:
+            return 10, f"LIQD(${relevant_liq:,.0f})"
+        elif relevant_liq > 20000:
+            return 5, f"LIQD(${relevant_liq:,.0f})"
+        
+        return 0, ""
+    
+    def get_stats(self) -> dict:
+        """Get tracker statistics."""
+        return {
+            "connected": self.connected,
+            "total_tracked": self.total_liquidations,
+            "active_symbols": len(self.recent_liquidations)
+        }
+    
+    async def start(self):
+        """Start the liquidation tracker."""
+        await self.connect()
+    
+    async def stop(self):
+        """Stop the liquidation tracker."""
+        self.running = False
+        self.connected = False
+        if self.ws:
+            await self.ws.close()
+
+
+# Global Liquidation Tracker
+liquidation_tracker = LiquidationTracker()
 
 class MultiCoinScanner:
     """
@@ -3294,12 +3466,12 @@ class SignalGenerator:
         leverage: int = 10,
         basis_pct: float = 0.0,
         whale_zscore: float = 0.0,
-
         nearest_fvg: Optional[Dict] = None,
         breakout: Optional[str] = None,
         spread_pct: float = 0.05, # Phase 13
         volatility_ratio: float = 1.0, # Phase 13
-        coin_profile: Optional[Dict] = None  # Phase 28: Dynamic coin profile
+        coin_profile: Optional[Dict] = None,  # Phase 28: Dynamic coin profile
+        symbol: str = "BTCUSDT"  # Symbol for liquidation cascade lookup
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 9 Layers of confluence (SMC + Breakouts).
@@ -3413,10 +3585,11 @@ class SignalGenerator:
         reasons.append(f"MTF({htf_trend})")
         
         # Layer 5: Liquidation Cascade (Bonus) - Max 15 pts
-        is_cascade, liq_vol = self.check_liquidation_cascade()
-        if is_cascade:
-             score += 15
-             reasons.append("Cascade")
+        # Uses real-time liquidation stream from Binance
+        liq_score, liq_reason = liquidation_tracker.get_cascade_score(symbol if symbol else 'BTCUSDT', signal_side)
+        if liq_score > 0:
+            score += liq_score
+            reasons.append(liq_reason)
 
         # Layer 6: Spot-Futures Basis (Sentiment) - Max 10 pts
         # Contango (Basis > 0) favors Longs, Backwardation favors Shorts
