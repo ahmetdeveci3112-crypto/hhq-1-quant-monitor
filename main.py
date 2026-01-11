@@ -131,9 +131,58 @@ class SQLiteManager:
                 )
             ''')
             
+            # Signals table - ALL signals (accepted AND rejected) for performance analysis
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    zscore REAL,
+                    hurst REAL,
+                    atr REAL,
+                    signal_score INTEGER,
+                    htf_trend TEXT,
+                    mtf_confirmed INTEGER,
+                    mtf_reason TEXT,
+                    blacklisted INTEGER DEFAULT 0,
+                    accepted INTEGER DEFAULT 0,
+                    reject_reason TEXT,
+                    z_threshold REAL,
+                    min_confidence REAL,
+                    entry_tightness REAL,
+                    exit_tightness REAL,
+                    timestamp INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Open positions table - tracks positions while open
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    size REAL NOT NULL,
+                    size_usd REAL NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    leverage INTEGER,
+                    open_time INTEGER NOT NULL,
+                    signal_score INTEGER,
+                    zscore REAL,
+                    hurst REAL,
+                    atr REAL,
+                    htf_trend TEXT,
+                    status TEXT DEFAULT 'OPEN',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             await db.commit()
             self._initialized = True
-            logger.info("✅ SQLite database initialized")
+            logger.info("✅ SQLite database initialized with all tables")
     
     async def save_setting(self, key: str, value: any):
         """Save a setting to database."""
@@ -234,6 +283,93 @@ class SQLiteManager:
             ''', (limit,)) as cursor:
                 rows = await cursor.fetchall()
                 return [{"time": row["time"], "balance": row["balance"], "drawdown": row["drawdown"]} for row in reversed(rows)]
+    
+    async def save_signal(self, signal_data: dict):
+        """Save a signal (accepted or rejected) for performance analysis."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO signals (
+                    symbol, action, price, zscore, hurst, atr, signal_score,
+                    htf_trend, mtf_confirmed, mtf_reason, blacklisted, accepted,
+                    reject_reason, z_threshold, min_confidence, entry_tightness,
+                    exit_tightness, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                signal_data.get('symbol'),
+                signal_data.get('action'),
+                signal_data.get('price', 0),
+                signal_data.get('zscore', 0),
+                signal_data.get('hurst', 0),
+                signal_data.get('atr', 0),
+                signal_data.get('signal_score', 0),
+                signal_data.get('htf_trend', 'NEUTRAL'),
+                1 if signal_data.get('mtf_confirmed', False) else 0,
+                signal_data.get('mtf_reason', ''),
+                1 if signal_data.get('blacklisted', False) else 0,
+                1 if signal_data.get('accepted', False) else 0,
+                signal_data.get('reject_reason', ''),
+                signal_data.get('z_threshold', 0),
+                signal_data.get('min_confidence', 0),
+                signal_data.get('entry_tightness', 1.0),
+                signal_data.get('exit_tightness', 1.0),
+                signal_data.get('timestamp', int(datetime.now().timestamp() * 1000))
+            ))
+            await db.commit()
+    
+    async def save_open_position(self, pos: dict):
+        """Save an open position to database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO positions (
+                    id, symbol, side, entry_price, size, size_usd,
+                    stop_loss, take_profit, leverage, open_time,
+                    signal_score, zscore, hurst, atr, htf_trend, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                pos.get('id'),
+                pos.get('symbol'),
+                pos.get('side'),
+                pos.get('entryPrice'),
+                pos.get('size', 0),
+                pos.get('sizeUsd', 0),
+                pos.get('stopLoss', 0),
+                pos.get('takeProfit', 0),
+                pos.get('leverage', 10),
+                pos.get('openTime', 0),
+                pos.get('signalScore', 0),
+                pos.get('zscore', 0),
+                pos.get('hurst', 0),
+                pos.get('atr', 0),
+                pos.get('htfTrend', 'NEUTRAL'),
+                'OPEN'
+            ))
+            await db.commit()
+    
+    async def close_position_in_db(self, position_id: str):
+        """Mark a position as closed in database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE positions SET status = 'CLOSED' WHERE id = ?
+            ''', (position_id,))
+            await db.commit()
+    
+    async def get_all_settings(self) -> dict:
+        """Get all settings from database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT key, value FROM settings') as cursor:
+                rows = await cursor.fetchall()
+                return {row['key']: json.loads(row['value']) for row in rows}
+    
+    async def save_all_settings(self, settings: dict):
+        """Save all settings to database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            for key, value in settings.items():
+                await db.execute('''
+                    INSERT OR REPLACE INTO settings (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                ''', (key, json.dumps(value)))
+            await db.commit()
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -1859,6 +1995,28 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     symbol = signal.get('symbol', global_paper_trader.symbol)
     atr = signal.get('atr', 0)
     
+    # Prepare signal data for logging
+    signal_log_data = {
+        'symbol': symbol,
+        'action': action,
+        'price': price,
+        'zscore': signal.get('zscore', 0),
+        'hurst': signal.get('hurst', 0),
+        'atr': atr,
+        'signal_score': signal.get('confidenceScore', 0),
+        'z_threshold': global_paper_trader.z_score_threshold,
+        'min_confidence': global_paper_trader.min_confidence_score,
+        'entry_tightness': global_paper_trader.entry_tightness,
+        'exit_tightness': global_paper_trader.exit_tightness,
+        'timestamp': int(datetime.now().timestamp() * 1000),
+        'accepted': False,
+        'reject_reason': '',
+        'mtf_confirmed': True,
+        'mtf_reason': '',
+        'htf_trend': 'NEUTRAL',
+        'blacklisted': False
+    }
+    
     # Check if we already have a position in this symbol
     existing_position = None
     for pos in global_paper_trader.positions:
@@ -1868,18 +2026,39 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Don't open new position if we already have one in this symbol
     if existing_position:
+        signal_log_data['reject_reason'] = 'EXISTING_POSITION'
+        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
         return
     
     # Check max positions
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
+        signal_log_data['reject_reason'] = 'MAX_POSITIONS'
+        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        return
+    
+    # Check blacklist
+    if global_paper_trader.is_coin_blacklisted(symbol):
+        signal_log_data['reject_reason'] = 'BLACKLISTED'
+        signal_log_data['blacklisted'] = True
+        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
         return
     
     # MULTI-TIMEFRAME CONFIRMATION CHECK
     # Verify signal aligns with higher timeframe (1h) trend
     mtf_result = mtf_confirmation.confirm_signal(symbol, action)
+    signal_log_data['htf_trend'] = mtf_result.get('htf_trend', 'NEUTRAL')
+    signal_log_data['mtf_confirmed'] = mtf_result['confirmed']
+    signal_log_data['mtf_reason'] = mtf_result.get('reason', '')
+    
     if not mtf_result['confirmed']:
+        signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
+        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 MTF REJECTED: {action} {symbol} - {mtf_result['reason']}")
         return
+    
+    # Signal is ACCEPTED
+    signal_log_data['accepted'] = True
+    asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
     
     # Log if signal has MTF alignment bonus
     if mtf_result['bonus'] > 0:
