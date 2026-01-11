@@ -3061,6 +3061,16 @@ class PaperTradingEngine:
         # Phase 34: Pending Orders System
         self.pending_orders = []  # List of pending limit orders waiting for pullback
         self.pending_order_timeout_seconds = 1800  # 30 minutes to fill or cancel
+        
+        # =========================================================================
+        # COIN BLACKLIST SYSTEM
+        # Automatically blocks coins that consistently cause losses
+        # =========================================================================
+        self.coin_blacklist = {}  # symbol -> {until: timestamp, reason: str, losses: int}
+        self.coin_stats = {}  # symbol -> {wins: int, losses: int, consecutive_losses: int, last_trade_time: float}
+        self.blacklist_threshold = 2  # Consecutive losses to trigger blacklist
+        self.blacklist_duration_hours = 2  # Hours to keep coin blacklisted
+        
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
@@ -3072,6 +3082,128 @@ class PaperTradingEngine:
         self.logs = self.logs[-100:]  # Keep last 100 logs
         logger.info(f"[PaperTrading] {message}")
     
+    # =========================================================================
+    # COIN BLACKLIST SYSTEM METHODS
+    # =========================================================================
+    
+    def is_coin_blacklisted(self, symbol: str) -> bool:
+        """Check if a coin is currently blacklisted."""
+        if symbol not in self.coin_blacklist:
+            return False
+        
+        blacklist_entry = self.coin_blacklist[symbol]
+        until_time = blacklist_entry.get('until', 0)
+        
+        if datetime.now().timestamp() > until_time:
+            # Blacklist expired, remove it
+            del self.coin_blacklist[symbol]
+            self.add_log(f"✅ {symbol} blacklist'ten çıkarıldı (süre doldu)")
+            return False
+        
+        return True
+    
+    def add_to_blacklist(self, symbol: str, reason: str, losses: int):
+        """Add a coin to the blacklist."""
+        until_time = datetime.now().timestamp() + (self.blacklist_duration_hours * 3600)
+        self.coin_blacklist[symbol] = {
+            'until': until_time,
+            'reason': reason,
+            'losses': losses,
+            'added_at': datetime.now().isoformat()
+        }
+        self.add_log(f"🚫 {symbol} BLACKLIST'e eklendi: {reason} ({self.blacklist_duration_hours}h)")
+        logger.warning(f"Coin blacklisted: {symbol} - {reason}")
+    
+    def update_coin_stats(self, symbol: str, is_win: bool, pnl: float):
+        """Update coin statistics after a trade closes."""
+        if symbol not in self.coin_stats:
+            self.coin_stats[symbol] = {
+                'wins': 0,
+                'losses': 0,
+                'consecutive_losses': 0,
+                'consecutive_wins': 0,
+                'total_pnl': 0.0,
+                'last_trade_time': 0
+            }
+        
+        stats = self.coin_stats[symbol]
+        stats['last_trade_time'] = datetime.now().timestamp()
+        stats['total_pnl'] += pnl
+        
+        if is_win:
+            stats['wins'] += 1
+            stats['consecutive_wins'] += 1
+            stats['consecutive_losses'] = 0  # Reset loss streak
+        else:
+            stats['losses'] += 1
+            stats['consecutive_losses'] += 1
+            stats['consecutive_wins'] = 0  # Reset win streak
+            
+            # Check if should blacklist
+            if stats['consecutive_losses'] >= self.blacklist_threshold:
+                reason = f"{stats['consecutive_losses']} ardışık zarar"
+                self.add_to_blacklist(symbol, reason, stats['consecutive_losses'])
+                # Reset consecutive after blacklist
+                stats['consecutive_losses'] = 0
+    
+    def clean_expired_blacklist(self):
+        """Remove expired entries from blacklist."""
+        now = datetime.now().timestamp()
+        expired = [s for s, data in self.coin_blacklist.items() if now > data.get('until', 0)]
+        for symbol in expired:
+            del self.coin_blacklist[symbol]
+            self.add_log(f"✅ {symbol} blacklist süresi doldu")
+    
+    def get_blacklist_info(self) -> dict:
+        """Get current blacklist status for API/UI."""
+        self.clean_expired_blacklist()
+        return {
+            'blacklisted_coins': list(self.coin_blacklist.keys()),
+            'count': len(self.coin_blacklist),
+            'details': self.coin_blacklist
+        }
+
+    # =========================================================================
+    # DYNAMIC ATR MULTIPLIER
+    # Adjusts SL/TP based on current volatility conditions
+    # =========================================================================
+    
+    def calculate_dynamic_atr_multiplier(self, atr: float, price: float, lookback_atr: float = None) -> float:
+        """
+        Calculate a dynamic multiplier for ATR-based SL/TP.
+        
+        Logic:
+        - Normal volatility (ATR ~1% of price): multiplier = 1.0
+        - High volatility (ATR >2% of price): multiplier = 1.3-1.5 (wider SL/TP)
+        - Low volatility (ATR <0.5% of price): multiplier = 0.7-0.8 (tighter SL/TP)
+        
+        Returns: float between 0.7 and 1.5
+        """
+        if price <= 0 or atr <= 0:
+            return 1.0
+        
+        # Calculate ATR as percentage of price
+        atr_pct = (atr / price) * 100
+        
+        # Define volatility bands
+        LOW_VOL_THRESHOLD = 0.5   # <0.5% = low volatility
+        NORMAL_VOL = 1.0          # ~1% = normal
+        HIGH_VOL_THRESHOLD = 2.0  # >2% = high volatility
+        
+        if atr_pct < LOW_VOL_THRESHOLD:
+            # Low volatility: tighten SL/TP (0.7-0.9)
+            multiplier = 0.7 + (atr_pct / LOW_VOL_THRESHOLD) * 0.2
+        elif atr_pct > HIGH_VOL_THRESHOLD:
+            # High volatility: widen SL/TP (1.2-1.5)
+            excess_vol = min(atr_pct - HIGH_VOL_THRESHOLD, 3.0)  # Cap at 5%
+            multiplier = 1.2 + (excess_vol / 3.0) * 0.3
+        else:
+            # Normal volatility: scale linearly (0.9-1.2)
+            normalized = (atr_pct - LOW_VOL_THRESHOLD) / (HIGH_VOL_THRESHOLD - LOW_VOL_THRESHOLD)
+            multiplier = 0.9 + normalized * 0.3
+        
+        return round(min(1.5, max(0.7, multiplier)), 2)
+
     # =========================================================================
     # PHASE 30: KELLY CRITERION POSITION SIZING
     # =========================================================================
@@ -3170,6 +3302,11 @@ class PaperTradingEngine:
         # Use provided symbol or default
         trade_symbol = symbol if symbol else self.symbol
         
+        # BLACKLIST CHECK: Skip coins that consistently cause losses
+        if self.is_coin_blacklisted(trade_symbol):
+            logger.debug(f"Skipping {trade_symbol} - blacklisted")
+            return None
+        
         # Check position + pending order limits
         total_exposure = len(self.positions) + len(self.pending_orders)
         if total_exposure >= self.max_positions:
@@ -3240,10 +3377,13 @@ class PaperTradingEngine:
         
         # Calculate SL/TP based on pullback entry price
         # Apply exit_tightness: lower = quicker exit (smaller SL/TP), higher = hold longer (bigger SL/TP)
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness
-        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness
-        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness
+        # DYNAMIC ATR MULTIPLIER: Adjust based on current volatility
+        dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, price)
+        
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
             sl = entry_price - (atr * adjusted_sl_atr)
@@ -3966,6 +4106,11 @@ class PaperTradingEngine:
         self.stats['totalPnl'] += pnl
         if pnl > 0: self.stats['winningTrades'] += 1
         else: self.stats['losingTrades'] += 1
+        
+        # Update coin-specific stats for blacklist system
+        symbol = pos.get('symbol', 'UNKNOWN')
+        is_win = pnl > 0
+        self.update_coin_stats(symbol, is_win, pnl)
         
         # Phase 19: Log position close
         emoji = "✅" if pnl > 0 else "❌"
