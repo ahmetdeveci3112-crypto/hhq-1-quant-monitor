@@ -1560,8 +1560,8 @@ class MultiCoinScanner:
                     if base:
                         symbols.append(f"{base}USDT")
             
-            # Sort by some criteria (we'll use alphabetical for now, can add volume later)
-            symbols = sorted(list(set(symbols)))[:self.max_coins]
+            # Sort alphabetically and scan ALL coins (no limit)
+            symbols = sorted(list(set(symbols)))
             
             logger.info(f"Fetched {len(symbols)} USDT perpetual contracts")
             self.coins = symbols
@@ -1926,8 +1926,8 @@ class MultiCoinScanner:
             await self.exchange.close()
             self.exchange = None
 
-# Global MultiCoinScanner instance
-multi_coin_scanner = MultiCoinScanner(max_coins=200)  # 200 with WebSocket (instant data)
+# Global MultiCoinScanner instance (no limit - scans ALL perpetuals)
+multi_coin_scanner = MultiCoinScanner(max_coins=999)
 
 
 # ============================================================================
@@ -1950,10 +1950,15 @@ async def background_scanner_loop():
         # Initialize scanner
         if not multi_coin_scanner.coins:
             await multi_coin_scanner.fetch_all_futures_symbols()
+            logger.info(f"📊 Scanning ALL {len(multi_coin_scanner.coins)} USDT perpetual contracts")
             logger.info("Starting background OHLCV preload for Z-Score/Hurst calculation...")
-            await multi_coin_scanner.preload_all_coins(top_n=30)
+            await multi_coin_scanner.preload_all_coins(top_n=50)  # Preload top 50
         
         multi_coin_scanner.running = True
+        
+        # Track last coin refresh time (refresh every 30 minutes)
+        last_coin_refresh = datetime.now().timestamp()
+        coin_refresh_interval = 1800  # 30 minutes
         
         while True:
             try:
@@ -1963,6 +1968,16 @@ async def background_scanner_loop():
                         await btc_filter.update_btc_state(multi_coin_scanner.exchange)
                 except Exception as e:
                     logger.debug(f"BTC filter update error: {e}")
+                
+                # Refresh coin list every 30 minutes to catch new listings
+                now = datetime.now().timestamp()
+                if now - last_coin_refresh > coin_refresh_interval:
+                    old_count = len(multi_coin_scanner.coins)
+                    await multi_coin_scanner.fetch_all_futures_symbols()
+                    new_count = len(multi_coin_scanner.coins)
+                    if new_count > old_count:
+                        logger.info(f"🆕 New coins detected: {new_count - old_count} added (total: {new_count})")
+                    last_coin_refresh = now
                 
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
