@@ -32,8 +32,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
     if (t <= 0.6) return { label: 'Çok Sıkı', color: 'text-rose-500', desc: 'Fiyat çok yakınsa gir, az pozisyon' };
     if (t <= 0.8) return { label: 'Sıkı', color: 'text-orange-400', desc: 'Fiyat yakınsa gir' };
     if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart pullback' };
-    if (t <= 1.6) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Daha geniş pullback' };
-    return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'En geniş pullback, çok pozisyon' };
+    if (t <= 2.0) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Daha geniş pullback' };
+    if (t <= 3.0) return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'Geniş pullback, çok pozisyon' };
+    return { label: 'Ultra Gevşek', color: 'text-fuchsia-400', desc: 'En geniş pullback, maksimum pozisyon' };
   };
 
   // Exit tightness level helper
@@ -147,7 +148,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
               <input
                 type="range"
                 min="0.5"
-                max="2.0"
+                max="4.0"
                 step="0.1"
                 value={localSettings.entryTightness}
                 onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
@@ -155,7 +156,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.5x (Sıkı = Az Pozisyon)</span>
-                <span>2.0x (Gevşek = Çok Pozisyon)</span>
+                <span>4.0x (Gevşek = Çok Pozisyon)</span>
               </div>
             </div>
           </div>
