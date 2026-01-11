@@ -2053,16 +2053,20 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if not mtf_result['confirmed']:
         signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
-        logger.info(f"🚫 MTF REJECTED: {action} {symbol} - {mtf_result['reason']}")
+        logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
         return
     
     # Signal is ACCEPTED
     signal_log_data['accepted'] = True
     asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
     
-    # Log if signal has MTF alignment bonus
-    if mtf_result['bonus'] > 0:
-        logger.debug(f"✅ MTF BONUS: {action} {symbol} (+{mtf_result['bonus']:.1%}) - {mtf_result['reason']}")
+    # Log MTF score info
+    mtf_score = mtf_result.get('mtf_score', 0)
+    score_modifier = mtf_result.get('score_modifier', 1.0)
+    if score_modifier > 1.0:
+        logger.info(f"✅ MTF BONUS: {action} {symbol} (skor: +{mtf_score}) - {mtf_result['reason']}")
+    elif score_modifier < 1.0:
+        logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - {mtf_result['reason']}")
     
     # Execute trade
     try:
@@ -2073,8 +2077,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal=signal,
             symbol=symbol
         )
-        htf_info = mtf_result.get('htf_trend', 'N/A')
-        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} (1h: {htf_info})")
+        trends = mtf_result.get('trends', {})
+        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
@@ -2187,77 +2191,93 @@ session_manager = SessionManager()
 
 class MultiTimeframeConfirmation:
     """
-    Multi-Timeframe (MTF) Confirmation for signal validation.
-    Checks if 5m signals align with 1h trend direction.
+    Multi-Timeframe (MTF) Scoring System for signal validation.
     
-    Logic:
-    - LONG signals: 1h trend should be bullish or neutral (not bearish)
-    - SHORT signals: 1h trend should be bearish or neutral (not bullish)
-    - Strong alignment = bonus score, misalignment = penalty
+    Checks 3 timeframes: 15m, 1h, 4h
+    Each timeframe contributes points based on trend alignment:
+    - 15m: 20 points (short-term momentum)
+    - 1h:  30 points (main trend)
+    - 4h:  50 points (major trend direction)
+    
+    Total possible: 100 points (fully aligned) to -100 (fully opposite)
+    
+    Decision thresholds:
+    - Score > 50:  BONUS (+10% signal score)
+    - Score 0-50:  NORMAL (proceed as usual)
+    - Score 0 to -50: PENALTY (-20% signal score, but still allow)
+    - Score < -50: BLOCK (too risky, strong counter-trend)
     """
     
+    # Timeframe weights
+    WEIGHTS = {
+        '15m': 20,
+        '1h': 30,
+        '4h': 50
+    }
+    
     def __init__(self):
-        self.coin_trends = {}  # symbol -> {trend_1h, last_update, ema20, ema50, change_1h}
+        self.coin_trends = {}  # symbol -> {trend_15m, trend_1h, trend_4h, last_update, mtf_score}
         self.cache_ttl = 300  # 5 minutes cache per coin
-        logger.info("📊 MultiTimeframeConfirmation initialized")
+        logger.info("📊 MTF Scoring System initialized (15m:20, 1h:30, 4h:50)")
     
     def get_trend_from_closes(self, closes: list) -> dict:
-        """Calculate trend indicators from close prices."""
-        if len(closes) < 20:
-            return {"trend": "NEUTRAL", "strength": 0.0, "ema20": 0, "ema50": 0}
+        """Calculate trend from close prices using EMA and price change."""
+        if len(closes) < 10:
+            return {"trend": "NEUTRAL", "strength": 0.0}
         
-        # Calculate EMAs
-        closes_arr = np.array(closes[-50:] if len(closes) >= 50 else closes)
+        closes_arr = np.array(closes[-30:] if len(closes) >= 30 else closes)
         
-        # EMA20
-        alpha_20 = 2 / (20 + 1)
-        ema20 = closes_arr[0]
+        # Simple EMA10
+        alpha = 2 / (10 + 1)
+        ema = closes_arr[0]
         for c in closes_arr[1:]:
-            ema20 = alpha_20 * c + (1 - alpha_20) * ema20
-        
-        # EMA50 (if enough data)
-        ema50 = ema20
-        if len(closes_arr) >= 50:
-            alpha_50 = 2 / (50 + 1)
-            ema50 = closes_arr[0]
-            for c in closes_arr[1:]:
-                ema50 = alpha_50 * c + (1 - alpha_50) * ema50
+            ema = alpha * c + (1 - alpha) * ema
         
         current_price = closes_arr[-1]
         
-        # Calculate % change from start to end
+        # % change over last 4 candles
         if len(closes_arr) >= 4:
             change_pct = ((closes_arr[-1] - closes_arr[-4]) / closes_arr[-4]) * 100
         else:
             change_pct = 0
         
         # Determine trend
-        if current_price > ema20 and change_pct > 0.3:
-            trend = "BULLISH"
-            strength = min(1.0, change_pct / 2.0)
-        elif current_price > ema20 and current_price > ema50 and change_pct > 1.0:
-            trend = "STRONG_BULLISH"
-            strength = min(1.0, change_pct / 3.0)
-        elif current_price < ema20 and change_pct < -0.3:
-            trend = "BEARISH"
-            strength = min(1.0, abs(change_pct) / 2.0)
-        elif current_price < ema20 and current_price < ema50 and change_pct < -1.0:
-            trend = "STRONG_BEARISH"
-            strength = min(1.0, abs(change_pct) / 3.0)
+        if current_price > ema and change_pct > 0.2:
+            if change_pct > 1.0:
+                return {"trend": "STRONG_BULLISH", "strength": min(1.0, change_pct / 3.0)}
+            return {"trend": "BULLISH", "strength": min(1.0, change_pct / 2.0)}
+        elif current_price < ema and change_pct < -0.2:
+            if change_pct < -1.0:
+                return {"trend": "STRONG_BEARISH", "strength": min(1.0, abs(change_pct) / 3.0)}
+            return {"trend": "BEARISH", "strength": min(1.0, abs(change_pct) / 2.0)}
         else:
-            trend = "NEUTRAL"
-            strength = 0.0
+            return {"trend": "NEUTRAL", "strength": 0.0}
+    
+    def calculate_trend_score(self, trend: str, signal_action: str, weight: int) -> int:
+        """Calculate score contribution for a single timeframe."""
+        # For LONG signals: Bullish trend = positive, Bearish = negative
+        # For SHORT signals: Bearish trend = positive, Bullish = negative
         
-        return {
-            "trend": trend,
-            "strength": round(strength, 2),
-            "ema20": round(ema20, 6),
-            "ema50": round(ema50, 6),
-            "change_pct": round(change_pct, 2)
-        }
+        if signal_action == 'LONG':
+            if trend in ['BULLISH', 'STRONG_BULLISH']:
+                return weight  # Full positive
+            elif trend in ['BEARISH', 'STRONG_BEARISH']:
+                return -weight  # Full negative
+            else:
+                return 0  # Neutral
+        
+        elif signal_action == 'SHORT':
+            if trend in ['BEARISH', 'STRONG_BEARISH']:
+                return weight  # Full positive
+            elif trend in ['BULLISH', 'STRONG_BULLISH']:
+                return -weight  # Full negative
+            else:
+                return 0  # Neutral
+        
+        return 0
     
     async def update_coin_trend(self, symbol: str, exchange) -> dict:
-        """Fetch 1h candles and update trend for a coin."""
+        """Fetch 15m, 1h, 4h candles and calculate MTF data."""
         now = datetime.now().timestamp()
         
         # Check cache
@@ -2266,73 +2286,117 @@ class MultiTimeframeConfirmation:
             if now - cache.get('last_update', 0) < self.cache_ttl:
                 return cache
         
+        result = {
+            'symbol': symbol,
+            'trend_15m': 'NEUTRAL',
+            'trend_1h': 'NEUTRAL',
+            'trend_4h': 'NEUTRAL',
+            'last_update': now
+        }
+        
         try:
             ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
-            ohlcv_1h = await exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=50)
             
-            if ohlcv_1h and len(ohlcv_1h) >= 20:
-                closes = [c[4] for c in ohlcv_1h]
-                trend_data = self.get_trend_from_closes(closes)
-                trend_data['last_update'] = now
-                trend_data['symbol'] = symbol
-                self.coin_trends[symbol] = trend_data
-                return trend_data
+            # Fetch all 3 timeframes (parallel would be faster but keeping simple)
+            ohlcv_15m = await exchange.fetch_ohlcv(ccxt_symbol, '15m', limit=30)
+            ohlcv_1h = await exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=30)
+            ohlcv_4h = await exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=30)
+            
+            # Calculate trends
+            if ohlcv_15m and len(ohlcv_15m) >= 10:
+                closes_15m = [c[4] for c in ohlcv_15m]
+                trend_15m = self.get_trend_from_closes(closes_15m)
+                result['trend_15m'] = trend_15m['trend']
+            
+            if ohlcv_1h and len(ohlcv_1h) >= 10:
+                closes_1h = [c[4] for c in ohlcv_1h]
+                trend_1h = self.get_trend_from_closes(closes_1h)
+                result['trend_1h'] = trend_1h['trend']
+            
+            if ohlcv_4h and len(ohlcv_4h) >= 10:
+                closes_4h = [c[4] for c in ohlcv_4h]
+                trend_4h = self.get_trend_from_closes(closes_4h)
+                result['trend_4h'] = trend_4h['trend']
+            
+            self.coin_trends[symbol] = result
+            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}")
+            
         except Exception as e:
             logger.debug(f"MTF update failed for {symbol}: {e}")
         
-        # Return neutral if fetch failed
-        return {"trend": "NEUTRAL", "strength": 0.0, "last_update": now}
+        return result
     
     def confirm_signal(self, symbol: str, signal_action: str) -> dict:
         """
-        Confirm if signal aligns with higher timeframe trend.
+        Calculate MTF score and determine if signal should proceed.
         
         Returns: {
+            'mtf_score': int (-100 to +100),
             'confirmed': bool,
-            'penalty': float (0.0-0.5),
-            'bonus': float (0.0-0.2),
-            'reason': str
+            'score_modifier': float (0.8 to 1.1),
+            'reason': str,
+            'trends': {15m, 1h, 4h}
         }
         """
-        # Get cached trend (no async here - must be pre-fetched)
-        trend_data = self.coin_trends.get(symbol, {"trend": "NEUTRAL", "strength": 0.0})
-        htf_trend = trend_data.get('trend', 'NEUTRAL')
-        strength = trend_data.get('strength', 0.0)
+        trend_data = self.coin_trends.get(symbol, {
+            'trend_15m': 'NEUTRAL',
+            'trend_1h': 'NEUTRAL', 
+            'trend_4h': 'NEUTRAL'
+        })
+        
+        # Calculate score for each timeframe
+        score_15m = self.calculate_trend_score(trend_data.get('trend_15m', 'NEUTRAL'), signal_action, self.WEIGHTS['15m'])
+        score_1h = self.calculate_trend_score(trend_data.get('trend_1h', 'NEUTRAL'), signal_action, self.WEIGHTS['1h'])
+        score_4h = self.calculate_trend_score(trend_data.get('trend_4h', 'NEUTRAL'), signal_action, self.WEIGHTS['4h'])
+        
+        total_score = score_15m + score_1h + score_4h
         
         result = {
+            'mtf_score': total_score,
             'confirmed': True,
-            'penalty': 0.0,
-            'bonus': 0.0,
+            'score_modifier': 1.0,
             'reason': '',
-            'htf_trend': htf_trend
+            'htf_trend': trend_data.get('trend_1h', 'NEUTRAL'),  # Keep for compatibility
+            'trends': {
+                '15m': trend_data.get('trend_15m', 'NEUTRAL'),
+                '1h': trend_data.get('trend_1h', 'NEUTRAL'),
+                '4h': trend_data.get('trend_4h', 'NEUTRAL')
+            },
+            'scores': {
+                '15m': score_15m,
+                '1h': score_1h,
+                '4h': score_4h
+            }
         }
         
-        # LONG signals
-        if signal_action == 'LONG':
-            if htf_trend in ['BEARISH', 'STRONG_BEARISH']:
-                result['confirmed'] = False
-                result['penalty'] = 0.3 + (strength * 0.2)  # Up to 0.5 penalty
-                result['reason'] = f"LONG vs {htf_trend} 1h trend"
-            elif htf_trend in ['BULLISH', 'STRONG_BULLISH']:
-                result['bonus'] = 0.1 + (strength * 0.1)  # Up to 0.2 bonus
-                result['reason'] = f"LONG aligned with {htf_trend} 1h"
+        # Decision based on score
+        if total_score > 50:
+            # Strong alignment - BONUS
+            result['score_modifier'] = 1.1  # +10% bonus
+            result['reason'] = f"MTF uyumlu (+{total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}"
         
-        # SHORT signals
-        elif signal_action == 'SHORT':
-            if htf_trend in ['BULLISH', 'STRONG_BULLISH']:
-                result['confirmed'] = False
-                result['penalty'] = 0.3 + (strength * 0.2)
-                result['reason'] = f"SHORT vs {htf_trend} 1h trend"
-            elif htf_trend in ['BEARISH', 'STRONG_BEARISH']:
-                result['bonus'] = 0.1 + (strength * 0.1)
-                result['reason'] = f"SHORT aligned with {htf_trend} 1h"
+        elif total_score >= 0:
+            # Neutral to slight positive - NORMAL
+            result['score_modifier'] = 1.0
+            result['reason'] = f"MTF nötr ({total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}"
+        
+        elif total_score > -50:
+            # Against trend but not too strong - PENALTY
+            result['score_modifier'] = 0.8  # -20% penalty
+            result['reason'] = f"MTF karşıt ({total_score}): pozisyon açılacak ama %20 düşük skor"
+        
+        else:
+            # Strongly against trend - BLOCK
+            result['confirmed'] = False
+            result['score_modifier'] = 0.0
+            result['reason'] = f"MTF RED ({total_score}): çok güçlü karşı trend"
         
         return result
     
     def clean_stale_cache(self):
         """Remove old cache entries."""
         now = datetime.now().timestamp()
-        stale_limit = self.cache_ttl * 3  # Keep for 15 minutes max
+        stale_limit = self.cache_ttl * 3
         stale = [s for s, d in self.coin_trends.items() if now - d.get('last_update', 0) > stale_limit]
         for s in stale:
             del self.coin_trends[s]
