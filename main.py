@@ -3357,16 +3357,31 @@ class SignalGenerator:
             return None # Fail fast
             
         # Layer 2: Order Book Imbalance (Confirmation) - Max 20 pts
-        # RELAXED: 5% -> 3% threshold for easier confirmation
+        # Graduated scoring based on imbalance strength
         ob_aligned = False
-        if signal_side == "LONG" and imbalance > 3:
-            score += 20
-            ob_aligned = True
-            reasons.append(f"OB({imbalance:.1f}%)")
-        elif signal_side == "SHORT" and imbalance < -3:
-            score += 20
-            ob_aligned = True
-            reasons.append(f"OB({imbalance:.1f}%)")
+        ob_score = 0
+        if signal_side == "LONG" and imbalance > 0:
+            if imbalance >= 10:
+                ob_score = 20  # Strong buying pressure
+            elif imbalance >= 5:
+                ob_score = 15  # Good buying pressure
+            elif imbalance >= 2:
+                ob_score = 10  # Moderate buying pressure
+            if ob_score > 0:
+                score += ob_score
+                ob_aligned = True
+                reasons.append(f"OB(+{imbalance:.1f}%={ob_score}p)")
+        elif signal_side == "SHORT" and imbalance < 0:
+            if imbalance <= -10:
+                ob_score = 20  # Strong selling pressure
+            elif imbalance <= -5:
+                ob_score = 15  # Good selling pressure
+            elif imbalance <= -2:
+                ob_score = 10  # Moderate selling pressure
+            if ob_score > 0:
+                score += ob_score
+                ob_aligned = True
+                reasons.append(f"OB({imbalance:.1f}%={ob_score}p)")
             
         # Layer 3: VWAP Z-Score (Mean Reversion Check) - Max 20 pts
         # RELAXED: 1.0 -> 0.7 threshold for easier confirmation
