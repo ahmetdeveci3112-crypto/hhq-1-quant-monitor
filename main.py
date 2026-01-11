@@ -1082,7 +1082,7 @@ class LightweightCoinAnalyzer:
         except:
             pass
         
-        # Generate signal with VWAP, HTF trend, and Basis
+        # Generate signal with VWAP, HTF trend, Basis, and Whale activity
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
@@ -1093,7 +1093,8 @@ class LightweightCoinAnalyzer:
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             basis_pct=basis_pct,
-            symbol=self.symbol  # For liquidation cascade lookup
+            symbol=self.symbol,  # For liquidation cascade lookup
+            whale_zscore=whale_tracker.get_whale_zscore(self.symbol)  # Whale activity
         )
         
         if signal:
@@ -1379,6 +1380,121 @@ class LiquidationTracker:
 
 # Global Liquidation Tracker
 liquidation_tracker = LiquidationTracker()
+
+
+# ============================================================================
+# WHALE ACTIVITY TRACKER
+# ============================================================================
+
+class WhaleTracker:
+    """
+    Tracks large trade activity (whale movements) per symbol.
+    
+    Uses volume spikes to detect whale activity:
+    - Tracks volume over rolling windows
+    - Calculates Z-score of recent volume vs average
+    - Positive Z-score = high buying volume (bullish whale)
+    - Negative Z-score = high selling volume (bearish whale)
+    """
+    
+    def __init__(self):
+        # symbol -> {volumes: deque, buy_volumes: deque, sell_volumes: deque, last_price: float}
+        self.symbol_data: Dict[str, dict] = {}
+        self.volume_window = 20  # Rolling window for Z-score
+        self.whale_threshold_usd = 50000  # $50K+ trade = whale
+        logger.info("🐋 WhaleTracker initialized")
+    
+    def update(self, symbol: str, price: float, volume: float, price_change_pct: float):
+        """
+        Update whale tracking with new ticker data.
+        
+        Args:
+            symbol: Trading symbol (e.g., "BTCUSDT")
+            price: Current price
+            volume: Recent volume in base currency
+            price_change_pct: Recent price change percentage
+        """
+        if symbol not in self.symbol_data:
+            self.symbol_data[symbol] = {
+                'volumes': deque(maxlen=self.volume_window),
+                'volume_changes': deque(maxlen=self.volume_window),
+                'last_volume': 0,
+                'last_update': 0
+            }
+        
+        data = self.symbol_data[symbol]
+        now = datetime.now().timestamp()
+        
+        # Skip if updated too recently (< 1 second)
+        if now - data.get('last_update', 0) < 1:
+            return
+        
+        volume_usd = volume * price
+        
+        # Track volume change with direction from price change
+        # Positive price change + high volume = whale buying
+        # Negative price change + high volume = whale selling
+        if data['last_volume'] > 0 and volume_usd > self.whale_threshold_usd:
+            volume_delta = volume_usd - data['last_volume']
+            # Sign volume delta by price direction
+            if price_change_pct > 0:
+                data['volume_changes'].append(volume_delta)  # Positive = buy pressure
+            else:
+                data['volume_changes'].append(-abs(volume_delta))  # Negative = sell pressure
+        
+        data['volumes'].append(volume_usd)
+        data['last_volume'] = volume_usd
+        data['last_update'] = now
+    
+    def get_whale_zscore(self, symbol: str) -> float:
+        """
+        Calculate whale Z-score for a symbol.
+        
+        Returns:
+            Z-score: positive = whale buying, negative = whale selling
+        """
+        if symbol not in self.symbol_data:
+            return 0.0
+        
+        data = self.symbol_data[symbol]
+        changes = list(data.get('volume_changes', []))
+        
+        if len(changes) < 5:
+            return 0.0
+        
+        # Calculate Z-score of recent volume changes
+        mean = sum(changes) / len(changes)
+        if len(changes) < 2:
+            return 0.0
+        
+        variance = sum((x - mean) ** 2 for x in changes) / len(changes)
+        std = variance ** 0.5
+        
+        if std < 1:
+            return 0.0
+        
+        # Get most recent values (last 3)
+        recent = changes[-3:]
+        recent_mean = sum(recent) / len(recent)
+        
+        zscore = (recent_mean - mean) / std
+        return round(max(-5, min(5, zscore)), 2)  # Clamp to [-5, 5]
+    
+    def get_stats(self) -> dict:
+        """Get tracker statistics."""
+        return {
+            "tracked_symbols": len(self.symbol_data),
+            "active_whales": sum(
+                1 for s in self.symbol_data.values() 
+                if len(s.get('volume_changes', [])) > 5
+            )
+        }
+
+
+# Global Whale Tracker
+whale_tracker = WhaleTracker()
+
+
 
 class MultiCoinScanner:
     """
@@ -1713,6 +1829,9 @@ class MultiCoinScanner:
                 analyzer.update_price(price, high, low, volume)
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
+                
+                # Update whale tracker with volume and price change
+                whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
                 analyzer.opportunity.imbalance = imbalance  # Store for opportunity display
                 
                 # Analyze for signal with BTC basis and L1 imbalance
