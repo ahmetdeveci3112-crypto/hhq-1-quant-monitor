@@ -38,6 +38,206 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# SQLITE DATABASE MANAGER
+# ============================================================================
+import aiosqlite
+
+class SQLiteManager:
+    """
+    Async SQLite database manager for persistent storage.
+    Stores trades, settings, and logs in a SQLite database.
+    """
+    
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            if os.path.exists("/data"):
+                db_path = "/data/trading.db"
+                logger.info("📁 Using persistent SQLite: /data/trading.db")
+            else:
+                db_path = "trading.db"
+                logger.info("📁 Using local SQLite: trading.db")
+        self.db_path = db_path
+        self._initialized = False
+    
+    async def init_db(self):
+        """Initialize database tables."""
+        if self._initialized:
+            return
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            # Trades table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    size REAL NOT NULL,
+                    size_usd REAL NOT NULL,
+                    pnl REAL,
+                    pnl_percent REAL,
+                    open_time INTEGER NOT NULL,
+                    close_time INTEGER,
+                    close_reason TEXT,
+                    leverage INTEGER DEFAULT 10,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Settings table (key-value)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Logs table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Equity curve table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS equity_curve (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time INTEGER NOT NULL,
+                    balance REAL NOT NULL,
+                    drawdown REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Coin stats table (for blacklist system)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS coin_stats (
+                    symbol TEXT PRIMARY KEY,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    consecutive_losses INTEGER DEFAULT 0,
+                    consecutive_wins INTEGER DEFAULT 0,
+                    total_pnl REAL DEFAULT 0,
+                    last_trade_time REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            await db.commit()
+            self._initialized = True
+            logger.info("✅ SQLite database initialized")
+    
+    async def save_setting(self, key: str, value: any):
+        """Save a setting to database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (key, json.dumps(value)))
+            await db.commit()
+    
+    async def get_setting(self, key: str, default: any = None) -> any:
+        """Get a setting from database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('SELECT value FROM settings WHERE key = ?', (key,)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return json.loads(row[0])
+                return default
+    
+    async def save_trade(self, trade: dict):
+        """Save a completed trade."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO trades 
+                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, open_time, close_time, close_reason, leverage)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade.get('id'),
+                trade.get('symbol'),
+                trade.get('side'),
+                trade.get('entryPrice'),
+                trade.get('exitPrice'),
+                trade.get('size', 0),
+                trade.get('sizeUsd', 0),
+                trade.get('pnl'),
+                trade.get('pnlPercent', 0),
+                trade.get('openTime', 0),
+                trade.get('closeTime'),
+                trade.get('reason', trade.get('closeReason')),
+                trade.get('leverage', 10)
+            ))
+            await db.commit()
+    
+    async def get_recent_trades(self, limit: int = 50) -> list:
+        """Get recent trades."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('''
+                SELECT * FROM trades ORDER BY close_time DESC LIMIT ?
+            ''', (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+    
+    async def add_log(self, time: str, message: str, ts: int):
+        """Add a log entry."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO logs (time, message, ts) VALUES (?, ?, ?)
+            ''', (time, message, ts))
+            # Keep only last 500 logs
+            await db.execute('''
+                DELETE FROM logs WHERE id NOT IN (
+                    SELECT id FROM logs ORDER BY id DESC LIMIT 500
+                )
+            ''')
+            await db.commit()
+    
+    async def get_recent_logs(self, limit: int = 100) -> list:
+        """Get recent logs."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('''
+                SELECT time, message, ts FROM logs ORDER BY id DESC LIMIT ?
+            ''', (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [{"time": row["time"], "message": row["message"], "ts": row["ts"]} for row in rows]
+    
+    async def save_equity_point(self, time: int, balance: float, drawdown: float):
+        """Save an equity curve point."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO equity_curve (time, balance, drawdown) VALUES (?, ?, ?)
+            ''', (time, balance, drawdown))
+            # Keep only last 1000 points
+            await db.execute('''
+                DELETE FROM equity_curve WHERE id NOT IN (
+                    SELECT id FROM equity_curve ORDER BY id DESC LIMIT 1000
+                )
+            ''')
+            await db.commit()
+    
+    async def get_equity_curve(self, limit: int = 500) -> list:
+        """Get equity curve data."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('''
+                SELECT time, balance, drawdown FROM equity_curve ORDER BY id DESC LIMIT ?
+            ''', (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [{"time": row["time"], "balance": row["balance"], "drawdown": row["drawdown"]} for row in reversed(rows)]
+
+# Global SQLite manager
+sqlite_manager = SQLiteManager()
+
 # Forward declaration for background tasks
 background_scanner_task = None
 position_updater_task = None
@@ -46,6 +246,10 @@ position_updater_task = None
 async def lifespan(app: FastAPI):
     """Application lifespan: start background scanner and position updater on startup."""
     global background_scanner_task, position_updater_task
+    
+    # Initialize SQLite database
+    logger.info("📁 Initializing SQLite database...")
+    await sqlite_manager.init_db()
     
     logger.info("🚀 Starting 24/7 Background Scanner...")
     
@@ -3256,12 +3460,19 @@ class PaperTradingEngine:
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
     def add_log(self, message: str):
-        """Add a timestamped log entry (persisted to state)."""
+        """Add a timestamped log entry (persisted to state and SQLite)."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        entry = {"time": timestamp, "message": message, "ts": int(datetime.now().timestamp() * 1000)}
+        ts = int(datetime.now().timestamp() * 1000)
+        entry = {"time": timestamp, "message": message, "ts": ts}
         self.logs.append(entry)
-        self.logs = self.logs[-100:]  # Keep last 100 logs
+        self.logs = self.logs[-100:]  # Keep last 100 logs in memory
         logger.info(f"[PaperTrading] {message}")
+        
+        # Save to SQLite (async, non-blocking)
+        try:
+            asyncio.create_task(sqlite_manager.add_log(timestamp, message, ts))
+        except Exception:
+            pass  # Ignore if event loop not running
     
     # =========================================================================
     # COIN BLACKLIST SYSTEM METHODS
@@ -4276,11 +4487,22 @@ class PaperTradingEngine:
             "side": pos['side'],
             "entryPrice": pos['entryPrice'],
             "exitPrice": exit_price,
+            "size": pos.get('size', 0),
+            "sizeUsd": pos.get('sizeUsd', 0),
             "pnl": pnl,
+            "pnlPercent": (pnl / pos.get('sizeUsd', 1)) * 100 if pos.get('sizeUsd', 0) > 0 else 0,
+            "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
-            "reason": reason
+            "reason": reason,
+            "leverage": pos.get('leverage', 10)
         }
         self.trades.append(trade)
+        
+        # Save trade to SQLite (async, non-blocking)
+        try:
+            asyncio.create_task(sqlite_manager.save_trade(trade))
+        except Exception as e:
+            logger.debug(f"SQLite save error: {e}")
         
         # Update Stats
         self.stats['totalTrades'] += 1
