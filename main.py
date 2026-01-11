@@ -2064,9 +2064,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     mtf_score = mtf_result.get('mtf_score', 0)
     score_modifier = mtf_result.get('score_modifier', 1.0)
     if score_modifier > 1.0:
-        logger.info(f"✅ MTF BONUS: {action} {symbol} (skor: +{mtf_score}) - {mtf_result['reason']}")
+        logger.info(f"✅ MTF BONUS: {action} {symbol} (skor: +{mtf_score}) - pozisyon +%10 büyük")
     elif score_modifier < 1.0:
-        logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - {mtf_result['reason']}")
+        logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - pozisyon -%20 küçük")
+    
+    # Add MTF size modifier to signal for position sizing
+    signal['mtf_size_modifier'] = score_modifier
     
     # Execute trade
     try:
@@ -4034,6 +4037,11 @@ class PaperTradingEngine:
         # Position sizing
         risk_amount = self.balance * session_risk * size_mult
         position_size_usd = risk_amount * adjusted_leverage
+        
+        # Apply MTF size modifier (bonus: 1.1 = +10%, penalty: 0.8 = -20%)
+        mtf_size_modifier = signal.get('mtf_size_modifier', 1.0) if signal else 1.0
+        position_size_usd = position_size_usd * mtf_size_modifier
+        
         position_size = position_size_usd / entry_price
         
         # Create pending order
