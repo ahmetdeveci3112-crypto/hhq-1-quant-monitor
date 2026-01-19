@@ -824,14 +824,16 @@ export default function App() {
           {/* RIGHT COLUMN: Positions first (for mobile priority), then Signals, then Logs */}
           <div className="lg:col-span-4 flex flex-col gap-4 md:gap-6">
 
-            {/* Binance Style Wallet Panel */}
-            <WalletPanel
-              walletBalance={portfolio.balanceUsd}
-              unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
-              realizedPnl={portfolio.stats.totalPnl}
-              positions={portfolio.positions}
-              initialBalance={10000}
-            />
+            {/* Binance Style Wallet Panel - Desktop only (mobile has its own at top) */}
+            <div className="hidden lg:block">
+              <WalletPanel
+                walletBalance={portfolio.balanceUsd}
+                unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
+                realizedPnl={portfolio.stats.totalPnl}
+                positions={portfolio.positions}
+                initialBalance={10000}
+              />
+            </div>
 
             {/* Positions Tab - Desktop only (mobile is in left column) */}
             <div className="hidden lg:flex bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex-col gap-4">
