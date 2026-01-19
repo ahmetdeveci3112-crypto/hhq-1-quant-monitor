@@ -5,6 +5,7 @@ import { Position } from '../types';
 interface WalletPanelProps {
     walletBalance: number;
     unrealizedPnl: number;
+    realizedPnl: number;  // From backend stats.totalPnl
     positions: Position[];
     initialBalance: number;
 }
@@ -20,14 +21,14 @@ const formatCurrency = (value: number): string => {
 export const WalletPanel: React.FC<WalletPanelProps> = ({
     walletBalance,
     unrealizedPnl,
+    realizedPnl,
     positions,
     initialBalance = 10000,
 }) => {
     // Margin Balance = Wallet Balance + Unrealized PnL
     const marginBalance = walletBalance + unrealizedPnl;
 
-    // Today's Realized PnL (from closed trades - approximated as wallet change from initial)
-    const realizedPnl = walletBalance - initialBalance;
+    // Realized PnL percentage (from initial balance)
     const realizedPnlPercent = (realizedPnl / initialBalance) * 100;
 
     // Total Used Margin

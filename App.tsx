@@ -626,41 +626,6 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
-          {/* Binance Wallet Style Balance Display */}
-          <div className="hidden md:flex items-center gap-6 mr-4 border-r border-slate-800 pr-6">
-            {/* Margin Balance (Equity) = Wallet Balance + Unrealized PnL */}
-            <div className="text-right">
-              <div className="text-xs text-slate-500">Margin Balance</div>
-              <div className="text-sm font-mono font-bold text-white">
-                {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-              </div>
-              <div className={`text-[10px] font-mono ${(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? '▲' : '▼'} {formatCurrency(Math.abs(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000))} ({(((portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) / 10000 - 1) * 100).toFixed(2)}%)
-              </div>
-            </div>
-            {/* Unrealized PnL from open positions */}
-            <div className="text-right">
-              <div className="text-xs text-slate-500 flex items-center gap-1 justify-end">
-                Unrealized PnL {portfolio.positions.length > 0 && <span className="text-amber-400 animate-pulse">●</span>}
-              </div>
-              <div className={`text-sm font-mono font-bold ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-              </div>
-              <div className="text-[10px] text-slate-500 font-mono">
-                Wallet: {formatCurrency(portfolio.balanceUsd)}
-              </div>
-            </div>
-            {/* Available Balance = Wallet - Initial Margin (used for new positions) */}
-            <div className="text-right">
-              <div className="text-xs text-slate-500">Available</div>
-              <div className="text-sm font-mono font-bold text-cyan-400">
-                {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
-              </div>
-              <div className="text-[10px] text-slate-500 font-mono">
-                Margin: {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
-              </div>
-            </div>
-          </div>
 
           <button
             onClick={handleToggleAutoTrade}
@@ -702,34 +667,15 @@ export default function App() {
       {/* Main Content */}
       <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
 
-        {/* Mobile-Only: Binance Wallet Style Cards */}
-        <div className="md:hidden grid grid-cols-2 gap-3 mb-4">
-          {/* Margin Balance Card (Equity) */}
-          <div className="bg-gradient-to-br from-indigo-600/20 to-slate-900 border border-indigo-500/30 rounded-2xl p-4 shadow-xl">
-            <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1">Margin Balance</div>
-            <div className="text-xl font-bold text-white font-mono">
-              {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-            </div>
-            <div className={`text-[10px] font-mono mt-1 ${(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? '▲' : '▼'} {(((portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) / 10000 - 1) * 100).toFixed(2)}%
-            </div>
-          </div>
-
-          {/* Unrealized PnL Card */}
-          <div className={`bg-gradient-to-br ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'from-emerald-600/20 to-slate-900 border-emerald-500/30' : 'from-rose-600/20 to-slate-900 border-rose-500/30'} border rounded-2xl p-4 shadow-xl`}>
-            <div className="flex items-center gap-2">
-              <div className={`text-xs font-bold uppercase tracking-wider ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                Unrealized PnL
-              </div>
-              {portfolio.positions.length > 0 && <span className="text-amber-400 animate-pulse">●</span>}
-            </div>
-            <div className={`text-xl font-bold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-            </div>
-            <div className="text-[10px] text-slate-400 mt-1">
-              Wallet: {formatCurrency(portfolio.balanceUsd)}
-            </div>
-          </div>
+        {/* Mobile-Only: Binance Wallet Panel */}
+        <div className="md:hidden mb-4">
+          <WalletPanel
+            walletBalance={portfolio.balanceUsd}
+            unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
+            realizedPnl={portfolio.stats.totalPnl}
+            positions={portfolio.positions}
+            initialBalance={10000}
+          />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-6 h-full">
@@ -882,6 +828,7 @@ export default function App() {
             <WalletPanel
               walletBalance={portfolio.balanceUsd}
               unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
+              realizedPnl={portfolio.stats.totalPnl}
               positions={portfolio.positions}
               initialBalance={10000}
             />
