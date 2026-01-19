@@ -649,6 +649,16 @@ export default function App() {
                 Wallet: {formatCurrency(portfolio.balanceUsd)}
               </div>
             </div>
+            {/* Available Balance = Wallet - Initial Margin (used for new positions) */}
+            <div className="text-right">
+              <div className="text-xs text-slate-500">Available</div>
+              <div className="text-sm font-mono font-bold text-cyan-400">
+                {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+              </div>
+              <div className="text-[10px] text-slate-500 font-mono">
+                Margin: {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+              </div>
+            </div>
           </div>
 
           <button
