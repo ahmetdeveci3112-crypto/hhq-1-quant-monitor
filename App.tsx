@@ -707,40 +707,40 @@ export default function App() {
 
             {/* Compact Wallet Summary Bar */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-4 lg:px-6 py-3 lg:py-4">
-              {/* Mobile: Grid Layout */}
-              <div className="grid grid-cols-2 gap-3 lg:hidden">
+              {/* Mobile: Grid Layout - iyileştirilmiş boyutlar */}
+              <div className="grid grid-cols-2 gap-4 lg:hidden">
                 <div className="col-span-2">
-                  <div className="text-[10px] text-slate-500 uppercase">Margin Balance</div>
-                  <div className="text-xl font-bold text-white font-mono">
+                  <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
+                  <div className="text-2xl font-bold text-white font-mono">
                     {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-                    <span className="text-xs text-slate-500 ml-1">USDT</span>
+                    <span className="text-sm text-slate-500 ml-1">USDT</span>
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-slate-500 uppercase">Wallet</div>
-                  <div className="text-sm font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
+                  <div className="text-xs text-slate-500 uppercase">Wallet</div>
+                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-slate-500 uppercase">Unrealized</div>
-                  <div className={`text-sm font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  <div className="text-xs text-slate-500 uppercase">Unrealized</div>
+                  <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                     {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-slate-500 uppercase">Available</div>
-                  <div className="text-sm font-semibold text-cyan-400 font-mono">
+                  <div className="text-xs text-slate-500 uppercase">Available</div>
+                  <div className="text-base font-semibold text-cyan-400 font-mono">
                     {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-slate-500 uppercase">Used Margin</div>
-                  <div className="text-sm font-semibold text-amber-400 font-mono">
+                  <div className="text-xs text-slate-500 uppercase">Used Margin</div>
+                  <div className="text-base font-semibold text-amber-400 font-mono">
                     {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
                 <div className="col-span-2">
-                  <div className="text-[10px] text-slate-500 uppercase">Today's PnL</div>
-                  <div className={`text-sm font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  <div className="text-xs text-slate-500 uppercase">Today's PnL</div>
+                  <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                     {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
                   </div>
                 </div>
@@ -820,7 +820,7 @@ export default function App() {
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Close</button>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
-                          <div><span className="text-slate-500">Size</span><div className="font-mono text-white">{pos.size?.toFixed(2)}</div></div>
+                          <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">${formatCurrency(margin)}</div></div>
                           <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
                           <div><span className="text-slate-500">Mark</span><div className="font-mono text-white">${formatPrice(currentPrice)}</div></div>
                         </div>
@@ -845,7 +845,7 @@ export default function App() {
                     <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
                       <th className="text-left py-3 px-4 font-medium">Symbol</th>
                       <th className="text-left py-3 px-2 font-medium">Side</th>
-                      <th className="text-right py-3 px-2 font-medium">Size</th>
+                      <th className="text-right py-3 px-2 font-medium">Invested</th>
                       <th className="text-right py-3 px-2 font-medium">Entry</th>
                       <th className="text-right py-3 px-2 font-medium">Mark</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
@@ -886,7 +886,7 @@ export default function App() {
                                 {pos.side}
                               </span>
                             </td>
-                            <td className="py-3 px-2 text-right font-mono text-slate-300">{pos.size?.toFixed(4)}</td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatCurrency(margin)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(pos.entryPrice)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(currentPrice)}</td>
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -971,73 +971,80 @@ export default function App() {
             </div>
 
           </div>
-        )}
+        )
+        }
 
         {/* SIGNALS TAB */}
-        {activeTab === 'signals' && (
-          <div className="grid grid-cols-1 gap-4">
-            <ActiveSignalsPanel
-              signals={opportunities}
-              onMarketOrder={handleMarketOrder}
-              entryTightness={settings.entryTightness}
-            />
-          </div>
-        )}
+        {
+          activeTab === 'signals' && (
+            <div className="grid grid-cols-1 gap-4">
+              <ActiveSignalsPanel
+                signals={opportunities}
+                onMarketOrder={handleMarketOrder}
+                entryTightness={settings.entryTightness}
+              />
+            </div>
+          )
+        }
 
         {/* OPPORTUNITIES TAB */}
-        {activeTab === 'opportunities' && (
-          <div className="grid grid-cols-1 gap-4">
-            <OpportunitiesDashboard
-              opportunities={opportunities}
-              isLoading={isRunning && opportunities.length === 0}
-            />
-          </div>
-        )}
+        {
+          activeTab === 'opportunities' && (
+            <div className="grid grid-cols-1 gap-4">
+              <OpportunitiesDashboard
+                opportunities={opportunities}
+                isLoading={isRunning && opportunities.length === 0}
+              />
+            </div>
+          )
+        }
 
         {/* LOGS TAB */}
-        {activeTab === 'logs' && (
-          <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-bold text-white flex items-center gap-2 text-sm">
-                <Terminal className="w-4 h-4 text-indigo-500" />
-                Live System Logs
-              </h3>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-emerald-500 animate-pulse">● LIVE</span>
+        {
+          activeTab === 'logs' && (
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-bold text-white flex items-center gap-2 text-sm">
+                  <Terminal className="w-4 h-4 text-indigo-500" />
+                  Live System Logs
+                </h3>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-emerald-500 animate-pulse">● LIVE</span>
+                </div>
+              </div>
+              <div
+                ref={logRef}
+                className="h-[500px] overflow-y-auto font-mono text-xs bg-black/40 rounded-lg p-3 custom-scrollbar"
+              >
+                {logs.length === 0 ? (
+                  <div className="text-slate-600 text-center py-8">Bağlantı bekleniyor...</div>
+                ) : (
+                  logs.map((log, i) => {
+                    const isError = log.includes('ERROR') || log.includes('❌');
+                    const isSuccess = log.includes('✅') || log.includes('SUCCESS');
+                    const isPending = log.includes('PENDING');
+                    const isExpired = log.includes('EXPIRED');
+                    return (
+                      <div
+                        key={i}
+                        className={`py-0.5 border-b border-slate-800/30 ${isError ? 'text-rose-400' :
+                          isSuccess ? 'text-emerald-400' :
+                            isPending ? 'text-amber-400' :
+                              isExpired ? 'text-slate-500' :
+                                'text-slate-400'
+                          }`}
+                      >
+                        {log}
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
-            <div
-              ref={logRef}
-              className="h-[500px] overflow-y-auto font-mono text-xs bg-black/40 rounded-lg p-3 custom-scrollbar"
-            >
-              {logs.length === 0 ? (
-                <div className="text-slate-600 text-center py-8">Bağlantı bekleniyor...</div>
-              ) : (
-                logs.map((log, i) => {
-                  const isError = log.includes('ERROR') || log.includes('❌');
-                  const isSuccess = log.includes('✅') || log.includes('SUCCESS');
-                  const isPending = log.includes('PENDING');
-                  const isExpired = log.includes('EXPIRED');
-                  return (
-                    <div
-                      key={i}
-                      className={`py-0.5 border-b border-slate-800/30 ${isError ? 'text-rose-400' :
-                        isSuccess ? 'text-emerald-400' :
-                          isPending ? 'text-amber-400' :
-                            isExpired ? 'text-slate-500' :
-                              'text-slate-400'
-                        }`}
-                    >
-                      {log}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        )}
+          )
+        }
 
-      </main>
-    </div>
+      </main >
+    </div >
   );
 }
