@@ -706,8 +706,47 @@ export default function App() {
           <div className="space-y-4">
 
             {/* Compact Wallet Summary Bar */}
-            <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-6 py-4">
-              <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-4 lg:px-6 py-3 lg:py-4">
+              {/* Mobile: Grid Layout */}
+              <div className="grid grid-cols-2 gap-3 lg:hidden">
+                <div className="col-span-2">
+                  <div className="text-[10px] text-slate-500 uppercase">Margin Balance</div>
+                  <div className="text-xl font-bold text-white font-mono">
+                    {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    <span className="text-xs text-slate-500 ml-1">USDT</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Wallet</div>
+                  <div className="text-sm font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Unrealized</div>
+                  <div className={`text-sm font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Available</div>
+                  <div className="text-sm font-semibold text-cyan-400 font-mono">
+                    {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-slate-500 uppercase">Used Margin</div>
+                  <div className="text-sm font-semibold text-amber-400 font-mono">
+                    {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                  </div>
+                </div>
+                <div className="col-span-2">
+                  <div className="text-[10px] text-slate-500 uppercase">Today's PnL</div>
+                  <div className={`text-sm font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
+                  </div>
+                </div>
+              </div>
+              {/* Desktop: Flex Layout */}
+              <div className="hidden lg:flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-8">
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
@@ -751,13 +790,56 @@ export default function App() {
               </div>
             </div>
 
-            {/* Open Positions Table */}
+            {/* Open Positions */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-slate-800/50 flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-white">Open Positions</h3>
                 <span className="text-xs text-slate-500">{portfolio.positions.length} active</span>
               </div>
-              <div className="overflow-x-auto">
+
+              {/* Mobile: Card Layout */}
+              <div className="lg:hidden p-3 space-y-2 max-h-[300px] overflow-y-auto">
+                {portfolio.positions.length === 0 ? (
+                  <div className="text-center py-8 text-slate-600 text-xs">No open positions</div>
+                ) : (
+                  portfolio.positions.map(pos => {
+                    const opportunity = opportunities.find(o => o.symbol === pos.symbol);
+                    const storedCurrentPrice = (pos as any).currentPrice;
+                    const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
+                    const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
+                    const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
+                    const isLong = pos.side === 'LONG';
+                    return (
+                      <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
+                            <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
+                          </div>
+                          <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Close</button>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-[10px]">
+                          <div><span className="text-slate-500">Size</span><div className="font-mono text-white">{pos.size?.toFixed(2)}</div></div>
+                          <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
+                          <div><span className="text-slate-500">Mark</span><div className="font-mono text-white">${formatPrice(currentPrice)}</div></div>
+                        </div>
+                        <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
+                          <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
+                          </span>
+                          <span className={`text-xs font-mono font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Desktop: Table Layout */}
+              <div className="hidden lg:block overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
