@@ -703,84 +703,191 @@ export default function App() {
 
         {/* PORTFOLIO TAB */}
         {activeTab === 'portfolio' && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* Left: Wallet Panel */}
-            <div className="lg:col-span-1">
-              <WalletPanel
-                walletBalance={portfolio.balanceUsd}
-                unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
-                realizedPnl={portfolio.stats.totalPnl}
-                positions={portfolio.positions}
-                initialBalance={10000}
-              />
-            </div>
+          <div className="space-y-4">
 
-            {/* Middle: Active Positions */}
-            <div className="lg:col-span-1 bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-              <div className="flex items-center gap-4 pb-2 border-b border-slate-800/50 mb-3">
-                <span className="font-bold text-white text-sm">Positions</span>
-                <span className="text-slate-500 text-sm">Assets</span>
-                {portfolio.positions.length > 0 && (
-                  <span className="ml-auto text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full">
-                    {portfolio.positions.length}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto custom-scrollbar">
-                {portfolio.positions.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
-                    <Wallet className="w-6 h-6 mb-2 opacity-30" />
-                    <span className="text-xs">Açık Pozisyon Yok</span>
-                  </div>
-                ) : (
-                  portfolio.positions.map(pos => {
-                    const opportunity = opportunities.find(o => o.symbol === pos.symbol);
-                    const storedCurrentPrice = (pos as any).currentPrice;
-                    const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0)
-                      ? storedCurrentPrice
-                      : (opportunity?.price || pos.entryPrice);
-
-                    return (
-                      <PositionCardBinance
-                        key={pos.id}
-                        position={pos}
-                        currentPrice={currentPrice}
-                        onClose={() => handleManualClose(pos.id)}
-                      />
-                    );
-                  })
-                )}
-              </div>
-            </div>
-
-            {/* Right: Trade History */}
-            <div className="lg:col-span-1 bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="font-bold text-white flex items-center gap-2 text-sm">
-                  <BarChart3 className="w-4 h-4 text-indigo-500" />
-                  Son İşlemler
-                </h3>
-                <div className="text-xs text-slate-500">{portfolio.trades.length}</div>
-              </div>
-              <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar">
-                {portfolio.trades.slice().reverse().slice(0, 10).map((trade, i) => (
-                  <div key={i} className="flex items-center justify-between p-2 bg-slate-900/50 rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <span className={`text-xs px-1.5 py-0.5 rounded font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
-                        {trade.side}
-                      </span>
-                      <span className="text-xs text-white font-medium">{trade.symbol?.replace('USDT', '')}</span>
-                    </div>
-                    <div className={`text-xs font-mono font-bold ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
+            {/* Compact Wallet Summary Bar */}
+            <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-6 py-4">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex items-center gap-8">
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
+                    <div className="text-xl font-bold text-white font-mono">
+                      {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                      <span className="text-xs text-slate-500 ml-1">USDT</span>
                     </div>
                   </div>
-                ))}
-                {portfolio.trades.length === 0 && (
-                  <div className="text-center py-6 text-slate-600 text-xs">Henüz işlem yok</div>
-                )}
+                  <div className="h-8 w-px bg-slate-800"></div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Wallet Balance</div>
+                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>
+                    <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-8">
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
+                    <div className="text-base font-semibold text-cyan-400 font-mono">
+                      {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Used Margin</div>
+                    <div className="text-base font-semibold text-amber-400 font-mono">
+                      {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Today's PnL</div>
+                    <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
+
+            {/* Open Positions Table */}
+            <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-800/50 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Open Positions</h3>
+                <span className="text-xs text-slate-500">{portfolio.positions.length} active</span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
+                      <th className="text-left py-3 px-4 font-medium">Symbol</th>
+                      <th className="text-left py-3 px-2 font-medium">Side</th>
+                      <th className="text-right py-3 px-2 font-medium">Size</th>
+                      <th className="text-right py-3 px-2 font-medium">Entry</th>
+                      <th className="text-right py-3 px-2 font-medium">Mark</th>
+                      <th className="text-right py-3 px-2 font-medium">PnL</th>
+                      <th className="text-right py-3 px-2 font-medium">ROI%</th>
+                      <th className="text-right py-3 px-4 font-medium">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {portfolio.positions.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-12 text-center text-slate-600">No open positions</td>
+                      </tr>
+                    ) : (
+                      portfolio.positions.map(pos => {
+                        const opportunity = opportunities.find(o => o.symbol === pos.symbol);
+                        const storedCurrentPrice = (pos as any).currentPrice;
+                        const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
+                        const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
+                        const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
+                        const isLong = pos.side === 'LONG';
+
+                        return (
+                          <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
+                            <td className="py-3 px-4">
+                              <div className="flex items-center gap-2">
+                                <img
+                                  src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${pos.symbol.replace('USDT', '').toLowerCase()}.png`}
+                                  alt=""
+                                  className="w-5 h-5"
+                                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                                />
+                                <span className="font-medium text-white">{pos.symbol.replace('USDT', '')}</span>
+                                <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
+                              </div>
+                            </td>
+                            <td className="py-3 px-2">
+                              <span className={`text-xs px-2 py-0.5 rounded font-semibold ${isLong ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
+                                {pos.side}
+                              </span>
+                            </td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">{pos.size?.toFixed(4)}</td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(pos.entryPrice)}</td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(currentPrice)}</td>
+                            <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
+                            </td>
+                            <td className={`py-3 px-2 text-right font-mono font-semibold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+                            </td>
+                            <td className="py-3 px-4 text-right">
+                              <button
+                                onClick={() => handleManualClose(pos.id)}
+                                className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2 py-1 rounded transition-colors"
+                              >
+                                Close
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Trade History Table */}
+            <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-800/50 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Trade History</h3>
+                <span className="text-xs text-slate-500">{portfolio.trades.length} trades</span>
+              </div>
+              <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-[#0d1117]">
+                    <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
+                      <th className="text-left py-3 px-4 font-medium">Time</th>
+                      <th className="text-left py-3 px-2 font-medium">Symbol</th>
+                      <th className="text-left py-3 px-2 font-medium">Side</th>
+                      <th className="text-right py-3 px-2 font-medium">Entry</th>
+                      <th className="text-right py-3 px-2 font-medium">Exit</th>
+                      <th className="text-right py-3 px-2 font-medium">PnL</th>
+                      <th className="text-right py-3 px-2 font-medium">ROI%</th>
+                      <th className="text-left py-3 px-4 font-medium">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {portfolio.trades.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-12 text-center text-slate-600">No trades yet</td>
+                      </tr>
+                    ) : (
+                      portfolio.trades.slice().reverse().map((trade, i) => {
+                        const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
+                        const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
+                        return (
+                          <tr key={i} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
+                            <td className="py-3 px-4 text-slate-400 font-mono text-xs">
+                              {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                            </td>
+                            <td className="py-3 px-2 font-medium text-white">{trade.symbol?.replace('USDT', '') || 'N/A'}</td>
+                            <td className="py-3 px-2">
+                              <span className={`text-xs px-2 py-0.5 rounded font-semibold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
+                                {trade.side}
+                              </span>
+                            </td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(trade.entryPrice)}</td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(trade.exitPrice)}</td>
+                            <td className={`py-3 px-2 text-right font-mono font-semibold ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
+                            </td>
+                            <td className={`py-3 px-2 text-right font-mono font-semibold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {roi >= 0 ? '+' : ''}{roi.toFixed(1)}%
+                            </td>
+                            <td className="py-3 px-4 text-xs text-slate-400">{translateReason((trade as any).reason || trade.closeReason)}</td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
           </div>
         )}
 
