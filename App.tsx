@@ -18,6 +18,7 @@ import { PositionPanel } from './components/PositionPanel';
 import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 import { WalletPanel, PositionCardBinance } from './components/WalletPanel';
+import { TabNavigation } from './components/TabNavigation';
 import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
@@ -126,6 +127,9 @@ export default function App() {
   // Phase 16: Auto-trade enabled state
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
+
+  // UI Tab State
+  const [activeTab, setActiveTab] = useState('portfolio');
 
   // Real-time WebSocket for UI updates
   const handlePositionUpdate = useCallback((positions: any[]) => {
@@ -667,165 +671,41 @@ export default function App() {
       {/* Main Content */}
       <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
 
-        {/* Mobile-Only: Binance Wallet Panel */}
-        <div className="md:hidden mb-4">
-          <WalletPanel
-            walletBalance={portfolio.balanceUsd}
-            unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
-            realizedPnl={portfolio.stats.totalPnl}
-            positions={portfolio.positions}
-            initialBalance={10000}
-          />
+        {/* Tab Navigation */}
+        <TabNavigation
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          positionCount={portfolio.positions.length}
+          signalCount={opportunities.filter(o => o.signalAction !== 'NONE' && o.signalScore >= 45).length}
+        />
+
+        {/* Scanner Stats - Always visible compact bar */}
+        <div className="grid grid-cols-4 gap-2 mb-4">
+          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+            <span className="text-[10px] text-slate-500 uppercase">Coin</span>
+            <span className="text-sm font-bold text-white">{scannerStats.totalCoins}</span>
+          </div>
+          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+            <span className="text-[10px] text-slate-500 uppercase">Long</span>
+            <span className="text-sm font-bold text-emerald-400">{scannerStats.longSignals}</span>
+          </div>
+          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+            <span className="text-[10px] text-slate-500 uppercase">Short</span>
+            <span className="text-sm font-bold text-rose-400">{scannerStats.shortSignals}</span>
+          </div>
+          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+            <span className="text-[10px] text-slate-500 uppercase">Pozisyon</span>
+            <span className="text-sm font-bold text-amber-400">{portfolio.positions.length}</span>
+          </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-6 h-full">
+        {/* TAB CONTENT */}
 
-          {/* LEFT COLUMN: Market Data & Chart */}
-          <div className="lg:col-span-8 flex flex-col gap-4 md:gap-6">
-
-            {/* Top Row: Scanner Stats Cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4">
-              {/* Total Coins Scanned */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-indigo-500/10 to-transparent rounded-bl-3xl"></div>
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Taranan Coin</h3>
-                <div className="text-2xl font-bold text-white mb-1">{scannerStats.totalCoins}</div>
-                <div className="text-xs font-mono text-indigo-400">Analiz: {scannerStats.analyzedCoins}</div>
-              </div>
-
-              {/* Long Sinyaller */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-emerald-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Long Sinyaller</h3>
-                <div className="flex items-center gap-2">
-                  <div className="text-2xl font-bold text-emerald-400">{scannerStats.longSignals}</div>
-                  {scannerStats.longSignals > 0 && <span className="text-emerald-500">🟢</span>}
-                </div>
-              </div>
-
-              {/* Short Sinyaller */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-rose-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Short Sinyaller</h3>
-                <div className="flex items-center gap-2">
-                  <div className="text-2xl font-bold text-rose-400">{scannerStats.shortSignals}</div>
-                  {scannerStats.shortSignals > 0 && <span className="text-rose-500">🔴</span>}
-                </div>
-              </div>
-
-              {/* Aktif Pozisyon */}
-              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl relative overflow-hidden group hover:border-indigo-500/30 transition-colors">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">Aktif Pozisyon</h3>
-                <div className="flex items-center gap-3">
-                  <div className="text-2xl font-bold text-white">{portfolio.positions.length}</div>
-                  {portfolio.positions.length > 0 && (
-                    <div className="text-xs font-bold text-emerald-400 animate-pulse">● CANLI</div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Mobile-Only: Active Positions Panel after KPI, before Opportunities */}
-            <div className="lg:hidden bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-800/50 mb-3">
-                <h3 className="font-bold text-white flex items-center gap-2">
-                  <Zap className="w-5 h-5 text-amber-500" />
-                  Aktif Pozisyonlar
-                  {portfolio.positions.length > 0 && (
-                    <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full animate-pulse">
-                      {portfolio.positions.length}
-                    </span>
-                  )}
-                </h3>
-              </div>
-              <div className="flex flex-col gap-3 max-h-[300px] overflow-y-auto custom-scrollbar">
-                {portfolio.positions.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-4 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
-                    <Wallet className="w-5 h-5 mb-1 opacity-30" />
-                    <span className="text-xs">Açık Pozisyon Yok</span>
-                  </div>
-                ) : (
-                  portfolio.positions.map(pos => {
-                    const opportunity = opportunities.find(o => o.symbol === pos.symbol);
-                    const storedCurrentPrice = (pos as any).currentPrice;
-                    const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0)
-                      ? storedCurrentPrice
-                      : (opportunity?.price || pos.entryPrice);
-                    return (
-                      <PositionPanel
-                        key={pos.id}
-                        position={pos}
-                        currentPrice={currentPrice}
-                        onClosePosition={() => handleManualClose(pos.id)}
-                      />
-                    );
-                  })
-                )}
-              </div>
-            </div>
-
-            {/* Phase 31: Opportunities Dashboard (Replaces TradingView Chart) */}
-            <OpportunitiesDashboard
-              opportunities={opportunities}
-              isLoading={isRunning && opportunities.length === 0}
-            />
-
-            {/* Recent Trades Table */}
-            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="font-bold text-white flex items-center gap-2">
-                  <BarChart3 className="w-5 h-5 text-indigo-500" />
-                  Son İşlem Geçmişi
-                </h3>
-                <div className="text-xs text-slate-500">{portfolio.trades.length} İşlem</div>
-              </div>
-              <div className="overflow-x-auto max-h-[300px] overflow-y-auto custom-scrollbar">
-                <table className="w-full text-sm text-left">
-                  <thead className="sticky top-0 bg-[#151921]">
-                    <tr className="text-slate-500 border-b border-slate-800">
-                      <th className="pb-3 pl-2 font-medium">Saat</th>
-                      <th className="pb-3 font-medium">Coin</th>
-                      <th className="pb-3 font-medium">Yön</th>
-                      <th className="pb-3 font-medium">Giriş</th>
-                      <th className="pb-3 font-medium">Çıkış</th>
-                      <th className="pb-3 font-medium">Kar/Zarar</th>
-                      <th className="pb-3 font-medium text-right pr-2">Sebep</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {portfolio.trades.slice().reverse().map((trade, i) => (
-                      <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
-                        <td className="py-3 pl-2 text-slate-400 font-mono text-xs">{new Date(trade.closeTime || Date.now()).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</td>
-                        <td className="py-3">
-                          <span className="text-xs font-bold text-white">{trade.symbol?.replace('USDT', '') || 'N/A'}</span>
-                        </td>
-                        <td className="py-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
-                            {trade.side}
-                          </span>
-                        </td>
-                        <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.entryPrice)}</td>
-                        <td className="py-3 font-mono text-slate-300 text-xs">${formatPrice(trade.exitPrice)}</td>
-                        <td className={`py-3 font-mono font-bold text-xs ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
-                        </td>
-                        <td className="py-3 text-right pr-2 text-[10px] text-slate-500">{translateReason((trade as any).reason || trade.closeReason)}</td>
-                      </tr>
-                    ))}
-                    {portfolio.trades.length === 0 && (
-                      <tr>
-                        <td colSpan={7} className="py-8 text-center text-slate-600 italic">Henüz işlem kaydı yok.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-
-          {/* RIGHT COLUMN: Positions first (for mobile priority), then Signals, then Logs */}
-          <div className="lg:col-span-4 flex flex-col gap-4 md:gap-6">
-
-            {/* Binance Style Wallet Panel - Desktop only (mobile has its own at top) */}
-            <div className="hidden lg:block">
+        {/* PORTFOLIO TAB */}
+        {activeTab === 'portfolio' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            {/* Left: Wallet Panel */}
+            <div className="lg:col-span-1">
               <WalletPanel
                 walletBalance={portfolio.balanceUsd}
                 unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
@@ -835,9 +715,9 @@ export default function App() {
               />
             </div>
 
-            {/* Positions Tab - Desktop only (mobile is in left column) */}
-            <div className="hidden lg:flex bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex-col gap-4">
-              <div className="flex items-center gap-4 pb-2 border-b border-slate-800/50">
+            {/* Middle: Active Positions */}
+            <div className="lg:col-span-1 bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <div className="flex items-center gap-4 pb-2 border-b border-slate-800/50 mb-3">
                 <span className="font-bold text-white text-sm">Positions</span>
                 <span className="text-slate-500 text-sm">Assets</span>
                 {portfolio.positions.length > 0 && (
@@ -848,7 +728,7 @@ export default function App() {
               </div>
               <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto custom-scrollbar">
                 {portfolio.positions.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center flex-1 py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
+                  <div className="flex flex-col items-center justify-center py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
                     <Wallet className="w-6 h-6 mb-2 opacity-30" />
                     <span className="text-xs">Açık Pozisyon Yok</span>
                   </div>
@@ -873,46 +753,102 @@ export default function App() {
               </div>
             </div>
 
-            {/* Active Signals Panel - Phase 31 */}
-            <ActiveSignalsPanel signals={opportunities} onMarketOrder={handleMarketOrder} entryTightness={settings.entryTightness} />
-
-            {/* System Logs Terminal - Fixed height container with scroll */}
-            <div className="bg-[#151921] border border-slate-800 rounded-2xl flex flex-col shadow-xl overflow-hidden h-[250px]">
-              <div className="px-4 py-2 border-b border-slate-800 bg-[#151921]/80 backdrop-blur flex items-center justify-between shrink-0">
-                <h3 className="text-xs font-bold text-slate-300 flex items-center gap-2">
-                  <Terminal className="w-3.5 h-3.5 text-indigo-400" />
-                  Live System Logs
+            {/* Right: Trade History */}
+            <div className="lg:col-span-1 bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-bold text-white flex items-center gap-2 text-sm">
+                  <BarChart3 className="w-4 h-4 text-indigo-500" />
+                  Son İşlemler
                 </h3>
-                <div className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                  <span className="text-[9px] text-emerald-500 font-mono">LIVE</span>
-                </div>
+                <div className="text-xs text-slate-500">{portfolio.trades.length}</div>
               </div>
-              <div className="flex-1 bg-black/40 overflow-y-auto p-3 font-mono text-[9px] leading-relaxed space-y-1 custom-scrollbar" ref={logRef}>
-                {logs.slice(0, 30).map((log, i) => {
-                  const timestampMatch = log.match(/^\[(\d{1,2}:\d{2}:\d{2})\]/);
-                  const timestamp = timestampMatch ? timestampMatch[1] : '';
-                  const message = log.replace(/^\[.*?\]\s*☁️?\s*/, '');
-
-                  return (
-                    <div key={i} className="flex gap-2 opacity-90 hover:opacity-100 transition-opacity">
-                      <span className="text-slate-600 shrink-0 select-none text-[8px]">[{timestamp}]</span>
-                      <span className={`truncate ${message.includes('PROFIT') || message.includes('✅') ? 'text-emerald-400' :
-                        message.includes('LOSS') || message.includes('❌') ? 'text-rose-400' :
-                          message.includes('MTF CONFIRMED') ? 'text-indigo-400 font-bold' :
-                            message.includes('SİNYAL') || message.includes('Coin Profile') ? 'text-amber-400' :
-                              'text-slate-300'
-                        }`}>
-                        {message}
+              <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar">
+                {portfolio.trades.slice().reverse().slice(0, 10).map((trade, i) => (
+                  <div key={i} className="flex items-center justify-between p-2 bg-slate-900/50 rounded-lg">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs px-1.5 py-0.5 rounded font-bold ${trade.side === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
+                        {trade.side}
                       </span>
+                      <span className="text-xs text-white font-medium">{trade.symbol?.replace('USDT', '')}</span>
                     </div>
-                  );
-                })}
+                    <div className={`text-xs font-mono font-bold ${trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {trade.pnl >= 0 ? '+' : ''}{formatCurrency(trade.pnl)}
+                    </div>
+                  </div>
+                ))}
+                {portfolio.trades.length === 0 && (
+                  <div className="text-center py-6 text-slate-600 text-xs">Henüz işlem yok</div>
+                )}
               </div>
             </div>
           </div>
-        </div>
-      </main >
-    </div >
+        )}
+
+        {/* SIGNALS TAB */}
+        {activeTab === 'signals' && (
+          <div className="grid grid-cols-1 gap-4">
+            <ActiveSignalsPanel
+              signals={opportunities}
+              onMarketOrder={handleMarketOrder}
+              entryTightness={settings.entryTightness}
+            />
+          </div>
+        )}
+
+        {/* OPPORTUNITIES TAB */}
+        {activeTab === 'opportunities' && (
+          <div className="grid grid-cols-1 gap-4">
+            <OpportunitiesDashboard
+              opportunities={opportunities}
+              isLoading={isRunning && opportunities.length === 0}
+            />
+          </div>
+        )}
+
+        {/* LOGS TAB */}
+        {activeTab === 'logs' && (
+          <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-bold text-white flex items-center gap-2 text-sm">
+                <Terminal className="w-4 h-4 text-indigo-500" />
+                Live System Logs
+              </h3>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-emerald-500 animate-pulse">● LIVE</span>
+              </div>
+            </div>
+            <div
+              ref={logRef}
+              className="h-[500px] overflow-y-auto font-mono text-xs bg-black/40 rounded-lg p-3 custom-scrollbar"
+            >
+              {logs.length === 0 ? (
+                <div className="text-slate-600 text-center py-8">Bağlantı bekleniyor...</div>
+              ) : (
+                logs.map((log, i) => {
+                  const isError = log.includes('ERROR') || log.includes('❌');
+                  const isSuccess = log.includes('✅') || log.includes('SUCCESS');
+                  const isPending = log.includes('PENDING');
+                  const isExpired = log.includes('EXPIRED');
+                  return (
+                    <div
+                      key={i}
+                      className={`py-0.5 border-b border-slate-800/30 ${isError ? 'text-rose-400' :
+                        isSuccess ? 'text-emerald-400' :
+                          isPending ? 'text-amber-400' :
+                            isExpired ? 'text-slate-500' :
+                              'text-slate-400'
+                        }`}
+                    >
+                      {log}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+      </main>
+    </div>
   );
 }
