@@ -25,8 +25,11 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
     positions,
     initialBalance = 10000,
 }) => {
-    // Margin Balance = Wallet Balance + Unrealized PnL
-    const marginBalance = walletBalance + unrealizedPnl;
+    // Wallet Balance = Initial Balance + Realized PnL (settled funds)
+    const walletBalanceCalc = initialBalance + realizedPnl;
+
+    // Margin Balance = Initial Balance + Unrealized PnL (total equity including unrealized)
+    const marginBalance = initialBalance + unrealizedPnl;
 
     // Realized PnL percentage (from initial balance)
     const realizedPnlPercent = (realizedPnl / initialBalance) * 100;
@@ -37,8 +40,8 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
         return sum + margin;
     }, 0);
 
-    // Available Balance
-    const availableBalance = walletBalance - usedMargin;
+    // Available Balance = Margin Balance - Used Margin
+    const availableBalance = marginBalance - usedMargin;
 
     return (
         <div className="bg-[#0B0E14] rounded-2xl border border-slate-800 p-4 shadow-xl">
@@ -80,8 +83,8 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
             <div className="grid grid-cols-2 gap-4 mb-4">
                 <div>
                     <div className="text-xs text-slate-500 mb-1">Wallet Balance (USDT)</div>
-                    <div className="text-base font-bold text-white font-mono">{formatCurrency(walletBalance)}</div>
-                    <div className="text-[10px] text-slate-600">≈ ${formatCurrency(walletBalance)}</div>
+                    <div className="text-base font-bold text-white font-mono">{formatCurrency(walletBalanceCalc)}</div>
+                    <div className="text-[10px] text-slate-600">≈ ${formatCurrency(walletBalanceCalc)}</div>
                 </div>
                 <div>
                     <div className="text-xs text-slate-500 mb-1">Unrealized PNL (USDT)</div>
