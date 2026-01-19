@@ -820,7 +820,7 @@ export default function App() {
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Close</button>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
-                          <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">${formatCurrency(margin)}</div></div>
+                          <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
                           <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
                           <div><span className="text-slate-500">Mark</span><div className="font-mono text-white">${formatPrice(currentPrice)}</div></div>
                         </div>
@@ -886,7 +886,7 @@ export default function App() {
                                 {pos.side}
                               </span>
                             </td>
-                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatCurrency(margin)}</td>
+                            <td className="py-3 px-2 text-right font-mono text-slate-300">{formatCurrency(margin)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(pos.entryPrice)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(currentPrice)}</td>
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
