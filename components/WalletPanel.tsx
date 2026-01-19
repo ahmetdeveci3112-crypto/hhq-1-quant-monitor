@@ -28,8 +28,8 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
     // Wallet Balance = Initial Balance + Realized PnL (settled funds)
     const walletBalanceCalc = initialBalance + realizedPnl;
 
-    // Margin Balance = Initial Balance + Unrealized PnL (total equity including unrealized)
-    const marginBalance = initialBalance + unrealizedPnl;
+    // Margin Balance = Wallet Balance + Unrealized PnL (total equity)
+    const marginBalance = walletBalanceCalc + unrealizedPnl;
 
     // Realized PnL percentage (from initial balance)
     const realizedPnlPercent = (realizedPnl / initialBalance) * 100;
