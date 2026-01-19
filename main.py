@@ -374,6 +374,93 @@ class SQLiteManager:
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
 
+
+# ============================================================================
+# UI WEBSOCKET MANAGER - Real-time updates to UI clients
+# ============================================================================
+
+class UIWebSocketManager:
+    """
+    Manages WebSocket connections to UI clients.
+    Broadcasts real-time events: signals, positions, prices, logs.
+    """
+    
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.last_broadcast = 0
+        self.broadcast_interval = 0.5  # Min 500ms between price broadcasts
+        logger.info("🔌 UIWebSocketManager initialized")
+    
+    async def connect(self, websocket: WebSocket):
+        """Accept new WebSocket connection."""
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"🔌 UI WebSocket connected. Total clients: {len(self.active_connections)}")
+    
+    def disconnect(self, websocket: WebSocket):
+        """Remove disconnected WebSocket."""
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info(f"🔌 UI WebSocket disconnected. Total clients: {len(self.active_connections)}")
+    
+    async def broadcast(self, event_type: str, data: dict):
+        """Broadcast event to all connected UI clients."""
+        if not self.active_connections:
+            return
+        
+        message = {
+            "type": event_type,
+            "data": data,
+            "timestamp": int(datetime.now().timestamp() * 1000)
+        }
+        
+        # Remove dead connections
+        dead = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                dead.append(connection)
+        
+        for d in dead:
+            self.disconnect(d)
+    
+    async def broadcast_signal(self, signal: dict):
+        """Broadcast new signal event."""
+        await self.broadcast("SIGNAL", signal)
+    
+    async def broadcast_position_opened(self, position: dict):
+        """Broadcast position opened event."""
+        await self.broadcast("POSITION_OPENED", position)
+    
+    async def broadcast_position_closed(self, trade: dict):
+        """Broadcast position closed event."""
+        await self.broadcast("POSITION_CLOSED", trade)
+    
+    async def broadcast_pending_order(self, order: dict):
+        """Broadcast new pending order event."""
+        await self.broadcast("PENDING_ORDER", order)
+    
+    async def broadcast_price_update(self, positions: list):
+        """Broadcast position price updates (throttled)."""
+        now = datetime.now().timestamp()
+        if now - self.last_broadcast < self.broadcast_interval:
+            return  # Throttle
+        self.last_broadcast = now
+        await self.broadcast("PRICE_UPDATE", {"positions": positions})
+    
+    async def broadcast_log(self, log: str):
+        """Broadcast log message."""
+        await self.broadcast("LOG", {"message": log})
+    
+    async def broadcast_kill_switch(self, actions: dict):
+        """Broadcast kill switch event."""
+        await self.broadcast("KILL_SWITCH", actions)
+
+
+# Global UI WebSocket manager
+ui_ws_manager = UIWebSocketManager()
+
 # Forward declaration for background tasks
 background_scanner_task = None
 position_updater_task = None
@@ -558,6 +645,141 @@ def calculate_zscore(spread_series: list, lookback: int = 20) -> float:
 
 
 # ============================================================================
+# RSI CALCULATION (Relative Strength Index)
+# ============================================================================
+
+def calculate_rsi(closes: list, period: int = 14) -> float:
+    """
+    Calculate RSI (Relative Strength Index).
+    
+    RSI < 30 → Oversold (LONG opportunity)
+    RSI > 70 → Overbought (SHORT opportunity)
+    RSI 30-70 → Neutral
+    
+    Returns: RSI value (0-100)
+    """
+    if len(closes) < period + 1:
+        return 50.0  # Neutral
+    
+    try:
+        prices = np.array(closes[-(period + 1):])
+        deltas = np.diff(prices)
+        
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+        
+    except Exception as e:
+        logger.warning(f"RSI calculation error: {e}")
+        return 50.0
+
+
+# ============================================================================
+# CONSECUTIVE BAR CONFIRMATION
+# ============================================================================
+
+def check_consecutive_bars(closes: list, signal_side: str, required_bars: int = 2) -> tuple:
+    """
+    Check if the last N bars confirm the signal direction.
+    
+    For LONG signals: we want bars to be falling (creating oversold conditions)
+    For SHORT signals: we want bars to be rising (creating overbought conditions)
+    
+    Args:
+        closes: List of close prices
+        signal_side: "LONG" or "SHORT"
+        required_bars: Number of consecutive bars required (default 2)
+        
+    Returns:
+        (confirmed: bool, consecutive_count: int, direction: str)
+    """
+    if len(closes) < required_bars + 1:
+        return True, 0, "INSUFFICIENT_DATA"  # Not enough data, allow signal
+    
+    try:
+        recent_closes = list(closes[-(required_bars + 1):])
+        
+        # Calculate bar directions
+        bullish_count = 0
+        bearish_count = 0
+        
+        for i in range(1, len(recent_closes)):
+            if recent_closes[i] > recent_closes[i-1]:
+                bullish_count += 1
+            elif recent_closes[i] < recent_closes[i-1]:
+                bearish_count += 1
+        
+        # Determine direction
+        if bearish_count >= required_bars:
+            direction = "BEARISH"
+        elif bullish_count >= required_bars:
+            direction = "BULLISH"
+        else:
+            direction = "MIXED"
+        
+        # For LONG: we want recent bars to be bearish (price falling = oversold setup)
+        # For SHORT: we want recent bars to be bullish (price rising = overbought setup)
+        if signal_side == "LONG":
+            confirmed = bearish_count >= required_bars
+            return confirmed, bearish_count, direction
+        else:  # SHORT
+            confirmed = bullish_count >= required_bars
+            return confirmed, bullish_count, direction
+            
+    except Exception as e:
+        logger.warning(f"Consecutive bar check error: {e}")
+        return True, 0, "ERROR"  # On error, allow signal
+
+
+# ============================================================================
+# VOLUME SPIKE DETECTION
+# ============================================================================
+
+def detect_volume_spike(volumes: list, lookback: int = 20, threshold: float = 2.0) -> tuple:
+    """
+    Detect volume spikes (volume > threshold * average).
+    
+    Args:
+        volumes: List of volume values
+        lookback: Period for average calculation
+        threshold: Multiple of average to consider a spike
+        
+    Returns:
+        (is_spike: bool, volume_ratio: float)
+    """
+    if len(volumes) < lookback + 1:
+        return False, 1.0
+    
+    try:
+        recent_volumes = np.array(volumes[-(lookback + 1):-1])  # Exclude current
+        current_volume = volumes[-1]
+        
+        avg_volume = np.mean(recent_volumes)
+        
+        if avg_volume <= 0:
+            return False, 1.0
+        
+        volume_ratio = current_volume / avg_volume
+        is_spike = volume_ratio >= threshold
+        
+        return is_spike, volume_ratio
+        
+    except Exception as e:
+        logger.warning(f"Volume spike detection error: {e}")
+        return False, 1.0
+
+
+# ============================================================================
 # PHASE 22: MULTI-TIMEFRAME CONFIGURATION
 # ============================================================================
 
@@ -570,11 +792,11 @@ MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 # Crypto 5m ATR is typically 2-10% - adjusted thresholds accordingly
 # Low volatility = tighter stops, higher leverage | High volatility = wider stops, lower leverage
 VOLATILITY_LEVELS = {
-    "very_low":  {"max_atr_pct": 2.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},
-    "low":       {"max_atr_pct": 4.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},
-    "normal":    {"max_atr_pct": 6.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.010},
-    "high":      {"max_atr_pct": 10.0, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.015},
-    "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.020}
+    "very_low":  {"max_atr_pct": 2.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},  # 0.3% - çok düşük volatilite (3x)
+    "low":       {"max_atr_pct": 4.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},  # 0.6% (3x)
+    "normal":    {"max_atr_pct": 6.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.012},  # 1.2% (3x)
+    "high":      {"max_atr_pct": 10.0, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.018},  # 1.8% (3x)
+    "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 2.4% (3x)
 }
 
 def get_volatility_adjusted_params(volatility_pct: float, atr: float) -> dict:
@@ -898,6 +1120,360 @@ volume_profiler = VolumeProfileAnalyzer()
 
 
 # ============================================================================
+# LIQUIDITY SWEEP / SFP (Swing Failure Pattern) DETECTOR
+# ============================================================================
+
+class LiquiditySweepDetector:
+    """
+    Liquidity Sweep ve Swing Failure Pattern (SFP) tespiti.
+    
+    Mantık:
+    - Fiyat önceki bir tepenin (high) üzerine çıkıp, oradaki stop-loss emirlerini
+      tetikledikten sonra hızla ters yöne dönerse = BEARISH sweep (SHORT sinyali güçlenir)
+    - Fiyat önceki bir dibin (low) altına inip, stop-loss'ları tetikledikten sonra
+      hızla ters yöne dönerse = BULLISH sweep (LONG sinyali güçlenir)
+    
+    Bu pattern büyük oyuncuların "likidite avı" yaptığı noktaları yakalar.
+    """
+    
+    def __init__(self, lookback: int = 20, sweep_threshold_pct: float = 0.1):
+        """
+        Args:
+            lookback: Kaç bar geriye bakılacak (swing high/low için)
+            sweep_threshold_pct: Sweep olarak sayılması için minimum aşma yüzdesi
+        """
+        self.lookback = lookback
+        self.sweep_threshold_pct = sweep_threshold_pct
+        self.last_sweep = None
+        self.sweep_time = 0
+        
+    def detect_sweep(self, highs: list, lows: list, closes: list) -> dict:
+        """
+        Liquidity sweep tespiti yap.
+        
+        Args:
+            highs: Son N bar'ın high değerleri
+            lows: Son N bar'ın low değerleri
+            closes: Son N bar'ın close değerleri
+            
+        Returns:
+            {
+                'sweep_type': 'BULLISH' | 'BEARISH' | None,
+                'sweep_level': float (sweep edilen seviye),
+                'rejection_strength': float (0-1 arası, ne kadar güçlü reddedildi),
+                'score_bonus': int (sinyal skoruna eklenecek bonus)
+            }
+        """
+        result = {
+            'sweep_type': None,
+            'sweep_level': 0,
+            'rejection_strength': 0,
+            'score_bonus': 0
+        }
+        
+        if len(highs) < self.lookback + 2 or len(lows) < self.lookback + 2:
+            return result
+        
+        # Son bar hariç lookback period'daki swing high/low'u bul
+        lookback_highs = highs[-(self.lookback + 1):-1]
+        lookback_lows = lows[-(self.lookback + 1):-1]
+        
+        swing_high = max(lookback_highs)
+        swing_low = min(lookback_lows)
+        
+        # Mevcut ve önceki bar
+        current_high = highs[-1]
+        current_low = lows[-1]
+        current_close = closes[-1]
+        prev_close = closes[-2]
+        
+        # Sweep threshold hesapla
+        price_range = swing_high - swing_low
+        if price_range <= 0:
+            return result
+        
+        sweep_threshold = price_range * (self.sweep_threshold_pct / 100)
+        
+        # BEARISH SWEEP: High sweep edip aşağı kapanış
+        # Fiyat swing high'ın üzerine çıkıp, sonra altında kapandı
+        if current_high > swing_high + sweep_threshold:
+            # Ne kadar üzerine çıktı?
+            overshoot = current_high - swing_high
+            
+            # Ama close swing high'ın altında mı? (rejection)
+            if current_close < swing_high:
+                # Rejection strength: ne kadar güçlü reddedildi
+                wick_size = current_high - current_close
+                body_size = abs(current_close - prev_close)
+                
+                if wick_size > 0:
+                    rejection_strength = min(1.0, wick_size / (wick_size + body_size + 0.0001))
+                else:
+                    rejection_strength = 0
+                
+                result['sweep_type'] = 'BEARISH'
+                result['sweep_level'] = swing_high
+                result['rejection_strength'] = rejection_strength
+                
+                # Bonus hesapla: Güçlü sweep = daha fazla bonus
+                if rejection_strength > 0.7:
+                    result['score_bonus'] = 20  # Çok güçlü sweep
+                elif rejection_strength > 0.5:
+                    result['score_bonus'] = 15
+                elif rejection_strength > 0.3:
+                    result['score_bonus'] = 10
+                else:
+                    result['score_bonus'] = 5
+                    
+                self.last_sweep = result
+                self.sweep_time = datetime.now().timestamp()
+                return result
+        
+        # BULLISH SWEEP: Low sweep edip yukarı kapanış
+        # Fiyat swing low'un altına inip, sonra üstünde kapandı
+        if current_low < swing_low - sweep_threshold:
+            # Ne kadar altına indi?
+            undershoot = swing_low - current_low
+            
+            # Ama close swing low'un üstünde mi? (rejection)
+            if current_close > swing_low:
+                # Rejection strength
+                wick_size = current_close - current_low
+                body_size = abs(current_close - prev_close)
+                
+                if wick_size > 0:
+                    rejection_strength = min(1.0, wick_size / (wick_size + body_size + 0.0001))
+                else:
+                    rejection_strength = 0
+                
+                result['sweep_type'] = 'BULLISH'
+                result['sweep_level'] = swing_low
+                result['rejection_strength'] = rejection_strength
+                
+                # Bonus hesapla
+                if rejection_strength > 0.7:
+                    result['score_bonus'] = 20
+                elif rejection_strength > 0.5:
+                    result['score_bonus'] = 15
+                elif rejection_strength > 0.3:
+                    result['score_bonus'] = 10
+                else:
+                    result['score_bonus'] = 5
+                    
+                self.last_sweep = result
+                self.sweep_time = datetime.now().timestamp()
+                return result
+        
+        return result
+    
+    def get_signal_modifier(self, signal_side: str, sweep_result: dict) -> tuple:
+        """
+        Sweep sonucuna göre sinyal modifikasyonu döndür.
+        
+        Args:
+            signal_side: 'LONG' veya 'SHORT'
+            sweep_result: detect_sweep() sonucu
+            
+        Returns:
+            (score_modifier: int, reason: str)
+        """
+        if not sweep_result or not sweep_result.get('sweep_type'):
+            return 0, ""
+        
+        sweep_type = sweep_result['sweep_type']
+        bonus = sweep_result['score_bonus']
+        
+        # BULLISH sweep = LONG sinyalini güçlendir
+        if sweep_type == 'BULLISH' and signal_side == 'LONG':
+            return bonus, f"LiqSweep(BULL+{bonus}p)"
+        
+        # BEARISH sweep = SHORT sinyalini güçlendir
+        if sweep_type == 'BEARISH' and signal_side == 'SHORT':
+            return bonus, f"LiqSweep(BEAR+{bonus}p)"
+        
+        # Ters yönde sweep = cezalandır
+        if sweep_type == 'BULLISH' and signal_side == 'SHORT':
+            return -10, "LiqSweep(BULL-10p)"
+        
+        if sweep_type == 'BEARISH' and signal_side == 'LONG':
+            return -10, "LiqSweep(BEAR-10p)"
+        
+        return 0, ""
+
+
+# Global Liquidity Sweep Detector instance
+liquidity_sweep_detector = LiquiditySweepDetector(lookback=20, sweep_threshold_pct=0.1)
+
+
+# ============================================================================
+# SMT DIVERGENCE (Smart Money Technique Divergence)
+# ============================================================================
+
+class SMTDivergenceDetector:
+    """
+    SMT Divergence: BTC ve ETH arasındaki korelasyon kopukluğunu tespit eder.
+    
+    Mantık:
+    - BTC yeni bir dip yaparken ETH o dibi yapmazsa (daha yüksek dipte kalırsa)
+      = Gizli alım gücü var, LONG sinyali güçlenir
+    - BTC yeni bir tepe yaparken ETH o tepeyi yapmazsa (daha düşük tepede kalırsa)
+      = Gizli satış gücü var, SHORT sinyali güçlenir
+    
+    Bu tek grafiğe bakarak görülemeyen korelasyon kopukluğunu yakalar.
+    """
+    
+    def __init__(self, lookback: int = 20):
+        """
+        Args:
+            lookback: Swing high/low tespiti için geriye bakış periyodu
+        """
+        self.lookback = lookback
+        self.btc_prices = []  # (timestamp, high, low, close)
+        self.eth_prices = []
+        self.last_divergence = None
+        self.divergence_time = 0
+        
+    def update_prices(self, btc_high: float, btc_low: float, btc_close: float,
+                      eth_high: float, eth_low: float, eth_close: float):
+        """BTC ve ETH fiyatlarını güncelle."""
+        now = datetime.now().timestamp()
+        
+        self.btc_prices.append({
+            'ts': now, 'high': btc_high, 'low': btc_low, 'close': btc_close
+        })
+        self.eth_prices.append({
+            'ts': now, 'high': eth_high, 'low': eth_low, 'close': eth_close
+        })
+        
+        # Son 100 bar'ı tut
+        if len(self.btc_prices) > 100:
+            self.btc_prices = self.btc_prices[-100:]
+            self.eth_prices = self.eth_prices[-100:]
+    
+    def detect_divergence(self) -> dict:
+        """
+        SMT Divergence tespiti yap.
+        
+        Returns:
+            {
+                'divergence_type': 'BULLISH' | 'BEARISH' | None,
+                'strength': float (0-1 arası),
+                'score_bonus': int
+            }
+        """
+        result = {
+            'divergence_type': None,
+            'strength': 0,
+            'score_bonus': 0
+        }
+        
+        if len(self.btc_prices) < self.lookback + 2:
+            return result
+        
+        # Son lookback bar'daki swing high/low'ları bul
+        btc_highs = [p['high'] for p in self.btc_prices[-(self.lookback + 1):-1]]
+        btc_lows = [p['low'] for p in self.btc_prices[-(self.lookback + 1):-1]]
+        eth_highs = [p['high'] for p in self.eth_prices[-(self.lookback + 1):-1]]
+        eth_lows = [p['low'] for p in self.eth_prices[-(self.lookback + 1):-1]]
+        
+        btc_swing_high = max(btc_highs)
+        btc_swing_low = min(btc_lows)
+        eth_swing_high = max(eth_highs)
+        eth_swing_low = min(eth_lows)
+        
+        # Mevcut değerler
+        btc_current_high = self.btc_prices[-1]['high']
+        btc_current_low = self.btc_prices[-1]['low']
+        eth_current_high = self.eth_prices[-1]['high']
+        eth_current_low = self.eth_prices[-1]['low']
+        
+        # BULLISH DIVERGENCE: BTC yeni dip yapıyor, ETH yapmıyor
+        btc_new_low = btc_current_low < btc_swing_low
+        eth_holds_low = eth_current_low > eth_swing_low
+        
+        if btc_new_low and eth_holds_low:
+            # ETH ne kadar güçlü tutuyor?
+            eth_strength = (eth_current_low - eth_swing_low) / (eth_swing_high - eth_swing_low + 0.0001)
+            strength = min(1.0, abs(eth_strength))
+            
+            result['divergence_type'] = 'BULLISH'
+            result['strength'] = strength
+            
+            if strength > 0.5:
+                result['score_bonus'] = 15
+            elif strength > 0.3:
+                result['score_bonus'] = 10
+            else:
+                result['score_bonus'] = 5
+            
+            self.last_divergence = result
+            self.divergence_time = datetime.now().timestamp()
+            return result
+        
+        # BEARISH DIVERGENCE: BTC yeni tepe yapıyor, ETH yapmıyor
+        btc_new_high = btc_current_high > btc_swing_high
+        eth_fails_high = eth_current_high < eth_swing_high
+        
+        if btc_new_high and eth_fails_high:
+            # ETH ne kadar zayıf?
+            eth_weakness = (eth_swing_high - eth_current_high) / (eth_swing_high - eth_swing_low + 0.0001)
+            strength = min(1.0, abs(eth_weakness))
+            
+            result['divergence_type'] = 'BEARISH'
+            result['strength'] = strength
+            
+            if strength > 0.5:
+                result['score_bonus'] = 15
+            elif strength > 0.3:
+                result['score_bonus'] = 10
+            else:
+                result['score_bonus'] = 5
+            
+            self.last_divergence = result
+            self.divergence_time = datetime.now().timestamp()
+            return result
+        
+        return result
+    
+    def get_signal_modifier(self, signal_side: str) -> tuple:
+        """
+        Divergence sonucuna göre sinyal modifikasyonu döndür.
+        
+        Returns:
+            (score_modifier: int, reason: str)
+        """
+        # Son 5 dakika içindeki divergence'ı kullan
+        if self.last_divergence and self.divergence_time > 0:
+            age = datetime.now().timestamp() - self.divergence_time
+            if age > 300:  # 5 dakikadan eski
+                return 0, ""
+            
+            div_type = self.last_divergence.get('divergence_type')
+            bonus = self.last_divergence.get('score_bonus', 0)
+            
+            # BULLISH divergence = LONG güçlenir
+            if div_type == 'BULLISH' and signal_side == 'LONG':
+                return bonus, f"SMT(BULL+{bonus}p)"
+            
+            # BEARISH divergence = SHORT güçlenir
+            if div_type == 'BEARISH' and signal_side == 'SHORT':
+                return bonus, f"SMT(BEAR+{bonus}p)"
+            
+            # Ters yönde = ceza
+            if div_type == 'BULLISH' and signal_side == 'SHORT':
+                return -10, "SMT(BULL-10p)"
+            
+            if div_type == 'BEARISH' and signal_side == 'LONG':
+                return -10, "SMT(BEAR-10p)"
+        
+        return 0, ""
+
+
+# Global SMT Divergence Detector instance
+smt_divergence_detector = SMTDivergenceDetector(lookback=20)
+
+
+# ============================================================================
 # PHASE 31: MULTI-COIN SCANNER
 # ============================================================================
 
@@ -957,6 +1533,88 @@ class LightweightCoinAnalyzer:
         self.vwap_numerator: float = 0.0
         self.vwap_denominator: float = 0.0
         self.vwap: float = 0.0
+        
+        # Coin-specific statistics for dynamic thresholds
+        self.rsi_history: deque = deque(maxlen=100)  # Son 100 RSI değeri
+        self.volume_ratio_history: deque = deque(maxlen=100)  # Son 100 volume ratio
+        self.hurst_history: deque = deque(maxlen=100)  # Son 100 Hurst değeri
+    
+    def get_coin_stats(self) -> dict:
+        """
+        Coin'e özgü istatistikleri döndür.
+        Bu değerler konfirmasyon eşiklerini dinamik olarak ayarlamak için kullanılır.
+        """
+        stats = {
+            'rsi_avg': 50.0,
+            'rsi_std': 10.0,
+            'volume_avg': 1.0,
+            'volume_std': 0.5,
+            'hurst_avg': 0.5,
+            'hurst_std': 0.1,
+            'sample_count': 0
+        }
+        
+        if len(self.rsi_history) >= 10:
+            rsi_arr = np.array(self.rsi_history)
+            stats['rsi_avg'] = float(np.mean(rsi_arr))
+            stats['rsi_std'] = float(np.std(rsi_arr))
+        
+        if len(self.volume_ratio_history) >= 10:
+            vol_arr = np.array(self.volume_ratio_history)
+            stats['volume_avg'] = float(np.mean(vol_arr))
+            stats['volume_std'] = float(np.std(vol_arr))
+        
+        if len(self.hurst_history) >= 10:
+            hurst_arr = np.array(self.hurst_history)
+            stats['hurst_avg'] = float(np.mean(hurst_arr))
+            stats['hurst_std'] = float(np.std(hurst_arr))
+        
+        stats['sample_count'] = min(len(self.rsi_history), len(self.volume_ratio_history), len(self.hurst_history))
+        
+        return stats
+    
+    def get_daily_trend(self) -> tuple:
+        """
+        Coin'in kendi günlük trendini hesapla.
+        Mevcut closes verisinden son ~24 saat değişimini hesaplar.
+        
+        Returns:
+            (trend: str, change_pct: float)
+            trend: "STRONG_BULLISH", "BULLISH", "NEUTRAL", "BEARISH", "STRONG_BEARISH"
+        """
+        # 5 dakikalık mum kullanıyorsak, 24 saat = ~288 mum
+        # Ama muhtemelen daha az verimiz var, mevcut en eski veriden hesapla
+        if len(self.closes) < 50:  # En az 50 bar (~4 saat 5m mumlarla)
+            return "NEUTRAL", 0.0
+        
+        try:
+            closes_list = list(self.closes)
+            current = closes_list[-1]
+            
+            # Son 100 bar'ın başından karşılaştır (yoksa en eski bar)
+            lookback = min(100, len(closes_list) - 1)
+            past_price = closes_list[-lookback]
+            
+            if past_price <= 0:
+                return "NEUTRAL", 0.0
+            
+            change_pct = ((current - past_price) / past_price) * 100
+            
+            # Trend belirleme
+            if change_pct > 5.0:
+                return "STRONG_BULLISH", change_pct
+            elif change_pct > 2.0:
+                return "BULLISH", change_pct
+            elif change_pct < -5.0:
+                return "STRONG_BEARISH", change_pct
+            elif change_pct < -2.0:
+                return "BEARISH", change_pct
+            else:
+                return "NEUTRAL", change_pct
+                
+        except Exception as e:
+            logger.warning(f"Daily trend calculation error for {self.symbol}: {e}")
+            return "NEUTRAL", 0.0
     
     def preload_historical_data(self, ohlcv_data: list):
         """
@@ -1082,7 +1740,34 @@ class LightweightCoinAnalyzer:
         except:
             pass
         
-        # Generate signal with VWAP, HTF trend, Basis, and Whale activity
+        # Calculate RSI for Layer 10 scoring
+        rsi_value = 50.0  # Default neutral
+        if len(prices_list) >= 15:
+            rsi_value = calculate_rsi(prices_list, period=14)
+        
+        # Calculate Volume Ratio for Layer 11 scoring
+        volume_ratio = 1.0  # Default average
+        if len(self.volumes) >= 21:
+            is_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
+        
+        # Update coin-specific statistics for dynamic thresholds
+        self.rsi_history.append(rsi_value)
+        self.volume_ratio_history.append(volume_ratio)
+        self.hurst_history.append(hurst)
+        
+        # Get coin stats for dynamic threshold calculation
+        coin_stats = self.get_coin_stats()
+        
+        # Detect Liquidity Sweep / SFP for Layer 13
+        sweep_result = None
+        if len(self.highs) >= 22 and len(self.lows) >= 22:
+            sweep_result = liquidity_sweep_detector.detect_sweep(
+                list(self.highs), list(self.lows), prices_list
+            )
+        # Get coin's own daily trend (not BTC's)
+        coin_daily_trend, coin_daily_change = self.get_daily_trend()
+        
+        # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
@@ -1094,7 +1779,12 @@ class LightweightCoinAnalyzer:
             htf_trend=htf_trend,
             basis_pct=basis_pct,
             symbol=self.symbol,  # For liquidation cascade lookup
-            whale_zscore=whale_tracker.get_whale_zscore(self.symbol)  # Whale activity
+            whale_zscore=whale_tracker.get_whale_zscore(self.symbol),  # Whale activity
+            rsi=rsi_value,  # RSI for Layer 10
+            volume_ratio=volume_ratio,  # Volume spike for Layer 11
+            sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
+            coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
+            coin_daily_trend=coin_daily_trend  # Coin's own daily trend (not BTC's)
         )
         
         if signal:
@@ -1187,6 +1877,17 @@ class BinanceWebSocketManager:
                 'imbalance': imbalance,  # Simple L1 imbalance
                 'timestamp': int(ticker.get('E', 0))  # Event time
             }
+        
+        # Update SMT Divergence detector with BTC and ETH data
+        if 'BTCUSDT' in self.tickers and 'ETHUSDT' in self.tickers:
+            btc = self.tickers['BTCUSDT']
+            eth = self.tickers['ETHUSDT']
+            smt_divergence_detector.update_prices(
+                btc_high=btc['high'], btc_low=btc['low'], btc_close=btc['last'],
+                eth_high=eth['high'], eth_low=eth['low'], eth_close=eth['last']
+            )
+            # Detect divergence periodically
+            smt_divergence_detector.detect_divergence()
         
         self.last_update = datetime.now().timestamp()
     
@@ -1985,13 +2686,15 @@ async def background_scanner_loop():
                 
                 # Process signals for paper trading (only if enabled)
                 if global_paper_trader.enabled:
-                    # Phase 36: Check Kill Switch before processing any signals
-                    if daily_kill_switch.check_and_trigger(global_paper_trader.balance):
-                        # Kill switch triggered - close all positions
-                        if global_paper_trader.positions:
-                            daily_kill_switch.panic_close_all(global_paper_trader)
-                        # Skip signal processing when kill switch is active
-                        continue
+                    # Phase 36 IMPROVED: Position-based kill switch check
+                    # Checks each position individually, applies gradual reduction
+                    if global_paper_trader.positions:
+                        kill_switch_actions = daily_kill_switch.check_positions(global_paper_trader)
+                        # Log and broadcast if any actions were taken
+                        if kill_switch_actions.get('reduced') or kill_switch_actions.get('closed'):
+                            logger.info(f"🚨 Kill Switch Actions: Reduced={kill_switch_actions['reduced']}, Closed={kill_switch_actions['closed']}")
+                            # Broadcast kill switch event to UI
+                            await ui_ws_manager.broadcast_kill_switch(kill_switch_actions)
                     
                     # UPDATE MTF TRENDS for coins with active signals (before processing)
                     for signal in multi_coin_scanner.active_signals:
@@ -2108,13 +2811,28 @@ async def background_scanner_loop():
                             trail_activation = pos.get('trailActivation', entry_price)
                             trail_distance = pos.get('trailDistance', 0)
                             
+                            # ===================================================================
+                            # DYNAMIC TRAILING: Kâr arttıkça trail mesafesi küçülür
+                            # %2-5 kâr: standart, %5-10: sıkı, %10+: çok sıkı
+                            # ===================================================================
+                            pnl_pct = pos.get('unrealizedPnlPercent', 0)
+                            if pnl_pct >= 10.0:
+                                # Çok yüksek kâr: trail mesafesini %50'ye küçült
+                                dynamic_trail_distance = trail_distance * 0.5
+                            elif pnl_pct >= 5.0:
+                                # Yüksek kâr: trail mesafesini %75'e küçült
+                                dynamic_trail_distance = trail_distance * 0.75
+                            else:
+                                # Normal: standart trail mesafesi
+                                dynamic_trail_distance = trail_distance
+                            
                             if pos['side'] == 'LONG' and current_price > trail_activation:
-                                new_trailing = current_price - trail_distance
+                                new_trailing = current_price - dynamic_trail_distance
                                 if new_trailing > trailing_stop:
                                     pos['trailingStop'] = new_trailing
                                     pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT' and current_price < trail_activation:
-                                new_trailing = current_price + trail_distance
+                                new_trailing = current_price + dynamic_trail_distance
                                 if new_trailing < trailing_stop:
                                     pos['trailingStop'] = new_trailing
                                     pos['isTrailingActive'] = True
@@ -2127,6 +2845,10 @@ async def background_scanner_loop():
                 # PHASE 34: CHECK PENDING ORDERS FOR EXECUTION
                 # =====================================================================
                 global_paper_trader.check_pending_orders(opportunities)
+                
+                # Broadcast position updates to UI (throttled)
+                if global_paper_trader.positions:
+                    await ui_ws_manager.broadcast_price_update(global_paper_trader.positions)
                 
                 # Log periodic status (every 5 minutes = 30 iterations)
                 if int(datetime.now().timestamp()) % 300 < scan_interval:
@@ -2725,10 +3447,12 @@ class BTCCorrelationFilter:
     
     def __init__(self):
         self.btc_trend = "NEUTRAL"
+        self.btc_trend_daily = "NEUTRAL"  # Günlük trend
         self.btc_momentum = 0.0
         self.btc_price = 0.0
         self.btc_change_1h = 0.0
         self.btc_change_4h = 0.0
+        self.btc_change_1d = 0.0  # Günlük değişim
         self.last_update = 0
         self.update_interval = 300  # 5 dakikada bir güncelle
         
@@ -2739,7 +3463,7 @@ class BTCCorrelationFilter:
         self.spread_window = 100  # Last 100 values for Z-score
         self.beta = 0.052  # ETH typically ~5.2% of BTC price
         
-        logger.info("BTCCorrelationFilter initialized with Pairs Correlation")
+        logger.info("BTCCorrelationFilter initialized with 1D Trend Support")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -2750,9 +3474,10 @@ class BTCCorrelationFilter:
             return self.get_state()
         
         try:
-            # BTC 1H ve 4H verileri çek
+            # BTC 1H, 4H ve 1D verileri çek
             ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
             ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
+            ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)  # Son 3 gün
             
             if ohlcv_1h and len(ohlcv_1h) >= 2:
                 current = ohlcv_1h[-1][4]  # Close
@@ -2765,7 +3490,25 @@ class BTCCorrelationFilter:
                 prev_4h = ohlcv_4h[-2][4]
                 self.btc_change_4h = ((current - prev_4h) / prev_4h) * 100
             
-            # Trend belirleme
+            # 1D (Günlük) değişim hesapla
+            if ohlcv_1d and len(ohlcv_1d) >= 2:
+                current = ohlcv_1d[-1][4]  # Bugünün kapanışı
+                prev_1d = ohlcv_1d[-2][4]  # Dünün kapanışı
+                self.btc_change_1d = ((current - prev_1d) / prev_1d) * 100
+                
+                # Günlük trend belirleme
+                if self.btc_change_1d > 3.0:
+                    self.btc_trend_daily = "STRONG_BULLISH"
+                elif self.btc_change_1d > 1.0:
+                    self.btc_trend_daily = "BULLISH"
+                elif self.btc_change_1d < -3.0:
+                    self.btc_trend_daily = "STRONG_BEARISH"
+                elif self.btc_change_1d < -1.0:
+                    self.btc_trend_daily = "BEARISH"
+                else:
+                    self.btc_trend_daily = "NEUTRAL"
+            
+            # Kısa vadeli trend belirleme (1H + 4H)
             if self.btc_change_1h > 0.5 and self.btc_change_4h > 1.0:
                 self.btc_trend = "STRONG_BULLISH"
                 self.btc_momentum = 1.0
@@ -2783,7 +3526,7 @@ class BTCCorrelationFilter:
                 self.btc_momentum = 0.0
             
             self.last_update = now
-            logger.debug(f"BTC State: {self.btc_trend} | 1H: {self.btc_change_1h:.2f}% | 4H: {self.btc_change_4h:.2f}%")
+            logger.debug(f"BTC State: {self.btc_trend} | Daily:{self.btc_trend_daily} | 1H:{self.btc_change_1h:.2f}% | 4H:{self.btc_change_4h:.2f}% | 1D:{self.btc_change_1d:.2f}%")
             
         except Exception as e:
             logger.warning(f"BTC state update failed: {e}")
@@ -2802,34 +3545,53 @@ class BTCCorrelationFilter:
         penalty = 0.0
         reason = ""
         
+        # ===================================================================
+        # GÜNLÜK TREND FİLTRESİ (EN GÜÇLÜ)
+        # Günlük trend ters yöndeyse sinyali tamamen reddet
+        # ===================================================================
+        if self.btc_trend_daily == "STRONG_BEARISH" and signal_action == "LONG":
+            return (False, 1.0, "🚫 Daily STRONG_BEARISH - LONG blocked")
+        
+        if self.btc_trend_daily == "STRONG_BULLISH" and signal_action == "SHORT":
+            return (False, 1.0, "🚫 Daily STRONG_BULLISH - SHORT blocked")
+        
+        # Günlük trend orta düzeyde ters ise yüksek ceza
+        if self.btc_trend_daily == "BEARISH" and signal_action == "LONG":
+            penalty = 0.4  # %40 skor düşür
+            reason = "Daily BEARISH - LONG risky"
+        elif self.btc_trend_daily == "BULLISH" and signal_action == "SHORT":
+            penalty = 0.4
+            reason = "Daily BULLISH - SHORT risky"
+        
+        # Kısa vadeli trend kontrolü (1H + 4H)
         # BTC STRONG_BEARISH iken ALT LONG risky
         if self.btc_trend == "STRONG_BEARISH" and signal_action == "LONG":
-            penalty = 0.3  # %30 skor düşür
-            reason = "BTC Strong Bearish - ALT LONG risky"
+            penalty = max(penalty, 0.3)  # %30 skor düşür
+            reason = reason or "BTC Strong Bearish - ALT LONG risky"
         
         # BTC BEARISH iken ALT LONG dikkat
         elif self.btc_trend == "BEARISH" and signal_action == "LONG":
-            penalty = 0.15
-            reason = "BTC Bearish - ALT LONG caution"
+            penalty = max(penalty, 0.15)
+            reason = reason or "BTC Bearish - ALT LONG caution"
         
         # BTC STRONG_BULLISH iken ALT SHORT risky
         elif self.btc_trend == "STRONG_BULLISH" and signal_action == "SHORT":
-            penalty = 0.3
-            reason = "BTC Strong Bullish - ALT SHORT risky"
+            penalty = max(penalty, 0.3)
+            reason = reason or "BTC Strong Bullish - ALT SHORT risky"
         
         # BTC BULLISH iken ALT SHORT dikkat
         elif self.btc_trend == "BULLISH" and signal_action == "SHORT":
-            penalty = 0.15
-            reason = "BTC Bullish - ALT SHORT caution"
+            penalty = max(penalty, 0.15)
+            reason = reason or "BTC Bullish - ALT SHORT caution"
         
         # Aynı yönde ise bonus
         elif (self.btc_trend in ["BULLISH", "STRONG_BULLISH"] and signal_action == "LONG") or \
              (self.btc_trend in ["BEARISH", "STRONG_BEARISH"] and signal_action == "SHORT"):
-            penalty = -0.1  # Bonus (negatif penalty)
+            penalty = -0.15  # Günlük aynı yöndeyse daha büyük bonus
             reason = "BTC aligned with signal"
         
         # Yüksek penalty ise reddet
-        allowed = penalty < 0.25
+        allowed = penalty < 0.35
         
         return (allowed, penalty, reason)
     
@@ -3224,104 +3986,168 @@ balance_protector = BalanceProtector()
 
 
 # ============================================================================
-# PHASE 36: DAILY KILL SWITCH
+# PHASE 36: POSITION-BASED KILL SWITCH (IMPROVED)
 # ============================================================================
 
-class DailyKillSwitch:
+class PositionBasedKillSwitch:
     """
-    Emergency kill switch for daily drawdown protection.
-    Triggers when daily PnL drops below threshold (default -5%).
+    Improved kill switch with position-based logic.
+    - Checks each position individually for -10% loss
+    - Gradual position reduction instead of full close
+    - Excludes profitable positions
     """
     
-    def __init__(self, daily_limit_pct: float = -5.0):
-        self.daily_limit_pct = daily_limit_pct  # Default: -5%
+    def __init__(self, 
+                 first_reduction_pct: float = -10.0,  # First reduction at -10%
+                 full_close_pct: float = -15.0,       # Full close at -15%
+                 reduction_size: float = 0.5):        # Reduce 50% at first level
+        self.first_reduction_pct = first_reduction_pct
+        self.full_close_pct = full_close_pct
+        self.reduction_size = reduction_size  # 50% reduction at first level
+        
+        # Track which positions have been partially closed
+        self.partially_closed = {}  # {position_id: reduction_count}
+        
+        # Daily stats
         self.day_start_balance = 10000.0
         self.last_reset_date = None
-        self.is_triggered = False
-        self.trigger_time = None
-        logger.info(f"🚨 DailyKillSwitch initialized: {daily_limit_pct}% daily limit")
+        
+        logger.info(f"🚨 PositionBasedKillSwitch initialized: {first_reduction_pct}% first reduction, {full_close_pct}% full close")
     
     def reset_for_new_day(self, current_balance: float):
-        """Reset for new trading day (call at midnight UTC)."""
+        """Reset for new trading day."""
         today = datetime.now().date()
         if self.last_reset_date != today:
             self.day_start_balance = current_balance
             self.last_reset_date = today
-            self.is_triggered = False
-            self.trigger_time = None
+            self.partially_closed.clear()
             logger.info(f"📅 New trading day: Starting balance ${current_balance:.2f}")
     
-    def check_and_trigger(self, current_balance: float) -> bool:
+    def check_positions(self, paper_trader) -> dict:
         """
-        Check if kill switch should trigger.
-        Returns True if we hit the daily limit.
+        Check all positions and apply gradual reduction or close.
+        Returns summary of actions taken.
         """
-        # Auto-reset at new day
-        self.reset_for_new_day(current_balance)
+        self.reset_for_new_day(paper_trader.balance)
         
-        # Already triggered today
-        if self.is_triggered:
-            return True
+        actions = {
+            "reduced": [],
+            "closed": [],
+            "skipped_profitable": []
+        }
         
-        # Calculate daily PnL
-        if self.day_start_balance <= 0:
-            return False
-            
-        daily_pnl = current_balance - self.day_start_balance
-        daily_pnl_pct = (daily_pnl / self.day_start_balance) * 100
-        
-        # Check threshold
-        if daily_pnl_pct <= self.daily_limit_pct:
-            self.is_triggered = True
-            self.trigger_time = datetime.now()
-            logger.warning(f"🚨 KILL SWITCH TRIGGERED! Daily loss: {daily_pnl_pct:.2f}% (limit: {self.daily_limit_pct}%)")
-            return True
-        
-        return False
-    
-    def panic_close_all(self, paper_trader) -> int:
-        """
-        Emergency close all positions.
-        Returns number of positions closed.
-        """
-        closed_count = 0
         for pos in list(paper_trader.positions):
             try:
-                current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
-                paper_trader.close_position(pos, current_price, 'KILL_SWITCH')
-                closed_count += 1
-                logger.warning(f"🚨 KILL SWITCH: Closed {pos['side']} {pos['symbol']}")
+                pos_id = pos.get('id', '')
+                symbol = pos.get('symbol', '')
+                side = pos.get('side', '')
+                entry_price = pos.get('entryPrice', 0)
+                current_price = pos.get('currentPrice', entry_price)
+                pnl_pct = pos.get('unrealizedPnlPercent', 0)
+                
+                # Skip profitable positions (don't touch winners!)
+                if pnl_pct >= 0:
+                    actions["skipped_profitable"].append(symbol)
+                    continue
+                
+                # Check loss thresholds
+                if pnl_pct <= self.full_close_pct:
+                    # -15% or worse: FULL CLOSE
+                    paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
+                    actions["closed"].append(f"{symbol} ({pnl_pct:.1f}%)")
+                    logger.warning(f"🚨 KILL SWITCH FULL: Closed {side} {symbol} at {pnl_pct:.1f}%")
+                    
+                elif pnl_pct <= self.first_reduction_pct:
+                    # -10% to -15%: REDUCE 50% (only once per position)
+                    reduction_count = self.partially_closed.get(pos_id, 0)
+                    
+                    if reduction_count == 0:
+                        # First reduction - close 50%
+                        self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
+                        self.partially_closed[pos_id] = 1
+                        actions["reduced"].append(f"{symbol} ({pnl_pct:.1f}%)")
+                        logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {pnl_pct:.1f}%")
+                        
             except Exception as e:
-                logger.error(f"Kill switch close error: {e}")
+                logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
         
-        # Also cancel all pending orders
-        pending_count = len(paper_trader.pending_orders)
-        paper_trader.pending_orders.clear()
+        return actions
+    
+    def _reduce_position(self, paper_trader, pos: dict, current_price: float, reduction_pct: float):
+        """
+        Reduce position size by specified percentage.
+        Records partial close in trade history.
+        """
+        original_size = pos.get('size', 0)
+        original_size_usd = pos.get('sizeUsd', 0)
+        reduction_size = original_size * reduction_pct
+        reduction_size_usd = original_size_usd * reduction_pct
         
-        paper_trader.add_log(f"🚨 KILL SWITCH: Closed {closed_count} positions, cancelled {pending_count} pending orders")
-        return closed_count
+        # Calculate PnL for the reduced portion
+        entry_price = pos.get('entryPrice', current_price)
+        side = pos.get('side', 'LONG')
+        
+        if side == 'LONG':
+            price_diff = current_price - entry_price
+        else:
+            price_diff = entry_price - current_price
+        
+        pnl = reduction_size * price_diff
+        pnl_pct = (price_diff / entry_price) * 100 if entry_price > 0 else 0
+        
+        # Update balance with initial margin portion + PnL
+        # Initial Margin = sizeUsd / leverage
+        leverage = pos.get('leverage', 10)
+        reduction_initial_margin = reduction_size_usd / leverage
+        paper_trader.balance += reduction_initial_margin + pnl
+        
+        # Update position with reduced size
+        pos['size'] = original_size - reduction_size
+        pos['sizeUsd'] = original_size_usd - reduction_size_usd
+        # Update initialMargin proportionally
+        if 'initialMargin' in pos:
+            pos['initialMargin'] = pos['initialMargin'] * (1 - reduction_pct)
+        
+        # Record partial close in trade history
+        partial_trade = {
+            "id": f"{pos.get('id', '')}_PARTIAL",
+            "symbol": pos.get('symbol', ''),
+            "side": side,
+            "entryPrice": entry_price,
+            "exitPrice": current_price,
+            "size": reduction_size,
+            "sizeUsd": reduction_size_usd,
+            "pnl": pnl,
+            "pnlPercent": pnl_pct,
+            "openTime": pos.get('openTime', 0),
+            "closeTime": int(datetime.now().timestamp() * 1000),
+            "reason": "KILL_SWITCH_PARTIAL",
+            "leverage": pos.get('leverage', 10)
+        }
+        paper_trader.trades.append(partial_trade)
+        paper_trader.add_log(f"⚠️ PARTIAL CLOSE: {side} {pos.get('symbol', '')} reduced by 50% | PnL: ${pnl:.2f}")
     
     def get_status(self, current_balance: float) -> dict:
         """Get kill switch status for UI."""
         if self.day_start_balance <= 0:
-            return {"triggered": False, "daily_pnl_pct": 0, "limit_pct": self.daily_limit_pct}
+            return {"first_reduction_pct": self.first_reduction_pct, "full_close_pct": self.full_close_pct}
         
         daily_pnl = current_balance - self.day_start_balance
         daily_pnl_pct = (daily_pnl / self.day_start_balance) * 100
         
         return {
-            "triggered": self.is_triggered,
-            "trigger_time": self.trigger_time.isoformat() if self.trigger_time else None,
+            "type": "POSITION_BASED",
+            "first_reduction_pct": self.first_reduction_pct,
+            "full_close_pct": self.full_close_pct,
             "day_start_balance": self.day_start_balance,
             "daily_pnl": round(daily_pnl, 2),
             "daily_pnl_pct": round(daily_pnl_pct, 2),
-            "limit_pct": self.daily_limit_pct,
-            "remaining_pct": round(self.daily_limit_pct - daily_pnl_pct, 2) if not self.is_triggered else 0
+            "partially_closed_count": len(self.partially_closed)
         }
 
 
-# Global DailyKillSwitch instance
-daily_kill_switch = DailyKillSwitch()
+# Global PositionBasedKillSwitch instance (replaces DailyKillSwitch)
+daily_kill_switch = PositionBasedKillSwitch()
 
 
 # ============================================================================
@@ -3605,10 +4431,15 @@ class SignalGenerator:
         spread_pct: float = 0.05, # Phase 13
         volatility_ratio: float = 1.0, # Phase 13
         coin_profile: Optional[Dict] = None,  # Phase 28: Dynamic coin profile
-        symbol: str = "BTCUSDT"  # Symbol for liquidation cascade lookup
+        symbol: str = "BTCUSDT",  # Symbol for liquidation cascade lookup
+        rsi: float = 50.0,  # RSI value (0-100)
+        volume_ratio: float = 1.0,  # Current volume / avg volume
+        sweep_result: Optional[Dict] = None,  # Liquidity sweep detection result
+        coin_stats: Optional[Dict] = None,  # Coin-specific stats for dynamic thresholds
+        coin_daily_trend: str = "NEUTRAL"  # Coin's own daily trend
     ) -> Optional[Dict[str, Any]]:
         """
-        Generate signal based on 9 Layers of confluence (SMC + Breakouts).
+        Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
         Uses coin_profile for dynamic threshold and minimum score.
         """
         now = datetime.now().timestamp()
@@ -3616,6 +4447,16 @@ class SignalGenerator:
         # Check minimum interval
         if now - self.last_signal_time < self.min_signal_interval:
             return None
+        
+        # ===================================================================
+        # SAAT BAZLI FİLTRE: Düşük likidite saatlerinde sinyal üretme
+        # 02:00-06:00 UTC arası spread yüksek, manipülasyon riski var
+        # ===================================================================
+        current_hour = datetime.utcnow().hour
+        if 2 <= current_hour < 6:
+            # Düşük likidite saatlerinde sadece BTC/ETH için sinyal üret
+            if symbol not in ["BTCUSDT", "ETHUSDT"]:
+                return None
         
         # Phase 28: Dynamic threshold from coin profile
         if coin_profile:
@@ -3785,16 +4626,115 @@ class SignalGenerator:
                      reasons.append("BREAKDOWN(Trend)")
              elif hurst < 0.4:
                  # Mean Reversion Regime: Breakouts are often Fakeouts!
-                 # Penalize Breakout signals here?
                  # Or actually, if Z-Score says LONG (Oversold) but we have breakdown...
                  # It's mixed signals.
                  score -= 10
                  reasons.append("FakeoutRisk")
 
-        # FINAL DECISION: Dynamic minimum score from coin profile
-        # Phase 28: Coin-specific minimum score requirement
+        # Layer 10-14 artık SKOR VERMİYOR - bunlar KONFİRMASYON katmanları olarak aşağıda kontrol edilecek
+        # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
+        
+        # =====================================================================
+        # AŞAMA 1: MİNİMUM SKOR KONTROLÜ
+        # =====================================================================
+        # Sadece Z-Score, OB, VWAP, MTF (veto için), Liq Cascade, Basis, Whale, FVG, Breakout skorları kullanıldı
+        
         if score < min_score_required:
             return None
+        
+        # =====================================================================
+        # AŞAMA 2: KONFİRMASYON FİLTRELERİ (Skor Vermez, Sadece Kontrol Eder)
+        # Coin istatistiklerine göre dinamik eşikler kullanılır
+        # =====================================================================
+        confirmation_passed = True
+        confirmation_fails = []
+        
+        # ===================================================================
+        # KONFİRMASYON 0: COİN BAZLI GÜNLÜK TREND FİLTRESİ
+        # Coin'in kendi trendi ters yöndeyse sinyali reddet
+        # ===================================================================
+        if coin_daily_trend == "STRONG_BEARISH" and signal_side == "LONG":
+            confirmation_passed = False
+            confirmation_fails.append(f"COIN_TREND(STRONG_BEAR→LONG)")
+            reasons.append("🔻 Coin Daily: STRONG_BEARISH")
+        elif coin_daily_trend == "STRONG_BULLISH" and signal_side == "SHORT":
+            confirmation_passed = False
+            confirmation_fails.append(f"COIN_TREND(STRONG_BULL→SHORT)")
+            reasons.append("🔺 Coin Daily: STRONG_BULLISH")
+        elif coin_daily_trend == "BEARISH" and signal_side == "LONG":
+            # Uyarı ver ama reddetme (düşük güvenilirlik)
+            reasons.append(f"⚠️ CoinTrend(BEAR→LONG)")
+        elif coin_daily_trend == "BULLISH" and signal_side == "SHORT":
+            reasons.append(f"⚠️ CoinTrend(BULL→SHORT)")
+        
+        # Dinamik eşikler hesapla (coin_stats varsa kullan, yoksa varsayılan)
+        if coin_stats and coin_stats.get('sample_count', 0) >= 10:
+            # RSI dinamik eşik: ortalama + 1.5 * std
+            rsi_upper = min(80, coin_stats['rsi_avg'] + 1.5 * coin_stats['rsi_std'])
+            rsi_lower = max(20, coin_stats['rsi_avg'] - 1.5 * coin_stats['rsi_std'])
+            # Volume dinamik eşik: ortalama - 1 * std (minimum kabul edilen)
+            vol_threshold = max(0.3, coin_stats['volume_avg'] - coin_stats['volume_std'])
+            # Log dinamik eşikler
+            reasons.append(f"DynTH(RSI:{rsi_lower:.0f}-{rsi_upper:.0f},V:{vol_threshold:.1f}x)")
+        else:
+            # Varsayılan eşikler (yeterli veri yok)
+            rsi_upper = 75
+            rsi_lower = 25
+            vol_threshold = 0.5
+        
+        # Konfirmasyon 1: RSI Kontrolü (DİNAMİK)
+        if signal_side == "LONG" and rsi > rsi_upper:
+            confirmation_passed = False
+            confirmation_fails.append(f"RSI_HIGH({rsi:.0f}>{rsi_upper:.0f})")
+        elif signal_side == "SHORT" and rsi < rsi_lower:
+            confirmation_passed = False
+            confirmation_fails.append(f"RSI_LOW({rsi:.0f}<{rsi_lower:.0f})")
+        
+        # Konfirmasyon 2: Volume Kontrolü (DİNAMİK)
+        if volume_ratio < vol_threshold:
+            confirmation_passed = False
+            confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
+        
+        # Konfirmasyon 3: Hurst Regime Kontrolü (SADECE UYARI - VETO DEĞİL)
+        if hurst > 0.65:
+            reasons.append(f"HURST_WARN({hurst:.2f}>0.65)")
+        
+        # Konfirmasyon 4: Liquidity Sweep Kontrolü
+        # Ters yönde sweep varsa pozisyon açma
+        if sweep_result and sweep_result.get('sweep_type'):
+            sweep_type = sweep_result['sweep_type']
+            if sweep_type == 'BULLISH' and signal_side == 'SHORT':
+                confirmation_passed = False
+                confirmation_fails.append("SWEEP_CONTRA(BULL)")
+            elif sweep_type == 'BEARISH' and signal_side == 'LONG':
+                confirmation_passed = False
+                confirmation_fails.append("SWEEP_CONTRA(BEAR)")
+            else:
+                # Aynı yönde sweep = bonus log (sinyal güçlendi)
+                reasons.append(f"Sweep({sweep_type})")
+        
+        # Konfirmasyon 5: SMT Divergence Kontrolü
+        # Ters yönde divergence varsa dikkatli ol (uyarı, veto değil)
+        smt_div = smt_divergence_detector.last_divergence
+        if smt_div and smt_div.get('divergence_type'):
+            div_type = smt_div['divergence_type']
+            age = datetime.now().timestamp() - smt_divergence_detector.divergence_time
+            if age < 300:  # Son 5 dakika
+                if div_type == 'BULLISH' and signal_side == 'SHORT':
+                    # Uyarı - veto değil ama log
+                    reasons.append("SMT_WARN(BULL)")
+                elif div_type == 'BEARISH' and signal_side == 'LONG':
+                    reasons.append("SMT_WARN(BEAR)")
+                else:
+                    # Aynı yönde = teyit
+                    reasons.append(f"SMT({div_type})")
+        
+        # Konfirmasyon başarısız mı?
+        if not confirmation_passed:
+            logger.info(f"🚫 CONF_FAIL: {symbol} {signal_side} score={score} failed: {', '.join(confirmation_fails)}")
+            return None
+        
+        # Tüm konfirmasyonlar geçti - devam et
         
         # =====================================================================
         # PHASE 29: SPREAD-BASED DYNAMIC PARAMETERS
@@ -4026,6 +4966,28 @@ class PaperTradingEngine:
         
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
+    
+    def get_dynamic_risk_per_trade(self) -> float:
+        """
+        Son 5 trade'in performansına göre risk yüzdesini dinamik ayarla.
+        4+ win: %4 (agresif), 2-3 win: %3 (standart), 0-1 win: %2 (koruyucu)
+        """
+        if len(self.trades) < 5:
+            return self.risk_per_trade  # Yeterli veri yok, varsayılan kullan
+        
+        # Son 5 trade'i al
+        last_5 = self.trades[-5:]
+        wins = sum(1 for t in last_5 if t.get('pnl', 0) > 0)
+        
+        if wins >= 4:
+            # Kazanma serisi: agresif
+            return 0.04  # %4
+        elif wins >= 2:
+            # Normal: standart
+            return 0.03  # %3
+        else:
+            # Kaybetme serisi: koruyucu
+            return 0.02  # %2
     
     def add_log(self, message: str):
         """Add a timestamped log entry (persisted to state and SQLite)."""
@@ -4304,8 +5266,9 @@ class PaperTradingEngine:
         # Get pullback entry price from signal and apply entry_tightness
         if signal and 'entryPrice' in signal:
             base_pullback_pct = signal.get('pullbackPct', 0)
-            # Apply entry_tightness: lower = tighter entry (smaller pullback), higher = looser (bigger pullback)
-            adjusted_pullback_pct = base_pullback_pct * self.entry_tightness
+            # Apply entry_tightness: HIGHER = EASIER entry (smaller pullback)
+            # Formula: divide by entry_tightness (4.0x = pullback/4 = %75 daha az bekleme)
+            adjusted_pullback_pct = base_pullback_pct / max(0.1, self.entry_tightness)
             
             # Recalculate entry price with adjusted pullback
             if side == 'LONG':
@@ -4330,9 +5293,9 @@ class PaperTradingEngine:
             adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
             adjusted_leverage = max(3, min(75, adjusted_leverage))
         
-        # Kelly Criterion position sizing
-        kelly_risk = self.calculate_kelly_fraction()
-        session_risk = session_manager.adjust_risk(kelly_risk)
+        # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
+        dynamic_risk = self.get_dynamic_risk_per_trade()
+        session_risk = session_manager.adjust_risk(dynamic_risk)
         size_mult = signal.get('sizeMultiplier', 1.0) if signal else 1.0
         
         # Calculate SL/TP based on pullback entry price
@@ -4367,6 +5330,9 @@ class PaperTradingEngine:
         position_size = position_size_usd / entry_price
         
         # Create pending order
+        # Signal Confirmation: 5 dakika bekleme süresi - trend değişikliğini filtreler
+        signal_confirmation_delay_seconds = 300  # 5 dakika
+        
         pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
@@ -4383,8 +5349,10 @@ class PaperTradingEngine:
             "leverage": adjusted_leverage,
             "spreadLevel": spread_level,
             "createdAt": int(datetime.now().timestamp() * 1000),
+            "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),  # 5 dakika sonra aktif
             "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
-            "atr": atr
+            "atr": atr,
+            "confirmed": False  # Henüz konfirme edilmedi
         }
         
         self.pending_orders.append(pending_order)
@@ -4420,7 +5388,47 @@ class PaperTradingEngine:
             if not current_price or current_price <= 0:
                 continue
             
-            # Check if price reached entry level
+            # ===================================================================
+            # SIGNAL CONFIRMATION: 5 dakika bekleme
+            # Sinyal geldiğinde hemen execute etme, trend doğrulanmasını bekle
+            # ===================================================================
+            confirm_after = order.get('confirmAfter', 0)
+            is_confirmed = order.get('confirmed', False)
+            
+            if not is_confirmed:
+                if current_time < confirm_after:
+                    # Henüz konfirmasyon süresi dolmadı - fiyat hala doğru yönde mi kontrol et
+                    signal_price = order.get('signalPrice', entry_price)
+                    
+                    # Fiyat ters yöne gitti mi? (sinyal invalide oldu mu?)
+                    if side == 'LONG':
+                        # SHORT trendin devam ettiğini kontrol et (fiyat daha da düştü mü)
+                        price_change_pct = (current_price - signal_price) / signal_price * 100
+                        if price_change_pct > 2.0:  # Fiyat %2'den fazla yükseldi - sinyal geçersiz
+                            self.pending_orders.remove(order)
+                            self.add_log(f"❌ SIGNAL INVALID: {side} {symbol} - fiyat ters yöne gitti (+{price_change_pct:.1f}%)")
+                            logger.info(f"Signal invalidated: {order['id']} - price moved against signal")
+                            continue
+                    else:  # SHORT
+                        price_change_pct = (signal_price - current_price) / signal_price * 100
+                        if price_change_pct > 2.0:  # Fiyat %2'den fazla düştü - sinyal geçersiz
+                            self.pending_orders.remove(order)
+                            self.add_log(f"❌ SIGNAL INVALID: {side} {symbol} - fiyat ters yöne gitti (-{price_change_pct:.1f}%)")
+                            logger.info(f"Signal invalidated: {order['id']} - price moved against signal")
+                            continue
+                    
+                    # Beklemeye devam et
+                    remaining_secs = (confirm_after - current_time) / 1000
+                    if remaining_secs > 0 and remaining_secs % 60 < 5:  # Her dakika log
+                        logger.debug(f"Waiting for confirmation: {symbol} {side} - {remaining_secs:.0f}s remaining")
+                    continue
+                else:
+                    # Konfirmasyon süresi doldu - sinyali onayla
+                    order['confirmed'] = True
+                    self.add_log(f"✅ SIGNAL CONFIRMED: {side} {symbol} @ ${current_price:.4f} (5dk bekleme tamamlandı)")
+                    logger.info(f"Signal confirmed after 5min wait: {order['id']}")
+            
+            # Check if price reached entry level (only after confirmation)
             should_execute = False
             if side == 'LONG':
                 # For LONG, we want price to pull back DOWN to entry price
@@ -4479,8 +5487,16 @@ class PaperTradingEngine:
             "unrealizedPnlPercent": 0.0,
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": order['leverage'],
-            "spreadLevel": order['spreadLevel']
+            "spreadLevel": order['spreadLevel'],
+            "pullbackPct": order.get('pullbackPct', 1.0)  # Adverse exit kontrolü için
         }
+        
+        # Paper Trading: Initial Margin = Position Size / Leverage
+        # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
+        leverage = new_position.get('leverage', 10)
+        initial_margin = new_position['sizeUsd'] / leverage
+        new_position['initialMargin'] = initial_margin  # Store for close calculation
+        self.balance -= initial_margin
         
         self.positions.append(new_position)
         
@@ -4533,8 +5549,8 @@ class PaperTradingEngine:
                 new_sl = entry + (1.0 * atr)  # Lock in 1 ATR profit
             elif profit_atr >= 1.0 * t:
                 new_sl = entry + (0.5 * atr)  # Lock in 0.5 ATR profit
-            elif profit_atr >= 0.5 * t:
-                new_sl = entry  # Breakeven
+            elif profit_atr >= 0.25 * t:
+                new_sl = entry  # Breakeven (daha erken koruma)
             else:
                 return False  # No change
                 
@@ -4557,8 +5573,8 @@ class PaperTradingEngine:
                 new_sl = entry - (1.0 * atr)
             elif profit_atr >= 1.0 * t:
                 new_sl = entry - (0.5 * atr)
-            elif profit_atr >= 0.5 * t:
-                new_sl = entry  # Breakeven
+            elif profit_atr >= 0.25 * t:
+                new_sl = entry  # Breakeven (daha erken koruma)
             else:
                 return False
                 
@@ -4578,8 +5594,8 @@ class PaperTradingEngine:
         if pos['side'] == 'LONG':
             loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
             
-            # Only if in loss (>2%) and price is recovering
-            if loss_pct > 2:
+            # Only if in loss (>1%) and price is recovering
+            if loss_pct > 1:
                 if 'recovery_low' not in pos:
                     pos['recovery_low'] = current_price
                 elif current_price < pos['recovery_low']:
@@ -4604,7 +5620,7 @@ class PaperTradingEngine:
         elif pos['side'] == 'SHORT':
             loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
             
-            if loss_pct > 2:
+            if loss_pct > 1:  # %1 kayıpta recovery mode (daha erken müdahale)
                 if 'recovery_high' not in pos:
                     pos['recovery_high'] = current_price
                 elif current_price > pos['recovery_high']:
@@ -4691,6 +5707,62 @@ class PaperTradingEngine:
             self.close_position(pos, current_price, 'EMERGENCY_SL')
             return True
         return False
+    
+    def check_adverse_position_exit(self, pos: dict, current_price: float, atr: float = None) -> bool:
+        """
+        4 saat boyunca terste kalan pozisyonları kontrol et.
+        
+        Kapatma kriterleri:
+        1. Pozisyon 4+ saat terste (giriş fiyatının ters tarafında)
+        2. Fiyat, pullback seviyesinden daha fazla düşmemişse kapat
+        
+        Bu sayede:
+        - Dönmeyecek pozisyonlardan erken çıkılır
+        - Daha fazla düşmemişse zarar minimize edilir
+        """
+        open_time = pos.get('openTime', 0)
+        age_ms = int(datetime.now().timestamp() * 1000) - open_time
+        age_hours = age_ms / (1000 * 60 * 60)
+        
+        # 4 saatten önce kontrol etme
+        if age_hours < 4:
+            return False
+        
+        entry = pos['entryPrice']
+        pullback_pct = pos.get('pullbackPct', 1.0)  # Varsayılan %1
+        
+        if pos['side'] == 'LONG':
+            # Terste mi? (fiyat entry'nin altında)
+            if current_price >= entry:
+                return False  # Kârda, kontrol etme
+            
+            # Pullback threshold: entry'den ne kadar aşağı düşebilir
+            pullback_threshold = entry * (1 - pullback_pct / 100)
+            
+            # Fiyat pullback threshold'unun üstündeyse (çok fazla düşmediyse) kapat
+            if current_price >= pullback_threshold:
+                loss_pct = ((entry - current_price) / entry) * 100
+                self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
+                self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
+                return True
+                
+        elif pos['side'] == 'SHORT':
+            # Terste mi? (fiyat entry'nin üstünde)
+            if current_price <= entry:
+                return False  # Kârda, kontrol etme
+            
+            # Pullback threshold: entry'den ne kadar yukarı çıkabilir
+            pullback_threshold = entry * (1 + pullback_pct / 100)
+            
+            # Fiyat pullback threshold'unun altındaysa (çok fazla yükselmemişse) kapat
+            if current_price <= pullback_threshold:
+                loss_pct = ((current_price - entry) / entry) * 100
+                self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
+                self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
+                return True
+        
+        return False
+
     
     def check_daily_drawdown(self) -> bool:
         """Pause trading if daily loss exceeds limit."""
@@ -4942,6 +6014,12 @@ class PaperTradingEngine:
             "spreadLevel": signal.get('spreadLevel', 'normal')  # Phase 29: Store spread level
         }
         
+        # Paper Trading: Initial Margin = Position Size / Leverage
+        # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
+        initial_margin = new_position['sizeUsd'] / adjusted_leverage
+        new_position['initialMargin'] = initial_margin  # Store for close calculation
+        self.balance -= initial_margin
+        
         self.positions.append(new_position)
         self.add_log(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {adjusted_leverage}x | SL:${signal['sl']:.4f} TP:${signal['tp']:.4f}")
         self.save_state()
@@ -4977,6 +6055,10 @@ class PaperTradingEngine:
             
             # 1. Emergency SL (highest priority)
             if self.check_emergency_sl(pos, current_price):
+                continue
+            
+            # 1.5. Adverse Position Exit (4h terste kalan pozisyonlar)
+            if self.check_adverse_position_exit(pos, current_price, atr):
                 continue
             
             # 2. Time-based exit (gradual liquidation)
@@ -5050,8 +6132,11 @@ class PaperTradingEngine:
             pnl = (exit_price - pos['entryPrice']) * pos['size']
         else:
             pnl = (pos['entryPrice'] - exit_price) * pos['size']
-            
-        self.balance += pnl
+        
+        # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
+        # Initial Margin = sizeUsd / leverage (açılışta düşülen miktar)
+        initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))
+        self.balance += initial_margin + pnl  # Teminatı geri al + kâr/zarar
         self.positions.remove(pos)
         
         trade = {
@@ -5063,7 +6148,7 @@ class PaperTradingEngine:
             "size": pos.get('size', 0),
             "sizeUsd": pos.get('sizeUsd', 0),
             "pnl": pnl,
-            "pnlPercent": (pnl / pos.get('sizeUsd', 1)) * 100 if pos.get('sizeUsd', 0) > 0 else 0,
+            "pnlPercent": (pnl / pos.get('sizeUsd', 1)) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0,
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
@@ -6179,6 +7264,49 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     finally:
         # NOTE: Scanner continues running in background - we don't stop it here
         is_connected = False
+
+
+@app.websocket("/ws/ui")
+async def ui_websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time UI updates.
+    Broadcasts: signals, positions, prices, logs, kill switch events.
+    """
+    await ui_ws_manager.connect(websocket)
+    
+    try:
+        # Send initial state
+        initial_state = {
+            "balance": global_paper_trader.balance,
+            "positions": global_paper_trader.positions,
+            "pendingOrders": global_paper_trader.pending_orders,
+            "enabled": global_paper_trader.enabled,
+            "tradeCount": len(global_paper_trader.trades)
+        }
+        await websocket.send_json({"type": "INITIAL_STATE", "data": initial_state, "timestamp": int(datetime.now().timestamp() * 1000)})
+        
+        # Keep connection alive and handle incoming messages
+        while True:
+            try:
+                # Wait for any message (ping/pong or commands)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                
+                # Handle ping
+                if data == "ping":
+                    await websocket.send_text("pong")
+                    
+            except asyncio.TimeoutError:
+                # Send keepalive ping
+                try:
+                    await websocket.send_text("ping")
+                except:
+                    break
+                    
+    except WebSocketDisconnect:
+        ui_ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"UI WebSocket error: {e}")
+        ui_ws_manager.disconnect(websocket)
 
 
 @app.websocket("/ws")

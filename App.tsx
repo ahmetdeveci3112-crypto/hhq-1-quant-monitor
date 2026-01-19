@@ -17,6 +17,7 @@ import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
 import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
+import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
 // Production: fly.io backend, Development: localhost
@@ -27,6 +28,7 @@ const LOCAL_BACKEND = 'ws://localhost:8000';
 // Use Vercel env variables (VITE_BACKEND_WS_URL, VITE_BACKEND_API_URL) or fallback to auto-detection
 const BACKEND_WS_URL = import.meta.env.VITE_BACKEND_WS_URL || (isProduction ? `${FLY_IO_BACKEND}/ws` : `${LOCAL_BACKEND}/ws`);
 const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_BACKEND_WS_URL?.replace('/ws', '/ws/scanner') || (isProduction ? `${FLY_IO_BACKEND}/ws/scanner` : `${LOCAL_BACKEND}/ws/scanner`);
+const BACKEND_UI_WS_URL = isProduction ? `${FLY_IO_BACKEND}/ws/ui` : `${LOCAL_BACKEND}/ws/ui`;
 const BACKEND_API_URL = import.meta.env.VITE_BACKEND_API_URL || (isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000');
 
 const INITIAL_BALANCE = 10000;
@@ -123,6 +125,37 @@ export default function App() {
   // Phase 16: Auto-trade enabled state
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
+
+  // Real-time WebSocket for UI updates
+  const handlePositionUpdate = useCallback((positions: any[]) => {
+    if (positions && positions.length > 0) {
+      setPortfolio(prev => ({
+        ...prev,
+        positions: positions.map(p => ({
+          ...prev.positions.find(pp => pp.id === p.id),
+          ...p
+        }))
+      }));
+    }
+  }, []);
+
+  const handleKillSwitch = useCallback((actions: any) => {
+    addLog(`🚨 Kill Switch: Reduced=${actions.reduced?.length || 0}, Closed=${actions.closed?.length || 0}`);
+  }, [addLog]);
+
+  const handleWsLog = useCallback((message: string) => {
+    addLog(`☁️ ${message}`);
+  }, [addLog]);
+
+  const { isConnected: uiWsConnected, connectionStatus: uiWsStatus } = useUIWebSocket(
+    BACKEND_UI_WS_URL,
+    handlePositionUpdate,
+    undefined, // onSignal
+    undefined, // onPositionOpened
+    undefined, // onPositionClosed
+    handleKillSwitch,
+    handleWsLog
+  );
 
   // Phase 31: Fetch initial state from backend on page load (24/7 sync)
   useEffect(() => {
@@ -592,20 +625,28 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
-          {/* Balance - Hidden on mobile (shown in cards), visible on desktop */}
+          {/* Binance Wallet Style Balance Display */}
           <div className="hidden md:flex items-center gap-6 mr-4 border-r border-slate-800 pr-6">
+            {/* Margin Balance (Equity) = Wallet Balance + Unrealized PnL */}
             <div className="text-right">
-              <div className="text-xs text-slate-500">Bakiye</div>
+              <div className="text-xs text-slate-500">Margin Balance</div>
               <div className="text-sm font-mono font-bold text-white">
                 {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
               </div>
-            </div>
-            <div className="text-right">
-              <div className="text-xs text-slate-500">
-                K/Z {portfolio.positions.length > 0 && <span className="text-amber-400">●</span>}
+              <div className={`text-[10px] font-mono ${(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? '▲' : '▼'} {formatCurrency(Math.abs(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000))} ({(((portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) / 10000 - 1) * 100).toFixed(2)}%)
               </div>
-              <div className={`text-sm font-mono font-bold ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+            </div>
+            {/* Unrealized PnL from open positions */}
+            <div className="text-right">
+              <div className="text-xs text-slate-500 flex items-center gap-1 justify-end">
+                Unrealized PnL {portfolio.positions.length > 0 && <span className="text-amber-400 animate-pulse">●</span>}
+              </div>
+              <div className={`text-sm font-mono font-bold ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+              </div>
+              <div className="text-[10px] text-slate-500 font-mono">
+                Wallet: {formatCurrency(portfolio.balanceUsd)}
               </div>
             </div>
           </div>
@@ -650,32 +691,32 @@ export default function App() {
       {/* Main Content */}
       <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
 
-        {/* Mobile-Only: Prominent Balance & PnL Cards */}
+        {/* Mobile-Only: Binance Wallet Style Cards */}
         <div className="md:hidden grid grid-cols-2 gap-3 mb-4">
-          {/* Equity Card */}
+          {/* Margin Balance Card (Equity) */}
           <div className="bg-gradient-to-br from-indigo-600/20 to-slate-900 border border-indigo-500/30 rounded-2xl p-4 shadow-xl">
-            <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1">Bakiye</div>
+            <div className="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1">Margin Balance</div>
             <div className="text-xl font-bold text-white font-mono">
               {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
             </div>
-            <div className="text-[10px] text-slate-400 mt-1">
-              Ana: {formatCurrency(portfolio.balanceUsd)}
+            <div className={`text-[10px] font-mono mt-1 ${(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - 10000) >= 0 ? '▲' : '▼'} {(((portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) / 10000 - 1) * 100).toFixed(2)}%
             </div>
           </div>
 
-          {/* PnL Card */}
-          <div className={`bg-gradient-to-br ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'from-emerald-600/20 to-slate-900 border-emerald-500/30' : 'from-rose-600/20 to-slate-900 border-rose-500/30'} border rounded-2xl p-4 shadow-xl`}>
+          {/* Unrealized PnL Card */}
+          <div className={`bg-gradient-to-br ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'from-emerald-600/20 to-slate-900 border-emerald-500/30' : 'from-rose-600/20 to-slate-900 border-rose-500/30'} border rounded-2xl p-4 shadow-xl`}>
             <div className="flex items-center gap-2">
-              <div className={`text-xs font-bold uppercase tracking-wider ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                Toplam K/Z
+              <div className={`text-xs font-bold uppercase tracking-wider ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                Unrealized PnL
               </div>
               {portfolio.positions.length > 0 && <span className="text-amber-400 animate-pulse">●</span>}
             </div>
-            <div className={`text-xl font-bold font-mono ${(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+            <div className={`text-xl font-bold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
             </div>
             <div className="text-[10px] text-slate-400 mt-1">
-              {portfolio.positions.length > 0 ? `${portfolio.positions.length} açık pozisyon` : 'Tüm kapalı'}
+              Wallet: {formatCurrency(portfolio.balanceUsd)}
             </div>
           </div>
         </div>
@@ -907,7 +948,7 @@ export default function App() {
             </div>
           </div>
         </div>
-      </main>
-    </div>
+      </main >
+    </div >
   );
 }

@@ -51,7 +51,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     const activeSignals = signals
         .filter(s => s.signalAction !== 'NONE' && s.signalScore >= 45)
         .sort((a, b) => b.signalScore - a.signalScore)
-        .slice(0, 10);
+        .slice(0, 25);  // Show up to 25 active signals
 
     const handleMarketOrder = async (signal: CoinOpportunity) => {
         if (!onMarketOrder) return;
