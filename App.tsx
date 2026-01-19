@@ -17,6 +17,7 @@ import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
 import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
+import { WalletPanel, PositionCardBinance } from './components/WalletPanel';
 import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
@@ -877,20 +878,26 @@ export default function App() {
           {/* RIGHT COLUMN: Positions first (for mobile priority), then Signals, then Logs */}
           <div className="lg:col-span-4 flex flex-col gap-4 md:gap-6">
 
-            {/* Active Positions Panel - Desktop only (mobile is in left column) */}
+            {/* Binance Style Wallet Panel */}
+            <WalletPanel
+              walletBalance={portfolio.balanceUsd}
+              unrealizedPnl={portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)}
+              positions={portfolio.positions}
+              initialBalance={10000}
+            />
+
+            {/* Positions Tab - Desktop only (mobile is in left column) */}
             <div className="hidden lg:flex bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl flex-col gap-4">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-800/50">
-                <h3 className="font-bold text-white flex items-center gap-2">
-                  <Zap className="w-5 h-5 text-amber-500" />
-                  Aktif Pozisyonlar
-                  {portfolio.positions.length > 0 && (
-                    <span className="ml-1 text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full animate-pulse">
-                      {portfolio.positions.length}
-                    </span>
-                  )}
-                </h3>
+              <div className="flex items-center gap-4 pb-2 border-b border-slate-800/50">
+                <span className="font-bold text-white text-sm">Positions</span>
+                <span className="text-slate-500 text-sm">Assets</span>
+                {portfolio.positions.length > 0 && (
+                  <span className="ml-auto text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full">
+                    {portfolio.positions.length}
+                  </span>
+                )}
               </div>
-              <div className="flex flex-col gap-3 max-h-[350px] overflow-y-auto custom-scrollbar">
+              <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto custom-scrollbar">
                 {portfolio.positions.length === 0 ? (
                   <div className="flex flex-col items-center justify-center flex-1 py-6 text-slate-600 border border-dashed border-slate-800 rounded-xl bg-slate-900/30">
                     <Wallet className="w-6 h-6 mb-2 opacity-30" />
@@ -898,8 +905,6 @@ export default function App() {
                   </div>
                 ) : (
                   portfolio.positions.map(pos => {
-                    // Get current price: 1) From position's stored currentPrice (set by backend)
-                    // 2) From opportunities list 3) Fallback to entryPrice
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                     const storedCurrentPrice = (pos as any).currentPrice;
                     const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0)
@@ -907,11 +912,11 @@ export default function App() {
                       : (opportunity?.price || pos.entryPrice);
 
                     return (
-                      <PositionPanel
+                      <PositionCardBinance
                         key={pos.id}
                         position={pos}
                         currentPrice={currentPrice}
-                        onClosePosition={() => handleManualClose(pos.id)}
+                        onClose={() => handleManualClose(pos.id)}
                       />
                     );
                   })
