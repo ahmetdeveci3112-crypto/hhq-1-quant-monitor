@@ -798,7 +798,7 @@ export default function App() {
               </div>
 
               {/* Mobile: Card Layout */}
-              <div className="lg:hidden p-3 space-y-2 max-h-[300px] overflow-y-auto">
+              <div className="lg:hidden p-3 space-y-2 max-h-[400px] overflow-y-auto">
                 {portfolio.positions.length === 0 ? (
                   <div className="text-center py-8 text-slate-600 text-xs">No open positions</div>
                 ) : (
@@ -809,6 +809,16 @@ export default function App() {
                     const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                     const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                     const isLong = pos.side === 'LONG';
+
+                    // TP/SL ve Trailing bilgileri
+                    const tp = (pos as any).takeProfit || 0;
+                    const sl = (pos as any).stopLoss || 0;
+                    const trailingStop = (pos as any).trailingStop || sl;
+                    const isTrailingActive = (pos as any).isTrailingActive || false;
+                    const tpDistance = tp > 0 && currentPrice > 0
+                      ? isLong ? ((tp - currentPrice) / currentPrice) * 100 : ((currentPrice - tp) / currentPrice) * 100
+                      : 0;
+
                     return (
                       <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
                         <div className="flex items-center justify-between mb-2">
@@ -816,6 +826,7 @@ export default function App() {
                             <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
                             <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
+                            {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TRAIL</span>}
                           </div>
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Close</button>
                         </div>
@@ -823,6 +834,10 @@ export default function App() {
                           <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
                           <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
                           <div><span className="text-slate-500">Mark</span><div className="font-mono text-white">${formatPrice(currentPrice)}</div></div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
+                          <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
+                          <div><span className="text-rose-400">SL: ${formatPrice(isTrailingActive ? trailingStop : sl)}</span></div>
                         </div>
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -848,6 +863,8 @@ export default function App() {
                       <th className="text-right py-3 px-2 font-medium">Invested</th>
                       <th className="text-right py-3 px-2 font-medium">Entry</th>
                       <th className="text-right py-3 px-2 font-medium">Mark</th>
+                      <th className="text-right py-3 px-2 font-medium">TP/SL</th>
+                      <th className="text-center py-3 px-2 font-medium">Trail</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
                       <th className="text-right py-3 px-2 font-medium">ROI%</th>
                       <th className="text-right py-3 px-4 font-medium">Action</th>
@@ -856,7 +873,7 @@ export default function App() {
                   <tbody>
                     {portfolio.positions.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-12 text-center text-slate-600">No open positions</td>
+                        <td colSpan={10} className="py-12 text-center text-slate-600">No open positions</td>
                       </tr>
                     ) : (
                       portfolio.positions.map(pos => {
@@ -866,6 +883,19 @@ export default function App() {
                         const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                         const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                         const isLong = pos.side === 'LONG';
+
+                        // TP/SL ve Trailing bilgileri
+                        const tp = (pos as any).takeProfit || 0;
+                        const sl = (pos as any).stopLoss || 0;
+                        const trailingStop = (pos as any).trailingStop || sl;
+                        const isTrailingActive = (pos as any).isTrailingActive || false;
+
+                        // TP'ye ne kadar kaldı (%)
+                        const tpDistance = tp > 0 && currentPrice > 0
+                          ? isLong
+                            ? ((tp - currentPrice) / currentPrice) * 100
+                            : ((currentPrice - tp) / currentPrice) * 100
+                          : 0;
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
@@ -889,6 +919,19 @@ export default function App() {
                             <td className="py-3 px-2 text-right font-mono text-slate-300">{formatCurrency(margin)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(pos.entryPrice)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(currentPrice)}</td>
+                            <td className="py-3 px-2 text-right">
+                              <div className="text-[10px] space-y-0.5">
+                                <div className="text-emerald-400">TP: ${formatPrice(tp)} <span className="text-slate-500">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
+                                <div className="text-rose-400">SL: ${formatPrice(isTrailingActive ? trailingStop : sl)}</div>
+                              </div>
+                            </td>
+                            <td className="py-3 px-2 text-center">
+                              {isTrailingActive ? (
+                                <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">ON</span>
+                              ) : (
+                                <span className="text-[10px] bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">OFF</span>
+                              )}
+                            </td>
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
                             </td>
