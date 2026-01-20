@@ -4092,6 +4092,8 @@ class PositionBasedKillSwitch:
                     paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
                     actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                     logger.warning(f"🚨 KILL SWITCH FULL: Closed {side} {symbol} at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
+                    # Phase 48: Record fault for this coin
+                    kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_FULL')
                     
                 elif position_loss_pct <= self.first_reduction_pct:
                     # -10% to -15% of invested margin: REDUCE 50% (only once per position)
@@ -4103,6 +4105,8 @@ class PositionBasedKillSwitch:
                         self.partially_closed[pos_id] = 1
                         actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                         logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
+                        # Phase 48: Record fault for this coin
+                        kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_PARTIAL')
                         
             except Exception as e:
                 logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
@@ -4185,6 +4189,84 @@ class PositionBasedKillSwitch:
 # Global PositionBasedKillSwitch instance (replaces DailyKillSwitch)
 daily_kill_switch = PositionBasedKillSwitch()
 
+
+# ============================================================================
+# PHASE 48: KILL SWITCH FAULT TRACKER
+# ============================================================================
+
+class KillSwitchFaultTracker:
+    """
+    Tracks coins that have triggered kill switch and applies penalty to future signals.
+    
+    - Each kill switch adds -25 points to the coin's fault score
+    - Fault score decays by 10 points per 24 hours
+    - Penalty is applied to signal score before trade evaluation
+    """
+    
+    def __init__(self, penalty_per_fault: int = -25, decay_per_day: int = 10):
+        self.faults: Dict[str, list] = {}  # symbol -> list of fault timestamps
+        self.penalty_per_fault = penalty_per_fault  # -25 points per kill switch
+        self.decay_per_day = decay_per_day  # 10 points decay per 24h
+        self.max_penalty = -75  # Maximum penalty cap
+        logger.info(f"📋 KillSwitchFaultTracker initialized: {penalty_per_fault} points per fault, {decay_per_day} decay/day")
+    
+    def record_fault(self, symbol: str, reason: str = "KILL_SWITCH"):
+        """Record a kill switch fault for a symbol."""
+        if symbol not in self.faults:
+            self.faults[symbol] = []
+        
+        self.faults[symbol].append({
+            'timestamp': datetime.now().timestamp(),
+            'reason': reason
+        })
+        
+        # Keep only last 7 days of faults
+        cutoff = datetime.now().timestamp() - (7 * 24 * 60 * 60)
+        self.faults[symbol] = [f for f in self.faults[symbol] if f['timestamp'] > cutoff]
+        
+        penalty = self.get_penalty(symbol)
+        logger.warning(f"📋 FAULT RECORDED: {symbol} ({reason}) - Current penalty: {penalty} points")
+    
+    def get_penalty(self, symbol: str) -> int:
+        """
+        Calculate penalty for a symbol based on fault history.
+        Newer faults have full penalty, older faults decay.
+        """
+        if symbol not in self.faults or not self.faults[symbol]:
+            return 0
+        
+        now = datetime.now().timestamp()
+        total_penalty = 0
+        
+        for fault in self.faults[symbol]:
+            age_hours = (now - fault['timestamp']) / 3600
+            age_days = age_hours / 24
+            
+            # Calculate decayed penalty
+            decayed_penalty = self.penalty_per_fault + (self.decay_per_day * age_days)
+            if decayed_penalty < 0:  # Only apply if still negative
+                total_penalty += int(decayed_penalty)
+        
+        # Cap at max penalty
+        return max(total_penalty, self.max_penalty)
+    
+    def get_all_faults(self) -> Dict[str, dict]:
+        """Get summary of all faults for UI display."""
+        result = {}
+        for symbol, faults in self.faults.items():
+            if faults:
+                penalty = self.get_penalty(symbol)
+                if penalty < 0:
+                    result[symbol] = {
+                        'fault_count': len(faults),
+                        'penalty': penalty,
+                        'last_fault': max(f['timestamp'] for f in faults)
+                    }
+        return result
+
+
+# Global KillSwitchFaultTracker instance
+kill_switch_fault_tracker = KillSwitchFaultTracker()
 
 # ============================================================================
 # PHASE 36: ORDER BOOK IMBALANCE DETECTOR
@@ -4669,6 +4751,16 @@ class SignalGenerator:
 
         # Layer 10-14 artık SKOR VERMİYOR - bunlar KONFİRMASYON katmanları olarak aşağıda kontrol edilecek
         # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
+        
+        # =====================================================================
+        # PHASE 48: KILL SWITCH FAULT PENALTY
+        # =====================================================================
+        # Apply penalty for coins that have previously triggered kill switch
+        ks_penalty = kill_switch_fault_tracker.get_penalty(symbol)
+        if ks_penalty < 0:
+            score += ks_penalty  # ks_penalty is already negative
+            reasons.append(f"KS_FAULT({ks_penalty}p)")
+            logger.info(f"📋 Kill Switch Penalty applied to {symbol}: {ks_penalty} points (new score: {score})")
         
         # =====================================================================
         # AŞAMA 1: MİNİMUM SKOR KONTROLÜ
