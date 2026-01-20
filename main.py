@@ -2513,6 +2513,10 @@ class MultiCoinScanner:
         opportunities = []
         signals = []
         
+        # Yield control to event loop every N coins to prevent blocking API requests
+        yield_every = 50
+        coin_count = 0
+        
         for symbol, ticker in tickers.items():
             try:
                 analyzer = self.get_or_create_analyzer(symbol)
@@ -2543,6 +2547,11 @@ class MultiCoinScanner:
                     signals.append(signal)
                 
                 opportunities.append(analyzer.opportunity.to_dict())
+                
+                # Yield control to event loop periodically to allow API requests to be processed
+                coin_count += 1
+                if coin_count % yield_every == 0:
+                    await asyncio.sleep(0)
                 
             except Exception as e:
                 logger.debug(f"Error analyzing {symbol}: {e}")
