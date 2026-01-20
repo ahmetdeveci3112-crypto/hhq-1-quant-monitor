@@ -19,7 +19,8 @@ export function useUIWebSocket(
     onPositionOpened?: (position: any) => void,
     onPositionClosed?: (trade: any) => void,
     onKillSwitch?: (actions: any) => void,
-    onLog?: (message: string) => void
+    onLog?: (message: string) => void,
+    onInitialState?: (state: any) => void
 ) {
     const [state, setState] = useState<UIWebSocketState>({
         isConnected: false,
@@ -89,7 +90,7 @@ export function useUIWebSocket(
                             onLog?.(message.data.message);
                             break;
                         case 'INITIAL_STATE':
-                            // Initial state is handled separately
+                            onInitialState?.(message.data);
                             break;
                     }
                 } catch (e) {
@@ -106,11 +107,11 @@ export function useUIWebSocket(
                     clearInterval(pingIntervalRef.current);
                 }
 
-                // Auto-reconnect after 3 seconds
+                // Auto-reconnect after 1 second (faster reconnection)
                 reconnectTimeoutRef.current = setTimeout(() => {
                     console.log('🔄 Attempting to reconnect...');
                     connect();
-                }, 3000);
+                }, 1000);
             };
 
             ws.onerror = (error) => {
@@ -122,7 +123,7 @@ export function useUIWebSocket(
             console.error('WebSocket connection error:', error);
             setState(s => ({ ...s, connectionStatus: 'error' }));
         }
-    }, [wsUrl, onPositionUpdate, onSignal, onPositionOpened, onPositionClosed, onKillSwitch, onLog]);
+    }, [wsUrl, onPositionUpdate, onSignal, onPositionOpened, onPositionClosed, onKillSwitch, onLog, onInitialState]);
 
     const disconnect = useCallback(() => {
         if (reconnectTimeoutRef.current) {

@@ -152,6 +152,21 @@ export default function App() {
     addLog(`☁️ ${message}`);
   }, [addLog]);
 
+  const handleInitialState = useCallback((data: any) => {
+    console.log('📦 Received INITIAL_STATE from WebSocket');
+    if (data) {
+      setPortfolio(prev => ({
+        ...prev,
+        balanceUsd: data.balance || prev.balanceUsd,
+        positions: data.positions || prev.positions,
+        trades: prev.trades // trades are loaded separately from HTTP API
+      }));
+      if (data.enabled !== undefined) {
+        setAutoTradeEnabled(data.enabled);
+      }
+    }
+  }, []);
+
   const { isConnected: uiWsConnected, connectionStatus: uiWsStatus } = useUIWebSocket(
     BACKEND_UI_WS_URL,
     handlePositionUpdate,
@@ -159,7 +174,8 @@ export default function App() {
     undefined, // onPositionOpened
     undefined, // onPositionClosed
     handleKillSwitch,
-    handleWsLog
+    handleWsLog,
+    handleInitialState
   );
 
   // Phase 31: Fetch initial state from backend on page load (24/7 sync)
