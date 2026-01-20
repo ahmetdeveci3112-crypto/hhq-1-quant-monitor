@@ -7282,7 +7282,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         
         await websocket.send_json({
             "type": "scanner_update",
-            "opportunities": current_opportunities[:100],  # Top 100 opportunities
+            "opportunities": current_opportunities,  # ALL opportunities (no limit)
             "stats": current_stats,
             "portfolio": {
                 "balance": global_paper_trader.balance,
@@ -7314,7 +7314,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 # Send update to client
                 update_data = {
                     "type": "scanner_update",
-                    "opportunities": opportunities[:50],
+                    "opportunities": opportunities,  # ALL opportunities (no limit)
                     "stats": stats,
                     "portfolio": {
                         "balance": global_paper_trader.balance,
