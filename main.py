@@ -2514,7 +2514,8 @@ class MultiCoinScanner:
         signals = []
         
         # Yield control to event loop every N coins to prevent blocking API requests
-        yield_every = 50
+        # Lower value = more responsive API but slightly slower scan
+        yield_every = 10  # Yield frequently to keep API responsive
         coin_count = 0
         
         for symbol, ticker in tickers.items():
