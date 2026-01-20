@@ -7049,6 +7049,55 @@ async def paper_trading_update_settings(
     global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MaxPos:{global_paper_trader.max_positions}")
     global_paper_trader.save_state()
     logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} Entry:{global_paper_trader.entry_tightness} Exit:{global_paper_trader.exit_tightness}")
+    
+    # ====== PHASE 37: Update existing positions' TP/SL based on new exit_tightness ======
+    updated_positions = 0
+    for pos in global_paper_trader.positions:
+        try:
+            entry_price = pos.get('entryPrice', 0)
+            if entry_price <= 0:
+                continue
+            
+            # Use stored ATR or estimate from entry price (2% is typical ATR)
+            atr = pos.get('atr', entry_price * 0.02)
+            side = pos.get('side', '')
+            
+            # Recalculate TP/SL with new exit_tightness
+            adjusted_sl_atr = global_paper_trader.sl_atr * global_paper_trader.exit_tightness
+            adjusted_tp_atr = global_paper_trader.tp_atr * global_paper_trader.exit_tightness
+            adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
+            adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
+            
+            if side == 'LONG':
+                new_sl = entry_price - (atr * adjusted_sl_atr)
+                new_tp = entry_price + (atr * adjusted_tp_atr)
+                new_trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
+            else:  # SHORT
+                new_sl = entry_price + (atr * adjusted_sl_atr)
+                new_tp = entry_price - (atr * adjusted_tp_atr)
+                new_trail_activation = entry_price - (atr * adjusted_trail_activation_atr)
+            
+            new_trail_distance = atr * adjusted_trail_distance_atr
+            
+            # Only update if not already in trailing mode (to preserve trailing stop progress)
+            if not pos.get('isTrailingActive', False):
+                pos['stopLoss'] = new_sl
+                pos['trailingStop'] = new_sl
+            
+            pos['takeProfit'] = new_tp
+            pos['trailActivation'] = new_trail_activation
+            pos['trailDistance'] = new_trail_distance
+            
+            updated_positions += 1
+            
+        except Exception as e:
+            logger.error(f"Error updating position {pos.get('symbol', '?')}: {e}")
+    
+    if updated_positions > 0:
+        logger.info(f"🔄 Updated TP/SL for {updated_positions} existing positions based on new exit_tightness: {global_paper_trader.exit_tightness}")
+        global_paper_trader.add_log(f"🔄 {updated_positions} pozisyonun TP/SL'si güncellendi (Exit: {global_paper_trader.exit_tightness})")
+        global_paper_trader.save_state()
+    
     return JSONResponse({
         "success": True,
         "symbol": global_paper_trader.symbol,
@@ -7062,7 +7111,8 @@ async def paper_trading_update_settings(
         "zScoreThreshold": global_paper_trader.z_score_threshold,
         "minConfidenceScore": global_paper_trader.min_confidence_score,
         "entryTightness": global_paper_trader.entry_tightness,
-        "exitTightness": global_paper_trader.exit_tightness
+        "exitTightness": global_paper_trader.exit_tightness,
+        "updatedPositions": updated_positions
     })
 
 

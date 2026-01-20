@@ -815,9 +815,12 @@ export default function App() {
                     const sl = (pos as any).stopLoss || 0;
                     const trailingStop = (pos as any).trailingStop || sl;
                     const isTrailingActive = (pos as any).isTrailingActive || false;
-                    const tpDistance = tp > 0 && currentPrice > 0
-                      ? isLong ? ((tp - currentPrice) / currentPrice) * 100 : ((currentPrice - tp) / currentPrice) * 100
+                    const tpRoi = tp > 0 && pos.entryPrice > 0
+                      ? isLong
+                        ? ((tp - pos.entryPrice) / pos.entryPrice) * 100 * (pos.leverage || 10)
+                        : ((pos.entryPrice - tp) / pos.entryPrice) * 100 * (pos.leverage || 10)
                       : 0;
+                    const tpDistance = tpRoi - roi; // TP'ye kaç % kaldı
 
                     return (
                       <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
@@ -890,12 +893,16 @@ export default function App() {
                         const trailingStop = (pos as any).trailingStop || sl;
                         const isTrailingActive = (pos as any).isTrailingActive || false;
 
-                        // TP'ye ne kadar kaldı (%)
-                        const tpDistance = tp > 0 && currentPrice > 0
+                        // TP'ye ulaşınca elde edilecek ROI (kaldıraç dahil)
+                        const leverage = pos.leverage || 10;
+                        const tpRoi = tp > 0 && pos.entryPrice > 0
                           ? isLong
-                            ? ((tp - currentPrice) / currentPrice) * 100
-                            : ((currentPrice - tp) / currentPrice) * 100
+                            ? ((tp - pos.entryPrice) / pos.entryPrice) * 100 * leverage
+                            : ((pos.entryPrice - tp) / pos.entryPrice) * 100 * leverage
                           : 0;
+                        // Şu anki fiyattan TP'ye kalan mesafe (kaldıraçlı ROI farkı)
+                        const currentRoi = roi; // zaten kaldıraçlı
+                        const tpDistance = tpRoi - currentRoi; // TP'ye kaç % kaldı
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
