@@ -5476,6 +5476,10 @@ class PaperTradingEngine:
             "trailDistance": trail_distance,
             "leverage": adjusted_leverage,
             "spreadLevel": spread_level,
+            # Phase 49: Additional data for analysis
+            "signalScore": signal.get('confidenceScore', 0) if signal else 0,
+            "mtfScore": signal.get('mtf_score', 0) if signal else 0,
+            "zScore": signal.get('zscore', 0) if signal else 0,
             "createdAt": int(datetime.now().timestamp() * 1000),
             "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),  # 5 dakika sonra aktif
             "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
@@ -5616,7 +5620,11 @@ class PaperTradingEngine:
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": order['leverage'],
             "spreadLevel": order['spreadLevel'],
-            "pullbackPct": order.get('pullbackPct', 1.0)  # Adverse exit kontrolü için
+            "pullbackPct": order.get('pullbackPct', 1.0),  # Adverse exit kontrolü için
+            # Phase 49: Carry forward analysis data from pending order
+            "signalScore": order.get('signalScore', 0),
+            "mtfScore": order.get('mtfScore', 0),
+            "zScore": order.get('zScore', 0)
         }
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -6280,7 +6288,12 @@ class PaperTradingEngine:
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
-            "leverage": pos.get('leverage', 10)
+            "leverage": pos.get('leverage', 10),
+            # Phase 49: Carry forward analysis data for post-trade analysis
+            "signalScore": pos.get('signalScore', 0),
+            "mtfScore": pos.get('mtfScore', 0),
+            "zScore": pos.get('zScore', 0),
+            "spreadLevel": pos.get('spreadLevel', 'unknown')
         }
         self.trades.append(trade)
         
