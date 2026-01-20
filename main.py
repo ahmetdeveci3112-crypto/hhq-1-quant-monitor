@@ -6919,11 +6919,11 @@ async def paper_trading_status():
     return JSONResponse({
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
-        "trades": global_paper_trader.trades[-20:],  # Last 20 trades
+        "trades": global_paper_trader.trades,  # ALL trades (no limit)
         "stats": global_paper_trader.stats,
         "enabled": global_paper_trader.enabled,
-        "logs": global_paper_trader.logs[-30:],  # Last 30 logs
-        "equityCurve": global_paper_trader.equity_curve[-50:]
+        "logs": global_paper_trader.logs[-100:],  # Last 100 logs
+        "equityCurve": global_paper_trader.equity_curve[-200:]  # Last 200 points
     })
 
 @app.post("/paper-trading/reset")
@@ -7371,7 +7371,7 @@ async def ui_websocket_endpoint(websocket: WebSocket):
             # Include current scanner data for instant UI update
             "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
             "stats": multi_coin_scanner.get_scanner_stats() if multi_coin_scanner else {},
-            "logs": global_paper_trader.logs[-20:] if hasattr(global_paper_trader, 'logs') else []
+            "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else []
         }
         await websocket.send_json({"type": "INITIAL_STATE", "data": initial_state, "timestamp": int(datetime.now().timestamp() * 1000)})
         
