@@ -4026,7 +4026,8 @@ class PositionBasedKillSwitch:
     def check_positions(self, paper_trader) -> dict:
         """
         Check all positions and apply gradual reduction or close.
-        Uses ACTUAL portfolio loss percentage (PnL / balance) instead of leveraged ROI.
+        Uses POSITION-BASED UNLEVERAGED LOSS percentage: (PnL / invested_margin) * 100
+        This means -10% threshold triggers when you've lost 10% of your invested capital.
         Returns summary of actions taken.
         """
         self.reset_for_new_day(paper_trader.balance)
@@ -4037,9 +4038,6 @@ class PositionBasedKillSwitch:
             "skipped_profitable": []
         }
         
-        # Get current balance for portfolio-based loss calculation
-        current_balance = paper_trader.balance
-        
         for pos in list(paper_trader.positions):
             try:
                 pos_id = pos.get('id', '')
@@ -4049,36 +4047,52 @@ class PositionBasedKillSwitch:
                 current_price = pos.get('currentPrice', entry_price)
                 unrealized_pnl = pos.get('unrealizedPnl', 0)
                 
+                # Get invested margin (actual capital at risk, not leveraged size)
+                initial_margin = pos.get('initialMargin', 0)
+                leverage = pos.get('leverage', 10)
+                size_usd = pos.get('sizeUsd', 0)
+                
+                # Calculate margin if not stored
+                if initial_margin <= 0:
+                    initial_margin = size_usd / leverage if leverage > 0 else size_usd
+                
+                # Skip if no margin (invalid position)
+                if initial_margin <= 0:
+                    logger.warning(f"Kill switch: {symbol} has no margin data, skipping")
+                    continue
+                
                 # Skip profitable positions (don't touch winners!)
                 if unrealized_pnl >= 0:
                     actions["skipped_profitable"].append(symbol)
                     continue
                 
-                # Calculate ACTUAL portfolio loss percentage (without leverage effect)
-                # This is the real impact on the portfolio: PnL / total_balance
-                portfolio_loss_pct = (unrealized_pnl / current_balance) * 100 if current_balance > 0 else 0
+                # Calculate POSITION LOSS as % of INVESTED MARGIN (unleveraged)
+                # Example: $174 margin, $90 loss = -51.7% position loss
+                position_loss_pct = (unrealized_pnl / initial_margin) * 100
+                
+                # Also get leveraged ROI for logging comparison
+                leveraged_roi = pos.get('unrealizedPnlPercent', 0)
                 
                 # Log for debugging
-                leveraged_roi = pos.get('unrealizedPnlPercent', 0)
-                logger.debug(f"Kill switch check {symbol}: Portfolio Loss={portfolio_loss_pct:.2f}%, Leveraged ROI={leveraged_roi:.2f}%")
+                logger.info(f"🎯 Kill switch check {symbol}: Invested=${initial_margin:.2f}, PnL=${unrealized_pnl:.2f}, Position Loss={position_loss_pct:.2f}%, Leveraged ROI={leveraged_roi:.2f}%")
                 
-                # Check loss thresholds using portfolio loss (not leveraged ROI)
-                if portfolio_loss_pct <= self.full_close_pct:
-                    # -15% portfolio impact or worse: FULL CLOSE
+                # Check loss thresholds using POSITION LOSS (not leveraged ROI)
+                if position_loss_pct <= self.full_close_pct:
+                    # -15% of invested margin or worse: FULL CLOSE
                     paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
-                    actions["closed"].append(f"{symbol} ({portfolio_loss_pct:.1f}%)")
-                    logger.warning(f"🚨 KILL SWITCH FULL: Closed {side} {symbol} at {portfolio_loss_pct:.1f}% portfolio loss (ROI: {leveraged_roi:.1f}%)")
+                    actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
+                    logger.warning(f"🚨 KILL SWITCH FULL: Closed {side} {symbol} at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
                     
-                elif portfolio_loss_pct <= self.first_reduction_pct:
-                    # -10% to -15% portfolio impact: REDUCE 50% (only once per position)
+                elif position_loss_pct <= self.first_reduction_pct:
+                    # -10% to -15% of invested margin: REDUCE 50% (only once per position)
                     reduction_count = self.partially_closed.get(pos_id, 0)
                     
                     if reduction_count == 0:
                         # First reduction - close 50%
                         self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
                         self.partially_closed[pos_id] = 1
-                        actions["reduced"].append(f"{symbol} ({portfolio_loss_pct:.1f}%)")
-                        logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {portfolio_loss_pct:.1f}% portfolio loss (ROI: {leveraged_roi:.1f}%)")
+                        actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
+                        logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
                         
             except Exception as e:
                 logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
