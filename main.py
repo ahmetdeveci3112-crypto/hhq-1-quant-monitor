@@ -7287,9 +7287,9 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "portfolio": {
                 "balance": global_paper_trader.balance,
                 "positions": global_paper_trader.positions,
-                "trades": global_paper_trader.trades[-20:],
+                "trades": global_paper_trader.trades,  # ALL trades
                 "stats": global_paper_trader.stats,
-                "logs": global_paper_trader.logs[-30:],
+                "logs": global_paper_trader.logs[-100:],
                 "enabled": global_paper_trader.enabled
             },
             "timestamp": datetime.now().timestamp(),
@@ -7319,9 +7319,9 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     "portfolio": {
                         "balance": global_paper_trader.balance,
                         "positions": global_paper_trader.positions,
-                        "trades": global_paper_trader.trades[-20:],
+                        "trades": global_paper_trader.trades,  # ALL trades
                         "stats": global_paper_trader.stats,
-                        "logs": global_paper_trader.logs[-30:],
+                        "logs": global_paper_trader.logs[-100:],
                         "enabled": global_paper_trader.enabled
                     },
                     "timestamp": datetime.now().timestamp()
