@@ -82,6 +82,10 @@ class SQLiteManager:
                     close_time INTEGER,
                     close_reason TEXT,
                     leverage INTEGER DEFAULT 10,
+                    signal_score INTEGER DEFAULT 0,
+                    mtf_score INTEGER DEFAULT 0,
+                    z_score REAL DEFAULT 0,
+                    spread_level TEXT DEFAULT 'unknown',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -181,6 +185,26 @@ class SQLiteManager:
             ''')
             
             await db.commit()
+            
+            # Phase 49: Migration - Add new columns to trades table if they don't exist
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN signal_score INTEGER DEFAULT 0')
+            except:
+                pass  # Column already exists
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN mtf_score INTEGER DEFAULT 0')
+            except:
+                pass
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN z_score REAL DEFAULT 0')
+            except:
+                pass
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN spread_level TEXT DEFAULT "unknown"')
+            except:
+                pass
+            await db.commit()
+            
             self._initialized = True
             logger.info("✅ SQLite database initialized with all tables")
     
@@ -207,8 +231,8 @@ class SQLiteManager:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
                 INSERT OR REPLACE INTO trades 
-                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, open_time, close_time, close_reason, leverage)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, open_time, close_time, close_reason, leverage, signal_score, mtf_score, z_score, spread_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade.get('id'),
                 trade.get('symbol'),
@@ -222,7 +246,11 @@ class SQLiteManager:
                 trade.get('openTime', 0),
                 trade.get('closeTime'),
                 trade.get('reason', trade.get('closeReason')),
-                trade.get('leverage', 10)
+                trade.get('leverage', 10),
+                trade.get('signalScore', 0),
+                trade.get('mtfScore', 0),
+                trade.get('zScore', 0),
+                trade.get('spreadLevel', 'unknown')
             ))
             await db.commit()
     
