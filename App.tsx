@@ -155,14 +155,37 @@ export default function App() {
   const handleInitialState = useCallback((data: any) => {
     console.log('📦 Received INITIAL_STATE from WebSocket');
     if (data) {
+      // Update portfolio with all available data
       setPortfolio(prev => ({
         ...prev,
         balanceUsd: data.balance || prev.balanceUsd,
         positions: data.positions || prev.positions,
-        trades: prev.trades // trades are loaded separately from HTTP API
+        trades: data.trades || prev.trades
       }));
+
+      // Update auto trade state
       if (data.enabled !== undefined) {
         setAutoTradeEnabled(data.enabled);
+      }
+
+      // Update opportunities from scanner (instant data on connect)
+      if (data.opportunities && data.opportunities.length > 0) {
+        setOpportunities(data.opportunities);
+      }
+
+      // Update scanner stats
+      if (data.stats) {
+        setScannerStats(data.stats);
+      }
+
+      // Update logs
+      if (data.logs && data.logs.length > 0) {
+        setLogs(prev => {
+          const newLogs = data.logs
+            .filter((log: { message: string }) => !prev.some(p => p.includes(log.message)))
+            .map((log: { time: string; message: string }) => `[${log.time}] ☁️ ${log.message}`);
+          return newLogs.length > 0 ? [...newLogs.reverse(), ...prev].slice(0, 100) : prev;
+        });
       }
     }
   }, []);

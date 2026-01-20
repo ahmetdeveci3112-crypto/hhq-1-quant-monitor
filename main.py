@@ -7360,13 +7360,18 @@ async def ui_websocket_endpoint(websocket: WebSocket):
     await ui_ws_manager.connect(websocket)
     
     try:
-        # Send initial state
+        # Send initial state with ALL current data (portfolio + scanner data)
         initial_state = {
             "balance": global_paper_trader.balance,
             "positions": global_paper_trader.positions,
             "pendingOrders": global_paper_trader.pending_orders,
             "enabled": global_paper_trader.enabled,
-            "tradeCount": len(global_paper_trader.trades)
+            "tradeCount": len(global_paper_trader.trades),
+            "trades": global_paper_trader.trades,  # Include trade history
+            # Include current scanner data for instant UI update
+            "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
+            "stats": multi_coin_scanner.get_scanner_stats() if multi_coin_scanner else {},
+            "logs": global_paper_trader.logs[-20:] if hasattr(global_paper_trader, 'logs') else []
         }
         await websocket.send_json({"type": "INITIAL_STATE", "data": initial_state, "timestamp": int(datetime.now().timestamp() * 1000)})
         
