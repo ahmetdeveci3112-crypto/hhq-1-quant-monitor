@@ -110,17 +110,17 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-500 mb-3">
-                  📊 Sistem performansa göre bu aralıkta otomatik skor belirler
+                  📊 Sistem son 10 trade performansına göre bu aralıkta otomatik skor belirler
                 </p>
                 <div className="space-y-3">
                   <div>
                     <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                      <span>Min (Agresif)</span>
+                      <span>Kazanırken (Agresif Mod)</span>
                       <span className="font-mono text-emerald-400">{localSettings.minScoreLow || 50}</span>
                     </div>
                     <input
                       type="range"
-                      min="40"
+                      min="30"
                       max="60"
                       step="5"
                       value={localSettings.minScoreLow || 50}
@@ -130,13 +130,13 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                   </div>
                   <div>
                     <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                      <span>Max (Defansif)</span>
+                      <span>Kaybederken (Defansif Mod)</span>
                       <span className="font-mono text-rose-400">{localSettings.minScoreHigh || 70}</span>
                     </div>
                     <input
                       type="range"
                       min="60"
-                      max="85"
+                      max="100"
                       step="5"
                       value={localSettings.minScoreHigh || 70}
                       onChange={e => setLocalSettings({ ...localSettings, minScoreHigh: parseInt(e.target.value) })}
@@ -145,9 +145,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                   </div>
                 </div>
                 <div className="flex justify-between text-[10px] text-slate-400 mt-2 bg-slate-900/50 p-2 rounded">
-                  <span>⚔️ WR {'>'} 60%: {localSettings.minScoreLow || 50}</span>
-                  <span>⚖️ WR 40-60%: orta</span>
-                  <span>🛡️ WR {'<'} 40%: {localSettings.minScoreHigh || 70}</span>
+                  <span>⚔️ Kazanırken: {localSettings.minScoreLow || 50}</span>
+                  <span>⚖️ Normal: orta</span>
+                  <span>🛡️ Kaybederken: {localSettings.minScoreHigh || 70}</span>
                 </div>
               </div>
             </div>
