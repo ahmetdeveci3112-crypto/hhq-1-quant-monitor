@@ -4219,24 +4219,58 @@ daily_kill_switch = PositionBasedKillSwitch()
 
 
 # ============================================================================
-# PHASE 48: KILL SWITCH FAULT TRACKER
+# PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
 # ============================================================================
 
 class KillSwitchFaultTracker:
     """
     Tracks coins that have triggered kill switch and applies penalty to future signals.
     
-    - Each kill switch adds -25 points to the coin's fault score
-    - Fault score decays by 10 points per 24 hours
-    - Penalty is applied to signal score before trade evaluation
+    ENHANCED VERSION:
+    - Each kill switch adds -50 points to the coin's fault score (was -25)
+    - Fault score decays by 5 points per 24 hours (was 10)
+    - Coins with kill switch in last 24h are BLOCKED from new positions
+    - Loads existing faults from trade history on startup
     """
     
-    def __init__(self, penalty_per_fault: int = -25, decay_per_day: int = 10):
+    def __init__(self, penalty_per_fault: int = -50, decay_per_day: int = 5):
         self.faults: Dict[str, list] = {}  # symbol -> list of fault timestamps
-        self.penalty_per_fault = penalty_per_fault  # -25 points per kill switch
-        self.decay_per_day = decay_per_day  # 10 points decay per 24h
-        self.max_penalty = -75  # Maximum penalty cap
-        logger.info(f"📋 KillSwitchFaultTracker initialized: {penalty_per_fault} points per fault, {decay_per_day} decay/day")
+        self.penalty_per_fault = penalty_per_fault  # -50 points per kill switch
+        self.decay_per_day = decay_per_day  # 5 points decay per 24h (slower decay)
+        self.max_penalty = -100  # Maximum penalty cap (was -75)
+        self.block_hours = 24  # Block new positions for this many hours after KS
+        logger.info(f"📋 KillSwitchFaultTracker initialized: {penalty_per_fault} points/fault, {decay_per_day} decay/day, {self.block_hours}h block")
+    
+    def load_from_trade_history(self, trades: list):
+        """Load fault history from existing trades on startup."""
+        ks_count = 0
+        for trade in trades:
+            reason = trade.get('reason', '')
+            if 'KILL_SWITCH' in reason:
+                symbol = trade.get('symbol', '')
+                close_time = trade.get('closeTime', 0)
+                if symbol and close_time:
+                    if symbol not in self.faults:
+                        self.faults[symbol] = []
+                    self.faults[symbol].append({
+                        'timestamp': close_time / 1000,  # Convert from ms to seconds
+                        'reason': reason
+                    })
+                    ks_count += 1
+        
+        # Clean up old faults
+        self._cleanup_old_faults()
+        
+        active_faults = sum(len(f) for f in self.faults.values())
+        logger.info(f"📋 Loaded {ks_count} kill switch faults from trade history, {active_faults} still active")
+    
+    def _cleanup_old_faults(self):
+        """Remove faults older than 7 days."""
+        cutoff = datetime.now().timestamp() - (7 * 24 * 60 * 60)
+        for symbol in list(self.faults.keys()):
+            self.faults[symbol] = [f for f in self.faults[symbol] if f['timestamp'] > cutoff]
+            if not self.faults[symbol]:
+                del self.faults[symbol]
     
     def record_fault(self, symbol: str, reason: str = "KILL_SWITCH"):
         """Record a kill switch fault for a symbol."""
@@ -4248,12 +4282,26 @@ class KillSwitchFaultTracker:
             'reason': reason
         })
         
-        # Keep only last 7 days of faults
-        cutoff = datetime.now().timestamp() - (7 * 24 * 60 * 60)
-        self.faults[symbol] = [f for f in self.faults[symbol] if f['timestamp'] > cutoff]
+        self._cleanup_old_faults()
         
         penalty = self.get_penalty(symbol)
-        logger.warning(f"📋 FAULT RECORDED: {symbol} ({reason}) - Current penalty: {penalty} points")
+        is_blocked = self.is_blocked(symbol)
+        block_status = "🚫 BLOCKED 24h" if is_blocked else ""
+        logger.warning(f"📋 FAULT RECORDED: {symbol} ({reason}) - Penalty: {penalty}p {block_status}")
+    
+    def is_blocked(self, symbol: str) -> bool:
+        """Check if a coin is blocked from new positions (KS within last 24h)."""
+        if symbol not in self.faults or not self.faults[symbol]:
+            return False
+        
+        now = datetime.now().timestamp()
+        block_cutoff = now - (self.block_hours * 60 * 60)
+        
+        for fault in self.faults[symbol]:
+            if fault['timestamp'] > block_cutoff:
+                return True
+        
+        return False
     
     def get_penalty(self, symbol: str) -> int:
         """
@@ -4284,10 +4332,12 @@ class KillSwitchFaultTracker:
         for symbol, faults in self.faults.items():
             if faults:
                 penalty = self.get_penalty(symbol)
-                if penalty < 0:
+                is_blocked = self.is_blocked(symbol)
+                if penalty < 0 or is_blocked:
                     result[symbol] = {
                         'fault_count': len(faults),
                         'penalty': penalty,
+                        'is_blocked': is_blocked,
                         'last_fault': max(f['timestamp'] for f in faults)
                     }
         return result
@@ -4781,8 +4831,13 @@ class SignalGenerator:
         # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
         
         # =====================================================================
-        # PHASE 48: KILL SWITCH FAULT PENALTY
+        # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK
         # =====================================================================
+        # Check if coin is BLOCKED (kill switch within last 24h)
+        if kill_switch_fault_tracker.is_blocked(symbol):
+            logger.info(f"🚫 BLOCKED: {symbol} had kill switch within 24h - signal rejected")
+            return None
+        
         # Apply penalty for coins that have previously triggered kill switch
         ks_penalty = kill_switch_fault_tracker.get_penalty(symbol)
         if ks_penalty < 0:
@@ -5976,6 +6031,9 @@ class PaperTradingEngine:
                     # Phase 19: Load logs
                     self.logs = data.get('logs', [])
                     logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
+                    
+                    # Phase 48: Load kill switch faults from trade history
+                    kill_switch_fault_tracker.load_from_trade_history(self.trades)
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
