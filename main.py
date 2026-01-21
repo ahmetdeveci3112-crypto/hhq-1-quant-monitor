@@ -2733,6 +2733,13 @@ async def background_scanner_loop():
                             logger.info(f"🚨 Kill Switch Actions: Reduced={kill_switch_actions['reduced']}, Closed={kill_switch_actions['closed']}")
                             # Broadcast kill switch event to UI
                             await ui_ws_manager.broadcast_kill_switch(kill_switch_actions)
+                        
+                        # Phase 49: Time-based position management
+                        # Activates trailing early for profitable stagnant positions
+                        # Gradually reduces losing stagnant positions
+                        time_actions = time_based_position_manager.check_positions(global_paper_trader)
+                        if time_actions.get('trail_activated') or time_actions.get('time_reduced'):
+                            logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}")
                     
                     # UPDATE MTF TRENDS for coins with active signals (before processing)
                     for signal in multi_coin_scanner.active_signals:
@@ -4217,6 +4224,152 @@ class PositionBasedKillSwitch:
 # Global PositionBasedKillSwitch instance (replaces DailyKillSwitch)
 daily_kill_switch = PositionBasedKillSwitch()
 
+
+# ============================================================================
+# PHASE 49: TIME-BASED POSITION MANAGER
+# ============================================================================
+
+class TimeBasedPositionManager:
+    """
+    Manages positions based on time elapsed without favorable movement.
+    
+    STAGNANT PROFITABLE POSITIONS:
+    - If in profit but hasn't moved in favor for 30+ minutes, activate trailing stop early
+    
+    STAGNANT LOSING POSITIONS:
+    - Gradually reduce position size if not recovering:
+      - 1 hour without profit: reduce 10%
+      - 2 hours without profit: reduce 20%
+      - 4 hours without profit: reduce 20%
+      - 8 hours without profit: reduce 20%
+    """
+    
+    def __init__(self):
+        # Track position reductions: {pos_id: {'1h': bool, '2h': bool, '4h': bool, '8h': bool}}
+        self.time_reductions = {}
+        
+        # Time thresholds and reduction percentages
+        self.reduction_schedule = [
+            {'hours': 1, 'reduction_pct': 0.10, 'key': '1h'},   # 1 hour: 10%
+            {'hours': 2, 'reduction_pct': 0.20, 'key': '2h'},   # 2 hours: 20%
+            {'hours': 4, 'reduction_pct': 0.20, 'key': '4h'},   # 4 hours: 20%
+            {'hours': 8, 'reduction_pct': 0.20, 'key': '8h'},   # 8 hours: 20%
+        ]
+        
+        # Trail activation settings for stagnant profitable positions
+        self.early_trail_minutes = 30  # Activate trail if profitable but stagnant for 30 min
+        
+        logger.info("📊 TimeBasedPositionManager initialized")
+    
+    def check_positions(self, paper_trader) -> dict:
+        """
+        Check all positions for time-based management.
+        Returns summary of actions taken.
+        """
+        actions = {
+            "trail_activated": [],
+            "time_reduced": [],
+            "checked": 0
+        }
+        
+        current_time_ms = int(datetime.now().timestamp() * 1000)
+        
+        for pos in list(paper_trader.positions):
+            try:
+                pos_id = pos.get('id', '')
+                symbol = pos.get('symbol', '')
+                side = pos.get('side', '')
+                open_time = pos.get('openTime', current_time_ms)
+                unrealized_pnl = pos.get('unrealizedPnl', 0)
+                is_trailing_active = pos.get('isTrailingActive', False)
+                current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
+                
+                # Calculate position age in hours
+                age_hours = (current_time_ms - open_time) / (1000 * 60 * 60)
+                
+                actions["checked"] += 1
+                
+                # ===============================================
+                # CASE 1: PROFITABLE BUT STAGNANT
+                # ===============================================
+                if unrealized_pnl > 0 and not is_trailing_active:
+                    # Check if position is old enough and we should enable trailing
+                    age_minutes = age_hours * 60
+                    
+                    if age_minutes >= self.early_trail_minutes:
+                        # Activate trailing stop early to protect profits
+                        pos['isTrailingActive'] = True
+                        pos['trailingStop'] = current_price  # Set current price as trailing stop
+                        actions["trail_activated"].append(f"{symbol} ({age_minutes:.0f}min)")
+                        logger.info(f"📊 EARLY TRAIL: Activated trailing for {symbol} at ${unrealized_pnl:.2f} profit after {age_minutes:.0f} minutes")
+                
+                # ===============================================
+                # CASE 2: LOSING AND STAGNANT - GRADUAL REDUCTION
+                # ===============================================
+                elif unrealized_pnl < 0:
+                    # Initialize tracking for this position
+                    if pos_id not in self.time_reductions:
+                        self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
+                    
+                    # Check each time threshold
+                    for schedule in self.reduction_schedule:
+                        threshold_hours = schedule['hours']
+                        reduction_pct = schedule['reduction_pct']
+                        key = schedule['key']
+                        
+                        # Check if we've passed this threshold and haven't reduced yet
+                        if age_hours >= threshold_hours and not self.time_reductions[pos_id].get(key, False):
+                            # Reduce position
+                            reduction_amount = pos.get('size', 0) * reduction_pct
+                            reduction_usd = pos.get('sizeUsd', 0) * reduction_pct
+                            
+                            if reduction_amount > 0:
+                                # Calculate partial close PnL
+                                if side == 'LONG':
+                                    partial_pnl = (current_price - pos['entryPrice']) * reduction_amount
+                                else:
+                                    partial_pnl = (pos['entryPrice'] - current_price) * reduction_amount
+                                
+                                # Update position size
+                                pos['size'] -= reduction_amount
+                                pos['sizeUsd'] -= reduction_usd
+                                
+                                # Return margin proportionally
+                                initial_margin = pos.get('initialMargin', 0)
+                                margin_return = initial_margin * reduction_pct
+                                pos['initialMargin'] = initial_margin - margin_return
+                                paper_trader.balance += margin_return + partial_pnl
+                                
+                                # Mark as reduced
+                                self.time_reductions[pos_id][key] = True
+                                
+                                actions["time_reduced"].append(f"{symbol} {key} (-{reduction_pct*100:.0f}%)")
+                                logger.warning(f"📊 TIME REDUCE: {symbol} reduced {reduction_pct*100:.0f}% after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
+                                
+                                # Log to paper trader
+                                paper_trader.add_log(f"⏰ TIME REDUCE: {symbol} -{reduction_pct*100:.0f}% after {threshold_hours}h")
+                
+            except Exception as e:
+                logger.error(f"Error in time-based position check: {e}")
+        
+        # Cleanup old tracking data for closed positions
+        active_pos_ids = {p.get('id') for p in paper_trader.positions}
+        self.time_reductions = {k: v for k, v in self.time_reductions.items() if k in active_pos_ids}
+        
+        return actions
+    
+    def get_status(self) -> dict:
+        """Get current status for UI."""
+        return {
+            "type": "TIME_BASED",
+            "tracked_positions": len(self.time_reductions),
+            "early_trail_minutes": self.early_trail_minutes,
+            "reduction_schedule": [f"{s['hours']}h: {s['reduction_pct']*100:.0f}%" for s in self.reduction_schedule]
+        }
+
+
+# Global TimeBasedPositionManager instance
+time_based_position_manager = TimeBasedPositionManager()
 
 # ============================================================================
 # PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
