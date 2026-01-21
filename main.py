@@ -5178,6 +5178,45 @@ class PaperTradingEngine:
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
+    def get_today_pnl(self) -> dict:
+        """
+        Calculate today's PnL based on Turkey timezone (UTC+3).
+        Returns dict with todayPnl (dollar) and todayPnlPercent.
+        """
+        import pytz
+        
+        # Turkey timezone (UTC+3)
+        turkey_tz = pytz.timezone('Europe/Istanbul')
+        now_turkey = datetime.now(turkey_tz)
+        
+        # Start of today in Turkey time
+        today_start = now_turkey.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_ms = int(today_start.timestamp() * 1000)
+        
+        # Sum PnL of trades closed today
+        today_pnl = 0.0
+        today_trades_count = 0
+        
+        for trade in self.trades:
+            close_time = trade.get('closeTime', 0)
+            if close_time >= today_start_ms:
+                today_pnl += trade.get('pnl', 0)
+                today_trades_count += 1
+        
+        # Calculate percent based on start of day balance
+        # We store dayStartBalance or use initial if not set
+        day_start_balance = getattr(self, 'day_start_balance', 10000.0)
+        if day_start_balance <= 0:
+            day_start_balance = 10000.0
+        
+        today_pnl_percent = (today_pnl / day_start_balance) * 100 if day_start_balance > 0 else 0
+        
+        return {
+            'todayPnl': round(today_pnl, 2),
+            'todayPnlPercent': round(today_pnl_percent, 2),
+            'todayTradesCount': today_trades_count
+        }
+    
     def get_dynamic_risk_per_trade(self) -> float:
         """
         Son 5 trade'in performansına göre risk yüzdesini dinamik ayarla.
@@ -7108,11 +7147,13 @@ global_paper_trader = PaperTradingEngine()
 @app.get("/paper-trading/status")
 async def paper_trading_status():
     """Get current paper trading status - used for initial UI sync."""
+    today_pnl_data = global_paper_trader.get_today_pnl()
+    stats_with_today = {**global_paper_trader.stats, **today_pnl_data}
     return JSONResponse({
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
         "trades": global_paper_trader.trades,  # ALL trades (no limit)
-        "stats": global_paper_trader.stats,
+        "stats": stats_with_today,
         "enabled": global_paper_trader.enabled,
         "logs": global_paper_trader.logs[-100:],  # Last 100 logs
         "equityCurve": global_paper_trader.equity_curve[-200:]  # Last 200 points

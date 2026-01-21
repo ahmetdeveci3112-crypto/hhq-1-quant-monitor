@@ -777,8 +777,14 @@ export default function App() {
                     {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
-                <div className="col-span-2">
+                <div>
                   <div className="text-xs text-slate-500 uppercase">Today's PnL</div>
+                  <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
+                  </div>
+                </div>
+                <div className="col-span-2">
+                  <div className="text-xs text-slate-500 uppercase">Toplam Kazanç</div>
                   <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                     {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
                   </div>
@@ -821,6 +827,12 @@ export default function App() {
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Today's PnL</div>
+                    <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">Toplam Kazanç</div>
                     <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                       {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
                     </div>
