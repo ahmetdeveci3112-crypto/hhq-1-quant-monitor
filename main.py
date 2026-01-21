@@ -7218,7 +7218,7 @@ async def paper_trading_get_settings():
         "enabled": global_paper_trader.enabled,
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
-        "stats": global_paper_trader.stats,
+        "stats": {**global_paper_trader.stats, **global_paper_trader.get_today_pnl()},
         "trades": global_paper_trader.trades[-50:],
         "equityCurve": global_paper_trader.equity_curve[-100:],
         "slAtr": global_paper_trader.sl_atr,
@@ -7521,7 +7521,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "balance": global_paper_trader.balance,
                 "positions": global_paper_trader.positions,
                 "trades": global_paper_trader.trades,  # ALL trades
-                "stats": global_paper_trader.stats,
+                "stats": {**global_paper_trader.stats, **global_paper_trader.get_today_pnl()},
                 "logs": global_paper_trader.logs[-100:],
                 "enabled": global_paper_trader.enabled
             },
@@ -7553,7 +7553,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         "balance": global_paper_trader.balance,
                         "positions": global_paper_trader.positions,
                         "trades": global_paper_trader.trades,  # ALL trades
-                        "stats": global_paper_trader.stats,
+                        "stats": {**global_paper_trader.stats, **global_paper_trader.get_today_pnl()},
                         "logs": global_paper_trader.logs[-100:],
                         "enabled": global_paper_trader.enabled
                     },
