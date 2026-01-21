@@ -4351,6 +4351,31 @@ class TimeBasedPositionManager:
                                 
                                 # Log to paper trader
                                 paper_trader.add_log(f"⏰ TIME REDUCE: {symbol} -{reduction_pct*100:.0f}% after {threshold_hours}h")
+                                
+                                # ===== RECORD AS TRADE FOR HISTORY =====
+                                close_reason = f"TIME_REDUCE_{key.upper()}"
+                                trade_record = {
+                                    'symbol': symbol,
+                                    'side': side,
+                                    'entryPrice': pos['entryPrice'],
+                                    'exitPrice': current_price,
+                                    'size': reduction_amount,
+                                    'sizeUsd': reduction_usd,
+                                    'pnl': partial_pnl,
+                                    'pnlPercent': (partial_pnl / margin_return * 100) if margin_return > 0 else 0,
+                                    'openTime': pos.get('openTime', 0),
+                                    'closeTime': int(datetime.now().timestamp() * 1000),
+                                    'closeReason': close_reason,
+                                    'reason': close_reason,
+                                    'leverage': pos.get('leverage', 10),
+                                    'margin': margin_return,
+                                    'isPartialClose': True
+                                }
+                                paper_trader.trades.append(trade_record)
+                                paper_trader.stats['totalTrades'] += 1
+                                if partial_pnl > 0:
+                                    paper_trader.stats['winTrades'] += 1
+                                paper_trader.save_state()
                 
             except Exception as e:
                 logger.error(f"Error in time-based position check: {e}")
