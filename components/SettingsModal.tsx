@@ -101,24 +101,53 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
                 </div>
               </div>
 
-              {/* Minimum Confidence Score */}
-              <div>
+              {/* Dynamic Min Score Range */}
+              <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
                 <div className="flex justify-between items-center mb-2">
-                  <label className="text-sm text-slate-300">Min. Güven Skoru</label>
-                  <span className="text-sm font-mono text-indigo-400">{localSettings.minConfidenceScore}</span>
+                  <label className="text-sm text-slate-300">Min Güven Skoru Aralığı</label>
+                  <span className="text-sm font-mono text-indigo-400">
+                    {localSettings.minScoreLow || 50} - {localSettings.minScoreHigh || 70}
+                  </span>
                 </div>
-                <input
-                  type="range"
-                  min="40"
-                  max="85"
-                  step="5"
-                  value={localSettings.minConfidenceScore}
-                  onChange={e => setLocalSettings({ ...localSettings, minConfidenceScore: parseInt(e.target.value) })}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>40 (Gevşek)</span>
-                  <span>85 (Sıkı)</span>
+                <p className="text-[10px] text-slate-500 mb-3">
+                  📊 Sistem performansa göre bu aralıkta otomatik skor belirler
+                </p>
+                <div className="space-y-3">
+                  <div>
+                    <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                      <span>Min (Agresif)</span>
+                      <span className="font-mono text-emerald-400">{localSettings.minScoreLow || 50}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="40"
+                      max="60"
+                      step="5"
+                      value={localSettings.minScoreLow || 50}
+                      onChange={e => setLocalSettings({ ...localSettings, minScoreLow: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                      <span>Max (Defansif)</span>
+                      <span className="font-mono text-rose-400">{localSettings.minScoreHigh || 70}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="60"
+                      max="85"
+                      step="5"
+                      value={localSettings.minScoreHigh || 70}
+                      onChange={e => setLocalSettings({ ...localSettings, minScoreHigh: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                    />
+                  </div>
+                </div>
+                <div className="flex justify-between text-[10px] text-slate-400 mt-2 bg-slate-900/50 p-2 rounded">
+                  <span>⚔️ WR {'>'} 60%: {localSettings.minScoreLow || 50}</span>
+                  <span>⚖️ WR 40-60%: orta</span>
+                  <span>🛡️ WR {'<'} 40%: {localSettings.minScoreHigh || 70}</span>
                 </div>
               </div>
             </div>

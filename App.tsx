@@ -121,6 +121,8 @@ export default function App() {
     maxPositions: 5,
     zScoreThreshold: 1.2,
     minConfidenceScore: 55,
+    minScoreLow: 50,
+    minScoreHigh: 70,
     entryTightness: 1.0,
     exitTightness: 1.0
   });
@@ -434,6 +436,8 @@ export default function App() {
           maxPositions: String(settings.maxPositions),
           zScoreThreshold: String(settings.zScoreThreshold),
           minConfidenceScore: String(settings.minConfidenceScore),
+          minScoreLow: String(settings.minScoreLow || 50),
+          minScoreHigh: String(settings.minScoreHigh || 70),
           entryTightness: String(settings.entryTightness),
           exitTightness: String(settings.exitTightness)
         });

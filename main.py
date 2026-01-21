@@ -2889,6 +2889,9 @@ async def background_scanner_loop():
                 # =====================================================================
                 # PHASE 34: CHECK PENDING ORDERS FOR EXECUTION
                 # =====================================================================
+                # Phase 50: Calculate dynamic min score before processing signals
+                global_paper_trader.calculate_dynamic_min_score()
+                
                 global_paper_trader.check_pending_orders(opportunities)
                 
                 # Broadcast position updates to UI (throttled)
@@ -4371,6 +4374,140 @@ class TimeBasedPositionManager:
 # Global TimeBasedPositionManager instance
 time_based_position_manager = TimeBasedPositionManager()
 
+
+# ============================================================================
+# PHASE 50: DOUBLE TREND CONFIRMATION
+# ============================================================================
+
+class DoubleTrendConfirmation:
+    """
+    Pending order doldurulmadan önce trendin hala geçerli olduğunu onaylar.
+    V-Reversal koruması sağlar.
+    
+    Süreç:
+    1. Pending order oluşturulur (sinyal geldiğinde)
+    2. Fiyat pullback seviyesine ulaşır
+    3. [BU SINIF] İkinci trend onayı yapılır:
+       - Fiyat hala sinyal yönünde mi?
+       - Z-Score hala threshold üstünde mi?
+       - BTC hala aynı yönde mi?
+    4. Onay geçerse order doldurulur, değilse iptal edilir
+    """
+    
+    def __init__(self, confirmation_delay_seconds: int = 300):  # 5 dakika
+        self.confirmation_delay = confirmation_delay_seconds
+        self.pending_confirmations = {}  # order_id -> {signal_data, price_at_signal, timestamp}
+        logger.info(f"🔄 DoubleTrendConfirmation initialized: {confirmation_delay_seconds}s delay")
+    
+    def register_pending_order(self, order_id: str, signal: dict, price_at_signal: float):
+        """Pending order oluşturulduğunda kaydet."""
+        self.pending_confirmations[order_id] = {
+            'signal': signal,
+            'price_at_signal': price_at_signal,
+            'timestamp': datetime.now().timestamp(),
+            'side': signal.get('side', 'LONG'),
+            'zscore': signal.get('zscore', 0),
+            'symbol': signal.get('symbol', '')
+        }
+        logger.info(f"🔄 Registered for double confirmation: {signal.get('symbol')} {signal.get('side')}")
+    
+    def check_confirmation(self, order_id: str, current_price: float, current_zscore: float, 
+                          btc_trend: str = None) -> dict:
+        """
+        Pending order dolmadan önce trendin hala geçerli olduğunu kontrol et.
+        
+        Returns:
+            {
+                'confirmed': bool,
+                'reason': str,
+                'checks': {price: bool, zscore: bool, btc: bool}
+            }
+        """
+        if order_id not in self.pending_confirmations:
+            # Kayıt yok, onay gerekmiyor (eski sistemle uyumluluk)
+            return {'confirmed': True, 'reason': 'No confirmation needed', 'checks': {}}
+        
+        data = self.pending_confirmations[order_id]
+        side = data['side']
+        signal_price = data['price_at_signal']
+        signal_zscore = data['zscore']
+        symbol = data['symbol']
+        
+        checks = {
+            'price_direction': False,
+            'zscore_valid': False,
+            'btc_aligned': True  # Default True if no BTC check
+        }
+        
+        # CHECK 1: Fiyat hala sinyal yönünde mi?
+        if side == 'LONG':
+            # LONG için: fiyat düşmemeli (pullback sonrası yükseliyor olmalı)
+            price_ok = current_price >= signal_price * 0.995  # %0.5 tolerans
+            checks['price_direction'] = price_ok
+        else:
+            # SHORT için: fiyat yükselmemeli (pullback sonrası düşüyor olmalı)
+            price_ok = current_price <= signal_price * 1.005  # %0.5 tolerans
+            checks['price_direction'] = price_ok
+        
+        # CHECK 2: Z-Score hala threshold üstünde mi?
+        zscore_threshold = 0.8  # Daha düşük threshold (relaxed)
+        if side == 'LONG':
+            zscore_ok = current_zscore < -zscore_threshold  # Negative for oversold
+        else:
+            zscore_ok = current_zscore > zscore_threshold  # Positive for overbought
+        checks['zscore_valid'] = zscore_ok
+        
+        # CHECK 3: BTC trend hala uyumlu mu?
+        if btc_trend:
+            if side == 'LONG':
+                btc_ok = btc_trend in ['BULLISH', 'NEUTRAL']
+            else:
+                btc_ok = btc_trend in ['BEARISH', 'NEUTRAL']
+            checks['btc_aligned'] = btc_ok
+        
+        # Tüm kontroller geçti mi?
+        all_passed = all(checks.values())
+        
+        if all_passed:
+            # Kayıt temizle
+            del self.pending_confirmations[order_id]
+            return {
+                'confirmed': True,
+                'reason': 'All checks passed',
+                'checks': checks
+            }
+        else:
+            # Hangi kontroller başarısız?
+            failed = [k for k, v in checks.items() if not v]
+            logger.warning(f"🚫 Double confirmation FAILED for {symbol} {side}: {failed}")
+            # Kayıt temizle
+            del self.pending_confirmations[order_id]
+            return {
+                'confirmed': False,
+                'reason': f"Failed: {', '.join(failed)}",
+                'checks': checks
+            }
+    
+    def cleanup_expired(self, max_age_seconds: int = 1800):
+        """30 dakikadan eski kayıtları temizle."""
+        now = datetime.now().timestamp()
+        expired = [k for k, v in self.pending_confirmations.items() 
+                   if now - v['timestamp'] > max_age_seconds]
+        for k in expired:
+            del self.pending_confirmations[k]
+    
+    def get_status(self) -> dict:
+        """Get current status for UI."""
+        return {
+            "type": "DOUBLE_CONFIRMATION",
+            "pending_count": len(self.pending_confirmations),
+            "delay_seconds": self.confirmation_delay
+        }
+
+
+# Global DoubleTrendConfirmation instance
+double_trend_confirmation = DoubleTrendConfirmation()
+
 # ============================================================================
 # PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
 # ============================================================================
@@ -5303,7 +5440,10 @@ class PaperTradingEngine:
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
         # Algorithm sensitivity settings (can be adjusted via API)
         self.z_score_threshold = 1.2  # Min Z-Score for signal
-        self.min_confidence_score = 55  # Min confidence score for signal
+        # Phase 50: Dynamic Min Score Range
+        self.min_score_low = 50   # Minimum possible score (aggressive mode)
+        self.min_score_high = 70  # Maximum possible score (defensive mode)
+        self.min_confidence_score = 55  # Current effective min score (dynamically calculated)
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.0  # 0.5-2.0: Pullback multiplier
         self.exit_tightness = 1.0   # 0.5-2.0: SL/TP multiplier
@@ -5369,6 +5509,51 @@ class PaperTradingEngine:
             'todayPnlPercent': round(today_pnl_percent, 2),
             'todayTradesCount': today_trades_count
         }
+    
+    def calculate_dynamic_min_score(self) -> int:
+        """
+        Phase 50: Dinamik Minimum Skor Hesaplama
+        Son 10 trade'in win rate'ine göre min_score_low ve min_score_high arasında skor belirler.
+        
+        Win Rate < 40% → min_score_high (defansif mod)
+        Win Rate > 60% → min_score_low (agresif mod)
+        Win Rate 40-60% → orta değer (normal mod)
+        """
+        # Son 10 trade'i al
+        recent_trades = self.trades[-10:] if len(self.trades) >= 10 else self.trades
+        
+        if len(recent_trades) < 5:
+            # Yeterli veri yok, orta değer kullan
+            mid_score = (self.min_score_low + self.min_score_high) // 2
+            self.min_confidence_score = mid_score
+            return mid_score
+        
+        # Win rate hesapla
+        wins = sum(1 for t in recent_trades if t.get('pnl', 0) > 0)
+        win_rate = wins / len(recent_trades)
+        
+        # Dinamik skor hesapla
+        # Win Rate 0% → max score (70)
+        # Win Rate 50% → mid score (60) 
+        # Win Rate 100% → min score (50)
+        score_range = self.min_score_high - self.min_score_low  # 70 - 50 = 20
+        
+        # win_rate arttıkça skor DÜŞER (daha agresif)
+        dynamic_score = self.min_score_high - int(win_rate * score_range)
+        
+        # Aralık içinde kal
+        dynamic_score = max(self.min_score_low, min(self.min_score_high, dynamic_score))
+        
+        # Güncelle ve logla
+        old_score = self.min_confidence_score
+        self.min_confidence_score = dynamic_score
+        
+        if old_score != dynamic_score:
+            mode = "🛡️ Defansif" if dynamic_score >= 65 else ("⚔️ Agresif" if dynamic_score <= 55 else "⚖️ Normal")
+            logger.info(f"📊 Dynamic Min Score: {old_score} → {dynamic_score} | WR: {win_rate*100:.0f}% | Mode: {mode}")
+            self.add_log(f"📊 Min Skor: {dynamic_score} ({mode}, WR:{win_rate*100:.0f}%)")
+        
+        return dynamic_score
     
     def get_dynamic_risk_per_trade(self) -> float:
         """
@@ -7401,6 +7586,8 @@ async def paper_trading_update_settings(
     maxPositions: int = None,
     zScoreThreshold: float = None,
     minConfidenceScore: int = None,
+    minScoreLow: int = None,
+    minScoreHigh: int = None,
     entryTightness: float = None,
     exitTightness: float = None
 ):
@@ -7434,6 +7621,11 @@ async def paper_trading_update_settings(
         global_paper_trader.z_score_threshold = zScoreThreshold
     if minConfidenceScore is not None:
         global_paper_trader.min_confidence_score = minConfidenceScore
+    # Phase 50: Dynamic Min Score Range
+    if minScoreLow is not None:
+        global_paper_trader.min_score_low = minScoreLow
+    if minScoreHigh is not None:
+        global_paper_trader.min_score_high = minScoreHigh
     # Phase 36: Entry/Exit tightness settings
     if entryTightness is not None:
         global_paper_trader.entry_tightness = entryTightness
@@ -7441,9 +7633,9 @@ async def paper_trading_update_settings(
         global_paper_trader.exit_tightness = exitTightness
     
     # Log settings change (simplified)
-    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MaxPos:{global_paper_trader.max_positions}")
+    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_score_low}-{global_paper_trader.min_score_high}")
     global_paper_trader.save_state()
-    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} Entry:{global_paper_trader.entry_tightness} Exit:{global_paper_trader.exit_tightness}")
+    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_score_low}-{global_paper_trader.min_score_high} Entry:{global_paper_trader.entry_tightness} Exit:{global_paper_trader.exit_tightness}")
     
     # ====== PHASE 37: Update existing positions' TP/SL based on new exit_tightness ======
     updated_positions = 0
