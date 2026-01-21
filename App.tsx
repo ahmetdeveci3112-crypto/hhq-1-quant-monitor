@@ -52,18 +52,29 @@ const INITIAL_STATS: PortfolioStats = {
 const translateReason = (reason: string | undefined): string => {
   if (!reason) return '-';
   const mapping: Record<string, string> = {
-    'SL_HIT': 'Stop Loss',
-    'TP_HIT': 'Take Profit',
-    'TRAILING': 'Trailing Stop',
-    'MANUAL': 'Manuel',
-    'SIGNAL_REVERSAL_PROFIT': 'Ters Sinyal (Karlı)',
-    'SIGNAL_REVERSAL': 'Ters Sinyal',
-    'BREAKEVEN': 'Başabaş',
-    'RESCUE': 'Kurtarma',
+    'SL_HIT': '🛑 Stop Loss',
+    'TP_HIT': '✅ Take Profit',
+    'TRAILING': '📈 Trailing Stop',
+    'MANUAL': '👤 Manuel',
+    'SIGNAL_REVERSAL_PROFIT': '↩️ Ters Sinyal (Karlı)',
+    'SIGNAL_REVERSAL': '↩️ Ters Sinyal',
+    'BREAKEVEN': '⚖️ Başabaş',
+    'RESCUE': '🆘 Kurtarma',
     'END': 'Bitiş',
-    'SL': 'Stop Loss',
-    'TP': 'Take Profit'
+    'SL': '🛑 Stop Loss',
+    'TP': '✅ Take Profit',
+    // Kill Switch reasons
+    'KILL_SWITCH_FULL': '🚨 KS Tam Kapat',
+    'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi',
+    // Time-based reasons
+    'TIME_REDUCE_1H': '⏰ 1s Küçült',
+    'TIME_REDUCE_2H': '⏰ 2s Küçült',
+    'TIME_REDUCE_4H': '⏰ 4s Küçült',
+    'TIME_REDUCE_8H': '⏰ 8s Küçült',
   };
+  // Check for partial matches (e.g., reason contains TIME_REDUCE)
+  if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Küçültme';
+  if (reason.includes('KILL_SWITCH')) return mapping[reason] || '🚨 Kill Switch';
   return mapping[reason] || reason;
 };
 
@@ -919,6 +930,7 @@ export default function App() {
                       <th className="text-right py-3 px-2 font-medium">Mark</th>
                       <th className="text-right py-3 px-2 font-medium">TP/SL</th>
                       <th className="text-center py-3 px-2 font-medium">Trail</th>
+                      <th className="text-center py-3 px-2 font-medium">Age</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
                       <th className="text-right py-3 px-2 font-medium">ROI%</th>
                       <th className="text-right py-3 px-4 font-medium">Action</th>
@@ -989,6 +1001,22 @@ export default function App() {
                               ) : (
                                 <span className="text-[10px] bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">OFF</span>
                               )}
+                            </td>
+                            <td className="py-3 px-2 text-center">
+                              {(() => {
+                                const openTime = (pos as any).openTime || Date.now();
+                                const ageMs = Date.now() - openTime;
+                                const ageMinutes = Math.floor(ageMs / 60000);
+                                const hours = Math.floor(ageMinutes / 60);
+                                const mins = ageMinutes % 60;
+                                const isOld = hours >= 1;
+                                const color = hours >= 4 ? 'text-rose-400' : hours >= 1 ? 'text-amber-400' : 'text-slate-400';
+                                return (
+                                  <span className={`text-[10px] font-mono ${color}`}>
+                                    {hours > 0 ? `${hours}h ${mins}m` : `${mins}m`}
+                                  </span>
+                                );
+                              })()}
                             </td>
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
