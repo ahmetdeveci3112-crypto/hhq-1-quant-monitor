@@ -6774,6 +6774,15 @@ class PaperTradingEngine:
         if order in self.pending_orders:
             self.pending_orders.remove(order)
         
+        # Phase 55: Check if already have position in this coin
+        symbol = order.get('symbol', '')
+        existing_position = next((p for p in self.positions if p['symbol'] == symbol), None)
+        if existing_position:
+            self.add_log(f"⚠️ {symbol}'de zaten pozisyon var, yeni order iptal edildi")
+            logger.info(f"⚠️ SKIP ORDER: {symbol} already has open position")
+            return  # Don't create duplicate position
+        
+        
         # Recalculate SL/TP based on actual fill price
         # Apply exit_tightness for faster/slower exits
         atr = order.get('atr', fill_price * 0.01)
