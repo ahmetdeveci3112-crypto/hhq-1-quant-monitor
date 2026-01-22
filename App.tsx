@@ -164,6 +164,14 @@ export default function App() {
     lastAnalysis: null as string | null
   });
 
+  // Phase 53: Market Regime state
+  const [marketRegime, setMarketRegime] = useState<{
+    currentRegime: string;
+    lastUpdate: string | null;
+    priceCount: number;
+    params: { min_score_adjustment: number; trail_distance_mult: number; description: string };
+  } | null>(null);
+
   // UI Tab State
   const [activeTab, setActiveTab] = useState('portfolio');
 
@@ -488,6 +496,35 @@ export default function App() {
     const timer = setTimeout(saveToCloud, 500);
     return () => clearTimeout(timer);
   }, [settings, selectedCoin]);
+
+  // Phase 53: Fetch optimizer status when AI tab is active
+  useEffect(() => {
+    if (activeTab !== 'ai') return;
+
+    const fetchOptimizerStatus = async () => {
+      try {
+        const res = await fetch(`${BACKEND_API_URL}/optimizer/status`);
+        if (res.ok) {
+          const data = await res.json();
+          setOptimizerStats({
+            enabled: data.enabled ?? false,
+            earlyExitRate: data.postTradeStats?.early_exit_rate ?? 0,
+            trackingCount: data.trackingCount ?? 0,
+            lastAnalysis: data.lastAnalysis?.timestamp ?? null
+          });
+          if (data.marketRegime) {
+            setMarketRegime(data.marketRegime);
+          }
+        }
+      } catch (err) {
+        console.error('Optimizer status fetch error:', err);
+      }
+    };
+
+    fetchOptimizerStatus();
+    const interval = setInterval(fetchOptimizerStatus, 30000); // Her 30 saniye güncelle
+    return () => clearInterval(interval);
+  }, [activeTab]);
 
   // Phase 52: Toggle AI Optimizer
   const toggleOptimizer = async () => {
@@ -1200,6 +1237,7 @@ export default function App() {
                 tracking={[]}
                 analyses={[]}
                 onToggle={toggleOptimizer}
+                marketRegime={marketRegime || undefined}
               />
             </div>
           )

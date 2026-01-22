@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bot, Clock, TrendingUp, TrendingDown, AlertTriangle, CheckCircle } from 'lucide-react';
+import { Bot, Clock, TrendingUp, TrendingDown, AlertTriangle, CheckCircle, Activity, Zap } from 'lucide-react';
 
 interface PostTradeAnalysis {
     trade_id: string;
@@ -35,14 +35,37 @@ interface OptimizerStats {
     avgAvoidedLoss: number;
 }
 
+interface MarketRegime {
+    currentRegime: string;
+    lastUpdate: string | null;
+    priceCount: number;
+    params: {
+        min_score_adjustment: number;
+        trail_distance_mult: number;
+        description: string;
+    };
+}
+
 interface Props {
     stats: OptimizerStats;
     tracking: TrackingTrade[];
     analyses: PostTradeAnalysis[];
     onToggle: () => void;
+    marketRegime?: MarketRegime;
 }
 
-export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, onToggle }) => {
+const getRegimeStyle = (regime: string) => {
+    switch (regime) {
+        case 'TRENDING': return { color: 'text-emerald-400', bg: 'bg-emerald-500/20', icon: '📈' };
+        case 'VOLATILE': return { color: 'text-rose-400', bg: 'bg-rose-500/20', icon: '🔥' };
+        case 'QUIET': return { color: 'text-blue-400', bg: 'bg-blue-500/20', icon: '😴' };
+        default: return { color: 'text-amber-400', bg: 'bg-amber-500/20', icon: '↔️' };
+    }
+};
+
+export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, onToggle, marketRegime }) => {
+    const regimeStyle = getRegimeStyle(marketRegime?.currentRegime || 'RANGING');
+
     return (
         <div className="space-y-4">
             {/* Header */}
@@ -54,8 +77,8 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                 <button
                     onClick={onToggle}
                     className={`px-4 py-2 rounded-lg font-medium transition-colors ${stats.enabled
-                            ? 'bg-fuchsia-600 text-white'
-                            : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                        ? 'bg-fuchsia-600 text-white'
+                        : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
                         }`}
                 >
                     {stats.enabled ? '🤖 AI Aktif' : '🤖 AI Pasif'}
@@ -87,6 +110,36 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                     <div className="text-xs text-slate-400">Ort. Kaçırılan Kâr</div>
                 </div>
             </div>
+
+            {/* Market Regime Card */}
+            {marketRegime && (
+                <div className={`${regimeStyle.bg} border border-slate-700 rounded-xl p-4`}>
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <span className="text-3xl">{regimeStyle.icon}</span>
+                            <div>
+                                <div className={`text-lg font-bold ${regimeStyle.color}`}>
+                                    {marketRegime.currentRegime}
+                                </div>
+                                <div className="text-xs text-slate-400">
+                                    {marketRegime.params?.description || 'Piyasa Durumu'}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="text-right">
+                            <div className="text-xs text-slate-400">Min Score Adj</div>
+                            <div className={`font-bold ${marketRegime.params?.min_score_adjustment > 0 ? 'text-rose-400' : marketRegime.params?.min_score_adjustment < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
+                                {marketRegime.params?.min_score_adjustment > 0 ? '+' : ''}{marketRegime.params?.min_score_adjustment || 0}
+                            </div>
+                        </div>
+                    </div>
+                    {marketRegime.lastUpdate && (
+                        <div className="text-xs text-slate-500 mt-2">
+                            Son güncelleme: {new Date(marketRegime.lastUpdate).toLocaleTimeString('tr-TR')}
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* Currently Tracking */}
             <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
