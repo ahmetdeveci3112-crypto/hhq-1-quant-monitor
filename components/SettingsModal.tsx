@@ -20,6 +20,11 @@ interface Props {
 export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
+  // Sync localSettings when settings prop changes (AI made changes)
+  React.useEffect(() => {
+    setLocalSettings(settings);
+  }, [settings]);
+
   const handleSave = () => {
     onSave(localSettings);
     onClose();
