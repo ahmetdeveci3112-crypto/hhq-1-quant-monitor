@@ -19,6 +19,7 @@ import { OpportunitiesDashboard } from './components/OpportunitiesDashboard';
 import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 import { WalletPanel, PositionCardBinance } from './components/WalletPanel';
 import { TabNavigation } from './components/TabNavigation';
+import { AITrackingPanel } from './components/AITrackingPanel';
 import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
@@ -781,6 +782,7 @@ export default function App() {
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
           signalCount={opportunities.filter(o => o.signalAction !== 'NONE' && o.signalScore >= 45).length}
+          aiTrackingCount={optimizerStats.trackingCount}
         />
 
         {/* Scanner Stats - Always visible compact bar */}
@@ -1177,6 +1179,27 @@ export default function App() {
               <OpportunitiesDashboard
                 opportunities={opportunities}
                 isLoading={isRunning && opportunities.length === 0}
+              />
+            </div>
+          )
+        }
+
+        {/* AI TRACKING TAB */}
+        {
+          activeTab === 'ai' && (
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <AITrackingPanel
+                stats={{
+                  enabled: optimizerStats.enabled,
+                  trackingCount: optimizerStats.trackingCount,
+                  completedCount: 0,
+                  earlyExitRate: optimizerStats.earlyExitRate,
+                  avgMissedProfit: 0,
+                  avgAvoidedLoss: 0
+                }}
+                tracking={[]}
+                analyses={[]}
+                onToggle={toggleOptimizer}
               />
             </div>
           )

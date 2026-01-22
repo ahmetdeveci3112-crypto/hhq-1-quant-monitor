@@ -1,23 +1,26 @@
 import React, { useState } from 'react';
-import { Wallet, Zap, BarChart3, Terminal, TrendingUp, TrendingDown } from 'lucide-react';
+import { Wallet, Zap, BarChart3, Terminal, TrendingUp, TrendingDown, Bot } from 'lucide-react';
 
 interface TabsProps {
     activeTab: string;
     onTabChange: (tab: string) => void;
     positionCount: number;
     signalCount: number;
+    aiTrackingCount?: number;
 }
 
 export const TabNavigation: React.FC<TabsProps> = ({
     activeTab,
     onTabChange,
     positionCount,
-    signalCount
+    signalCount,
+    aiTrackingCount = 0
 }) => {
     const tabs = [
         { id: 'portfolio', label: 'Portfolio', icon: Wallet, badge: positionCount > 0 ? positionCount : null },
         { id: 'signals', label: 'Sinyaller', icon: Zap, badge: signalCount > 0 ? signalCount : null },
         { id: 'opportunities', label: 'Fırsatlar', icon: TrendingUp, badge: null },
+        { id: 'ai', label: 'AI', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
         { id: 'logs', label: 'Loglar', icon: Terminal, badge: null },
     ];
 
