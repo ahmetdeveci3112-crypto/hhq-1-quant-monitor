@@ -5086,6 +5086,161 @@ market_regime_detector = MarketRegimeDetector()
 
 
 # ============================================================================
+# PHASE 54: SCORE COMPONENT ANALYZER
+# ============================================================================
+
+class ScoreComponentAnalyzer:
+    """
+    Hangi skor bileşeninin en çok kâr getirdiğini analiz eder.
+    Korelasyon analizi yaparak ağırlık önerileri üretir.
+    """
+    
+    def __init__(self):
+        self.trade_components = []  # Trade'lerin skor bileşenleri
+        self.max_records = 500
+        self.last_analysis = None
+        self.weight_recommendations = {}
+        logger.info("📊 ScoreComponentAnalyzer initialized")
+    
+    def record_trade(self, trade: dict, components: dict):
+        """
+        Trade kapandığında skor bileşenlerini kaydet.
+        components: {zscore, hurst, volume_spike, imbalance, mtf_score, spread_level}
+        """
+        record = {
+            'trade_id': trade.get('id', ''),
+            'pnl': trade.get('pnl', 0),
+            'is_win': trade.get('pnl', 0) > 0,
+            'pnl_percent': trade.get('pnlPercent', 0),
+            'components': {
+                'zscore': abs(components.get('zScore', 0)),
+                'hurst': components.get('hurst', 0.5),
+                'volume_spike': 1 if components.get('volumeSpike', False) else 0,
+                'imbalance': abs(components.get('imbalance', 0)),
+                'mtf_score': components.get('mtfScore', 0),
+                'spread_level': self._spread_to_numeric(components.get('spreadLevel', 'medium')),
+                'signal_score': components.get('signalScore', 0),
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.trade_components.append(record)
+        
+        if len(self.trade_components) > self.max_records:
+            self.trade_components = self.trade_components[-self.max_records:]
+        
+        logger.debug(f"📊 SCORE RECORD: {trade.get('symbol')} PnL:{trade.get('pnl', 0):.2f} ZS:{components.get('zScore', 0):.2f}")
+    
+    def _spread_to_numeric(self, spread_level: str) -> float:
+        """Spread seviyesini sayıya çevir."""
+        mapping = {
+            'extreme': 1.0,
+            'very_low': 0.9,
+            'low': 0.7,
+            'medium': 0.5,
+            'high': 0.3,
+            'very_high': 0.1
+        }
+        return mapping.get(spread_level, 0.5)
+    
+    def analyze(self) -> dict:
+        """Korelasyon analizi yap ve ağırlık önerileri üret."""
+        if len(self.trade_components) < 20:
+            return {'error': 'Yeterli veri yok (min 20 trade)'}
+        
+        recent = self.trade_components[-100:]  # Son 100 trade
+        
+        # Her bileşen için kazanan/kaybeden ortalamalarını hesapla
+        component_stats = {}
+        component_names = ['zscore', 'hurst', 'volume_spike', 'imbalance', 'mtf_score', 'spread_level', 'signal_score']
+        
+        for comp in component_names:
+            winners = [r['components'][comp] for r in recent if r['is_win']]
+            losers = [r['components'][comp] for r in recent if not r['is_win']]
+            
+            avg_winner = sum(winners) / len(winners) if winners else 0
+            avg_loser = sum(losers) / len(losers) if losers else 0
+            
+            # Kazanan/kaybeden farkı (pozitif = kazananlarda daha yüksek)
+            diff = avg_winner - avg_loser
+            
+            # Korelasyon hesapla (basit yaklaşım)
+            all_values = [r['components'][comp] for r in recent]
+            all_pnls = [r['pnl'] for r in recent]
+            
+            correlation = self._calculate_correlation(all_values, all_pnls)
+            
+            component_stats[comp] = {
+                'avg_winner': round(avg_winner, 3),
+                'avg_loser': round(avg_loser, 3),
+                'diff': round(diff, 3),
+                'correlation': round(correlation, 3),
+                'importance': abs(correlation)  # Mutlak korelasyon
+            }
+        
+        # Importance'a göre sırala
+        sorted_components = sorted(component_stats.items(), key=lambda x: x[1]['importance'], reverse=True)
+        
+        # Ağırlık önerileri üret
+        recommendations = {}
+        for comp, stats in sorted_components[:3]:  # Top 3 önemli
+            if stats['correlation'] > 0.15:
+                recommendations[comp] = 'INCREASE'
+            elif stats['correlation'] < -0.15:
+                recommendations[comp] = 'DECREASE'
+        
+        result = {
+            'timestamp': datetime.now().isoformat(),
+            'trade_count': len(recent),
+            'component_stats': component_stats,
+            'ranked_components': [{'name': k, **v} for k, v in sorted_components],
+            'weight_recommendations': recommendations,
+            'top_component': sorted_components[0][0] if sorted_components else None,
+            'worst_component': sorted_components[-1][0] if sorted_components else None,
+        }
+        
+        self.last_analysis = result
+        self.weight_recommendations = recommendations
+        
+        top_comp = sorted_components[0] if sorted_components else ('N/A', {})
+        logger.info(f"📊 SCORE ANALYSIS: Top={top_comp[0]} (corr:{top_comp[1].get('correlation', 0):.2f}) | {len(recommendations)} öneri")
+        
+        return result
+    
+    def _calculate_correlation(self, x: list, y: list) -> float:
+        """Basit Pearson korelasyonu hesapla."""
+        if len(x) < 2 or len(x) != len(y):
+            return 0.0
+        
+        n = len(x)
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xy = sum(x[i] * y[i] for i in range(n))
+        sum_x2 = sum(xi ** 2 for xi in x)
+        sum_y2 = sum(yi ** 2 for yi in y)
+        
+        numerator = n * sum_xy - sum_x * sum_y
+        denominator = ((n * sum_x2 - sum_x ** 2) * (n * sum_y2 - sum_y ** 2)) ** 0.5
+        
+        if denominator == 0:
+            return 0.0
+        
+        return numerator / denominator
+    
+    def get_status(self) -> dict:
+        """API için durum özeti."""
+        return {
+            'recordCount': len(self.trade_components),
+            'lastAnalysis': self.last_analysis,
+            'recommendations': self.weight_recommendations
+        }
+
+
+# Global Score Component Analyzer instance
+score_component_analyzer = ScoreComponentAnalyzer()
+
+
+# ============================================================================
 # PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
 # ============================================================================
 
@@ -7367,6 +7522,20 @@ class PaperTradingEngine:
             post_trade_tracker.start_tracking(trade)
         except Exception as e:
             logger.debug(f"Post-trade tracking error: {e}")
+        
+        # Phase 54: Record score components for analysis
+        try:
+            components = {
+                'zScore': pos.get('zScore', 0),
+                'signalScore': pos.get('signalScore', 0),
+                'mtfScore': pos.get('mtfScore', 0),
+                'spreadLevel': pos.get('spreadLevel', 'medium'),
+                'hurst': pos.get('hurst', 0.5),
+                'imbalance': pos.get('imbalance', 0),
+            }
+            score_component_analyzer.record_trade(trade, components)
+        except Exception as e:
+            logger.debug(f"Score component record error: {e}")
 
 
 
@@ -8119,7 +8288,8 @@ async def optimizer_status():
         "postTradeStats": post_trade_tracker.get_stats(),
         "trackingCount": len(post_trade_tracker.tracking),
         "recentAnalyses": post_trade_tracker.analysis_results[-10:],
-        "marketRegime": market_regime_detector.get_status()
+        "marketRegime": market_regime_detector.get_status(),
+        "scoreAnalysis": score_component_analyzer.get_status()
     })
 
 @app.post("/optimizer/run")
