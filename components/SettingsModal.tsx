@@ -61,6 +61,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
   const entryLevel = getEntryLevel();
   const exitLevel = getExitLevel();
 
+  // AI açıkken ayarları kilitle
+  const isLocked = optimizerStats?.enabled ?? false;
+
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
       <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
@@ -72,8 +75,19 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
         </div>
 
         <div className="p-6 space-y-6">
+          {/* AI Lock Warning */}
+          {isLocked && (
+            <div className="bg-fuchsia-900/30 border border-fuchsia-500/50 rounded-lg p-3 flex items-center gap-2">
+              <Bot className="w-5 h-5 text-fuchsia-400" />
+              <div>
+                <div className="text-sm font-medium text-fuchsia-300">AI Optimizer Aktif</div>
+                <p className="text-xs text-fuchsia-400/80">Ayarlar AI tarafından yönetiliyor. Değiştirmek için önce AI'ı kapatın.</p>
+              </div>
+            </div>
+          )}
+
           {/* Signal Algorithm Sensitivity Section */}
-          <div>
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-indigo-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <Zap className="w-4 h-4" />
               1. Sinyal Algoritması
@@ -163,7 +177,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
           </div>
 
           {/* Entry Algorithm Section */}
-          <div>
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-amber-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <Target className="w-4 h-4" />
               2. Giriş Algoritması (Pullback)
@@ -200,7 +214,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
           </div>
 
           {/* Exit Algorithm Section */}
-          <div>
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <LogOut className="w-4 h-4" />
               3. Çıkış Algoritması (SL/TP)
@@ -237,7 +251,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
           </div>
 
           {/* Risk Management Section */}
-          <div>
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <TrendingUp className="w-4 h-4" />
               Risk Yönetimi
