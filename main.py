@@ -4175,17 +4175,20 @@ class PositionBasedKillSwitch:
                     kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_FULL')
                     
                 elif position_loss_pct <= self.first_reduction_pct:
-                    # -10% to -15% of invested margin: REDUCE 50% (only once per position)
-                    reduction_count = self.partially_closed.get(pos_id, 0)
+                    # -15% to -20% of invested margin: REDUCE 50% (only once per position)
+                    # Phase 55: Use position-internal flag instead of dictionary
+                    already_reduced = pos.get('kill_switch_reduced', False)
                     
-                    if reduction_count == 0:
+                    if not already_reduced:
                         # First reduction - close 50%
+                        pos['kill_switch_reduced'] = True  # Mark as reduced
                         self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
-                        self.partially_closed[pos_id] = 1
+                        self.partially_closed[pos_id] = 1  # Keep for backwards compat
                         actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                         logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
                         # Phase 48: Record fault for this coin
                         kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_PARTIAL')
+                    # If already_reduced, wait for -20% (full_close_pct) to trigger
                         
             except Exception as e:
                 logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
