@@ -128,6 +128,9 @@ export interface SystemSettings {
   // Algorithm sensitivity settings
   zScoreThreshold: number;      // Min Z-Score for signal (1.0-2.5, lower = more signals)
   minConfidenceScore: number;   // Min confidence score (40-80, lower = more signals)
+  // Phase 50: Dynamic min score range
+  minScoreLow?: number;         // Min score when winning (aggressive: 30-60)
+  minScoreHigh?: number;        // Min score when losing (defensive: 60-95)
   // Entry/Exit control settings
   entryTightness: number;       // 0.5-2.0: Pullback multiplier (lower = tighter entry, higher = looser)
   exitTightness: number;        // 0.5-2.0: SL/TP multiplier (lower = quick exit, higher = hold longer)

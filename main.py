@@ -2904,6 +2904,32 @@ async def background_scanner_loop():
                     short_count = stats.get('shortSignals', 0)
                     pending_count = len(global_paper_trader.pending_orders)
                     logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count} | Pending: {pending_count}")
+                    
+                    # Phase 52: Update post-trade tracker with current prices
+                    try:
+                        current_prices = {opp['symbol']: opp.get('currentPrice', 0) for opp in opportunities}
+                        completed_analyses = post_trade_tracker.update_prices(current_prices)
+                        if completed_analyses:
+                            logger.info(f"📊 Post-trade: {len(completed_analyses)} trade analizi tamamlandı")
+                    except Exception as pt_error:
+                        logger.debug(f"Post-trade update error: {pt_error}")
+                
+                # Phase 52: Run optimizer every hour
+                if int(datetime.now().timestamp()) % 3600 < scan_interval:
+                    try:
+                        pt_stats = post_trade_tracker.get_stats()
+                        analysis = performance_analyzer.analyze(global_paper_trader.trades, pt_stats)
+                        if analysis:
+                            current_settings = {
+                                'min_score_low': global_paper_trader.min_score_low,
+                                'min_score_high': global_paper_trader.min_score_high,
+                                'trail_distance_atr': global_paper_trader.trail_distance_atr,
+                            }
+                            optimization = parameter_optimizer.optimize(analysis, current_settings)
+                            if optimization.get('recommendations') and parameter_optimizer.enabled:
+                                parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
+                    except Exception as opt_error:
+                        logger.debug(f"Optimizer error: {opt_error}")
                 
                 await asyncio.sleep(scan_interval)
                 
@@ -4560,9 +4586,337 @@ class DoubleTrendConfirmation:
 # Global DoubleTrendConfirmation instance
 double_trend_confirmation = DoubleTrendConfirmation()
 
+
+# ============================================================================
+# PHASE 52: ADAPTIVE TRADING SYSTEM - POST-TRADE TRACKER
+# ============================================================================
+
+class PostTradeTracker:
+    """
+    Kapatılan trade'leri 24 saat takip eder.
+    Erken/geç çıkış analizi yaparak optimizasyona veri sağlar.
+    """
+    
+    def __init__(self, tracking_hours: int = 24):
+        self.tracking_hours = tracking_hours
+        self.tracking = {}  # {trade_id: tracking_data}
+        self.analysis_results = []  # Tamamlanan analizler
+        self.max_results = 200  # Son 200 analiz sakla
+        logger.info(f"📊 PostTradeTracker initialized: {tracking_hours}h tracking")
+    
+    def start_tracking(self, closed_trade: dict):
+        """Trade kapandığında takibe al."""
+        trade_id = closed_trade.get('id', str(datetime.now().timestamp()))
+        
+        self.tracking[trade_id] = {
+            'trade': closed_trade,
+            'symbol': closed_trade.get('symbol', ''),
+            'side': closed_trade.get('side', ''),
+            'exit_price': closed_trade.get('exitPrice', 0),
+            'exit_time': datetime.now(),
+            'pnl': closed_trade.get('pnl', 0),
+            'reason': closed_trade.get('reason', closed_trade.get('closeReason', '')),
+            'max_price_after': closed_trade.get('exitPrice', 0),
+            'min_price_after': closed_trade.get('exitPrice', 0),
+            'price_samples': 0,
+        }
+        logger.debug(f"📊 POST-TRADE: Started tracking {closed_trade.get('symbol')} ({closed_trade.get('side')})")
+    
+    def update_prices(self, current_prices: dict):
+        """Fiyatları güncelle - her 15 dakikada çağrılmalı."""
+        now = datetime.now()
+        completed = []
+        
+        for trade_id, data in list(self.tracking.items()):
+            symbol = data['symbol']
+            current_price = current_prices.get(symbol, 0)
+            
+            if current_price > 0:
+                data['price_samples'] += 1
+                data['max_price_after'] = max(data['max_price_after'], current_price)
+                data['min_price_after'] = min(data['min_price_after'], current_price)
+            
+            # 24 saat doldu mu?
+            hours_passed = (now - data['exit_time']).total_seconds() / 3600
+            if hours_passed >= self.tracking_hours:
+                result = self._finalize_analysis(trade_id, data)
+                completed.append(result)
+        
+        return completed
+    
+    def _finalize_analysis(self, trade_id: str, data: dict) -> dict:
+        """24 saat sonunda sonuçları hesapla."""
+        self.tracking.pop(trade_id, None)
+        
+        side = data['side']
+        exit_price = data['exit_price']
+        
+        if exit_price <= 0:
+            return {}
+        
+        if side == 'LONG':
+            # LONG için: Çıkıştan sonra fiyat ne kadar yükseldi?
+            best_price = data['max_price_after']
+            missed_profit_pct = (best_price - exit_price) / exit_price * 100
+            worst_price = data['min_price_after']
+            avoided_loss_pct = (exit_price - worst_price) / exit_price * 100
+        else:
+            # SHORT için: Çıkıştan sonra fiyat ne kadar düştü?
+            best_price = data['min_price_after']
+            missed_profit_pct = (exit_price - best_price) / exit_price * 100
+            worst_price = data['max_price_after']
+            avoided_loss_pct = (worst_price - exit_price) / exit_price * 100
+        
+        was_early = missed_profit_pct > 2  # %2'den fazla kaçırıldı mı?
+        was_correct = avoided_loss_pct > 1  # %1'den fazla zarar önlendi mi?
+        
+        result = {
+            'trade_id': trade_id,
+            'symbol': data['symbol'],
+            'side': side,
+            'exit_price': exit_price,
+            'best_price_24h': best_price,
+            'worst_price_24h': worst_price,
+            'missed_profit_pct': round(missed_profit_pct, 2),
+            'avoided_loss_pct': round(avoided_loss_pct, 2),
+            'was_early_exit': was_early,
+            'was_correct_exit': was_correct,
+            'actual_pnl': data['pnl'],
+            'close_reason': data['reason'],
+            'analysis_time': datetime.now().isoformat()
+        }
+        
+        self.analysis_results.append(result)
+        # Eski sonuçları temizle
+        if len(self.analysis_results) > self.max_results:
+            self.analysis_results = self.analysis_results[-self.max_results:]
+        
+        status = '🔴 ERKEN' if was_early else ('🟢 DOĞRU' if was_correct else '🟡 NÖTR')
+        logger.info(f"📊 POST-TRADE COMPLETE: {data['symbol']} {side} - {status} | Kaçırılan: %{missed_profit_pct:.1f} | Önlenen: %{avoided_loss_pct:.1f}")
+        
+        return result
+    
+    def get_early_exit_rate(self, recent_count: int = 50) -> float:
+        """Son N analizde erken çıkış oranı."""
+        recent = self.analysis_results[-recent_count:]
+        if not recent:
+            return 0.0
+        early_count = sum(1 for r in recent if r.get('was_early_exit', False))
+        return early_count / len(recent) * 100
+    
+    def get_stats(self) -> dict:
+        """Özet istatistikler."""
+        recent = self.analysis_results[-50:]
+        return {
+            'tracking_count': len(self.tracking),
+            'completed_count': len(self.analysis_results),
+            'early_exit_rate': self.get_early_exit_rate(),
+            'avg_missed_profit': sum(r.get('missed_profit_pct', 0) for r in recent) / len(recent) if recent else 0,
+            'avg_avoided_loss': sum(r.get('avoided_loss_pct', 0) for r in recent) / len(recent) if recent else 0,
+        }
+
+
+# ============================================================================
+# PHASE 52: ADAPTIVE TRADING SYSTEM - PERFORMANCE ANALYZER
+# ============================================================================
+
+class PerformanceAnalyzer:
+    """
+    Son trade'leri analiz ederek optimizasyon verisi üretir.
+    """
+    
+    def __init__(self):
+        self.last_analysis = None
+        self.analysis_interval_minutes = 60  # Her saat analiz
+        logger.info("📈 PerformanceAnalyzer initialized")
+    
+    def analyze(self, trades: list, post_trade_stats: dict = None) -> dict:
+        """Son trade'leri analiz et."""
+        if not trades:
+            return {}
+        
+        recent_trades = trades[-100:]  # Son 100 trade
+        
+        # Temel istatistikler
+        winners = [t for t in recent_trades if t.get('pnl', 0) > 0]
+        losers = [t for t in recent_trades if t.get('pnl', 0) < 0]
+        
+        win_rate = len(winners) / len(recent_trades) * 100 if recent_trades else 0
+        avg_winner = sum(t.get('pnl', 0) for t in winners) / len(winners) if winners else 0
+        avg_loser = sum(t.get('pnl', 0) for t in losers) / len(losers) if losers else 0
+        profit_factor = abs(avg_winner * len(winners)) / abs(avg_loser * len(losers)) if losers and avg_loser != 0 else 999
+        
+        # Coin bazlı performans
+        coin_performance = {}
+        for t in recent_trades:
+            symbol = t.get('symbol', '').replace('USDT', '')
+            if symbol not in coin_performance:
+                coin_performance[symbol] = {'wins': 0, 'losses': 0, 'pnl': 0}
+            if t.get('pnl', 0) > 0:
+                coin_performance[symbol]['wins'] += 1
+            else:
+                coin_performance[symbol]['losses'] += 1
+            coin_performance[symbol]['pnl'] += t.get('pnl', 0)
+        
+        # En iyi/kötü coinler
+        sorted_coins = sorted(coin_performance.items(), key=lambda x: x[1]['pnl'], reverse=True)
+        top_coins = [c[0] for c in sorted_coins[:5] if c[1]['pnl'] > 0]
+        worst_coins = [c[0] for c in sorted_coins[-5:] if c[1]['pnl'] < 0]
+        
+        # Reason bazlı analiz
+        reason_performance = {}
+        for t in recent_trades:
+            reason = t.get('reason', t.get('closeReason', 'UNKNOWN'))
+            if reason not in reason_performance:
+                reason_performance[reason] = {'count': 0, 'pnl': 0, 'wins': 0}
+            reason_performance[reason]['count'] += 1
+            reason_performance[reason]['pnl'] += t.get('pnl', 0)
+            if t.get('pnl', 0) > 0:
+                reason_performance[reason]['wins'] += 1
+        
+        analysis = {
+            'timestamp': datetime.now().isoformat(),
+            'trade_count': len(recent_trades),
+            'win_rate': round(win_rate, 1),
+            'avg_winner': round(avg_winner, 2),
+            'avg_loser': round(avg_loser, 2),
+            'profit_factor': round(min(profit_factor, 99), 2),
+            'top_coins': top_coins,
+            'worst_coins': worst_coins,
+            'reason_performance': reason_performance,
+            'early_exit_rate': post_trade_stats.get('early_exit_rate', 0) if post_trade_stats else 0,
+        }
+        
+        self.last_analysis = analysis
+        logger.info(f"📈 ANALYSIS: WR {win_rate:.1f}% | PF {profit_factor:.2f} | Top: {top_coins[:3]} | Worst: {worst_coins[:3]}")
+        
+        return analysis
+
+
+# ============================================================================
+# PHASE 52: ADAPTIVE TRADING SYSTEM - PARAMETER OPTIMIZER
+# ============================================================================
+
+class ParameterOptimizer:
+    """
+    Analiz sonuçlarına göre parametreleri otomatik optimize eder.
+    """
+    
+    def __init__(self):
+        self.last_optimization = None
+        self.optimization_history = []
+        self.enabled = False  # Varsayılan kapalı
+        
+        # Güvenlik sınırları
+        self.limits = {
+            'min_score_low': (30, 60),
+            'min_score_high': (60, 95),
+            'sl_atr': (1.5, 4.0),
+            'trail_distance_atr': (0.5, 2.0),
+        }
+        
+        logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
+    
+    def optimize(self, analysis: dict, current_settings: dict) -> dict:
+        """Analiz sonuçlarına göre optimizasyon önerileri üret."""
+        if not analysis:
+            return {}
+        
+        recommendations = {}
+        changes = []
+        
+        # Win Rate bazlı min score ayarı
+        win_rate = analysis.get('win_rate', 50)
+        if win_rate > 60:
+            new_low = max(self.limits['min_score_low'][0], current_settings.get('min_score_low', 50) - 5)
+            recommendations['min_score_low'] = new_low
+            changes.append(f"min_score_low: {current_settings.get('min_score_low', 50)}→{new_low} (WR yüksek)")
+        elif win_rate < 40:
+            new_high = min(self.limits['min_score_high'][1], current_settings.get('min_score_high', 70) + 5)
+            recommendations['min_score_high'] = new_high
+            changes.append(f"min_score_high: {current_settings.get('min_score_high', 70)}→{new_high} (WR düşük)")
+        
+        # Early exit rate bazlı trail ayarı
+        early_exit_rate = analysis.get('early_exit_rate', 0)
+        if early_exit_rate > 50:
+            new_trail = min(self.limits['trail_distance_atr'][1], 
+                           current_settings.get('trail_distance_atr', 1.0) + 0.2)
+            recommendations['trail_distance_atr'] = new_trail
+            changes.append(f"trail: +0.2 (erken çıkış %{early_exit_rate:.0f})")
+        elif early_exit_rate < 20 and early_exit_rate > 0:
+            new_trail = max(self.limits['trail_distance_atr'][0], 
+                           current_settings.get('trail_distance_atr', 1.0) - 0.1)
+            recommendations['trail_distance_atr'] = new_trail
+            changes.append(f"trail: -0.1 (erken çıkış düşük)")
+        
+        # Worst coins'i blokla önerisi
+        worst_coins = analysis.get('worst_coins', [])
+        if worst_coins:
+            recommendations['block_coins'] = worst_coins[:3]
+            changes.append(f"block önerisi: {worst_coins[:3]}")
+        
+        result = {
+            'timestamp': datetime.now().isoformat(),
+            'recommendations': recommendations,
+            'changes': changes,
+            'applied': False  # Manuel onay gerekir
+        }
+        
+        self.last_optimization = result
+        self.optimization_history.append(result)
+        if len(self.optimization_history) > 50:
+            self.optimization_history = self.optimization_history[-50:]
+        
+        if changes:
+            logger.info(f"🤖 OPTIMIZER: {len(changes)} öneri - {', '.join(changes)}")
+        
+        return result
+    
+    def apply_recommendations(self, paper_trader, recommendations: dict):
+        """Önerileri uygula (sadece enabled ise)."""
+        if not self.enabled:
+            logger.info("🤖 OPTIMIZER: Auto-mode disabled, skipping apply")
+            return False
+        
+        applied = []
+        
+        if 'min_score_low' in recommendations:
+            paper_trader.min_score_low = recommendations['min_score_low']
+            applied.append('min_score_low')
+        
+        if 'min_score_high' in recommendations:
+            paper_trader.min_score_high = recommendations['min_score_high']
+            applied.append('min_score_high')
+        
+        if 'trail_distance_atr' in recommendations:
+            paper_trader.trail_distance_atr = recommendations['trail_distance_atr']
+            applied.append('trail_distance_atr')
+        
+        if applied:
+            logger.info(f"🤖 OPTIMIZER: Applied {applied}")
+            paper_trader.add_log(f"🤖 Auto-optimize: {', '.join(applied)} güncellendi")
+            paper_trader.save_state()
+        
+        return len(applied) > 0
+    
+    def get_status(self) -> dict:
+        return {
+            'enabled': self.enabled,
+            'last_optimization': self.last_optimization,
+            'history_count': len(self.optimization_history),
+        }
+
+
+# Global Adaptive Trading instances
+post_trade_tracker = PostTradeTracker()
+performance_analyzer = PerformanceAnalyzer()
+parameter_optimizer = ParameterOptimizer()
+
+
 # ============================================================================
 # PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
 # ============================================================================
+
 
 class KillSwitchFaultTracker:
     """
@@ -6834,6 +7188,12 @@ class PaperTradingEngine:
         self.add_log(f"{emoji} POZİSYON KAPANDI [{reason}]: {pos['side']} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
         self.save_state()
         logger.info(f"✅ CLOSE POSITION: {reason} PnL: {pnl:.2f}")
+        
+        # Phase 52: Post-trade tracking for 24h analysis
+        try:
+            post_trade_tracker.start_tracking(trade)
+        except Exception as e:
+            logger.debug(f"Post-trade tracking error: {e}")
 
 
 
@@ -7563,6 +7923,58 @@ async def paper_trading_toggle():
     status = "enabled" if global_paper_trader.enabled else "disabled"
     return JSONResponse({"success": True, "enabled": global_paper_trader.enabled, "message": f"Auto-trading {status}"})
 
+# Phase 52: Optimizer endpoints
+@app.post("/optimizer/toggle")
+async def optimizer_toggle():
+    """Toggle auto-optimizer on/off."""
+    parameter_optimizer.enabled = not parameter_optimizer.enabled
+    status = "enabled" if parameter_optimizer.enabled else "disabled"
+    logger.info(f"🤖 Auto-optimizer {status}")
+    return JSONResponse({
+        "success": True, 
+        "enabled": parameter_optimizer.enabled, 
+        "message": f"Auto-optimizer {status}"
+    })
+
+@app.get("/optimizer/status")
+async def optimizer_status():
+    """Get optimizer status and analysis."""
+    return JSONResponse({
+        "enabled": parameter_optimizer.enabled,
+        "lastOptimization": parameter_optimizer.last_optimization,
+        "lastAnalysis": performance_analyzer.last_analysis,
+        "postTradeStats": post_trade_tracker.get_stats(),
+        "trackingCount": len(post_trade_tracker.tracking),
+        "recentAnalyses": post_trade_tracker.analysis_results[-10:]
+    })
+
+@app.post("/optimizer/run")
+async def optimizer_run_now():
+    """Manually trigger optimization analysis."""
+    try:
+        pt_stats = post_trade_tracker.get_stats()
+        analysis = performance_analyzer.analyze(global_paper_trader.trades, pt_stats)
+        
+        if analysis:
+            current_settings = {
+                'min_score_low': global_paper_trader.min_score_low,
+                'min_score_high': global_paper_trader.min_score_high,
+                'trail_distance_atr': global_paper_trader.trail_distance_atr,
+            }
+            optimization = parameter_optimizer.optimize(analysis, current_settings)
+            
+            return JSONResponse({
+                "success": True,
+                "analysis": analysis,
+                "optimization": optimization
+            })
+        
+        return JSONResponse({"success": False, "message": "No trades to analyze"})
+    except Exception as e:
+        logger.error(f"Optimizer run error: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
 @app.post("/scanner/start")
 async def scanner_start():
     """Start the background scanner."""
@@ -7626,7 +8038,14 @@ async def paper_trading_get_settings():
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
         # Server-side logs
-        "logs": global_paper_trader.logs[-50:]
+        "logs": global_paper_trader.logs[-50:],
+        # Phase 52: Adaptive Trading System stats
+        "optimizer": {
+            "enabled": parameter_optimizer.enabled,
+            "lastOptimization": parameter_optimizer.last_optimization,
+            "postTradeStats": post_trade_tracker.get_stats(),
+            "lastAnalysis": performance_analyzer.last_analysis,
+        }
     })
 
 @app.post("/paper-trading/settings")
