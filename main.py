@@ -4040,14 +4040,16 @@ balance_protector = BalanceProtector()
 class PositionBasedKillSwitch:
     """
     Improved kill switch with position-based logic.
-    - Checks each position individually for -10% loss
+    - Checks each position individually for loss threshold
     - Gradual position reduction instead of full close
     - Excludes profitable positions
+    
+    Phase 51: Thresholds increased to give TIME_REDUCE more room
     """
     
     def __init__(self, 
-                 first_reduction_pct: float = -10.0,  # First reduction at -10%
-                 full_close_pct: float = -15.0,       # Full close at -15%
+                 first_reduction_pct: float = -15.0,  # First reduction at -15% (was -10%)
+                 full_close_pct: float = -20.0,       # Full close at -20% (was -15%)
                  reduction_size: float = 0.5):        # Reduce 50% at first level
         self.first_reduction_pct = first_reduction_pct
         self.full_close_pct = full_close_pct
@@ -7591,6 +7593,9 @@ async def paper_trading_get_settings():
         # Algorithm sensitivity settings
         "zScoreThreshold": global_paper_trader.z_score_threshold,
         "minConfidenceScore": global_paper_trader.min_confidence_score,
+        # Phase 50: Dynamic Min Score Range
+        "minScoreLow": global_paper_trader.min_score_low,
+        "minScoreHigh": global_paper_trader.min_score_high,
         # Phase 36: Entry/Exit tightness
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,

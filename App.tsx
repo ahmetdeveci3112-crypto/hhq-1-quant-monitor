@@ -383,6 +383,8 @@ export default function App() {
           maxPositions: data.maxPositions ?? 1,
           zScoreThreshold: data.zScoreThreshold ?? 1.2,
           minConfidenceScore: data.minConfidenceScore ?? 55,
+          minScoreLow: data.minScoreLow ?? 50,
+          minScoreHigh: data.minScoreHigh ?? 70,
           entryTightness: data.entryTightness ?? 1.0,
           exitTightness: data.exitTightness ?? 1.0
         });
