@@ -4294,18 +4294,44 @@ class TimeBasedPositionManager:
                 actions["checked"] += 1
                 
                 # ===============================================
-                # CASE 1: PROFITABLE BUT STAGNANT
+                # CASE 1: PROFITABLE - DYNAMIC PULLBACK TRAIL
+                # Phase 51: Spread-based dynamic pullback threshold
                 # ===============================================
                 if unrealized_pnl > 0 and not is_trailing_active:
-                    # Check if position is old enough and we should enable trailing
                     age_minutes = age_hours * 60
                     
+                    # Only consider early trail after 30 minutes
                     if age_minutes >= self.early_trail_minutes:
-                        # Activate trailing stop early to protect profits
-                        pos['isTrailingActive'] = True
-                        pos['trailingStop'] = current_price  # Set current price as trailing stop
-                        actions["trail_activated"].append(f"{symbol} ({age_minutes:.0f}min)")
-                        logger.info(f"📊 EARLY TRAIL: Activated trailing for {symbol} at ${unrealized_pnl:.2f} profit after {age_minutes:.0f} minutes")
+                        # Get ATR and spread level from position
+                        atr = pos.get('atr', current_price * 0.02)  # Default 2% if no ATR
+                        spread_level = pos.get('spread_level', 'Normal')
+                        
+                        # Dynamic pullback multiplier based on spread
+                        spread_multipliers = {
+                            'Very Low': 0.5,   # BTC, ETH - small pullback triggers trail
+                            'Low': 0.75,
+                            'Normal': 1.0,
+                            'High': 1.5,
+                            'Very High': 2.0   # Meme coins - wait for larger pullback
+                        }
+                        multiplier = spread_multipliers.get(spread_level, 1.0)
+                        pullback_threshold = atr * multiplier
+                        
+                        # Track highest profit reached
+                        highest_profit = pos.get('highestProfit', unrealized_pnl)
+                        if unrealized_pnl > highest_profit:
+                            pos['highestProfit'] = unrealized_pnl
+                            highest_profit = unrealized_pnl
+                        
+                        # Calculate pullback from highest profit
+                        profit_pullback = highest_profit - unrealized_pnl
+                        
+                        # Activate trail if pullback exceeds threshold
+                        if profit_pullback >= pullback_threshold:
+                            pos['isTrailingActive'] = True
+                            pos['trailingStop'] = current_price
+                            actions["trail_activated"].append(f"{symbol} (pullback ${profit_pullback:.2f})")
+                            logger.info(f"📊 EARLY TRAIL: {symbol} activated - pullback ${profit_pullback:.2f} >= threshold ${pullback_threshold:.2f} (spread: {spread_level})")
                 
                 # ===============================================
                 # CASE 2: LOSING AND STAGNANT - GRADUAL REDUCTION
