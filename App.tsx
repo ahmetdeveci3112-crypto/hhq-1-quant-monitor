@@ -48,33 +48,47 @@ const INITIAL_STATS: PortfolioStats = {
   avgLoss: 0,
 };
 
-// Close reason to Turkish mapping
+// Close reason to Turkish mapping with detailed descriptions
 const translateReason = (reason: string | undefined): string => {
   if (!reason) return '-';
   const mapping: Record<string, string> = {
-    'SL_HIT': '🛑 Stop Loss',
-    'TP_HIT': '✅ Take Profit',
-    'TRAILING': '📈 Trailing Stop',
-    'MANUAL': '👤 Manuel',
-    'SIGNAL_REVERSAL_PROFIT': '↩️ Ters Sinyal (Karlı)',
-    'SIGNAL_REVERSAL': '↩️ Ters Sinyal',
-    'BREAKEVEN': '⚖️ Başabaş',
-    'RESCUE': '🆘 Kurtarma',
-    'END': 'Bitiş',
+    // Normal exits
+    'SL_HIT': '🛑 Stop Loss (Zarar Sınırı)',
+    'TP_HIT': '✅ Take Profit (Hedef Kâr)',
+    'TRAILING': '📈 Trailing Stop (Takip Eden)',
+    'MANUAL': '👤 Manuel Kapatma',
+
+    // Signal-based exits
+    'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersindi (Kârda)',
+    'SIGNAL_REVERSAL': '↩️ Sinyal Tersindi (Zararda)',
+    'BREAKEVEN': '⚖️ Başabaş Çıkış',
+    'RESCUE': '🆘 Kurtarma Modu',
+    'END': '🔚 Sistem Kapanış',
     'SL': '🛑 Stop Loss',
     'TP': '✅ Take Profit',
-    // Kill Switch reasons
-    'KILL_SWITCH_FULL': '🚨 KS Tam Kapat',
-    'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi',
-    // Time-based reasons
-    'TIME_REDUCE_1H': '⏰ 1s Küçült',
-    'TIME_REDUCE_2H': '⏰ 2s Küçült',
-    'TIME_REDUCE_4H': '⏰ 4s Küçült',
-    'TIME_REDUCE_8H': '⏰ 8s Küçült',
+
+    // Kill Switch reasons - detailed
+    'KILL_SWITCH_FULL': '🚨 Kill Switch: Tam Kapatma (-%20)',
+    'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: %50 Küçültme (-%15)',
+
+    // Time-based reasons - detailed
+    'TIME_REDUCE_4H': '⏰ Zaman Aşımı: 4 Saat (%50 Küçült)',
+    'TIME_REDUCE_8H': '⏰ Zaman Aşımı: 8 Saat (Tam Çıkış)',
+    'TIME_REDUCE_1H': '⏰ Zaman: 1 Saat Küçültme',
+    'TIME_REDUCE_2H': '⏰ Zaman: 2 Saat Küçültme',
+
+    // Early trail activation
+    'EARLY_TRAIL': '📊 Erken Trailing (Pullback)',
   };
-  // Check for partial matches (e.g., reason contains TIME_REDUCE)
+
+  // Check for partial matches with detailed info
+  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%50)';
+  if (reason.includes('TIME_REDUCE_8H')) return '⏰ 8s Aşımı (Çıkış)';
   if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Küçültme';
-  if (reason.includes('KILL_SWITCH')) return mapping[reason] || '🚨 Kill Switch';
+  if (reason.includes('KILL_SWITCH_FULL')) return '🚨 KS Tam (-%20)';
+  if (reason.includes('KILL_SWITCH_PARTIAL')) return '⚠️ KS Kısmi (-%15)';
+  if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch';
+
   return mapping[reason] || reason;
 };
 
