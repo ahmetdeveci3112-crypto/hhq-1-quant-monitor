@@ -4389,8 +4389,12 @@ class TimeBasedPositionManager:
                         reduction_pct = schedule['reduction_pct']
                         key = schedule['key']
                         
+                        # Phase 55: Use position-internal flag to survive restarts
+                        pos_flag_key = f"time_reduced_{key}"
+                        already_reduced_flag = pos.get(pos_flag_key, False)
+                        
                         # Check if we've passed this threshold and haven't reduced yet
-                        if age_hours >= threshold_hours and not self.time_reductions[pos_id].get(key, False):
+                        if age_hours >= threshold_hours and not already_reduced_flag:
                             # Reduce position
                             reduction_amount = pos.get('size', 0) * reduction_pct
                             reduction_usd = pos.get('sizeUsd', 0) * reduction_pct
@@ -4412,8 +4416,9 @@ class TimeBasedPositionManager:
                                 pos['initialMargin'] = initial_margin - margin_return
                                 paper_trader.balance += margin_return + partial_pnl
                                 
-                                # Mark as reduced
+                                # Mark as reduced - BOTH in dictionary and position
                                 self.time_reductions[pos_id][key] = True
+                                pos[pos_flag_key] = True  # Position-internal flag
                                 
                                 actions["time_reduced"].append(f"{symbol} {key} (-{reduction_pct*100:.0f}%)")
                                 logger.warning(f"📊 TIME REDUCE: {symbol} reduced {reduction_pct*100:.0f}% after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
