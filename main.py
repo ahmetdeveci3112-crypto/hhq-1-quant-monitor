@@ -2917,8 +2917,21 @@ async def background_scanner_loop():
                 # Phase 52: Run optimizer every hour
                 if int(datetime.now().timestamp()) % 3600 < scan_interval:
                     try:
+                        # Phase 53: Update market regime with BTC price
+                        btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
+                        if btc_opp:
+                            market_regime_detector.update_btc_price(btc_opp.get('currentPrice', 0))
+                        regime = market_regime_detector.detect_regime()
+                        regime_params = market_regime_detector.get_regime_params()
+                        
                         pt_stats = post_trade_tracker.get_stats()
                         analysis = performance_analyzer.analyze(global_paper_trader.trades, pt_stats)
+                        
+                        # Add market regime to analysis
+                        if analysis:
+                            analysis['market_regime'] = regime
+                            analysis['regime_params'] = regime_params
+                        
                         if analysis:
                             current_settings = {
                                 'min_score_low': global_paper_trader.min_score_low,
@@ -4855,11 +4868,33 @@ class ParameterOptimizer:
             recommendations['block_coins'] = worst_coins[:3]
             changes.append(f"block önerisi: {worst_coins[:3]}")
         
+        # Phase 53: Market regime bazlı optimizasyon
+        market_regime = analysis.get('market_regime', 'RANGING')
+        regime_params = analysis.get('regime_params', {})
+        
+        if regime_params:
+            min_score_adj = regime_params.get('min_score_adjustment', 0)
+            if min_score_adj != 0:
+                # Regime'e göre min score ayarla
+                current_low = current_settings.get('min_score_low', 50)
+                current_high = current_settings.get('min_score_high', 70)
+                
+                new_low = max(self.limits['min_score_low'][0], 
+                             min(self.limits['min_score_low'][1], current_low + min_score_adj))
+                new_high = max(self.limits['min_score_high'][0], 
+                              min(self.limits['min_score_high'][1], current_high + min_score_adj))
+                
+                if new_low != current_low or new_high != current_high:
+                    recommendations['min_score_low'] = int(new_low)
+                    recommendations['min_score_high'] = int(new_high)
+                    changes.append(f"regime {market_regime}: min_score {current_low}-{current_high}→{int(new_low)}-{int(new_high)}")
+        
         result = {
             'timestamp': datetime.now().isoformat(),
             'recommendations': recommendations,
             'changes': changes,
-            'applied': False  # Manuel onay gerekir
+            'applied': False,  # Manuel onay gerekir
+            'market_regime': market_regime
         }
         
         self.last_optimization = result
@@ -4914,8 +4949,146 @@ parameter_optimizer = ParameterOptimizer()
 
 
 # ============================================================================
+# PHASE 53: MARKET REGIME DETECTOR
+# ============================================================================
+
+class MarketRegimeDetector:
+    """
+    Piyasa durumunu algılar ve AI optimizasyonuna veri sağlar.
+    BTC price action, volatilite ve trend analizi yapar.
+    """
+    
+    TRENDING = "TRENDING"      # Güçlü trend var, trail gevşet, TP uzat
+    RANGING = "RANGING"        # Yatay piyasa, SL sıkılaştır, TP yakınlaştır
+    VOLATILE = "VOLATILE"      # Yüksek volatilite, yüksek min score, seçici ol
+    QUIET = "QUIET"            # Düşük volatilite, düşük min score, agresif ol
+    
+    def __init__(self):
+        self.current_regime = self.RANGING
+        self.btc_prices = []  # Son 24 saatlik BTC fiyatları
+        self.last_update = None
+        self.regime_history = []
+        self.max_history = 100
+        logger.info("📊 MarketRegimeDetector initialized")
+    
+    def update_btc_price(self, price: float):
+        """BTC fiyatını kaydet."""
+        self.btc_prices.append({
+            'price': price,
+            'time': datetime.now()
+        })
+        # Son 24 saat tut (1440 dakika, her 5dk'da 1 kayıt = 288 kayıt)
+        if len(self.btc_prices) > 300:
+            self.btc_prices = self.btc_prices[-300:]
+    
+    def detect_regime(self) -> str:
+        """Piyasa durumunu algıla."""
+        if len(self.btc_prices) < 10:
+            return self.RANGING  # Yeterli veri yok
+        
+        prices = [p['price'] for p in self.btc_prices[-50:]]  # Son ~4 saat
+        
+        if len(prices) < 10:
+            return self.RANGING
+        
+        # Volatilite hesapla (standart sapma / ortalama)
+        avg_price = sum(prices) / len(prices)
+        variance = sum((p - avg_price) ** 2 for p in prices) / len(prices)
+        std_dev = variance ** 0.5
+        volatility = (std_dev / avg_price) * 100  # Yüzde olarak
+        
+        # Trend hesapla (ilk vs son fiyat)
+        first_half = sum(prices[:len(prices)//2]) / (len(prices)//2)
+        second_half = sum(prices[len(prices)//2:]) / (len(prices) - len(prices)//2)
+        trend_strength = abs((second_half - first_half) / first_half) * 100  # Yüzde
+        
+        # Price range hesapla
+        price_range = (max(prices) - min(prices)) / avg_price * 100  # Yüzde
+        
+        # Regime belirleme
+        if volatility > 2.0 or price_range > 5.0:
+            regime = self.VOLATILE
+        elif trend_strength > 1.5 and price_range > 2.0:
+            regime = self.TRENDING
+        elif volatility < 0.5 and price_range < 1.0:
+            regime = self.QUIET
+        else:
+            regime = self.RANGING
+        
+        # Değişiklik varsa logla
+        if regime != self.current_regime:
+            logger.info(f"📊 MARKET REGIME CHANGE: {self.current_regime} → {regime} (vol:{volatility:.2f}%, trend:{trend_strength:.2f}%, range:{price_range:.2f}%)")
+            self.regime_history.append({
+                'from': self.current_regime,
+                'to': regime,
+                'time': datetime.now().isoformat(),
+                'volatility': volatility,
+                'trend_strength': trend_strength
+            })
+            if len(self.regime_history) > self.max_history:
+                self.regime_history = self.regime_history[-self.max_history:]
+        
+        self.current_regime = regime
+        self.last_update = datetime.now()
+        
+        return regime
+    
+    def get_regime_params(self) -> dict:
+        """
+        Mevcut regime için önerilen parametreleri döndür.
+        Bu değerler ParameterOptimizer tarafından kullanılır.
+        """
+        params = {
+            self.TRENDING: {
+                'min_score_adjustment': -5,    # Daha agresif
+                'trail_distance_mult': 1.3,    # Trail'i gevşet, trend devam etsin
+                'sl_atr_mult': 1.2,            # SL biraz gevşet
+                'tp_atr_mult': 1.5,            # TP'yi uzat
+                'description': 'Trend takibi modu - TP uzun, trail gevşek'
+            },
+            self.RANGING: {
+                'min_score_adjustment': 0,     # Normal
+                'trail_distance_mult': 1.0,
+                'sl_atr_mult': 1.0,
+                'tp_atr_mult': 1.0,
+                'description': 'Yatay piyasa - standart ayarlar'
+            },
+            self.VOLATILE: {
+                'min_score_adjustment': +10,   # Çok seçici
+                'trail_distance_mult': 0.8,    # Trail'i sıkılaştır
+                'sl_atr_mult': 1.3,            # SL gevşet (whipsaw koruması)
+                'tp_atr_mult': 0.8,            # TP yakınlaştır
+                'description': 'Volatil piyasa - yüksek seçicilik, hızlı çıkış'
+            },
+            self.QUIET: {
+                'min_score_adjustment': -10,   # Agresif
+                'trail_distance_mult': 0.9,    # Trail orta
+                'sl_atr_mult': 0.9,            # SL sıkı
+                'tp_atr_mult': 0.9,            # TP yakın
+                'description': 'Sakin piyasa - agresif giriş, sıkı çıkış'
+            }
+        }
+        return params.get(self.current_regime, params[self.RANGING])
+    
+    def get_status(self) -> dict:
+        """API için durum özeti."""
+        return {
+            'currentRegime': self.current_regime,
+            'lastUpdate': self.last_update.isoformat() if self.last_update else None,
+            'priceCount': len(self.btc_prices),
+            'params': self.get_regime_params(),
+            'recentChanges': self.regime_history[-5:] if self.regime_history else []
+        }
+
+
+# Global Market Regime instance
+market_regime_detector = MarketRegimeDetector()
+
+
+# ============================================================================
 # PHASE 48: KILL SWITCH FAULT TRACKER (Enhanced)
 # ============================================================================
+
 
 
 class KillSwitchFaultTracker:
@@ -7945,7 +8118,8 @@ async def optimizer_status():
         "lastAnalysis": performance_analyzer.last_analysis,
         "postTradeStats": post_trade_tracker.get_stats(),
         "trackingCount": len(post_trade_tracker.tracking),
-        "recentAnalyses": post_trade_tracker.analysis_results[-10:]
+        "recentAnalyses": post_trade_tracker.analysis_results[-10:],
+        "marketRegime": market_regime_detector.get_status()
     })
 
 @app.post("/optimizer/run")
