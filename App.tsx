@@ -155,6 +155,14 @@ export default function App() {
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
 
+  // Phase 52: AI Optimizer state
+  const [optimizerStats, setOptimizerStats] = useState({
+    enabled: false,
+    earlyExitRate: 0,
+    trackingCount: 0,
+    lastAnalysis: null as string | null
+  });
+
   // UI Tab State
   const [activeTab, setActiveTab] = useState('portfolio');
 
@@ -416,6 +424,16 @@ export default function App() {
           setLogs(prev => [...cloudLogs.reverse(), ...prev].slice(0, 100));
         }
 
+        // Phase 52: Load optimizer stats
+        if (data.optimizer) {
+          setOptimizerStats({
+            enabled: data.optimizer.enabled ?? false,
+            earlyExitRate: data.optimizer.postTradeStats?.early_exit_rate ?? 0,
+            trackingCount: data.optimizer.postTradeStats?.tracking_count ?? 0,
+            lastAnalysis: data.optimizer.lastAnalysis?.timestamp ?? null
+          });
+        }
+
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
         addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)} `);
@@ -469,6 +487,20 @@ export default function App() {
     const timer = setTimeout(saveToCloud, 500);
     return () => clearTimeout(timer);
   }, [settings, selectedCoin]);
+
+  // Phase 52: Toggle AI Optimizer
+  const toggleOptimizer = async () => {
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/optimizer/toggle`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setOptimizerStats(prev => ({ ...prev, enabled: data.enabled }));
+        addLog(`🤖 AI Optimizer ${data.enabled ? 'aktif' : 'pasif'}`);
+      }
+    } catch (err) {
+      console.error('Optimizer toggle error:', err);
+    }
+  };
 
   // ============================================================================
   // WEBSOCKET CONNECTION
@@ -655,6 +687,8 @@ export default function App() {
           settings={settings}
           onClose={() => setShowSettings(false)}
           onSave={setSettings}
+          optimizerStats={optimizerStats}
+          onToggleOptimizer={toggleOptimizer}
         />
       )}
 

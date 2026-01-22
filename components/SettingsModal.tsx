@@ -1,14 +1,23 @@
 import React from 'react';
-import { X, Save, Zap, TrendingUp, Target, LogOut } from 'lucide-react';
+import { X, Save, Zap, TrendingUp, Target, LogOut, Bot } from 'lucide-react';
 import { SystemSettings } from '../types';
+
+interface OptimizerStats {
+  enabled: boolean;
+  earlyExitRate: number;
+  trackingCount: number;
+  lastAnalysis: string | null;
+}
 
 interface Props {
   onClose: () => void;
   settings: SystemSettings;
   onSave: (s: SystemSettings) => void;
+  optimizerStats?: OptimizerStats;
+  onToggleOptimizer?: () => void;
 }
 
-export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) => {
+export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
   const handleSave = () => {
@@ -299,6 +308,58 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave }) =>
               </div>
             </div>
           </div>
+
+          {/* AI Optimizer Section */}
+          {optimizerStats && (
+            <div>
+              <h3 className="text-sm font-semibold text-fuchsia-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                <Bot className="w-4 h-4" />
+                5. AI Optimizer
+              </h3>
+
+              <div className="space-y-4">
+                {/* Toggle */}
+                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-sm font-medium text-white">Auto-Optimize</div>
+                      <p className="text-xs text-slate-400 mt-1">Sistem ayarlarını otomatik optimize et</p>
+                    </div>
+                    <button
+                      onClick={onToggleOptimizer}
+                      className={`relative w-14 h-7 rounded-full transition-colors ${optimizerStats.enabled ? 'bg-fuchsia-600' : 'bg-slate-600'
+                        }`}
+                    >
+                      <span className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full transition-transform ${optimizerStats.enabled ? 'translate-x-7' : ''
+                        }`} />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Stats */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-center">
+                    <div className="text-xs text-slate-400">Takip Edilen</div>
+                    <div className="text-xl font-bold text-fuchsia-400">{optimizerStats.trackingCount}</div>
+                    <div className="text-[10px] text-slate-500">trade</div>
+                  </div>
+                  <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-center">
+                    <div className="text-xs text-slate-400">Erken Çıkış</div>
+                    <div className={`text-xl font-bold ${optimizerStats.earlyExitRate > 50 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                      %{optimizerStats.earlyExitRate.toFixed(0)}
+                    </div>
+                    <div className="text-[10px] text-slate-500">oran</div>
+                  </div>
+                </div>
+
+                {optimizerStats.lastAnalysis && (
+                  <div className="text-xs text-slate-400 text-center">
+                    Son analiz: {new Date(optimizerStats.lastAnalysis).toLocaleString('tr-TR')}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="p-6 border-t border-slate-800 flex justify-end gap-3 sticky bottom-0 bg-slate-900">
