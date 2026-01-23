@@ -8559,9 +8559,18 @@ async def optimizer_run_now():
         
         if analysis:
             current_settings = {
+                'z_score_threshold': global_paper_trader.z_score_threshold,
                 'min_score_low': global_paper_trader.min_score_low,
                 'min_score_high': global_paper_trader.min_score_high,
+                'entry_tightness': global_paper_trader.entry_tightness,
+                'exit_tightness': global_paper_trader.exit_tightness,
+                'sl_atr': global_paper_trader.sl_atr,
+                'tp_atr': global_paper_trader.tp_atr,
+                'trail_activation_atr': global_paper_trader.trail_activation_atr,
                 'trail_distance_atr': global_paper_trader.trail_distance_atr,
+                'max_positions': global_paper_trader.max_positions,
+                'kill_switch_first_reduction': daily_kill_switch.first_reduction_pct,
+                'kill_switch_full_close': daily_kill_switch.full_close_pct,
             }
             optimization = parameter_optimizer.optimize(analysis, current_settings)
             
