@@ -5032,10 +5032,10 @@ class ParameterOptimizer:
         # 8. Kill Switch (kill switch rate bazlı)
         current_ks_first = current_settings.get('kill_switch_first_reduction', -100)
         current_ks_full = current_settings.get('kill_switch_full_close', -150)
-        if kill_switch_rate > 30:
+        if kill_switch_rate > 25:  # %25+ tetiklenme oranı
             # Çok tetikleniyor, gevşet
-            new_ks_first = max(self.limits['kill_switch_first_reduction'][0], current_ks_first - 10)
-            new_ks_full = max(self.limits['kill_switch_full_close'][0], current_ks_full - 10)
+            new_ks_first = max(self.limits['kill_switch_first_reduction'][0], current_ks_first - 15)
+            new_ks_full = max(self.limits['kill_switch_full_close'][0], current_ks_full - 15)
             recommendations['kill_switch_first_reduction'] = int(new_ks_first)
             recommendations['kill_switch_full_close'] = int(new_ks_full)
             changes.append(f"KS gevşet: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
