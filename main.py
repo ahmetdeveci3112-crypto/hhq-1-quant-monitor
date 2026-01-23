@@ -4306,11 +4306,11 @@ class TimeBasedPositionManager:
         # Track position reductions: {pos_id: {'1h': bool, '2h': bool, '4h': bool, '8h': bool}}
         self.time_reductions = {}
         
-        # Time thresholds and reduction percentages (SIMPLIFIED)
-        # Only 2 levels: 4h = 50% reduce, 8h = 100% close
+        # Time thresholds and reduction percentages
+        # 4h = 10% reduce, 8h = 10% reduce (less aggressive with kill switch active)
         self.reduction_schedule = [
-            {'hours': 4, 'reduction_pct': 0.50, 'key': '4h'},   # 4 hours: 50% reduce
-            {'hours': 8, 'reduction_pct': 1.00, 'key': '8h'},   # 8 hours: 100% close (full exit)
+            {'hours': 4, 'reduction_pct': 0.10, 'key': '4h'},   # 4 hours: 10% reduce
+            {'hours': 8, 'reduction_pct': 0.10, 'key': '8h'},   # 8 hours: 10% reduce
         ]
         
         # Trail activation settings for stagnant profitable positions
