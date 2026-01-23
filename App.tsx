@@ -1237,15 +1237,15 @@ export default function App() {
             <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
               <AITrackingPanel
                 stats={{
-                  enabled: optimizerStats.enabled,
-                  trackingCount: optimizerStats.trackingCount,
-                  completedCount: optimizerStats.completedCount,
-                  earlyExitRate: optimizerStats.earlyExitRate,
-                  avgMissedProfit: optimizerStats.avgMissedProfit,
-                  avgAvoidedLoss: optimizerStats.avgAvoidedLoss
+                  enabled: optimizerStats.enabled ?? false,
+                  trackingCount: optimizerStats.trackingCount ?? 0,
+                  completedCount: optimizerStats.completedCount ?? 0,
+                  earlyExitRate: optimizerStats.earlyExitRate ?? 0,
+                  avgMissedProfit: optimizerStats.avgMissedProfit ?? 0,
+                  avgAvoidedLoss: optimizerStats.avgAvoidedLoss ?? 0
                 }}
-                tracking={optimizerStats.trackingList}
-                analyses={optimizerStats.recentAnalyses}
+                tracking={optimizerStats.trackingList ?? []}
+                analyses={optimizerStats.recentAnalyses ?? []}
                 onToggle={toggleOptimizer}
                 marketRegime={marketRegime || undefined}
               />

@@ -2939,8 +2939,17 @@ async def background_scanner_loop():
                                 'trail_distance_atr': global_paper_trader.trail_distance_atr,
                             }
                             optimization = parameter_optimizer.optimize(analysis, current_settings)
+                            
+                            # Log AI analysis
+                            global_paper_trader.add_log(f"🤖 AI Analiz: WR %{analysis.get('win_rate', 0):.0f} | PF {analysis.get('profit_factor', 0):.2f} | Regime: {regime}")
+                            
+                            if optimization.get('changes'):
+                                global_paper_trader.add_log(f"🤖 AI Öneri: {', '.join(optimization.get('changes', []))}")
+                            
                             if optimization.get('recommendations') and parameter_optimizer.enabled:
-                                parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
+                                applied = parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
+                                if applied:
+                                    global_paper_trader.add_log(f"🤖 AI Uygulama: Ayarlar otomatik güncellendi ✅")
                     except Exception as opt_error:
                         logger.debug(f"Optimizer error: {opt_error}")
                 
