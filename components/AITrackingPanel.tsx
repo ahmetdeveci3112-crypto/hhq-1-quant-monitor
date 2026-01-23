@@ -66,8 +66,12 @@ const getRegimeStyle = (regime: string) => {
     }
 };
 
-export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, onToggle, marketRegime }) => {
+export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime }) => {
     const regimeStyle = getRegimeStyle(marketRegime?.currentRegime || 'RANGING');
+
+    // Ensure arrays are never undefined
+    const safeTracking = tracking || [];
+    const safeAnalyses = analyses || [];
 
     return (
         <div className="space-y-4">
@@ -150,7 +154,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                     <Clock className="w-4 h-4" />
                     Şu An Takip Edilen (24 Saat)
                 </h3>
-                {tracking.length === 0 ? (
+                {safeTracking.length === 0 ? (
                     <div className="text-center py-6 text-slate-500">
                         Takipte trade yok
                     </div>
@@ -167,7 +171,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                                 </tr>
                             </thead>
                             <tbody>
-                                {tracking.map((t, i) => (
+                                {safeTracking.map((t, i) => (
                                     <tr key={t.id || i} className="border-t border-slate-700/50">
                                         <td className="py-2 font-medium text-white">{t.symbol.replace('USDT', '')}</td>
                                         <td className={`py-2 ${t.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -196,7 +200,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                     <CheckCircle className="w-4 h-4" />
                     Tamamlanan Analizler
                 </h3>
-                {analyses.length === 0 ? (
+                {safeAnalyses.length === 0 ? (
                     <div className="text-center py-6 text-slate-500">
                         Henüz analiz tamamlanmadı
                     </div>
@@ -213,7 +217,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                                 </tr>
                             </thead>
                             <tbody>
-                                {analyses.slice(-10).reverse().map((a, i) => (
+                                {safeAnalyses.slice(-10).reverse().map((a, i) => (
                                     <tr key={i} className="border-t border-slate-700/50">
                                         <td className="py-2 font-medium text-white">{a.symbol.replace('USDT', '')}</td>
                                         <td className={`py-2 ${a.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
