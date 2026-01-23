@@ -4843,8 +4843,13 @@ class PerformanceAnalyzer:
         # Toplam PnL hesapla
         total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
         
+        # Use Turkey timezone for analysis timestamp
+        from zoneinfo import ZoneInfo
+        turkey_tz = ZoneInfo('Europe/Istanbul')
+        turkey_time = datetime.now(turkey_tz)
+        
         analysis = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': turkey_time.strftime('%d.%m.%Y %H:%M:%S'),
             'trade_count': len(recent_trades),
             'total_pnl': round(total_pnl, 2),  # PnL-bazlı AI kararı için
             'win_rate': round(win_rate, 1),
