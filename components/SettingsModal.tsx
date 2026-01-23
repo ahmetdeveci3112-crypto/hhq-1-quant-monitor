@@ -271,16 +271,16 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </div>
                 <input
                   type="range"
-                  min="-30"
-                  max="-5"
-                  step="1"
+                  min="-200"
+                  max="-30"
+                  step="5"
                   value={localSettings.killSwitchFirstReduction}
                   onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-30% (Gevşek)</span>
-                  <span>-5% (Sıkı)</span>
+                  <span>-200% (Gevşek)</span>
+                  <span>-30% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-500 mt-1">Pozisyon bu eşiğe ulaştığında %50 küçültülür</p>
               </div>
@@ -293,16 +293,16 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </div>
                 <input
                   type="range"
-                  min="-50"
-                  max="-10"
-                  step="1"
+                  min="-300"
+                  max="-50"
+                  step="5"
                   value={localSettings.killSwitchFullClose}
                   onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-50% (Gevşek)</span>
-                  <span>-10% (Sıkı)</span>
+                  <span>-300% (Gevşek)</span>
+                  <span>-50% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-500 mt-1">Pozisyon bu eşiğe ulaştığında tamamen kapatılır</p>
               </div>

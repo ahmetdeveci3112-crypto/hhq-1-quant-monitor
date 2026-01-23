@@ -2937,6 +2937,8 @@ async def background_scanner_loop():
                                 'min_score_low': global_paper_trader.min_score_low,
                                 'min_score_high': global_paper_trader.min_score_high,
                                 'trail_distance_atr': global_paper_trader.trail_distance_atr,
+                                'kill_switch_first_reduction': daily_kill_switch.first_reduction_pct,
+                                'kill_switch_full_close': daily_kill_switch.full_close_pct,
                             }
                             optimization = parameter_optimizer.optimize(analysis, current_settings)
                             
@@ -4096,8 +4098,8 @@ class PositionBasedKillSwitch:
     """
     
     def __init__(self, 
-                 first_reduction_pct: float = -15.0,  # First reduction at -15% (was -10%)
-                 full_close_pct: float = -20.0,       # Full close at -20% (was -15%)
+                 first_reduction_pct: float = -100.0,  # First reduction at -100% (leveraged ROI)
+                 full_close_pct: float = -150.0,       # Full close at -150% (leveraged ROI)
                  reduction_size: float = 0.5):        # Reduce 50% at first level
         self.first_reduction_pct = first_reduction_pct
         self.full_close_pct = full_close_pct
@@ -4864,9 +4866,9 @@ class ParameterOptimizer:
             'min_score_high': (60, 95),
             'sl_atr': (1.5, 4.0),
             'trail_distance_atr': (0.5, 2.0),
-            # Phase 57: Kill Switch limits
-            'kill_switch_first_reduction': (-30, -5),
-            'kill_switch_full_close': (-50, -10),
+            # Phase 57: Kill Switch limits (leveraged ROI based)
+            'kill_switch_first_reduction': (-200, -30),
+            'kill_switch_full_close': (-300, -50),
         }
         
         logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
@@ -8372,19 +8374,30 @@ async def optimizer_status():
     """Get optimizer status and analysis."""
     # Convert tracking dict to list for UI
     tracking_list = []
-    for trade_id, data in post_trade_tracker.tracking.items():
-        tracking_list.append({
-            'id': trade_id,
-            'symbol': data.get('symbol', ''),
-            'side': data.get('side', ''),
-            'exitPrice': data.get('exit_price', 0),
-            'exitTime': data.get('exit_time').isoformat() if data.get('exit_time') else None,
-            'pnl': data.get('pnl', 0),
-            'reason': data.get('reason', ''),
-            'maxPriceAfter': data.get('max_price_after', 0),
-            'minPriceAfter': data.get('min_price_after', 0),
-            'priceSamples': data.get('price_samples', 0),
-        })
+    try:
+        for trade_id, data in post_trade_tracker.tracking.items():
+            exit_time = data.get('exit_time')
+            exit_time_str = None
+            if exit_time:
+                try:
+                    exit_time_str = exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time)
+                except:
+                    exit_time_str = str(exit_time)
+            
+            tracking_list.append({
+                'id': trade_id,
+                'symbol': data.get('symbol', ''),
+                'side': data.get('side', ''),
+                'exitPrice': data.get('exit_price', 0),
+                'exitTime': exit_time_str,
+                'pnl': data.get('pnl', 0),
+                'reason': data.get('reason', ''),
+                'maxPriceAfter': data.get('max_price_after', 0),
+                'minPriceAfter': data.get('min_price_after', 0),
+                'priceSamples': data.get('price_samples', 0),
+            })
+    except Exception as e:
+        logger.error(f"Error building tracking list: {e}")
     
     return JSONResponse({
         "enabled": parameter_optimizer.enabled,

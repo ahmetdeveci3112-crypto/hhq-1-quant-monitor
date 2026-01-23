@@ -140,8 +140,8 @@ export default function App() {
     minScoreHigh: 70,
     entryTightness: 1.0,
     exitTightness: 1.0,
-    killSwitchFirstReduction: -15,
-    killSwitchFullClose: -20
+    killSwitchFirstReduction: -100,
+    killSwitchFullClose: -150
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -425,8 +425,8 @@ export default function App() {
           minScoreHigh: data.minScoreHigh ?? 70,
           entryTightness: data.entryTightness ?? 1.0,
           exitTightness: data.exitTightness ?? 1.0,
-          killSwitchFirstReduction: data.killSwitchFirstReduction ?? -15,
-          killSwitchFullClose: data.killSwitchFullClose ?? -20
+          killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
+          killSwitchFullClose: data.killSwitchFullClose ?? -150
         });
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
