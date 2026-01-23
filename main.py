@@ -2916,6 +2916,7 @@ async def background_scanner_loop():
                 
                 # Phase 52: Run optimizer every 15 minutes (900 seconds)
                 if int(datetime.now().timestamp()) % 900 < scan_interval:
+                    logger.info("🤖 AI Optimizer check triggered (15-min interval)")
                     try:
                         # Phase 53: Update market regime with BTC price
                         btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
@@ -2952,6 +2953,7 @@ async def background_scanner_loop():
                             # Log AI analysis with PnL and mode
                             mode = optimization.get('mode', 'N/A')
                             total_pnl = analysis.get('total_pnl', 0)
+                            logger.info(f"🤖 AI [{mode}]: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | Regime {regime}")
                             global_paper_trader.add_log(f"🤖 AI [{mode}]: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | PF {analysis.get('profit_factor', 0):.2f}")
                             
                             if optimization.get('changes'):
@@ -2960,9 +2962,12 @@ async def background_scanner_loop():
                             if optimization.get('recommendations') and parameter_optimizer.enabled:
                                 applied = parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
                                 if applied:
+                                    logger.info(f"🤖 AI Optimizer: Settings applied - {list(applied.keys())}")
                                     global_paper_trader.add_log(f"🤖 Ayarlar güncellendi ✅")
+                        else:
+                            logger.info("🤖 AI Optimizer: No analysis data available")
                     except Exception as opt_error:
-                        logger.debug(f"Optimizer error: {opt_error}")
+                        logger.error(f"🤖 AI Optimizer error: {opt_error}")
                 
                 await asyncio.sleep(scan_interval)
                 
@@ -5048,8 +5053,13 @@ class ParameterOptimizer:
             changes.append(f"KS sıkılaştır: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
         
         # === SONUÇ ===
+        # Use Turkey timezone (UTC+3)
+        from zoneinfo import ZoneInfo
+        turkey_tz = ZoneInfo('Europe/Istanbul')
+        turkey_time = datetime.now(turkey_tz)
+        
         result = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': turkey_time.strftime('%d.%m.%Y %H:%M:%S'),
             'mode': mode,
             'total_pnl': total_pnl,
             'recommendations': recommendations,
