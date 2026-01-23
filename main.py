@@ -8920,6 +8920,12 @@ async def get_performance_summary():
     trades = global_paper_trader.trades
     stats = global_paper_trader.stats
     
+    # Fix: Calculate from trades list (source of truth) instead of possibly stale stats
+    total_trades = len(trades)
+    total_pnl = sum(t.get('pnl', 0) for t in trades)
+    winning_trades = len([t for t in trades if t.get('pnl', 0) > 0])
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    
     # Recent performance (last 7 days)
     week_ago = datetime.now().timestamp() * 1000 - (7 * 24 * 60 * 60 * 1000)
     recent_trades = [t for t in trades if t.get('closeTime', 0) > week_ago]
@@ -8938,9 +8944,9 @@ async def get_performance_summary():
     
     return JSONResponse({
         "success": True,
-        "totalPnl": round(stats.get('totalPnl', 0), 2),
-        "totalTrades": stats.get('totalTrades', 0),
-        "winRate": round((stats.get('winningTrades', 0) / stats.get('totalTrades', 1)) * 100, 1) if stats.get('totalTrades', 0) > 0 else 0,
+        "totalPnl": round(total_pnl, 2),
+        "totalTrades": total_trades,
+        "winRate": round(win_rate, 1),
         "recentPnl": round(recent_pnl, 2),
         "recentTrades": len(recent_trades),
         "recentWinRate": round(recent_wr, 1),
