@@ -139,7 +139,9 @@ export default function App() {
     minScoreLow: 50,
     minScoreHigh: 70,
     entryTightness: 1.0,
-    exitTightness: 1.0
+    exitTightness: 1.0,
+    killSwitchFirstReduction: -15,
+    killSwitchFullClose: -20
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -422,7 +424,9 @@ export default function App() {
           minScoreLow: data.minScoreLow ?? 50,
           minScoreHigh: data.minScoreHigh ?? 70,
           entryTightness: data.entryTightness ?? 1.0,
-          exitTightness: data.exitTightness ?? 1.0
+          exitTightness: data.exitTightness ?? 1.0,
+          killSwitchFirstReduction: data.killSwitchFirstReduction ?? -15,
+          killSwitchFullClose: data.killSwitchFullClose ?? -20
         });
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
@@ -487,7 +491,9 @@ export default function App() {
           minScoreLow: String(settings.minScoreLow || 50),
           minScoreHigh: String(settings.minScoreHigh || 70),
           entryTightness: String(settings.entryTightness),
-          exitTightness: String(settings.exitTightness)
+          exitTightness: String(settings.exitTightness),
+          killSwitchFirstReduction: String(settings.killSwitchFirstReduction),
+          killSwitchFullClose: String(settings.killSwitchFullClose)
         });
         const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
         if (res.ok) {

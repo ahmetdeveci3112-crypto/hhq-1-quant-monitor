@@ -4820,6 +4820,10 @@ class PerformanceAnalyzer:
             if t.get('pnl', 0) > 0:
                 reason_performance[reason]['wins'] += 1
         
+        # Phase 57: Kill Switch tetikleme oranı
+        kill_switch_trades = [t for t in recent_trades if 'KILL_SWITCH' in str(t.get('reason', '')) or 'KILL_SWITCH' in str(t.get('closeReason', ''))]
+        kill_switch_rate = len(kill_switch_trades) / len(recent_trades) * 100 if recent_trades else 0
+        
         analysis = {
             'timestamp': datetime.now().isoformat(),
             'trade_count': len(recent_trades),
@@ -4831,10 +4835,11 @@ class PerformanceAnalyzer:
             'worst_coins': worst_coins,
             'reason_performance': reason_performance,
             'early_exit_rate': post_trade_stats.get('early_exit_rate', 0) if post_trade_stats else 0,
+            'kill_switch_rate': round(kill_switch_rate, 1),  # Phase 57
         }
         
         self.last_analysis = analysis
-        logger.info(f"📈 ANALYSIS: WR {win_rate:.1f}% | PF {profit_factor:.2f} | Top: {top_coins[:3]} | Worst: {worst_coins[:3]}")
+        logger.info(f"📈 ANALYSIS: WR {win_rate:.1f}% | PF {profit_factor:.2f} | KS Rate {kill_switch_rate:.1f}% | Top: {top_coins[:3]} | Worst: {worst_coins[:3]}")
         
         return analysis
 
@@ -4859,6 +4864,9 @@ class ParameterOptimizer:
             'min_score_high': (60, 95),
             'sl_atr': (1.5, 4.0),
             'trail_distance_atr': (0.5, 2.0),
+            # Phase 57: Kill Switch limits
+            'kill_switch_first_reduction': (-30, -5),
+            'kill_switch_full_close': (-50, -10),
         }
         
         logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
@@ -4900,6 +4908,32 @@ class ParameterOptimizer:
         if worst_coins:
             recommendations['block_coins'] = worst_coins[:3]
             changes.append(f"block önerisi: {worst_coins[:3]}")
+        
+        # Phase 57: Kill Switch rate bazlı ayarlar
+        kill_switch_rate = analysis.get('kill_switch_rate', 0)
+        if kill_switch_rate > 30:  # Kill switch çok tetikleniyor (%30+)
+            # Eşikleri gevşet (daha negatif yap)
+            current_first = current_settings.get('kill_switch_first_reduction', -15)
+            current_full = current_settings.get('kill_switch_full_close', -20)
+            
+            new_first = max(self.limits['kill_switch_first_reduction'][0], current_first - 5)
+            new_full = max(self.limits['kill_switch_full_close'][0], current_full - 5)
+            
+            recommendations['kill_switch_first_reduction'] = new_first
+            recommendations['kill_switch_full_close'] = new_full
+            changes.append(f"KS gevşet: {current_first}/{current_full}→{new_first}/{new_full} (rate %{kill_switch_rate:.0f})")
+            
+        elif kill_switch_rate < 5 and win_rate < 40:  # Kill switch az tetikleniyor ama win rate düşük
+            # Eşikleri sık (daha az negatif yap)
+            current_first = current_settings.get('kill_switch_first_reduction', -15)
+            current_full = current_settings.get('kill_switch_full_close', -20)
+            
+            new_first = min(self.limits['kill_switch_first_reduction'][1], current_first + 3)
+            new_full = min(self.limits['kill_switch_full_close'][1], current_full + 3)
+            
+            recommendations['kill_switch_first_reduction'] = new_first
+            recommendations['kill_switch_full_close'] = new_full
+            changes.append(f"KS sıkılaştır: {current_first}/{current_full}→{new_first}/{new_full} (WR düşük)")
         
         # Phase 53: Market regime bazlı optimizasyon
         market_regime = analysis.get('market_regime', 'RANGING')
@@ -4959,6 +4993,15 @@ class ParameterOptimizer:
         if 'trail_distance_atr' in recommendations:
             paper_trader.trail_distance_atr = recommendations['trail_distance_atr']
             applied.append('trail_distance_atr')
+        
+        # Phase 57: Kill Switch settings
+        if 'kill_switch_first_reduction' in recommendations:
+            daily_kill_switch.first_reduction_pct = recommendations['kill_switch_first_reduction']
+            applied.append('kill_switch_first')
+        
+        if 'kill_switch_full_close' in recommendations:
+            daily_kill_switch.full_close_pct = recommendations['kill_switch_full_close']
+            applied.append('kill_switch_full')
         
         if applied:
             logger.info(f"🤖 OPTIMIZER: Applied {applied}")
@@ -8452,7 +8495,10 @@ async def paper_trading_get_settings():
             "lastOptimization": parameter_optimizer.last_optimization,
             "postTradeStats": post_trade_tracker.get_stats(),
             "lastAnalysis": performance_analyzer.last_analysis,
-        }
+        },
+        # Phase 57: Kill Switch settings
+        "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
+        "killSwitchFullClose": daily_kill_switch.full_close_pct
     })
 
 @app.post("/paper-trading/settings")
@@ -8470,7 +8516,9 @@ async def paper_trading_update_settings(
     minScoreLow: int = None,
     minScoreHigh: int = None,
     entryTightness: float = None,
-    exitTightness: float = None
+    exitTightness: float = None,
+    killSwitchFirstReduction: float = None,
+    killSwitchFullClose: float = None
 ):
     """Update cloud trading settings."""
     if symbol:
@@ -8513,10 +8561,18 @@ async def paper_trading_update_settings(
     if exitTightness is not None:
         global_paper_trader.exit_tightness = exitTightness
     
+    # Phase 57: Kill Switch settings
+    if killSwitchFirstReduction is not None:
+        daily_kill_switch.first_reduction_pct = killSwitchFirstReduction
+        logger.info(f"🚨 Kill Switch First Reduction updated: {killSwitchFirstReduction}%")
+    if killSwitchFullClose is not None:
+        daily_kill_switch.full_close_pct = killSwitchFullClose
+        logger.info(f"🚨 Kill Switch Full Close updated: {killSwitchFullClose}%")
+    
     # Log settings change (simplified)
-    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_score_low}-{global_paper_trader.min_score_high}")
+    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
     global_paper_trader.save_state()
-    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} MinScore:{global_paper_trader.min_score_low}-{global_paper_trader.min_score_high} Entry:{global_paper_trader.entry_tightness} Exit:{global_paper_trader.exit_tightness}")
+    logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} KillSwitch:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
     
     # ====== PHASE 37: Update existing positions' TP/SL based on new exit_tightness ======
     updated_positions = 0
@@ -8580,6 +8636,8 @@ async def paper_trading_update_settings(
         "minConfidenceScore": global_paper_trader.min_confidence_score,
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
+        "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
+        "killSwitchFullClose": daily_kill_switch.full_close_pct,
         "updatedPositions": updated_positions
     })
 
