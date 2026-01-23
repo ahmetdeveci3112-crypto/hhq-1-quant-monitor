@@ -21,6 +21,7 @@ export const TabNavigation: React.FC<TabsProps> = ({
         { id: 'signals', label: 'Sinyaller', icon: Zap, badge: signalCount > 0 ? signalCount : null },
         { id: 'opportunities', label: 'Fırsatlar', icon: TrendingUp, badge: null },
         { id: 'ai', label: 'AI', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
+        { id: 'performance', label: 'Performans', icon: BarChart3, badge: null },
         { id: 'logs', label: 'Loglar', icon: Terminal, badge: null },
     ];
 

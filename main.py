@@ -5577,6 +5577,235 @@ class KillSwitchFaultTracker:
 # Global KillSwitchFaultTracker instance
 kill_switch_fault_tracker = KillSwitchFaultTracker()
 
+
+# ============================================================================
+# PHASE 59: COIN PERFORMANCE TRACKER (Coin-Based Learning)
+# ============================================================================
+
+class CoinPerformanceTracker:
+    """
+    Coin bazlı performans takibi ve öğrenme sistemi.
+    Her coin için win rate, ortalama PnL ve kill switch sayısını takip eder.
+    AI optimizer'a veri sağlar ve düşük performanslı coinleri otomatik bloklar.
+    """
+    
+    def __init__(self, min_trades_for_stats: int = 5, block_threshold_wr: float = 20.0):
+        self.coin_stats: Dict[str, dict] = {}  # {symbol: stats}
+        self.min_trades_for_stats = min_trades_for_stats
+        self.block_threshold_wr = block_threshold_wr  # Block if WR < 20%
+        self.max_history_per_coin = 50  # Son 50 trade tut
+        logger.info("📊 CoinPerformanceTracker initialized (Phase 59)")
+    
+    def load_from_trade_history(self, trades: list):
+        """Mevcut trade history'den coin istatistiklerini yükle."""
+        for trade in trades:
+            symbol = trade.get('symbol', '')
+            if not symbol:
+                continue
+            
+            pnl = trade.get('pnl', 0)
+            reason = trade.get('reason', trade.get('closeReason', ''))
+            close_time = trade.get('closeTime', 0)
+            
+            self._record_trade_internal(symbol, pnl, reason, close_time)
+        
+        logger.info(f"📊 CoinPerformanceTracker: Loaded stats for {len(self.coin_stats)} coins")
+    
+    def _record_trade_internal(self, symbol: str, pnl: float, reason: str, close_time: int = 0):
+        """Dahili trade kayıt fonksiyonu."""
+        if symbol not in self.coin_stats:
+            self.coin_stats[symbol] = {
+                'trades': [],
+                'total_trades': 0,
+                'wins': 0,
+                'losses': 0,
+                'total_pnl': 0.0,
+                'kill_switch_count': 0,
+                'last_trade_time': 0
+            }
+        
+        stats = self.coin_stats[symbol]
+        
+        # Trade kaydet
+        stats['trades'].append({
+            'pnl': pnl,
+            'reason': reason,
+            'time': close_time or int(datetime.now().timestamp() * 1000)
+        })
+        
+        # Son N trade tut
+        if len(stats['trades']) > self.max_history_per_coin:
+            stats['trades'] = stats['trades'][-self.max_history_per_coin:]
+        
+        # İstatistikleri güncelle
+        stats['total_trades'] += 1
+        stats['total_pnl'] += pnl
+        stats['last_trade_time'] = close_time or int(datetime.now().timestamp() * 1000)
+        
+        if pnl > 0:
+            stats['wins'] += 1
+        else:
+            stats['losses'] += 1
+        
+        if 'KILL_SWITCH' in reason:
+            stats['kill_switch_count'] += 1
+    
+    def record_trade(self, symbol: str, pnl: float, reason: str):
+        """Yeni trade kaydet."""
+        self._record_trade_internal(symbol, pnl, reason)
+        
+        # Coin performance logla
+        stats = self.coin_stats.get(symbol, {})
+        wr = self.get_win_rate(symbol)
+        logger.debug(f"📊 Coin {symbol}: WR={wr:.1f}% | PnL=${pnl:+.2f} | Total=${stats.get('total_pnl', 0):.2f}")
+    
+    def get_win_rate(self, symbol: str) -> float:
+        """Coin'in win rate'ini döndür."""
+        stats = self.coin_stats.get(symbol, {})
+        total = stats.get('total_trades', 0)
+        if total < self.min_trades_for_stats:
+            return 50.0  # Yeterli veri yok, nötr
+        wins = stats.get('wins', 0)
+        return (wins / total) * 100
+    
+    def get_coin_penalty(self, symbol: str) -> int:
+        """
+        Coin performansına göre sinyal puanı cezası döndür.
+        Düşük performanslı coinler için 0-30 puan düşürülür.
+        """
+        stats = self.coin_stats.get(symbol, {})
+        total = stats.get('total_trades', 0)
+        
+        if total < self.min_trades_for_stats:
+            return 0  # Yeterli veri yok
+        
+        win_rate = self.get_win_rate(symbol)
+        avg_pnl = stats.get('total_pnl', 0) / total
+        ks_rate = (stats.get('kill_switch_count', 0) / total) * 100
+        
+        penalty = 0
+        
+        # Win rate bazlı ceza
+        if win_rate < 25:
+            penalty += 20
+        elif win_rate < 35:
+            penalty += 10
+        elif win_rate < 45:
+            penalty += 5
+        
+        # Avg PnL bazlı ceza
+        if avg_pnl < -10:
+            penalty += 15
+        elif avg_pnl < -5:
+            penalty += 10
+        elif avg_pnl < 0:
+            penalty += 5
+        
+        # Kill switch rate bazlı ceza
+        if ks_rate > 40:
+            penalty += 15
+        elif ks_rate > 25:
+            penalty += 10
+        elif ks_rate > 15:
+            penalty += 5
+        
+        return min(penalty, 50)  # Max 50 puan ceza
+    
+    def is_coin_blocked(self, symbol: str) -> bool:
+        """Coin'in bloklanıp bloklanmadığını kontrol et."""
+        stats = self.coin_stats.get(symbol, {})
+        total = stats.get('total_trades', 0)
+        
+        if total < self.min_trades_for_stats:
+            return False
+        
+        win_rate = self.get_win_rate(symbol)
+        ks_count = stats.get('kill_switch_count', 0)
+        
+        # Win rate çok düşük veya çok fazla kill switch
+        if win_rate < self.block_threshold_wr:
+            return True
+        if ks_count >= 5 and (ks_count / total) > 0.4:  # %40+ KS rate
+            return True
+        
+        return False
+    
+    def get_worst_performers(self, limit: int = 10) -> list:
+        """En kötü performanslı coinleri döndür."""
+        performers = []
+        for symbol, stats in self.coin_stats.items():
+            total = stats.get('total_trades', 0)
+            if total < self.min_trades_for_stats:
+                continue
+            
+            win_rate = self.get_win_rate(symbol)
+            avg_pnl = stats.get('total_pnl', 0) / total
+            
+            performers.append({
+                'symbol': symbol,
+                'win_rate': round(win_rate, 1),
+                'avg_pnl': round(avg_pnl, 2),
+                'total_pnl': round(stats.get('total_pnl', 0), 2),
+                'trades': total,
+                'ks_count': stats.get('kill_switch_count', 0),
+                'penalty': self.get_coin_penalty(symbol)
+            })
+        
+        # Avg PnL'e göre sırala (en kötüden en iyiye)
+        performers.sort(key=lambda x: x['avg_pnl'])
+        return performers[:limit]
+    
+    def get_best_performers(self, limit: int = 10) -> list:
+        """En iyi performanslı coinleri döndür."""
+        performers = []
+        for symbol, stats in self.coin_stats.items():
+            total = stats.get('total_trades', 0)
+            if total < self.min_trades_for_stats:
+                continue
+            
+            win_rate = self.get_win_rate(symbol)
+            avg_pnl = stats.get('total_pnl', 0) / total
+            
+            performers.append({
+                'symbol': symbol,
+                'win_rate': round(win_rate, 1),
+                'avg_pnl': round(avg_pnl, 2),
+                'total_pnl': round(stats.get('total_pnl', 0), 2),
+                'trades': total,
+                'ks_count': stats.get('kill_switch_count', 0)
+            })
+        
+        # Avg PnL'e göre sırala (en iyiden en kötüye)
+        performers.sort(key=lambda x: x['avg_pnl'], reverse=True)
+        return performers[:limit]
+    
+    def get_stats_for_optimizer(self) -> dict:
+        """AI optimizer için coin istatistiklerini döndür."""
+        worst = self.get_worst_performers(5)
+        best = self.get_best_performers(5)
+        
+        blocked_coins = [s for s in self.coin_stats.keys() if self.is_coin_blocked(s)]
+        
+        return {
+            'worst_performers': worst,
+            'best_performers': best,
+            'blocked_coins': blocked_coins,
+            'total_coins_tracked': len(self.coin_stats)
+        }
+    
+    def get_all_stats(self) -> dict:
+        """Tüm coin istatistiklerini döndür."""
+        return {
+            'coins': len(self.coin_stats),
+            'worst_performers': self.get_worst_performers(10),
+            'best_performers': self.get_best_performers(10),
+            'blocked_coins': [s for s in self.coin_stats.keys() if self.is_coin_blocked(s)]
+        }
+
+
+# Global CoinPerformanceTracker instance
+coin_performance_tracker = CoinPerformanceTracker()
+
 # ============================================================================
 # PHASE 36: ORDER BOOK IMBALANCE DETECTOR
 # ============================================================================
@@ -7061,15 +7290,32 @@ class PaperTradingEngine:
     # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
     # =========================================================================
     
-    def get_dynamic_trail_distance(self, atr: float) -> float:
-        """Calculate trail distance based on current spread."""
+    def get_dynamic_trail_distance(self, atr: float, roi_pct: float = 0) -> float:
+        """
+        Calculate trail distance based on current spread and ROI.
+        Phase 59: ROI-based dynamic trail - more profit = wider trail
+        """
         spread = self.current_spread_pct
+        
+        # Base trail distance from spread
         if spread < 0.05:
-            return atr * 0.5  # Tight trailing for low spread
+            base_trail = atr * 0.5  # Tight trailing for low spread
         elif spread < 0.15:
-            return atr * 1.0  # Normal trailing
+            base_trail = atr * 1.0  # Normal trailing
         else:
-            return atr * (1.0 + spread)  # Wide trailing scales with spread
+            base_trail = atr * (1.0 + spread)  # Wide trailing scales with spread
+        
+        # Phase 59: ROI-based multiplier - kâr arttıkça trail genişler
+        if roi_pct >= 50:
+            roi_mult = 2.0  # Very profitable, give lots of room
+        elif roi_pct >= 25:
+            roi_mult = 1.5  # Good profit, moderate room
+        elif roi_pct >= 10:
+            roi_mult = 1.2  # Small profit, slightly more room
+        else:
+            roi_mult = 1.0  # Standard trail
+        
+        return base_trail * roi_mult
     
     def update_progressive_sl(self, pos: dict, current_price: float, atr: float):
         """Move SL progressively as position goes into profit.
@@ -7369,6 +7615,8 @@ class PaperTradingEngine:
                     
                     # Phase 48: Load kill switch faults from trade history
                     kill_switch_fault_tracker.load_from_trade_history(self.trades)
+                    # Phase 59: Load coin performance stats from trade history
+                    coin_performance_tracker.load_from_trade_history(self.trades)
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
@@ -7635,10 +7883,21 @@ class PaperTradingEngine:
             if self.check_loss_recovery(pos, current_price, atr):
                 continue
             
-            # ===== ORIGINAL TRAILING LOGIC (spread-aware) =====
+            # ===== ORIGINAL TRAILING LOGIC (spread-aware + ROI-aware) =====
             
-            # Get dynamic trail distance based on current spread
-            dynamic_trail = self.get_dynamic_trail_distance(atr)
+            # Phase 59: Calculate ROI for dynamic trail
+            roi_pct = pos.get('unrealizedPnlPercent', 0)
+            if roi_pct == 0:
+                # Calculate if not cached
+                entry = pos.get('entryPrice', 0)
+                if entry > 0:
+                    if pos['side'] == 'LONG':
+                        roi_pct = ((current_price - entry) / entry) * 100 * pos.get('leverage', 1)
+                    else:
+                        roi_pct = ((entry - current_price) / entry) * 100 * pos.get('leverage', 1)
+            
+            # Get dynamic trail distance based on spread AND ROI
+            dynamic_trail = self.get_dynamic_trail_distance(atr, roi_pct)
             
             if pos['side'] == 'LONG':
                 if current_price >= pos['trailActivation']:
@@ -7766,6 +8025,12 @@ class PaperTradingEngine:
             score_component_analyzer.record_trade(trade, components)
         except Exception as e:
             logger.debug(f"Score component record error: {e}")
+        
+        # Phase 59: Record coin performance for learning
+        try:
+            coin_performance_tracker.record_trade(pos.get('symbol', ''), pnl, reason)
+        except Exception as e:
+            logger.debug(f"Coin performance record error: {e}")
 
 
 
@@ -8585,6 +8850,105 @@ async def optimizer_run_now():
         logger.error(f"Optimizer run error: {e}")
         return JSONResponse({"success": False, "message": str(e)})
 
+
+# ============================================================================
+# PHASE 59: PERFORMANCE DASHBOARD ENDPOINTS
+# ============================================================================
+
+@app.get("/performance/coins")
+async def get_coin_performance():
+    """Get coin-based performance statistics."""
+    return JSONResponse({
+        "success": True,
+        **coin_performance_tracker.get_all_stats()
+    })
+
+@app.get("/performance/daily")
+async def get_daily_performance():
+    """Get daily PnL data for charts."""
+    trades = global_paper_trader.trades
+    
+    # Group trades by day
+    daily_pnl = {}
+    for trade in trades:
+        close_time = trade.get('closeTime', 0)
+        if close_time:
+            day = datetime.fromtimestamp(close_time / 1000).strftime('%Y-%m-%d')
+            if day not in daily_pnl:
+                daily_pnl[day] = {'pnl': 0, 'trades': 0, 'wins': 0}
+            daily_pnl[day]['pnl'] += trade.get('pnl', 0)
+            daily_pnl[day]['trades'] += 1
+            if trade.get('pnl', 0) > 0:
+                daily_pnl[day]['wins'] += 1
+    
+    # Convert to list sorted by date
+    daily_list = []
+    for day, data in sorted(daily_pnl.items()):
+        wr = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
+        daily_list.append({
+            'date': day,
+            'pnl': round(data['pnl'], 2),
+            'trades': data['trades'],
+            'winRate': round(wr, 1)
+        })
+    
+    # Calculate cumulative PnL
+    cumulative = 0
+    for item in daily_list:
+        cumulative += item['pnl']
+        item['cumulative'] = round(cumulative, 2)
+    
+    return JSONResponse({
+        "success": True,
+        "dailyPnl": daily_list[-30:],  # Last 30 days
+        "totalDays": len(daily_list)
+    })
+
+@app.get("/performance/optimizer-history")
+async def get_optimizer_history():
+    """Get AI optimizer change history."""
+    history = parameter_optimizer.optimization_history[-20:]  # Last 20
+    return JSONResponse({
+        "success": True,
+        "history": history,
+        "totalOptimizations": len(parameter_optimizer.optimization_history)
+    })
+
+@app.get("/performance/summary")
+async def get_performance_summary():
+    """Get comprehensive performance summary for dashboard."""
+    trades = global_paper_trader.trades
+    stats = global_paper_trader.stats
+    
+    # Recent performance (last 7 days)
+    week_ago = datetime.now().timestamp() * 1000 - (7 * 24 * 60 * 60 * 1000)
+    recent_trades = [t for t in trades if t.get('closeTime', 0) > week_ago]
+    recent_pnl = sum(t.get('pnl', 0) for t in recent_trades)
+    recent_wins = len([t for t in recent_trades if t.get('pnl', 0) > 0])
+    recent_wr = (recent_wins / len(recent_trades) * 100) if recent_trades else 0
+    
+    # Close reason breakdown
+    reason_stats = {}
+    for t in trades:
+        reason = t.get('reason', 'UNKNOWN')
+        if reason not in reason_stats:
+            reason_stats[reason] = {'count': 0, 'pnl': 0}
+        reason_stats[reason]['count'] += 1
+        reason_stats[reason]['pnl'] += t.get('pnl', 0)
+    
+    return JSONResponse({
+        "success": True,
+        "totalPnl": round(stats.get('totalPnl', 0), 2),
+        "totalTrades": stats.get('totalTrades', 0),
+        "winRate": round((stats.get('winningTrades', 0) / stats.get('totalTrades', 1)) * 100, 1) if stats.get('totalTrades', 0) > 0 else 0,
+        "recentPnl": round(recent_pnl, 2),
+        "recentTrades": len(recent_trades),
+        "recentWinRate": round(recent_wr, 1),
+        "coinStats": coin_performance_tracker.get_stats_for_optimizer(),
+        "closeReasons": reason_stats,
+        "optimizerEnabled": parameter_optimizer.enabled,
+        "lastOptimization": parameter_optimizer.last_optimization
+    })
 
 @app.post("/scanner/start")
 async def scanner_start():
