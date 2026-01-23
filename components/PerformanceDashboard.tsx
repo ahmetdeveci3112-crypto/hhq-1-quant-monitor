@@ -130,33 +130,42 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                     <BarChart3 className="w-5 h-5 text-fuchsia-400" />
                     Günlük PnL (Son 30 Gün)
                 </h3>
-                <div className="flex items-end gap-1 h-32">
-                    {dailyPnl.slice(-30).map((day, i) => (
-                        <div
-                            key={i}
-                            className="flex-1 group relative"
-                            title={`${day.date}: $${day.pnl.toFixed(2)}`}
-                        >
-                            <div
-                                className={`w-full rounded-t transition-all ${day.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'}`}
-                                style={{
-                                    height: `${Math.max((Math.abs(day.pnl) / maxPnl) * 100, 5)}%`,
-                                    opacity: 0.6 + (i / 30) * 0.4
-                                }}
-                            />
-                            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block bg-slate-900 px-2 py-1 rounded text-xs whitespace-nowrap z-10">
-                                <div className="text-white">{day.date}</div>
-                                <div className={day.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                    ${day.pnl.toFixed(2)}
+                {dailyPnl.length === 0 ? (
+                    <div className="flex items-center justify-center h-40 text-slate-500">
+                        Henüz günlük veri yok
+                    </div>
+                ) : (
+                    <>
+                        <div className="flex items-end gap-2 h-40">
+                            {dailyPnl.slice(-30).map((day, i) => (
+                                <div
+                                    key={i}
+                                    className="flex-1 min-w-[20px] group relative flex flex-col items-center"
+                                >
+                                    <div
+                                        className={`w-full rounded-t transition-all ${day.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'}`}
+                                        style={{
+                                            height: `${Math.max((Math.abs(day.pnl) / maxPnl) * 100, 10)}%`,
+                                            minHeight: '8px'
+                                        }}
+                                    />
+                                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block bg-slate-900 px-2 py-1 rounded text-xs whitespace-nowrap z-10 border border-slate-700">
+                                        <div className="text-white font-medium">{day.date}</div>
+                                        <div className={day.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                                            ${day.pnl.toFixed(2)}
+                                        </div>
+                                        <div className="text-slate-500">{day.trades} trade</div>
+                                    </div>
                                 </div>
-                            </div>
+                            ))}
                         </div>
-                    ))}
-                </div>
-                <div className="flex justify-between text-xs text-slate-500 mt-2">
-                    <span>{dailyPnl[0]?.date || ''}</span>
-                    <span>{dailyPnl[dailyPnl.length - 1]?.date || ''}</span>
-                </div>
+                        <div className="flex justify-between text-xs text-slate-500 mt-2">
+                            <span>{dailyPnl[0]?.date || ''}</span>
+                            <span className="text-slate-400">{dailyPnl.length} gün</span>
+                            <span>{dailyPnl[dailyPnl.length - 1]?.date || ''}</span>
+                        </div>
+                    </>
+                )}
             </div>
 
             {/* Top/Worst Coins */}
