@@ -7352,12 +7352,20 @@ class PaperTradingEngine:
                     # Phase 32: Load algorithm sensitivity settings
                     self.z_score_threshold = data.get('z_score_threshold', 1.2)
                     self.min_confidence_score = data.get('min_confidence_score', 55)
+                    # Phase 50: Dynamic Min Score Range
+                    self.min_score_low = data.get('min_score_low', 50)
+                    self.min_score_high = data.get('min_score_high', 70)
                     # Phase 36: Load entry/exit tightness
                     self.entry_tightness = data.get('entry_tightness', 1.0)
                     self.exit_tightness = data.get('exit_tightness', 1.0)
+                    # Phase 57: Load Kill Switch settings
+                    if 'kill_switch_first_reduction' in data:
+                        daily_kill_switch.first_reduction_pct = data.get('kill_switch_first_reduction', -100)
+                    if 'kill_switch_full_close' in data:
+                        daily_kill_switch.full_close_pct = data.get('kill_switch_full_close', -150)
                     # Phase 19: Load logs
                     self.logs = data.get('logs', [])
-                    logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr}")
+                    logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr} | KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
                     
                     # Phase 48: Load kill switch faults from trade history
                     kill_switch_fault_tracker.load_from_trade_history(self.trades)
@@ -7386,9 +7394,15 @@ class PaperTradingEngine:
                 # Phase 32: Save algorithm sensitivity settings
                 "z_score_threshold": self.z_score_threshold,
                 "min_confidence_score": self.min_confidence_score,
+                # Phase 50: Dynamic Min Score Range
+                "min_score_low": self.min_score_low,
+                "min_score_high": self.min_score_high,
                 # Phase 36: Save entry/exit tightness
                 "entry_tightness": self.entry_tightness,
                 "exit_tightness": self.exit_tightness,
+                # Phase 57: Kill Switch settings
+                "kill_switch_first_reduction": daily_kill_switch.first_reduction_pct,
+                "kill_switch_full_close": daily_kill_switch.full_close_pct,
                 # Phase 19: Save logs
                 "logs": self.logs[-100:]
             }
