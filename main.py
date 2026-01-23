@@ -6759,8 +6759,12 @@ class PaperTradingEngine:
     
     def add_log(self, message: str):
         """Add a timestamped log entry (persisted to state and SQLite)."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        ts = int(datetime.now().timestamp() * 1000)
+        # Use Turkey timezone
+        from zoneinfo import ZoneInfo
+        turkey_tz = ZoneInfo('Europe/Istanbul')
+        turkey_now = datetime.now(turkey_tz)
+        timestamp = turkey_now.strftime("%H:%M:%S")
+        ts = int(turkey_now.timestamp() * 1000)
         entry = {"time": timestamp, "message": message, "ts": ts}
         self.logs.append(entry)
         self.logs = self.logs[-100:]  # Keep last 100 logs in memory
