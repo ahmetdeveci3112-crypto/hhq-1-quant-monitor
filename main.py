@@ -2934,24 +2934,33 @@ async def background_scanner_loop():
                         
                         if analysis:
                             current_settings = {
+                                'z_score_threshold': global_paper_trader.z_score_threshold,
                                 'min_score_low': global_paper_trader.min_score_low,
                                 'min_score_high': global_paper_trader.min_score_high,
+                                'entry_tightness': global_paper_trader.entry_tightness,
+                                'exit_tightness': global_paper_trader.exit_tightness,
+                                'sl_atr': global_paper_trader.sl_atr,
+                                'tp_atr': global_paper_trader.tp_atr,
+                                'trail_activation_atr': global_paper_trader.trail_activation_atr,
                                 'trail_distance_atr': global_paper_trader.trail_distance_atr,
+                                'max_positions': global_paper_trader.max_positions,
                                 'kill_switch_first_reduction': daily_kill_switch.first_reduction_pct,
                                 'kill_switch_full_close': daily_kill_switch.full_close_pct,
                             }
                             optimization = parameter_optimizer.optimize(analysis, current_settings)
                             
-                            # Log AI analysis
-                            global_paper_trader.add_log(f"🤖 AI Analiz: WR %{analysis.get('win_rate', 0):.0f} | PF {analysis.get('profit_factor', 0):.2f} | Regime: {regime}")
+                            # Log AI analysis with PnL and mode
+                            mode = optimization.get('mode', 'N/A')
+                            total_pnl = analysis.get('total_pnl', 0)
+                            global_paper_trader.add_log(f"🤖 AI [{mode}]: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | PF {analysis.get('profit_factor', 0):.2f}")
                             
                             if optimization.get('changes'):
-                                global_paper_trader.add_log(f"🤖 AI Öneri: {', '.join(optimization.get('changes', []))}")
+                                global_paper_trader.add_log(f"🤖 Öneri: {', '.join(optimization.get('changes', [])[:3])}")
                             
                             if optimization.get('recommendations') and parameter_optimizer.enabled:
                                 applied = parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
                                 if applied:
-                                    global_paper_trader.add_log(f"🤖 AI Uygulama: Ayarlar otomatik güncellendi ✅")
+                                    global_paper_trader.add_log(f"🤖 Ayarlar güncellendi ✅")
                     except Exception as opt_error:
                         logger.debug(f"Optimizer error: {opt_error}")
                 
@@ -4826,9 +4835,13 @@ class PerformanceAnalyzer:
         kill_switch_trades = [t for t in recent_trades if 'KILL_SWITCH' in str(t.get('reason', '')) or 'KILL_SWITCH' in str(t.get('closeReason', ''))]
         kill_switch_rate = len(kill_switch_trades) / len(recent_trades) * 100 if recent_trades else 0
         
+        # Toplam PnL hesapla
+        total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
+        
         analysis = {
             'timestamp': datetime.now().isoformat(),
             'trade_count': len(recent_trades),
+            'total_pnl': round(total_pnl, 2),  # PnL-bazlı AI kararı için
             'win_rate': round(win_rate, 1),
             'avg_winner': round(avg_winner, 2),
             'avg_loser': round(avg_loser, 2),
@@ -4837,7 +4850,7 @@ class PerformanceAnalyzer:
             'worst_coins': worst_coins,
             'reason_performance': reason_performance,
             'early_exit_rate': post_trade_stats.get('early_exit_rate', 0) if post_trade_stats else 0,
-            'kill_switch_rate': round(kill_switch_rate, 1),  # Phase 57
+            'kill_switch_rate': round(kill_switch_rate, 1),
         }
         
         self.last_analysis = analysis
@@ -4860,13 +4873,23 @@ class ParameterOptimizer:
         self.optimization_history = []
         self.enabled = False  # Varsayılan kapalı
         
-        # Güvenlik sınırları
+        # Güvenlik sınırları - TÜM AYARLAR
         self.limits = {
+            # Sinyal kalitesi
+            'z_score_threshold': (0.8, 2.5),
             'min_score_low': (30, 60),
             'min_score_high': (60, 95),
-            'sl_atr': (1.5, 4.0),
-            'trail_distance_atr': (0.5, 2.0),
-            # Phase 57: Kill Switch limits (leveraged ROI based)
+            # Giriş/Çıkış
+            'entry_tightness': (0.5, 4.0),
+            'exit_tightness': (0.3, 2.0),
+            # Risk yönetimi
+            'sl_atr': (1.0, 4.0),
+            'tp_atr': (1.5, 6.0),
+            'trail_activation_atr': (1.0, 3.0),
+            'trail_distance_atr': (0.3, 2.0),
+            # Pozisyon yönetimi
+            'max_positions': (2, 15),
+            # Kill Switch (leveraged ROI based)
             'kill_switch_first_reduction': (-200, -30),
             'kill_switch_full_close': (-300, -50),
         }
@@ -4874,95 +4897,164 @@ class ParameterOptimizer:
         logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
     
     def optimize(self, analysis: dict, current_settings: dict) -> dict:
-        """Analiz sonuçlarına göre optimizasyon önerileri üret."""
+        """
+        PnL-bazlı optimizasyon: Kâr/zarar durumuna göre tüm ayarları kontrol eder.
+        Win rate değil, net PnL ana karar faktörüdür.
+        """
         if not analysis:
             return {}
         
         recommendations = {}
         changes = []
         
-        # Win Rate bazlı min score ayarı
+        # === ANA METRİKLER ===
+        total_pnl = analysis.get('total_pnl', 0)  # Son dönem toplam PnL
         win_rate = analysis.get('win_rate', 50)
-        if win_rate > 60:
-            new_low = max(self.limits['min_score_low'][0], current_settings.get('min_score_low', 50) - 5)
-            recommendations['min_score_low'] = new_low
-            changes.append(f"min_score_low: {current_settings.get('min_score_low', 50)}→{new_low} (WR yüksek)")
-        elif win_rate < 40:
-            new_high = min(self.limits['min_score_high'][1], current_settings.get('min_score_high', 70) + 5)
-            recommendations['min_score_high'] = new_high
-            changes.append(f"min_score_high: {current_settings.get('min_score_high', 70)}→{new_high} (WR düşük)")
-        
-        # Early exit rate bazlı trail ayarı
+        profit_factor = analysis.get('profit_factor', 1.0)
+        kill_switch_rate = analysis.get('kill_switch_rate', 0)
         early_exit_rate = analysis.get('early_exit_rate', 0)
+        market_regime = analysis.get('market_regime', 'RANGING')
+        
+        # === PnL-BAZLI DURUM TESPİTİ ===
+        # Kârda = agresif, Zararda = defansif
+        if total_pnl > 50:  # $50+ kâr
+            mode = 'AGGRESSIVE'
+        elif total_pnl > 0:  # 0-$50 kâr
+            mode = 'NEUTRAL_UP'
+        elif total_pnl > -50:  # 0 ile -$50 arası zarar
+            mode = 'NEUTRAL_DOWN'
+        else:  # -$50'den fazla zarar
+            mode = 'DEFENSIVE'
+        
+        # Profit factor da kontrol et
+        if profit_factor < 0.8:  # Zarar eden sistem
+            mode = 'DEFENSIVE'
+        elif profit_factor > 2.0:  # Çok karlı sistem
+            mode = 'AGGRESSIVE'
+        
+        logger.info(f"🤖 AI Mode: {mode} | PnL: ${total_pnl:.2f} | WR: {win_rate:.1f}% | PF: {profit_factor:.2f}")
+        
+        # === AYAR OPTİMİZASYONU ===
+        
+        # 1. Z-Score Threshold
+        current_z = current_settings.get('z_score_threshold', 1.2)
+        if mode == 'AGGRESSIVE':
+            target_z = max(self.limits['z_score_threshold'][0], current_z - 0.1)
+        elif mode == 'DEFENSIVE':
+            target_z = min(self.limits['z_score_threshold'][1], current_z + 0.1)
+        else:
+            target_z = current_z
+        if abs(target_z - current_z) >= 0.1:
+            recommendations['z_score_threshold'] = round(target_z, 1)
+            changes.append(f"z_score: {current_z}→{target_z}")
+        
+        # 2. Min Score Range
+        current_low = current_settings.get('min_score_low', 50)
+        current_high = current_settings.get('min_score_high', 70)
+        if mode == 'AGGRESSIVE':
+            new_low = max(self.limits['min_score_low'][0], current_low - 5)
+            new_high = max(self.limits['min_score_high'][0], current_high - 5)
+        elif mode == 'DEFENSIVE':
+            new_low = min(self.limits['min_score_low'][1], current_low + 5)
+            new_high = min(self.limits['min_score_high'][1], current_high + 5)
+        else:
+            new_low, new_high = current_low, current_high
+        if new_low != current_low or new_high != current_high:
+            recommendations['min_score_low'] = int(new_low)
+            recommendations['min_score_high'] = int(new_high)
+            changes.append(f"min_score: {current_low}-{current_high}→{new_low}-{new_high}")
+        
+        # 3. Entry Tightness
+        current_entry = current_settings.get('entry_tightness', 1.0)
+        if mode == 'AGGRESSIVE':
+            new_entry = min(self.limits['entry_tightness'][1], current_entry + 0.3)
+        elif mode == 'DEFENSIVE':
+            new_entry = max(self.limits['entry_tightness'][0], current_entry - 0.2)
+        else:
+            new_entry = current_entry
+        if abs(new_entry - current_entry) >= 0.2:
+            recommendations['entry_tightness'] = round(new_entry, 1)
+            changes.append(f"entry: {current_entry}→{new_entry}")
+        
+        # 4. Exit Tightness
+        current_exit = current_settings.get('exit_tightness', 1.0)
+        if mode == 'AGGRESSIVE':
+            new_exit = min(self.limits['exit_tightness'][1], current_exit + 0.2)
+        elif mode == 'DEFENSIVE':
+            new_exit = max(self.limits['exit_tightness'][0], current_exit - 0.1)
+        else:
+            new_exit = current_exit
+        if abs(new_exit - current_exit) >= 0.1:
+            recommendations['exit_tightness'] = round(new_exit, 1)
+            changes.append(f"exit: {current_exit}→{new_exit}")
+        
+        # 5. SL/TP ATR
+        current_sl = current_settings.get('sl_atr', 2.0)
+        current_tp = current_settings.get('tp_atr', 3.0)
+        if mode == 'AGGRESSIVE':
+            new_sl = min(self.limits['sl_atr'][1], current_sl + 0.3)
+            new_tp = min(self.limits['tp_atr'][1], current_tp + 0.5)
+        elif mode == 'DEFENSIVE':
+            new_sl = max(self.limits['sl_atr'][0], current_sl - 0.2)
+            new_tp = max(self.limits['tp_atr'][0], current_tp - 0.3)
+        else:
+            new_sl, new_tp = current_sl, current_tp
+        if abs(new_sl - current_sl) >= 0.2:
+            recommendations['sl_atr'] = round(new_sl, 1)
+            changes.append(f"sl_atr: {current_sl}→{new_sl}")
+        if abs(new_tp - current_tp) >= 0.3:
+            recommendations['tp_atr'] = round(new_tp, 1)
+            changes.append(f"tp_atr: {current_tp}→{new_tp}")
+        
+        # 6. Trail Distance
+        current_trail = current_settings.get('trail_distance_atr', 1.0)
         if early_exit_rate > 50:
-            new_trail = min(self.limits['trail_distance_atr'][1], 
-                           current_settings.get('trail_distance_atr', 1.0) + 0.2)
-            recommendations['trail_distance_atr'] = new_trail
+            new_trail = min(self.limits['trail_distance_atr'][1], current_trail + 0.2)
+            recommendations['trail_distance_atr'] = round(new_trail, 1)
             changes.append(f"trail: +0.2 (erken çıkış %{early_exit_rate:.0f})")
         elif early_exit_rate < 20 and early_exit_rate > 0:
-            new_trail = max(self.limits['trail_distance_atr'][0], 
-                           current_settings.get('trail_distance_atr', 1.0) - 0.1)
-            recommendations['trail_distance_atr'] = new_trail
-            changes.append(f"trail: -0.1 (erken çıkış düşük)")
+            new_trail = max(self.limits['trail_distance_atr'][0], current_trail - 0.1)
+            recommendations['trail_distance_atr'] = round(new_trail, 1)
+            changes.append(f"trail: -0.1")
         
-        # Worst coins'i blokla önerisi
-        worst_coins = analysis.get('worst_coins', [])
-        if worst_coins:
-            recommendations['block_coins'] = worst_coins[:3]
-            changes.append(f"block önerisi: {worst_coins[:3]}")
+        # 7. Max Positions
+        current_max = current_settings.get('max_positions', 5)
+        if mode == 'AGGRESSIVE':
+            new_max = min(self.limits['max_positions'][1], current_max + 2)
+        elif mode == 'DEFENSIVE':
+            new_max = max(self.limits['max_positions'][0], current_max - 2)
+        else:
+            new_max = current_max
+        if new_max != current_max:
+            recommendations['max_positions'] = int(new_max)
+            changes.append(f"max_pos: {current_max}→{new_max}")
         
-        # Phase 57: Kill Switch rate bazlı ayarlar
-        kill_switch_rate = analysis.get('kill_switch_rate', 0)
-        if kill_switch_rate > 30:  # Kill switch çok tetikleniyor (%30+)
-            # Eşikleri gevşet (daha negatif yap)
-            current_first = current_settings.get('kill_switch_first_reduction', -15)
-            current_full = current_settings.get('kill_switch_full_close', -20)
-            
-            new_first = max(self.limits['kill_switch_first_reduction'][0], current_first - 5)
-            new_full = max(self.limits['kill_switch_full_close'][0], current_full - 5)
-            
-            recommendations['kill_switch_first_reduction'] = new_first
-            recommendations['kill_switch_full_close'] = new_full
-            changes.append(f"KS gevşet: {current_first}/{current_full}→{new_first}/{new_full} (rate %{kill_switch_rate:.0f})")
-            
-        elif kill_switch_rate < 5 and win_rate < 40:  # Kill switch az tetikleniyor ama win rate düşük
-            # Eşikleri sık (daha az negatif yap)
-            current_first = current_settings.get('kill_switch_first_reduction', -15)
-            current_full = current_settings.get('kill_switch_full_close', -20)
-            
-            new_first = min(self.limits['kill_switch_first_reduction'][1], current_first + 3)
-            new_full = min(self.limits['kill_switch_full_close'][1], current_full + 3)
-            
-            recommendations['kill_switch_first_reduction'] = new_first
-            recommendations['kill_switch_full_close'] = new_full
-            changes.append(f"KS sıkılaştır: {current_first}/{current_full}→{new_first}/{new_full} (WR düşük)")
+        # 8. Kill Switch (kill switch rate bazlı)
+        current_ks_first = current_settings.get('kill_switch_first_reduction', -100)
+        current_ks_full = current_settings.get('kill_switch_full_close', -150)
+        if kill_switch_rate > 30:
+            # Çok tetikleniyor, gevşet
+            new_ks_first = max(self.limits['kill_switch_first_reduction'][0], current_ks_first - 10)
+            new_ks_full = max(self.limits['kill_switch_full_close'][0], current_ks_full - 10)
+            recommendations['kill_switch_first_reduction'] = int(new_ks_first)
+            recommendations['kill_switch_full_close'] = int(new_ks_full)
+            changes.append(f"KS gevşet: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
+        elif kill_switch_rate < 5 and mode == 'DEFENSIVE':
+            # Az tetikleniyor ama zarar ediyoruz, sıkılaştır
+            new_ks_first = min(self.limits['kill_switch_first_reduction'][1], current_ks_first + 5)
+            new_ks_full = min(self.limits['kill_switch_full_close'][1], current_ks_full + 5)
+            recommendations['kill_switch_first_reduction'] = int(new_ks_first)
+            recommendations['kill_switch_full_close'] = int(new_ks_full)
+            changes.append(f"KS sıkılaştır: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
         
-        # Phase 53: Market regime bazlı optimizasyon
-        market_regime = analysis.get('market_regime', 'RANGING')
-        regime_params = analysis.get('regime_params', {})
-        
-        if regime_params:
-            min_score_adj = regime_params.get('min_score_adjustment', 0)
-            if min_score_adj != 0:
-                # Regime'e göre min score ayarla
-                current_low = current_settings.get('min_score_low', 50)
-                current_high = current_settings.get('min_score_high', 70)
-                
-                new_low = max(self.limits['min_score_low'][0], 
-                             min(self.limits['min_score_low'][1], current_low + min_score_adj))
-                new_high = max(self.limits['min_score_high'][0], 
-                              min(self.limits['min_score_high'][1], current_high + min_score_adj))
-                
-                if new_low != current_low or new_high != current_high:
-                    recommendations['min_score_low'] = int(new_low)
-                    recommendations['min_score_high'] = int(new_high)
-                    changes.append(f"regime {market_regime}: min_score {current_low}-{current_high}→{int(new_low)}-{int(new_high)}")
-        
+        # === SONUÇ ===
         result = {
             'timestamp': datetime.now().isoformat(),
+            'mode': mode,
+            'total_pnl': total_pnl,
             'recommendations': recommendations,
             'changes': changes,
-            'applied': False,  # apply_recommendations içinde True yapılacak
+            'applied': False,
             'market_regime': market_regime
         }
         
@@ -4972,47 +5064,80 @@ class ParameterOptimizer:
             self.optimization_history = self.optimization_history[-50:]
         
         if changes:
-            logger.info(f"🤖 OPTIMIZER: {len(changes)} öneri - {', '.join(changes)}")
+            logger.info(f"🤖 OPTIMIZER ({mode}): {len(changes)} öneri - {', '.join(changes)}")
         
         return result
     
     def apply_recommendations(self, paper_trader, recommendations: dict):
-        """Önerileri uygula (sadece enabled ise)."""
+        """Tüm optimizasyon önerilerini uygula (sadece enabled ise)."""
         if not self.enabled:
             logger.info("🤖 OPTIMIZER: Auto-mode disabled, skipping apply")
             return False
         
         applied = []
         
+        # Sinyal kalitesi
+        if 'z_score_threshold' in recommendations:
+            paper_trader.z_score_threshold = recommendations['z_score_threshold']
+            applied.append('z_score')
+        
         if 'min_score_low' in recommendations:
             paper_trader.min_score_low = recommendations['min_score_low']
-            applied.append('min_score_low')
+            applied.append('min_low')
         
         if 'min_score_high' in recommendations:
             paper_trader.min_score_high = recommendations['min_score_high']
-            applied.append('min_score_high')
+            applied.append('min_high')
+        
+        # Giriş/Çıkış
+        if 'entry_tightness' in recommendations:
+            paper_trader.entry_tightness = recommendations['entry_tightness']
+            applied.append('entry')
+        
+        if 'exit_tightness' in recommendations:
+            paper_trader.exit_tightness = recommendations['exit_tightness']
+            applied.append('exit')
+        
+        # Risk yönetimi
+        if 'sl_atr' in recommendations:
+            paper_trader.sl_atr = recommendations['sl_atr']
+            applied.append('sl_atr')
+        
+        if 'tp_atr' in recommendations:
+            paper_trader.tp_atr = recommendations['tp_atr']
+            applied.append('tp_atr')
+        
+        if 'trail_activation_atr' in recommendations:
+            paper_trader.trail_activation_atr = recommendations['trail_activation_atr']
+            applied.append('trail_act')
         
         if 'trail_distance_atr' in recommendations:
             paper_trader.trail_distance_atr = recommendations['trail_distance_atr']
-            applied.append('trail_distance_atr')
+            applied.append('trail_dist')
         
-        # Phase 57: Kill Switch settings
+        # Pozisyon yönetimi
+        if 'max_positions' in recommendations:
+            paper_trader.max_positions = recommendations['max_positions']
+            applied.append('max_pos')
+        
+        # Kill Switch
         if 'kill_switch_first_reduction' in recommendations:
             daily_kill_switch.first_reduction_pct = recommendations['kill_switch_first_reduction']
-            applied.append('kill_switch_first')
+            applied.append('ks_first')
         
         if 'kill_switch_full_close' in recommendations:
             daily_kill_switch.full_close_pct = recommendations['kill_switch_full_close']
-            applied.append('kill_switch_full')
+            applied.append('ks_full')
         
         if applied:
-            logger.info(f"🤖 OPTIMIZER: Applied {applied}")
-            paper_trader.add_log(f"🤖 Auto-optimize: {', '.join(applied)} güncellendi")
+            logger.info(f"🤖 OPTIMIZER: Applied {len(applied)} settings: {applied}")
+            paper_trader.add_log(f"🤖 AI güncelledi: {', '.join(applied)}")
             paper_trader.save_state()
             # Mark as applied in last_optimization
             if self.last_optimization:
                 self.last_optimization['applied'] = True
                 self.last_optimization['applied_at'] = datetime.now().isoformat()
+                self.last_optimization['applied_settings'] = applied
         
         return len(applied) > 0
     
