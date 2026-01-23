@@ -103,13 +103,13 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                 <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4 text-center">
                     <AlertTriangle className={`w-5 h-5 mx-auto mb-2 ${stats.earlyExitRate > 50 ? 'text-rose-400' : 'text-emerald-400'}`} />
                     <div className={`text-2xl font-bold ${stats.earlyExitRate > 50 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                        %{stats.earlyExitRate.toFixed(0)}
+                        %{(stats.earlyExitRate ?? 0).toFixed(0)}
                     </div>
                     <div className="text-xs text-slate-400">Erken Çıkış Oranı</div>
                 </div>
                 <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4 text-center">
                     <TrendingUp className="w-5 h-5 text-blue-400 mx-auto mb-2" />
-                    <div className="text-2xl font-bold text-blue-400">%{stats.avgMissedProfit.toFixed(1)}</div>
+                    <div className="text-2xl font-bold text-blue-400">%{(stats.avgMissedProfit ?? 0).toFixed(1)}</div>
                     <div className="text-xs text-slate-400">Ort. Kaçırılan Kâr</div>
                 </div>
             </div>
