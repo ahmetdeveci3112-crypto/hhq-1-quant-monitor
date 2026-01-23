@@ -8920,10 +8920,10 @@ async def get_performance_summary():
     trades = global_paper_trader.trades
     stats = global_paper_trader.stats
     
-    # Fix: Calculate from trades list (source of truth) instead of possibly stale stats
+    # Use stats.totalPnl (correct realized PnL) but trades list length for count
     total_trades = len(trades)
-    total_pnl = sum(t.get('pnl', 0) for t in trades)
-    winning_trades = len([t for t in trades if t.get('pnl', 0) > 0])
+    total_pnl = stats.get('totalPnl', 0)  # Use stats - this tracks realized PnL correctly
+    winning_trades = stats.get('winningTrades', 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
     
     # Recent performance (last 7 days)
