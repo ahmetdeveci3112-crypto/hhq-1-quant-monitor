@@ -2914,8 +2914,8 @@ async def background_scanner_loop():
                     except Exception as pt_error:
                         logger.debug(f"Post-trade update error: {pt_error}")
                 
-                # Phase 52: Run optimizer every hour
-                if int(datetime.now().timestamp()) % 3600 < scan_interval:
+                # Phase 52: Run optimizer every 15 minutes (900 seconds)
+                if int(datetime.now().timestamp()) % 900 < scan_interval:
                     try:
                         # Phase 53: Update market regime with BTC price
                         btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
@@ -4901,7 +4901,7 @@ class ParameterOptimizer:
             'timestamp': datetime.now().isoformat(),
             'recommendations': recommendations,
             'changes': changes,
-            'applied': False,  # Manuel onay gerekir
+            'applied': False,  # apply_recommendations içinde True yapılacak
             'market_regime': market_regime
         }
         
@@ -4939,6 +4939,10 @@ class ParameterOptimizer:
             logger.info(f"🤖 OPTIMIZER: Applied {applied}")
             paper_trader.add_log(f"🤖 Auto-optimize: {', '.join(applied)} güncellendi")
             paper_trader.save_state()
+            # Mark as applied in last_optimization
+            if self.last_optimization:
+                self.last_optimization['applied'] = True
+                self.last_optimization['applied_at'] = datetime.now().isoformat()
         
         return len(applied) > 0
     
@@ -8298,12 +8302,29 @@ async def optimizer_toggle():
 @app.get("/optimizer/status")
 async def optimizer_status():
     """Get optimizer status and analysis."""
+    # Convert tracking dict to list for UI
+    tracking_list = []
+    for trade_id, data in post_trade_tracker.tracking.items():
+        tracking_list.append({
+            'id': trade_id,
+            'symbol': data.get('symbol', ''),
+            'side': data.get('side', ''),
+            'exitPrice': data.get('exit_price', 0),
+            'exitTime': data.get('exit_time').isoformat() if data.get('exit_time') else None,
+            'pnl': data.get('pnl', 0),
+            'reason': data.get('reason', ''),
+            'maxPriceAfter': data.get('max_price_after', 0),
+            'minPriceAfter': data.get('min_price_after', 0),
+            'priceSamples': data.get('price_samples', 0),
+        })
+    
     return JSONResponse({
         "enabled": parameter_optimizer.enabled,
         "lastOptimization": parameter_optimizer.last_optimization,
         "lastAnalysis": performance_analyzer.last_analysis,
         "postTradeStats": post_trade_tracker.get_stats(),
         "trackingCount": len(post_trade_tracker.tracking),
+        "trackingList": tracking_list,
         "recentAnalyses": post_trade_tracker.analysis_results[-10:],
         "marketRegime": market_regime_detector.get_status(),
         "scoreAnalysis": score_component_analyzer.get_status()

@@ -17,13 +17,16 @@ interface PostTradeAnalysis {
 }
 
 interface TrackingTrade {
+    id: string;
     symbol: string;
     side: string;
-    exit_price: number;
-    max_price_after: number;
-    min_price_after: number;
+    exitPrice: number;
+    exitTime: string;
     pnl: number;
-    exit_time: string;
+    reason: string;
+    maxPriceAfter: number;
+    minPriceAfter: number;
+    priceSamples: number;
 }
 
 interface OptimizerStats {
@@ -165,19 +168,19 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking, analyses, on
                             </thead>
                             <tbody>
                                 {tracking.map((t, i) => (
-                                    <tr key={i} className="border-t border-slate-700/50">
+                                    <tr key={t.id || i} className="border-t border-slate-700/50">
                                         <td className="py-2 font-medium text-white">{t.symbol.replace('USDT', '')}</td>
                                         <td className={`py-2 ${t.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
                                             {t.side === 'LONG' ? '📈' : '📉'} {t.side}
                                         </td>
-                                        <td className="py-2 text-right font-mono text-slate-300">${t.exit_price.toFixed(4)}</td>
+                                        <td className="py-2 text-right font-mono text-slate-300">${t.exitPrice?.toFixed(4) || '0'}</td>
                                         <td className="py-2 text-right font-mono">
-                                            <span className="text-emerald-400">${t.max_price_after.toFixed(4)}</span>
+                                            <span className="text-emerald-400">${t.maxPriceAfter?.toFixed(4) || '0'}</span>
                                             <span className="text-slate-500"> / </span>
-                                            <span className="text-rose-400">${t.min_price_after.toFixed(4)}</span>
+                                            <span className="text-rose-400">${t.minPriceAfter?.toFixed(4) || '0'}</span>
                                         </td>
                                         <td className={`py-2 text-right font-mono ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            ${t.pnl.toFixed(2)}
+                                            ${t.pnl?.toFixed(2) || '0'}
                                         </td>
                                     </tr>
                                 ))}

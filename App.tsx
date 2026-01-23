@@ -161,7 +161,12 @@ export default function App() {
     enabled: false,
     earlyExitRate: 0,
     trackingCount: 0,
-    lastAnalysis: null as string | null
+    lastAnalysis: null as string | null,
+    trackingList: [] as any[],
+    recentAnalyses: [] as any[],
+    completedCount: 0,
+    avgMissedProfit: 0,
+    avgAvoidedLoss: 0
   });
 
   // Phase 53: Market Regime state
@@ -510,7 +515,12 @@ export default function App() {
             enabled: data.enabled ?? false,
             earlyExitRate: data.postTradeStats?.early_exit_rate ?? 0,
             trackingCount: data.trackingCount ?? 0,
-            lastAnalysis: data.lastAnalysis?.timestamp ?? null
+            lastAnalysis: data.lastAnalysis?.timestamp ?? null,
+            trackingList: data.trackingList ?? [],
+            recentAnalyses: data.recentAnalyses ?? [],
+            completedCount: data.postTradeStats?.completed_count ?? 0,
+            avgMissedProfit: data.postTradeStats?.avg_missed_profit ?? 0,
+            avgAvoidedLoss: data.postTradeStats?.avg_avoided_loss ?? 0
           });
           if (data.marketRegime) {
             setMarketRegime(data.marketRegime);
@@ -1229,13 +1239,13 @@ export default function App() {
                 stats={{
                   enabled: optimizerStats.enabled,
                   trackingCount: optimizerStats.trackingCount,
-                  completedCount: 0,
+                  completedCount: optimizerStats.completedCount,
                   earlyExitRate: optimizerStats.earlyExitRate,
-                  avgMissedProfit: 0,
-                  avgAvoidedLoss: 0
+                  avgMissedProfit: optimizerStats.avgMissedProfit,
+                  avgAvoidedLoss: optimizerStats.avgAvoidedLoss
                 }}
-                tracking={[]}
-                analyses={[]}
+                tracking={optimizerStats.trackingList}
+                analyses={optimizerStats.recentAnalyses}
                 onToggle={toggleOptimizer}
                 marketRegime={marketRegime || undefined}
               />
