@@ -4324,9 +4324,11 @@ class TimeBasedPositionManager:
         actions = {
             "trail_activated": [],
             "time_reduced": [],
+            "time_closed": [],
             "checked": 0
         }
         
+        positions_to_remove = []  # Phase 56: Track positions to remove after 100% reduction
         current_time_ms = int(datetime.now().timestamp() * 1000)
         
         for pos in list(paper_trader.positions):
@@ -4452,16 +4454,30 @@ class TimeBasedPositionManager:
                                     'reason': close_reason,
                                     'leverage': pos.get('leverage', 10),
                                     'margin': margin_return,
-                                    'isPartialClose': True
+                                    'isPartialClose': reduction_pct < 1.0  # Only partial if not 100%
                                 }
                                 paper_trader.trades.append(trade_record)
                                 paper_trader.stats['totalTrades'] += 1
                                 if partial_pnl > 0:
                                     paper_trader.stats['winTrades'] += 1
+                                
+                                # Phase 56: If 100% reduction, mark position for removal
+                                if reduction_pct >= 1.0 or pos.get('size', 0) <= 0 or pos.get('sizeUsd', 0) <= 0.01:
+                                    positions_to_remove.append(pos_id)
+                                    logger.warning(f"📊 TIME CLOSE: {symbol} fully closed after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
+                                    paper_trader.add_log(f"⏰ TIME CLOSE: {symbol} fully closed after {threshold_hours}h")
+                                
                                 paper_trader.save_state()
                 
             except Exception as e:
                 logger.error(f"Error in time-based position check: {e}")
+        
+        # Phase 56: Remove positions that were fully closed (100% reduction)
+        if positions_to_remove:
+            paper_trader.positions = [p for p in paper_trader.positions if p.get('id') not in positions_to_remove]
+            actions["time_closed"] = positions_to_remove
+            logger.info(f"📊 TIME CLOSE: Removed {len(positions_to_remove)} fully closed positions")
+            paper_trader.save_state()
         
         # Cleanup old tracking data for closed positions
         active_pos_ids = {p.get('id') for p in paper_trader.positions}
