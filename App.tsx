@@ -20,6 +20,7 @@ import { ActiveSignalsPanel } from './components/ActiveSignalsPanel';
 import { WalletPanel, PositionCardBinance } from './components/WalletPanel';
 import { TabNavigation } from './components/TabNavigation';
 import { AITrackingPanel } from './components/AITrackingPanel';
+import { PerformanceDashboard } from './components/PerformanceDashboard';
 import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
@@ -1255,6 +1256,15 @@ export default function App() {
                 onToggle={toggleOptimizer}
                 marketRegime={marketRegime || undefined}
               />
+            </div>
+          )
+        }
+
+        {/* PERFORMANCE TAB */}
+        {
+          activeTab === 'performance' && (
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <PerformanceDashboard apiUrl={isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000'} />
             </div>
           )
         }
