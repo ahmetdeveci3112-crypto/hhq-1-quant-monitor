@@ -26,7 +26,7 @@ export const TabNavigation: React.FC<TabsProps> = ({
     ];
 
     return (
-        <div className="flex items-center gap-1 bg-[#0B0E14] border border-slate-800 rounded-xl p-1 mb-4">
+        <div className="flex items-center gap-1 bg-[#0B0E14] border border-slate-800 rounded-xl p-1 mb-4 overflow-x-auto scrollbar-hide">
             {tabs.map((tab) => {
                 const Icon = tab.icon;
                 const isActive = activeTab === tab.id;
@@ -36,7 +36,7 @@ export const TabNavigation: React.FC<TabsProps> = ({
                         key={tab.id}
                         onClick={() => onTabChange(tab.id)}
                         className={`
-              flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all
+              flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-2 sm:py-2.5 rounded-lg font-medium text-xs sm:text-sm transition-all whitespace-nowrap flex-shrink-0
               ${isActive
                                 ? 'bg-indigo-600 text-white shadow-lg'
                                 : 'text-slate-400 hover:text-white hover:bg-slate-800/50'

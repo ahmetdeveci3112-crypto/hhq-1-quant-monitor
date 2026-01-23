@@ -70,55 +70,55 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     return (
         <div className="space-y-6">
             {/* Summary Cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div className="bg-gradient-to-br from-emerald-900/50 to-emerald-800/30 border border-emerald-700/50 rounded-xl p-4">
-                    <div className="flex items-center gap-2 mb-2">
-                        <TrendingUp className="w-5 h-5 text-emerald-400" />
-                        <span className="text-sm text-emerald-300">Toplam Kâr</span>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4">
+                <div className="bg-gradient-to-br from-emerald-900/50 to-emerald-800/30 border border-emerald-700/50 rounded-xl p-2 sm:p-4">
+                    <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
+                        <TrendingUp className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-400" />
+                        <span className="text-xs sm:text-sm text-emerald-300">Toplam Kâr</span>
                     </div>
-                    <div className="text-2xl font-bold text-white">
+                    <div className="text-lg sm:text-2xl font-bold text-white">
                         ${summary?.totalPnl?.toFixed(2) || '0.00'}
                     </div>
-                    <div className="text-xs text-emerald-400 mt-1">
+                    <div className="text-[10px] sm:text-xs text-emerald-400 mt-1">
                         {summary?.totalTrades || 0} trade
                     </div>
                 </div>
 
-                <div className="bg-gradient-to-br from-blue-900/50 to-blue-800/30 border border-blue-700/50 rounded-xl p-4">
-                    <div className="flex items-center gap-2 mb-2">
-                        <BarChart3 className="w-5 h-5 text-blue-400" />
-                        <span className="text-sm text-blue-300">Win Rate</span>
+                <div className="bg-gradient-to-br from-blue-900/50 to-blue-800/30 border border-blue-700/50 rounded-xl p-2 sm:p-4">
+                    <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
+                        <BarChart3 className="w-4 h-4 sm:w-5 sm:h-5 text-blue-400" />
+                        <span className="text-xs sm:text-sm text-blue-300">Win Rate</span>
                     </div>
-                    <div className="text-2xl font-bold text-white">
+                    <div className="text-lg sm:text-2xl font-bold text-white">
                         %{summary?.winRate?.toFixed(1) || '0'}
                     </div>
-                    <div className="text-xs text-blue-400 mt-1">
-                        Son 7 gün: %{summary?.recentWinRate?.toFixed(1) || '0'}
+                    <div className="text-[10px] sm:text-xs text-blue-400 mt-1 truncate">
+                        Son 7g: %{summary?.recentWinRate?.toFixed(1) || '0'}
                     </div>
                 </div>
 
-                <div className="bg-gradient-to-br from-fuchsia-900/50 to-fuchsia-800/30 border border-fuchsia-700/50 rounded-xl p-4">
-                    <div className="flex items-center gap-2 mb-2">
-                        <Bot className="w-5 h-5 text-fuchsia-400" />
-                        <span className="text-sm text-fuchsia-300">Son 7 Gün</span>
+                <div className="bg-gradient-to-br from-fuchsia-900/50 to-fuchsia-800/30 border border-fuchsia-700/50 rounded-xl p-2 sm:p-4">
+                    <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
+                        <Bot className="w-4 h-4 sm:w-5 sm:h-5 text-fuchsia-400" />
+                        <span className="text-xs sm:text-sm text-fuchsia-300">Son 7 Gün</span>
                     </div>
-                    <div className={`text-2xl font-bold ${(summary?.recentPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    <div className={`text-lg sm:text-2xl font-bold ${(summary?.recentPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         ${summary?.recentPnl?.toFixed(2) || '0.00'}
                     </div>
-                    <div className="text-xs text-fuchsia-400 mt-1">
+                    <div className="text-[10px] sm:text-xs text-fuchsia-400 mt-1">
                         {summary?.recentTrades || 0} trade
                     </div>
                 </div>
 
-                <div className="bg-gradient-to-br from-amber-900/50 to-amber-800/30 border border-amber-700/50 rounded-xl p-4">
-                    <div className="flex items-center gap-2 mb-2">
-                        <Trophy className="w-5 h-5 text-amber-400" />
-                        <span className="text-sm text-amber-300">Takip Edilen</span>
+                <div className="bg-gradient-to-br from-amber-900/50 to-amber-800/30 border border-amber-700/50 rounded-xl p-2 sm:p-4">
+                    <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
+                        <Trophy className="w-4 h-4 sm:w-5 sm:h-5 text-amber-400" />
+                        <span className="text-xs sm:text-sm text-amber-300">Takip</span>
                     </div>
-                    <div className="text-2xl font-bold text-white">
+                    <div className="text-lg sm:text-2xl font-bold text-white">
                         {coinStats?.coins || 0}
                     </div>
-                    <div className="text-xs text-amber-400 mt-1">
+                    <div className="text-[10px] sm:text-xs text-amber-400 mt-1">
                         {coinStats?.blocked_coins?.length || 0} bloklu
                     </div>
                 </div>
