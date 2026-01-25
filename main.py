@@ -2255,9 +2255,32 @@ class MultiCoinScanner:
     
     async def fetch_all_futures_symbols(self) -> list:
         """Fetch all USDT perpetual contracts from Binance Futures."""
+        
+        # Method 1: Try direct Binance API (most reliable, bypasses CCXT issues)
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        symbols = []
+                        for s in data.get('symbols', []):
+                            if (s.get('symbol', '').endswith('USDT') and 
+                                s.get('contractType') == 'PERPETUAL' and 
+                                s.get('status') == 'TRADING'):
+                                symbols.append(s['symbol'])
+                        
+                        if len(symbols) > 100:  # Sanity check
+                            symbols = sorted(list(set(symbols)))
+                            logger.info(f"✅ Fetched {len(symbols)} USDT perpetual contracts (direct API)")
+                            self.coins = symbols
+                            return symbols
+        except Exception as e:
+            logger.warning(f"Direct Binance API failed: {e}, trying CCXT...")
+        
+        # Method 2: Try CCXT (may fail on some servers due to geo-restrictions)
         try:
             if not self.exchange:
-                # Use API keys from environment if available (fixes geo-blocking on Railway)
                 api_key = os.environ.get('BINANCE_API_KEY', '')
                 api_secret = os.environ.get('BINANCE_SECRET', '')
                 
@@ -2284,50 +2307,51 @@ class MultiCoinScanner:
                     market.get('linear', False) and 
                     market.get('active', True) and
                     ':USDT' in symbol):
-                    # Convert to simple format: BTC/USDT:USDT -> BTCUSDT
                     base = market.get('base', '')
                     if base:
                         symbols.append(f"{base}USDT")
             
-            # Sort alphabetically and scan ALL coins (no limit)
             symbols = sorted(list(set(symbols)))
             
-            logger.info(f"Fetched {len(symbols)} USDT perpetual contracts")
-            self.coins = symbols
-            return symbols
-            
+            if len(symbols) > 100:
+                logger.info(f"✅ Fetched {len(symbols)} USDT perpetual contracts (CCXT)")
+                self.coins = symbols
+                return symbols
+                
         except Exception as e:
-            logger.error(f"Error fetching futures symbols: {e}")
-            # Fallback to top 100 coins by market cap/volume
-            self.coins = [
-                # Top 20
-                'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-                'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'DOTUSDT',
-                'LINKUSDT', 'MATICUSDT', 'ICPUSDT', 'SHIBUSDT', 'LTCUSDT',
-                'BCHUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT', 'XLMUSDT',
-                # 21-40
-                'APTUSDT', 'FILUSDT', 'LDOUSDT', 'ARBUSDT', 'OPUSDT',
-                'INJUSDT', 'RNDRUSDT', 'HBARUSDT', 'VETUSDT', 'AAVEUSDT',
-                'IMXUSDT', 'MKRUSDT', 'GRTUSDT', 'THETAUSDT', 'FTMUSDT',
-                'ALGOUSDT', 'RUNEUSDT', 'EGLDUSDT', 'SNXUSDT', 'AXSUSDT',
-                # 41-60
-                'SANDUSDT', 'MANAUSDT', 'GALAUSDT', 'APEUSDT', 'CHZUSDT',
-                'CRVUSDT', 'LRCUSDT', 'ENJUSDT', 'DYDXUSDT', 'MINAUSDT',
-                'KAVAUSDT', 'COMPUSDT', 'GMTUSDT', 'ONEUSDT', 'IOTAUSDT',
-                'ZECUSDT', 'KSMUSDT', 'DASHUSDT', 'SUIUSDT', 'SEIUSDT',
-                # 61-80  
-                '1000PEPEUSDT', '1000SHIBUSDT', 'WIFUSDT', 'BONKUSDT', 'FLOKIUSDT',
-                'ORDIUSDT', 'TIAUSDT', 'FETUSDT', 'AGIXUSDT', 'OCEANUSDT',
-                'WOOUSDT', 'BLURUSDT', 'CFXUSDT', 'STXUSDT', 'ARKMUSDT',
-                'PENDLEUSDT', 'JOEUSDT', 'HOOKUSDT', 'MAGICUSDT', 'TUSDT',
-                # 81-100
-                'CKBUSDT', 'TRUUSDT', 'SSVUSDT', 'RPLUSDT', 'GMXUSDT',
-                'LEVERUSDT', 'CYBERUSDT', 'ARKUSDT', 'POLYXUSDT', 'BIGTIMEUSDT',
-                'WLDUSDT', 'LQTYUSDT', 'OXTUSDT', 'AMBUSDT', 'PHBUSDT',
-                'COMBOUSDT', 'MAVUSDT', 'XVSUSDT', 'EDUUSDT', 'IDUSDT'
-            ]
-            logger.info(f"Using fallback list of {len(self.coins)} coins")
-            return self.coins
+            logger.error(f"CCXT also failed: {e}")
+        
+        # Method 3: Fallback to hardcoded top 100 coins
+        logger.warning("⚠️ All API methods failed, using fallback 100 coin list")
+        self.coins = [
+            # Top 20
+            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+            'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'DOTUSDT',
+            'LINKUSDT', 'MATICUSDT', 'ICPUSDT', 'SHIBUSDT', 'LTCUSDT',
+            'BCHUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT', 'XLMUSDT',
+            # 21-40
+            'APTUSDT', 'FILUSDT', 'LDOUSDT', 'ARBUSDT', 'OPUSDT',
+            'INJUSDT', 'RNDRUSDT', 'HBARUSDT', 'VETUSDT', 'AAVEUSDT',
+            'IMXUSDT', 'MKRUSDT', 'GRTUSDT', 'THETAUSDT', 'FTMUSDT',
+            'ALGOUSDT', 'RUNEUSDT', 'EGLDUSDT', 'SNXUSDT', 'AXSUSDT',
+            # 41-60
+            'SANDUSDT', 'MANAUSDT', 'GALAUSDT', 'APEUSDT', 'CHZUSDT',
+            'CRVUSDT', 'LRCUSDT', 'ENJUSDT', 'DYDXUSDT', 'MINAUSDT',
+            'KAVAUSDT', 'COMPUSDT', 'GMTUSDT', 'ONEUSDT', 'IOTAUSDT',
+            'ZECUSDT', 'KSMUSDT', 'DASHUSDT', 'SUIUSDT', 'SEIUSDT',
+            # 61-80  
+            '1000PEPEUSDT', '1000SHIBUSDT', 'WIFUSDT', 'BONKUSDT', 'FLOKIUSDT',
+            'ORDIUSDT', 'TIAUSDT', 'FETUSDT', 'AGIXUSDT', 'OCEANUSDT',
+            'WOOUSDT', 'BLURUSDT', 'CFXUSDT', 'STXUSDT', 'ARKMUSDT',
+            'PENDLEUSDT', 'JOEUSDT', 'HOOKUSDT', 'MAGICUSDT', 'TUSDT',
+            # 81-100
+            'CKBUSDT', 'TRUUSDT', 'SSVUSDT', 'RPLUSDT', 'GMXUSDT',
+            'LEVERUSDT', 'CYBERUSDT', 'ARKUSDT', 'POLYXUSDT', 'BIGTIMEUSDT',
+            'WLDUSDT', 'LQTYUSDT', 'OXTUSDT', 'AMBUSDT', 'PHBUSDT',
+            'COMBOUSDT', 'MAVUSDT', 'XVSUSDT', 'EDUUSDT', 'IDUSDT'
+        ]
+        logger.info(f"Using fallback list of {len(self.coins)} coins")
+        return self.coins
     
     def get_or_create_analyzer(self, symbol: str) -> LightweightCoinAnalyzer:
         """Get existing analyzer or create new one."""
