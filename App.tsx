@@ -129,18 +129,18 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<SystemSettings>({
     leverage: 10,
-    stopLossAtr: 2,
-    takeProfit: 3,
+    stopLossAtr: 30,
+    takeProfit: 20,
     riskPerTrade: 2,
     trailActivationAtr: 1.5,
     trailDistanceAtr: 1,
-    maxPositions: 5,
-    zScoreThreshold: 1.2,
-    minConfidenceScore: 55,
-    minScoreLow: 50,
-    minScoreHigh: 70,
-    entryTightness: 1.0,
-    exitTightness: 1.0,
+    maxPositions: 50,
+    zScoreThreshold: 1.6,
+    minConfidenceScore: 68,
+    minScoreLow: 60,
+    minScoreHigh: 90,
+    entryTightness: 1.8,
+    exitTightness: 1.2,
     killSwitchFirstReduction: -100,
     killSwitchFullClose: -150
   });
@@ -414,18 +414,18 @@ export default function App() {
         }
         setSettings({
           leverage: data.leverage ?? 10,
-          stopLossAtr: data.slAtr ?? 2,
-          takeProfit: data.tpAtr ?? 3,
+          stopLossAtr: data.slAtr ?? 30,
+          takeProfit: data.tpAtr ?? 20,
           riskPerTrade: (data.riskPerTrade ?? 0.02) * 100,
           trailActivationAtr: data.trailActivationAtr ?? 1.5,
           trailDistanceAtr: data.trailDistanceAtr ?? 1,
-          maxPositions: data.maxPositions ?? 1,
-          zScoreThreshold: data.zScoreThreshold ?? 1.2,
-          minConfidenceScore: data.minConfidenceScore ?? 55,
-          minScoreLow: data.minScoreLow ?? 50,
-          minScoreHigh: data.minScoreHigh ?? 70,
-          entryTightness: data.entryTightness ?? 1.0,
-          exitTightness: data.exitTightness ?? 1.0,
+          maxPositions: data.maxPositions ?? 50,
+          zScoreThreshold: data.zScoreThreshold ?? 1.6,
+          minConfidenceScore: data.minConfidenceScore ?? 68,
+          minScoreLow: data.minScoreLow ?? 60,
+          minScoreHigh: data.minScoreHigh ?? 90,
+          entryTightness: data.entryTightness ?? 1.8,
+          exitTightness: data.exitTightness ?? 1.2,
           killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
           killSwitchFullClose: data.killSwitchFullClose ?? -150
         });
@@ -455,7 +455,7 @@ export default function App() {
 
         const symbol = data.symbol || 'N/A';
         const leverage = data.leverage || 0;
-        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 2} TP:${data.tpAtr || 3} | $${(data.balance || 0).toFixed(0)} `);
+        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 30} TP:${data.tpAtr || 20} | $${(data.balance || 0).toFixed(0)} `);
         setIsSynced(true); // Phase 27: Allow auto-save only after sync
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
