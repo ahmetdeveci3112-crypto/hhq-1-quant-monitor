@@ -827,25 +827,46 @@ VOLATILITY_LEVELS = {
     "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 2.4% (3x)
 }
 
-def get_volatility_adjusted_params(volatility_pct: float, atr: float) -> dict:
+def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: float = 0.0) -> dict:
     """
     Get SL/TP/Trail/Leverage based on volatility (ATR as % of price).
     Phase 35: Using ATR percentage for proper volatility classification.
+    Phase 43: Price-based leverage cap for low-price coins (tick sensitivity).
     
     Args:
         volatility_pct: ATR as percentage of price (e.g., 2.5 for 2.5%)
         atr: Absolute ATR value for calculating distances
+        price: Current price for low-price coin leverage cap
         
     Returns:
         dict with trail_distance, stop_loss, take_profit, leverage, pullback, level
     """
     for level, params in VOLATILITY_LEVELS.items():
         if volatility_pct <= params["max_atr_pct"]:
+            leverage = params["leverage"]
+            
+            # Phase 43: Price-based leverage cap for low-price coins
+            # Low-price coins have high tick sensitivity - small price moves = big % changes
+            # Cap leverage to prevent excessive risk
+            if price > 0:
+                if price < 0.10:
+                    max_leverage = 5  # Very low price: max 5x
+                elif price < 1.00:
+                    max_leverage = 10  # Low price: max 10x
+                elif price < 10.0:
+                    max_leverage = 15  # Medium-low price: max 15x
+                else:
+                    max_leverage = 50  # Normal price: volatility-based
+                
+                if leverage > max_leverage:
+                    logger.debug(f"Price-based leverage cap: {leverage}x -> {max_leverage}x (price=${price:.4f})")
+                    leverage = max_leverage
+            
             return {
                 "trail_distance": atr * params["trail"],
                 "stop_loss": atr * params["sl"],
                 "take_profit": atr * params["tp"],
-                "leverage": params["leverage"],
+                "leverage": leverage,
                 "pullback": params["pullback"],
                 "sl_multiplier": params["sl"],
                 "tp_multiplier": params["tp"],
@@ -854,11 +875,22 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float) -> dict:
             }
     # Default to very_high
     params = VOLATILITY_LEVELS["very_high"]
+    leverage = params["leverage"]
+    
+    # Apply price cap for default case too
+    if price > 0:
+        if price < 0.10:
+            leverage = min(leverage, 5)
+        elif price < 1.00:
+            leverage = min(leverage, 10)
+        elif price < 10.0:
+            leverage = min(leverage, 15)
+    
     return {
         "trail_distance": atr * params["trail"],
         "stop_loss": atr * params["sl"],
         "take_profit": atr * params["tp"],
-        "leverage": params["leverage"],
+        "leverage": leverage,
         "pullback": params["pullback"],
         "sl_multiplier": params["sl"],
         "tp_multiplier": params["tp"],
@@ -867,9 +899,9 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float) -> dict:
     }
 
 # Backwards compatibility alias
-def get_spread_adjusted_params(spread_pct: float, atr: float) -> dict:
+def get_spread_adjusted_params(spread_pct: float, atr: float, price: float = 0.0) -> dict:
     """Alias for get_volatility_adjusted_params for backwards compatibility."""
-    return get_volatility_adjusted_params(spread_pct, atr)
+    return get_volatility_adjusted_params(spread_pct, atr, price)
 
 
 
