@@ -255,73 +255,13 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
           </div>
 
-          {/* Kill Switch Section */}
-          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
-            <h3 className="text-sm font-semibold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
-              <ShieldAlert className="w-4 h-4" />
-              4. Kill Switch (Kayıp Koruma)
-            </h3>
-
-            <div className="space-y-4">
-              {/* First Reduction Threshold */}
-              <div>
-                <div className="flex justify-between items-center mb-2">
-                  <label className="text-sm text-slate-300">İlk Küçültme Eşiği</label>
-                  <span className="text-sm font-mono text-orange-400">{localSettings.killSwitchFirstReduction}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="-200"
-                  max="-30"
-                  step="5"
-                  value={localSettings.killSwitchFirstReduction}
-                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-200% (Gevşek)</span>
-                  <span>-30% (Sıkı)</span>
-                </div>
-                <p className="text-[10px] text-slate-500 mt-1">Pozisyon bu eşiğe ulaştığında %50 küçültülür</p>
-              </div>
-
-              {/* Full Close Threshold */}
-              <div>
-                <div className="flex justify-between items-center mb-2">
-                  <label className="text-sm text-slate-300">Tam Kapatma Eşiği</label>
-                  <span className="text-sm font-mono text-rose-400">{localSettings.killSwitchFullClose}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="-300"
-                  max="-50"
-                  step="5"
-                  value={localSettings.killSwitchFullClose}
-                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-300% (Gevşek)</span>
-                  <span>-50% (Sıkı)</span>
-                </div>
-                <p className="text-[10px] text-slate-500 mt-1">Pozisyon bu eşiğe ulaştığında tamamen kapatılır</p>
-              </div>
-
-              {/* Info Box */}
-              <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3">
-                <p className="text-[10px] text-slate-400">
-                  ⚠️ <strong>Önemli:</strong> Eşikler yatırılan marjin üzerinden hesaplanır (kaldıraçsız).
-                  Örnek: 10x kaldıraçla %-15 eşik = fiyat %-1.5 düştüğünde tetiklenir.
-                </p>
-              </div>
-            </div>
-          </div>
+          {/* Kill Switch - REMOVED (now dynamic per-position based on leverage in backend) */}
 
           {/* Risk Management Section */}
           <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <TrendingUp className="w-4 h-4" />
-              5. Risk Yönetimi
+              4. Risk Yönetimi
             </h3>
 
             <div className="grid grid-cols-2 gap-4">

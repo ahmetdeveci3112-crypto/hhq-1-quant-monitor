@@ -4103,20 +4103,26 @@ balance_protector = BalanceProtector()
 
 class PositionBasedKillSwitch:
     """
-    Improved kill switch with position-based logic.
-    - Checks each position individually for loss threshold
-    - Gradual position reduction instead of full close
-    - Excludes profitable positions
+    Dynamic Kill Switch - thresholds calculated per-position based on leverage.
     
-    Phase 51: Thresholds increased to give TIME_REDUCE more room
+    Base thresholds (at 10x leverage):
+    - First Reduction: -70% of invested margin → close 50% of position
+    - Full Close: -150% of invested margin → close entire position
+    
+    Leverage adjustment:
+    - Higher leverage (>10x): Tighter thresholds (more sensitive)
+    - Lower leverage (<10x): Looser thresholds (more room)
+    
+    Formula: threshold = base_threshold * (10 / leverage)
+    - 25x leverage: -70% * (10/25) = -28% first, -60% full
+    - 10x leverage: -70% * (10/10) = -70% first, -150% full  
+    - 5x leverage: -70% * (10/5) = -140% first, -300% full
     """
     
-    def __init__(self, 
-                 first_reduction_pct: float = -100.0,  # First reduction at -100% (leveraged ROI)
-                 full_close_pct: float = -150.0,       # Full close at -150% (leveraged ROI)
-                 reduction_size: float = 0.5):        # Reduce 50% at first level
-        self.first_reduction_pct = first_reduction_pct
-        self.full_close_pct = full_close_pct
+    def __init__(self, reduction_size: float = 0.5):
+        # Base thresholds at 10x leverage (reference point)
+        self.base_first_reduction = -70.0  # -70% of invested margin
+        self.base_full_close = -150.0      # -150% of invested margin
         self.reduction_size = reduction_size  # 50% reduction at first level
         
         # Track which positions have been partially closed
@@ -4126,7 +4132,38 @@ class PositionBasedKillSwitch:
         self.day_start_balance = 10000.0
         self.last_reset_date = None
         
-        logger.info(f"🚨 PositionBasedKillSwitch initialized: {first_reduction_pct}% first reduction, {full_close_pct}% full close")
+        # Keep these for backwards compatibility (but they're not used anymore)
+        self.first_reduction_pct = self.base_first_reduction
+        self.full_close_pct = self.base_full_close
+        
+        logger.info(f"🚨 Dynamic Kill Switch initialized: Base thresholds {self.base_first_reduction}%/{self.base_full_close}% (adjusted by leverage)")
+    
+    def get_dynamic_thresholds(self, leverage: int) -> tuple:
+        """
+        Calculate dynamic thresholds based on position's leverage.
+        
+        Higher leverage = tighter thresholds (more sensitive to moves)
+        Lower leverage = looser thresholds (more room for recovery)
+        
+        Returns: (first_reduction_pct, full_close_pct)
+        """
+        if leverage <= 0:
+            leverage = 10  # Default
+        
+        # Adjustment factor: 10 is the reference leverage
+        # Higher leverage = smaller factor = tighter threshold
+        # Lower leverage = larger factor = looser threshold
+        factor = 10.0 / leverage
+        
+        first_reduction = self.base_first_reduction * factor
+        full_close = self.base_full_close * factor
+        
+        # Clamp to reasonable bounds
+        first_reduction = max(-200.0, min(-20.0, first_reduction))  # -20% to -200%
+        full_close = max(-300.0, min(-40.0, full_close))            # -40% to -300%
+        
+        return (first_reduction, full_close)
+
     
     def reset_for_new_day(self, current_balance: float):
         """Reset for new trading day."""
@@ -4184,24 +4221,26 @@ class PositionBasedKillSwitch:
                 # Example: $174 margin, $90 loss = -51.7% position loss
                 position_loss_pct = (unrealized_pnl / initial_margin) * 100
                 
+                # Get DYNAMIC thresholds based on this position's leverage
+                first_threshold, full_threshold = self.get_dynamic_thresholds(leverage)
+                
                 # Also get leveraged ROI for logging comparison
                 leveraged_roi = pos.get('unrealizedPnlPercent', 0)
                 
-                # Log for debugging
-                logger.info(f"🎯 Kill switch check {symbol}: Invested=${initial_margin:.2f}, PnL=${unrealized_pnl:.2f}, Position Loss={position_loss_pct:.2f}%, Leveraged ROI={leveraged_roi:.2f}%")
+                # Log for debugging with dynamic thresholds
+                logger.info(f"🎯 Kill switch check {symbol} [{leverage}x]: Loss={position_loss_pct:.1f}% | Thresholds: {first_threshold:.0f}%/{full_threshold:.0f}%")
                 
-                # Check loss thresholds using POSITION LOSS (not leveraged ROI)
-                if position_loss_pct <= self.full_close_pct:
-                    # -15% of invested margin or worse: FULL CLOSE
+                # Check loss thresholds using POSITION LOSS with DYNAMIC thresholds
+                if position_loss_pct <= full_threshold:
+                    # Full close threshold reached
                     paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
                     actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
-                    logger.warning(f"🚨 KILL SWITCH FULL: Closed {side} {symbol} at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
+                    logger.warning(f"🚨 KILL SWITCH FULL [{leverage}x]: Closed {side} {symbol} at {position_loss_pct:.1f}% loss (threshold: {full_threshold:.0f}%)")
                     # Phase 48: Record fault for this coin
                     kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_FULL')
                     
-                elif position_loss_pct <= self.first_reduction_pct:
-                    # -15% to -20% of invested margin: REDUCE 50% (only once per position)
-                    # Phase 55: Use position-internal flag instead of dictionary
+                elif position_loss_pct <= first_threshold:
+                    # First reduction threshold - close 50% (only once per position)
                     already_reduced = pos.get('kill_switch_reduced', False)
                     
                     if not already_reduced:
@@ -4210,10 +4249,10 @@ class PositionBasedKillSwitch:
                         self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
                         self.partially_closed[pos_id] = 1  # Keep for backwards compat
                         actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
-                        logger.warning(f"⚠️ KILL SWITCH REDUCE: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% position loss (ROI: {leveraged_roi:.1f}%)")
+                        logger.warning(f"⚠️ KILL SWITCH REDUCE [{leverage}x]: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% loss (threshold: {first_threshold:.0f}%)")
                         # Phase 48: Record fault for this coin
                         kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_PARTIAL')
-                    # If already_reduced, wait for -20% (full_close_pct) to trigger
+                    # If already_reduced, wait for full_threshold to trigger
                         
             except Exception as e:
                 logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
@@ -4899,9 +4938,7 @@ class ParameterOptimizer:
             'trail_distance_atr': (0.3, 2.0),
             # Pozisyon yönetimi
             'max_positions': (2, 15),
-            # Kill Switch (leveraged ROI based)
-            'kill_switch_first_reduction': (-200, -30),
-            'kill_switch_full_close': (-300, -50),
+            # Kill Switch - REMOVED (now dynamic per-position based on leverage)
         }
         
         logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
@@ -5039,23 +5076,9 @@ class ParameterOptimizer:
             recommendations['max_positions'] = int(new_max)
             changes.append(f"max_pos: {current_max}→{new_max}")
         
-        # 8. Kill Switch (kill switch rate bazlı)
-        current_ks_first = current_settings.get('kill_switch_first_reduction', -100)
-        current_ks_full = current_settings.get('kill_switch_full_close', -150)
-        if kill_switch_rate > 25:  # %25+ tetiklenme oranı
-            # Çok tetikleniyor, gevşet
-            new_ks_first = max(self.limits['kill_switch_first_reduction'][0], current_ks_first - 15)
-            new_ks_full = max(self.limits['kill_switch_full_close'][0], current_ks_full - 15)
-            recommendations['kill_switch_first_reduction'] = int(new_ks_first)
-            recommendations['kill_switch_full_close'] = int(new_ks_full)
-            changes.append(f"KS gevşet: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
-        elif kill_switch_rate < 5 and mode == 'DEFENSIVE':
-            # Az tetikleniyor ama zarar ediyoruz, sıkılaştır
-            new_ks_first = min(self.limits['kill_switch_first_reduction'][1], current_ks_first + 5)
-            new_ks_full = min(self.limits['kill_switch_full_close'][1], current_ks_full + 5)
-            recommendations['kill_switch_first_reduction'] = int(new_ks_first)
-            recommendations['kill_switch_full_close'] = int(new_ks_full)
-            changes.append(f"KS sıkılaştır: {current_ks_first}/{current_ks_full}→{new_ks_first}/{new_ks_full}")
+        # 8. Kill Switch - REMOVED (now dynamic based on leverage per-position)
+        # Kill switch thresholds are automatically calculated in PositionBasedKillSwitch
+        # based on each position's leverage, no longer needs AI adjustment
         
         # === SONUÇ ===
         # Use Turkey timezone (UTC+3)
@@ -5135,14 +5158,8 @@ class ParameterOptimizer:
             paper_trader.max_positions = recommendations['max_positions']
             applied.append('max_pos')
         
-        # Kill Switch
-        if 'kill_switch_first_reduction' in recommendations:
-            daily_kill_switch.first_reduction_pct = recommendations['kill_switch_first_reduction']
-            applied.append('ks_first')
-        
-        if 'kill_switch_full_close' in recommendations:
-            daily_kill_switch.full_close_pct = recommendations['kill_switch_full_close']
-            applied.append('ks_full')
+        # Kill Switch - REMOVED (now dynamic per-position based on leverage)
+        # No longer applied from recommendations
         
         if applied:
             logger.info(f"🤖 OPTIMIZER: Applied {len(applied)} settings: {applied}")
