@@ -5711,12 +5711,13 @@ class CoinPerformanceTracker:
             pnl = trade.get('pnl', 0)
             reason = trade.get('reason', trade.get('closeReason', ''))
             close_time = trade.get('closeTime', 0)
+            size_usd = trade.get('size_usd', trade.get('sizeUsd', 100))  # Default $100 if not available
             
-            self._record_trade_internal(symbol, pnl, reason, close_time)
+            self._record_trade_internal(symbol, pnl, reason, close_time, size_usd)
         
         logger.info(f"📊 CoinPerformanceTracker: Loaded stats for {len(self.coin_stats)} coins")
     
-    def _record_trade_internal(self, symbol: str, pnl: float, reason: str, close_time: int = 0):
+    def _record_trade_internal(self, symbol: str, pnl: float, reason: str, close_time: int = 0, size_usd: float = 100.0):
         """Dahili trade kayıt fonksiyonu."""
         if symbol not in self.coin_stats:
             self.coin_stats[symbol] = {
@@ -5725,6 +5726,7 @@ class CoinPerformanceTracker:
                 'wins': 0,
                 'losses': 0,
                 'total_pnl': 0.0,
+                'total_invested': 0.0,  # Toplam yatırılan miktar
                 'kill_switch_count': 0,
                 'last_trade_time': 0
             }
@@ -5745,6 +5747,7 @@ class CoinPerformanceTracker:
         # İstatistikleri güncelle
         stats['total_trades'] += 1
         stats['total_pnl'] += pnl
+        stats['total_invested'] = stats.get('total_invested', 0) + size_usd
         stats['last_trade_time'] = close_time or int(datetime.now().timestamp() * 1000)
         
         if pnl > 0:
@@ -5828,9 +5831,11 @@ class CoinPerformanceTracker:
         ks_count = stats.get('kill_switch_count', 0)
         total_pnl = stats.get('total_pnl', 0)
         
+        total_invested = stats.get('total_invested', 0)
+        
         # Kriter 1: Toplam zarar yatırılan parayı aştıysa blokla
-        # Normal pozisyon ~$100-200, bu yüzden -$100 eşik
-        if total_pnl < -100:
+        # Örn: $500 yatırdık, $500+ kaybettik → blokla
+        if total_invested > 0 and total_pnl < 0 and abs(total_pnl) >= total_invested:
             return True
         
         # Kriter 2: Win rate çok düşük
