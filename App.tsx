@@ -1021,6 +1021,20 @@ export default function App() {
                           <span className={`text-xs font-mono font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
                           </span>
+                          {/* Kill Switch indicator */}
+                          {(() => {
+                            const lev = pos.leverage || 10;
+                            const factor = Math.sqrt(lev / 10);
+                            const ksFirst = Math.max(-120, Math.min(-40, -70 * factor));
+                            const marginLoss = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
+                            const isCritical = marginLoss <= ksFirst;
+                            const isNear = marginLoss <= ksFirst * 0.7;
+                            return marginLoss < 0 ? (
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNear ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
+                                KS:{ksFirst.toFixed(0)}%
+                              </span>
+                            ) : null;
+                          })()}
                         </div>
                       </div>
                     );
@@ -1043,13 +1057,14 @@ export default function App() {
                       <th className="text-center py-3 px-2 font-medium">Age</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
                       <th className="text-right py-3 px-2 font-medium">ROI%</th>
+                      <th className="text-center py-3 px-2 font-medium">KS</th>
                       <th className="text-right py-3 px-4 font-medium">Action</th>
                     </tr>
                   </thead>
                   <tbody>
                     {portfolio.positions.length === 0 ? (
                       <tr>
-                        <td colSpan={10} className="py-12 text-center text-slate-600">No open positions</td>
+                        <td colSpan={12} className="py-12 text-center text-slate-600">No open positions</td>
                       </tr>
                     ) : (
                       portfolio.positions.map(pos => {
@@ -1134,6 +1149,24 @@ export default function App() {
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
                             </td>
+                            <td className="py-3 px-2 text-center">
+                              {(() => {
+                                // Dynamic Kill Switch thresholds: sqrt(leverage/10) factor
+                                const lev = pos.leverage || 10;
+                                const factor = Math.sqrt(lev / 10);
+                                const ksFirst = Math.max(-120, Math.min(-40, -70 * factor));
+                                const ksFull = Math.max(-200, Math.min(-80, -150 * factor));
+                                const marginLoss = margin > 0 ? (pos.unrealizedPnl / margin) * 100 : 0;
+                                const isNearKS = marginLoss <= ksFirst * 0.7; // %70'ine yaklaştıysa uyar
+                                const isCritical = marginLoss <= ksFirst;
+                                return (
+                                  <div className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNearKS ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
+                                    <div>{ksFirst.toFixed(0)}%</div>
+                                    <div className="text-[8px] opacity-70">({marginLoss.toFixed(0)}%)</div>
+                                  </div>
+                                );
+                              })()}
+                            </td>
                             <td className="py-3 px-4 text-right">
                               <button
                                 onClick={() => handleManualClose(pos.id)}
@@ -1157,7 +1190,49 @@ export default function App() {
                 <h3 className="text-sm font-semibold text-white">Trade History</h3>
                 <span className="text-xs text-slate-500">{portfolio.trades.length} trades</span>
               </div>
-              <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+
+              {/* Mobile: Card Layout */}
+              <div className="lg:hidden p-3 space-y-2 max-h-[400px] overflow-y-auto">
+                {portfolio.trades.length === 0 ? (
+                  <div className="text-center py-8 text-slate-600 text-xs">No trades yet</div>
+                ) : (
+                  portfolio.trades.slice().reverse().slice(0, 50).map((trade, i) => {
+                    const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
+                    const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
+                    const isLong = trade.side === 'LONG';
+                    const isWin = trade.pnl >= 0;
+                    return (
+                      <div key={i} className={`p-3 rounded-lg border ${isWin ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'N/A'}</span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{trade.side}</span>
+                          </div>
+                          <span className="text-[10px] text-slate-500">
+                            {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-[10px]">
+                          <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(trade.entryPrice)}</div></div>
+                          <div><span className="text-slate-500">Exit</span><div className="font-mono text-white">${formatPrice(trade.exitPrice)}</div></div>
+                          <div><span className="text-slate-500">Reason</span><div className="text-slate-400 truncate">{translateReason((trade as any).reason || trade.closeReason)}</div></div>
+                        </div>
+                        <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
+                          <span className={`text-xs font-mono font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {isWin ? '+' : ''}{formatCurrency(trade.pnl)}
+                          </span>
+                          <span className={`text-xs font-mono font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {roi >= 0 ? '+' : ''}{roi.toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Desktop: Table Layout */}
+              <div className="hidden lg:block overflow-x-auto max-h-[400px] overflow-y-auto">
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-[#0d1117]">
                     <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">

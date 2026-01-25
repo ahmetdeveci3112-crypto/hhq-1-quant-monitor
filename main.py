@@ -5790,8 +5790,8 @@ class CoinPerformanceTracker:
                 'penalty': self.get_coin_penalty(symbol)
             })
         
-        # Avg PnL'e göre sırala (en kötüden en iyiye)
-        performers.sort(key=lambda x: x['avg_pnl'])
+        # Total PnL'e göre sırala (en kötüden en iyiye)
+        performers.sort(key=lambda x: x['total_pnl'])
         return performers[:limit]
     
     def get_best_performers(self, limit: int = 10) -> list:
@@ -5814,8 +5814,8 @@ class CoinPerformanceTracker:
                 'ks_count': stats.get('kill_switch_count', 0)
             })
         
-        # Avg PnL'e göre sırala (en iyiden en kötüye)
-        performers.sort(key=lambda x: x['avg_pnl'], reverse=True)
+        # Total PnL'e göre sırala (en iyiden en kötüye)
+        performers.sort(key=lambda x: x['total_pnl'], reverse=True)
         return performers[:limit]
     
     def get_stats_for_optimizer(self) -> dict:
