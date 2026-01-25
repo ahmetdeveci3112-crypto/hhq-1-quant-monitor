@@ -7609,20 +7609,20 @@ class PaperTradingEngine:
                     self.leverage = data.get('leverage', 10)
                     self.risk_per_trade = data.get('risk_per_trade', 0.02)
                     # Phase 18: Load full trading parameters
-                    self.sl_atr = data.get('sl_atr', 2.0)
-                    self.tp_atr = data.get('tp_atr', 3.0)
+                    self.sl_atr = data.get('sl_atr', 30)  # Default: 30 ATR
+                    self.tp_atr = data.get('tp_atr', 20)  # Default: 20 ATR
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
-                    self.max_positions = data.get('max_positions', 5)
+                    self.max_positions = data.get('max_positions', 50)  # Default: 50
                     # Phase 32: Load algorithm sensitivity settings
-                    self.z_score_threshold = data.get('z_score_threshold', 1.2)
-                    self.min_confidence_score = data.get('min_confidence_score', 55)
+                    self.z_score_threshold = data.get('z_score_threshold', 1.6)  # Default: 1.6
+                    self.min_confidence_score = data.get('min_confidence_score', 68)  # Default: 68
                     # Phase 50: Dynamic Min Score Range
-                    self.min_score_low = data.get('min_score_low', 50)
-                    self.min_score_high = data.get('min_score_high', 70)
+                    self.min_score_low = data.get('min_score_low', 60)  # Default: 60
+                    self.min_score_high = data.get('min_score_high', 90)  # Default: 90
                     # Phase 36: Load entry/exit tightness
-                    self.entry_tightness = data.get('entry_tightness', 1.0)
-                    self.exit_tightness = data.get('exit_tightness', 1.0)
+                    self.entry_tightness = data.get('entry_tightness', 1.8)  # Default: Gevşek
+                    self.exit_tightness = data.get('exit_tightness', 1.2)  # Default: 1.2x
                     # Phase 57: Load Kill Switch settings
                     if 'kill_switch_first_reduction' in data:
                         daily_kill_switch.first_reduction_pct = data.get('kill_switch_first_reduction', -100)
