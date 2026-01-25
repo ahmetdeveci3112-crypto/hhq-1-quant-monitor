@@ -6507,7 +6507,7 @@ class SignalGenerator:
         # =====================================================================
         
         # Get spread-adjusted parameters (includes leverage, SL/TP multipliers, pullback)
-        spread_params = get_spread_adjusted_params(spread_pct, atr)
+        spread_params = get_spread_adjusted_params(spread_pct, atr, price)
         
         # Dynamic Leverage from Spread (low spread = high leverage)
         spread_leverage = spread_params['leverage']
