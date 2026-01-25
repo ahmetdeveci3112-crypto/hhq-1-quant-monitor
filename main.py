@@ -5711,13 +5711,14 @@ class CoinPerformanceTracker:
             pnl = trade.get('pnl', 0)
             reason = trade.get('reason', trade.get('closeReason', ''))
             close_time = trade.get('closeTime', 0)
-            size_usd = trade.get('size_usd', trade.get('sizeUsd', 100))  # Default $100 if not available
+            size_usd = trade.get('size_usd', trade.get('sizeUsd', 100))  # Kaldıraçlı pozisyon
+            leverage = trade.get('leverage', 10)  # Kaldıraç
             
-            self._record_trade_internal(symbol, pnl, reason, close_time, size_usd)
+            self._record_trade_internal(symbol, pnl, reason, close_time, size_usd, leverage)
         
         logger.info(f"📊 CoinPerformanceTracker: Loaded stats for {len(self.coin_stats)} coins")
     
-    def _record_trade_internal(self, symbol: str, pnl: float, reason: str, close_time: int = 0, size_usd: float = 100.0):
+    def _record_trade_internal(self, symbol: str, pnl: float, reason: str, close_time: int = 0, size_usd: float = 100.0, leverage: int = 10):
         """Dahili trade kayıt fonksiyonu."""
         if symbol not in self.coin_stats:
             self.coin_stats[symbol] = {
@@ -5736,7 +5737,9 @@ class CoinPerformanceTracker:
         # Trade kaydet
         stats['trades'].append({
             'pnl': pnl,
-            'size_usd': size_usd,  # Pozisyon boyutu
+            'size_usd': size_usd,  # Kaldıraçlı pozisyon boyutu
+            'leverage': leverage,  # Kaldıraç
+            'margin': size_usd / leverage if leverage > 0 else size_usd,  # Gerçek yatırılan
             'reason': reason,
             'time': close_time or int(datetime.now().timestamp() * 1000)
         })
@@ -5835,13 +5838,16 @@ class CoinPerformanceTracker:
         total_invested = stats.get('total_invested', 0)
         trades = stats.get('trades', [])
         
-        # Kriter 1: Herhangi bir pozisyonda yatırılanı kaybettiyse blokla
-        # Örn: $100 pozisyon, -$100 veya daha fazla zarar → blokla
+        # Kriter 1: Herhangi bir pozisyonda yatırılan MARGIN'ı kaybettiyse blokla
+        # Margin = size_usd / leverage (gerçek yatırılan para)
+        # Örn: $100 margin, -$100 veya daha fazla zarar → blokla
         for trade in trades:
             trade_size = trade.get('size_usd', 100)
+            trade_leverage = trade.get('leverage', 10)
+            trade_margin = trade_size / trade_leverage if trade_leverage > 0 else trade_size
             trade_pnl = trade.get('pnl', 0)
-            # Pozisyon kaybı >= pozisyon boyutu (100%+ kayıp)
-            if trade_pnl < 0 and abs(trade_pnl) >= trade_size:
+            # Margin kaybı >= margin boyutu (100%+ kayıp)
+            if trade_pnl < 0 and abs(trade_pnl) >= trade_margin:
                 return True
         
         # Kriter 2: Win rate çok düşük
