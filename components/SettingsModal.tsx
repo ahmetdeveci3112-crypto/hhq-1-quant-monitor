@@ -373,11 +373,15 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   </div>
                 </div>
 
-                {optimizerStats.lastAnalysis && (
-                  <div className="text-xs text-slate-400 text-center">
-                    Son analiz: {new Date(optimizerStats.lastAnalysis).toLocaleString('tr-TR')}
-                  </div>
-                )}
+                {optimizerStats.lastAnalysis && (() => {
+                  const date = new Date(optimizerStats.lastAnalysis);
+                  const isValid = !isNaN(date.getTime());
+                  return isValid ? (
+                    <div className="text-xs text-slate-400 text-center">
+                      Son analiz: {date.toLocaleString('tr-TR')}
+                    </div>
+                  ) : null;
+                })()}
               </div>
             </div>
           )}
