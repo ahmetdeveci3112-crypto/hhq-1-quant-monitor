@@ -5736,6 +5736,7 @@ class CoinPerformanceTracker:
         # Trade kaydet
         stats['trades'].append({
             'pnl': pnl,
+            'size_usd': size_usd,  # Pozisyon boyutu
             'reason': reason,
             'time': close_time or int(datetime.now().timestamp() * 1000)
         })
@@ -5832,11 +5833,16 @@ class CoinPerformanceTracker:
         total_pnl = stats.get('total_pnl', 0)
         
         total_invested = stats.get('total_invested', 0)
+        trades = stats.get('trades', [])
         
-        # Kriter 1: Toplam zarar yatırılan parayı aştıysa blokla
-        # Örn: $500 yatırdık, $500+ kaybettik → blokla
-        if total_invested > 0 and total_pnl < 0 and abs(total_pnl) >= total_invested:
-            return True
+        # Kriter 1: Herhangi bir pozisyonda yatırılanı kaybettiyse blokla
+        # Örn: $100 pozisyon, -$100 veya daha fazla zarar → blokla
+        for trade in trades:
+            trade_size = trade.get('size_usd', 100)
+            trade_pnl = trade.get('pnl', 0)
+            # Pozisyon kaybı >= pozisyon boyutu (100%+ kayıp)
+            if trade_pnl < 0 and abs(trade_pnl) >= trade_size:
+                return True
         
         # Kriter 2: Win rate çok düşük
         if win_rate < self.block_threshold_wr:
