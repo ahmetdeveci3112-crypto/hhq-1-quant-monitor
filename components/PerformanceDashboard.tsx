@@ -324,6 +324,35 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 </div>
             </div>
 
+            {/* Blocked Coins */}
+            {coinStats?.blocked_coins?.length > 0 && (
+                <div className="bg-gradient-to-br from-rose-900/30 to-rose-800/20 border border-rose-700/50 rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider flex items-center gap-2">
+                            <AlertTriangle className="w-4 h-4" />
+                            Bloklu Coinler
+                        </h3>
+                        <span className="text-xs bg-rose-500/20 text-rose-400 px-2 py-1 rounded-full">
+                            {coinStats.blocked_coins.length} coin
+                        </span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                        {coinStats.blocked_coins.map((coin: string) => (
+                            <div
+                                key={coin}
+                                className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5"
+                            >
+                                <span className="w-2 h-2 bg-rose-500 rounded-full"></span>
+                                {coin.replace('USDT', '')}
+                            </div>
+                        ))}
+                    </div>
+                    <p className="text-xs text-rose-400/60 mt-3">
+                        Bu coinlerde margin kaybı %100+ veya win rate %20 altı. Yeni pozisyon açılmaz.
+                    </p>
+                </div>
+            )}
+
             {/* Refresh Button */}
             <button
                 onClick={fetchData}
