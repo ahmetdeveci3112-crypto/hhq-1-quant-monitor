@@ -124,45 +124,125 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 </div>
             </div>
 
-            {/* Daily PnL Chart */}
-            <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
-                <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-                    <BarChart3 className="w-5 h-5 text-fuchsia-400" />
-                    Günlük PnL (Son 30 Gün)
-                </h3>
+            {/* Daily PnL Chart - Professional Design */}
+            <div className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-slate-700/50 rounded-2xl p-4 sm:p-6 backdrop-blur-sm">
+                {/* Header with Summary Stats */}
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-3">
+                    <div className="flex items-center gap-3">
+                        <div className="p-2 bg-gradient-to-br from-fuchsia-500/20 to-purple-500/20 rounded-xl">
+                            <BarChart3 className="w-5 h-5 text-fuchsia-400" />
+                        </div>
+                        <div>
+                            <h3 className="text-lg font-bold text-white">Günlük PnL</h3>
+                            <p className="text-xs text-slate-500">Son 30 gün performansı</p>
+                        </div>
+                    </div>
+
+                    {/* Quick Stats */}
+                    {dailyPnl.length > 0 && (
+                        <div className="flex gap-3 sm:gap-4 text-xs">
+                            <div className="flex items-center gap-1.5">
+                                <div className="w-2 h-2 rounded-full bg-emerald-400"></div>
+                                <span className="text-slate-400">Kârlı:</span>
+                                <span className="text-emerald-400 font-semibold">{dailyPnl.filter(d => d.pnl >= 0).length}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                                <div className="w-2 h-2 rounded-full bg-rose-400"></div>
+                                <span className="text-slate-400">Zararlı:</span>
+                                <span className="text-rose-400 font-semibold">{dailyPnl.filter(d => d.pnl < 0).length}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                                <TrendingUp className="w-3 h-3 text-fuchsia-400" />
+                                <span className="text-slate-400">Toplam:</span>
+                                <span className={`font-semibold ${dailyPnl.reduce((a, b) => a + b.pnl, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    ${dailyPnl.reduce((a, b) => a + b.pnl, 0).toFixed(0)}
+                                </span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
                 {dailyPnl.length === 0 ? (
-                    <div className="flex items-center justify-center h-40 text-slate-500">
-                        Henüz günlük veri yok
+                    <div className="flex flex-col items-center justify-center h-48 text-slate-500">
+                        <BarChart3 className="w-12 h-12 mb-3 opacity-30" />
+                        <span>Henüz günlük veri yok</span>
                     </div>
                 ) : (
                     <>
-                        <div className="flex items-end gap-2 h-40">
-                            {dailyPnl.slice(-30).map((day, i) => (
-                                <div
-                                    key={i}
-                                    className="flex-1 min-w-[20px] group relative flex flex-col items-center"
-                                >
-                                    <div
-                                        className={`w-full rounded-t transition-all ${day.pnl >= 0 ? 'bg-emerald-500' : 'bg-rose-500'}`}
-                                        style={{
-                                            height: `${Math.max((Math.abs(day.pnl) / maxPnl) * 100, 10)}%`,
-                                            minHeight: '8px'
-                                        }}
-                                    />
-                                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block bg-slate-900 px-2 py-1 rounded text-xs whitespace-nowrap z-10 border border-slate-700">
-                                        <div className="text-white font-medium">{day.date}</div>
-                                        <div className={day.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                            ${day.pnl.toFixed(2)}
+                        {/* Chart Container */}
+                        <div className="relative">
+                            {/* Zero Line */}
+                            <div className="absolute left-0 right-0 top-1/2 border-t border-slate-600/50 border-dashed z-0"></div>
+
+                            {/* Bars */}
+                            <div className="flex items-center gap-1 h-48 relative z-10">
+                                {dailyPnl.slice(-30).map((day, i) => {
+                                    const percentage = (Math.abs(day.pnl) / maxPnl) * 45;
+                                    const isPositive = day.pnl >= 0;
+
+                                    return (
+                                        <div
+                                            key={i}
+                                            className="flex-1 min-w-[8px] group relative flex flex-col items-center justify-center h-full"
+                                        >
+                                            {/* Bar */}
+                                            <div
+                                                className={`w-full rounded transition-all duration-300 cursor-pointer
+                                                    ${isPositive
+                                                        ? 'bg-gradient-to-t from-emerald-600 to-emerald-400 hover:from-emerald-500 hover:to-emerald-300 shadow-emerald-500/20'
+                                                        : 'bg-gradient-to-b from-rose-600 to-rose-400 hover:from-rose-500 hover:to-rose-300 shadow-rose-500/20'
+                                                    } hover:shadow-lg`}
+                                                style={{
+                                                    height: `${Math.max(percentage, 3)}%`,
+                                                    marginTop: isPositive ? 'auto' : '0',
+                                                    marginBottom: isPositive ? '0' : 'auto',
+                                                    position: 'absolute',
+                                                    top: isPositive ? 'auto' : '50%',
+                                                    bottom: isPositive ? '50%' : 'auto'
+                                                }}
+                                            />
+
+                                            {/* Enhanced Tooltip */}
+                                            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 hidden group-hover:block z-50">
+                                                <div className="bg-slate-900/95 backdrop-blur-md px-3 py-2 rounded-xl border border-slate-600/50 shadow-2xl min-w-[140px]">
+                                                    <div className="text-white font-semibold text-sm mb-1">{day.date}</div>
+                                                    <div className="flex items-center justify-between gap-4">
+                                                        <span className="text-slate-400 text-xs">PnL</span>
+                                                        <span className={`font-bold ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                                            {isPositive ? '+' : ''}${day.pnl.toFixed(2)}
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex items-center justify-between gap-4 mt-1">
+                                                        <span className="text-slate-400 text-xs">Trade</span>
+                                                        <span className="text-white text-sm">{day.trades}</span>
+                                                    </div>
+                                                    <div className="flex items-center justify-between gap-4 mt-1">
+                                                        <span className="text-slate-400 text-xs">Win Rate</span>
+                                                        <span className="text-fuchsia-400 text-sm">{day.winRate?.toFixed(0) || 0}%</span>
+                                                    </div>
+                                                    {/* Arrow */}
+                                                    <div className="absolute top-full left-1/2 -translate-x-1/2 border-8 border-transparent border-t-slate-900/95"></div>
+                                                </div>
+                                            </div>
                                         </div>
-                                        <div className="text-slate-500">{day.trades} trade</div>
-                                    </div>
-                                </div>
-                            ))}
+                                    );
+                                })}
+                            </div>
                         </div>
-                        <div className="flex justify-between text-xs text-slate-500 mt-2">
-                            <span>{dailyPnl[0]?.date || ''}</span>
-                            <span className="text-slate-400">{dailyPnl.length} gün</span>
-                            <span>{dailyPnl[dailyPnl.length - 1]?.date || ''}</span>
+
+                        {/* X-Axis Labels */}
+                        <div className="flex justify-between items-center text-xs text-slate-500 mt-4 px-1">
+                            <div className="flex flex-col">
+                                <span className="text-slate-400 font-medium">{dailyPnl[0]?.date?.split('-').slice(1).join('/') || ''}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="h-px w-8 bg-gradient-to-r from-transparent via-slate-600 to-transparent"></div>
+                                <span className="text-fuchsia-400 font-medium">{dailyPnl.length} gün</span>
+                                <div className="h-px w-8 bg-gradient-to-r from-transparent via-slate-600 to-transparent"></div>
+                            </div>
+                            <div className="flex flex-col items-end">
+                                <span className="text-slate-400 font-medium">{dailyPnl[dailyPnl.length - 1]?.date?.split('-').slice(1).join('/') || ''}</span>
+                            </div>
                         </div>
                     </>
                 )}
