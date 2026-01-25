@@ -4142,25 +4142,32 @@ class PositionBasedKillSwitch:
         """
         Calculate dynamic thresholds based on position's leverage.
         
-        Higher leverage = tighter thresholds (more sensitive to moves)
-        Lower leverage = looser thresholds (more room for recovery)
+        Higher leverage = LOOSER thresholds (more tolerance for volatility)
+        Lower leverage = TIGHTER thresholds (less tolerance needed)
+        
+        Logic: High leverage coins (BTC/ETH) are low spread, so we give more room.
+               Low leverage coins (shitcoins) are high spread, but we close earlier
+               because they have higher risk.
         
         Returns: (first_reduction_pct, full_close_pct)
         """
         if leverage <= 0:
             leverage = 10  # Default
         
-        # Adjustment factor: 10 is the reference leverage
-        # Higher leverage = smaller factor = tighter threshold
-        # Lower leverage = larger factor = looser threshold
-        factor = 10.0 / leverage
+        # Adjustment factor: leverage / 10
+        # Higher leverage = larger factor = looser threshold
+        # Lower leverage = smaller factor = tighter threshold
+        # Using sqrt for smoother scaling
+        factor = (leverage / 10.0) ** 0.5  # sqrt scaling
         
         first_reduction = self.base_first_reduction * factor
         full_close = self.base_full_close * factor
         
         # Clamp to reasonable bounds
-        first_reduction = max(-200.0, min(-20.0, first_reduction))  # -20% to -200%
-        full_close = max(-300.0, min(-40.0, full_close))            # -40% to -300%
+        # Min: -40% (very tight) for low leverage shitcoins
+        # Max: -120% (loose) for high leverage majors
+        first_reduction = max(-120.0, min(-40.0, first_reduction))
+        full_close = max(-200.0, min(-80.0, full_close))
         
         return (first_reduction, full_close)
 
