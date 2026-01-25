@@ -6616,22 +6616,22 @@ class PaperTradingEngine:
         self.leverage = 10
         self.risk_per_trade = 0.02  # 2%
         # Phase 18: Full Trading Parameters
-        self.sl_atr = 2.0
-        self.tp_atr = 3.0
+        self.sl_atr = 30  # High value - position risk management handles actual exits
+        self.tp_atr = 20
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
         # Phase 22: Multi-position config
-        self.max_positions = 5  # Allow up to 5 positions
+        self.max_positions = 50  # Allow up to 50 positions
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
         # Algorithm sensitivity settings (can be adjusted via API)
-        self.z_score_threshold = 1.2  # Min Z-Score for signal
+        self.z_score_threshold = 1.6  # Min Z-Score for signal
         # Phase 50: Dynamic Min Score Range
-        self.min_score_low = 50   # Minimum possible score (aggressive mode)
-        self.min_score_high = 70  # Maximum possible score (defensive mode)
-        self.min_confidence_score = 55  # Current effective min score (dynamically calculated)
+        self.min_score_low = 60   # Minimum possible score (aggressive mode)
+        self.min_score_high = 90  # Maximum possible score (defensive mode)
+        self.min_confidence_score = 68  # Current effective min score (dynamically calculated)
         # Phase 36: Entry/Exit tightness settings
-        self.entry_tightness = 1.0  # 0.5-2.0: Pullback multiplier
-        self.exit_tightness = 1.0   # 0.5-2.0: SL/TP multiplier
+        self.entry_tightness = 1.8  # 0.5-2.0: Pullback multiplier (Gevşek/Loose mode)
+        self.exit_tightness = 1.2   # 0.5-2.0: SL/TP multiplier
         # Phase 19: Server-side persistent logs
         self.logs = []
         # Phase 20: Advanced Risk Management Config
