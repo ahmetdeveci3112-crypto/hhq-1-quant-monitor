@@ -5826,10 +5826,18 @@ class CoinPerformanceTracker:
         
         win_rate = self.get_win_rate(symbol)
         ks_count = stats.get('kill_switch_count', 0)
+        total_pnl = stats.get('total_pnl', 0)
         
-        # Win rate çok düşük veya çok fazla kill switch
+        # Kriter 1: Toplam zarar yatırılan parayı aştıysa blokla
+        # Normal pozisyon ~$100-200, bu yüzden -$100 eşik
+        if total_pnl < -100:
+            return True
+        
+        # Kriter 2: Win rate çok düşük
         if win_rate < self.block_threshold_wr:
             return True
+        
+        # Kriter 3: Çok fazla kill switch
         if ks_count >= 5 and (ks_count / total) > 0.4:  # %40+ KS rate
             return True
         
