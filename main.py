@@ -854,19 +854,20 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
             
             # Phase 43: Combined leverage formula (logarithmic version)
             # Price Factor: Logarithmic reduction for low-price coins
-            # $100+ → 1.0, $10 → 0.9, $1 → 0.8, $0.1 → 0.7, $0.01 → 0.6, $0.001 → 0.5
+            # $100+ → 1.0, $10 → 0.95, $1 → 0.9, $0.1 → 0.85, $0.01 → 0.80, $0.001 → 0.75
             import math
             if price > 0:
                 # log10(100) = 2, log10(0.001) = -3
-                # Normalized to 0.5-1.0 range across common price spectrum
+                # Phase 60: Relaxed - min 0.75 (was 0.6), smoother curve
                 log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
-                price_factor = max(0.6, min(1.0, (log_price + 4) / 6))  # Maps -4..2 to 0.6..1.0 (gevşetildi)
+                price_factor = max(0.75, min(1.0, (log_price + 4) / 8))  # Maps -4..4 to 0.75..1.0 (gevşetildi)
             else:
                 price_factor = 1.0  # If price=0, don't penalize
             
             # Spread Factor: Reduce leverage for high spread coins
+            # Phase 60: Relaxed - ×1.5 (was ×2), min 0.65 (was 0.5)
             if spread_pct > 0:
-                spread_factor = max(0.5, 1.0 - spread_pct * 2)  # max %25 spread = min 0.5 factor
+                spread_factor = max(0.65, 1.0 - spread_pct * 1.5)  # max %23 spread = min 0.65 factor
             else:
                 spread_factor = 1.0
             
@@ -899,11 +900,11 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
     import math
     if price > 0:
         log_price = math.log10(max(price, 0.0001))
-        price_factor = max(0.6, min(1.0, (log_price + 4) / 6))
+        price_factor = max(0.75, min(1.0, (log_price + 4) / 8))  # Phase 60: Relaxed
     else:
         price_factor = 1.0
     
-    spread_factor = max(0.5, 1.0 - spread_pct * 2) if spread_pct > 0 else 1.0
+    spread_factor = max(0.65, 1.0 - spread_pct * 1.5) if spread_pct > 0 else 1.0  # Phase 60: Relaxed
     final_leverage = max(3, int(round(base_leverage * price_factor * spread_factor)))
     
     return {
