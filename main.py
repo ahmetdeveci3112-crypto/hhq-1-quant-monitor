@@ -853,26 +853,39 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
             base_leverage = params["leverage"]  # Volatility-based base (3-50x)
             
             # Phase 43: Combined leverage formula
-            # Price Factor: Continuous reduction for low-price coins
+            # Price Factor: Tier-based reduction for low-price coins (tick sensitivity)
+            # Düşük fiyatlı coinlerde max leverage limiti
             if price > 0:
-                price_factor = min(price / 10.0, 1.0)  # $10 altı sürekli azalt
+                if price < 0.001:      # $0.001 altı (SHIB, PEPE vb)
+                    max_price_leverage = 5
+                elif price < 0.01:     # $0.01 altı
+                    max_price_leverage = 10
+                elif price < 0.1:      # $0.10 altı
+                    max_price_leverage = 15
+                elif price < 1.0:      # $1 altı
+                    max_price_leverage = 20
+                elif price < 10.0:     # $10 altı
+                    max_price_leverage = 25
+                else:                   # $10+ normal
+                    max_price_leverage = 50
             else:
-                price_factor = 1.0
+                max_price_leverage = 50
             
             # Spread Factor: Reduce leverage for high spread coins
             if spread_pct > 0:
-                spread_factor = max(0.2, 1.0 - spread_pct * 2)  # max %40 spread = min 0.2 factor
+                spread_factor = max(0.5, 1.0 - spread_pct * 2)  # max %25 spread = min 0.5 factor
             else:
                 spread_factor = 1.0
             
-            # Combined formula
-            final_leverage = base_leverage * price_factor * spread_factor
+            # Combined: min of (volatility-based, price-based) × spread_factor
+            price_limited_leverage = min(base_leverage, max_price_leverage)
+            final_leverage = int(round(price_limited_leverage * spread_factor))
             
             # Ensure minimum 3x leverage
-            final_leverage = max(3, int(round(final_leverage)))
+            final_leverage = max(3, final_leverage)
             
             if final_leverage != base_leverage:
-                logger.debug(f"Combined leverage: {base_leverage}x × {price_factor:.2f} (price) × {spread_factor:.2f} (spread) = {final_leverage}x")
+                logger.debug(f"Combined leverage: base={base_leverage}x, price_max={max_price_leverage}x, spread_factor={spread_factor:.2f} → final={final_leverage}x")
             
             return {
                 "trail_distance": atr * params["trail"],
@@ -890,10 +903,26 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
     params = VOLATILITY_LEVELS["very_high"]
     base_leverage = params["leverage"]
     
-    # Apply combined formula for default case too
-    price_factor = min(price / 10.0, 1.0) if price > 0 else 1.0
-    spread_factor = max(0.2, 1.0 - spread_pct * 2) if spread_pct > 0 else 1.0
-    final_leverage = max(3, int(round(base_leverage * price_factor * spread_factor)))
+    # Apply tier-based price limits for default case too
+    if price > 0:
+        if price < 0.001:
+            max_price_leverage = 5
+        elif price < 0.01:
+            max_price_leverage = 10
+        elif price < 0.1:
+            max_price_leverage = 15
+        elif price < 1.0:
+            max_price_leverage = 20
+        elif price < 10.0:
+            max_price_leverage = 25
+        else:
+            max_price_leverage = 50
+    else:
+        max_price_leverage = 50
+    
+    spread_factor = max(0.5, 1.0 - spread_pct * 2) if spread_pct > 0 else 1.0
+    price_limited_leverage = min(base_leverage, max_price_leverage)
+    final_leverage = max(3, int(round(price_limited_leverage * spread_factor)))
     
     return {
         "trail_distance": atr * params["trail"],
