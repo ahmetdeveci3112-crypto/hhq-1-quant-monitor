@@ -5582,20 +5582,20 @@ class KillSwitchFaultTracker:
     """
     Tracks coins that have triggered kill switch and applies penalty to future signals.
     
-    ENHANCED VERSION:
-    - Each kill switch adds -25 points to the coin's fault score
-    - Fault score decays by 5 points per 24 hours
-    - Coins with kill switch in last 4h are BLOCKED from new positions
-    - Loads existing faults from trade history on startup
+    Phase 60 - REDUCED DURATIONS:
+    - Each kill switch adds -15 points to the coin's fault score (was -25)
+    - Fault score decays by 10 points per 24 hours (was 5)
+    - Coins with kill switch in last 2h are BLOCKED from new positions (was 4h)
+    - Full recovery in ~1.5 days instead of 5 days
     """
     
-    def __init__(self, penalty_per_fault: int = -25, decay_per_day: int = 5):
+    def __init__(self, penalty_per_fault: int = -15, decay_per_day: int = 10):
         self.faults: Dict[str, list] = {}  # symbol -> list of fault timestamps
-        self.penalty_per_fault = penalty_per_fault  # -25 points per kill switch
-        self.decay_per_day = decay_per_day  # 5 points decay per 24h
-        self.max_penalty = -100  # Maximum penalty cap
-        self.block_hours = 4  # Block new positions for 4 hours after KS (was 24)
-        logger.info(f"📋 KillSwitchFaultTracker initialized: {penalty_per_fault} points/fault, {decay_per_day} decay/day, {self.block_hours}h block")
+        self.penalty_per_fault = penalty_per_fault  # -15 points per kill switch (was -25)
+        self.decay_per_day = decay_per_day  # 10 points decay per 24h (was 5)
+        self.max_penalty = -50  # Maximum penalty cap (was -100)
+        self.block_hours = 2  # Block new positions for 2 hours after KS (was 4)
+        logger.info(f"📋 KillSwitchFaultTracker: {penalty_per_fault} pts/fault, {decay_per_day} decay/day, {self.block_hours}h block")
     
     def load_from_trade_history(self, trades: list):
         """Load fault history from existing trades on startup."""
