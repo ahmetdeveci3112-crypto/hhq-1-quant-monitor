@@ -50,46 +50,63 @@ const INITIAL_STATS: PortfolioStats = {
   avgLoss: 0,
 };
 
-// Close reason to Turkish mapping with detailed descriptions
+// Close reason to Turkish mapping with detailed algorithmic descriptions
+// Phase 57: Complete close reason mapping for all algorithm criteria
 const translateReason = (reason: string | undefined): string => {
   if (!reason) return '-';
-  const mapping: Record<string, string> = {
-    // Normal exits
-    'SL_HIT': '🛑 Stop Loss (Zarar Sınırı)',
-    'TP_HIT': '✅ Take Profit (Hedef Kâr)',
-    'TRAILING': '📈 Trailing Stop (Takip Eden)',
-    'MANUAL': '👤 Manuel Kapatma',
 
-    // Signal-based exits
-    'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersindi (Kârda)',
-    'SIGNAL_REVERSAL': '↩️ Sinyal Tersindi (Zararda)',
+  const mapping: Record<string, string> = {
+    // ===== NORMAL SL/TP EXITS =====
+    'SL': '🛑 Stop Loss (SL tetiklendi)',
+    'TP': '✅ Take Profit (TP hedefe ulaştı)',
+    'SL_HIT': '🛑 Stop Loss Hit',
+    'TP_HIT': '✅ Take Profit Hit',
+    'TRAILING': '📈 Trailing Stop (Takip eden SL)',
+
+    // ===== KILL SWITCH - GÜNLÜK ZARAR LİMİTİ =====
+    'KILL_SWITCH_FULL': '🚨 Kill Switch: Günlük -%20 → TAM KAPATMA',
+    'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: Günlük -%15 → %50 Küçültme',
+
+    // ===== TIME-BASED REDUCTIONS - ZAMAN BAZLI KÜÇÜLTME =====
+    'TIME_REDUCE_1H': '⏱️ 1 Saat Aşımı: %25 pozisyon küçültme',
+    'TIME_REDUCE_2H': '⏰ 2 Saat Aşımı: %50 pozisyon küçültme',
+    'TIME_REDUCE_4H': '⏰ 4 Saat Aşımı: %75 pozisyon küçültme',
+    'TIME_REDUCE_8H': '🕐 8 Saat Aşımı: %100 TAM ÇIKIŞ',
+    'TIME_GRADUAL': '⏳ Kademeli Zaman Çıkışı (süre limiti)',
+    'TIME_FORCE': '⌛ Zorla Zaman Çıkışı (max süre aşıldı)',
+
+    // ===== RECOVERY & ADVERSE EXITS =====
+    'RECOVERY_EXIT': '🔄 Toparlanma Çıkışı (kayıptan dönüş)',
+    'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman Çıkışı (uzun süreli zarar)',
+    'EMERGENCY_SL': '🚨 ACİL Stop Loss (ani düşüş koruması)',
+
+    // ===== SIGNAL-BASED EXITS =====
+    'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersindi → Kârda çıkış',
+    'SIGNAL_REVERSAL': '↩️ Sinyal Ters Dönüşü',
+
+    // ===== OTHER EXITS =====
+    'MANUAL': '👤 Manuel Kapama',
     'BREAKEVEN': '⚖️ Başabaş Çıkış',
     'RESCUE': '🆘 Kurtarma Modu',
     'END': '🔚 Sistem Kapanış',
-    'SL': '🛑 Stop Loss',
-    'TP': '✅ Take Profit',
-
-    // Kill Switch reasons - detailed
-    'KILL_SWITCH_FULL': '🚨 Kill Switch: Tam Kapatma (-%20)',
-    'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: %50 Küçültme (-%15)',
-
-    // Time-based reasons - detailed
-    'TIME_REDUCE_4H': '⏰ Zaman Aşımı: 4 Saat (%50 Küçült)',
-    'TIME_REDUCE_8H': '⏰ Zaman Aşımı: 8 Saat (Tam Çıkış)',
-    'TIME_REDUCE_1H': '⏰ Zaman: 1 Saat Küçültme',
-    'TIME_REDUCE_2H': '⏰ Zaman: 2 Saat Küçültme',
-
-    // Early trail activation
-    'EARLY_TRAIL': '📊 Erken Trailing (Pullback)',
+    'EARLY_TRAIL': '📊 Erken Trailing (pullback aktivasyon)',
   };
 
-  // Check for partial matches with detailed info
-  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%50)';
-  if (reason.includes('TIME_REDUCE_8H')) return '⏰ 8s Aşımı (Çıkış)';
-  if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Küçültme';
-  if (reason.includes('KILL_SWITCH_FULL')) return '🚨 KS Tam (-%20)';
-  if (reason.includes('KILL_SWITCH_PARTIAL')) return '⚠️ KS Kısmi (-%15)';
-  if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch';
+  // Check for partial matches (some reasons have dynamic suffixes)
+  if (reason.includes('TIME_REDUCE_1H')) return '⏱️ 1s Aşımı (%25 küçült)';
+  if (reason.includes('TIME_REDUCE_2H')) return '⏰ 2s Aşımı (%50 küçült)';
+  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%75 küçült)';
+  if (reason.includes('TIME_REDUCE_8H')) return '🕐 8s Aşımı (Çıkış)';
+  if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Bazlı Küçültme';
+  if (reason.includes('TIME_GRADUAL')) return '⏳ Kademeli Zaman Çıkışı';
+  if (reason.includes('TIME_FORCE')) return '⌛ Zorla Zaman Çıkışı';
+  if (reason.includes('KILL_SWITCH_FULL')) return '🚨 KS: Tam Kapama (-%20)';
+  if (reason.includes('KILL_SWITCH_PARTIAL')) return '⚠️ KS: %50 Küçültme (-%15)';
+  if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch Tetiklendi';
+  if (reason.includes('RECOVERY_EXIT')) return '🔄 Toparlanma Çıkışı';
+  if (reason.includes('ADVERSE_TIME')) return '📉 Olumsuz Zaman Çıkışı';
+  if (reason.includes('EMERGENCY')) return '🚨 Acil Stop Loss';
+  if (reason.includes('SIGNAL_REVERSAL')) return '↩️ Sinyal Tersindi';
 
   return mapping[reason] || reason;
 };

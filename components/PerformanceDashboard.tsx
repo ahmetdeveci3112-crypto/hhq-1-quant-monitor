@@ -23,6 +23,31 @@ interface Props {
     apiUrl: string;
 }
 
+// Phase 57: Translate close reasons to detailed Turkish descriptions
+const translateReason = (reason: string): string => {
+    const mapping: Record<string, string> = {
+        'SL': '🛑 Stop Loss',
+        'TP': '✅ Take Profit',
+        'SL_HIT': '🛑 Stop Loss',
+        'TP_HIT': '✅ Take Profit',
+        'KILL_SWITCH_FULL': '🚨 KS Tam (-%20)',
+        'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi (-%15)',
+        'TIME_REDUCE_1H': '⏱️ 1s Aşımı',
+        'TIME_REDUCE_2H': '⏰ 2s Aşımı',
+        'TIME_REDUCE_4H': '⏰ 4s Aşımı',
+        'TIME_REDUCE_8H': '🕐 8s Aşımı',
+        'TIME_GRADUAL': '⏳ Kademeli Çıkış',
+        'TIME_FORCE': '⌛ Zorla Çıkış',
+        'RECOVERY_EXIT': '🔄 Toparlanma',
+        'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman',
+        'EMERGENCY_SL': '🚨 Acil SL',
+        'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi',
+        'SIGNAL_REVERSAL': '↩️ Sinyal Tersi',
+        'MANUAL': '👤 Manuel',
+    };
+    return mapping[reason] || reason;
+};
+
 export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     const [summary, setSummary] = useState<any>(null);
     const [dailyPnl, setDailyPnl] = useState<DailyPnL[]>([]);
@@ -309,18 +334,22 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
             {/* Close Reason Stats */}
             <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
                 <h3 className="text-sm font-semibold text-blue-400 uppercase tracking-wider mb-3">
-                    Kapanış Nedenleri
+                    Kapanış Nedenleri (Detaylı)
                 </h3>
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    {summary?.closeReasons && Object.entries(summary.closeReasons).map(([reason, data]: [string, any]) => (
-                        <div key={reason} className="bg-slate-700/30 rounded-lg p-3 text-center">
-                            <div className="text-xs text-slate-400 mb-1">{reason}</div>
-                            <div className={`text-lg font-bold ${data.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                ${data.pnl.toFixed(0)}
+                    {summary?.closeReasons && Object.entries(summary.closeReasons)
+                        .sort(([, a]: any, [, b]: any) => Math.abs(b.pnl) - Math.abs(a.pnl))
+                        .map(([reason, data]: [string, any]) => (
+                            <div key={reason} className="bg-slate-700/30 rounded-lg p-3 text-center">
+                                <div className="text-xs text-slate-400 mb-1 truncate" title={reason}>
+                                    {translateReason(reason)}
+                                </div>
+                                <div className={`text-lg font-bold ${data.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    ${data.pnl.toFixed(0)}
+                                </div>
+                                <div className="text-xs text-slate-500">{data.count} trade</div>
                             </div>
-                            <div className="text-xs text-slate-500">{data.count} trade</div>
-                        </div>
-                    ))}
+                        ))}
                 </div>
             </div>
 
