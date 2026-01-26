@@ -4261,12 +4261,15 @@ class PositionBasedKillSwitch:
     
     def reset_for_new_day(self, current_balance: float):
         """Reset for new trading day."""
-        today = datetime.now().date()
+        # Phase 60: Use Turkey timezone (UTC+3)
+        import pytz
+        turkey_tz = pytz.timezone('Europe/Istanbul')
+        today = datetime.now(turkey_tz).date()
         if self.last_reset_date != today:
             self.day_start_balance = current_balance
             self.last_reset_date = today
             self.partially_closed.clear()
-            logger.info(f"📅 New trading day: Starting balance ${current_balance:.2f}")
+            logger.info(f"📅 New trading day (Turkey): Starting balance ${current_balance:.2f}")
     
     def check_positions(self, paper_trader) -> dict:
         """
@@ -7723,7 +7726,11 @@ class PaperTradingEngine:
     
     def check_daily_drawdown(self) -> bool:
         """Pause trading if daily loss exceeds limit."""
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Phase 60: Use Turkey timezone (UTC+3) for consistency with get_today_pnl
+        import pytz
+        turkey_tz = pytz.timezone('Europe/Istanbul')
+        now_turkey = datetime.now(turkey_tz)
+        today_start = now_turkey.replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_ms = int(today_start.timestamp() * 1000)
         
         today_trades = [t for t in self.trades if t.get('closeTime', 0) >= today_start_ms]
