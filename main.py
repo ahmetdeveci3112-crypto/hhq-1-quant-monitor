@@ -6788,6 +6788,9 @@ class PaperTradingEngine:
         self.blacklist_threshold = 2  # Consecutive losses to trigger blacklist
         self.blacklist_duration_hours = 2  # Hours to keep coin blacklisted
         
+        # Phase 60: AI Optimizer Toggle - kapalıyken dinamik hesaplamalar yapılmaz
+        self.ai_optimizer_enabled = False  # Default: OFF - manuel ayarlar geçerli
+        
         self.load_state()
         self.add_log("🚀 Paper Trading Engine başlatıldı")
     
@@ -6835,10 +6838,17 @@ class PaperTradingEngine:
         Phase 50: Dinamik Minimum Skor Hesaplama
         Son 10 trade'in win rate'ine göre min_score_low ve min_score_high arasında skor belirler.
         
+        Phase 60: AI Optimizer kapalıyken bu hesaplama ATLANIR.
+        Kullanıcının Settings Modal'dan ayarladığı değerler geçerli olur.
+        
         Win Rate < 40% → min_score_high (defansif mod)
         Win Rate > 60% → min_score_low (agresif mod)
         Win Rate 40-60% → orta değer (normal mod)
         """
+        # Phase 60: AI Optimizer kapalıysa dinamik hesaplama yapma
+        if not self.ai_optimizer_enabled:
+            return self.min_confidence_score  # Manuel ayarı koru
+        
         # Son 10 trade'i al
         recent_trades = self.trades[-10:] if len(self.trades) >= 10 else self.trades
         
@@ -7763,6 +7773,13 @@ class PaperTradingEngine:
                         daily_kill_switch.first_reduction_pct = data.get('kill_switch_first_reduction', -100)
                     if 'kill_switch_full_close' in data:
                         daily_kill_switch.full_close_pct = data.get('kill_switch_full_close', -150)
+                    # Phase 60: Load AI Optimizer state
+                    self.ai_optimizer_enabled = data.get('ai_optimizer_enabled', False)
+                    # Sync with parameter_optimizer
+                    try:
+                        parameter_optimizer.enabled = self.ai_optimizer_enabled
+                    except:
+                        pass
                     # Phase 19: Load logs
                     self.logs = data.get('logs', [])
                     logger.info(f"Loaded Paper Trading: ${self.balance:.2f} | {self.symbol} | {self.leverage}x | SL:{self.sl_atr} TP:{self.tp_atr} | KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
@@ -7805,6 +7822,8 @@ class PaperTradingEngine:
                 # Phase 57: Kill Switch settings
                 "kill_switch_first_reduction": daily_kill_switch.first_reduction_pct,
                 "kill_switch_full_close": daily_kill_switch.full_close_pct,
+                # Phase 60: AI Optimizer state
+                "ai_optimizer_enabled": self.ai_optimizer_enabled,
                 # Phase 19: Save logs
                 "logs": self.logs[-100:]
             }
@@ -8928,8 +8947,22 @@ async def paper_trading_toggle():
 async def optimizer_toggle():
     """Toggle auto-optimizer on/off."""
     parameter_optimizer.enabled = not parameter_optimizer.enabled
+    
+    # Phase 60: Sync with paper_trader for dynamic calculations
+    if global_paper_trader:
+        global_paper_trader.ai_optimizer_enabled = parameter_optimizer.enabled
+        global_paper_trader.save_state()
+    
     status = "enabled" if parameter_optimizer.enabled else "disabled"
     logger.info(f"🤖 Auto-optimizer {status}")
+    
+    # Log mode change
+    if global_paper_trader:
+        if parameter_optimizer.enabled:
+            global_paper_trader.add_log(f"🤖 AI Optimizer AKTİF - Dinamik ayarlar etkin")
+        else:
+            global_paper_trader.add_log(f"👤 AI Optimizer KAPALI - Manuel ayarlar geçerli")
+    
     return JSONResponse({
         "success": True, 
         "enabled": parameter_optimizer.enabled, 
