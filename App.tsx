@@ -67,11 +67,10 @@ const translateReason = (reason: string | undefined): string => {
     'KILL_SWITCH_FULL': '🚨 Kill Switch: Günlük -%20 → TAM KAPATMA',
     'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: Günlük -%15 → %50 Küçültme',
 
-    // ===== TIME-BASED REDUCTIONS - ZAMAN BAZLI KÜÇÜLTME =====
-    'TIME_REDUCE_1H': '⏱️ 1 Saat Aşımı: %25 pozisyon küçültme',
-    'TIME_REDUCE_2H': '⏰ 2 Saat Aşımı: %50 pozisyon küçültme',
-    'TIME_REDUCE_4H': '⏰ 4 Saat Aşımı: %75 pozisyon küçültme',
-    'TIME_REDUCE_8H': '🕐 8 Saat Aşımı: %100 TAM ÇIKIŞ',
+    // ===== TIME-BASED REDUCTIONS - ZAMAN BAZLI KÜCÜLTME =====
+    // NOT: Sadece 4h ve 8h var, her biri %10 azaltma
+    'TIME_REDUCE_4H': '⏰ 4 Saat Aşımı: %10 pozisyon küçültme',
+    'TIME_REDUCE_8H': '🕐 8 Saat Aşımı: %10 pozisyon küçültme',
     'TIME_GRADUAL': '⏳ Kademeli Zaman Çıkışı (süre limiti)',
     'TIME_FORCE': '⌛ Zorla Zaman Çıkışı (max süre aşıldı)',
 
@@ -93,10 +92,8 @@ const translateReason = (reason: string | undefined): string => {
   };
 
   // Check for partial matches (some reasons have dynamic suffixes)
-  if (reason.includes('TIME_REDUCE_1H')) return '⏱️ 1s Aşımı (%25 küçült)';
-  if (reason.includes('TIME_REDUCE_2H')) return '⏰ 2s Aşımı (%50 küçült)';
-  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%75 küçült)';
-  if (reason.includes('TIME_REDUCE_8H')) return '🕐 8s Aşımı (Çıkış)';
+  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%10 küçült)';
+  if (reason.includes('TIME_REDUCE_8H')) return '🕐 8s Aşımı (%10 küçült)';
   if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Bazlı Küçültme';
   if (reason.includes('TIME_GRADUAL')) return '⏳ Kademeli Zaman Çıkışı';
   if (reason.includes('TIME_FORCE')) return '⌛ Zorla Zaman Çıkışı';
