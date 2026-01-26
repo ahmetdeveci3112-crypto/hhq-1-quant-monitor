@@ -8124,7 +8124,16 @@ class PaperTradingEngine:
             "signalScore": pos.get('signalScore', 0),
             "mtfScore": pos.get('mtfScore', 0),
             "zScore": pos.get('zScore', 0),
-            "spreadLevel": pos.get('spreadLevel', 'unknown')
+            "spreadLevel": pos.get('spreadLevel', 'unknown'),
+            # Phase 58: Exit criteria for tooltip display
+            "stopLoss": pos.get('stopLoss', 0),
+            "takeProfit": pos.get('takeProfit', 0),
+            "trailActivation": pos.get('trailActivation', 0),
+            "trailingStop": pos.get('trailingStop', 0),
+            "isTrailingActive": pos.get('isTrailingActive', False),
+            "atr": pos.get('atr', 0),
+            "slMultiplier": pos.get('slMultiplier', 0),
+            "tpMultiplier": pos.get('tpMultiplier', 0),
         }
         self.trades.append(trade)
         

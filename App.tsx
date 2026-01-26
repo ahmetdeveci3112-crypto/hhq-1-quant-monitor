@@ -108,6 +108,71 @@ const translateReason = (reason: string | undefined): string => {
   return mapping[reason] || reason;
 };
 
+// Phase 58: Generate tooltip with calculation details for close reason
+const getReasonTooltip = (trade: any): string => {
+  const reason = trade.reason || trade.closeReason || '';
+  const entry = trade.entryPrice || 0;
+  const exit = trade.exitPrice || 0;
+  const sl = trade.stopLoss || 0;
+  const tp = trade.takeProfit || 0;
+  const trail = trade.trailingStop || 0;
+  const isTrailing = trade.isTrailingActive || false;
+  const leverage = trade.leverage || 10;
+  const atr = trade.atr || 0;
+
+  const lines: string[] = [];
+
+  // Common info
+  lines.push(`📊 ${trade.side} @ ${leverage}x`);
+  lines.push(`Entry: $${entry.toFixed(6)}`);
+  lines.push(`Exit: $${exit.toFixed(6)}`);
+
+  if (reason === 'SL' || reason.includes('STOP')) {
+    lines.push('--- Stop Loss ---');
+    lines.push(`SL Level: $${sl.toFixed(6)}`);
+    if (isTrailing) {
+      lines.push(`Trailing: $${trail.toFixed(6)}`);
+      lines.push('✔ Trailing aktifti');
+    }
+    if (atr > 0) {
+      const slDistance = Math.abs(entry - sl);
+      const slAtr = slDistance / atr;
+      lines.push(`SL Mesafesi: ${slAtr.toFixed(1)}x ATR`);
+    }
+  } else if (reason === 'TP' || reason.includes('PROFIT')) {
+    lines.push('--- Take Profit ---');
+    lines.push(`TP Level: $${tp.toFixed(6)}`);
+    if (atr > 0) {
+      const tpDistance = Math.abs(tp - entry);
+      const tpAtr = tpDistance / atr;
+      lines.push(`TP Mesafesi: ${tpAtr.toFixed(1)}x ATR`);
+    }
+  } else if (reason.includes('TIME_REDUCE')) {
+    lines.push('--- Zaman Bazlı ---');
+    lines.push('Pozisyon çok uzun süre açık kaldı');
+    lines.push('4h/8h sonra %10 küçültme');
+  } else if (reason.includes('KILL_SWITCH')) {
+    lines.push('--- Kill Switch ---');
+    lines.push('Günlük zarar limiti aşıldı');
+    if (reason.includes('PARTIAL')) {
+      lines.push('-%15 → %50 pozisyon küçültme');
+    } else {
+      lines.push('-%20 → Tam kapatma');
+    }
+  } else if (reason.includes('RECOVERY')) {
+    lines.push('--- Toparlanma ---');
+    lines.push('Kayıptan kâra dönüş çıkışı');
+  } else if (reason.includes('ADVERSE')) {
+    lines.push('--- Olumsuz Zaman ---');
+    lines.push('Uzun süreli zarardaki pozisyon');
+  } else if (reason.includes('EMERGENCY')) {
+    lines.push('--- Acil Çıkış ---');
+    lines.push('Ani düşüşten koruma');
+  }
+
+  return lines.join('\n');
+};
+
 export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [selectedCoin, setSelectedCoin] = useState<string | null>(null);
@@ -1288,7 +1353,20 @@ export default function App() {
                             <td className={`py-3 px-2 text-right font-mono font-semibold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {roi >= 0 ? '+' : ''}{roi.toFixed(1)}%
                             </td>
-                            <td className="py-3 px-4 text-xs text-slate-400">{translateReason((trade as any).reason || trade.closeReason)}</td>
+                            <td
+                              className="py-3 px-4 text-xs text-slate-400 cursor-help relative group"
+                              title={getReasonTooltip(trade)}
+                            >
+                              <span className="hover:text-white transition-colors">
+                                {translateReason((trade as any).reason || trade.closeReason)}
+                              </span>
+                              {/* Tooltip on hover */}
+                              <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-64 p-3 bg-slate-800 border border-slate-600 rounded-lg shadow-xl text-xs whitespace-pre-line">
+                                <div className="text-slate-300 font-mono">
+                                  {getReasonTooltip(trade)}
+                                </div>
+                              </div>
+                            </td>
                           </tr>
                         );
                       })
