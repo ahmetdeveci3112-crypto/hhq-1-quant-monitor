@@ -9070,14 +9070,20 @@ async def get_coin_performance():
 @app.get("/performance/daily")
 async def get_daily_performance():
     """Get daily PnL data for charts."""
+    import pytz
+    turkey_tz = pytz.timezone('Europe/Istanbul')
+    
     trades = global_paper_trader.trades
     
-    # Group trades by day
+    # Group trades by day (using Turkey timezone)
     daily_pnl = {}
     for trade in trades:
         close_time = trade.get('closeTime', 0)
         if close_time:
-            day = datetime.fromtimestamp(close_time / 1000).strftime('%Y-%m-%d')
+            # Phase 60: Use Turkey timezone for date grouping
+            utc_dt = datetime.utcfromtimestamp(close_time / 1000).replace(tzinfo=pytz.UTC)
+            turkey_dt = utc_dt.astimezone(turkey_tz)
+            day = turkey_dt.strftime('%Y-%m-%d')
             if day not in daily_pnl:
                 daily_pnl[day] = {'pnl': 0, 'trades': 0, 'wins': 0}
             daily_pnl[day]['pnl'] += trade.get('pnl', 0)
