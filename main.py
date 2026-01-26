@@ -3336,7 +3336,9 @@ TRADING_SESSIONS = {
         "hours_utc": (22, 24),
         "name": "Gece",
         "volatility": "low",
-        "preferred_strategy": "avoid",
+        # Phase 59: "avoid" -> "low_volatility" - tüm saatlerde sinyal üret
+        # Gelecekte tekrar aktif etmek için: "avoid" yapın
+        "preferred_strategy": "low_volatility",  # WAS: "avoid"
         "leverage_mult": 0.5,
         "risk_mult": 0.5
     }
@@ -3383,9 +3385,16 @@ class SessionManager:
         return base_risk * config['risk_mult']
     
     def should_trade(self) -> bool:
-        """Bu session'da trade yapılmalı mı?"""
-        _, config = self.get_current_session()
+        """
+        Bu session'da trade yapılmalı mı?
+        
+        Phase 59: Deaktive edildi - tüm saatlerde sinyal üretilecek.
+        Gelecekte tekrar aktif etmek için:
         return config['preferred_strategy'] != "avoid"
+        """
+        # _, config = self.get_current_session()
+        # return config['preferred_strategy'] != "avoid"
+        return True  # Always trade - session restriction disabled
     
     def get_session_info(self) -> dict:
         """Session bilgisi."""
