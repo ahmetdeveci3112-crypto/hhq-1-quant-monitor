@@ -129,6 +129,32 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </div>
               </div>
 
+              {/* Min Confidence Score - Direct Control */}
+              <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 mb-4">
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-sm text-slate-300">Minimum Güven Skoru</label>
+                  <span className="text-sm font-mono text-indigo-400 font-bold">
+                    {localSettings.minConfidenceScore || 55}
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-500 mb-3">
+                  🎯 Sinyal üretimi için gerekli minimum skor. AI Optimizer kapalıyken bu değer sabit kalır.
+                </p>
+                <input
+                  type="range"
+                  min="30"
+                  max="80"
+                  step="5"
+                  value={localSettings.minConfidenceScore || 55}
+                  onChange={e => setLocalSettings({ ...localSettings, minConfidenceScore: parseInt(e.target.value) })}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                  <span>30 (Çok fazla sinyal)</span>
+                  <span>80 (Çok az sinyal)</span>
+                </div>
+              </div>
+
               {/* Dynamic Min Score Range */}
               <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
                 <div className="flex justify-between items-center mb-2">
@@ -138,7 +164,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-500 mb-3">
-                  📊 Sistem son 10 trade performansına göre bu aralıkta otomatik skor belirler
+                  🤖 AI Optimizer AÇIK iken: Sistem son 10 trade performansına göre bu aralıkta otomatik skor belirler
                 </p>
                 <div className="space-y-3">
                   <div>
