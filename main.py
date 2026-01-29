@@ -3337,29 +3337,56 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # =====================================================
     # DYNAMIC LEVERAGE (Cloud Scanner - WebSocket Parity)
-    # Calculate leverage based on MTF score alignment
+    # Calculate leverage based on MTF score + PRICE + SPREAD factors
     # =====================================================
     try:
+        import math
+        
         # Calculate TF count from scores (positive score = aligned)
         scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
         tf_count = sum(1 for s in scores.values() if s > 0)
         
-        # Dynamic leverage based on MTF agreement
+        # Base leverage from MTF agreement
         if tf_count >= 3:
-            dynamic_leverage = 100  # All TFs aligned
+            base_leverage = 100  # All TFs aligned
         elif tf_count >= 2:
-            dynamic_leverage = 75   # 2 TFs aligned
+            base_leverage = 75   # 2 TFs aligned
         elif tf_count >= 1:
-            dynamic_leverage = 50   # 1 TF aligned
+            base_leverage = 50   # 1 TF aligned
         else:
-            dynamic_leverage = 25   # No TF aligned
+            base_leverage = 25   # No TF aligned
+        
+        # PRICE FACTOR: Logarithmic reduction for low-price coins
+        # $100+ → 1.0, $10 → 0.97, $1 → 0.94, $0.1 → 0.91, $0.01 → 0.88, $0.001 → 0.85
+        if price > 0:
+            log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
+            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))  # More aggressive: $0.01 → 0.5, $0.001 → 0.3
+        else:
+            price_factor = 1.0
+        
+        # SPREAD FACTOR: Get from signal or default
+        spread_pct = signal.get('spreadPct', 0.05)
+        if spread_pct > 0:
+            spread_factor = max(0.5, 1.0 - spread_pct * 2)  # High spread = lower leverage
+        else:
+            spread_factor = 1.0
+        
+        # COMBINED LEVERAGE: base × price_factor × spread_factor
+        dynamic_leverage = int(round(base_leverage * price_factor * spread_factor))
+        dynamic_leverage = max(3, min(75, dynamic_leverage))  # Clamp 3-75x
         
         signal['leverage'] = dynamic_leverage
         signal['tf_count'] = tf_count
-        logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF count: {tf_count}/3)")
+        signal['price_factor'] = round(price_factor, 2)
+        signal['spread_factor'] = round(spread_factor, 2)
+        
+        if price_factor < 0.9 or spread_factor < 0.9:
+            logger.info(f"📊 Leverage Adjusted: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} → {dynamic_leverage}x for {symbol} @ ${price:.6f}")
+        else:
+            logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF count: {tf_count}/3)")
     except Exception as lev_err:
         logger.warning(f"Dynamic leverage error: {lev_err}")
-        signal['leverage'] = 50  # Fallback
+        signal['leverage'] = 25  # Fallback to safer 25x
     
     # =====================================================
     # VOLUME PROFILE BOOST (Cloud Scanner - WebSocket Parity)
