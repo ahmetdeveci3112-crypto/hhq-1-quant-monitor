@@ -4334,14 +4334,16 @@ class PositionBasedKillSwitch:
         # Using sqrt for smoother scaling
         factor = (leverage / 10.0) ** 0.5  # sqrt scaling
         
-        first_reduction = self.base_first_reduction * factor
-        full_close = self.base_full_close * factor
+        # Use UI-configured thresholds (first_reduction_pct, full_close_pct) as base
+        # These can be changed via Settings Modal
+        first_reduction = self.first_reduction_pct * factor
+        full_close = self.full_close_pct * factor
         
         # Clamp to reasonable bounds
         # Min: -40% (very tight) for low leverage shitcoins
         # Max: -120% (loose) for high leverage majors
-        first_reduction = max(-120.0, min(-40.0, first_reduction))
-        full_close = max(-200.0, min(-80.0, full_close))
+        first_reduction = max(-200.0, min(-30.0, first_reduction))
+        full_close = max(-300.0, min(-60.0, full_close))
         
         return (first_reduction, full_close)
 
