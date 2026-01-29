@@ -3319,6 +3319,55 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Add MTF size modifier to signal for position sizing
     signal['mtf_size_modifier'] = score_modifier
     
+    # =====================================================
+    # DYNAMIC LEVERAGE (Cloud Scanner - WebSocket Parity)
+    # Calculate leverage based on MTF score alignment
+    # =====================================================
+    try:
+        # Calculate TF count from scores (positive score = aligned)
+        scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
+        tf_count = sum(1 for s in scores.values() if s > 0)
+        
+        # Dynamic leverage based on MTF agreement
+        if tf_count >= 3:
+            dynamic_leverage = 100  # All TFs aligned
+        elif tf_count >= 2:
+            dynamic_leverage = 75   # 2 TFs aligned
+        elif tf_count >= 1:
+            dynamic_leverage = 50   # 1 TF aligned
+        else:
+            dynamic_leverage = 25   # No TF aligned
+        
+        signal['leverage'] = dynamic_leverage
+        signal['tf_count'] = tf_count
+        logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF count: {tf_count}/3)")
+    except Exception as lev_err:
+        logger.warning(f"Dynamic leverage error: {lev_err}")
+        signal['leverage'] = 50  # Fallback
+    
+    # =====================================================
+    # VOLUME PROFILE BOOST (Cloud Scanner - WebSocket Parity)
+    # Boost signals near POC/VAH/VAL levels
+    # =====================================================
+    try:
+        # Update volume profile if stale (every hour)
+        if datetime.now().timestamp() - volume_profiler.last_update > 3600:
+            # Try to get OHLCV from scanner's exchange
+            if multi_coin_scanner.exchange:
+                ccxt_symbol = symbol.replace('USDT', '/USDT')
+                ohlcv_4h = await multi_coin_scanner.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
+                if ohlcv_4h:
+                    volume_profiler.calculate_profile(ohlcv_4h)
+        
+        # Get boost based on price proximity to key levels
+        vp_boost = volume_profiler.get_signal_boost(price, action)
+        if vp_boost > 0:
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + vp_boost)
+            signal['vp_boost'] = vp_boost
+            logger.info(f"📈 VP BOOST: +{vp_boost*100:.0f}% @ POC={volume_profiler.poc:.6f}")
+    except Exception as vp_err:
+        logger.warning(f"Volume Profile error: {vp_err}")
+    
     # Execute trade
     try:
         await global_paper_trader.open_position(
@@ -3329,7 +3378,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             symbol=symbol
         )
         trends = mtf_result.get('trends', {})
-        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
+        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
