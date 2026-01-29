@@ -2783,6 +2783,10 @@ async def background_scanner_loop():
                 try:
                     if multi_coin_scanner.exchange:
                         await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+                        # ALSO update market regime with current BTC price
+                        btc_price = btc_filter.btc_price
+                        if btc_price and btc_price > 0:
+                            market_regime_detector.update_btc_price(btc_price)
                 except Exception as e:
                     logger.debug(f"BTC filter update error: {e}")
                 
@@ -2981,16 +2985,18 @@ async def background_scanner_loop():
                     long_count = stats.get('longSignals', 0)
                     short_count = stats.get('shortSignals', 0)
                     pending_count = len(global_paper_trader.pending_orders)
-                    logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count} | Pending: {pending_count}")
-                    
-                    # Phase 52: Update post-trade tracker with current prices
-                    try:
+                    tracking_count = len(post_trade_tracker.tracking)
+                    logger.info(f"📊 Scanner Status: {stats.get('analyzedCoins', 0)} coins | L:{long_count} S:{short_count} | Pending: {pending_count} | Tracking: {tracking_count}")
+                
+                # Phase 52: Update post-trade tracker with current prices (EVERY scan cycle for accurate tracking)
+                try:
+                    if post_trade_tracker.tracking:  # Only if we have trades to track
                         current_prices = {opp['symbol']: opp.get('currentPrice', 0) for opp in opportunities}
                         completed_analyses = post_trade_tracker.update_prices(current_prices)
                         if completed_analyses:
                             logger.info(f"📊 Post-trade: {len(completed_analyses)} trade analizi tamamlandı")
-                    except Exception as pt_error:
-                        logger.debug(f"Post-trade update error: {pt_error}")
+                except Exception as pt_error:
+                    logger.debug(f"Post-trade update error: {pt_error}")
                 
                 # Phase 52: Run optimizer every 15 minutes (900 seconds)
                 if int(datetime.now().timestamp()) % 900 < scan_interval:
