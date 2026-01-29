@@ -2783,10 +2783,6 @@ async def background_scanner_loop():
                 try:
                     if multi_coin_scanner.exchange:
                         await btc_filter.update_btc_state(multi_coin_scanner.exchange)
-                        # ALSO update market regime with current BTC price
-                        btc_price = btc_filter.btc_price
-                        if btc_price and btc_price > 0:
-                            market_regime_detector.update_btc_price(btc_price)
                 except Exception as e:
                     logger.debug(f"BTC filter update error: {e}")
                 
@@ -2803,6 +2799,19 @@ async def background_scanner_loop():
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
                 stats = multi_coin_scanner.get_scanner_stats()
+                
+                # Update market regime with BTC price (from btc_filter OR from opportunities)
+                try:
+                    btc_price = btc_filter.btc_price
+                    if not btc_price or btc_price <= 0:
+                        # Fallback: get from scan results
+                        btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
+                        if btc_opp:
+                            btc_price = btc_opp.get('currentPrice', 0)
+                    if btc_price and btc_price > 0:
+                        market_regime_detector.update_btc_price(btc_price)
+                except Exception as regime_err:
+                    logger.debug(f"Market regime update error: {regime_err}")
                 
                 # Process signals for paper trading (only if enabled)
                 if global_paper_trader.enabled:
