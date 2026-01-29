@@ -281,7 +281,76 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
           </div>
 
-          {/* Kill Switch - REMOVED (now dynamic per-position based on leverage in backend) */}
+          {/* Kill Switch Section */}
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
+            <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4" />
+              Kill Switch (Pozisyon Koruma)
+            </h3>
+
+            <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 space-y-4">
+              <p className="text-[10px] text-slate-500 mb-3">
+                🛡️ Pozisyon başına zarar limitleri. Kaldıraca göre dinamik olarak ayarlanır (yüksek kaldıraç = daha sıkı limitler).
+              </p>
+
+              {/* First Reduction Threshold */}
+              <div>
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-sm text-slate-300">İlk Azaltma Eşiği</label>
+                  <span className="text-sm font-mono text-orange-400">
+                    %{localSettings.killSwitchFirstReduction || -15}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="-50"
+                  max="-5"
+                  step="5"
+                  value={localSettings.killSwitchFirstReduction || -15}
+                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                  <span>-50% (Gevşek)</span>
+                  <span>-5% (Sıkı)</span>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Pozisyon bu zarara ulaşınca %50 küçültülür
+                </p>
+              </div>
+
+              {/* Full Close Threshold */}
+              <div>
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-sm text-slate-300">Tam Kapanış Eşiği</label>
+                  <span className="text-sm font-mono text-rose-400">
+                    %{localSettings.killSwitchFullClose || -25}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="-80"
+                  max="-10"
+                  step="5"
+                  value={localSettings.killSwitchFullClose || -25}
+                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                  <span>-80% (Gevşek)</span>
+                  <span>-10% (Sıkı)</span>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Pozisyon bu zarara ulaşınca tamamen kapatılır
+                </p>
+              </div>
+
+              {/* Dynamic Threshold Info */}
+              <div className="bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
+                <span className="text-amber-400">⚡ Dinamik Eşikler:</span> Yüksek kaldıraçlı pozisyonlar (75x+) için eşikler otomatik olarak sıkılaştırılır
+              </div>
+            </div>
+          </div>
 
           {/* Risk Management Section */}
           <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
