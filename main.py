@@ -3260,6 +3260,37 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
         return
     
+    # =====================================================
+    # BTC TREND FILTER (Cloud Scanner)
+    # =====================================================
+    try:
+        btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, action)
+        
+        if not btc_allowed:
+            signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
+            asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+            logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason}")
+            return
+        
+        # Apply penalty to signal score and size
+        if btc_penalty > 0:
+            # Score penalty: 0.5 penalty = -50% score adjustment
+            original_score = signal.get('confidenceScore', 60)
+            score_penalty = int(original_score * btc_penalty)
+            signal['confidenceScore'] = max(40, original_score - score_penalty)
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 - btc_penalty)
+            signal['btc_adjustment'] = btc_reason
+            logger.info(f"⚠️ BTC PENALTY: {action} {symbol} | Score: -{score_penalty} | Size: -{btc_penalty*100:.0f}%")
+        elif btc_penalty < 0:
+            # Bonus for aligned signals
+            bonus = abs(btc_penalty)
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + bonus)
+            signal['btc_adjustment'] = btc_reason
+            logger.info(f"✅ BTC BONUS: {action} {symbol} | Size: +{bonus*100:.0f}%")
+            
+    except Exception as btc_err:
+        logger.warning(f"BTC Filter error: {btc_err}")
+    
     # MULTI-TIMEFRAME CONFIRMATION CHECK
     # Verify signal aligns with higher timeframe (1h) trend
     mtf_result = mtf_confirmation.confirm_signal(symbol, action)
@@ -3755,10 +3786,10 @@ class BTCCorrelationFilter:
         
         # Günlük trend orta düzeyde ters ise yüksek ceza
         if self.btc_trend_daily == "BEARISH" and signal_action == "LONG":
-            penalty = 0.4  # %40 skor düşür
+            penalty = 0.5  # %50 skor düşür (sıkılaştırıldı)
             reason = "Daily BEARISH - LONG risky"
         elif self.btc_trend_daily == "BULLISH" and signal_action == "SHORT":
-            penalty = 0.4
+            penalty = 0.5  # %50 skor düşür (sıkılaştırıldı)
             reason = "Daily BULLISH - SHORT risky"
         
         # Kısa vadeli trend kontrolü (1H + 4H)
@@ -3788,8 +3819,8 @@ class BTCCorrelationFilter:
             penalty = -0.15  # Günlük aynı yöndeyse daha büyük bonus
             reason = "BTC aligned with signal"
         
-        # Yüksek penalty ise reddet
-        allowed = penalty < 0.35
+        # Yüksek penalty ise reddet (threshold sıkılaştırıldı)
+        allowed = penalty < 0.30
         
         return (allowed, penalty, reason)
     
@@ -6356,12 +6387,12 @@ class SignalGenerator:
         mtf_score = 0
         if signal_side == "LONG":
             if htf_trend == "STRONG_BEARISH": mtf_score = -100 # VETO
-            elif htf_trend == "BEARISH": mtf_score = 0
+            elif htf_trend == "BEARISH": mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
             else: mtf_score = 20 # Bullish
         else: # SHORT
             if htf_trend == "STRONG_BULLISH": mtf_score = -100 # VETO
-            elif htf_trend == "BULLISH": mtf_score = 0
+            elif htf_trend == "BULLISH": mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
             else: mtf_score = 20 # Bearish
             
