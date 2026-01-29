@@ -3337,7 +3337,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # =====================================================
     # DYNAMIC LEVERAGE (Cloud Scanner - WebSocket Parity)
-    # Calculate leverage based on MTF score + PRICE + SPREAD factors
+    # Calculate leverage based on MTF + PRICE + SPREAD + VOLATILITY
     # =====================================================
     try:
         import math
@@ -3357,33 +3357,50 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             base_leverage = 25   # No TF aligned
         
         # PRICE FACTOR: Logarithmic reduction for low-price coins
-        # $100+ → 1.0, $10 → 0.97, $1 → 0.94, $0.1 → 0.91, $0.01 → 0.88, $0.001 → 0.85
+        # $100+ → 1.0, $1 → 0.50, $0.01 → 0.30
         if price > 0:
             log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
-            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))  # More aggressive: $0.01 → 0.5, $0.001 → 0.3
+            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))
         else:
             price_factor = 1.0
         
-        # SPREAD FACTOR: Get from signal or default
+        # SPREAD FACTOR: High spread = lower leverage
         spread_pct = signal.get('spreadPct', 0.05)
         if spread_pct > 0:
-            spread_factor = max(0.5, 1.0 - spread_pct * 2)  # High spread = lower leverage
+            spread_factor = max(0.5, 1.0 - spread_pct * 2)
         else:
             spread_factor = 1.0
         
-        # COMBINED LEVERAGE: base × price_factor × spread_factor
-        dynamic_leverage = int(round(base_leverage * price_factor * spread_factor))
+        # VOLATILITY FACTOR: High ATR = lower leverage (NEW!)
+        # ATR as % of price: <2% = 1.0, 2-4% = 0.8, 4-6% = 0.6, 6-10% = 0.4, 10%+ = 0.3
+        volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 2.0
+        if volatility_pct <= 2.0:
+            volatility_factor = 1.0   # Low volatility - no reduction
+        elif volatility_pct <= 4.0:
+            volatility_factor = 0.8   # Normal volatility
+        elif volatility_pct <= 6.0:
+            volatility_factor = 0.6   # High volatility
+        elif volatility_pct <= 10.0:
+            volatility_factor = 0.4   # Very high volatility
+        else:
+            volatility_factor = 0.3   # Extreme volatility
+        
+        # COMBINED LEVERAGE: base × price × spread × volatility
+        dynamic_leverage = int(round(base_leverage * price_factor * spread_factor * volatility_factor))
         dynamic_leverage = max(3, min(75, dynamic_leverage))  # Clamp 3-75x
         
         signal['leverage'] = dynamic_leverage
         signal['tf_count'] = tf_count
         signal['price_factor'] = round(price_factor, 2)
         signal['spread_factor'] = round(spread_factor, 2)
+        signal['volatility_factor'] = round(volatility_factor, 2)
+        signal['volatility_pct'] = round(volatility_pct, 2)
         
-        if price_factor < 0.9 or spread_factor < 0.9:
-            logger.info(f"📊 Leverage Adjusted: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} → {dynamic_leverage}x for {symbol} @ ${price:.6f}")
+        # Log if any factor reduced leverage
+        if price_factor < 0.9 or spread_factor < 0.9 or volatility_factor < 0.9:
+            logger.info(f"📊 Leverage: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} × vol={volatility_factor:.2f} → {dynamic_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
         else:
-            logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF count: {tf_count}/3)")
+            logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF:{tf_count}/3)")
     except Exception as lev_err:
         logger.warning(f"Dynamic leverage error: {lev_err}")
         signal['leverage'] = 25  # Fallback to safer 25x
