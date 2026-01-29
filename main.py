@@ -827,6 +827,95 @@ VOLATILITY_LEVELS = {
     "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 10%+ = 3x
 }
 
+# =====================================================
+# DYNAMIC TRAIL PARAMETERS (Hybrid Approach)
+# Calculates trail_activation and trail_distance based on:
+# 1. Volatility (ATR %)
+# 2. Hurst exponent (trend vs mean-reversion)
+# 3. Price factor (low price = more risk)
+# 4. Spread factor (high spread = more risk)
+# =====================================================
+def get_dynamic_trail_params(
+    volatility_pct: float,
+    hurst: float = 0.5,
+    price: float = 0.0,
+    spread_pct: float = 0.0
+) -> tuple:
+    """
+    Calculate dynamic trail_activation_atr and trail_distance_atr.
+    
+    Args:
+        volatility_pct: ATR as percentage of price (e.g., 5.0 for 5%)
+        hurst: Hurst exponent (0-1, >0.5 = trending, <0.5 = mean reverting)
+        price: Current price for price factor calculation
+        spread_pct: Current spread percentage
+        
+    Returns:
+        tuple: (trail_activation_atr, trail_distance_atr)
+    """
+    import math
+    
+    # 1. BASE VALUES FROM VOLATILITY
+    # Low volatility → wider trails (let profits run)
+    # High volatility → tighter trails (lock in profits quickly)
+    if volatility_pct <= 2.0:
+        base_activation = 2.0   # Need big move before trail
+        base_distance = 1.5     # Wide trail distance
+    elif volatility_pct <= 4.0:
+        base_activation = 1.5
+        base_distance = 1.0
+    elif volatility_pct <= 6.0:
+        base_activation = 1.2
+        base_distance = 0.8
+    elif volatility_pct <= 10.0:
+        base_activation = 1.0
+        base_distance = 0.6
+    else:
+        base_activation = 0.8   # Quick activation for very volatile
+        base_distance = 0.5     # Tight trail
+    
+    # 2. HURST ADJUSTMENT
+    # Trending (>0.5) → wider trails to capture bigger moves
+    # Mean-reverting (<0.5) → tighter trails, exit quickly
+    if hurst >= 0.65:
+        hurst_mult = 1.4   # Strong trend → let it run
+    elif hurst >= 0.55:
+        hurst_mult = 1.2   # Mild trend
+    elif hurst >= 0.45:
+        hurst_mult = 1.0   # Random walk
+    elif hurst >= 0.35:
+        hurst_mult = 0.8   # Mild mean-reversion → tighter
+    else:
+        hurst_mult = 0.6   # Strong mean-reversion → very tight
+    
+    # 3. PRICE FACTOR (Log scale)
+    # Low price coins are riskier → tighter trails
+    if price > 0:
+        log_price = math.log10(max(price, 0.0001))
+        price_factor = max(0.5, min(1.0, (log_price + 2) / 4))
+    else:
+        price_factor = 1.0
+    
+    # 4. SPREAD FACTOR
+    # High spread = low liquidity → tighter trails (exit while you can)
+    if spread_pct > 0:
+        spread_factor = max(0.6, 1.0 - spread_pct * 1.5)
+    else:
+        spread_factor = 1.0
+    
+    # COMBINED: Riskier coins get tighter trails
+    risk_mult = (price_factor + spread_factor) / 2  # Average of price and spread risk
+    
+    # Final calculation
+    final_activation = base_activation * hurst_mult * max(0.5, risk_mult)
+    final_distance = base_distance * hurst_mult * max(0.5, risk_mult)
+    
+    # Clamp to reasonable ranges
+    final_activation = max(0.5, min(3.0, final_activation))  # 0.5-3.0 range
+    final_distance = max(0.3, min(2.0, final_distance))      # 0.3-2.0 range
+    
+    return round(final_activation, 2), round(final_distance, 2)
+
 def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: float = 0.0, spread_pct: float = 0.0) -> dict:
     """
     Get SL/TP/Trail/Leverage based on volatility (ATR as % of price).
@@ -3434,6 +3523,33 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.info(f"📈 VP BOOST: {symbol} +{vp_boost*100:.0f}% @ POC={coin_vp.poc:.6f}")
     except Exception as vp_err:
         logger.warning(f"Volume Profile error: {vp_err}")
+    
+    # =====================================================
+    # DYNAMIC TRAIL PARAMETERS (Cloud Scanner - WebSocket Parity)
+    # Calculate trail_activation and trail_distance per-coin
+    # =====================================================
+    try:
+        # Get Hurst from signal if available
+        hurst = signal.get('hurst', 0.5)
+        volatility_pct = signal.get('volatility_pct', (atr / price * 100) if price > 0 else 3.0)
+        spread_pct = signal.get('spreadPct', 0.05)
+        
+        # Calculate dynamic trail params
+        trail_activation_atr, trail_distance_atr = get_dynamic_trail_params(
+            volatility_pct=volatility_pct,
+            hurst=hurst,
+            price=price,
+            spread_pct=spread_pct
+        )
+        
+        signal['dynamic_trail_activation'] = trail_activation_atr
+        signal['dynamic_trail_distance'] = trail_distance_atr
+        
+        # Log if significantly different from defaults (1.5, 1.0)
+        if abs(trail_activation_atr - 1.5) > 0.3 or abs(trail_distance_atr - 1.0) > 0.2:
+            logger.info(f"🎯 Dynamic Trail: act={trail_activation_atr}x, dist={trail_distance_atr}x | {symbol} (vol:{volatility_pct:.1f}%, hurst:{hurst:.2f})")
+    except Exception as trail_err:
+        logger.debug(f"Dynamic trail params error: {trail_err}")
     
     # Execute trade
     try:
@@ -7379,8 +7495,19 @@ class PaperTradingEngine:
         
         adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
         adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness * dynamic_atr_mult
+        
+        # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
+        if signal and 'dynamic_trail_activation' in signal:
+            # Use per-coin dynamic trail params
+            base_trail_activation_atr = signal['dynamic_trail_activation']
+            base_trail_distance_atr = signal['dynamic_trail_distance']
+        else:
+            # Fallback to global defaults
+            base_trail_activation_atr = self.trail_activation_atr
+            base_trail_distance_atr = self.trail_distance_atr
+        
+        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
             sl = entry_price - (atr * adjusted_sl_atr)
@@ -7430,7 +7557,10 @@ class PaperTradingEngine:
             "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),  # 5 dakika sonra aktif
             "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
             "atr": atr,
-            "confirmed": False  # Henüz konfirme edilmedi
+            "confirmed": False,  # Henüz konfirme edilmedi
+            # Dynamic trail params (per-coin)
+            "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
+            "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr
         }
         
         self.pending_orders.append(pending_order)
@@ -7550,8 +7680,17 @@ class PaperTradingEngine:
         
         adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
         adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness * dynamic_atr_mult
+        
+        # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
+        if 'dynamic_trail_activation' in order:
+            base_trail_activation_atr = order['dynamic_trail_activation']
+            base_trail_distance_atr = order['dynamic_trail_distance']
+        else:
+            base_trail_activation_atr = self.trail_activation_atr
+            base_trail_distance_atr = self.trail_distance_atr
+        
+        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
             sl = fill_price - (atr * adjusted_sl_atr)
