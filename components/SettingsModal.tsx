@@ -298,21 +298,21 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 <div className="flex justify-between items-center mb-2">
                   <label className="text-sm text-slate-300">İlk Azaltma Eşiği</label>
                   <span className="text-sm font-mono text-orange-400">
-                    %{localSettings.killSwitchFirstReduction || -15}
+                    %{localSettings.killSwitchFirstReduction || -70}
                   </span>
                 </div>
                 <input
                   type="range"
-                  min="-50"
-                  max="-5"
-                  step="5"
-                  value={localSettings.killSwitchFirstReduction || -15}
+                  min="-100"
+                  max="-30"
+                  step="10"
+                  value={localSettings.killSwitchFirstReduction || -70}
                   onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-50% (Gevşek)</span>
-                  <span>-5% (Sıkı)</span>
+                  <span>-100% (Gevşek)</span>
+                  <span>-30% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
                   Pozisyon bu zarara ulaşınca %50 küçültülür
@@ -324,21 +324,21 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 <div className="flex justify-between items-center mb-2">
                   <label className="text-sm text-slate-300">Tam Kapanış Eşiği</label>
                   <span className="text-sm font-mono text-rose-400">
-                    %{localSettings.killSwitchFullClose || -25}
+                    %{localSettings.killSwitchFullClose || -150}
                   </span>
                 </div>
                 <input
                   type="range"
-                  min="-80"
-                  max="-10"
-                  step="5"
-                  value={localSettings.killSwitchFullClose || -25}
+                  min="-200"
+                  max="-80"
+                  step="10"
+                  value={localSettings.killSwitchFullClose || -150}
                   onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-80% (Gevşek)</span>
-                  <span>-10% (Sıkı)</span>
+                  <span>-200% (Gevşek)</span>
+                  <span>-80% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
                   Pozisyon bu zarara ulaşınca tamamen kapatılır
