@@ -1196,8 +1196,9 @@ class VolumeProfileAnalyzer:
         }
 
 
-# Global Volume Profile instance
-volume_profiler = VolumeProfileAnalyzer()
+# Global Volume Profile instances (per-coin for accurate POC calculations)
+volume_profiler = VolumeProfileAnalyzer()  # Fallback for single-coin mode
+coin_volume_profiles = {}  # {symbol: VolumeProfileAnalyzer} for multi-coin scanning
 
 
 # ============================================================================
@@ -3347,24 +3348,31 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # =====================================================
     # VOLUME PROFILE BOOST (Cloud Scanner - WebSocket Parity)
-    # Boost signals near POC/VAH/VAL levels
+    # FIX #4: Per-coin Volume Profile (accurate POC/VAH/VAL)
     # =====================================================
     try:
+        # Get or create per-coin volume profiler
+        if symbol not in coin_volume_profiles:
+            coin_volume_profiles[symbol] = VolumeProfileAnalyzer()
+        
+        coin_vp = coin_volume_profiles[symbol]
+        
         # Update volume profile if stale (every hour)
-        if datetime.now().timestamp() - volume_profiler.last_update > 3600:
+        if datetime.now().timestamp() - coin_vp.last_update > 3600:
             # Try to get OHLCV from scanner's exchange
             if multi_coin_scanner.exchange:
                 ccxt_symbol = symbol.replace('USDT', '/USDT')
                 ohlcv_4h = await multi_coin_scanner.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
                 if ohlcv_4h:
-                    volume_profiler.calculate_profile(ohlcv_4h)
+                    coin_vp.calculate_profile(ohlcv_4h)
+                    logger.debug(f"Updated VP for {symbol}: POC={coin_vp.poc:.6f}")
         
         # Get boost based on price proximity to key levels
-        vp_boost = volume_profiler.get_signal_boost(price, action)
+        vp_boost = coin_vp.get_signal_boost(price, action)
         if vp_boost > 0:
             signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + vp_boost)
             signal['vp_boost'] = vp_boost
-            logger.info(f"📈 VP BOOST: +{vp_boost*100:.0f}% @ POC={volume_profiler.poc:.6f}")
+            logger.info(f"📈 VP BOOST: {symbol} +{vp_boost*100:.0f}% @ POC={coin_vp.poc:.6f}")
     except Exception as vp_err:
         logger.warning(f"Volume Profile error: {vp_err}")
     
@@ -7409,21 +7417,26 @@ class PaperTradingEngine:
                     # Henüz konfirmasyon süresi dolmadı - fiyat hala doğru yönde mi kontrol et
                     signal_price = order.get('signalPrice', entry_price)
                     
-                    # Fiyat ters yöne gitti mi? (sinyal invalide oldu mu?)
+                    # FIX #3: Signal Invalidation Logic Corrected
+                    # LONG sinyal: Eğer fiyat ÇOK FAZLA DÜŞTÜYSE (entry'i geçip gitti), sinyal geçersiz
+                    # SHORT sinyal: Eğer fiyat ÇOK FAZLA YÜKSELDİYSE (entry'i geçip gitti), sinyal geçersiz
+                    # Threshold: Entry fiyatının %3 ötesine geçerse iptal
+                    
                     if side == 'LONG':
-                        # SHORT trendin devam ettiğini kontrol et (fiyat daha da düştü mü)
-                        price_change_pct = (current_price - signal_price) / signal_price * 100
-                        if price_change_pct > 2.0:  # Fiyat %2'den fazla yükseldi - sinyal geçersiz
+                        # LONG için: Fiyat entry'den %3 daha aşağı düştüyse → sinyal kaçırıldı
+                        price_drop_pct = (signal_price - current_price) / signal_price * 100
+                        if price_drop_pct > 3.0:  # Fiyat %3'den fazla düştü - entry kaçırıldı
                             self.pending_orders.remove(order)
-                            self.add_log(f"❌ SIGNAL INVALID: {side} {symbol} - fiyat ters yöne gitti (+{price_change_pct:.1f}%)")
-                            logger.info(f"Signal invalidated: {order['id']} - price moved against signal")
+                            self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
+                            logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
                             continue
                     else:  # SHORT
-                        price_change_pct = (signal_price - current_price) / signal_price * 100
-                        if price_change_pct > 2.0:  # Fiyat %2'den fazla düştü - sinyal geçersiz
+                        # SHORT için: Fiyat entry'den %3 daha yukarı çıktıysa → sinyal kaçırıldı
+                        price_rise_pct = (current_price - signal_price) / signal_price * 100
+                        if price_rise_pct > 3.0:  # Fiyat %3'den fazla yükseldi - entry kaçırıldı
                             self.pending_orders.remove(order)
-                            self.add_log(f"❌ SIGNAL INVALID: {side} {symbol} - fiyat ters yöne gitti (-{price_change_pct:.1f}%)")
-                            logger.info(f"Signal invalidated: {order['id']} - price moved against signal")
+                            self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
+                            logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
                             continue
                     
                     # Beklemeye devam et
@@ -7471,10 +7484,13 @@ class PaperTradingEngine:
         atr = order.get('atr', fill_price * 0.01)
         side = order['side']
         
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness
-        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness
-        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness
+        # FIX #2: Dynamic ATR Multiplier (parity with open_position)
+        dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, fill_price)
+        
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_activation_atr = self.trail_activation_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_distance_atr = self.trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
             sl = fill_price - (atr * adjusted_sl_atr)
@@ -8117,7 +8133,7 @@ class PaperTradingEngine:
             else:
                 pnl = (pos['entryPrice'] - current_price) * pos['size']
             
-            pnl_percent = (pnl / pos['sizeUsd']) * 100 * self.leverage if pos.get('sizeUsd', 0) > 0 else 0
+            pnl_percent = (pnl / pos['sizeUsd']) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0
             
             pos['unrealizedPnl'] = pnl
             pos['unrealizedPnlPercent'] = pnl_percent
