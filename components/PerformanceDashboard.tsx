@@ -23,27 +23,47 @@ interface Props {
     apiUrl: string;
 }
 
-// Phase 57: Translate close reasons to detailed Turkish descriptions
+// Phase 58: Translate close reasons to detailed Turkish descriptions with algorithm criteria
 const translateReason = (reason: string): string => {
     const mapping: Record<string, string> = {
-        'SL': '🛑 Stop Loss',
-        'TP': '✅ Take Profit',
-        'SL_HIT': '🛑 Stop Loss',
-        'TP_HIT': '✅ Take Profit',
-        'KILL_SWITCH_FULL': '🚨 KS Tam (-%20)',
-        'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi (-%15)',
-        'TIME_REDUCE_4H': '⏰ 4s Aşımı (%10)',
-        'TIME_REDUCE_8H': '🕐 8s Aşımı (%10)',
-        'TIME_GRADUAL': '⏳ Kademeli Çıkış',
-        'TIME_FORCE': '⌛ Zorla Çıkış',
-        'RECOVERY_EXIT': '🔄 Toparlanma',
-        'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman',
-        'EMERGENCY_SL': '🚨 Acil SL',
-        'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi',
-        'SIGNAL_REVERSAL': '↩️ Sinyal Tersi',
-        'MANUAL': '👤 Manuel',
+        // ===== STOP LOSS / TAKE PROFIT =====
+        'SL': '🛑 SL: Trailing Stop Tetiklendi',
+        'TP': '✅ TP: Hedef Fiyata Ulaşıldı',
+        'SL_HIT': '🛑 SL: Stop Loss Fiyatı Aşıldı',
+        'TP_HIT': '✅ TP: Take Profit Fiyatı Yakalandı',
+
+        // ===== KILL SWITCH - GÜNLÜK ZARAR LİMİTİ =====
+        'KILL_SWITCH_FULL': '🚨 KS Tam: Margin Kaybı ≥%50 → Tam Kapatma',
+        'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi: Margin Kaybı ≥%30 → %50 Küçültme',
+
+        // ===== TIME-BASED - ZAMAN BAZLI =====
+        'TIME_GRADUAL': '⏳ Zaman: 12h Aşımı + 0.3 ATR Geri Çekilme',
+        'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Çıkış',
+
+        // ===== RECOVERY & ADVERSE =====
+        'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa Dönüş',
+        'ADVERSE_TIME_EXIT': '📉 Olumsuz: 8h+ Zararda Kaldı',
+        'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Limiti',
+
+        // ===== SIGNAL-BASED =====
+        'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi: Kârda İken Trend Döndü',
+        'SIGNAL_REVERSAL': '↩️ Sinyal Tersi: Trend Yönü Değişti',
+
+        // ===== MANUEL =====
+        'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
     };
-    return mapping[reason] || reason;
+
+    // Partial match for dynamic reasons
+    if (reason?.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
+    if (reason?.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
+    if (reason?.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
+    if (reason?.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
+    if (reason?.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
+    if (reason?.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
+    if (reason?.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
+    if (reason?.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
+
+    return mapping[reason] || reason || '-';
 };
 
 export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {

@@ -51,64 +51,58 @@ const INITIAL_STATS: PortfolioStats = {
 };
 
 // Close reason to Turkish mapping with detailed algorithmic descriptions
-// Phase 57: Complete close reason mapping for all algorithm criteria
+// Phase 58: Complete close reason mapping with specific algorithm criteria
 const translateReason = (reason: string | undefined): string => {
   if (!reason) return '-';
 
   const mapping: Record<string, string> = {
-    // ===== NORMAL SL/TP EXITS =====
-    'SL': '🛑 Stop Loss (SL tetiklendi)',
-    'TP': '✅ Take Profit (TP hedefe ulaştı)',
-    'SL_HIT': '🛑 Stop Loss Hit',
-    'TP_HIT': '✅ Take Profit Hit',
-    'TRAILING': '📈 Trailing Stop (Takip eden SL)',
+    // ===== STOP LOSS / TAKE PROFIT (SL/TP HIT) =====
+    'SL': '🛑 SL: Trailing Stop Tetiklendi (3-tick onayı)',
+    'TP': '✅ TP: Hedef Fiyata Ulaşıldı (R:R oranı)',
+    'SL_HIT': '🛑 SL: Stop Loss Fiyatı Aşıldı',
+    'TP_HIT': '✅ TP: Take Profit Fiyatı Yakalandı',
+    'TRAILING': '📈 Trailing: Takip Eden SL Tetiklendi',
 
-    // ===== KILL SWITCH - GÜNLÜK ZARAR LİMİTİ =====
-    'KILL_SWITCH_FULL': '🚨 Kill Switch: Günlük -%20 → TAM KAPATMA',
-    'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: Günlük -%15 → %50 Küçültme',
+    // ===== KILL SWITCH - MARGIN KAYBI LİMİTİ =====
+    'KILL_SWITCH_FULL': '🚨 KS Tam: Margin Kaybı ≥%50 → Tam Kapatma',
+    'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi: Margin Kaybı ≥%30 → %50 Küçültme',
 
-    // ===== TIME-BASED REDUCTIONS - ZAMAN BAZLI KÜCÜLTME =====
-    // NOT: Sadece 4h ve 8h var, her biri %10 azaltma
-    'TIME_REDUCE_4H': '⏰ 4 Saat Aşımı: %10 pozisyon küçültme',
-    'TIME_REDUCE_8H': '🕐 8 Saat Aşımı: %10 pozisyon küçültme',
-    'TIME_GRADUAL': '⏳ Kademeli Zaman Çıkışı (süre limiti)',
-    'TIME_FORCE': '⌛ Zorla Zaman Çıkışı (max süre aşıldı)',
+    // ===== TIME-BASED - ZAMAN BAZLI ÇIKIŞ =====
+    'TIME_GRADUAL': '⏳ Zaman: 12h+ Aşımı + 0.3 ATR Geri Çekilme',
+    'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Kapatma',
 
-    // ===== RECOVERY & ADVERSE EXITS =====
-    'RECOVERY_EXIT': '🔄 Toparlanma Çıkışı (kayıptan dönüş)',
-    'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman Çıkışı (uzun süreli zarar)',
-    'EMERGENCY_SL': '🚨 ACİL Stop Loss (ani düşüş koruması)',
+    // ===== RECOVERY & ADVERSE - TOPARLANMA/OLUMSUZ =====
+    'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa/Kâra Dönüş',
+    'ADVERSE_TIME_EXIT': '📉 Olumsuz: 8h+ Zararda → Kayıp Minimizasyonu',
+    'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Aşıldı',
 
-    // ===== SIGNAL-BASED EXITS =====
-    'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersindi → Kârda çıkış',
-    'SIGNAL_REVERSAL': '↩️ Sinyal Ters Dönüşü',
+    // ===== SIGNAL-BASED - SİNYAL BAZLI =====
+    'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi: Kârda İken Trend Döndü',
+    'SIGNAL_REVERSAL': '↩️ Sinyal Tersi: Trend Yönü Değişti',
 
-    // ===== OTHER EXITS =====
-    'MANUAL': '👤 Manuel Kapama',
-    'BREAKEVEN': '⚖️ Başabaş Çıkış',
-    'RESCUE': '🆘 Kurtarma Modu',
-    'END': '🔚 Sistem Kapanış',
-    'EARLY_TRAIL': '📊 Erken Trailing (pullback aktivasyon)',
+    // ===== MANUEL & DİĞER =====
+    'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
+    'BREAKEVEN': '⚖️ Başabaş: Kayıpsız Çıkış',
+    'RESCUE': '🆘 Kurtarma: Acil Durum Modu',
+    'END': '🔚 Sistem: Oturum Sonlandırıldı',
+    'EARLY_TRAIL': '📊 Erken Trail: Pullback Aktivasyon Çıkışı',
   };
 
-  // Check for partial matches (some reasons have dynamic suffixes)
-  if (reason.includes('TIME_REDUCE_4H')) return '⏰ 4s Aşımı (%10 küçült)';
-  if (reason.includes('TIME_REDUCE_8H')) return '🕐 8s Aşımı (%10 küçült)';
-  if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Bazlı Küçültme';
-  if (reason.includes('TIME_GRADUAL')) return '⏳ Kademeli Zaman Çıkışı';
-  if (reason.includes('TIME_FORCE')) return '⌛ Zorla Zaman Çıkışı';
-  if (reason.includes('KILL_SWITCH_FULL')) return '🚨 KS: Tam Kapama (-%20)';
-  if (reason.includes('KILL_SWITCH_PARTIAL')) return '⚠️ KS: %50 Küçültme (-%15)';
-  if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch Tetiklendi';
-  if (reason.includes('RECOVERY_EXIT')) return '🔄 Toparlanma Çıkışı';
-  if (reason.includes('ADVERSE_TIME')) return '📉 Olumsuz Zaman Çıkışı';
-  if (reason.includes('EMERGENCY')) return '🚨 Acil Stop Loss';
-  if (reason.includes('SIGNAL_REVERSAL')) return '↩️ Sinyal Tersindi';
+  // Partial matches for dynamic suffixes
+  if (reason.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
+  if (reason.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
+  if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
+  if (reason.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
+  if (reason.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
+  if (reason.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
+  if (reason.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
+  if (reason.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
+  if (reason.includes('SIGNAL_REVERSAL')) return '↩️ Sinyal Tersi: Trend Döndü';
 
   return mapping[reason] || reason;
 };
 
-// Phase 58: Generate tooltip with calculation details for close reason
+// Phase 58: Generate tooltip with detailed algorithm criteria for close reason
 const getReasonTooltip = (trade: any): string => {
   const reason = trade.reason || trade.closeReason || '';
   const entry = trade.entryPrice || 0;
@@ -119,6 +113,8 @@ const getReasonTooltip = (trade: any): string => {
   const isTrailing = trade.isTrailingActive || false;
   const leverage = trade.leverage || 10;
   const atr = trade.atr || 0;
+  const margin = trade.margin || (trade.sizeUsd || 100) / leverage;
+  const pnlPct = margin > 0 ? (trade.pnl / margin) * 100 : 0;
 
   const lines: string[] = [];
 
@@ -126,48 +122,84 @@ const getReasonTooltip = (trade: any): string => {
   lines.push(`📊 ${trade.side} @ ${leverage}x`);
   lines.push(`Entry: $${entry.toFixed(6)}`);
   lines.push(`Exit: $${exit.toFixed(6)}`);
+  lines.push(`Margin ROI: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
 
-  if (reason === 'SL' || reason.includes('STOP')) {
-    lines.push('--- Stop Loss ---');
-    lines.push(`SL Level: $${sl.toFixed(6)}`);
+  if (reason === 'SL' || reason === 'SL_HIT') {
+    lines.push('');
+    lines.push('━━━ STOP LOSS KRİTERİ ━━━');
+    lines.push(`Stop Level: $${sl.toFixed(6)}`);
+    lines.push('Koşul: Fiyat SL seviyesini 3 kez üst üste geçti');
     if (isTrailing) {
-      lines.push(`Trailing: $${trail.toFixed(6)}`);
-      lines.push('✔ Trailing aktifti');
+      lines.push(`Trailing SL: $${trail.toFixed(6)}`);
+      lines.push('✔ Trailing aktif - dinamik takip edildi');
     }
     if (atr > 0) {
       const slDistance = Math.abs(entry - sl);
       const slAtr = slDistance / atr;
       lines.push(`SL Mesafesi: ${slAtr.toFixed(1)}x ATR`);
     }
-  } else if (reason === 'TP' || reason.includes('PROFIT')) {
-    lines.push('--- Take Profit ---');
+  } else if (reason === 'TP' || reason === 'TP_HIT' || reason.includes('PROFIT')) {
+    lines.push('');
+    lines.push('━━━ TAKE PROFIT KRİTERİ ━━━');
     lines.push(`TP Level: $${tp.toFixed(6)}`);
+    lines.push('Koşul: Fiyat TP hedefine ulaştı');
     if (atr > 0) {
       const tpDistance = Math.abs(tp - entry);
       const tpAtr = tpDistance / atr;
       lines.push(`TP Mesafesi: ${tpAtr.toFixed(1)}x ATR`);
     }
-  } else if (reason.includes('TIME_REDUCE')) {
-    lines.push('--- Zaman Bazlı ---');
-    lines.push('Pozisyon çok uzun süre açık kaldı');
-    lines.push('4h/8h sonra %10 küçültme');
   } else if (reason.includes('KILL_SWITCH')) {
-    lines.push('--- Kill Switch ---');
-    lines.push('Günlük zarar limiti aşıldı');
+    lines.push('');
+    lines.push('━━━ KILL SWITCH KRİTERİ ━━━');
+    lines.push('Dinamik eşikler (leverage bazlı):');
     if (reason.includes('PARTIAL')) {
-      lines.push('-%15 → %50 pozisyon küçültme');
+      lines.push(`• %30 margin kaybı → %50 küçültme`);
+      lines.push('• Kalan pozisyon %50 devam etti');
     } else {
-      lines.push('-%20 → Tam kapatma');
+      lines.push(`• %50 margin kaybı → TAM KAPATMA`);
+      lines.push('• Tüm pozisyon likide edildi');
     }
+    lines.push(`Gerçekleşen Kayıp: ${pnlPct.toFixed(1)}%`);
+  } else if (reason.includes('TIME_GRADUAL')) {
+    lines.push('');
+    lines.push('━━━ ZAMAN AŞIMI KRİTERİ ━━━');
+    lines.push('• Pozisyon 12+ saat açık kaldı');
+    lines.push('• 0.3 ATR geri çekilme beklendi');
+    lines.push('Koşul: Bounce tespit edildi, kademeli çıkış');
+  } else if (reason.includes('TIME_FORCE')) {
+    lines.push('');
+    lines.push('━━━ ZORLA ÇIKIŞ KRİTERİ ━━━');
+    lines.push('• Pozisyon 48+ saat açık kaldı');
+    lines.push('• Maksimum süre aşıldı');
+    lines.push('Koşul: Hard limit - zorunlu kapatma');
   } else if (reason.includes('RECOVERY')) {
-    lines.push('--- Toparlanma ---');
-    lines.push('Kayıptan kâra dönüş çıkışı');
+    lines.push('');
+    lines.push('━━━ TOPARLANMA KRİTERİ ━━━');
+    lines.push('• Pozisyon zararda başladı');
+    lines.push('• Başabaş veya küçük kâra döndü');
+    lines.push('Koşul: Kayıp minimizasyonu için çıkış');
   } else if (reason.includes('ADVERSE')) {
-    lines.push('--- Olumsuz Zaman ---');
-    lines.push('Uzun süreli zarardaki pozisyon');
+    lines.push('');
+    lines.push('━━━ OLUMSUZ ZAMAN KRİTERİ ━━━');
+    lines.push('• Pozisyon 8+ saat zararda kaldı');
+    lines.push('• Toparlanma sinyali görülmedi');
+    lines.push('Koşul: Uzun süreli zarar → kayıp kes');
   } else if (reason.includes('EMERGENCY')) {
-    lines.push('--- Acil Çıkış ---');
-    lines.push('Ani düşüşten koruma');
+    lines.push('');
+    lines.push('━━━ ACİL SL KRİTERİ ━━━');
+    lines.push('• Pozisyon kaybı %15\'i aştı');
+    lines.push('• Acil koruma mekanizması devreye girdi');
+    lines.push('Koşul: Ani düşüşten sermaye koruma');
+  } else if (reason.includes('SIGNAL_REVERSAL')) {
+    lines.push('');
+    lines.push('━━━ SİNYAL TERSİ KRİTERİ ━━━');
+    lines.push('• Teknik sinyal yönü değişti');
+    lines.push('• Pozisyon kârda iken ters sinyal geldi');
+    lines.push('Koşul: Trend dönüşü - kârı koru');
+  } else if (reason === 'MANUAL') {
+    lines.push('');
+    lines.push('━━━ MANUEL KAPATMA ━━━');
+    lines.push('Kullanıcı tarafından kapatıldı');
   }
 
   return lines.join('\n');
