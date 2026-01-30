@@ -943,12 +943,13 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
             
             # Phase 43: Combined leverage formula (logarithmic version)
             # Price Factor: Logarithmic reduction for low-price coins
-            # Phase 60b: Further relaxed - min 0.85 (was 0.75)
-            # $100+ → 1.0, $10 → 0.97, $1 → 0.94, $0.1 → 0.91, $0.01 → 0.88, $0.001 → 0.85
+            # Phase 61: FIXED - previous formula was broken, all prices mapped to 0.85
+            # NEW: Softer gradient: $100+=1.0, $10=0.98, $1=0.95, $0.1=0.92, $0.01=0.89
             import math
             if price > 0:
                 log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
-                price_factor = max(0.85, min(1.0, (log_price + 5) / 10))  # Maps -5..5 to 0.85..1.0
+                # Fixed formula: 0.95 base + 0.03 per log unit
+                price_factor = max(0.85, min(1.0, 0.95 + log_price * 0.03))
             else:
                 price_factor = 1.0  # If price=0, don't penalize
             
@@ -985,10 +986,11 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
     base_leverage = params["leverage"]
     
     # Apply logarithmic Combined Formula for default case too
+    # Phase 61: FIXED formula
     import math
     if price > 0:
         log_price = math.log10(max(price, 0.0001))
-        price_factor = max(0.85, min(1.0, (log_price + 5) / 10))  # Phase 60b: Further relaxed
+        price_factor = max(0.85, min(1.0, 0.95 + log_price * 0.03))  # Fixed formula
     else:
         price_factor = 1.0
     
