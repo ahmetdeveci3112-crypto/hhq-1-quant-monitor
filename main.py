@@ -3988,7 +3988,15 @@ class BTCCorrelationFilter:
         self.spread_window = 100  # Last 100 values for Z-score
         self.beta = 0.052  # ETH typically ~5.2% of BTC price
         
-        logger.info("📊 BTCCorrelationFilter initialized with Emergency Mode + ETH Trend Filter")
+        # Phase 60d: Recovery Detection - Karma Yaklaşım
+        self.flash_crash_start_time = None  # Flash crash başlangıç zamanı
+        self.prev_btc_change_30m = 0.0      # Önceki 30m değişim (momentum shift)
+        self.prev_eth_change_30m = 0.0      # Önceki ETH 30m değişim
+        self.btc_momentum_improving = False  # BTC momentum iyileşiyor mu?
+        self.eth_momentum_improving = False  # ETH momentum iyileşiyor mu?
+        self.recovery_phase = "NORMAL"       # BLOCKED / PENALTY_HIGH / PENALTY_LOW / NORMAL
+        
+        logger.info("📊 BTCCorrelationFilter initialized with Recovery Detection + Karma Approach")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -4009,15 +4017,61 @@ class BTCCorrelationFilter:
             if ohlcv_30m and len(ohlcv_30m) >= 2:
                 current = ohlcv_30m[-1][4]  # Close
                 prev_30m = ohlcv_30m[-2][4]
-                self.btc_change_30m = ((current - prev_30m) / prev_30m) * 100
+                new_change = ((current - prev_30m) / prev_30m) * 100
                 
-                # Flash crash algılama: 30m'de %2+ düşüş
+                # =================================================================
+                # Phase 60d: MOMENTUM SHIFT DETECTION
+                # Düşüş yavaşlıyorsa momentum iyileşiyor
+                # =================================================================
+                if self.prev_btc_change_30m < -1.0:  # Önceden düşüşteydik
+                    # Yeni değer daha iyi mi? (daha az negatif veya pozitif)
+                    if new_change > self.prev_btc_change_30m + 0.5:  # En az 0.5% iyileşme
+                        if not self.btc_momentum_improving:
+                            logger.info(f"📈 BTC MOMENTUM SHIFT: {self.prev_btc_change_30m:.1f}% → {new_change:.1f}% (improving)")
+                        self.btc_momentum_improving = True
+                    else:
+                        self.btc_momentum_improving = False
+                else:
+                    self.btc_momentum_improving = False
+                
+                self.prev_btc_change_30m = self.btc_change_30m  # Önceki değeri sakla
+                self.btc_change_30m = new_change
+                
+                # =================================================================
+                # Phase 60d: FLASH CRASH + TIME-BASED RECOVERY
+                # =================================================================
                 if self.btc_change_30m < -2.0:
+                    # Flash crash başladı veya devam ediyor
                     if not self.flash_crash_active:
                         logger.warning(f"⚡ FLASH CRASH DETECTED: 30m:{self.btc_change_30m:.1f}%")
+                        self.flash_crash_start_time = datetime.now()
                     self.flash_crash_active = True
+                    
+                    # Time-based recovery phase belirleme
+                    if self.flash_crash_start_time:
+                        elapsed_minutes = (datetime.now() - self.flash_crash_start_time).total_seconds() / 60
+                        
+                        if elapsed_minutes < 10:
+                            self.recovery_phase = "BLOCKED"
+                        elif elapsed_minutes < 20:
+                            self.recovery_phase = "PENALTY_HIGH"  # 50% penalty
+                        elif elapsed_minutes < 30:
+                            self.recovery_phase = "PENALTY_LOW"   # 25% penalty
+                        else:
+                            self.recovery_phase = "NORMAL"
+                        
+                        # Momentum iyileşiyorsa fazı hızlandır
+                        if self.btc_momentum_improving and self.recovery_phase == "BLOCKED":
+                            self.recovery_phase = "PENALTY_HIGH"
+                            logger.info(f"📈 RECOVERY ACCELERATED: Momentum improving, phase → PENALTY_HIGH")
+                    
                 elif self.btc_change_30m > -1.0:
+                    # Flash crash sona erdi
+                    if self.flash_crash_active:
+                        logger.info(f"✅ FLASH CRASH ENDED: 30m recovered to {self.btc_change_30m:.1f}%")
                     self.flash_crash_active = False
+                    self.flash_crash_start_time = None
+                    self.recovery_phase = "NORMAL"
             
             if ohlcv_1h and len(ohlcv_1h) >= 2:
                 current = ohlcv_1h[-1][4]  # Close
@@ -4091,8 +4145,22 @@ class BTCCorrelationFilter:
                 if eth_30m and len(eth_30m) >= 2:
                     curr = eth_30m[-1][4]
                     prev = eth_30m[-2][4]
-                    self.eth_change_30m = ((curr - prev) / prev) * 100
+                    new_eth_change = ((curr - prev) / prev) * 100
                     self.eth_price = curr
+                    
+                    # Phase 60d: ETH Momentum Shift Detection
+                    if self.prev_eth_change_30m < -1.5:
+                        if new_eth_change > self.prev_eth_change_30m + 0.5:
+                            if not self.eth_momentum_improving:
+                                logger.info(f"📈 ETH MOMENTUM SHIFT: {self.prev_eth_change_30m:.1f}% → {new_eth_change:.1f}%")
+                            self.eth_momentum_improving = True
+                        else:
+                            self.eth_momentum_improving = False
+                    else:
+                        self.eth_momentum_improving = False
+                    
+                    self.prev_eth_change_30m = self.eth_change_30m
+                    self.eth_change_30m = new_eth_change
                     
                     # ETH Flash crash: 30m'de %3+ düşüş
                     if self.eth_change_30m < -3.0:
@@ -4199,11 +4267,33 @@ class BTCCorrelationFilter:
             return (False, 1.0, "⚠️ BTC Data Not Ready - Signal Blocked")
         
         # ===================================================================
-        # Phase 60b: FLASH CRASH - 30m hızlı düşüş kontrolü
+        # Phase 60d: FLASH CRASH + RECOVERY DETECTION (Karma Yaklaşım)
+        # Tam blokaj yerine kademeli penalty sistemi
         # ===================================================================
         if self.flash_crash_active and signal_action == "LONG":
-            logger.warning(f"⚡ FLASH CRASH BLOCK: {symbol} LONG rejected - 30m:{self.btc_change_30m:.1f}%")
-            return (False, 1.0, f"⚡ Flash Crash Active (30m:{self.btc_change_30m:.1f}%) - LONG BLOCKED")
+            if self.recovery_phase == "BLOCKED":
+                # İlk 10 dk veya momentum kötüleşiyor = tam blokaj
+                if not self.btc_momentum_improving:
+                    logger.warning(f"⚡ FLASH CRASH BLOCKED: {symbol} LONG rejected - Phase:{self.recovery_phase}, Momentum:{self.btc_momentum_improving}")
+                    return (False, 1.0, f"⚡ Flash Crash [{self.recovery_phase}] - LONG BLOCKED")
+                else:
+                    # Momentum iyileşiyor ama henüz erken - yüksek penalty ile izin ver
+                    logger.info(f"📈 RECOVERY LONG: {symbol} - Momentum improving, penalty=50%")
+                    return (True, 0.5, f"📈 Recovery Phase (momentum improving) - 50% penalty")
+            
+            elif self.recovery_phase == "PENALTY_HIGH":
+                # 10-20 dk arası = %50 penalty ile izin ver
+                logger.info(f"📈 RECOVERY LONG: {symbol} - Phase:{self.recovery_phase}, penalty=50%")
+                return (True, 0.5, f"📈 Recovery Phase [{self.recovery_phase}] - 50% penalty")
+            
+            elif self.recovery_phase == "PENALTY_LOW":
+                # 20-30 dk arası = %25 penalty ile izin ver
+                logger.info(f"📈 RECOVERY LONG: {symbol} - Phase:{self.recovery_phase}, penalty=25%")
+                return (True, 0.25, f"📈 Recovery Phase [{self.recovery_phase}] - 25% penalty")
+            
+            else:
+                # 30+ dk = normal
+                pass
         
         # ===================================================================
         # Phase 60c: ETH DIVERGENCE FILTER
@@ -4337,7 +4427,12 @@ class BTCCorrelationFilter:
             "eth_change_30m": round(self.eth_change_30m, 2),
             "eth_change_1h": round(self.eth_change_1h, 2),
             "eth_change_4h": round(self.eth_change_4h, 2),
-            "eth_flash_crash": self.eth_flash_crash
+            "eth_flash_crash": self.eth_flash_crash,
+            # Phase 60d: Recovery Detection
+            "recovery_phase": self.recovery_phase,
+            "btc_momentum_improving": self.btc_momentum_improving,
+            "eth_momentum_improving": self.eth_momentum_improving,
+            "flash_crash_start_time": self.flash_crash_start_time.isoformat() if self.flash_crash_start_time else None
         }
     
     # =========================================================================
