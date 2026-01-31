@@ -10139,10 +10139,20 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Phase 60c: Update BTC/ETH state before filtering
         # =========================================================
         try:
-            if multi_coin_scanner.exchange:
-                await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+            exchange_for_btc = multi_coin_scanner.exchange
+            # Fallback: Create exchange if not available
+            if not exchange_for_btc:
+                import ccxt.async_support as ccxt_async
+                exchange_for_btc = ccxt_async.binance({'enableRateLimit': True})
+                logger.info("📊 Created fallback exchange for BTC state update")
+            
+            await btc_filter.update_btc_state(exchange_for_btc)
+            
+            # Close fallback exchange if we created it
+            if not multi_coin_scanner.exchange and exchange_for_btc:
+                await exchange_for_btc.close()
         except Exception as btc_update_err:
-            logger.debug(f"BTC state update error on connect: {btc_update_err}")
+            logger.warning(f"BTC state update error: {btc_update_err}")
         
         # Build current opportunities from existing analyzers
         current_opportunities = []
@@ -10221,8 +10231,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 # Phase 60c: Periodic BTC/ETH state update
                 # =========================================================
                 try:
-                    if multi_coin_scanner.exchange:
-                        await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+                    exchange_for_btc = multi_coin_scanner.exchange
+                    if not exchange_for_btc:
+                        import ccxt.async_support as ccxt_async
+                        exchange_for_btc = ccxt_async.binance({'enableRateLimit': True})
+                    
+                    await btc_filter.update_btc_state(exchange_for_btc)
+                    
+                    if not multi_coin_scanner.exchange and exchange_for_btc:
+                        await exchange_for_btc.close()
                 except Exception:
                     pass  # Silent fail, will retry next loop
                 
