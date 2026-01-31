@@ -16,6 +16,7 @@ Features:
 import asyncio
 import json
 import logging
+import math
 import os
 import websockets
 from collections import deque
@@ -3398,6 +3399,55 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     except Exception as btc_err:
         logger.warning(f"BTC Filter error: {btc_err}")
     
+    # =====================================================
+    # Phase 60: MARKET REGIME FILTER
+    # TRENDING_DOWN durumunda LONG sinyallere ek kontrol
+    # =====================================================
+    try:
+        current_regime = market_regime_detector.current_regime
+        regime_params = market_regime_detector.get_regime_params()
+        
+        # TRENDING_DOWN durumunda LONG sinyallere ağır penalty
+        if current_regime == "TRENDING_DOWN" and action == "LONG":
+            long_penalty = regime_params.get('long_penalty', 0.5)
+            
+            # %50+ penalty varsa sinyali reddet
+            if long_penalty >= 0.5:
+                signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
+                asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+                logger.info(f"🚫 REGIME BLOCK: {action} {symbol} - TRENDING_DOWN blocks LONGs")
+                return
+            else:
+                # Düşük penalty - sadece uyar
+                original_score = signal.get('confidenceScore', 60)
+                penalty_amount = int(original_score * long_penalty)
+                signal['confidenceScore'] = max(40, original_score - penalty_amount)
+                signal['regime_adjustment'] = f"TRENDING_DOWN penalty -{penalty_amount}"
+                logger.info(f"⚠️ REGIME PENALTY: {action} {symbol} | Score: -{penalty_amount}")
+        
+        # TRENDING_UP durumunda SHORT sinyallere uyarı
+        elif current_regime == "TRENDING_UP" and action == "SHORT":
+            short_penalty = regime_params.get('short_penalty', 0.2)
+            original_score = signal.get('confidenceScore', 60)
+            penalty_amount = int(original_score * short_penalty)
+            signal['confidenceScore'] = max(40, original_score - penalty_amount)
+            signal['regime_adjustment'] = f"TRENDING_UP penalty -{penalty_amount}"
+            logger.info(f"⚠️ REGIME PENALTY: {action} {symbol} | Score: -{penalty_amount}")
+        
+        # TRENDING_UP + LONG veya TRENDING_DOWN + SHORT = bonus
+        elif (current_regime == "TRENDING_UP" and action == "LONG"):
+            long_bonus = regime_params.get('long_bonus', 0.15)
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + long_bonus)
+            signal['regime_adjustment'] = f"TRENDING_UP bonus +{int(long_bonus*100)}%"
+            logger.info(f"✅ REGIME BONUS: {action} {symbol} | Size: +{int(long_bonus*100)}%")
+        elif (current_regime == "TRENDING_DOWN" and action == "SHORT"):
+            short_bonus = regime_params.get('short_bonus', 0.2)
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + short_bonus)
+            signal['regime_adjustment'] = f"TRENDING_DOWN bonus +{int(short_bonus*100)}%"
+            logger.info(f"✅ REGIME BONUS: {action} {symbol} | Size: +{int(short_bonus*100)}%")
+    except Exception as regime_err:
+        logger.debug(f"Market Regime Filter error: {regime_err}")
+    
     # MULTI-TIMEFRAME CONFIRMATION CHECK
     # Verify signal aligns with higher timeframe (1h) trend
     mtf_result = mtf_confirmation.confirm_signal(symbol, action)
@@ -3913,11 +3963,19 @@ class BTCCorrelationFilter:
         self.btc_trend_daily = "NEUTRAL"  # Günlük trend
         self.btc_momentum = 0.0
         self.btc_price = 0.0
+        self.btc_change_30m = 0.0  # Phase 60b: 30m hızlı momentum
         self.btc_change_1h = 0.0
         self.btc_change_4h = 0.0
         self.btc_change_1d = 0.0  # Günlük değişim
         self.last_update = 0
-        self.update_interval = 300  # 5 dakikada bir güncelle
+        self.base_update_interval = 120  # 2 dakikada bir güncelle (was 300)
+        self.update_interval = 120  # Dinamik aralık
+        
+        # Phase 60: Emergency Mode - Strong bearish market protection
+        self.emergency_mode = False
+        self.emergency_reason = ""
+        self.emergency_start_time = None
+        self.flash_crash_active = False  # Phase 60b: 30m hızlı düşüş algılama
         
         # Phase 36: Pairs correlation
         self.eth_price = 0.0
@@ -3926,7 +3984,7 @@ class BTCCorrelationFilter:
         self.spread_window = 100  # Last 100 values for Z-score
         self.beta = 0.052  # ETH typically ~5.2% of BTC price
         
-        logger.info("BTCCorrelationFilter initialized with 1D Trend Support")
+        logger.info("📊 BTCCorrelationFilter initialized with Emergency Mode + 30m Momentum")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -3937,10 +3995,25 @@ class BTCCorrelationFilter:
             return self.get_state()
         
         try:
-            # BTC 1H, 4H ve 1D verileri çek
+            # BTC 30m, 1H, 4H ve 1D verileri çek
+            ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)  # Phase 60b: 30m momentum
             ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
             ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
             ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)  # Son 3 gün
+            
+            # Phase 60b: 30m momentum hesapla (hızlı düşüş algılama)
+            if ohlcv_30m and len(ohlcv_30m) >= 2:
+                current = ohlcv_30m[-1][4]  # Close
+                prev_30m = ohlcv_30m[-2][4]
+                self.btc_change_30m = ((current - prev_30m) / prev_30m) * 100
+                
+                # Flash crash algılama: 30m'de %2+ düşüş
+                if self.btc_change_30m < -2.0:
+                    if not self.flash_crash_active:
+                        logger.warning(f"⚡ FLASH CRASH DETECTED: 30m:{self.btc_change_30m:.1f}%")
+                    self.flash_crash_active = True
+                elif self.btc_change_30m > -1.0:
+                    self.flash_crash_active = False
             
             if ohlcv_1h and len(ohlcv_1h) >= 2:
                 current = ohlcv_1h[-1][4]  # Close
@@ -3971,25 +4044,83 @@ class BTCCorrelationFilter:
                 else:
                     self.btc_trend_daily = "NEUTRAL"
             
-            # Kısa vadeli trend belirleme (1H + 4H)
-            if self.btc_change_1h > 0.5 and self.btc_change_4h > 1.0:
+            # =================================================================
+            # Phase 60b: IMPROVED STRONG_BEARISH Detection
+            # 1H eşiği gevşetildi (-0.5% → -1.5%), 30m flash crash eklendi
+            # =================================================================
+            
+            # STRONG_BULLISH: 1H ve 4H ikisi de pozitif
+            if self.btc_change_1h > 1.5 and self.btc_change_4h > 2.0:
                 self.btc_trend = "STRONG_BULLISH"
                 self.btc_momentum = 1.0
-            elif self.btc_change_1h > 0.2:
+            elif self.btc_change_1h > 0.5:
                 self.btc_trend = "BULLISH"
                 self.btc_momentum = 0.5
-            elif self.btc_change_1h < -0.5 and self.btc_change_4h < -1.0:
+            # FLASH CRASH: 30m'de %2+ düşüş = anlık STRONG_BEARISH
+            elif self.flash_crash_active or self.btc_change_30m < -1.5:
                 self.btc_trend = "STRONG_BEARISH"
                 self.btc_momentum = -1.0
-            elif self.btc_change_1h < -0.2:
+            # STRONG_BEARISH: 1H < -1.5% VEYA 4H < -3.0% (gevşetildi)
+            elif self.btc_change_1h < -1.5 or self.btc_change_4h < -3.0:
+                self.btc_trend = "STRONG_BEARISH"
+                self.btc_momentum = -1.0
+            # BEARISH: 1H < -0.5% VEYA 4H < -1.5% (gevşetildi)
+            elif self.btc_change_1h < -0.5 or self.btc_change_4h < -1.5:
                 self.btc_trend = "BEARISH"
                 self.btc_momentum = -0.5
+            elif self.btc_change_1h < -0.2:
+                self.btc_trend = "BEARISH"
+                self.btc_momentum = -0.3
             else:
                 self.btc_trend = "NEUTRAL"
                 self.btc_momentum = 0.0
             
+            # =================================================================
+            # Phase 60: EMERGENCY MODE - Extreme market conditions
+            # BEARISH: 4H'da %5+ düşüş veya 1D'da %6+ düşüş = Emergency Bearish
+            # BULLISH: 4H'da %5+ yükseliş veya 1D'da %6+ yükseliş = Emergency Bullish
+            # =================================================================
+            prev_emergency = self.emergency_mode
+            
+            # Emergency BEARISH (Strong düşüş)
+            if self.btc_change_4h < -5.0 or self.btc_change_1d < -6.0:
+                self.emergency_mode = "BEARISH"
+                self.emergency_reason = f"🚨 EMERGENCY BEARISH: 4H:{self.btc_change_4h:.1f}%, 1D:{self.btc_change_1d:.1f}%"
+                if prev_emergency != "BEARISH":
+                    self.emergency_start_time = datetime.now()
+                    logger.warning(f"🚨🚨🚨 EMERGENCY BEARISH ACTIVATED: {self.emergency_reason}")
+            # Emergency BULLISH (Strong yükseliş)
+            elif self.btc_change_4h > 5.0 or self.btc_change_1d > 6.0:
+                self.emergency_mode = "BULLISH"
+                self.emergency_reason = f"🚀 EMERGENCY BULLISH: 4H:+{self.btc_change_4h:.1f}%, 1D:+{self.btc_change_1d:.1f}%"
+                if prev_emergency != "BULLISH":
+                    self.emergency_start_time = datetime.now()
+                    logger.warning(f"🚀🚀🚀 EMERGENCY BULLISH ACTIVATED: {self.emergency_reason}")
+            elif abs(self.btc_change_4h) < 3.0 and abs(self.btc_change_1d) < 4.0:
+                # Normal piyasa - emergency moddan çık
+                if prev_emergency:
+                    logger.info(f"✅ Emergency Mode deactivated - market normalized")
+                self.emergency_mode = False
+                self.emergency_reason = ""
+            else:
+                # Orta seviye - mevcut durumu koru
+                pass
+            
+            # =================================================================
+            # Phase 60: DYNAMIC UPDATE INTERVAL
+            # Volatil dönemlerde güncelleme hızını artır
+            # =================================================================
+            if abs(self.btc_change_1h) > 2.0 or abs(self.btc_change_4h) > 4.0:
+                self.update_interval = 60  # Hızlı hareket: 1 dakika
+            elif abs(self.btc_change_1h) > 1.0 or abs(self.btc_change_4h) > 2.0:
+                self.update_interval = 90  # Orta hareket: 1.5 dakika
+            else:
+                self.update_interval = self.base_update_interval  # Normal: 2 dakika
+            
             self.last_update = now
-            logger.debug(f"BTC State: {self.btc_trend} | Daily:{self.btc_trend_daily} | 1H:{self.btc_change_1h:.2f}% | 4H:{self.btc_change_4h:.2f}% | 1D:{self.btc_change_1d:.2f}%")
+            log_level = "warning" if self.emergency_mode else "debug"
+            logger.log(getattr(logging, log_level.upper(), logging.DEBUG), 
+                       f"BTC State: {self.btc_trend} | Daily:{self.btc_trend_daily} | 1H:{self.btc_change_1h:.2f}% | 4H:{self.btc_change_4h:.2f}% | 1D:{self.btc_change_1d:.2f}% | Emergency:{self.emergency_mode} | Interval:{self.update_interval}s")
             
         except Exception as e:
             logger.warning(f"BTC state update failed: {e}")
@@ -4005,8 +4136,60 @@ class BTCCorrelationFilter:
         if 'BTC' in symbol:
             return (True, 0.0, "BTC no filter")
         
+        # ===================================================================
+        # Phase 60b: BTC VERİSİ KONTROLÜ
+        # BTC verisi henüz güncellenmemişse sinyali reddet (güvenlik önlemi)
+        # ===================================================================
+        if self.last_update == 0:
+            logger.warning(f"⚠️ BTC DATA NOT READY: {symbol} {signal_action} blocked - waiting for BTC state update")
+            return (False, 1.0, "⚠️ BTC Data Not Ready - Signal Blocked")
+        
+        # ===================================================================
+        # Phase 60b: FLASH CRASH - 30m hızlı düşüş kontrolü
+        # ===================================================================
+        if self.flash_crash_active and signal_action == "LONG":
+            logger.warning(f"⚡ FLASH CRASH BLOCK: {symbol} LONG rejected - 30m:{self.btc_change_30m:.1f}%")
+            return (False, 1.0, f"⚡ Flash Crash Active (30m:{self.btc_change_30m:.1f}%) - LONG BLOCKED")
+        
+        # ===================================================================
+        # Phase 60: EMERGENCY MODE - Tüm counter-trend sinyalleri bloke et
+        # BEARISH: LONG bloke, SHORT bonus
+        # BULLISH: SHORT bloke, LONG bonus
+        # ===================================================================
+        if self.emergency_mode == "BEARISH":
+            if signal_action == "LONG":
+                logger.warning(f"🚨 EMERGENCY BEARISH BLOCK: {symbol} LONG rejected - {self.emergency_reason}")
+                return (False, 1.0, f"🚨 {self.emergency_reason} - ALL LONGS BLOCKED")
+            else:
+                # SHORT sinyallere bonus ver
+                return (True, -0.25, f"✅ Emergency SHORT allowed - trend aligned")
+        elif self.emergency_mode == "BULLISH":
+            if signal_action == "SHORT":
+                logger.warning(f"🚀 EMERGENCY BULLISH BLOCK: {symbol} SHORT rejected - {self.emergency_reason}")
+                return (False, 1.0, f"🚀 {self.emergency_reason} - ALL SHORTS BLOCKED")
+            else:
+                # LONG sinyallere bonus ver
+                return (True, -0.25, f"✅ Emergency LONG allowed - trend aligned")
+        
         penalty = 0.0
         reason = ""
+        
+        # ===================================================================
+        # Phase 60: FULL ALIGNMENT VETO
+        # Daily + Short-term trend aynı yöndeyse, ters sinyal mutlak veto
+        # ===================================================================
+        full_bearish = (self.btc_trend_daily in ["BEARISH", "STRONG_BEARISH"] and 
+                        self.btc_trend in ["BEARISH", "STRONG_BEARISH"])
+        full_bullish = (self.btc_trend_daily in ["BULLISH", "STRONG_BULLISH"] and 
+                        self.btc_trend in ["BULLISH", "STRONG_BULLISH"])
+        
+        if full_bearish and signal_action == "LONG":
+            logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} LONG blocked (Daily+ShortTerm BEARISH)")
+            return (False, 1.0, "🚫 Full Bearish Alignment - LONG VETOED")
+        
+        if full_bullish and signal_action == "SHORT":
+            logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} SHORT blocked (Daily+ShortTerm BULLISH)")
+            return (False, 1.0, "🚫 Full Bullish Alignment - SHORT VETOED")
         
         # ===================================================================
         # GÜNLÜK TREND FİLTRESİ (EN GÜÇLÜ)
@@ -4029,32 +4212,32 @@ class BTCCorrelationFilter:
         # Kısa vadeli trend kontrolü (1H + 4H)
         # BTC STRONG_BEARISH iken ALT LONG risky
         if self.btc_trend == "STRONG_BEARISH" and signal_action == "LONG":
-            penalty = max(penalty, 0.3)  # %30 skor düşür
+            penalty = max(penalty, 0.4)  # %40 skor düşür (was 0.3)
             reason = reason or "BTC Strong Bearish - ALT LONG risky"
         
         # BTC BEARISH iken ALT LONG dikkat
         elif self.btc_trend == "BEARISH" and signal_action == "LONG":
-            penalty = max(penalty, 0.15)
+            penalty = max(penalty, 0.2)  # %20 (was 0.15)
             reason = reason or "BTC Bearish - ALT LONG caution"
         
         # BTC STRONG_BULLISH iken ALT SHORT risky
         elif self.btc_trend == "STRONG_BULLISH" and signal_action == "SHORT":
-            penalty = max(penalty, 0.3)
+            penalty = max(penalty, 0.4)  # %40 (was 0.3)
             reason = reason or "BTC Strong Bullish - ALT SHORT risky"
         
         # BTC BULLISH iken ALT SHORT dikkat
         elif self.btc_trend == "BULLISH" and signal_action == "SHORT":
-            penalty = max(penalty, 0.15)
+            penalty = max(penalty, 0.2)  # %20 (was 0.15)
             reason = reason or "BTC Bullish - ALT SHORT caution"
         
         # Aynı yönde ise bonus
         elif (self.btc_trend in ["BULLISH", "STRONG_BULLISH"] and signal_action == "LONG") or \
              (self.btc_trend in ["BEARISH", "STRONG_BEARISH"] and signal_action == "SHORT"):
-            penalty = -0.15  # Günlük aynı yöndeyse daha büyük bonus
-            reason = "BTC aligned with signal"
+            penalty = -0.2  # Günlük aynı yöndeyse daha büyük bonus (was -0.15)
+            reason = "✅ BTC trend aligned with signal"
         
         # Yüksek penalty ise reddet (threshold sıkılaştırıldı)
-        allowed = penalty < 0.30
+        allowed = penalty < 0.35  # was 0.30
         
         return (allowed, penalty, reason)
     
@@ -4062,10 +4245,17 @@ class BTCCorrelationFilter:
         """BTC durumu."""
         return {
             "trend": self.btc_trend,
+            "trend_daily": self.btc_trend_daily,
             "momentum": self.btc_momentum,
             "price": self.btc_price,
+            "change_30m": round(self.btc_change_30m, 2),
             "change_1h": round(self.btc_change_1h, 2),
-            "change_4h": round(self.btc_change_4h, 2)
+            "change_4h": round(self.btc_change_4h, 2),
+            "change_1d": round(self.btc_change_1d, 2),
+            "flash_crash_active": self.flash_crash_active,
+            "emergency_mode": self.emergency_mode,
+            "emergency_reason": self.emergency_reason,
+            "update_interval": self.update_interval
         }
     
     # =========================================================================
@@ -5558,20 +5748,26 @@ class MarketRegimeDetector:
     """
     Piyasa durumunu algılar ve AI optimizasyonuna veri sağlar.
     BTC price action, volatilite ve trend analizi yapar.
+    
+    Phase 60: TRENDING_DOWN/TRENDING_UP ayrımı eklendi.
+    Düşüş trendinde LONG sinyallere ağır penalize uygulanır.
     """
     
-    TRENDING = "TRENDING"      # Güçlü trend var, trail gevşet, TP uzat
-    RANGING = "RANGING"        # Yatay piyasa, SL sıkılaştır, TP yakınlaştır
-    VOLATILE = "VOLATILE"      # Yüksek volatilite, yüksek min score, seçici ol
-    QUIET = "QUIET"            # Düşük volatilite, düşük min score, agresif ol
+    TRENDING_UP = "TRENDING_UP"      # Güçlü yükselis trendi, LONG'lara bonus
+    TRENDING_DOWN = "TRENDING_DOWN"  # Güçlü düşüş trendi, LONG'lara veto
+    TRENDING = "TRENDING"            # Eski uyumluluk için (yön belirsiz)
+    RANGING = "RANGING"              # Yatay piyasa, SL sıkılaştır, TP yakınlaştır
+    VOLATILE = "VOLATILE"            # Yüksek volatilite, yüksek min score, seçici ol
+    QUIET = "QUIET"                  # Düşük volatilite, düşük min score, agresif ol
     
     def __init__(self):
         self.current_regime = self.RANGING
+        self.trend_direction = "NEUTRAL"  # UP, DOWN, NEUTRAL
         self.btc_prices = []  # Son 24 saatlik BTC fiyatları
         self.last_update = None
         self.regime_history = []
         self.max_history = 100
-        logger.info("📊 MarketRegimeDetector initialized")
+        logger.info("📊 MarketRegimeDetector initialized with Direction Awareness")
     
     def update_btc_price(self, price: float):
         """BTC fiyatını kaydet."""
@@ -5604,14 +5800,29 @@ class MarketRegimeDetector:
         second_half = sum(prices[len(prices)//2:]) / (len(prices) - len(prices)//2)
         trend_strength = abs((second_half - first_half) / first_half) * 100  # Yüzde
         
+        # Phase 60: Trend yönünü belirle
+        trend_direction_raw = (second_half - first_half) / first_half * 100
+        if trend_direction_raw > 1.0:
+            self.trend_direction = "UP"
+        elif trend_direction_raw < -1.0:
+            self.trend_direction = "DOWN"
+        else:
+            self.trend_direction = "NEUTRAL"
+        
         # Price range hesapla
         price_range = (max(prices) - min(prices)) / avg_price * 100  # Yüzde
         
-        # Regime belirleme
+        # Regime belirleme (Phase 60: Yön farkındalığı eklendi)
         if volatility > 2.0 or price_range > 5.0:
             regime = self.VOLATILE
         elif trend_strength > 1.5 and price_range > 2.0:
-            regime = self.TRENDING
+            # Phase 60: Trend yönüne göre TRENDING_UP veya TRENDING_DOWN
+            if self.trend_direction == "DOWN":
+                regime = self.TRENDING_DOWN
+            elif self.trend_direction == "UP":
+                regime = self.TRENDING_UP
+            else:
+                regime = self.TRENDING  # Eski uyumluluk
         elif volatility < 0.5 and price_range < 1.0:
             regime = self.QUIET
         else:
@@ -5619,13 +5830,14 @@ class MarketRegimeDetector:
         
         # Değişiklik varsa logla
         if regime != self.current_regime:
-            logger.info(f"📊 MARKET REGIME CHANGE: {self.current_regime} → {regime} (vol:{volatility:.2f}%, trend:{trend_strength:.2f}%, range:{price_range:.2f}%)")
+            logger.info(f"📊 MARKET REGIME CHANGE: {self.current_regime} → {regime} (vol:{volatility:.2f}%, trend:{trend_strength:.2f}%, dir:{self.trend_direction}, range:{price_range:.2f}%)")
             self.regime_history.append({
                 'from': self.current_regime,
                 'to': regime,
                 'time': datetime.now().isoformat(),
                 'volatility': volatility,
-                'trend_strength': trend_strength
+                'trend_strength': trend_strength,
+                'trend_direction': self.trend_direction
             })
             if len(self.regime_history) > self.max_history:
                 self.regime_history = self.regime_history[-self.max_history:]
@@ -5641,6 +5853,26 @@ class MarketRegimeDetector:
         Bu değerler ParameterOptimizer tarafından kullanılır.
         """
         params = {
+            # Phase 60: TRENDING_UP - Yükseliş trendinde LONG'lara bonus
+            self.TRENDING_UP: {
+                'min_score_adjustment': -5,    # Daha agresif LONG
+                'trail_distance_mult': 1.3,    # Trail'i gevşet, trend devam etsin
+                'sl_atr_mult': 1.2,            # SL biraz gevşet
+                'tp_atr_mult': 1.5,            # TP'yi uzat
+                'long_bonus': 0.15,            # LONG sinyallere bonus
+                'short_penalty': 0.2,          # SHORT sinyallere penalty
+                'description': '📈 Yükseliş trendi - LONG bonus, SHORT riskli'
+            },
+            # Phase 60: TRENDING_DOWN - Düşüş trendinde LONG'lara veto
+            self.TRENDING_DOWN: {
+                'min_score_adjustment': +15,   # Çok seçici (LONG için)
+                'trail_distance_mult': 0.7,    # Trail'i sıkılaştır, hızlı çık
+                'sl_atr_mult': 0.8,            # SL sıkı tut
+                'tp_atr_mult': 0.7,            # TP yakın, hızlı kâr al
+                'long_penalty': 0.5,           # LONG sinyallere ağır penalty
+                'short_bonus': 0.2,            # SHORT sinyallere bonus
+                'description': '📉 Düşüş trendi - LONG riskli, SHORT bonus'
+            },
             self.TRENDING: {
                 'min_score_adjustment': -5,    # Daha agresif
                 'trail_distance_mult': 1.3,    # Trail'i gevşet, trend devam etsin
@@ -5676,6 +5908,7 @@ class MarketRegimeDetector:
         """API için durum özeti."""
         return {
             'currentRegime': self.current_regime,
+            'trendDirection': self.trend_direction,
             'lastUpdate': self.last_update.isoformat() if self.last_update else None,
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),
@@ -10073,64 +10306,164 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             coin_profile=streamer.coin_profile  # Phase 28: Dynamic optimization
                         )
                         
-                        # Phase 22: Multi-Timeframe Confirmation
+                        # =====================================================
+                        # PHASE 63: Cloud Scanner Parity - Real MTF Confirmation
+                        # Uses same algorithm as Cloud Scanner for consistency
+                        # =====================================================
                         if signal:
-                            # Analyze current timeframe signals using available data
-                            tf_signals = {}
+                            action = signal['action']
+                            atr = metrics['atr']
+                            hurst = metrics['hurst']
+                            spread_pct = metrics.get('spreadPct', 0.05)
                             
-                            # Primary timeframe (from streamer data)
-                            closes_list = list(streamer.closes)
-                            if len(closes_list) >= 20:
-                                primary_tf_signal = mtf_analyzer.analyze_timeframe(closes_list)
-                                tf_signals['15m'] = primary_tf_signal
-                                
-                                # Simulate other timeframes by resampling (approximation)
-                                # 1m: use last 20 closes directly
-                                tf_signals['1m'] = primary_tf_signal  # Same direction
-                                
-                                # 5m: use every 5th close
-                                if len(closes_list) >= 100:
-                                    closes_5m = closes_list[::5][-20:]
-                                    tf_signals['5m'] = mtf_analyzer.analyze_timeframe(closes_5m)
-                                else:
-                                    tf_signals['5m'] = primary_tf_signal
-                                
-                                # 1h: use every 4th close (15m * 4 = 1h)
-                                if len(closes_list) >= 80:
-                                    closes_1h = closes_list[::4][-20:]
-                                    tf_signals['1h'] = mtf_analyzer.analyze_timeframe(closes_1h)
-                                else:
-                                    tf_signals['1h'] = {"direction": "NEUTRAL", "strength": 0}
-                                
-                                # 4h: use every 16th close (15m * 16 = 4h)
-                                if len(closes_list) >= 320:
-                                    closes_4h = closes_list[::16][-20:]
-                                    tf_signals['4h'] = mtf_analyzer.analyze_timeframe(closes_4h)
-                                else:
-                                    tf_signals['4h'] = {"direction": "NEUTRAL", "strength": 0}
-                                
-                                # 1d: use every 96th close (15m * 96 = 1d)
-                                if len(closes_list) >= 480:
-                                    closes_1d = closes_list[::96][-20:]
-                                    tf_signals['1d'] = mtf_analyzer.analyze_timeframe(closes_1d)
-                                else:
-                                    tf_signals['1d'] = {"direction": "NEUTRAL", "strength": 0}
+                            # Update MTF trends using real OHLCV data (Cloud Scanner parity)
+                            try:
+                                await mtf_confirmation.update_coin_trend(active_symbol, streamer.exchange)
+                            except Exception as mtf_update_err:
+                                logger.warning(f"MTF trend update error: {mtf_update_err}")
                             
-                            current_spread_pct = metrics.get('spreadPct', 0.05)
-                            mtf_confirmation = mtf_analyzer.get_mtf_confirmation(tf_signals, spread_pct=current_spread_pct)
+                            # Get MTF confirmation using Cloud Scanner's scoring system
+                            mtf_result = mtf_confirmation.confirm_signal(active_symbol, action)
+                            mtf_score = mtf_result.get('mtf_score', 0)
+                            mtf_confirmed = mtf_result.get('confirmed', False)
+                            score_modifier = mtf_result.get('score_modifier', 1.0)
                             
-                            if mtf_confirmation and mtf_confirmation['action'] == signal['action']:
-                                # Signal confirmed by multi-timeframe analysis
-                                size_multiplier = mtf_analyzer.calculate_position_size_multiplier(mtf_confirmation)
-                                dynamic_leverage = mtf_analyzer.calculate_dynamic_leverage(mtf_confirmation)
-                                
-                                signal['sizeMultiplier'] = size_multiplier
-                                signal['leverage'] = dynamic_leverage
-                                signal['mtf_confidence'] = mtf_confirmation['confidence']
-                                signal['mtf_tf_count'] = mtf_confirmation['tf_count']
+                            # Log MTF result (Cloud Scanner parity)
+                            if score_modifier > 1.0:
+                                logger.info(f"✅ MTF BONUS: {action} {active_symbol} (skor: +{mtf_score}) - pozisyon +%10 büyük")
+                            elif score_modifier < 1.0 and mtf_confirmed:
+                                logger.info(f"⚠️ MTF PENALTY: {action} {active_symbol} (skor: {mtf_score}) - pozisyon -%20 küçük")
+                            
+                            if not mtf_confirmed:
+                                logger.info(f"🚫 MTF RED: {action} {active_symbol} (skor: {mtf_score}) - sinyal reddedildi")
+                                signal = None
+                            else:
+                                # Add MTF size modifier to signal
+                                signal['mtf_size_modifier'] = score_modifier
+                                signal['mtf_score'] = mtf_score
                                 
                                 # =====================================================
-                                # PHASE 30: BTC CORRELATION FILTER
+                                # DYNAMIC LEVERAGE (Cloud Scanner Parity)
+                                # Calculate leverage based on MTF + PRICE + SPREAD + VOLATILITY
+                                # =====================================================
+                                try:
+                                    import math
+                                    
+                                    # Calculate TF count from scores (positive score = aligned)
+                                    scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
+                                    tf_count = sum(1 for s in scores.values() if s > 0)
+                                    
+                                    # Base leverage from MTF agreement
+                                    if tf_count >= 3:
+                                        base_leverage = 100  # All TFs aligned
+                                    elif tf_count >= 2:
+                                        base_leverage = 75   # 2 TFs aligned
+                                    elif tf_count >= 1:
+                                        base_leverage = 50   # 1 TF aligned
+                                    else:
+                                        base_leverage = 25   # No TF aligned
+                                    
+                                    # PRICE FACTOR: Logarithmic reduction for low-price coins
+                                    if price > 0:
+                                        log_price = math.log10(max(price, 0.0001))
+                                        price_factor = max(0.3, min(1.0, (log_price + 2) / 4))
+                                    else:
+                                        price_factor = 1.0
+                                    
+                                    # SPREAD FACTOR: High spread = lower leverage
+                                    if spread_pct > 0:
+                                        spread_factor = max(0.5, 1.0 - spread_pct * 2)
+                                    else:
+                                        spread_factor = 1.0
+                                    
+                                    # VOLATILITY FACTOR: High ATR = lower leverage
+                                    volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 2.0
+                                    if volatility_pct <= 2.0:
+                                        volatility_factor = 1.0
+                                    elif volatility_pct <= 4.0:
+                                        volatility_factor = 0.8
+                                    elif volatility_pct <= 6.0:
+                                        volatility_factor = 0.6
+                                    elif volatility_pct <= 10.0:
+                                        volatility_factor = 0.4
+                                    else:
+                                        volatility_factor = 0.3
+                                    
+                                    # COMBINED LEVERAGE
+                                    dynamic_leverage = int(round(base_leverage * price_factor * spread_factor * volatility_factor))
+                                    dynamic_leverage = max(3, min(75, dynamic_leverage))
+                                    
+                                    signal['leverage'] = dynamic_leverage
+                                    signal['tf_count'] = tf_count
+                                    signal['price_factor'] = round(price_factor, 2)
+                                    signal['spread_factor'] = round(spread_factor, 2)
+                                    signal['volatility_factor'] = round(volatility_factor, 2)
+                                    signal['volatility_pct'] = round(volatility_pct, 2)
+                                    
+                                    # Log if any factor reduced leverage
+                                    if price_factor < 0.9 or spread_factor < 0.9 or volatility_factor < 0.9:
+                                        logger.info(f"📊 Leverage: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} × vol={volatility_factor:.2f} → {dynamic_leverage}x | {active_symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
+                                    else:
+                                        logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF:{tf_count}/3)")
+                                except Exception as lev_err:
+                                    logger.warning(f"Dynamic leverage error: {lev_err}")
+                                    signal['leverage'] = 25
+                                
+                                # =====================================================
+                                # VOLUME PROFILE BOOST (Cloud Scanner Parity)
+                                # Uses per-coin volume profiler
+                                # =====================================================
+                                try:
+                                    # Get or create per-coin volume profiler
+                                    if active_symbol not in coin_volume_profiles:
+                                        coin_volume_profiles[active_symbol] = VolumeProfileAnalyzer()
+                                    
+                                    coin_vp = coin_volume_profiles[active_symbol]
+                                    
+                                    # Update volume profile if stale (every hour)
+                                    if datetime.now().timestamp() - coin_vp.last_update > 3600:
+                                        ohlcv_4h = await streamer.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
+                                        if ohlcv_4h:
+                                            coin_vp.calculate_profile(ohlcv_4h)
+                                            logger.debug(f"Updated VP for {active_symbol}: POC={coin_vp.poc:.6f}")
+                                    
+                                    # Get boost based on price proximity to key levels
+                                    vp_boost = coin_vp.get_signal_boost(price, action)
+                                    if vp_boost > 0:
+                                        signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + vp_boost)
+                                        signal['vp_boost'] = vp_boost
+                                        logger.info(f"📈 VP BOOST: {active_symbol} +{vp_boost*100:.0f}% @ POC={coin_vp.poc:.6f}")
+                                except Exception as vp_err:
+                                    logger.warning(f"Volume Profile error: {vp_err}")
+                                
+                                # =====================================================
+                                # DYNAMIC TRAIL PARAMETERS (Cloud Scanner Parity)
+                                # Calculate trail_activation and trail_distance per-coin
+                                # =====================================================
+                                try:
+                                    volatility_pct = signal.get('volatility_pct', (atr / price * 100) if price > 0 else 3.0)
+                                    
+                                    # Calculate dynamic trail params
+                                    trail_activation_atr, trail_distance_atr = get_dynamic_trail_params(
+                                        volatility_pct=volatility_pct,
+                                        hurst=hurst,
+                                        price=price,
+                                        spread_pct=spread_pct
+                                    )
+                                    
+                                    signal['dynamic_trail_activation'] = trail_activation_atr
+                                    signal['dynamic_trail_distance'] = trail_distance_atr
+                                    signal['hurst'] = hurst
+                                    signal['spreadPct'] = spread_pct
+                                    
+                                    # Log if significantly different from defaults (1.5, 1.0)
+                                    if abs(trail_activation_atr - 1.5) > 0.3 or abs(trail_distance_atr - 1.0) > 0.2:
+                                        logger.info(f"🎯 Dynamic Trail: act={trail_activation_atr}x, dist={trail_distance_atr}x | {active_symbol} (vol:{volatility_pct:.1f}%, hurst:{hurst:.2f})")
+                                except Exception as trail_err:
+                                    logger.debug(f"Dynamic trail params error: {trail_err}")
+                                
+                                # =====================================================
+                                # BTC CORRELATION FILTER
                                 # =====================================================
                                 try:
                                     await btc_filter.update_btc_state(streamer.exchange)
@@ -10140,54 +10473,28 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     
                                     if not btc_allowed:
                                         logger.info(f"BTC FILTER BLOCKED: {btc_reason}")
-                                        signal = None  # Block signal
+                                        signal = None
                                     elif btc_penalty != 0:
-                                        # Apply penalty/bonus to size multiplier
-                                        signal['sizeMultiplier'] *= (1 - btc_penalty)
+                                        signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 - btc_penalty)
                                         signal['btc_adjustment'] = btc_reason
-                                        logger.info(f"BTC ADJUSTMENT: {btc_reason} | Size: {signal['sizeMultiplier']:.2f}x")
+                                        logger.info(f"BTC ADJUSTMENT: {btc_reason} | Size: {signal.get('sizeMultiplier', 1.0):.2f}x")
                                 except Exception as btc_err:
                                     logger.warning(f"BTC Filter error: {btc_err}")
                                 
-                                # =====================================================
-                                # PHASE 30: VOLUME PROFILE BOOST
-                                # =====================================================
+                                # Execute trade if signal still valid
                                 if signal:
-                                    try:
-                                        # Update volume profile if stale
-                                        if datetime.now().timestamp() - volume_profiler.last_update > 3600:  # 1 hour
-                                            ohlcv_4h = await streamer.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
-                                            if ohlcv_4h:
-                                                volume_profiler.calculate_profile(ohlcv_4h)
-                                        
-                                        vp_boost = volume_profiler.get_signal_boost(price, signal['action'])
-                                        if vp_boost > 0:
-                                            signal['sizeMultiplier'] *= (1 + vp_boost)
-                                            signal['vp_boost'] = vp_boost
-                                            logger.info(f"VP BOOST: +{vp_boost*100:.0f}% @ POC={volume_profiler.poc:.6f}")
-                                    except Exception as vp_err:
-                                        logger.warning(f"Volume Profile error: {vp_err}")
-                                
-                                if signal:
-                                    logger.info(f"MTF CONFIRMED: {mtf_confirmation['action']} | {mtf_confirmation['tf_count']}/{mtf_confirmation['total_tfs']} TF | Size: {signal['sizeMultiplier']:.2f}x | Lev: {dynamic_leverage}x")
+                                    trends = mtf_result.get('trends', {})
+                                    logger.info(f"🤖 WS-Trade: {action} {active_symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
                                     
-                                    # Phase 15: Cloud Paper Trading
                                     try:
                                         if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
-                                            # Phase 20: Update spread for dynamic trailing
-                                            streamer.paper_trader.current_spread_pct = metrics.get('spreadPct', 0.05)
+                                            streamer.paper_trader.current_spread_pct = spread_pct
                                             streamer.paper_trader.on_signal(signal, price)
                                     except Exception as pt_err:
                                         logger.error(f"Paper Trading Error: {pt_err}")
                                     
                                     manager.last_signals[symbol] = signal
                                     logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
-                            else:
-                                # Signal NOT confirmed - log but don't trade
-                                if mtf_confirmation:
-                                    logger.info(f"MTF MISMATCH: Signal={signal['action']}, MTF={mtf_confirmation['action']}")
-                                else:
-                                    logger.info(f"MTF REJECTED: Not enough TF agreement for {signal['action']}")
 
                     except Exception as e:
                         logger.error(f"Signal Generation Error: {e}")
