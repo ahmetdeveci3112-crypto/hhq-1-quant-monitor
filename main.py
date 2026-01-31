@@ -3977,14 +3977,18 @@ class BTCCorrelationFilter:
         self.emergency_start_time = None
         self.flash_crash_active = False  # Phase 60b: 30m hızlı düşüş algılama
         
-        # Phase 36: Pairs correlation
+        # Phase 36: Pairs correlation + Phase 60c: ETH Trend Filter
         self.eth_price = 0.0
+        self.eth_change_30m = 0.0  # Phase 60c
         self.eth_change_1h = 0.0
+        self.eth_change_4h = 0.0   # Phase 60c
+        self.eth_trend = "NEUTRAL"  # Phase 60c: ETH specific trend
+        self.eth_flash_crash = False  # Phase 60c: ETH 30m hızlı düşüş
         self.spread_history = []  # Rolling spread values
         self.spread_window = 100  # Last 100 values for Z-score
         self.beta = 0.052  # ETH typically ~5.2% of BTC price
         
-        logger.info("📊 BTCCorrelationFilter initialized with Emergency Mode + 30m Momentum")
+        logger.info("📊 BTCCorrelationFilter initialized with Emergency Mode + ETH Trend Filter")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -4076,6 +4080,56 @@ class BTCCorrelationFilter:
                 self.btc_momentum = 0.0
             
             # =================================================================
+            # Phase 60c: ETH TREND TRACKING
+            # BTC stabil ama ETH/ALT'lar düşerse koruma sağlar
+            # =================================================================
+            try:
+                eth_30m = await exchange.fetch_ohlcv('ETH/USDT', '30m', limit=4)
+                eth_1h = await exchange.fetch_ohlcv('ETH/USDT', '1h', limit=4)
+                eth_4h = await exchange.fetch_ohlcv('ETH/USDT', '4h', limit=4)
+                
+                if eth_30m and len(eth_30m) >= 2:
+                    curr = eth_30m[-1][4]
+                    prev = eth_30m[-2][4]
+                    self.eth_change_30m = ((curr - prev) / prev) * 100
+                    self.eth_price = curr
+                    
+                    # ETH Flash crash: 30m'de %3+ düşüş
+                    if self.eth_change_30m < -3.0:
+                        if not self.eth_flash_crash:
+                            logger.warning(f"⚡ ETH FLASH CRASH: 30m:{self.eth_change_30m:.1f}%")
+                        self.eth_flash_crash = True
+                    elif self.eth_change_30m > -1.5:
+                        self.eth_flash_crash = False
+                
+                if eth_1h and len(eth_1h) >= 2:
+                    curr = eth_1h[-1][4]
+                    prev = eth_1h[-2][4]
+                    self.eth_change_1h = ((curr - prev) / prev) * 100
+                
+                if eth_4h and len(eth_4h) >= 2:
+                    curr = eth_4h[-1][4]
+                    prev = eth_4h[-2][4]
+                    self.eth_change_4h = ((curr - prev) / prev) * 100
+                
+                # ETH Trend belirleme
+                if self.eth_flash_crash or self.eth_change_30m < -2.0:
+                    self.eth_trend = "STRONG_BEARISH"
+                elif self.eth_change_1h < -2.0 or self.eth_change_4h < -4.0:
+                    self.eth_trend = "STRONG_BEARISH"
+                elif self.eth_change_1h < -1.0 or self.eth_change_4h < -2.0:
+                    self.eth_trend = "BEARISH"
+                elif self.eth_change_1h > 2.0 and self.eth_change_4h > 3.0:
+                    self.eth_trend = "STRONG_BULLISH"
+                elif self.eth_change_1h > 1.0:
+                    self.eth_trend = "BULLISH"
+                else:
+                    self.eth_trend = "NEUTRAL"
+                    
+            except Exception as eth_err:
+                logger.debug(f"ETH fetch error: {eth_err}")
+            
+            # =================================================================
             # Phase 60: EMERGENCY MODE - Extreme market conditions
             # BEARISH: 4H'da %5+ düşüş veya 1D'da %6+ düşüş = Emergency Bearish
             # BULLISH: 4H'da %5+ yükseliş veya 1D'da %6+ yükseliş = Emergency Bullish
@@ -4152,6 +4206,27 @@ class BTCCorrelationFilter:
             return (False, 1.0, f"⚡ Flash Crash Active (30m:{self.btc_change_30m:.1f}%) - LONG BLOCKED")
         
         # ===================================================================
+        # Phase 60c: ETH DIVERGENCE FILTER
+        # BTC stabil ama ETH düşüyorsa ALT LONG'ları bloke et
+        # ===================================================================
+        # ETH kendisi ise filtreleme yok
+        if 'ETH' in symbol:
+            pass  # ETH için sadece BTC filter yeterli
+        elif self.eth_flash_crash and signal_action == "LONG":
+            logger.warning(f"⚡ ETH FLASH CRASH BLOCK: {symbol} LONG rejected - ETH 30m:{self.eth_change_30m:.1f}%")
+            return (False, 1.0, f"⚡ ETH Flash Crash (30m:{self.eth_change_30m:.1f}%) - ALT LONG BLOCKED")
+        elif self.eth_trend == "STRONG_BEARISH" and signal_action == "LONG":
+            # ETH strong bearish ama BTC normal ise - ALT'lar genelde ETH'yi takip eder
+            if self.btc_trend not in ["STRONG_BEARISH", "BEARISH"]:
+                logger.info(f"🔻 ETH DIVERGENCE: {symbol} LONG penalty - ETH:{self.eth_trend}, BTC:{self.btc_trend}")
+                return (True, 0.3, f"ETH Divergence (ETH bearish, BTC stable) - HIGH RISK")
+        
+        # ETH BULLISH iken SHORT sinyallere dikkat
+        elif self.eth_trend == "STRONG_BULLISH" and signal_action == "SHORT":
+            if self.btc_trend not in ["STRONG_BULLISH", "BULLISH"]:
+                logger.info(f"🔺 ETH DIVERGENCE: {symbol} SHORT penalty - ETH:{self.eth_trend}, BTC:{self.btc_trend}")
+                return (True, 0.3, f"ETH Divergence (ETH bullish, BTC stable) - HIGH RISK")
+        
         # Phase 60: EMERGENCY MODE - Tüm counter-trend sinyalleri bloke et
         # BEARISH: LONG bloke, SHORT bonus
         # BULLISH: SHORT bloke, LONG bonus
@@ -4242,7 +4317,7 @@ class BTCCorrelationFilter:
         return (allowed, penalty, reason)
     
     def get_state(self) -> dict:
-        """BTC durumu."""
+        """BTC ve ETH durumu."""
         return {
             "trend": self.btc_trend,
             "trend_daily": self.btc_trend_daily,
@@ -4255,7 +4330,14 @@ class BTCCorrelationFilter:
             "flash_crash_active": self.flash_crash_active,
             "emergency_mode": self.emergency_mode,
             "emergency_reason": self.emergency_reason,
-            "update_interval": self.update_interval
+            "update_interval": self.update_interval,
+            # Phase 60c: ETH State
+            "eth_trend": self.eth_trend,
+            "eth_price": round(self.eth_price, 2),
+            "eth_change_30m": round(self.eth_change_30m, 2),
+            "eth_change_1h": round(self.eth_change_1h, 2),
+            "eth_change_4h": round(self.eth_change_4h, 2),
+            "eth_flash_crash": self.eth_flash_crash
         }
     
     # =========================================================================
