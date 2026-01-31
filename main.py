@@ -10063,14 +10063,51 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Sort by signal score
         current_opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
         
-        # Get current stats
-        current_stats = multi_coin_scanner.get_scanner_stats() if multi_coin_scanner.coins else {
-            "totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0
+        # =========================================================
+        # Phase 60b: Apply BTC Filter to opportunities for UI
+        # Block counter-trend signals from being displayed
+        # =========================================================
+        filtered_opportunities = []
+        for opp in current_opportunities:
+            signal_action = opp.get('signalAction', 'NONE')
+            symbol = opp.get('symbol', '')
+            
+            if signal_action == 'NONE':
+                # No signal - keep in list
+                filtered_opportunities.append(opp)
+            else:
+                # Has signal - apply BTC filter
+                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
+                if btc_allowed:
+                    # Apply penalty to score if needed
+                    if btc_penalty > 0:
+                        original_score = opp.get('signalScore', 0)
+                        opp['signalScore'] = int(original_score * (1 - btc_penalty))
+                        opp['btcFilterNote'] = btc_reason
+                    filtered_opportunities.append(opp)
+                else:
+                    # Signal blocked - convert to NONE so it doesn't show as active signal
+                    opp['signalAction'] = 'NONE'
+                    opp['signalScore'] = 0
+                    opp['btcFilterBlocked'] = btc_reason
+                    filtered_opportunities.append(opp)  # Keep coin but remove signal
+        
+        # Get current stats (recalculate based on filtered)
+        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG')
+        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT')
+        current_stats = {
+            "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner.coins else 0,
+            "analyzedCoins": len(filtered_opportunities),
+            "longSignals": long_count,
+            "shortSignals": short_count,
+            "activeSignals": long_count + short_count,
+            "btcState": btc_filter.get_state(),
+            "lastUpdate": datetime.now().timestamp()
         }
         
         await websocket.send_json({
             "type": "scanner_update",
-            "opportunities": current_opportunities,  # ALL opportunities (no limit)
+            "opportunities": filtered_opportunities,  # FILTERED opportunities
             "stats": current_stats,
             "portfolio": {
                 "balance": global_paper_trader.balance,
@@ -10097,12 +10134,49 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         opportunities.append(opp)
                 
                 opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
-                stats = multi_coin_scanner.get_scanner_stats()
+                
+                # =========================================================
+                # Phase 60b: Apply BTC Filter to opportunities for UI
+                # =========================================================
+                filtered_opps = []
+                for opp in opportunities:
+                    signal_action = opp.get('signalAction', 'NONE')
+                    symbol = opp.get('symbol', '')
+                    
+                    if signal_action == 'NONE':
+                        filtered_opps.append(opp)
+                    else:
+                        btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
+                        if btc_allowed:
+                            if btc_penalty > 0:
+                                original_score = opp.get('signalScore', 0)
+                                opp['signalScore'] = int(original_score * (1 - btc_penalty))
+                                opp['btcFilterNote'] = btc_reason
+                            filtered_opps.append(opp)
+                        else:
+                            # Block signal - convert to NONE
+                            opp['signalAction'] = 'NONE'
+                            opp['signalScore'] = 0
+                            opp['btcFilterBlocked'] = btc_reason
+                            filtered_opps.append(opp)
+                
+                # Recalculate stats based on filtered
+                long_count = sum(1 for o in filtered_opps if o.get('signalAction') == 'LONG')
+                short_count = sum(1 for o in filtered_opps if o.get('signalAction') == 'SHORT')
+                stats = {
+                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner.coins else 0,
+                    "analyzedCoins": len(filtered_opps),
+                    "longSignals": long_count,
+                    "shortSignals": short_count,
+                    "activeSignals": long_count + short_count,
+                    "btcState": btc_filter.get_state(),
+                    "lastUpdate": datetime.now().timestamp()
+                }
                 
                 # Send update to client
                 update_data = {
                     "type": "scanner_update",
-                    "opportunities": opportunities,  # ALL opportunities (no limit)
+                    "opportunities": filtered_opps,  # FILTERED opportunities
                     "stats": stats,
                     "portfolio": {
                         "balance": global_paper_trader.balance,
