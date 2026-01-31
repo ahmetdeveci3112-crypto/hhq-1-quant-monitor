@@ -4004,7 +4004,13 @@ class BTCCorrelationFilter:
         self.btc_momentum_weakening = False  # Yükseliş yavaşlıyor mu?
         self.recovery_phase_short = "NORMAL" # SHORT için recovery phase
         
-        logger.info("📊 BTCCorrelationFilter initialized with Bidirectional Recovery Detection")
+        # Phase 60e: MTF Momentum Tracking
+        self.btc_change_15m = 0.0           # 15m değişim
+        self.prev_btc_change_15m = 0.0      # Önceki 15m değişim
+        self.prev_btc_change_1h = 0.0       # Önceki 1H değişim
+        self.prev_btc_change_4h = 0.0       # Önceki 4H değişim
+        
+        logger.info("📊 BTCCorrelationFilter initialized with MTF Recovery Detection")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -4015,11 +4021,19 @@ class BTCCorrelationFilter:
             return self.get_state()
         
         try:
-            # BTC 30m, 1H, 4H ve 1D verileri çek
+            # Phase 60e: BTC 15m, 30m, 1H, 4H ve 1D verileri çek
+            ohlcv_15m = await exchange.fetch_ohlcv('BTC/USDT', '15m', limit=4)  # Phase 60e: 15m momentum
             ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)  # Phase 60b: 30m momentum
             ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
             ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
             ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)  # Son 3 gün
+            
+            # Phase 60e: 15m momentum hesapla
+            if ohlcv_15m and len(ohlcv_15m) >= 2:
+                current = ohlcv_15m[-1][4]
+                prev = ohlcv_15m[-2][4]
+                self.prev_btc_change_15m = self.btc_change_15m
+                self.btc_change_15m = ((current - prev) / prev) * 100
             
             # Phase 60b: 30m momentum hesapla (hızlı düşüş algılama)
             if ohlcv_30m and len(ohlcv_30m) >= 2:
@@ -4133,11 +4147,13 @@ class BTCCorrelationFilter:
                 current = ohlcv_1h[-1][4]  # Close
                 prev_1h = ohlcv_1h[-2][4]
                 self.btc_price = current
+                self.prev_btc_change_1h = self.btc_change_1h  # Phase 60e: prev sakla
                 self.btc_change_1h = ((current - prev_1h) / prev_1h) * 100
             
             if ohlcv_4h and len(ohlcv_4h) >= 2:
                 current = ohlcv_4h[-1][4]
                 prev_4h = ohlcv_4h[-2][4]
+                self.prev_btc_change_4h = self.btc_change_4h  # Phase 60e: prev sakla
                 self.btc_change_4h = ((current - prev_4h) / prev_4h) * 100
             
             # 1D (Günlük) değişim hesapla
@@ -4402,21 +4418,52 @@ class BTCCorrelationFilter:
                 logger.info(f"🔺 ETH DIVERGENCE: {symbol} SHORT penalty - ETH:{self.eth_trend}, BTC:{self.btc_trend}")
                 return (True, 0.3, f"ETH Divergence (ETH bullish, BTC stable) - HIGH RISK")
         
-        # Phase 60: EMERGENCY MODE - Tüm counter-trend sinyalleri bloke et
-        # BEARISH: LONG bloke, SHORT bonus
-        # BULLISH: SHORT bloke, LONG bonus
+        # Phase 60e: EMERGENCY MODE + MTF RECOVERY
+        # MTF skor bazlı kademeli recovery
         # ===================================================================
         if self.emergency_mode == "BEARISH":
             if signal_action == "LONG":
-                logger.warning(f"🚨 EMERGENCY BEARISH BLOCK: {symbol} LONG rejected - {self.emergency_reason}")
-                return (False, 1.0, f"🚨 {self.emergency_reason} - ALL LONGS BLOCKED")
+                # MTF Momentum Score hesapla
+                mtf_score = self.calculate_mtf_momentum_score("LONG")
+                
+                if mtf_score == 0:
+                    # Hiçbir TF iyileşmiyor = tam blokaj
+                    logger.warning(f"🚨 EMERGENCY BEARISH BLOCK: {symbol} LONG - MTF:{mtf_score}/7")
+                    return (False, 1.0, f"🚨 Emergency BEARISH (MTF:{mtf_score}/7) - LONG BLOCKED")
+                elif mtf_score <= 2:
+                    # Sadece kısa vade = 60% penalty
+                    logger.info(f"📈 MTF RECOVERY: {symbol} LONG - Score:{mtf_score}/7, penalty=60%")
+                    return (True, 0.6, f"📈 MTF Recovery ({mtf_score}/7) - 60% penalty")
+                elif mtf_score <= 4:
+                    # Orta vade = 40% penalty
+                    logger.info(f"📈 MTF RECOVERY: {symbol} LONG - Score:{mtf_score}/7, penalty=40%")
+                    return (True, 0.4, f"📈 MTF Recovery ({mtf_score}/7) - 40% penalty")
+                else:
+                    # Güçlü dönüş = 25% penalty
+                    logger.info(f"📈 STRONG MTF RECOVERY: {symbol} LONG - Score:{mtf_score}/7, penalty=25%")
+                    return (True, 0.25, f"📈 Strong MTF Recovery ({mtf_score}/7) - 25% penalty")
             else:
                 # SHORT sinyallere bonus ver
                 return (True, -0.25, f"✅ Emergency SHORT allowed - trend aligned")
+        
         elif self.emergency_mode == "BULLISH":
             if signal_action == "SHORT":
-                logger.warning(f"🚀 EMERGENCY BULLISH BLOCK: {symbol} SHORT rejected - {self.emergency_reason}")
-                return (False, 1.0, f"🚀 {self.emergency_reason} - ALL SHORTS BLOCKED")
+                # MTF Momentum Score hesapla
+                mtf_score = self.calculate_mtf_momentum_score("SHORT")
+                
+                if mtf_score == 0:
+                    # Hiçbir TF zayıflamıyor = tam blokaj
+                    logger.warning(f"🚀 EMERGENCY BULLISH BLOCK: {symbol} SHORT - MTF:{mtf_score}/7")
+                    return (False, 1.0, f"🚀 Emergency BULLISH (MTF:{mtf_score}/7) - SHORT BLOCKED")
+                elif mtf_score <= 2:
+                    logger.info(f"📉 MTF RECOVERY: {symbol} SHORT - Score:{mtf_score}/7, penalty=60%")
+                    return (True, 0.6, f"📉 MTF Recovery ({mtf_score}/7) - 60% penalty")
+                elif mtf_score <= 4:
+                    logger.info(f"📉 MTF RECOVERY: {symbol} SHORT - Score:{mtf_score}/7, penalty=40%")
+                    return (True, 0.4, f"📉 MTF Recovery ({mtf_score}/7) - 40% penalty")
+                else:
+                    logger.info(f"📉 STRONG MTF RECOVERY: {symbol} SHORT - Score:{mtf_score}/7, penalty=25%")
+                    return (True, 0.25, f"📉 Strong MTF Recovery ({mtf_score}/7) - 25% penalty")
             else:
                 # LONG sinyallere bonus ver
                 return (True, -0.25, f"✅ Emergency LONG allowed - trend aligned")
@@ -4491,6 +4538,43 @@ class BTCCorrelationFilter:
         
         return (allowed, penalty, reason)
     
+    def calculate_mtf_momentum_score(self, direction: str = "LONG") -> int:
+        """
+        Phase 60e: MTF Momentum Score hesapla.
+        direction: "LONG" = düşüşten dönüş, "SHORT" = yükselişten dönüş
+        Returns: 0-7 arası skor (7 = güçlü dönüş sinyali)
+        """
+        score = 0
+        
+        if direction == "LONG":  # Düşüşten dönüş - değerler iyileşiyor mu?
+            # 15m: +0.3% iyileşme = 1 puan
+            if self.btc_change_15m > self.prev_btc_change_15m + 0.3:
+                score += 1
+            # 30m: +0.5% iyileşme = 1 puan
+            if self.btc_change_30m > self.prev_btc_change_30m + 0.5:
+                score += 1
+            # 1H: +0.5% iyileşme = 2 puan
+            if self.btc_change_1h > self.prev_btc_change_1h + 0.5:
+                score += 2
+            # 4H: +1.0% iyileşme = 3 puan
+            if self.btc_change_4h > self.prev_btc_change_4h + 1.0:
+                score += 3
+        else:  # SHORT - yükselişten dönüş - değerler zayıflıyor mu?
+            # 15m: -0.3% zayıflama = 1 puan
+            if self.btc_change_15m < self.prev_btc_change_15m - 0.3:
+                score += 1
+            # 30m: -0.5% zayıflama = 1 puan
+            if self.btc_change_30m < self.prev_btc_change_30m - 0.5:
+                score += 1
+            # 1H: -0.5% zayıflama = 2 puan
+            if self.btc_change_1h < self.prev_btc_change_1h - 0.5:
+                score += 2
+            # 4H: -1.0% zayıflama = 3 puan
+            if self.btc_change_4h < self.prev_btc_change_4h - 1.0:
+                score += 3
+        
+        return score
+    
     def get_state(self) -> dict:
         """BTC ve ETH durumu."""
         return {
@@ -4522,7 +4606,11 @@ class BTCCorrelationFilter:
             "flash_crash_active": self.flash_crash_active,
             "flash_pump_active": self.flash_pump_active,
             "flash_crash_start_time": self.flash_crash_start_time.isoformat() if self.flash_crash_start_time else None,
-            "flash_pump_start_time": self.flash_pump_start_time.isoformat() if self.flash_pump_start_time else None
+            "flash_pump_start_time": self.flash_pump_start_time.isoformat() if self.flash_pump_start_time else None,
+            # Phase 60e: MTF Recovery
+            "change_15m": round(self.btc_change_15m, 2),
+            "mtf_score_long": self.calculate_mtf_momentum_score("LONG"),
+            "mtf_score_short": self.calculate_mtf_momentum_score("SHORT")
         }
     
     # =========================================================================
