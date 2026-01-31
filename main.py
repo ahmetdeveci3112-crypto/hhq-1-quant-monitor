@@ -10135,6 +10135,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     stream_interval = 2  # Stream updates every 2 seconds (faster for real-time position tracking)
     
     try:
+        # =========================================================
+        # Phase 60c: Update BTC/ETH state before filtering
+        # =========================================================
+        try:
+            if multi_coin_scanner.exchange:
+                await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+        except Exception as btc_update_err:
+            logger.debug(f"BTC state update error on connect: {btc_update_err}")
+        
         # Build current opportunities from existing analyzers
         current_opportunities = []
         for symbol, analyzer in multi_coin_scanner.analyzers.items():
@@ -10208,6 +10217,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Stream updates loop (scanner is running in background)
         while is_connected:
             try:
+                # =========================================================
+                # Phase 60c: Periodic BTC/ETH state update
+                # =========================================================
+                try:
+                    if multi_coin_scanner.exchange:
+                        await btc_filter.update_btc_state(multi_coin_scanner.exchange)
+                except Exception:
+                    pass  # Silent fail, will retry next loop
+                
                 # Get latest opportunities from background scanner (no scanning here)
                 opportunities = []
                 for symbol, analyzer in multi_coin_scanner.analyzers.items():
