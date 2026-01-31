@@ -3988,15 +3988,23 @@ class BTCCorrelationFilter:
         self.spread_window = 100  # Last 100 values for Z-score
         self.beta = 0.052  # ETH typically ~5.2% of BTC price
         
-        # Phase 60d: Recovery Detection - Karma Yaklaşım
+        # Phase 60d: Recovery Detection - Karma Yaklaşım (İki Yönlü)
+        # BEARISH Recovery (Flash Crash → LONG)
         self.flash_crash_start_time = None  # Flash crash başlangıç zamanı
+        self.flash_crash_active = False
         self.prev_btc_change_30m = 0.0      # Önceki 30m değişim (momentum shift)
         self.prev_eth_change_30m = 0.0      # Önceki ETH 30m değişim
-        self.btc_momentum_improving = False  # BTC momentum iyileşiyor mu?
+        self.btc_momentum_improving = False  # BTC momentum iyileşiyor mu? (düşüş yavaşlıyor)
         self.eth_momentum_improving = False  # ETH momentum iyileşiyor mu?
         self.recovery_phase = "NORMAL"       # BLOCKED / PENALTY_HIGH / PENALTY_LOW / NORMAL
         
-        logger.info("📊 BTCCorrelationFilter initialized with Recovery Detection + Karma Approach")
+        # BULLISH Recovery (Flash Pump → SHORT)
+        self.flash_pump_active = False       # Hızlı yükseliş aktif mi?
+        self.flash_pump_start_time = None    # Flash pump başlangıç zamanı
+        self.btc_momentum_weakening = False  # Yükseliş yavaşlıyor mu?
+        self.recovery_phase_short = "NORMAL" # SHORT için recovery phase
+        
+        logger.info("📊 BTCCorrelationFilter initialized with Bidirectional Recovery Detection")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -4072,6 +4080,54 @@ class BTCCorrelationFilter:
                     self.flash_crash_active = False
                     self.flash_crash_start_time = None
                     self.recovery_phase = "NORMAL"
+                
+                # =================================================================
+                # Phase 60d: FLASH PUMP + TIME-BASED RECOVERY (BULLISH → SHORT)
+                # Aşırı yükseliş sonrası SHORT sinyalleri için recovery
+                # =================================================================
+                if self.btc_change_30m > 2.0:
+                    # Flash pump başladı veya devam ediyor
+                    if not self.flash_pump_active:
+                        logger.warning(f"🚀 FLASH PUMP DETECTED: 30m:+{self.btc_change_30m:.1f}%")
+                        self.flash_pump_start_time = datetime.now()
+                    self.flash_pump_active = True
+                    
+                    # Momentum zayıflama kontrolü (yükseliş yavaşlıyor mu?)
+                    if self.prev_btc_change_30m > 1.0:  # Önceden yükselişteydi
+                        if new_change < self.prev_btc_change_30m - 0.5:  # Yavaşlıyor
+                            if not self.btc_momentum_weakening:
+                                logger.info(f"📉 BTC MOMENTUM WEAKENING: {self.prev_btc_change_30m:.1f}% → {new_change:.1f}%")
+                            self.btc_momentum_weakening = True
+                        else:
+                            self.btc_momentum_weakening = False
+                    else:
+                        self.btc_momentum_weakening = False
+                    
+                    # Time-based recovery phase for SHORT
+                    if self.flash_pump_start_time:
+                        elapsed_minutes = (datetime.now() - self.flash_pump_start_time).total_seconds() / 60
+                        
+                        if elapsed_minutes < 10:
+                            self.recovery_phase_short = "BLOCKED"
+                        elif elapsed_minutes < 20:
+                            self.recovery_phase_short = "PENALTY_HIGH"
+                        elif elapsed_minutes < 30:
+                            self.recovery_phase_short = "PENALTY_LOW"
+                        else:
+                            self.recovery_phase_short = "NORMAL"
+                        
+                        # Momentum zayıflıyorsa fazı hızlandır
+                        if self.btc_momentum_weakening and self.recovery_phase_short == "BLOCKED":
+                            self.recovery_phase_short = "PENALTY_HIGH"
+                            logger.info(f"📉 SHORT RECOVERY ACCELERATED: Momentum weakening, phase → PENALTY_HIGH")
+                
+                elif self.btc_change_30m < 1.0:
+                    # Flash pump sona erdi
+                    if self.flash_pump_active:
+                        logger.info(f"✅ FLASH PUMP ENDED: 30m cooled to {self.btc_change_30m:.1f}%")
+                    self.flash_pump_active = False
+                    self.flash_pump_start_time = None
+                    self.recovery_phase_short = "NORMAL"
             
             if ohlcv_1h and len(ohlcv_1h) >= 2:
                 current = ohlcv_1h[-1][4]  # Close
@@ -4296,6 +4352,35 @@ class BTCCorrelationFilter:
                 pass
         
         # ===================================================================
+        # Phase 60d: FLASH PUMP + RECOVERY DETECTION (BULLISH → SHORT)
+        # Aşırı yükseliş sonrası SHORT sinyalleri için kademeli izin
+        # ===================================================================
+        if self.flash_pump_active and signal_action == "SHORT":
+            if self.recovery_phase_short == "BLOCKED":
+                # İlk 10 dk veya momentum güçlenmeye devam ediyor = tam blokaj
+                if not self.btc_momentum_weakening:
+                    logger.warning(f"🚀 FLASH PUMP BLOCKED: {symbol} SHORT rejected - Phase:{self.recovery_phase_short}")
+                    return (False, 1.0, f"🚀 Flash Pump [{self.recovery_phase_short}] - SHORT BLOCKED")
+                else:
+                    # Momentum zayıflıyor ama henüz erken - yüksek penalty ile izin ver
+                    logger.info(f"📉 RECOVERY SHORT: {symbol} - Momentum weakening, penalty=50%")
+                    return (True, 0.5, f"📉 Recovery Phase (momentum weakening) - 50% penalty")
+            
+            elif self.recovery_phase_short == "PENALTY_HIGH":
+                # 10-20 dk arası = %50 penalty ile izin ver
+                logger.info(f"📉 RECOVERY SHORT: {symbol} - Phase:{self.recovery_phase_short}, penalty=50%")
+                return (True, 0.5, f"📉 Recovery Phase [{self.recovery_phase_short}] - 50% penalty")
+            
+            elif self.recovery_phase_short == "PENALTY_LOW":
+                # 20-30 dk arası = %25 penalty ile izin ver
+                logger.info(f"📉 RECOVERY SHORT: {symbol} - Phase:{self.recovery_phase_short}, penalty=25%")
+                return (True, 0.25, f"📉 Recovery Phase [{self.recovery_phase_short}] - 25% penalty")
+            
+            else:
+                # 30+ dk = normal
+                pass
+        
+        # ===================================================================
         # Phase 60c: ETH DIVERGENCE FILTER
         # BTC stabil ama ETH düşüyorsa ALT LONG'ları bloke et
         # ===================================================================
@@ -4428,11 +4513,16 @@ class BTCCorrelationFilter:
             "eth_change_1h": round(self.eth_change_1h, 2),
             "eth_change_4h": round(self.eth_change_4h, 2),
             "eth_flash_crash": self.eth_flash_crash,
-            # Phase 60d: Recovery Detection
+            # Phase 60d: Recovery Detection (Bidirectional)
             "recovery_phase": self.recovery_phase,
+            "recovery_phase_short": self.recovery_phase_short,
             "btc_momentum_improving": self.btc_momentum_improving,
+            "btc_momentum_weakening": self.btc_momentum_weakening,
             "eth_momentum_improving": self.eth_momentum_improving,
-            "flash_crash_start_time": self.flash_crash_start_time.isoformat() if self.flash_crash_start_time else None
+            "flash_crash_active": self.flash_crash_active,
+            "flash_pump_active": self.flash_pump_active,
+            "flash_crash_start_time": self.flash_crash_start_time.isoformat() if self.flash_crash_start_time else None,
+            "flash_pump_start_time": self.flash_pump_start_time.isoformat() if self.flash_pump_start_time else None
         }
     
     # =========================================================================
