@@ -771,7 +771,8 @@ export default function App() {
             }
 
             // Update portfolio from scanner - SKIP if in live trading mode
-            if (data.portfolio && !isLiveMode) {
+            // Use ref instead of state to avoid stale closure
+            if (data.portfolio && !isLiveModeRef.current) {
               const pf = data.portfolio;
               setPortfolio({
                 balanceUsd: pf.balance || 0,
@@ -1031,13 +1032,13 @@ export default function App() {
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Available</div>
                   <div className="text-base font-semibold text-cyan-400 font-mono">
-                    {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                    {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Used Margin</div>
                   <div className="text-base font-semibold text-amber-400 font-mono">
-                    {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                    {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
                 <div>
@@ -1079,13 +1080,13 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
                     <div className="text-base font-semibold text-cyan-400 font-mono">
-                      {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                      {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                     </div>
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Used Margin</div>
                     <div className="text-base font-semibold text-amber-400 font-mono">
-                      {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                      {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                     </div>
                   </div>
                   <div>
