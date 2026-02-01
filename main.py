@@ -11576,7 +11576,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         # Phase 96: Use SQLite for trade history - reliable local source
         # Binance API was failing and not returning any trades
         try:
-            sqlite_trades = await sqlite_manager.get_recent_trades(limit=50)
+            sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)  # Phase 96: Show all trades
             # Convert SQLite format to frontend format
             initial_trades = []
             for t in sqlite_trades:
