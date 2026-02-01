@@ -11780,19 +11780,67 @@ async def ui_websocket_endpoint(websocket: WebSocket):
     await ui_ws_manager.connect(websocket)
     
     try:
-        # Send initial state with ALL current data (portfolio + scanner data)
-        initial_state = {
-            "balance": global_paper_trader.balance,
-            "positions": global_paper_trader.positions,
-            "pendingOrders": global_paper_trader.pending_orders,
-            "enabled": global_paper_trader.enabled,
-            "tradeCount": len(global_paper_trader.trades),
-            "trades": global_paper_trader.trades,  # Include trade history
-            # Include current scanner data for instant UI update
-            "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
-            "stats": multi_coin_scanner.get_scanner_stats() if multi_coin_scanner else {},
-            "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else []
-        }
+        # Phase 91: Send initial state with correct data source based on trading mode
+        # Use Binance data for live mode, paper trader for paper mode
+        
+        if live_binance_trader.enabled:
+            # Live mode: Get data from Binance
+            try:
+                initial_balance_data = await live_binance_trader.get_balance()
+                initial_balance = initial_balance_data.get('walletBalance', 0)
+                initial_live_balance = initial_balance_data
+            except:
+                initial_balance = 0
+                initial_live_balance = None
+            
+            try:
+                initial_positions = await live_binance_trader.get_positions()
+            except:
+                initial_positions = []
+            
+            # Get PnL data
+            try:
+                pnl_data = await live_binance_trader.get_pnl_from_binance()
+            except:
+                pnl_data = {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0}
+            
+            initial_state = {
+                "balance": initial_balance,
+                "positions": initial_positions,
+                "pendingOrders": global_paper_trader.pending_orders,
+                "enabled": global_paper_trader.enabled,
+                "tradeCount": len(global_paper_trader.trades),
+                "trades": global_paper_trader.trades,
+                "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
+                "stats": {
+                    "todayPnl": pnl_data.get('todayPnl', 0),
+                    "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
+                    "totalPnl": pnl_data.get('totalPnl', 0),
+                    "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
+                    "liveBalance": initial_live_balance
+                },
+                "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
+                "tradingMode": "live"
+            }
+        else:
+            # Paper mode: Use paper trader data
+            pnl_data = global_paper_trader.get_today_pnl()
+            initial_state = {
+                "balance": global_paper_trader.balance,
+                "positions": global_paper_trader.positions,
+                "pendingOrders": global_paper_trader.pending_orders,
+                "enabled": global_paper_trader.enabled,
+                "tradeCount": len(global_paper_trader.trades),
+                "trades": global_paper_trader.trades,
+                "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
+                "stats": {
+                    **global_paper_trader.stats,
+                    **pnl_data
+                },
+                "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
+                "tradingMode": "paper"
+            }
+        
         await websocket.send_json({"type": "INITIAL_STATE", "data": initial_state, "timestamp": int(datetime.now().timestamp() * 1000)})
         
         # Keep connection alive and handle incoming messages
