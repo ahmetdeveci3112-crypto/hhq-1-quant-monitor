@@ -271,6 +271,7 @@ export default function App() {
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
   const [isLiveMode, setIsLiveMode] = useState(false); // Live trading mode flag
   const isLiveModeRef = useRef(false); // Ref for callbacks to avoid stale closure
+  const tradingModeKnownRef = useRef(false); // Block updates until trading mode is determined
 
   // Phase 52: AI Optimizer state
   const [optimizerStats, setOptimizerStats] = useState({
@@ -320,6 +321,13 @@ export default function App() {
   const handleInitialState = useCallback((data: any) => {
     console.log('📦 Received INITIAL_STATE from WebSocket');
     if (data) {
+      // BLOCK portfolio updates until we know trading mode
+      // This prevents WebSocket from applying paper data before live mode is detected
+      if (!tradingModeKnownRef.current) {
+        console.log('⏳ Waiting for trading mode to be determined...');
+        return; // Don't apply any portfolio updates yet
+      }
+
       // Update portfolio with all available data - SKIP if in live mode
       if (!isLiveModeRef.current) {
         setPortfolio(prev => ({
@@ -394,6 +402,7 @@ export default function App() {
                   });
                   setIsLiveMode(true); // Mark as live mode
                   isLiveModeRef.current = true; // Update ref for callbacks
+                  tradingModeKnownRef.current = true; // Allow future updates
                   console.log('📡 Live trading data synced from Binance');
                 }
               }
@@ -410,6 +419,7 @@ export default function App() {
               equityCurve: data.equityCurve || [],
               stats: data.stats || INITIAL_STATS
             });
+            tradingModeKnownRef.current = true; // Allow future updates
           }
 
           // Sync auto trade state
