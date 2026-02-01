@@ -623,10 +623,28 @@ class LiveBinanceTrader:
                 if abs(contracts) > 0:
                     # CCXT symbol format: BTC/USDT:USDT -> BTCUSDT
                     symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
-                    logger.info(f"Found active position: {symbol} contracts={contracts}")
                     
                     # Get raw Binance info for accurate data
                     raw_info = p.get('info', {})
+                    
+                    # Determine side correctly:
+                    # 1. Check CCXT side field first
+                    # 2. Fall back to raw Binance positionAmt (negative = SHORT)
+                    ccxt_side = p.get('side', '').upper()
+                    raw_position_amt = float(raw_info.get('positionAmt', 0) or 0)
+                    
+                    if ccxt_side in ['LONG', 'SHORT']:
+                        side = ccxt_side
+                    elif raw_position_amt < 0:
+                        side = 'SHORT'
+                    elif raw_position_amt > 0:
+                        side = 'LONG'
+                    else:
+                        # Fallback to contracts sign
+                        side = 'LONG' if contracts > 0 else 'SHORT'
+                    
+                    logger.info(f"Found active position: {symbol} side={side} contracts={contracts} raw_amt={raw_position_amt}")
+                    
                     notional = abs(float(p.get('notional', 0)))
                     position_margin = float(raw_info.get('positionInitialMargin', 0) or raw_info.get('initialMargin', 0) or 0)
                     
@@ -646,7 +664,7 @@ class LiveBinanceTrader:
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
                         'symbol': symbol,
-                        'side': 'LONG' if contracts > 0 else 'SHORT',
+                        'side': side,  # Use calculated side from CCXT/raw info
                         'size': abs(contracts),
                         'sizeUsd': notional,
                         'entryPrice': float(p.get('entryPrice', 0)),
@@ -791,6 +809,74 @@ class LiveBinanceTrader:
                 
         logger.warning(f"⚠️ EMERGENCY CLOSE: {len(closed)} positions closed")
         return closed
+    
+    async def get_pnl_from_binance(self) -> dict:
+        """
+        Binance Futures income history'den Today's PnL ve Total PnL hesapla.
+        Returns: {todayPnl, todayPnlPercent, totalPnl, totalPnlPercent, todayTradesCount}
+        """
+        if not self.enabled or not self.exchange:
+            return {
+                'todayPnl': 0, 'todayPnlPercent': 0,
+                'totalPnl': 0, 'totalPnlPercent': 0,
+                'todayTradesCount': 0
+            }
+        
+        try:
+            import pytz
+            
+            # Turkey timezone (UTC+3)
+            turkey_tz = pytz.timezone('Europe/Istanbul')
+            now_turkey = datetime.now(turkey_tz)
+            
+            # Start of today in Turkey time
+            today_start = now_turkey.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_start_ms = int(today_start.timestamp() * 1000)
+            
+            # Fetch income history from Binance (REALIZED_PNL type)
+            # This gives us all realized PnL from closed positions
+            params = {
+                'incomeType': 'REALIZED_PNL',
+                'limit': 1000  # Max allowed
+            }
+            
+            all_income = await self.exchange.fapiPrivate_get_income(params)
+            
+            today_pnl = 0.0
+            total_pnl = 0.0
+            today_trades_count = 0
+            
+            for income in all_income:
+                pnl = float(income.get('income', 0))
+                timestamp = int(income.get('time', 0))
+                total_pnl += pnl
+                
+                if timestamp >= today_start_ms:
+                    today_pnl += pnl
+                    today_trades_count += 1
+            
+            # Calculate percentages based on wallet balance
+            wallet_balance = self.last_balance if self.last_balance > 0 else 100
+            today_pnl_percent = (today_pnl / wallet_balance) * 100
+            total_pnl_percent = (total_pnl / wallet_balance) * 100
+            
+            logger.info(f"📊 PnL from Binance: Today=${today_pnl:.2f} ({today_pnl_percent:.2f}%) | Total=${total_pnl:.2f}")
+            
+            return {
+                'todayPnl': round(today_pnl, 2),
+                'todayPnlPercent': round(today_pnl_percent, 2),
+                'totalPnl': round(total_pnl, 2),
+                'totalPnlPercent': round(total_pnl_percent, 2),
+                'todayTradesCount': today_trades_count
+            }
+            
+        except Exception as e:
+            logger.error(f"PnL fetch error: {e}")
+            return {
+                'todayPnl': 0, 'todayPnlPercent': 0,
+                'totalPnl': 0, 'totalPnlPercent': 0,
+                'todayTradesCount': 0
+            }
 
     def get_status(self) -> dict:
         """Trader durumu."""
@@ -3462,7 +3548,7 @@ async def background_scanner_loop():
                 # Phase 50: Calculate dynamic min score before processing signals
                 global_paper_trader.calculate_dynamic_min_score()
                 
-                global_paper_trader.check_pending_orders(opportunities)
+                await global_paper_trader.check_pending_orders(opportunities)
                 
                 # Broadcast position updates to UI (throttled)
                 if global_paper_trader.positions:
@@ -8558,7 +8644,7 @@ class PaperTradingEngine:
         
         return pending_order
     
-    def check_pending_orders(self, opportunities: list):
+    async def check_pending_orders(self, opportunities: list):
         """Check all pending orders against current prices and execute or expire them."""
         current_time = int(datetime.now().timestamp() * 1000)
         
@@ -8642,9 +8728,9 @@ class PaperTradingEngine:
                     should_execute = True
             
             if should_execute:
-                self.execute_pending_order(order, current_price)
+                await self.execute_pending_order(order, current_price)
     
-    def execute_pending_order(self, order: dict, fill_price: float):
+    async def execute_pending_order(self, order: dict, fill_price: float):
         """Execute a pending order at the fill price."""
         # Remove from pending
         if order in self.pending_orders:
@@ -8724,16 +8810,14 @@ class PaperTradingEngine:
         if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
             try:
                 logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance...")
-                binance_order = asyncio.create_task(
-                    live_binance_trader.place_market_order(
-                        symbol=symbol,
-                        side=side,
-                        size_usd=order['sizeUsd'],
-                        leverage=order['leverage']
-                    )
+                
+                # Use await for proper async execution
+                result = await live_binance_trader.place_market_order(
+                    symbol=symbol,
+                    side=side,
+                    size_usd=order['sizeUsd'],
+                    leverage=order['leverage']
                 )
-                # Wait for the order to complete
-                result = asyncio.get_event_loop().run_until_complete(binance_order)
                 
                 if result:
                     new_position['binance_order_id'] = result.get('id')
@@ -9452,30 +9536,38 @@ class PaperTradingEngine:
 
     def close_position(self, pos: Dict, exit_price: float, reason: str):
         # =====================================================================
-        # LIVE TRADING: Close position on Binance first
+        # LIVE TRADING: Schedule close on Binance (fire-and-forget)
         # =====================================================================
         if live_binance_trader.enabled and pos.get('isLive', False):
+            symbol = pos.get('symbol', '')
+            side = pos.get('side', 'LONG')
+            amount = pos.get('size', 0)
+            
+            logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
+            
+            # Schedule async close as background task (fire-and-forget)
             try:
-                symbol = pos.get('symbol', '')
-                side = pos.get('side', 'LONG')
-                amount = pos.get('size', 0)
-                
-                logger.info(f"🔴 LIVE CLOSE: Closing {side} {symbol} on Binance...")
-                
-                # Create async task for closing
-                close_task = asyncio.create_task(
-                    live_binance_trader.close_position(symbol, side, amount)
-                )
-                result = asyncio.get_event_loop().run_until_complete(close_task)
-                
-                if not result:
-                    logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
-                    self.add_log(f"❌ BINANCE KAPANIŞ HATASI: {side} {symbol}")
-                    # Continue anyway to keep positions in sync
-                    
-            except Exception as e:
-                logger.error(f"❌ LIVE CLOSE ERROR: {e}")
-                # Continue anyway
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Inside async context - schedule as task
+                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount))
+                else:
+                    # Outside async context - run directly
+                    loop.run_until_complete(self._close_on_binance(symbol, side, amount))
+            except RuntimeError:
+                # No event loop in current thread
+                asyncio.run(self._close_on_binance(symbol, side, amount))
+    
+    async def _close_on_binance(self, symbol: str, side: str, amount: float):
+        """Helper to close position on Binance asynchronously."""
+        try:
+            result = await live_binance_trader.close_position(symbol, side, amount)
+            if result:
+                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol}")
+            else:
+                logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
+        except Exception as e:
+            logger.error(f"❌ LIVE CLOSE ERROR: {e}")
         
         if pos['side'] == 'LONG':
             pnl = (exit_price - pos['entryPrice']) * pos['size']
@@ -10338,6 +10430,7 @@ async def live_trading_status():
     try:
         balance = await live_binance_trader.get_balance()
         positions = await live_binance_trader.get_positions()
+        pnl_data = await live_binance_trader.get_pnl_from_binance()
         
         return JSONResponse({
             "enabled": True,
@@ -10346,7 +10439,13 @@ async def live_trading_status():
             "positions": positions,
             "position_count": len(positions),
             "last_sync": live_binance_trader.last_sync_time,
-            "status": live_binance_trader.get_status()
+            "status": live_binance_trader.get_status(),
+            # PnL data from Binance income history
+            "todayPnl": pnl_data.get('todayPnl', 0),
+            "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
+            "totalPnl": pnl_data.get('totalPnl', 0),
+            "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
+            "todayTradesCount": pnl_data.get('todayTradesCount', 0)
         })
     except Exception as e:
         return JSONResponse({

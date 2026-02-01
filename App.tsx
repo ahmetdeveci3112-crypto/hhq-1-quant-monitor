@@ -407,6 +407,11 @@ export default function App() {
                     stats: {
                       ...INITIAL_STATS,
                       ...data.stats,
+                      // Live PnL from Binance income history (backend calculated)
+                      todayPnl: liveData.todayPnl || 0,
+                      todayPnlPercent: liveData.todayPnlPercent || 0,
+                      totalPnl: liveData.totalPnl || 0,
+                      totalPnlPercent: liveData.totalPnlPercent || 0,
                       // Store live balance details in stats for UI access
                       liveBalance: {
                         walletBalance,
