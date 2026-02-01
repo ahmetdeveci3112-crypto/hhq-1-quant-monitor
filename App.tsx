@@ -503,52 +503,15 @@ export default function App() {
     fetchInitialState();
   }, []);
 
-  // Live Trading Auto-Refresh: Poll every 10 seconds when in live mode
+  // Phase 89: REST API polling DISABLED - WebSocket is the single source of truth
+  // This eliminates data conflicts between REST and WebSocket sources
   useEffect(() => {
-    if (!isLiveMode) return;
-
-    const pollLiveData = async () => {
-      try {
-        const liveRes = await fetch(`${BACKEND_API_URL}/live-trading/status`);
-        if (liveRes.ok) {
-          const liveData = await liveRes.json();
-          if (liveData.enabled) {
-            const balance = liveData.balance || {};
-            const walletBalance = balance.walletBalance || balance.total || 0;
-            const marginBalance = balance.marginBalance || balance.total || 0;
-            const availableBalance = balance.availableBalance || balance.free || 0;
-            const unrealizedPnl = balance.unrealizedPnl || 0;
-
-            setPortfolio(prev => ({
-              ...prev,
-              balanceUsd: walletBalance,
-              positions: liveData.positions || [],
-              stats: {
-                ...prev.stats,
-                todayPnl: liveData.todayPnl || 0,
-                todayPnlPercent: liveData.todayPnlPercent || 0,
-                totalPnl: liveData.totalPnl || 0,
-                totalPnlPercent: liveData.totalPnlPercent || 0,
-                liveBalance: {
-                  walletBalance,
-                  marginBalance,
-                  availableBalance,
-                  unrealizedPnl
-                }
-              }
-            }));
-          }
-        }
-      } catch (e) {
-        console.error('Live data poll failed:', e);
-      }
-    };
-
-    // Poll every 10 seconds
-    const intervalId = setInterval(pollLiveData, 10000);
-
-    // Cleanup on unmount
-    return () => clearInterval(intervalId);
+    // DISABLED: All data now comes exclusively from WebSocket
+    // if (!isLiveMode) return;
+    // const pollLiveData = async () => { ... };
+    // const intervalId = setInterval(pollLiveData, 10000);
+    // return () => clearInterval(intervalId);
+    console.log('📊 Phase 89: REST polling disabled - using WebSocket only');
   }, [isLiveMode]);
   const handleManualClose = useCallback(async (positionId: string) => {
     try {

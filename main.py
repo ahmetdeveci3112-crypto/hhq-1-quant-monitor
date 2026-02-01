@@ -936,6 +936,58 @@ class LiveBinanceTrader:
                 'todayTradesCount': 0
             }
 
+    async def get_trade_history(self, limit: int = 50, days_back: int = 7) -> list:
+        """
+        Binance Futures'dan trade history çek.
+        Uses income history with REALIZED_PNL type for closed trades.
+        Returns list of trades in frontend-compatible format.
+        """
+        if not self.enabled or not self.exchange:
+            return []
+        
+        try:
+            import pytz
+            turkey_tz = pytz.timezone('Europe/Istanbul')
+            now = datetime.now(turkey_tz)
+            
+            # Get income history (REALIZED_PNL = closed trades)
+            start_time = int((now - timedelta(days=days_back)).timestamp() * 1000)
+            
+            income_history = await self.exchange.fapiPrivateGetIncome({
+                'incomeType': 'REALIZED_PNL',
+                'startTime': start_time,
+                'limit': min(limit, 1000)
+            })
+            
+            trades = []
+            for income in income_history:
+                symbol = income.get('symbol', 'UNKNOWN')
+                pnl = float(income.get('income', 0))
+                timestamp = int(income.get('time', 0))
+                
+                # Format for frontend
+                trade = {
+                    'symbol': symbol,
+                    'pnl': round(pnl, 4),
+                    'pnlFormatted': f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}",
+                    'timestamp': timestamp,
+                    'time': datetime.fromtimestamp(timestamp / 1000, turkey_tz).strftime('%H:%M:%S'),
+                    'date': datetime.fromtimestamp(timestamp / 1000, turkey_tz).strftime('%Y-%m-%d'),
+                    'type': 'CLOSE',
+                    'side': 'WIN' if pnl > 0 else 'LOSS'
+                }
+                trades.append(trade)
+            
+            # Sort by timestamp descending (newest first)
+            trades.sort(key=lambda x: x['timestamp'], reverse=True)
+            
+            logger.info(f"📊 Fetched {len(trades)} trades from Binance (last {days_back} days)")
+            return trades[:limit]
+            
+        except Exception as e:
+            logger.error(f"Trade history fetch error: {e}")
+            return []
+
     def get_status(self) -> dict:
         """Trader durumu."""
         return {
@@ -11435,15 +11487,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             initial_live_balance = None
             initial_positions = []
         
-        # Phase 88: Fetch trades from SQLite (persistent) instead of paper_trader (memory)
+        # Phase 89: Fetch trades from Binance API (not SQLite) - single source of truth
         try:
-            initial_trades = await sqlite_manager.get_recent_trades(limit=50)
-            logger.info(f"Phase 88: Fetched {len(initial_trades)} trades from SQLite")
+            initial_trades = await live_binance_trader.get_trade_history(limit=50, days_back=7)
+            logger.info(f"Phase 89: Fetched {len(initial_trades)} trades from Binance API")
         except Exception as e:
-            logger.warning(f"SQLite trades fetch failed: {e}")
-            initial_trades = global_paper_trader.trades[-20:]  # Fallback to memory
+            logger.warning(f"Binance trade history fetch failed: {e}")
+            initial_trades = []  # No fallback - Binance is the only source
         
-        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}, liveBalance={initial_live_balance}")
+        logger.info(f"Phase 89: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:
