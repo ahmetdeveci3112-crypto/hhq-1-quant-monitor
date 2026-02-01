@@ -942,6 +942,8 @@ class LiveBinanceTrader:
         Uses income history with REALIZED_PNL type for closed trades.
         Returns list of trades in frontend-compatible format.
         """
+        logger.info(f"get_trade_history called: enabled={self.enabled}, exchange={self.exchange is not None}")
+        
         if not self.enabled or not self.exchange:
             logger.warning(f"get_trade_history: Early return - enabled={self.enabled}, exchange={self.exchange is not None}")
             return []
@@ -954,6 +956,9 @@ class LiveBinanceTrader:
             # Get income history (REALIZED_PNL = closed trades)
             start_time = int((now - timedelta(days=days_back)).timestamp() * 1000)
             
+            # Try direct fapiPrivateGetIncome call
+            logger.info(f"Calling fapiPrivateGetIncome with startTime={start_time}")
+            
             income_history = await self.exchange.fapiPrivateGetIncome({
                 'incomeType': 'REALIZED_PNL',
                 'startTime': start_time,
@@ -961,6 +966,10 @@ class LiveBinanceTrader:
             })
             
             logger.info(f"Trade history: Got {len(income_history) if income_history else 0} records from Binance API")
+            
+            if not income_history:
+                logger.warning("Trade history: Income history returned empty/None")
+                return []
             
             trades = []
             for income in income_history:
@@ -973,7 +982,7 @@ class LiveBinanceTrader:
                 trade = {
                     # Required by frontend
                     'symbol': symbol,
-                    'side': 'SHORT',  # Income history doesn't have side info, default to SHORT
+                    'side': 'LONG' if pnl > 0 else 'SHORT',  # Guess based on PnL
                     'entryPrice': 0,  # Not available from income history
                     'exitPrice': 0,   # Not available from income history
                     'pnl': round(pnl, 4),
@@ -995,7 +1004,7 @@ class LiveBinanceTrader:
             # Sort by timestamp descending (newest first)
             trades.sort(key=lambda x: x['timestamp'], reverse=True)
             
-            logger.info(f"📊 Fetched {len(trades)} trades from Binance (last {days_back} days)")
+            logger.info(f"📊 Returning {len(trades)} trades from Binance (last {days_back} days)")
             return trades[:limit]
             
         except Exception as e:
