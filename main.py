@@ -605,8 +605,8 @@ class LiveBinanceTrader:
             logger.error(f"Balance fetch error: {e}")
             return {'walletBalance': 0, 'marginBalance': 0, 'availableBalance': 0, 'unrealizedPnl': 0, 'free': 0, 'used': 0, 'total': self.last_balance}
     
-    async def get_positions(self) -> list:
-        """Binance'den açık pozisyonları çek."""
+    async def get_positions(self, fast: bool = False) -> list:
+        """Binance'den açık pozisyonları çek. fast=True skips expensive openTime lookup."""
         logger.info(f"get_positions called: enabled={self.enabled}, exchange={self.exchange is not None}")
         
         if not self.enabled or not self.exchange:
@@ -664,44 +664,47 @@ class LiveBinanceTrader:
                     # Get position open time from trade history
                     # Fetch recent trades for this symbol to find when position was opened
                     open_time = int(datetime.now().timestamp() * 1000)  # Default to now
-                    try:
-                        # Fetch trades from last 7 days for more accurate open time
-                        seven_days_ago = int((datetime.now().timestamp() - 7*24*60*60) * 1000)
-                        trades = await self.exchange.fapiPrivateGetUserTrades({
-                            'symbol': symbol,
-                            'startTime': seven_days_ago,
-                            'limit': 500  # Fetch more trades to find older positions
-                        })
-                        
-                        if trades and len(trades) > 0:
-                            # Sort trades by time (oldest first)
-                            sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                    
+                    # Phase 79: Skip expensive openTime lookup in fast mode
+                    if not fast:
+                        try:
+                            # Fetch trades from last 7 days for more accurate open time
+                            seven_days_ago = int((datetime.now().timestamp() - 7*24*60*60) * 1000)
+                            trades = await self.exchange.fapiPrivateGetUserTrades({
+                                'symbol': symbol,
+                                'startTime': seven_days_ago,
+                                'limit': 500  # Fetch more trades to find older positions
+                            })
                             
-                            # Strategy: Find the earliest trade that opened current position
-                            # For LONG: Look for first BUY that started the position
-                            # For SHORT: Look for first SELL that started the position
-                            
-                            # Simple approach: Find earliest trade matching position direction
-                            earliest_matching = None
-                            for t in sorted_trades:
-                                is_buyer = t.get('buyer', False)
-                                trade_time = int(t.get('time', 0))
+                            if trades and len(trades) > 0:
+                                # Sort trades by time (oldest first)
+                                sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
                                 
-                                # Match direction: LONG = buyer, SHORT = !buyer
-                                if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
-                                    earliest_matching = trade_time
-                                    break  # Found the oldest matching trade
+                                # Strategy: Find the earliest trade that opened current position
+                                # For LONG: Look for first BUY that started the position
+                                # For SHORT: Look for first SELL that started the position
                             
-                            if earliest_matching:
-                                open_time = earliest_matching
-                                logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
-                            else:
-                                # Fallback: Use oldest trade time if position predates our history
-                                open_time = int(sorted_trades[0].get('time', open_time))
-                                logger.info(f"  Position {symbol} history starts at: {datetime.fromtimestamp(open_time/1000)}")
+                                # Simple approach: Find earliest trade matching position direction
+                                earliest_matching = None
+                                for t in sorted_trades:
+                                    is_buyer = t.get('buyer', False)
+                                    trade_time = int(t.get('time', 0))
+                                    
+                                    # Match direction: LONG = buyer, SHORT = !buyer
+                                    if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
+                                        earliest_matching = trade_time
+                                        break  # Found the oldest matching trade
                                 
-                    except Exception as te:
-                        logger.warning(f"Could not get trade history for {symbol}: {te}")
+                                if earliest_matching:
+                                    open_time = earliest_matching
+                                    logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
+                                else:
+                                    # Fallback: Use oldest trade time if position predates our history
+                                    open_time = int(sorted_trades[0].get('time', open_time))
+                                    logger.info(f"  Position {symbol} history starts at: {datetime.fromtimestamp(open_time/1000)}")
+                                    
+                        except Exception as te:
+                            logger.warning(f"Could not get trade history for {symbol}: {te}")
                     
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
@@ -11373,13 +11376,25 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logger.warning(f"Phase 78: Failed to fetch immediate balance: {e}")
         
+        # Phase 79: Fetch positions in fast mode (skip expensive openTime lookup)
+        initial_positions = global_paper_trader.positions
+        if live_binance_trader.enabled:
+            try:
+                fast_positions = await live_binance_trader.get_positions(fast=True)
+                if fast_positions:
+                    initial_positions = fast_positions
+                    global_paper_trader.positions = fast_positions  # Update cache
+                    logger.info(f"Phase 79: Fast-fetched {len(fast_positions)} positions for initial state")
+            except Exception as e:
+                logger.warning(f"Phase 79: Failed to fast-fetch positions: {e}")
+        
         await websocket.send_json({
             "type": "scanner_update",
             "opportunities": filtered_opportunities,  # FILTERED opportunities
             "stats": current_stats,
             "portfolio": {
                 "balance": initial_balance,
-                "positions": global_paper_trader.positions,
+                "positions": initial_positions,
                 "trades": global_paper_trader.trades,  # ALL trades
                 "stats": {
                     **global_paper_trader.stats, 
