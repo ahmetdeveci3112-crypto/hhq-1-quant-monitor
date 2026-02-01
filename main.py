@@ -964,17 +964,28 @@ class LiveBinanceTrader:
                 symbol = income.get('symbol', 'UNKNOWN')
                 pnl = float(income.get('income', 0))
                 timestamp = int(income.get('time', 0))
+                close_time = datetime.fromtimestamp(timestamp / 1000, turkey_tz)
                 
-                # Format for frontend
+                # Frontend-compatible format with all required fields
                 trade = {
+                    # Required by frontend
                     'symbol': symbol,
+                    'side': 'SHORT',  # Income history doesn't have side info, default to SHORT
+                    'entryPrice': 0,  # Not available from income history
+                    'exitPrice': 0,   # Not available from income history
                     'pnl': round(pnl, 4),
+                    'closeTime': timestamp,
+                    'closeReason': 'Binance PnL',
+                    # Additional fields
                     'pnlFormatted': f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}",
                     'timestamp': timestamp,
-                    'time': datetime.fromtimestamp(timestamp / 1000, turkey_tz).strftime('%H:%M:%S'),
-                    'date': datetime.fromtimestamp(timestamp / 1000, turkey_tz).strftime('%Y-%m-%d'),
+                    'time': close_time.strftime('%H:%M:%S'),
+                    'date': close_time.strftime('%Y-%m-%d'),
                     'type': 'CLOSE',
-                    'side': 'WIN' if pnl > 0 else 'LOSS'
+                    'margin': 0,  # Not available
+                    'leverage': 1,
+                    'sizeUsd': 0,
+                    'reason': 'Realized PnL from Binance'
                 }
                 trades.append(trade)
             
