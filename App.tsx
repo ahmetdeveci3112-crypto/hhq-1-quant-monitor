@@ -827,6 +827,12 @@ export default function App() {
 
           // Phase 31: Handle scanner update
           if (data.type === 'scanner_update') {
+            // Phase 74: Detect trading mode from scanner_update
+            if (data.tradingMode === 'live') {
+              setIsLiveMode(true);
+              isLiveModeRef.current = true;
+            }
+
             // Update opportunities
             if (data.opportunities) {
               setOpportunities(data.opportunities);

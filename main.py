@@ -11360,6 +11360,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "logs": global_paper_trader.logs[-100:],
                 "enabled": global_paper_trader.enabled
             },
+            "tradingMode": "live" if live_binance_trader.enabled else "paper",
             "timestamp": datetime.now().timestamp(),
             "message": "State restored" if current_opportunities else "Scanner starting..."
         })
@@ -11445,6 +11446,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         "logs": global_paper_trader.logs[-100:],
                         "enabled": global_paper_trader.enabled
                     },
+                    "tradingMode": "live" if live_binance_trader.enabled else "paper",
                     "timestamp": datetime.now().timestamp()
                 }
                 
