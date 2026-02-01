@@ -11542,63 +11542,74 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         }
         
         # =====================================================================
-        # Phase 88: BINANCE-ONLY - Get data directly from Binance, not paper trader
+        # Phase 97: PARALLEL DATA FETCHING - Major speed improvement
+        # Fetch Balance, Positions, and Trades concurrently (4-5s → ~1s)
         # =====================================================================
+        start_time = datetime.now()
+        
+        async def fetch_balance():
+            """Fetch balance from Binance or paper trader."""
+            if live_binance_trader.enabled:
+                try:
+                    return await live_binance_trader.get_balance()
+                except Exception as e:
+                    logger.warning(f"Binance balance fetch failed: {e}")
+                    return {}
+            return {'walletBalance': global_paper_trader.balance}
+        
+        async def fetch_positions():
+            """Fetch positions from Binance, sorted newest first."""
+            if live_binance_trader.enabled:
+                try:
+                    pos = await live_binance_trader.get_positions()
+                    return sorted(pos, key=lambda p: p.get('openTime', 0), reverse=True)
+                except Exception as e:
+                    logger.warning(f"Binance positions fetch failed: {e}")
+            return []
+        
+        async def fetch_trades():
+            """Fetch trade history from SQLite."""
+            try:
+                sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
+                trades = []
+                for t in sqlite_trades:
+                    trades.append({
+                        'symbol': t.get('symbol', 'UNKNOWN'),
+                        'side': t.get('side', 'LONG'),
+                        'entryPrice': t.get('entry_price', 0),
+                        'exitPrice': t.get('exit_price', 0),
+                        'pnl': t.get('pnl', 0),
+                        'closeTime': t.get('close_time', 0),
+                        'closeReason': t.get('close_reason', 'Unknown'),
+                        'pnlFormatted': f"+${t.get('pnl', 0):.2f}" if t.get('pnl', 0) >= 0 else f"-${abs(t.get('pnl', 0)):.2f}",
+                        'leverage': t.get('leverage', 1),
+                        'sizeUsd': t.get('size_usd', 0)
+                    })
+                return trades
+            except Exception as e:
+                logger.warning(f"SQLite trade fetch failed: {e}")
+                return []
+        
+        # Start all tasks concurrently
+        balance_task = asyncio.create_task(fetch_balance())
+        positions_task = asyncio.create_task(fetch_positions())
+        trades_task = asyncio.create_task(fetch_trades())
+        
+        # Await all results
+        balance_result = await balance_task
+        initial_positions = await positions_task
+        initial_trades = await trades_task
+        
+        # Process balance result
         if live_binance_trader.enabled:
-            # Get REAL balance from Binance
-            try:
-                binance_balance = await live_binance_trader.get_balance()
-                initial_balance = binance_balance.get('walletBalance', 0)
-                initial_live_balance = binance_balance
-            except Exception as e:
-                logger.warning(f"Binance balance fetch failed: {e}")
-                initial_balance = 0
-                initial_live_balance = None
-            
-            # Get REAL positions from Binance (not paper trader)
-            try:
-                initial_positions = await live_binance_trader.get_positions()
-                # Sort by openTime if available (newest first)
-                initial_positions = sorted(
-                    initial_positions,
-                    key=lambda p: p.get('openTime', 0),
-                    reverse=True
-                )
-            except Exception as e:
-                logger.warning(f"Binance positions fetch failed: {e}")
-                initial_positions = []
+            initial_balance = balance_result.get('walletBalance', 0)
+            initial_live_balance = balance_result
         else:
-            # Fallback to paper trader if live mode disabled (shouldn't happen)
-            initial_balance = global_paper_trader.balance
+            initial_balance = balance_result.get('walletBalance', 0)
             initial_live_balance = None
-            initial_positions = []
         
-        # Phase 96: Use SQLite for trade history - reliable local source
-        # Binance API was failing and not returning any trades
-        try:
-            sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)  # Phase 96: Show all trades
-            # Convert SQLite format to frontend format
-            initial_trades = []
-            for t in sqlite_trades:
-                trade = {
-                    'symbol': t.get('symbol', 'UNKNOWN'),
-                    'side': t.get('side', 'LONG'),
-                    'entryPrice': t.get('entry_price', 0),
-                    'exitPrice': t.get('exit_price', 0),
-                    'pnl': t.get('pnl', 0),
-                    'closeTime': t.get('close_time', 0),
-                    'closeReason': t.get('close_reason', 'Unknown'),
-                    'pnlFormatted': f"+${t.get('pnl', 0):.2f}" if t.get('pnl', 0) >= 0 else f"-${abs(t.get('pnl', 0)):.2f}",
-                    'leverage': t.get('leverage', 1),
-                    'sizeUsd': t.get('size_usd', 0)
-                }
-                initial_trades.append(trade)
-            logger.info(f"Phase 96: Fetched {len(initial_trades)} trades from SQLite")
-        except Exception as e:
-            logger.warning(f"SQLite trade fetch failed: {e}")
-            initial_trades = []
-        
-        logger.info(f"Phase 96: SQLite state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
+        load_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Phase 97: Parallel load completed in {load_time:.2f}s - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:

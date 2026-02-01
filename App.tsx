@@ -1405,7 +1405,7 @@ export default function App() {
                 {portfolio.trades.length === 0 ? (
                   <div className="text-center py-8 text-slate-600 text-xs">No trades yet</div>
                 ) : (
-                  portfolio.trades.slice().reverse().slice(0, 50).map((trade, i) => {
+                  portfolio.trades.slice(0, 50).map((trade, i) => {
                     const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
                     const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
                     const isLong = trade.side === 'LONG';
@@ -1461,7 +1461,7 @@ export default function App() {
                         <td colSpan={8} className="py-12 text-center text-slate-600">No trades yet</td>
                       </tr>
                     ) : (
-                      portfolio.trades.slice().reverse().map((trade, i) => {
+                      portfolio.trades.map((trade, i) => {
                         const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
                         const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
                         return (
