@@ -4022,11 +4022,16 @@ class BTCCorrelationFilter:
         
         try:
             # Phase 60e: BTC 15m, 30m, 1H, 4H ve 1D verileri çek
-            ohlcv_15m = await exchange.fetch_ohlcv('BTC/USDT', '15m', limit=4)  # Phase 60e: 15m momentum
-            ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)  # Phase 60b: 30m momentum
+            # Rate limit fix: 100ms delay between calls
+            ohlcv_15m = await exchange.fetch_ohlcv('BTC/USDT', '15m', limit=4)
+            await asyncio.sleep(0.1)
+            ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)
+            await asyncio.sleep(0.1)
             ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
+            await asyncio.sleep(0.1)
             ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
-            ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)  # Son 3 gün
+            await asyncio.sleep(0.1)
+            ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)
             
             # Phase 60e: 15m momentum hesapla
             if ohlcv_15m and len(ohlcv_15m) >= 2:
@@ -4210,8 +4215,11 @@ class BTCCorrelationFilter:
             # BTC stabil ama ETH/ALT'lar düşerse koruma sağlar
             # =================================================================
             try:
+                # Rate limit fix: 100ms delay between calls
                 eth_30m = await exchange.fetch_ohlcv('ETH/USDT', '30m', limit=4)
+                await asyncio.sleep(0.1)
                 eth_1h = await exchange.fetch_ohlcv('ETH/USDT', '1h', limit=4)
+                await asyncio.sleep(0.1)
                 eth_4h = await exchange.fetch_ohlcv('ETH/USDT', '4h', limit=4)
                 
                 if eth_30m and len(eth_30m) >= 2:
