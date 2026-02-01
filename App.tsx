@@ -270,6 +270,7 @@ export default function App() {
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
   const [isLiveMode, setIsLiveMode] = useState(false); // Live trading mode flag
+  const isLiveModeRef = useRef(false); // Ref for callbacks to avoid stale closure
 
   // Phase 52: AI Optimizer state
   const [optimizerStats, setOptimizerStats] = useState({
@@ -319,13 +320,15 @@ export default function App() {
   const handleInitialState = useCallback((data: any) => {
     console.log('📦 Received INITIAL_STATE from WebSocket');
     if (data) {
-      // Update portfolio with all available data
-      setPortfolio(prev => ({
-        ...prev,
-        balanceUsd: data.balance || prev.balanceUsd,
-        positions: data.positions || prev.positions,
-        trades: data.trades || prev.trades
-      }));
+      // Update portfolio with all available data - SKIP if in live mode
+      if (!isLiveModeRef.current) {
+        setPortfolio(prev => ({
+          ...prev,
+          balanceUsd: data.balance || prev.balanceUsd,
+          positions: data.positions || prev.positions,
+          trades: data.trades || prev.trades
+        }));
+      }
 
       // Update auto trade state
       if (data.enabled !== undefined) {
@@ -390,6 +393,7 @@ export default function App() {
                     stats: data.stats || INITIAL_STATS
                   });
                   setIsLiveMode(true); // Mark as live mode
+                  isLiveModeRef.current = true; // Update ref for callbacks
                   console.log('📡 Live trading data synced from Binance');
                 }
               }
@@ -531,8 +535,8 @@ export default function App() {
         const data = await res.json();
         setAutoTradeEnabled(data.enabled ?? true);
 
-        // Load cloud portfolio state
-        if (data.balance !== undefined) {
+        // Load cloud portfolio state - SKIP if in live mode
+        if (data.balance !== undefined && !isLiveModeRef.current) {
           setPortfolio(prev => ({
             ...prev,
             balanceUsd: data.balance,
