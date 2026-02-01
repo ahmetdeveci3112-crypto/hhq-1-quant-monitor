@@ -11391,8 +11391,12 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         initial_live_balance = getattr(global_paper_trader, 'liveBalance', None)
         
         # Use cached positions from sync loop (already has proper SL/TP)
-        # For display, filter only live positions
-        initial_positions = [p for p in global_paper_trader.positions if p.get('isLive', False)]
+        # For display, filter only live positions and SORT by openTime (newest first) for consistent UI
+        initial_positions = sorted(
+            [p for p in global_paper_trader.positions if p.get('isLive', False)],
+            key=lambda p: p.get('openTime', 0),
+            reverse=True  # Newest first
+        )
         
         # If no cached data yet (first start), use last_positions from trader
         if not initial_positions and live_binance_trader.enabled:
@@ -11509,13 +11513,20 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     pnl_data = global_paper_trader.get_today_pnl()
                 
                 # Send update to client
+                # Sort positions by openTime (newest first) for consistent UI display
+                sorted_positions = sorted(
+                    [p for p in global_paper_trader.positions if p.get('isLive', False)],
+                    key=lambda p: p.get('openTime', 0),
+                    reverse=True
+                )
+                
                 update_data = {
                     "type": "scanner_update",
                     "opportunities": filtered_opps,  # FILTERED opportunities
                     "stats": stats,
                     "portfolio": {
                         "balance": global_paper_trader.balance,
-                        "positions": global_paper_trader.positions,
+                        "positions": sorted_positions,  # Sorted by openTime
                         "trades": global_paper_trader.trades,  # ALL trades
                         "stats": {
                             **global_paper_trader.stats, 
