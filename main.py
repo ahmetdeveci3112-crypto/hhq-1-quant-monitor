@@ -11435,7 +11435,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             initial_live_balance = None
             initial_positions = []
         
-        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, liveBalance={initial_live_balance}")
+        # Phase 88: Fetch trades from SQLite (persistent) instead of paper_trader (memory)
+        try:
+            initial_trades = await sqlite_manager.get_recent_trades(limit=50)
+            logger.info(f"Phase 88: Fetched {len(initial_trades)} trades from SQLite")
+        except Exception as e:
+            logger.warning(f"SQLite trades fetch failed: {e}")
+            initial_trades = global_paper_trader.trades[-20:]  # Fallback to memory
+        
+        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}, liveBalance={initial_live_balance}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:
@@ -11460,7 +11468,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "portfolio": {
                 "balance": initial_balance,
                 "positions": initial_positions,
-                "trades": global_paper_trader.trades[-20:],  # Keep trades for history
+                "trades": initial_trades[-20:],  # Phase 88: From SQLite
                 "stats": {
                     **pnl_data,
                     "liveBalance": initial_live_balance
@@ -11485,7 +11493,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "portfolio": {
                 "balance": initial_balance,
                 "positions": initial_positions,
-                "trades": global_paper_trader.trades,  # ALL trades
+                "trades": initial_trades,  # Phase 88: From SQLite (all trades)
                 "stats": {
                     **pnl_data,
                     "liveBalance": initial_live_balance
@@ -11602,7 +11610,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     "portfolio": {
                         "balance": stream_balance,
                         "positions": stream_positions,  # From Binance
-                        "trades": global_paper_trader.trades,  # Keep trades for history (will migrate later)
+                        "trades": initial_trades,  # Phase 88: From SQLite
                         "stats": {
                             **global_paper_trader.stats, 
                             **pnl_data,
