@@ -943,6 +943,7 @@ class LiveBinanceTrader:
         Returns list of trades in frontend-compatible format.
         """
         if not self.enabled or not self.exchange:
+            logger.warning(f"get_trade_history: Early return - enabled={self.enabled}, exchange={self.exchange is not None}")
             return []
         
         try:
