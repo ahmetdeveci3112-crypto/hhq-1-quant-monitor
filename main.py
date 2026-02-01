@@ -11812,12 +11812,18 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                 "tradeCount": len(global_paper_trader.trades),
                 "trades": global_paper_trader.trades,
                 "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
+                # Phase 92: Include scanner stats with totalCoins
                 "stats": {
                     "todayPnl": pnl_data.get('todayPnl', 0),
                     "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
                     "totalPnl": pnl_data.get('totalPnl', 0),
                     "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
-                    "liveBalance": initial_live_balance
+                    "liveBalance": initial_live_balance,
+                    # Scanner stats
+                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    "longSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'LONG'),
+                    "shortSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'SHORT')
                 },
                 "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
                 "tradingMode": "live"
@@ -11833,9 +11839,15 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                 "tradeCount": len(global_paper_trader.trades),
                 "trades": global_paper_trader.trades,
                 "opportunities": multi_coin_scanner.opportunities if multi_coin_scanner else [],
+                # Phase 92: Include scanner stats with totalCoins
                 "stats": {
                     **global_paper_trader.stats,
-                    **pnl_data
+                    **pnl_data,
+                    # Scanner stats
+                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    "longSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'LONG'),
+                    "shortSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'SHORT')
                 },
                 "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
                 "tradingMode": "paper"
