@@ -11435,7 +11435,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             initial_live_balance = None
             initial_positions = []
         
-        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}")
+        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, liveBalance={initial_live_balance}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:
