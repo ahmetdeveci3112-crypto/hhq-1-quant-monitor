@@ -4,7 +4,7 @@
 #
 
 app = 'hhq-1-quant-monitor'
-primary_region = 'ams'
+primary_region = 'sin'
 
 [build]
 

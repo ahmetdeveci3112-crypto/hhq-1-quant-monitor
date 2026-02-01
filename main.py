@@ -487,21 +487,309 @@ class UIWebSocketManager:
         await self.broadcast("KILL_SWITCH", actions)
 
 
+
 # Global UI WebSocket manager
 ui_ws_manager = UIWebSocketManager()
+
+
+# ============================================================================
+# LIVE BINANCE TRADER - Real Order Execution
+# ============================================================================
+
+class LiveBinanceTrader:
+    """
+    Binance Futures gerçek emir ve pozisyon yönetimi.
+    Pozisyonlar, bakiye, PnL Binance'den okunur - backend hesaplamaz.
+    Backend sadece AL/SAT emirleri gönderir.
+    """
+    
+    def __init__(self):
+        self.exchange = None
+        self.enabled = False
+        self.initialized = False
+        self.last_balance = 0.0
+        self.last_positions = []
+        self.last_sync_time = 0
+        self.trading_mode = os.environ.get('TRADING_MODE', 'paper')  # paper, live
+        logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
+        
+    async def initialize(self):
+        """Binance bağlantısını başlat."""
+        self.last_error = None  # Reset error
+        
+        if self.trading_mode == 'paper':
+            self.last_error = "trading_mode is paper, not live"
+            logger.info("📄 PAPER MODE: Binance connection skipped")
+            return False
+            
+        api_key = os.environ.get('BINANCE_API_KEY')
+        api_secret = os.environ.get('BINANCE_SECRET')
+        
+        if not api_key or not api_secret:
+            self.last_error = f"Missing credentials: api_key={bool(api_key)}, secret={bool(api_secret)}"
+            logger.error("❌ BINANCE_API_KEY ve BINANCE_SECRET tanımlı değil!")
+            return False
+        
+        try:
+            self.exchange = ccxt_async.binance({
+                'apiKey': api_key,
+                'secret': api_secret,
+                'options': {'defaultType': 'future'},
+                'enableRateLimit': True,
+            })
+            
+            # Bağlantı testi - bakiye çek
+            balance = await self.exchange.fetch_balance()
+            self.last_balance = float(balance.get('USDT', {}).get('free', 0))
+            
+            logger.info(f"✅ Binance Futures bağlantısı başarılı!")
+            logger.info(f"💰 Kullanılabilir Bakiye: ${self.last_balance:.2f} USDT")
+            
+            self.enabled = True
+            self.initialized = True
+            return True
+            
+        except Exception as e:
+            self.last_error = f"Binance connection error: {str(e)}"
+            logger.error(f"❌ Binance bağlantı hatası: {e}")
+            self.exchange = None  # Reset exchange on error to allow retry
+            self.enabled = False
+            return False
+    
+    async def get_balance(self) -> dict:
+        """Binance'den bakiye çek."""
+        if not self.enabled or not self.exchange:
+            return {'free': 0, 'used': 0, 'total': 0}
+            
+        try:
+            balance = await self.exchange.fetch_balance()
+            usdt = balance.get('USDT', {})
+            result = {
+                'free': float(usdt.get('free', 0)),
+                'used': float(usdt.get('used', 0)),
+                'total': float(usdt.get('total', 0))
+            }
+            self.last_balance = result['total']
+            return result
+        except Exception as e:
+            logger.error(f"Balance fetch error: {e}")
+            return {'free': 0, 'used': 0, 'total': self.last_balance}
+    
+    async def get_positions(self) -> list:
+        """Binance'den açık pozisyonları çek."""
+        if not self.enabled or not self.exchange:
+            return []
+            
+        try:
+            positions = await self.exchange.fetch_positions()
+            result = []
+            
+            for p in positions:
+                contracts = float(p.get('contracts', 0))
+                if abs(contracts) > 0:
+                    # CCXT symbol format: BTC/USDT:USDT -> BTCUSDT
+                    symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
+                    
+                    result.append({
+                        'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
+                        'symbol': symbol,
+                        'side': 'LONG' if contracts > 0 else 'SHORT',
+                        'size': abs(contracts),
+                        'sizeUsd': abs(float(p.get('notional', 0))),
+                        'entryPrice': float(p.get('entryPrice', 0)),
+                        'markPrice': float(p.get('markPrice', 0)),
+                        'unrealizedPnl': float(p.get('unrealizedPnl', 0)),
+                        'unrealizedPnlPercent': float(p.get('percentage', 0)),
+                        'leverage': int(p.get('leverage', 1)),
+                        'liquidationPrice': float(p.get('liquidationPrice', 0)),
+                        'marginType': p.get('marginMode', 'cross'),
+                        'openTime': int(datetime.now().timestamp() * 1000),  # Binance doesn't provide this
+                        'isLive': True  # Mark as live position
+                    })
+            
+            self.last_positions = result
+            return result
+            
+        except Exception as e:
+            logger.error(f"Positions fetch error: {e}")
+            return self.last_positions
+    
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Kaldıraç ayarla."""
+        if not self.enabled or not self.exchange:
+            return False
+            
+        try:
+            ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+            await self.exchange.set_leverage(leverage, ccxt_symbol)
+            logger.info(f"⚙️ Leverage set: {symbol} -> {leverage}x")
+            return True
+        except Exception as e:
+            logger.warning(f"Leverage set warning (may already be set): {e}")
+            return True  # Often fails if already set, which is OK
+    
+    async def place_market_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
+        """Market emir gönder."""
+        if not self.enabled or not self.exchange:
+            logger.error("❌ LiveBinanceTrader not enabled, order rejected")
+            return None
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            # Kaldıraç ayarla
+            await self.set_leverage(symbol, leverage)
+            
+            # Fiyat çek ve miktar hesapla
+            ticker = await self.exchange.fetch_ticker(ccxt_symbol)
+            price = ticker['last']
+            amount = size_usd / price
+            
+            # Minimum lot size kontrolü (Binance gereksinimleri)
+            markets = await self.exchange.load_markets()
+            market = markets.get(ccxt_symbol)
+            if market:
+                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+                if amount < min_amount:
+                    logger.warning(f"⚠️ Amount {amount} below minimum {min_amount}, adjusting...")
+                    amount = min_amount
+            
+            # Emir gönder
+            order_side = 'buy' if side == 'LONG' else 'sell'
+            order = await self.exchange.create_market_order(
+                ccxt_symbol,
+                order_side,
+                amount,
+                params={'reduceOnly': False}
+            )
+            
+            logger.info(f"📤 BINANCE ORDER SENT: {side} {symbol}")
+            logger.info(f"   💵 Size: ${size_usd:.2f} | Amount: {amount:.6f}")
+            logger.info(f"   📊 Leverage: {leverage}x | Price: ${price:.4f}")
+            logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
+            
+            return {
+                'id': order.get('id'),
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'price': price,
+                'cost': size_usd,
+                'status': order.get('status', 'filled'),
+                'timestamp': int(datetime.now().timestamp() * 1000)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ BINANCE ORDER FAILED: {side} {symbol} | Error: {e}")
+            return None
+    
+    async def close_position(self, symbol: str, side: str, amount: float) -> dict:
+        """Pozisyon kapat (reduceOnly=True)."""
+        if not self.enabled or not self.exchange:
+            logger.error("❌ LiveBinanceTrader not enabled, close rejected")
+            return None
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            # Kapanış emri - ters yönde reduceOnly
+            close_side = 'sell' if side == 'LONG' else 'buy'
+            order = await self.exchange.create_market_order(
+                ccxt_symbol,
+                close_side,
+                amount,
+                params={'reduceOnly': True}
+            )
+            
+            logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}")
+            logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
+            
+            return {
+                'id': order.get('id'),
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'status': order.get('status', 'filled'),
+                'timestamp': int(datetime.now().timestamp() * 1000)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} | Error: {e}")
+            return None
+    
+    async def close_all_positions(self) -> list:
+        """Tüm açık pozisyonları kapat (Emergency)."""
+        if not self.enabled:
+            return []
+            
+        closed = []
+        positions = await self.get_positions()
+        
+        for pos in positions:
+            result = await self.close_position(
+                pos['symbol'], 
+                pos['side'], 
+                pos['size']
+            )
+            if result:
+                closed.append(result)
+                
+        logger.warning(f"⚠️ EMERGENCY CLOSE: {len(closed)} positions closed")
+        return closed
+
+    def get_status(self) -> dict:
+        """Trader durumu."""
+        return {
+            'enabled': self.enabled,
+            'initialized': self.initialized,
+            'trading_mode': self.trading_mode,
+            'last_balance': self.last_balance,
+            'position_count': len(self.last_positions),
+            'last_sync': self.last_sync_time
+        }
+
+
+# Global LiveBinanceTrader instance
+live_binance_trader = LiveBinanceTrader()
+
 
 # Forward declaration for background tasks
 background_scanner_task = None
 position_updater_task = None
+binance_sync_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: start background scanner and position updater on startup."""
-    global background_scanner_task, position_updater_task
+    global background_scanner_task, position_updater_task, binance_sync_task
     
     # Initialize SQLite database
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
+    
+    # Initialize LiveBinanceTrader (if TRADING_MODE is live)
+    # Note: Read TRADING_MODE here (after secrets are loaded) and update the trader
+    trading_mode = os.environ.get('TRADING_MODE', 'paper')
+    live_binance_trader.trading_mode = trading_mode  # Update trading mode from env
+    logger.info(f"📊 Trading Mode: {trading_mode.upper()}")
+    
+    if trading_mode == 'live':
+        try:
+            logger.info("🔌 Initializing LiveBinanceTrader...")
+            success = await live_binance_trader.initialize()
+            if success:
+                logger.info("✅ LiveBinanceTrader ready for real trading!")
+                # Start Binance position sync loop
+                binance_sync_task = asyncio.create_task(binance_position_sync_loop())
+                logger.info("🔄 Binance position sync loop started!")
+            else:
+                logger.error("❌ LiveBinanceTrader failed to initialize!")
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: LiveBinanceTrader initialization error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    else:
+        logger.info("📄 Paper trading mode - no Binance connection")
     
     # Start Liquidation Tracker
     logger.info("💀 Starting Liquidation Tracker...")
@@ -519,13 +807,57 @@ async def lifespan(app: FastAPI):
     
     # Shutdown: stop all tasks
     logger.info("🛑 Shutting down Background Tasks...")
-    for task in [background_scanner_task, position_updater_task]:
+    for task in [background_scanner_task, position_updater_task, binance_sync_task]:
         if task:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+    
+    # Close Binance connection
+    if live_binance_trader.exchange:
+        await live_binance_trader.exchange.close()
+        logger.info("🔌 Binance connection closed")
+
+
+async def binance_position_sync_loop():
+    """
+    Binance'den pozisyon/bakiye senkronizasyonu (her 5 saniye).
+    Live trading modunda Binance'deki gerçek pozisyonları UI'a yansıtır.
+    """
+    logger.info("🔄 Binance Position Sync Loop started")
+    
+    while True:
+        try:
+            if live_binance_trader.enabled:
+                # Bakiye güncelle
+                balance = await live_binance_trader.get_balance()
+                
+                # PaperTradingEngine bakiyesini Binance'den al
+                global_paper_trader.balance = balance['total']
+                
+                # Pozisyonları güncelle (Binance'den)
+                positions = await live_binance_trader.get_positions()
+                
+                # Sync timestamp
+                live_binance_trader.last_sync_time = int(datetime.now().timestamp() * 1000)
+                
+                # UI'a broadcast et
+                await ui_ws_manager.broadcast('binance_sync', {
+                    'balance': balance,
+                    'positions': positions,
+                    'position_count': len(positions),
+                    'sync_time': live_binance_trader.last_sync_time,
+                    'trading_mode': 'live'
+                })
+                
+                logger.debug(f"Binance sync: ${balance['total']:.2f} | {len(positions)} positions")
+                
+        except Exception as e:
+            logger.error(f"Binance sync error: {e}")
+        
+        await asyncio.sleep(5)
 
 app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0", lifespan=lifespan)
 
@@ -8331,12 +8663,47 @@ class PaperTradingEngine:
             "zScore": order.get('zScore', 0)
         }
         
+        # =====================================================================
+        # LIVE TRADING: Send order to Binance before creating local position
+        # =====================================================================
+        if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
+            try:
+                logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance...")
+                binance_order = asyncio.create_task(
+                    live_binance_trader.place_market_order(
+                        symbol=symbol,
+                        side=side,
+                        size_usd=order['sizeUsd'],
+                        leverage=order['leverage']
+                    )
+                )
+                # Wait for the order to complete
+                result = asyncio.get_event_loop().run_until_complete(binance_order)
+                
+                if result:
+                    new_position['binance_order_id'] = result.get('id')
+                    new_position['binance_fill_price'] = result.get('price', fill_price)
+                    new_position['isLive'] = True
+                    logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')}")
+                else:
+                    logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
+                    self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi")
+                    return  # Don't create position if Binance order failed
+                    
+            except Exception as e:
+                logger.error(f"❌ LIVE ORDER ERROR: {e}")
+                self.add_log(f"❌ LIVE TRADING HATASI: {side} {symbol} - {str(e)[:50]}")
+                return  # Don't create position if there was an error
+        
         # Paper Trading: Initial Margin = Position Size / Leverage
         # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
         leverage = new_position.get('leverage', 10)
         initial_margin = new_position['sizeUsd'] / leverage
         new_position['initialMargin'] = initial_margin  # Store for close calculation
-        self.balance -= initial_margin
+        
+        # Live trading'de bakiyeyi düşürme - Binance zaten düşürdü
+        if not live_binance_trader.enabled:
+            self.balance -= initial_margin
         
         self.positions.append(new_position)
         
@@ -8347,9 +8714,10 @@ class PaperTradingEngine:
         else:
             improvement = ((fill_price - signal_price) / signal_price) * 100
         
-        self.add_log(f"✅ PENDING FILLED: {side} {order['symbol']} @ ${fill_price:.4f} | Improvement: {improvement:.2f}% | Lev: {order['leverage']}x")
+        live_tag = "🔴 LIVE" if live_binance_trader.enabled else "📄 PAPER"
+        self.add_log(f"✅ {live_tag} FILLED: {side} {order['symbol']} @ ${fill_price:.4f} | Improvement: {improvement:.2f}% | Lev: {order['leverage']}x")
         self.save_state()
-        logger.info(f"✅ PENDING FILLED: {side} {order['symbol']} @ {fill_price} (improvement: {improvement:.2f}%)")
+        logger.info(f"✅ {live_tag} FILLED: {side} {order['symbol']} @ {fill_price} (improvement: {improvement:.2f}%)")
     
     # =========================================================================
     # PHASE 20: ADVANCED RISK MANAGEMENT METHODS
@@ -9028,6 +9396,32 @@ class PaperTradingEngine:
                         self.close_position(pos, current_price, 'TP')
 
     def close_position(self, pos: Dict, exit_price: float, reason: str):
+        # =====================================================================
+        # LIVE TRADING: Close position on Binance first
+        # =====================================================================
+        if live_binance_trader.enabled and pos.get('isLive', False):
+            try:
+                symbol = pos.get('symbol', '')
+                side = pos.get('side', 'LONG')
+                amount = pos.get('size', 0)
+                
+                logger.info(f"🔴 LIVE CLOSE: Closing {side} {symbol} on Binance...")
+                
+                # Create async task for closing
+                close_task = asyncio.create_task(
+                    live_binance_trader.close_position(symbol, side, amount)
+                )
+                result = asyncio.get_event_loop().run_until_complete(close_task)
+                
+                if not result:
+                    logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
+                    self.add_log(f"❌ BINANCE KAPANIŞ HATASI: {side} {symbol}")
+                    # Continue anyway to keep positions in sync
+                    
+            except Exception as e:
+                logger.error(f"❌ LIVE CLOSE ERROR: {e}")
+                # Continue anyway
+        
         if pos['side'] == 'LONG':
             pnl = (exit_price - pos['entryPrice']) * pos['size']
         else:
@@ -9036,7 +9430,11 @@ class PaperTradingEngine:
         # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
         # Initial Margin = sizeUsd / leverage (açılışta düşülen miktar)
         initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))
-        self.balance += initial_margin + pnl  # Teminatı geri al + kâr/zarar
+        
+        # Live trading'de bakiye Binance'den senkronize edilir
+        if not live_binance_trader.enabled:
+            self.balance += initial_margin + pnl  # Teminatı geri al + kâr/zarar
+            
         self.positions.remove(pos)
         
         trade = {
@@ -9053,6 +9451,7 @@ class PaperTradingEngine:
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
             "leverage": pos.get('leverage', 10),
+            "isLive": pos.get('isLive', False),  # Mark if it was a live trade
             # Phase 49: Carry forward analysis data for post-trade analysis
             "signalScore": pos.get('signalScore', 0),
             "mtfScore": pos.get('mtfScore', 0),
@@ -9088,10 +9487,11 @@ class PaperTradingEngine:
         self.update_coin_stats(symbol, is_win, pnl)
         
         # Phase 19: Log position close
+        live_tag = "🔴 LIVE" if pos.get('isLive', False) else "📄 PAPER"
         emoji = "✅" if pnl > 0 else "❌"
-        self.add_log(f"{emoji} POZİSYON KAPANDI [{reason}]: {pos['side']} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
+        self.add_log(f"{emoji} {live_tag} KAPANDI [{reason}]: {pos['side']} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
         self.save_state()
-        logger.info(f"✅ CLOSE POSITION: {reason} PnL: {pnl:.2f}")
+        logger.info(f"✅ {live_tag} CLOSE: {reason} PnL: {pnl:.2f}")
         
         # Phase 52: Post-trade tracking for 24h analysis
         try:
@@ -9815,6 +10215,18 @@ async def health_check():
     """Health check endpoint."""
     return JSONResponse({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
+@app.get("/server-ip")
+async def server_ip():
+    """Get server's outbound IP for Binance whitelisting."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.ipify.org?format=json", timeout=aiohttp.ClientTimeout(total=10)) as response:
+                data = await response.json()
+                return JSONResponse({"outbound_ip": data.get("ip"), "region": os.environ.get("FLY_REGION", "unknown")})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 # Phase 16: Global Paper Trader for REST API access
 global_paper_trader = PaperTradingEngine()
 
@@ -9830,8 +10242,112 @@ async def paper_trading_status():
         "stats": stats_with_today,
         "enabled": global_paper_trader.enabled,
         "logs": global_paper_trader.logs[-100:],  # Last 100 logs
-        "equityCurve": global_paper_trader.equity_curve[-200:]  # Last 200 points
+        "equityCurve": global_paper_trader.equity_curve[-200:],  # Last 200 points
+        "tradingMode": live_binance_trader.trading_mode,  # paper or live
+        "liveEnabled": live_binance_trader.enabled
     })
+
+
+# ============================================================================
+# LIVE TRADING ENDPOINTS
+# ============================================================================
+
+@app.get("/live-trading/status")
+async def live_trading_status():
+    """Get live trading status - Binance connection and positions."""
+    
+    # Check environment variable directly (not cached value from import time)
+    env_trading_mode = os.environ.get('TRADING_MODE', 'paper')
+    init_error = None
+    
+    # Auto-initialize if TRADING_MODE is live and exchange not yet created
+    # Use same logic as test-connection: check exchange object, not enabled flag
+    if env_trading_mode == 'live' and not live_binance_trader.exchange:
+        live_binance_trader.trading_mode = env_trading_mode
+        try:
+            success = await live_binance_trader.initialize()
+            if not success:
+                init_error = getattr(live_binance_trader, 'last_error', 'Initialize returned False')
+        except Exception as e:
+            init_error = str(e)
+            logger.error(f"Live trading init error: {e}")
+    
+    if not live_binance_trader.enabled:
+        return JSONResponse({
+            "enabled": False,
+            "trading_mode": env_trading_mode,
+            "message": "Live trading not enabled. Set TRADING_MODE=live to activate.",
+            "init_error": init_error or getattr(live_binance_trader, 'last_error', None)
+        })
+    
+    try:
+        balance = await live_binance_trader.get_balance()
+        positions = await live_binance_trader.get_positions()
+        
+        return JSONResponse({
+            "enabled": True,
+            "trading_mode": "live",
+            "balance": balance,
+            "positions": positions,
+            "position_count": len(positions),
+            "last_sync": live_binance_trader.last_sync_time,
+            "status": live_binance_trader.get_status()
+        })
+    except Exception as e:
+        return JSONResponse({
+            "enabled": True,
+            "trading_mode": "live",
+            "error": str(e)
+        }, status_code=500)
+
+
+@app.post("/live-trading/emergency-close")
+async def live_trading_emergency_close():
+    """Emergency close all positions on Binance."""
+    if not live_binance_trader.enabled:
+        return JSONResponse({
+            "success": False,
+            "message": "Live trading not enabled"
+        }, status_code=400)
+    
+    try:
+        closed = await live_binance_trader.close_all_positions()
+        return JSONResponse({
+            "success": True,
+            "closed_positions": len(closed),
+            "details": closed
+        })
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
+
+@app.post("/live-trading/test-connection")
+async def live_trading_test_connection():
+    """Test Binance API connection."""
+    try:
+        if not live_binance_trader.exchange:
+            # Try to initialize
+            success = await live_binance_trader.initialize()
+            if not success:
+                return JSONResponse({
+                    "success": False,
+                    "message": "Failed to initialize Binance connection"
+                }, status_code=400)
+        
+        balance = await live_binance_trader.get_balance()
+        return JSONResponse({
+            "success": True,
+            "message": "Binance connection successful!",
+            "balance": balance
+        })
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
 
 @app.post("/paper-trading/reset")
 async def paper_trading_reset():

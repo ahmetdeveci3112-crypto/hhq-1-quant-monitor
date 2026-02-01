@@ -372,15 +372,39 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
 
-          // Sync portfolio state
-          setPortfolio({
-            balanceUsd: data.balance || 10000,
-            initialBalance: 10000,
-            positions: data.positions || [],
-            trades: data.trades || [],
-            equityCurve: data.equityCurve || [],
-            stats: data.stats || INITIAL_STATS
-          });
+          // Check if live trading is enabled - use live data instead of paper data
+          if (data.tradingMode === 'live' && data.liveEnabled) {
+            try {
+              const liveRes = await fetch(`${BACKEND_API_URL}/live-trading/status`);
+              if (liveRes.ok) {
+                const liveData = await liveRes.json();
+                if (liveData.enabled) {
+                  // Use real Binance data
+                  setPortfolio({
+                    balanceUsd: liveData.balance?.total || liveData.balance?.free || 0,
+                    initialBalance: liveData.balance?.total || 0, // No fixed initial for live
+                    positions: liveData.positions || [],
+                    trades: data.trades || [], // Keep paper trades for history
+                    equityCurve: data.equityCurve || [],
+                    stats: data.stats || INITIAL_STATS
+                  });
+                  console.log('📡 Live trading data synced from Binance');
+                }
+              }
+            } catch (liveErr) {
+              console.error('Failed to fetch live trading status:', liveErr);
+            }
+          } else {
+            // Sync portfolio state from paper trading
+            setPortfolio({
+              balanceUsd: data.balance || 10000,
+              initialBalance: 10000,
+              positions: data.positions || [],
+              trades: data.trades || [],
+              equityCurve: data.equityCurve || [],
+              stats: data.stats || INITIAL_STATS
+            });
+          }
 
           // Sync auto trade state
           setAutoTradeEnabled(data.enabled);
