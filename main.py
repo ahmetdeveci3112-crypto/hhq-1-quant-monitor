@@ -577,11 +577,15 @@ class LiveBinanceTrader:
     
     async def get_positions(self) -> list:
         """Binance'den açık pozisyonları çek."""
+        logger.info(f"get_positions called: enabled={self.enabled}, exchange={self.exchange is not None}")
+        
         if not self.enabled or not self.exchange:
+            logger.warning(f"get_positions early return: enabled={self.enabled}, exchange={self.exchange is not None}")
             return []
             
         try:
             positions = await self.exchange.fetch_positions()
+            logger.info(f"fetch_positions returned {len(positions)} items")
             result = []
             
             for p in positions:
@@ -589,6 +593,7 @@ class LiveBinanceTrader:
                 if abs(contracts) > 0:
                     # CCXT symbol format: BTC/USDT:USDT -> BTCUSDT
                     symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
+                    logger.info(f"Found active position: {symbol} contracts={contracts}")
                     
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
@@ -600,13 +605,14 @@ class LiveBinanceTrader:
                         'markPrice': float(p.get('markPrice', 0)),
                         'unrealizedPnl': float(p.get('unrealizedPnl', 0)),
                         'unrealizedPnlPercent': float(p.get('percentage', 0)),
-                        'leverage': int(p.get('leverage', 1)),
+                        'leverage': int(p.get('leverage') or 1),
                         'liquidationPrice': float(p.get('liquidationPrice', 0)),
                         'marginType': p.get('marginMode', 'cross'),
                         'openTime': int(datetime.now().timestamp() * 1000),  # Binance doesn't provide this
                         'isLive': True  # Mark as live position
                     })
             
+            logger.info(f"get_positions returning {len(result)} active positions")
             self.last_positions = result
             return result
             
@@ -10348,6 +10354,43 @@ async def live_trading_test_connection():
             "success": False,
             "error": str(e)
         }, status_code=500)
+
+@app.get("/live-trading/raw-positions")
+async def live_trading_raw_positions():
+    """Debug: Get raw positions from Binance API."""
+    try:
+        if not live_binance_trader.exchange:
+            return JSONResponse({"error": "Exchange not initialized"}, status_code=400)
+        
+        # Get raw positions from Binance
+        raw_positions = await live_binance_trader.exchange.fetch_positions()
+        
+        # Filter only positions with any activity
+        active = []
+        for p in raw_positions:
+            contracts = float(p.get('contracts', 0))
+            notional = float(p.get('notional', 0))
+            if abs(contracts) > 0 or abs(notional) > 0:
+                active.append({
+                    'symbol': p.get('symbol'),
+                    'contracts': contracts,
+                    'notional': notional,
+                    'entryPrice': p.get('entryPrice'),
+                    'markPrice': p.get('markPrice'),
+                    'side': p.get('side'),
+                    'leverage': p.get('leverage'),
+                    'unrealizedPnl': p.get('unrealizedPnl'),
+                    'marginMode': p.get('marginMode'),
+                    'raw_info': p.get('info', {})  # Include raw Binance response
+                })
+        
+        return JSONResponse({
+            "total_symbols": len(raw_positions),
+            "active_positions": len(active),
+            "positions": active
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/paper-trading/reset")
 async def paper_trading_reset():

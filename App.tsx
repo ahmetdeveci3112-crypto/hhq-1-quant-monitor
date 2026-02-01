@@ -269,6 +269,7 @@ export default function App() {
   // Phase 16: Auto-trade enabled state
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(true);
   const [isSynced, setIsSynced] = useState(false); // Phase 27: Prevent race conditions
+  const [isLiveMode, setIsLiveMode] = useState(false); // Live trading mode flag
 
   // Phase 52: AI Optimizer state
   const [optimizerStats, setOptimizerStats] = useState({
@@ -388,6 +389,7 @@ export default function App() {
                     equityCurve: data.equityCurve || [],
                     stats: data.stats || INITIAL_STATS
                   });
+                  setIsLiveMode(true); // Mark as live mode
                   console.log('📡 Live trading data synced from Binance');
                 }
               }
@@ -763,12 +765,12 @@ export default function App() {
               setScannerStats(data.stats);
             }
 
-            // Update portfolio from scanner
-            if (data.portfolio) {
+            // Update portfolio from scanner - SKIP if in live trading mode
+            if (data.portfolio && !isLiveMode) {
               const pf = data.portfolio;
               setPortfolio({
-                balanceUsd: pf.balance || 10000,
-                initialBalance: 10000,
+                balanceUsd: pf.balance || 0,
+                initialBalance: 0,
                 positions: pf.positions || [],
                 trades: pf.trades || [],
                 equityCurve: [],
