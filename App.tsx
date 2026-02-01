@@ -433,8 +433,8 @@ export default function App() {
           } else {
             // Sync portfolio state from paper trading
             setPortfolio({
-              balanceUsd: data.balance || 10000,
-              initialBalance: 10000,
+              balanceUsd: data.balance || 0,
+              initialBalance: data.balance || 0,
               positions: data.positions || [],
               trades: data.trades || [],
               equityCurve: data.equityCurve || [],
@@ -921,12 +921,12 @@ export default function App() {
         if (!prev.equityCurve || prev.equityCurve.length === 0) {
           return {
             ...prev,
-            equityCurve: [{ time: Date.now(), balance: prev.balanceUsd || 10000, drawdown: 0 }]
+            equityCurve: [{ time: Date.now(), balance: prev.balanceUsd || 0, drawdown: 0 }]
           };
         }
 
         const lastPoint = prev.equityCurve[prev.equityCurve.length - 1];
-        const currentEquity = (prev.balanceUsd || 10000) +
+        const currentEquity = (prev.balanceUsd || 0) +
           (prev.positions || []).reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
 
         // Only add new point if significant change or every minute
@@ -1083,29 +1083,29 @@ export default function App() {
 
             {/* Compact Wallet Summary Bar */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-4 lg:px-6 py-3 lg:py-4">
-              {/* Mobile: Grid Layout - iyileştirilmiş boyutlar */}
+              {/* Mobile: Grid Layout - Simplified balance display */}
               <div className="grid grid-cols-2 gap-4 lg:hidden">
                 <div className="col-span-2">
                   <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
                   <div className="text-2xl font-bold text-white font-mono">
-                    {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.marginBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
+                    {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                     <span className="text-sm text-slate-500 ml-1">USDT</span>
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Wallet</div>
-                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.walletBalance : (10000 + portfolio.stats.totalPnl))}</div>
+                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Unrealized</div>
-                  <div className={`text-base font-semibold font-mono ${(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                  <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Available</div>
                   <div className="text-base font-semibold text-cyan-400 font-mono">
-                    {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.availableBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
+                    {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                   </div>
                 </div>
                 <div>
@@ -1123,29 +1123,29 @@ export default function App() {
                 <div className="col-span-2">
                   <div className="text-xs text-slate-500 uppercase">Toplam Kazanç</div>
                   <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
+                    {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({portfolio.balanceUsd > 0 ? ((portfolio.stats.totalPnl / portfolio.balanceUsd) * 100).toFixed(2) : '0.00'}%)
                   </div>
                 </div>
               </div>
-              {/* Desktop: Flex Layout */}
+              {/* Desktop: Flex Layout - Simplified balance display */}
               <div className="hidden lg:flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-8">
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
                     <div className="text-xl font-bold text-white font-mono">
-                      {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.marginBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
+                      {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                       <span className="text-xs text-slate-500 ml-1">USDT</span>
                     </div>
                   </div>
                   <div className="h-8 w-px bg-slate-800"></div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Wallet Balance</div>
-                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.walletBalance : (10000 + portfolio.stats.totalPnl))}</div>
+                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>
-                    <div className={`text-base font-semibold font-mono ${(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                     </div>
                   </div>
                 </div>
@@ -1153,7 +1153,7 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
                     <div className="text-base font-semibold text-cyan-400 font-mono">
-                      {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.availableBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
+                      {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                     </div>
                   </div>
                   <div>
@@ -1171,7 +1171,7 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Toplam Kazanç</div>
                     <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({((portfolio.stats.totalPnl / 10000) * 100).toFixed(2)}%)
+                      {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({portfolio.balanceUsd > 0 ? ((portfolio.stats.totalPnl / portfolio.balanceUsd) * 100).toFixed(2) : '0.00'}%)
                     </div>
                   </div>
                 </div>
