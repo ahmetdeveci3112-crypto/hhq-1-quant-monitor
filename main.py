@@ -833,27 +833,32 @@ class LiveBinanceTrader:
             today_start = now_turkey.replace(hour=0, minute=0, second=0, microsecond=0)
             today_start_ms = int(today_start.timestamp() * 1000)
             
-            # Fetch income history from Binance (REALIZED_PNL type)
-            # This gives us all realized PnL from closed positions
-            params = {
-                'incomeType': 'REALIZED_PNL',
-                'limit': 1000  # Max allowed
-            }
-            
-            all_income = await self.exchange.fapiPrivate_get_income(params)
+            # Fetch income history from Binance (all types for accurate Today's PnL)
+            # Binance Today's PnL includes: REALIZED_PNL, FUNDING_FEE, COMMISSION, etc.
+            # CCXT async uses camelCase: fapiPrivateGetIncome
+            all_income = await self.exchange.fapiPrivateGetIncome({
+                'limit': 1000  # All income types, max allowed
+            })
             
             today_pnl = 0.0
             total_pnl = 0.0
             today_trades_count = 0
             
+            logger.info(f"📊 Income history: {len(all_income)} entries, today_start_ms={today_start_ms}")
+            
             for income in all_income:
+                income_type = income.get('incomeType', '')
                 pnl = float(income.get('income', 0))
                 timestamp = int(income.get('time', 0))
-                total_pnl += pnl
                 
-                if timestamp >= today_start_ms:
-                    today_pnl += pnl
-                    today_trades_count += 1
+                # Only count trading-related income (exclude transfers, deposits)
+                if income_type in ['REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION']:
+                    total_pnl += pnl
+                    
+                    if timestamp >= today_start_ms:
+                        today_pnl += pnl
+                        today_trades_count += 1
+                        logger.info(f"  📈 Today: {income_type} ${pnl:.4f} @ {timestamp}")
             
             # Calculate percentages based on wallet balance
             wallet_balance = self.last_balance if self.last_balance > 0 else 100
