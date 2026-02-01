@@ -595,17 +595,36 @@ class LiveBinanceTrader:
                     symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
                     logger.info(f"Found active position: {symbol} contracts={contracts}")
                     
+                    # Get raw Binance info for accurate data
+                    raw_info = p.get('info', {})
+                    notional = abs(float(p.get('notional', 0)))
+                    position_margin = float(raw_info.get('positionInitialMargin', 0) or raw_info.get('initialMargin', 0) or 0)
+                    
+                    # Calculate leverage from notional/margin
+                    if position_margin > 0:
+                        calculated_leverage = int(round(notional / position_margin))
+                    else:
+                        calculated_leverage = int(p.get('leverage') or 1)
+                    
+                    # Calculate PnL percentage based on margin (ROI)
+                    unrealized_pnl = float(p.get('unrealizedPnl', 0))
+                    if position_margin > 0:
+                        pnl_percent = (unrealized_pnl / position_margin) * 100
+                    else:
+                        pnl_percent = float(p.get('percentage', 0))
+                    
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
                         'symbol': symbol,
                         'side': 'LONG' if contracts > 0 else 'SHORT',
                         'size': abs(contracts),
-                        'sizeUsd': abs(float(p.get('notional', 0))),
+                        'sizeUsd': notional,
                         'entryPrice': float(p.get('entryPrice', 0)),
                         'markPrice': float(p.get('markPrice', 0)),
-                        'unrealizedPnl': float(p.get('unrealizedPnl', 0)),
-                        'unrealizedPnlPercent': float(p.get('percentage', 0)),
-                        'leverage': int(p.get('leverage') or 1),
+                        'unrealizedPnl': unrealized_pnl,
+                        'unrealizedPnlPercent': pnl_percent,
+                        'leverage': calculated_leverage,
+                        'margin': position_margin,  # Add margin for UI
                         'liquidationPrice': float(p.get('liquidationPrice', 0)),
                         'marginType': p.get('marginMode', 'cross'),
                         'openTime': int(datetime.now().timestamp() * 1000),  # Binance doesn't provide this

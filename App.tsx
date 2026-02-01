@@ -1004,13 +1004,13 @@ export default function App() {
                 <div className="col-span-2">
                   <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
                   <div className="text-2xl font-bold text-white font-mono">
-                    {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                     <span className="text-sm text-slate-500 ml-1">USDT</span>
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Wallet</div>
-                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
+                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl))}</div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Unrealized</div>
@@ -1049,14 +1049,14 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
                     <div className="text-xl font-bold text-white font-mono">
-                      {formatCurrency((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                      {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                       <span className="text-xs text-slate-500 ml-1">USDT</span>
                     </div>
                   </div>
                   <div className="h-8 w-px bg-slate-800"></div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Wallet Balance</div>
-                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(10000 + portfolio.stats.totalPnl)}</div>
+                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl))}</div>
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>

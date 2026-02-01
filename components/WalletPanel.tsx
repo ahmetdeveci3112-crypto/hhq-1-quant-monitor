@@ -8,6 +8,7 @@ interface WalletPanelProps {
     realizedPnl: number;  // From backend stats.totalPnl
     positions: Position[];
     initialBalance: number;
+    isLiveMode?: boolean;  // When true, use walletBalance directly from Binance
 }
 
 const formatCurrency = (value: number): string => {
@@ -24,9 +25,11 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
     realizedPnl,
     positions,
     initialBalance = 10000,
+    isLiveMode = false,
 }) => {
-    // Wallet Balance = Initial Balance + Realized PnL (settled funds)
-    const walletBalanceCalc = initialBalance + realizedPnl;
+    // In live mode, use walletBalance directly from Binance
+    // In paper mode, calculate: Initial Balance + Realized PnL
+    const walletBalanceCalc = isLiveMode ? walletBalance : (initialBalance + realizedPnl);
 
     // Margin Balance = Wallet Balance + Unrealized PnL (total equity)
     const marginBalance = walletBalanceCalc + unrealizedPnl;
@@ -34,9 +37,9 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
     // Realized PnL percentage (from initial balance)
     const realizedPnlPercent = (realizedPnl / initialBalance) * 100;
 
-    // Total Used Margin
+    // Total Used Margin - use margin field from backend if available
     const usedMargin = positions.reduce((sum, p) => {
-        const margin = (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10);
+        const margin = (p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10);
         return sum + margin;
     }, 0);
 
@@ -124,7 +127,8 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
 }) => {
     const isLong = position.side === 'LONG';
     const pnl = position.unrealizedPnl || 0;
-    const margin = (position as any).initialMargin || (position.sizeUsd || 0) / (position.leverage || 10);
+    // Use margin field from backend if available
+    const margin = (position as any).margin || (position as any).initialMargin || (position.sizeUsd || 0) / (position.leverage || 10);
     const roi = margin > 0 ? (pnl / margin) * 100 : 0;
     const sizeCoins = position.size || 0;
     const symbol = position.symbol.replace('USDT', '');
