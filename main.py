@@ -10758,7 +10758,9 @@ async def live_trading_status():
         positions = await live_binance_trader.get_positions()
         pnl_data = await live_binance_trader.get_pnl_from_binance()
         # Phase 93: Add trade history
+        logger.info("Phase 93: Calling get_trade_history...")
         trades = await live_binance_trader.get_trade_history(limit=50, days_back=7)
+        logger.info(f"Phase 93: Got {len(trades) if trades else 0} trades from get_trade_history")
         
         return JSONResponse({
             "enabled": True,
