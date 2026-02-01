@@ -1166,8 +1166,9 @@ async def binance_position_sync_loop():
         except Exception as e:
             logger.error(f"Binance sync error: {e}")
         
-        # Phase 82: Increased interval to 10s (was 5s) - reduces API load by 50%
-        await asyncio.sleep(10)
+        # Phase 86: Reduced interval to 3s (was 10s) - utilizing ~60% of API capacity
+        # Weight calculation: 20 calls/min × 40 weight = 800 weight/min (of 2400 limit)
+        await asyncio.sleep(3)
 
 app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0", lifespan=lifespan)
 
@@ -3505,7 +3506,7 @@ async def background_scanner_loop():
     """
     logger.info("🔄 Background Scanner Loop started - running 24/7")
     
-    scan_interval = 5  # Scan every 5 seconds (faster for position monitoring)
+    scan_interval = 3  # Phase 86: Reduced to 3s for faster signal detection (~60% API capacity)
     
     # Wait for app to fully initialize
     await asyncio.sleep(3)
