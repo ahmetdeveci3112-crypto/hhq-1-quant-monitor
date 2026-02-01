@@ -1037,8 +1037,14 @@ async def binance_position_sync_loop():
                     'unrealizedPnl': balance.get('unrealizedPnl', 0)
                 }
                 
-                # Pozisyonları güncelle (Binance'den)
-                binance_positions = await live_binance_trader.get_positions()
+                # Pozisyonları güncelle (Binance'den) - FAST MODE to reduce API calls
+                # Phase 82: Use fast=True (1 API call instead of 21+)
+                # Binance limits: 2400 weight/min - fast mode uses ~5 weight vs ~110 weight
+                binance_positions = await live_binance_trader.get_positions(fast=True)
+                logger.info(f"📊 Binance sync: {len(binance_positions)} positions from API")
+                
+                # Store for fallback access
+                live_binance_trader.last_positions = binance_positions
                 
                 # ================================================================
                 # Phase 72: Sync ALL Binance positions into PaperTradingEngine
@@ -1127,6 +1133,11 @@ async def binance_position_sync_loop():
                 # Sync timestamp
                 live_binance_trader.last_sync_time = int(datetime.now().timestamp() * 1000)
                 
+                # Phase 83: Position count verification
+                engine_live_count = len([p for p in global_paper_trader.positions if p.get('isLive')])
+                if len(binance_positions) != engine_live_count:
+                    logger.warning(f"⚠️ Position mismatch: Binance={len(binance_positions)}, Engine={engine_live_count}")
+                
                 # UI'a broadcast et
                 await ui_ws_manager.broadcast('binance_sync', {
                     'balance': balance,
@@ -1136,12 +1147,13 @@ async def binance_position_sync_loop():
                     'trading_mode': 'live'
                 })
                 
-                logger.debug(f"Binance sync: ${balance['total']:.2f} | {len(binance_positions)} positions")
+                logger.info(f"✅ Sync complete: ${balance['total']:.2f} | {len(binance_positions)} positions | Engine: {engine_live_count}")
                 
         except Exception as e:
             logger.error(f"Binance sync error: {e}")
         
-        await asyncio.sleep(5)
+        # Phase 82: Increased interval to 10s (was 5s) - reduces API load by 50%
+        await asyncio.sleep(10)
 
 app = FastAPI(title="HHQ-1 Quant Backend", version="2.0.0", lifespan=lifespan)
 
