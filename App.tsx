@@ -412,105 +412,29 @@ export default function App() {
   const uiWsConnected = true; // Placeholder - scanner WS handles all data now
   const uiWsStatus = 'connected'; // Placeholder
 
-  // Phase 31: Fetch initial state from backend on page load (24/7 sync)
+
+  // Phase 96: SINGLE SOURCE OF TRUTH - Scanner WebSocket handles ALL data
+  // DISABLED: REST API was causing 5-10 second delay and data conflicts
+  // The scanner WebSocket sends complete initial state on connect
   useEffect(() => {
-    const fetchInitialState = async () => {
+    const fetchMinimalState = async () => {
+      // Only fetch scanner running status - everything else comes from WebSocket
       try {
-        const res = await fetch(`${BACKEND_API_URL}/paper-trading/status`);
-        if (res.ok) {
-          const data = await res.json();
-
-          // Check if live trading is enabled - use live data instead of paper data
-          if (data.tradingMode === 'live' && data.liveEnabled) {
-            try {
-              const liveRes = await fetch(`${BACKEND_API_URL}/live-trading/status`);
-              if (liveRes.ok) {
-                const liveData = await liveRes.json();
-                if (liveData.enabled) {
-                  // Use correct Binance Futures balance fields
-                  const balance = liveData.balance || {};
-                  const walletBalance = balance.walletBalance || balance.total || 0;
-                  const marginBalance = balance.marginBalance || balance.total || 0;
-                  const availableBalance = balance.availableBalance || balance.free || 0;
-                  const unrealizedPnl = balance.unrealizedPnl || 0;
-
-                  setPortfolio({
-                    balanceUsd: walletBalance,           // Wallet Balance (shown as "WALLET" in UI)
-                    initialBalance: walletBalance,       // Use wallet as initial for accurate calculation
-                    positions: liveData.positions || [],
-                    trades: data.trades || [], // Keep paper trades for history
-                    equityCurve: data.equityCurve || [],
-                    stats: {
-                      ...INITIAL_STATS,
-                      ...data.stats,
-                      // Live PnL from Binance income history (backend calculated)
-                      todayPnl: liveData.todayPnl || 0,
-                      todayPnlPercent: liveData.todayPnlPercent || 0,
-                      totalPnl: liveData.totalPnl || 0,
-                      totalPnlPercent: liveData.totalPnlPercent || 0,
-                      // Store live balance details in stats for UI access
-                      liveBalance: {
-                        walletBalance,
-                        marginBalance,
-                        availableBalance,
-                        unrealizedPnl
-                      }
-                    }
-                  });
-                  setIsLiveMode(true); // Mark as live mode
-                  isLiveModeRef.current = true; // Update ref for callbacks
-                  tradingModeKnownRef.current = true; // Allow future updates
-                  console.log('📡 Live trading data synced from Binance');
-                }
-              }
-            } catch (liveErr) {
-              console.error('Failed to fetch live trading status:', liveErr);
-            }
-          } else {
-            // Sync portfolio state from paper trading
-            setPortfolio({
-              balanceUsd: data.balance || 0,
-              initialBalance: data.balance || 0,
-              positions: data.positions || [],
-              trades: data.trades || [],
-              equityCurve: data.equityCurve || [],
-              stats: data.stats || INITIAL_STATS
-            });
-            tradingModeKnownRef.current = true; // Allow future updates
-          }
-
-          // Sync auto trade state
-          setAutoTradeEnabled(data.enabled);
-
-          // Fetch scanner running status
-          try {
-            const scannerRes = await fetch(`${BACKEND_API_URL}/scanner/status`);
-            if (scannerRes.ok) {
-              const scannerData = await scannerRes.json();
-              setIsRunning(scannerData.running);
-            }
-          } catch {
-            // If scanner status fails, default to running if trading is enabled
-            setIsRunning(data.enabled);
-          }
-
-          // Sync logs
-          if (data.logs && data.logs.length > 0) {
-            const formattedLogs = data.logs.map((log: { time: string; message: string }) =>
-              `[${log.time}] ☁️ ${log.message}`
-            );
-            setLogs(formattedLogs.reverse());
-          }
-
-          setIsSynced(true);
-          console.log('📡 Initial state synced from backend');
+        const scannerRes = await fetch(`${BACKEND_API_URL}/scanner/status`);
+        if (scannerRes.ok) {
+          const scannerData = await scannerRes.json();
+          setIsRunning(scannerData.running);
         }
-      } catch (e) {
-        console.error('Failed to fetch initial state:', e);
+      } catch {
+        setIsRunning(true); // Default to running
       }
+
+      // Mark as synced - actual data comes from WebSocket
+      setIsSynced(true);
+      console.log('📊 Phase 96: REST fetch disabled - using WebSocket only');
     };
 
-    fetchInitialState();
+    fetchMinimalState();
   }, []);
 
   // Phase 89: REST API polling DISABLED - WebSocket is the single source of truth
@@ -861,7 +785,7 @@ export default function App() {
                 // Even if not in live mode ref, if we have live balance, use it
                 balanceToUse = liveBalance.walletBalance;
               }
-              console.log('Phase 88 Balance Debug:', { liveBalance, pfBalance: pf.balance, balanceToUse, isLiveMode: isLiveModeRef.current });
+              // Phase 96: Removed noisy debug log
 
               setPortfolio(prev => ({
                 ...prev,

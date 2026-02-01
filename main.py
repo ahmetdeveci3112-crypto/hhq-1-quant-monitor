@@ -11573,15 +11573,32 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             initial_live_balance = None
             initial_positions = []
         
-        # Phase 89: Fetch trades from Binance API (not SQLite) - single source of truth
+        # Phase 96: Use SQLite for trade history - reliable local source
+        # Binance API was failing and not returning any trades
         try:
-            initial_trades = await live_binance_trader.get_trade_history(limit=50, days_back=7)
-            logger.info(f"Phase 89: Fetched {len(initial_trades)} trades from Binance API")
+            sqlite_trades = await sqlite_manager.get_recent_trades(limit=50)
+            # Convert SQLite format to frontend format
+            initial_trades = []
+            for t in sqlite_trades:
+                trade = {
+                    'symbol': t.get('symbol', 'UNKNOWN'),
+                    'side': t.get('side', 'LONG'),
+                    'entryPrice': t.get('entry_price', 0),
+                    'exitPrice': t.get('exit_price', 0),
+                    'pnl': t.get('pnl', 0),
+                    'closeTime': t.get('close_time', 0),
+                    'closeReason': t.get('close_reason', 'Unknown'),
+                    'pnlFormatted': f"+${t.get('pnl', 0):.2f}" if t.get('pnl', 0) >= 0 else f"-${abs(t.get('pnl', 0)):.2f}",
+                    'leverage': t.get('leverage', 1),
+                    'sizeUsd': t.get('size_usd', 0)
+                }
+                initial_trades.append(trade)
+            logger.info(f"Phase 96: Fetched {len(initial_trades)} trades from SQLite")
         except Exception as e:
-            logger.warning(f"Binance trade history fetch failed: {e}")
-            initial_trades = []  # No fallback - Binance is the only source
+            logger.warning(f"SQLite trade fetch failed: {e}")
+            initial_trades = []
         
-        logger.info(f"Phase 89: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
+        logger.info(f"Phase 96: SQLite state - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:
