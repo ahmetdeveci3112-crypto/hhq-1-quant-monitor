@@ -1026,6 +1026,13 @@ async def binance_position_sync_loop():
                 
                 # PaperTradingEngine bakiyesini Binance'den al
                 global_paper_trader.balance = balance['total']
+                # Phase 75: Store full balance details for scanner_update
+                global_paper_trader.liveBalance = {
+                    'walletBalance': balance.get('walletBalance', balance.get('total', 0)),
+                    'marginBalance': balance.get('marginBalance', balance.get('total', 0)),
+                    'availableBalance': balance.get('availableBalance', balance.get('free', 0)),
+                    'unrealizedPnl': balance.get('unrealizedPnl', 0)
+                }
                 
                 # Pozisyonları güncelle (Binance'den)
                 binance_positions = await live_binance_trader.get_positions()
@@ -11356,7 +11363,11 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "balance": global_paper_trader.balance,
                 "positions": global_paper_trader.positions,
                 "trades": global_paper_trader.trades,  # ALL trades
-                "stats": {**global_paper_trader.stats, **global_paper_trader.get_today_pnl()},
+                "stats": {
+                    **global_paper_trader.stats, 
+                    **global_paper_trader.get_today_pnl(),
+                    "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                },
                 "logs": global_paper_trader.logs[-100:],
                 "enabled": global_paper_trader.enabled
             },
@@ -11442,7 +11453,11 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         "balance": global_paper_trader.balance,
                         "positions": global_paper_trader.positions,
                         "trades": global_paper_trader.trades,  # ALL trades
-                        "stats": {**global_paper_trader.stats, **global_paper_trader.get_today_pnl()},
+                        "stats": {
+                            **global_paper_trader.stats, 
+                            **global_paper_trader.get_today_pnl(),
+                            "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                        },
                         "logs": global_paper_trader.logs[-100:],
                         "enabled": global_paper_trader.enabled
                     },

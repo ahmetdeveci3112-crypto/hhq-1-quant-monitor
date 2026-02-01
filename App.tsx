@@ -211,13 +211,13 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  // Paper Trading State
+  // Paper Trading State - Initialize with 0 to prevent paper values flash
   const [portfolio, setPortfolio] = useState<Portfolio>({
-    balanceUsd: 10000,
-    initialBalance: 10000,
+    balanceUsd: 0,
+    initialBalance: 0,
     positions: [],
     trades: [],
-    equityCurve: [{ time: Date.now(), balance: 10000, drawdown: 0 }],
+    equityCurve: [{ time: Date.now(), balance: 0, drawdown: 0 }],
     stats: INITIAL_STATS
   });
 
