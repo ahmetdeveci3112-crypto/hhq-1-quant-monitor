@@ -4023,6 +4023,7 @@ class BTCCorrelationFilter:
         try:
             # Phase 60e: BTC 15m, 30m, 1H, 4H ve 1D verileri çek
             # Rate limit fix: 100ms delay between calls
+            logger.info("📊 Fetching BTC OHLCV data...")
             ohlcv_15m = await exchange.fetch_ohlcv('BTC/USDT', '15m', limit=4)
             await asyncio.sleep(0.1)
             ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)
@@ -4032,6 +4033,7 @@ class BTCCorrelationFilter:
             ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
             await asyncio.sleep(0.1)
             ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)
+            logger.info(f"📊 BTC OHLCV fetched: 15m={len(ohlcv_15m) if ohlcv_15m else 0}, 30m={len(ohlcv_30m) if ohlcv_30m else 0}, 1h={len(ohlcv_1h) if ohlcv_1h else 0}, 4h={len(ohlcv_4h) if ohlcv_4h else 0}, 1d={len(ohlcv_1d) if ohlcv_1d else 0}")
             
             # Phase 60e: 15m momentum hesapla
             if ohlcv_15m and len(ohlcv_15m) >= 2:
@@ -4273,6 +4275,9 @@ class BTCCorrelationFilter:
                     self.eth_trend = "BULLISH"
                 else:
                     self.eth_trend = "NEUTRAL"
+                
+                # ETH State log
+                logger.info(f"📊 ETH State: {self.eth_trend} | 30m:{self.eth_change_30m:.2f}% | 1H:{self.eth_change_1h:.2f}% | 4H:{self.eth_change_4h:.2f}% | Price:${self.eth_price:.2f}")
                     
             except Exception as eth_err:
                 logger.debug(f"ETH fetch error: {eth_err}")
@@ -4320,9 +4325,8 @@ class BTCCorrelationFilter:
                 self.update_interval = self.base_update_interval  # Normal: 2 dakika
             
             self.last_update = now
-            log_level = "warning" if self.emergency_mode else "debug"
-            logger.log(getattr(logging, log_level.upper(), logging.DEBUG), 
-                       f"BTC State: {self.btc_trend} | Daily:{self.btc_trend_daily} | 1H:{self.btc_change_1h:.2f}% | 4H:{self.btc_change_4h:.2f}% | 1D:{self.btc_change_1d:.2f}% | Emergency:{self.emergency_mode} | Interval:{self.update_interval}s")
+            # Her zaman INFO seviyesinde logla (debug görünmüyor)
+            logger.info(f"📊 BTC State: {self.btc_trend} | Daily:{self.btc_trend_daily} | 1H:{self.btc_change_1h:.2f}% | 4H:{self.btc_change_4h:.2f}% | 1D:{self.btc_change_1d:.2f}% | Emergency:{self.emergency_mode} | Interval:{self.update_interval}s")
             
         except Exception as e:
             logger.warning(f"BTC state update failed: {e}")
