@@ -1184,7 +1184,7 @@ export default function App() {
                 {portfolio.positions.length === 0 ? (
                   <div className="text-center py-8 text-slate-600 text-xs">No open positions</div>
                 ) : (
-                  portfolio.positions.map(pos => {
+                  [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                     const storedCurrentPrice = (pos as any).currentPrice;
                     const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
@@ -1277,7 +1277,7 @@ export default function App() {
                         <td colSpan={12} className="py-12 text-center text-slate-600">No open positions</td>
                       </tr>
                     ) : (
-                      portfolio.positions.map(pos => {
+                      [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                         const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                         const storedCurrentPrice = (pos as any).currentPrice;
                         const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
