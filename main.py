@@ -11378,14 +11378,17 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 initial_balance = global_paper_trader.balance
         
         # Phase 79: Fetch positions in fast mode (skip expensive openTime lookup)
+        # NOTE: Do NOT write live positions to global_paper_trader.positions!
+        # That would cause SL check to close them. Only send to frontend for display.
         initial_positions = global_paper_trader.positions
         if live_binance_trader.enabled:
             try:
                 fast_positions = await live_binance_trader.get_positions(fast=True)
                 if fast_positions:
-                    initial_positions = fast_positions
-                    global_paper_trader.positions = fast_positions  # Update cache
-                    logger.info(f"Phase 79: Fast-fetched {len(fast_positions)} positions for initial state")
+                    initial_positions = fast_positions  # Only for frontend display
+                    # DO NOT: global_paper_trader.positions = fast_positions
+                    # This would cause SL check to close live positions!
+                    logger.info(f"Phase 79: Fast-fetched {len(fast_positions)} positions for frontend display")
             except Exception as e:
                 logger.warning(f"Phase 79: Failed to fast-fetch positions: {e}")
         
