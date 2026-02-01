@@ -11358,9 +11358,9 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "lastUpdate": datetime.now().timestamp()
         }
         
-        # Phase 78: Fetch balance from Binance immediately before sending initial state
+        # Phase 78: Always fetch fresh balance from Binance for initial state
         initial_balance = global_paper_trader.balance
-        if live_binance_trader.enabled and initial_balance <= 0:
+        if live_binance_trader.enabled:
             try:
                 balance_data = await live_binance_trader.get_balance()
                 if balance_data:
@@ -11372,9 +11372,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         'availableBalance': balance_data.get('availableBalance', balance_data.get('free', 0)),
                         'unrealizedPnl': balance_data.get('unrealizedPnl', 0)
                     }
-                    logger.info(f"Phase 78: Fetched immediate balance for initial state: ${initial_balance:.2f}")
+                    logger.info(f"Phase 78: Fetched fresh balance for initial state: ${initial_balance:.2f}")
             except Exception as e:
-                logger.warning(f"Phase 78: Failed to fetch immediate balance: {e}")
+                logger.warning(f"Phase 78: Failed to fetch balance, using cached: {e}")
+                initial_balance = global_paper_trader.balance
         
         # Phase 79: Fetch positions in fast mode (skip expensive openTime lookup)
         initial_positions = global_paper_trader.positions
