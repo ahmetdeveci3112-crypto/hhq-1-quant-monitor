@@ -1155,7 +1155,13 @@ async def binance_position_sync_loop():
                     'trading_mode': 'live'
                 })
                 
-                logger.info(f"✅ Sync complete: ${balance['total']:.2f} | {len(binance_positions)} positions | Engine: {engine_live_count}")
+                # Phase 84: Refresh PnL cache every sync cycle for consistent UI display
+                try:
+                    pnl_data = await live_binance_trader.get_pnl_from_binance()
+                    live_binance_trader.cached_pnl = pnl_data
+                    logger.info(f"✅ Sync: ${balance['total']:.2f} | {len(binance_positions)} pos | PnL today=${pnl_data.get('todayPnl', 0):.2f}")
+                except Exception as pe:
+                    logger.warning(f"PnL cache refresh failed: {pe}")
                 
         except Exception as e:
             logger.error(f"Binance sync error: {e}")
@@ -11394,6 +11400,19 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         
         logger.info(f"Phase 80: Instant state from cache - balance=${initial_balance:.2f}, positions={len(initial_positions)}")
         
+        # Get PnL data - use Binance for live mode, paper trades for paper mode
+        if live_binance_trader.enabled:
+            # Use cached Binance PnL or fetch fresh
+            pnl_data = getattr(live_binance_trader, 'cached_pnl', None)
+            if not pnl_data:
+                try:
+                    pnl_data = await live_binance_trader.get_pnl_from_binance()
+                    live_binance_trader.cached_pnl = pnl_data
+                except:
+                    pnl_data = {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0}
+        else:
+            pnl_data = global_paper_trader.get_today_pnl()
+        
         await websocket.send_json({
             "type": "scanner_update",
             "opportunities": filtered_opportunities,  # FILTERED opportunities
@@ -11404,7 +11423,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "trades": global_paper_trader.trades,  # ALL trades
                 "stats": {
                     **global_paper_trader.stats, 
-                    **global_paper_trader.get_today_pnl(),
+                    **pnl_data,  # Use correct PnL source based on mode
                     "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
                 },
                 "logs": global_paper_trader.logs[-100:],
@@ -11483,6 +11502,12 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     "lastUpdate": datetime.now().timestamp()
                 }
                 
+                # Get PnL data - use cached Binance PnL for live mode
+                if live_binance_trader.enabled:
+                    pnl_data = getattr(live_binance_trader, 'cached_pnl', {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0})
+                else:
+                    pnl_data = global_paper_trader.get_today_pnl()
+                
                 # Send update to client
                 update_data = {
                     "type": "scanner_update",
@@ -11494,7 +11519,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         "trades": global_paper_trader.trades,  # ALL trades
                         "stats": {
                             **global_paper_trader.stats, 
-                            **global_paper_trader.get_today_pnl(),
+                            **pnl_data,  # Use correct PnL source based on mode
                             "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
                         },
                         "logs": global_paper_trader.logs[-100:],
