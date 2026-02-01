@@ -535,17 +535,8 @@ export default function App() {
         const data = await res.json();
         setAutoTradeEnabled(data.enabled ?? true);
 
-        // Load cloud portfolio state - SKIP if in live mode
-        if (data.balance !== undefined && !isLiveModeRef.current) {
-          setPortfolio(prev => ({
-            ...prev,
-            balanceUsd: data.balance,
-            positions: data.positions || [],
-            stats: data.stats || prev.stats,
-            trades: data.trades || prev.trades,
-            equityCurve: data.equityCurve || prev.equityCurve
-          }));
-        }
+        // NOTE: Portfolio updates removed from here - handled by fetchInitialState
+        // This prevents race condition where this overwrites live trading data
 
         // Phase 18: Sync ALL settings from cloud
         if (data.symbol) {
