@@ -11399,25 +11399,39 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "lastUpdate": datetime.now().timestamp()
         }
         
-        # Phase 80: INSTANT INITIAL STATE - Use cached data from sync loop
-        # The binance_position_sync_loop runs every 5s and keeps data fresh
-        # No need to block WebSocket connect with Binance API calls
-        initial_balance = global_paper_trader.balance  # Already synced by background loop
-        initial_live_balance = getattr(global_paper_trader, 'liveBalance', None)
+        # =====================================================================
+        # Phase 88: BINANCE-ONLY - Get data directly from Binance, not paper trader
+        # =====================================================================
+        if live_binance_trader.enabled:
+            # Get REAL balance from Binance
+            try:
+                binance_balance = await live_binance_trader.get_balance()
+                initial_balance = binance_balance.get('walletBalance', 0)
+                initial_live_balance = binance_balance
+            except Exception as e:
+                logger.warning(f"Binance balance fetch failed: {e}")
+                initial_balance = 0
+                initial_live_balance = None
+            
+            # Get REAL positions from Binance (not paper trader)
+            try:
+                initial_positions = await live_binance_trader.get_positions()
+                # Sort by openTime if available (newest first)
+                initial_positions = sorted(
+                    initial_positions,
+                    key=lambda p: p.get('openTime', 0),
+                    reverse=True
+                )
+            except Exception as e:
+                logger.warning(f"Binance positions fetch failed: {e}")
+                initial_positions = []
+        else:
+            # Fallback to paper trader if live mode disabled (shouldn't happen)
+            initial_balance = global_paper_trader.balance
+            initial_live_balance = None
+            initial_positions = []
         
-        # Use cached positions from sync loop (already has proper SL/TP)
-        # For display, filter only live positions and SORT by openTime (newest first) for consistent UI
-        initial_positions = sorted(
-            [p for p in global_paper_trader.positions if p.get('isLive', False)],
-            key=lambda p: p.get('openTime', 0),
-            reverse=True  # Newest first
-        )
-        
-        # If no cached data yet (first start), use last_positions from trader
-        if not initial_positions and live_binance_trader.enabled:
-            initial_positions = getattr(live_binance_trader, 'last_positions', [])
-        
-        logger.info(f"Phase 80: Instant state from cache - balance=${initial_balance:.2f}, positions={len(initial_positions)}")
+        logger.info(f"Phase 88: Binance-only state - balance=${initial_balance:.2f}, positions={len(initial_positions)}")
         
         # Get PnL data - use Binance for live mode, paper trades for paper mode
         if live_binance_trader.enabled:
@@ -11433,6 +11447,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             pnl_data = global_paper_trader.get_today_pnl()
         
         # Phase 85: Progressive Data Loading - Send critical data FIRST (instant UI)
+        # Phase 88: Now using Binance data instead of paper trader
         # Step 1: Send balance and positions immediately (what user cares about most)
         await websocket.send_json({
             "type": "scanner_update",
@@ -11441,21 +11456,20 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "portfolio": {
                 "balance": initial_balance,
                 "positions": initial_positions,
-                "trades": global_paper_trader.trades[-20:],  # Only last 20 trades initially
+                "trades": global_paper_trader.trades[-20:],  # Keep trades for history
                 "stats": {
-                    **global_paper_trader.stats, 
                     **pnl_data,
-                    "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                    "liveBalance": initial_live_balance
                 },
                 "logs": [],  # Logs can come later
-                "enabled": global_paper_trader.enabled
+                "enabled": True
             },
             "tradingMode": "live" if live_binance_trader.enabled else "paper",
             "timestamp": datetime.now().timestamp(),
             "message": "Portfolio loaded"
         })
         
-        logger.info(f"Phase 85: Sent critical data first (balance + positions)")
+        logger.info(f"Phase 88: Sent critical data from Binance (balance + positions)")
         
         # Step 2: Small delay then send full data with opportunities
         await asyncio.sleep(0.5)  # 500ms delay for better UX
@@ -11467,14 +11481,13 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "portfolio": {
                 "balance": initial_balance,
                 "positions": initial_positions,
-                "trades": global_paper_trader.trades,  # ALL trades now
+                "trades": global_paper_trader.trades,  # ALL trades
                 "stats": {
-                    **global_paper_trader.stats, 
                     **pnl_data,
-                    "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                    "liveBalance": initial_live_balance
                 },
                 "logs": global_paper_trader.logs[-100:],
-                "enabled": global_paper_trader.enabled
+                "enabled": True
             },
             "tradingMode": "live" if live_binance_trader.enabled else "paper",
             "timestamp": datetime.now().timestamp(),
@@ -11555,28 +11568,43 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 else:
                     pnl_data = global_paper_trader.get_today_pnl()
                 
-                # Send update to client
-                # Sort positions by openTime (newest first) for consistent UI display
-                sorted_positions = sorted(
-                    [p for p in global_paper_trader.positions if p.get('isLive', False)],
-                    key=lambda p: p.get('openTime', 0),
-                    reverse=True
-                )
+                # =====================================================================
+                # Phase 88: BINANCE-ONLY - Get positions and balance from Binance
+                # =====================================================================
+                if live_binance_trader.enabled:
+                    try:
+                        stream_positions = await live_binance_trader.get_positions()
+                        stream_positions = sorted(stream_positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                    except:
+                        stream_positions = []
+                    
+                    try:
+                        stream_balance_data = await live_binance_trader.get_balance()
+                        stream_balance = stream_balance_data.get('walletBalance', 0)
+                        stream_live_balance = stream_balance_data
+                    except:
+                        stream_balance = 0
+                        stream_live_balance = None
+                else:
+                    # Fallback for paper mode (shouldn't happen)
+                    stream_positions = []
+                    stream_balance = global_paper_trader.balance
+                    stream_live_balance = None
                 
                 update_data = {
                     "type": "scanner_update",
                     "opportunities": filtered_opps,  # FILTERED opportunities
                     "stats": stats,
                     "portfolio": {
-                        "balance": global_paper_trader.balance,
-                        "positions": sorted_positions,  # Sorted by openTime
-                        "trades": global_paper_trader.trades,  # ALL trades
+                        "balance": stream_balance,
+                        "positions": stream_positions,  # From Binance
+                        "trades": global_paper_trader.trades,  # Keep trades for history (will migrate later)
                         "stats": {
                             **global_paper_trader.stats, 
-                            **pnl_data,  # Use correct PnL source based on mode
-                            "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                            **pnl_data,
+                            "liveBalance": stream_live_balance
                         },
-                        "logs": global_paper_trader.logs[-100:],
+                        "logs": global_paper_trader.logs[-100:],  # Keep logs
                         "enabled": global_paper_trader.enabled
                     },
                     "tradingMode": "live" if live_binance_trader.enabled else "paper",
