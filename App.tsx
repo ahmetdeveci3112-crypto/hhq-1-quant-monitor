@@ -828,9 +828,13 @@ export default function App() {
           // Phase 31: Handle scanner update
           if (data.type === 'scanner_update') {
             // Phase 74: Detect trading mode from scanner_update
-            if (data.tradingMode === 'live') {
-              setIsLiveMode(true);
-              isLiveModeRef.current = true;
+            // Phase 81: Also set tradingModeKnownRef to unblock updates
+            if (data.tradingMode) {
+              tradingModeKnownRef.current = true; // Unblock portfolio updates
+              if (data.tradingMode === 'live') {
+                setIsLiveMode(true);
+                isLiveModeRef.current = true;
+              }
             }
 
             // Update opportunities
@@ -843,18 +847,28 @@ export default function App() {
               setScannerStats(data.stats);
             }
 
-            // Update portfolio from scanner - SKIP if in live trading mode
+            // Phase 81: Update portfolio for BOTH live and paper modes
             // Use ref instead of state to avoid stale closure
-            if (data.portfolio && !isLiveModeRef.current) {
+            if (data.portfolio) {
               const pf = data.portfolio;
-              setPortfolio({
-                balanceUsd: pf.balance || 0,
-                initialBalance: 0,
-                positions: pf.positions || [],
-                trades: pf.trades || [],
-                equityCurve: [],
-                stats: pf.stats || INITIAL_STATS
-              });
+
+              // For live mode: use liveBalance if available
+              const liveBalance = pf.stats?.liveBalance;
+              const balanceToUse = isLiveModeRef.current && liveBalance
+                ? liveBalance.walletBalance
+                : (pf.balance || 0);
+
+              setPortfolio(prev => ({
+                ...prev,
+                balanceUsd: balanceToUse,
+                positions: pf.positions || prev.positions,
+                trades: pf.trades || prev.trades,
+                stats: {
+                  ...prev.stats,
+                  ...pf.stats,
+                  liveBalance: liveBalance || prev.stats?.liveBalance
+                }
+              }));
 
               // Update autoTradeEnabled
               if (pf.enabled !== undefined) {
