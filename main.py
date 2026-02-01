@@ -11730,8 +11730,14 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                         "positions": stream_positions,  # From Binance
                         "trades": initial_trades,  # Phase 88: From SQLite
                         "stats": {
-                            **global_paper_trader.stats, 
-                            **pnl_data,
+                            # Phase 91: Use appropriate stats based on mode
+                            # Live mode: only use Binance PnL data, not paper stats
+                            "todayPnl": pnl_data.get('todayPnl', 0),
+                            "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
+                            "totalPnl": pnl_data.get('totalPnl', 0),
+                            "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
+                            "winRate": global_paper_trader.stats.get('winRate', 0),
+                            "totalTrades": global_paper_trader.stats.get('totalTrades', 0),
                             "liveBalance": stream_live_balance
                         },
                         "logs": global_paper_trader.logs[-100:],  # Keep logs
