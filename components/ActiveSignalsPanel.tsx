@@ -91,7 +91,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     const SignalCard = ({ signal, key: _key }: { signal: CoinOpportunity; key?: string }) => {
         const isLong = signal.signalAction === 'LONG';
         const spreadInfo = getSpreadInfo(signal.spreadPct || 5, entryTightness);
-        const leverage = spreadInfo.leverage;
+        // Use backend leverage if available, fallback to local calculation
+        const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = isLong
             ? signal.price * (1 - spreadInfo.pullback / 100)
             : signal.price * (1 + spreadInfo.pullback / 100);
@@ -265,7 +266,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             {(signal.hurst || 0).toFixed(2)}
                                         </td>
                                         <td className="py-2.5 px-3 text-center">
-                                            <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{spreadInfo.leverage}x</span>
+                                            <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{signal.leverage || spreadInfo.leverage}x</span>
                                         </td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">{spreadInfo.level}</td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">

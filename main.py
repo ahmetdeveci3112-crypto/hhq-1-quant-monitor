@@ -619,7 +619,7 @@ class LiveBinanceTrader:
             result = []
             
             for p in positions:
-                contracts = float(p.get('contracts', 0))
+                contracts = float(p.get('contracts') or 0)
                 if abs(contracts) > 0:
                     # CCXT symbol format: BTC/USDT:USDT -> BTCUSDT
                     symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
@@ -645,7 +645,7 @@ class LiveBinanceTrader:
                     
                     logger.info(f"Found active position: {symbol} side={side} contracts={contracts} raw_amt={raw_position_amt}")
                     
-                    notional = abs(float(p.get('notional', 0)))
+                    notional = abs(float(p.get('notional') or 0))
                     position_margin = float(raw_info.get('positionInitialMargin', 0) or raw_info.get('initialMargin', 0) or 0)
                     
                     # Calculate leverage from notional/margin
@@ -655,11 +655,53 @@ class LiveBinanceTrader:
                         calculated_leverage = int(p.get('leverage') or 1)
                     
                     # Calculate PnL percentage based on margin (ROI)
-                    unrealized_pnl = float(p.get('unrealizedPnl', 0))
+                    unrealized_pnl = float(p.get('unrealizedPnl') or 0)
                     if position_margin > 0:
                         pnl_percent = (unrealized_pnl / position_margin) * 100
                     else:
-                        pnl_percent = float(p.get('percentage', 0))
+                        pnl_percent = float(p.get('percentage') or 0)
+                    
+                    # Get position open time from trade history
+                    # Fetch recent trades for this symbol to find when position was opened
+                    open_time = int(datetime.now().timestamp() * 1000)  # Default to now
+                    try:
+                        # Fetch trades from last 7 days for more accurate open time
+                        seven_days_ago = int((datetime.now().timestamp() - 7*24*60*60) * 1000)
+                        trades = await self.exchange.fapiPrivateGetUserTrades({
+                            'symbol': symbol,
+                            'startTime': seven_days_ago,
+                            'limit': 500  # Fetch more trades to find older positions
+                        })
+                        
+                        if trades and len(trades) > 0:
+                            # Sort trades by time (oldest first)
+                            sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                            
+                            # Strategy: Find the earliest trade that opened current position
+                            # For LONG: Look for first BUY that started the position
+                            # For SHORT: Look for first SELL that started the position
+                            
+                            # Simple approach: Find earliest trade matching position direction
+                            earliest_matching = None
+                            for t in sorted_trades:
+                                is_buyer = t.get('buyer', False)
+                                trade_time = int(t.get('time', 0))
+                                
+                                # Match direction: LONG = buyer, SHORT = !buyer
+                                if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
+                                    earliest_matching = trade_time
+                                    break  # Found the oldest matching trade
+                            
+                            if earliest_matching:
+                                open_time = earliest_matching
+                                logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
+                            else:
+                                # Fallback: Use oldest trade time if position predates our history
+                                open_time = int(sorted_trades[0].get('time', open_time))
+                                logger.info(f"  Position {symbol} history starts at: {datetime.fromtimestamp(open_time/1000)}")
+                                
+                    except Exception as te:
+                        logger.warning(f"Could not get trade history for {symbol}: {te}")
                     
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
@@ -667,15 +709,15 @@ class LiveBinanceTrader:
                         'side': side,  # Use calculated side from CCXT/raw info
                         'size': abs(contracts),
                         'sizeUsd': notional,
-                        'entryPrice': float(p.get('entryPrice', 0)),
-                        'markPrice': float(p.get('markPrice', 0)),
+                        'entryPrice': float(p.get('entryPrice') or 0),
+                        'markPrice': float(p.get('markPrice') or 0),
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
                         'leverage': calculated_leverage,
                         'margin': position_margin,  # Add margin for UI
-                        'liquidationPrice': float(p.get('liquidationPrice', 0)),
+                        'liquidationPrice': float(p.get('liquidationPrice') or 0),
                         'marginType': p.get('marginMode', 'cross'),
-                        'openTime': int(datetime.now().timestamp() * 1000),  # Binance doesn't provide this
+                        'openTime': open_time,  # Actual position open time from trade history
                         'isLive': True  # Mark as live position
                     })
             
@@ -971,6 +1013,8 @@ async def binance_position_sync_loop():
     """
     Binance'den pozisyon/bakiye senkronizasyonu (her 5 saniye).
     Live trading modunda Binance'deki gerçek pozisyonları UI'a yansıtır.
+    
+    Phase 72: Tüm Binance pozisyonlarını (manuel dahil) algoritma yönetimi altına alır.
     """
     logger.info("🔄 Binance Position Sync Loop started")
     
@@ -984,7 +1028,91 @@ async def binance_position_sync_loop():
                 global_paper_trader.balance = balance['total']
                 
                 # Pozisyonları güncelle (Binance'den)
-                positions = await live_binance_trader.get_positions()
+                binance_positions = await live_binance_trader.get_positions()
+                
+                # ================================================================
+                # Phase 72: Sync ALL Binance positions into PaperTradingEngine
+                # This ensures algorithm manages all positions (including manual)
+                # ================================================================
+                existing_symbols = {p.get('symbol') for p in global_paper_trader.positions if p.get('isLive')}
+                
+                for bp in binance_positions:
+                    symbol = bp.get('symbol', '')
+                    
+                    # Check if position already exists in engine
+                    if symbol not in existing_symbols:
+                        # New position (manual or from previous session) - add with default params
+                        entry_price = bp.get('entryPrice', 0)
+                        mark_price = bp.get('markPrice', entry_price)
+                        atr = entry_price * 0.02  # Estimate 2% ATR if unknown
+                        
+                        # Calculate default exit parameters
+                        # IMPORTANT: If position is already profitable, set TP beyond CURRENT price
+                        # to avoid instant TP trigger on sync
+                        if bp['side'] == 'LONG':
+                            # For LONG: if mark > entry, position is profitable
+                            if mark_price > entry_price:
+                                # TP beyond current price, SL at breakeven or below entry
+                                stop_loss = entry_price  # Breakeven
+                                take_profit = mark_price + (atr * global_paper_trader.tp_atr / 10)
+                                trail_activation = mark_price + (atr * 0.5)  # Near current price
+                            else:
+                                stop_loss = entry_price - (atr * global_paper_trader.sl_atr / 10)
+                                take_profit = entry_price + (atr * global_paper_trader.tp_atr / 10)
+                                trail_activation = entry_price + (atr * global_paper_trader.trail_activation_atr)
+                        else:
+                            # For SHORT: if mark < entry, position is profitable
+                            if mark_price < entry_price:
+                                # TP beyond current price, SL at breakeven or above entry
+                                stop_loss = entry_price  # Breakeven
+                                take_profit = mark_price - (atr * global_paper_trader.tp_atr / 10)
+                                trail_activation = mark_price - (atr * 0.5)  # Near current price
+                            else:
+                                stop_loss = entry_price + (atr * global_paper_trader.sl_atr / 10)
+                                take_profit = entry_price - (atr * global_paper_trader.tp_atr / 10)
+                                trail_activation = entry_price - (atr * global_paper_trader.trail_activation_atr)
+                        
+                        new_pos = {
+                            'id': bp.get('id', f"BIN_{symbol}_{int(datetime.now().timestamp())}"),
+                            'symbol': symbol,
+                            'side': bp.get('side', 'LONG'),
+                            'size': bp.get('size', 0),
+                            'sizeUsd': bp.get('sizeUsd', 0),
+                            'entryPrice': entry_price,
+                            'markPrice': bp.get('markPrice', entry_price),
+                            'leverage': bp.get('leverage', 10),
+                            'margin': bp.get('margin', 0),
+                            'initialMargin': bp.get('margin', 0),
+                            'openTime': bp.get('openTime', int(datetime.now().timestamp() * 1000)),
+                            # Exit parameters
+                            'stopLoss': stop_loss,
+                            'takeProfit': take_profit,
+                            'trailActivation': trail_activation,
+                            'trailingStop': stop_loss,
+                            'isTrailingActive': False,
+                            'slConfirmCount': 0,
+                            'atr': atr,
+                            'isLive': True,
+                            'isSynced': True,  # Mark as synced from Binance
+                        }
+                        
+                        global_paper_trader.positions.append(new_pos)
+                        logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} (manual/external position)")
+                    else:
+                        # Update existing position with current Binance data
+                        for pos in global_paper_trader.positions:
+                            if pos.get('symbol') == symbol and pos.get('isLive'):
+                                pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
+                                pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
+                                pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
+                                break
+                
+                # Remove closed positions from engine that are no longer on Binance
+                binance_symbols = {p.get('symbol') for p in binance_positions}
+                global_paper_trader.positions = [
+                    p for p in global_paper_trader.positions 
+                    if not p.get('isLive') or p.get('symbol') in binance_symbols
+                ]
                 
                 # Sync timestamp
                 live_binance_trader.last_sync_time = int(datetime.now().timestamp() * 1000)
@@ -992,13 +1120,13 @@ async def binance_position_sync_loop():
                 # UI'a broadcast et
                 await ui_ws_manager.broadcast('binance_sync', {
                     'balance': balance,
-                    'positions': positions,
-                    'position_count': len(positions),
+                    'positions': binance_positions,
+                    'position_count': len(binance_positions),
                     'sync_time': live_binance_trader.last_sync_time,
                     'trading_mode': 'live'
                 })
                 
-                logger.debug(f"Binance sync: ${balance['total']:.2f} | {len(positions)} positions")
+                logger.debug(f"Binance sync: ${balance['total']:.2f} | {len(binance_positions)} positions")
                 
         except Exception as e:
             logger.error(f"Binance sync error: {e}")
@@ -1295,15 +1423,15 @@ MTF_CONFIRMATION_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 
 # Volatility-based parameters using ATR as percentage of price
-# Phase 35: Use ATR% for proper volatility classification
-# Crypto 5m ATR is typically 2-10% - adjusted thresholds accordingly
+# Phase 73: ATR% thresholds adjusted 5× higher to match observed values
+# Observed ATR% in production: 13-55% (higher than typical due to 4h OHLCV source)
 # Low volatility = tighter stops, higher leverage | High volatility = wider stops, lower leverage
 VOLATILITY_LEVELS = {
-    "very_low":  {"max_atr_pct": 2.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},  # <2% = 50x
-    "low":       {"max_atr_pct": 4.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},  # <4% = 25x
-    "normal":    {"max_atr_pct": 6.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.012},  # <6% = 10x
-    "high":      {"max_atr_pct": 10.0, "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.018},  # <10% = 5x
-    "very_high": {"max_atr_pct": 100,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 10%+ = 3x
+    "very_low":  {"max_atr_pct": 10.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},  # <10% = 50x
+    "low":       {"max_atr_pct": 20.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},  # <20% = 25x
+    "normal":    {"max_atr_pct": 30.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.012},  # <30% = 10x
+    "high":      {"max_atr_pct": 50.0,  "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.018},  # <50% = 5x
+    "very_high": {"max_atr_pct": 100,   "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 50%+ = 3x
 }
 
 # =====================================================
@@ -1490,9 +1618,19 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
 
 # Backwards compatibility alias
 def get_spread_adjusted_params(spread_pct: float, atr: float, price: float = 0.0) -> dict:
-    """Alias for get_volatility_adjusted_params for backwards compatibility."""
-    # Note: spread_pct is passed as both volatility_pct (first arg) and spread_pct (fourth arg)
-    return get_volatility_adjusted_params(spread_pct, atr, price, spread_pct)
+    """Alias for get_volatility_adjusted_params for backwards compatibility.
+    
+    IMPORTANT: volatility_pct should be ATR as percentage of price, NOT spread_pct.
+    spread_pct is bid-ask spread (typically 0.05-0.5%)
+    volatility_pct is ATR/price*100 (typically 10-50% for observed data)
+    """
+    # FIX: Calculate actual volatility_pct from ATR and price
+    if price > 0 and atr > 0:
+        volatility_pct = (atr / price) * 100
+    else:
+        volatility_pct = 15.0  # Default to mid-range if unknown
+    
+    return get_volatility_adjusted_params(volatility_pct, atr, price, spread_pct)
 
 
 
@@ -2145,6 +2283,7 @@ class CoinOpportunity:
         self.last_signal_time: Optional[float] = None
         self.atr: float = 0.0
         self.last_update: float = 0.0
+        self.leverage: int = 10  # Default leverage, updated by SignalGenerator
     
     def to_dict(self) -> dict:
         return {
@@ -2160,7 +2299,8 @@ class CoinOpportunity:
             "priceChange24h": round(self.price_change_24h, 2),
             "lastSignalTime": self.last_signal_time,
             "atr": self.atr,
-            "lastUpdate": self.last_update
+            "lastUpdate": self.last_update,
+            "leverage": self.leverage  # Phase 73: Include leverage in UI data
         }
 
 
@@ -2442,6 +2582,7 @@ class LightweightCoinAnalyzer:
         if signal:
             self.opportunity.signal_score = signal.get('confidenceScore', 0)
             self.opportunity.signal_action = signal.get('action', 'NONE')
+            self.opportunity.leverage = signal.get('leverage', 10)  # Phase 73: Pass leverage to UI
             self.opportunity.last_signal_time = datetime.now().timestamp()
             return signal
         else:
@@ -3990,16 +4131,17 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         else:
             spread_factor = 1.0
         
-        # VOLATILITY FACTOR: High ATR = lower leverage (NEW!)
-        # ATR as % of price: <2% = 1.0, 2-4% = 0.8, 4-6% = 0.6, 6-10% = 0.4, 10%+ = 0.3
-        volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 2.0
-        if volatility_pct <= 2.0:
+        # VOLATILITY FACTOR: High ATR = lower leverage
+        # Phase 73: ATR% thresholds adjusted 5× to match observed values
+        # ATR as % of price: <10% = 1.0, 10-20% = 0.8, 20-30% = 0.6, 30-50% = 0.4, 50%+ = 0.3
+        volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 10.0
+        if volatility_pct <= 10.0:
             volatility_factor = 1.0   # Low volatility - no reduction
-        elif volatility_pct <= 4.0:
+        elif volatility_pct <= 20.0:
             volatility_factor = 0.8   # Normal volatility
-        elif volatility_pct <= 6.0:
+        elif volatility_pct <= 30.0:
             volatility_factor = 0.6   # High volatility
-        elif volatility_pct <= 10.0:
+        elif volatility_pct <= 50.0:
             volatility_factor = 0.4   # Very high volatility
         else:
             volatility_factor = 0.3   # Extreme volatility
@@ -9540,60 +9682,33 @@ class PaperTradingEngine:
                         self.close_position(pos, current_price, 'TP')
 
     def close_position(self, pos: Dict, exit_price: float, reason: str):
-        # =====================================================================
-        # LIVE TRADING: Schedule close on Binance (fire-and-forget)
-        # =====================================================================
-        if live_binance_trader.enabled and pos.get('isLive', False):
-            symbol = pos.get('symbol', '')
-            side = pos.get('side', 'LONG')
-            amount = pos.get('size', 0)
-            
-            logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
-            
-            # Schedule async close as background task (fire-and-forget)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Inside async context - schedule as task
-                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount))
-                else:
-                    # Outside async context - run directly
-                    loop.run_until_complete(self._close_on_binance(symbol, side, amount))
-            except RuntimeError:
-                # No event loop in current thread
-                asyncio.run(self._close_on_binance(symbol, side, amount))
-    
-    async def _close_on_binance(self, symbol: str, side: str, amount: float):
-        """Helper to close position on Binance asynchronously."""
-        try:
-            result = await live_binance_trader.close_position(symbol, side, amount)
-            if result:
-                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol}")
-            else:
-                logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
-        except Exception as e:
-            logger.error(f"❌ LIVE CLOSE ERROR: {e}")
-        
+        """
+        Close a position and record it in trade history.
+        For live trading, also schedules async Binance close.
+        """
+        # Calculate PnL
         if pos['side'] == 'LONG':
             pnl = (exit_price - pos['entryPrice']) * pos['size']
         else:
             pnl = (pos['entryPrice'] - exit_price) * pos['size']
         
         # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
-        # Initial Margin = sizeUsd / leverage (açılışta düşülen miktar)
         initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))
         
         # Live trading'de bakiye Binance'den senkronize edilir
         if not live_binance_trader.enabled:
-            self.balance += initial_margin + pnl  # Teminatı geri al + kâr/zarar
-            
-        self.positions.remove(pos)
+            self.balance += initial_margin + pnl
         
+        # Remove from positions list
+        if pos in self.positions:
+            self.positions.remove(pos)
+        
+        # Record trade
         trade = {
-            "id": pos['id'],
-            "symbol": pos['symbol'],
-            "side": pos['side'],
-            "entryPrice": pos['entryPrice'],
+            "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+            "symbol": pos.get('symbol', 'UNKNOWN'),
+            "side": pos.get('side', 'LONG'),
+            "entryPrice": pos.get('entryPrice', 0),
             "exitPrice": exit_price,
             "size": pos.get('size', 0),
             "sizeUsd": pos.get('sizeUsd', 0),
@@ -9603,13 +9718,11 @@ class PaperTradingEngine:
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
             "leverage": pos.get('leverage', 10),
-            "isLive": pos.get('isLive', False),  # Mark if it was a live trade
-            # Phase 49: Carry forward analysis data for post-trade analysis
+            "isLive": pos.get('isLive', False),
             "signalScore": pos.get('signalScore', 0),
             "mtfScore": pos.get('mtfScore', 0),
             "zScore": pos.get('zScore', 0),
             "spreadLevel": pos.get('spreadLevel', 'unknown'),
-            # Phase 58: Exit criteria for tooltip display
             "stopLoss": pos.get('stopLoss', 0),
             "takeProfit": pos.get('takeProfit', 0),
             "trailActivation": pos.get('trailActivation', 0),
@@ -9630,20 +9743,41 @@ class PaperTradingEngine:
         # Update Stats
         self.stats['totalTrades'] += 1
         self.stats['totalPnl'] += pnl
-        if pnl > 0: self.stats['winningTrades'] += 1
-        else: self.stats['losingTrades'] += 1
+        if pnl > 0: 
+            self.stats['winningTrades'] += 1
+        else: 
+            self.stats['losingTrades'] += 1
         
         # Update coin-specific stats for blacklist system
         symbol = pos.get('symbol', 'UNKNOWN')
         is_win = pnl > 0
         self.update_coin_stats(symbol, is_win, pnl)
         
-        # Phase 19: Log position close
+        # Log position close
         live_tag = "🔴 LIVE" if pos.get('isLive', False) else "📄 PAPER"
         emoji = "✅" if pnl > 0 else "❌"
-        self.add_log(f"{emoji} {live_tag} KAPANDI [{reason}]: {pos['side']} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
+        self.add_log(f"{emoji} {live_tag} KAPANDI [{reason}]: {pos.get('side', 'UNKNOWN')} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
         self.save_state()
         logger.info(f"✅ {live_tag} CLOSE: {reason} PnL: {pnl:.2f}")
+        
+        # =====================================================================
+        # LIVE TRADING: Schedule close on Binance (fire-and-forget)
+        # =====================================================================
+        if live_binance_trader.enabled and pos.get('isLive', False):
+            symbol = pos.get('symbol', '')
+            side = pos.get('side', 'LONG')
+            amount = pos.get('size', 0)
+            
+            logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
+            
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount))
+                else:
+                    loop.run_until_complete(self._close_on_binance(symbol, side, amount))
+            except RuntimeError:
+                asyncio.run(self._close_on_binance(symbol, side, amount))
         
         # Phase 52: Post-trade tracking for 24h analysis
         try:
@@ -9670,6 +9804,17 @@ class PaperTradingEngine:
             coin_performance_tracker.record_trade(pos.get('symbol', ''), pnl, reason)
         except Exception as e:
             logger.debug(f"Coin performance record error: {e}")
+    
+    async def _close_on_binance(self, symbol: str, side: str, amount: float):
+        """Helper to close position on Binance asynchronously."""
+        try:
+            result = await live_binance_trader.close_position(symbol, side, amount)
+            if result:
+                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol}")
+            else:
+                logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
+        except Exception as e:
+            logger.error(f"❌ LIVE CLOSE ERROR: {e}")
 
 
 

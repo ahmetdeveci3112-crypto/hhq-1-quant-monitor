@@ -252,6 +252,7 @@ export interface CoinOpportunity {
   lastSignalTime: number | null;
   atr: number;
   lastUpdate: number;
+  leverage?: number;  // Phase 73: Backend-calculated leverage based on volatility
 }
 
 export interface ScannerStats {
