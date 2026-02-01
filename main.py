@@ -11358,39 +11358,21 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "lastUpdate": datetime.now().timestamp()
         }
         
-        # Phase 78: Always fetch fresh balance from Binance for initial state
-        initial_balance = global_paper_trader.balance
-        if live_binance_trader.enabled:
-            try:
-                balance_data = await live_binance_trader.get_balance()
-                if balance_data:
-                    initial_balance = balance_data.get('total', 0)
-                    global_paper_trader.balance = initial_balance
-                    global_paper_trader.liveBalance = {
-                        'walletBalance': balance_data.get('walletBalance', balance_data.get('total', 0)),
-                        'marginBalance': balance_data.get('marginBalance', balance_data.get('total', 0)),
-                        'availableBalance': balance_data.get('availableBalance', balance_data.get('free', 0)),
-                        'unrealizedPnl': balance_data.get('unrealizedPnl', 0)
-                    }
-                    logger.info(f"Phase 78: Fetched fresh balance for initial state: ${initial_balance:.2f}")
-            except Exception as e:
-                logger.warning(f"Phase 78: Failed to fetch balance, using cached: {e}")
-                initial_balance = global_paper_trader.balance
+        # Phase 80: INSTANT INITIAL STATE - Use cached data from sync loop
+        # The binance_position_sync_loop runs every 5s and keeps data fresh
+        # No need to block WebSocket connect with Binance API calls
+        initial_balance = global_paper_trader.balance  # Already synced by background loop
+        initial_live_balance = getattr(global_paper_trader, 'liveBalance', None)
         
-        # Phase 79: Fetch positions in fast mode (skip expensive openTime lookup)
-        # NOTE: Do NOT write live positions to global_paper_trader.positions!
-        # That would cause SL check to close them. Only send to frontend for display.
-        initial_positions = global_paper_trader.positions
-        if live_binance_trader.enabled:
-            try:
-                fast_positions = await live_binance_trader.get_positions(fast=True)
-                if fast_positions:
-                    initial_positions = fast_positions  # Only for frontend display
-                    # DO NOT: global_paper_trader.positions = fast_positions
-                    # This would cause SL check to close live positions!
-                    logger.info(f"Phase 79: Fast-fetched {len(fast_positions)} positions for frontend display")
-            except Exception as e:
-                logger.warning(f"Phase 79: Failed to fast-fetch positions: {e}")
+        # Use cached positions from sync loop (already has proper SL/TP)
+        # For display, filter only live positions
+        initial_positions = [p for p in global_paper_trader.positions if p.get('isLive', False)]
+        
+        # If no cached data yet (first start), use last_positions from trader
+        if not initial_positions and live_binance_trader.enabled:
+            initial_positions = getattr(live_binance_trader, 'last_positions', [])
+        
+        logger.info(f"Phase 80: Instant state from cache - balance=${initial_balance:.2f}, positions={len(initial_positions)}")
         
         await websocket.send_json({
             "type": "scanner_update",
