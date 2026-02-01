@@ -9131,12 +9131,13 @@ class PaperTradingEngine:
                     logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')}")
                 else:
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
-                    self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi")
+                    self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi (yetersiz bakiye veya symbol hatası)")
                     return  # Don't create position if Binance order failed
                     
             except Exception as e:
+                error_msg = str(e)[:80]  # Truncate long error messages
                 logger.error(f"❌ LIVE ORDER ERROR: {e}")
-                self.add_log(f"❌ LIVE TRADING HATASI: {side} {symbol} - {str(e)[:50]}")
+                self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
                 return  # Don't create position if there was an error
         
         # Paper Trading: Initial Margin = Position Size / Leverage
