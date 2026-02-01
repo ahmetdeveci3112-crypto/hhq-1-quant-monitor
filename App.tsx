@@ -878,9 +878,15 @@ export default function App() {
 
               // For live mode: use liveBalance if available
               const liveBalance = pf.stats?.liveBalance;
-              const balanceToUse = isLiveModeRef.current && liveBalance
-                ? liveBalance.walletBalance
-                : (pf.balance || 0);
+              // Phase 88: More robust balance calculation with proper fallbacks
+              let balanceToUse = pf.balance || 0;
+              if (isLiveModeRef.current && liveBalance && liveBalance.walletBalance) {
+                balanceToUse = liveBalance.walletBalance;
+              } else if (liveBalance?.walletBalance) {
+                // Even if not in live mode ref, if we have live balance, use it
+                balanceToUse = liveBalance.walletBalance;
+              }
+              console.log('Phase 88 Balance Debug:', { liveBalance, pfBalance: pf.balance, balanceToUse, isLiveMode: isLiveModeRef.current });
 
               setPortfolio(prev => ({
                 ...prev,
