@@ -10754,6 +10754,8 @@ async def live_trading_status():
         balance = await live_binance_trader.get_balance()
         positions = await live_binance_trader.get_positions()
         pnl_data = await live_binance_trader.get_pnl_from_binance()
+        # Phase 93: Add trade history
+        trades = await live_binance_trader.get_trade_history(limit=50, days_back=7)
         
         return JSONResponse({
             "enabled": True,
@@ -10768,7 +10770,9 @@ async def live_trading_status():
             "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
             "totalPnl": pnl_data.get('totalPnl', 0),
             "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
-            "todayTradesCount": pnl_data.get('todayTradesCount', 0)
+            "todayTradesCount": pnl_data.get('todayTradesCount', 0),
+            # Phase 93: Trade history
+            "trades": trades
         })
     except Exception as e:
         return JSONResponse({
