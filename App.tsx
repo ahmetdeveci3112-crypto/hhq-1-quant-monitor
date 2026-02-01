@@ -391,14 +391,30 @@ export default function App() {
               if (liveRes.ok) {
                 const liveData = await liveRes.json();
                 if (liveData.enabled) {
-                  // Use real Binance data
+                  // Use correct Binance Futures balance fields
+                  const balance = liveData.balance || {};
+                  const walletBalance = balance.walletBalance || balance.total || 0;
+                  const marginBalance = balance.marginBalance || balance.total || 0;
+                  const availableBalance = balance.availableBalance || balance.free || 0;
+                  const unrealizedPnl = balance.unrealizedPnl || 0;
+
                   setPortfolio({
-                    balanceUsd: liveData.balance?.total || liveData.balance?.free || 0,
-                    initialBalance: liveData.balance?.total || 0, // No fixed initial for live
+                    balanceUsd: walletBalance,           // Wallet Balance (shown as "WALLET" in UI)
+                    initialBalance: walletBalance,       // Use wallet as initial for accurate calculation
                     positions: liveData.positions || [],
                     trades: data.trades || [], // Keep paper trades for history
                     equityCurve: data.equityCurve || [],
-                    stats: data.stats || INITIAL_STATS
+                    stats: {
+                      ...INITIAL_STATS,
+                      ...data.stats,
+                      // Store live balance details in stats for UI access
+                      liveBalance: {
+                        walletBalance,
+                        marginBalance,
+                        availableBalance,
+                        unrealizedPnl
+                      }
+                    }
                   });
                   setIsLiveMode(true); // Mark as live mode
                   isLiveModeRef.current = true; // Update ref for callbacks
@@ -1015,24 +1031,24 @@ export default function App() {
                 <div className="col-span-2">
                   <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
                   <div className="text-2xl font-bold text-white font-mono">
-                    {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.marginBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                     <span className="text-sm text-slate-500 ml-1">USDT</span>
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Wallet</div>
-                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl))}</div>
+                  <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.walletBalance : (10000 + portfolio.stats.totalPnl))}</div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Unrealized</div>
-                  <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                  <div className={`text-base font-semibold font-mono ${(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-slate-500 uppercase">Available</div>
                   <div className="text-base font-semibold text-cyan-400 font-mono">
-                    {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                    {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.availableBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                   </div>
                 </div>
                 <div>
@@ -1060,19 +1076,19 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
                     <div className="text-xl font-bold text-white font-mono">
-                      {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                      {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.marginBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                       <span className="text-xs text-slate-500 ml-1">USDT</span>
                     </div>
                   </div>
                   <div className="h-8 w-px bg-slate-800"></div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Wallet Balance</div>
-                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl))}</div>
+                    <div className="text-base font-semibold text-white font-mono">{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.walletBalance : (10000 + portfolio.stats.totalPnl))}</div>
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>
-                    <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                    <div className={`text-base font-semibold font-mono ${(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.unrealizedPnl : portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                     </div>
                   </div>
                 </div>
@@ -1080,7 +1096,7 @@ export default function App() {
                   <div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
                     <div className="text-base font-semibold text-cyan-400 font-mono">
-                      {formatCurrency((isLiveMode ? portfolio.balanceUsd : (10000 + portfolio.stats.totalPnl)) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                      {formatCurrency(isLiveMode && (portfolio.stats as any).liveBalance ? (portfolio.stats as any).liveBalance.availableBalance : ((10000 + portfolio.stats.totalPnl) + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                     </div>
                   </div>
                   <div>

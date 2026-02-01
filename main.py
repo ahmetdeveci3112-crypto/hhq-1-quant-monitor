@@ -557,23 +557,53 @@ class LiveBinanceTrader:
             return False
     
     async def get_balance(self) -> dict:
-        """Binance'den bakiye çek."""
+        """Binance'den bakiye çek - Futures account için doğru alanlar."""
         if not self.enabled or not self.exchange:
-            return {'free': 0, 'used': 0, 'total': 0}
+            return {'walletBalance': 0, 'marginBalance': 0, 'availableBalance': 0, 'unrealizedPnl': 0, 'free': 0, 'used': 0, 'total': 0}
             
         try:
             balance = await self.exchange.fetch_balance()
+            
+            # Get raw Binance info for accurate Futures balance fields
+            info = balance.get('info', {})
+            
+            # Binance Futures returns these in 'info':
+            # totalWalletBalance: Wallet Balance (without unrealized PnL)
+            # totalMarginBalance: Margin Balance (wallet + unrealized PnL)
+            # totalUnrealizedProfit: Unrealized PnL
+            # availableBalance: Available Balance for trading
+            
+            wallet_balance = float(info.get('totalWalletBalance', 0) or 0)
+            margin_balance = float(info.get('totalMarginBalance', 0) or 0)
+            unrealized_pnl = float(info.get('totalUnrealizedProfit', 0) or 0)
+            available_balance = float(info.get('availableBalance', 0) or 0)
+            
+            # Fallback to USDT if raw info not available
             usdt = balance.get('USDT', {})
+            if wallet_balance == 0:
+                wallet_balance = float(usdt.get('total', 0))
+            if available_balance == 0:
+                available_balance = float(usdt.get('free', 0))
+            
             result = {
-                'free': float(usdt.get('free', 0)),
-                'used': float(usdt.get('used', 0)),
-                'total': float(usdt.get('total', 0))
+                # Correct Binance Futures fields
+                'walletBalance': wallet_balance,      # "Balance" in Binance UI
+                'marginBalance': margin_balance,      # "Margin Balance" in Binance UI
+                'availableBalance': available_balance, # Available for trading
+                'unrealizedPnl': unrealized_pnl,      # "Unrealized PNL" in Binance UI
+                # Legacy fields for compatibility
+                'free': available_balance,
+                'used': margin_balance - available_balance,
+                'total': margin_balance
             }
-            self.last_balance = result['total']
+            
+            self.last_balance = margin_balance  # Use margin balance as total
+            logger.info(f"Balance: wallet={wallet_balance:.2f}, margin={margin_balance:.2f}, available={available_balance:.2f}, unrealizedPnl={unrealized_pnl:.2f}")
             return result
+            
         except Exception as e:
             logger.error(f"Balance fetch error: {e}")
-            return {'free': 0, 'used': 0, 'total': self.last_balance}
+            return {'walletBalance': 0, 'marginBalance': 0, 'availableBalance': 0, 'unrealizedPnl': 0, 'free': 0, 'used': 0, 'total': self.last_balance}
     
     async def get_positions(self) -> list:
         """Binance'den açık pozisyonları çek."""
