@@ -356,12 +356,17 @@ export default function App() {
       }
 
       // Update portfolio with WebSocket data (works for both live and paper mode now)
-      // Phase 88: Always update portfolio from WebSocket regardless of REST API status
+      // Phase 89: Always update portfolio from WebSocket including stats (PnL data)
       setPortfolio(prev => ({
         ...prev,
         balanceUsd: data.balance || prev.balanceUsd,
         positions: data.positions || prev.positions,
-        trades: data.trades || prev.trades
+        trades: data.trades || prev.trades,
+        stats: {
+          ...prev.stats,
+          ...data.stats,  // Phase 89: Include todayPnl, totalPnl from WebSocket
+          liveBalance: data.stats?.liveBalance || prev.stats?.liveBalance
+        }
       }));
 
       // Update auto trade state
