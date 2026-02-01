@@ -345,22 +345,24 @@ export default function App() {
   const handleInitialState = useCallback((data: any) => {
     console.log('📦 Received INITIAL_STATE from WebSocket');
     if (data) {
-      // BLOCK portfolio updates until we know trading mode
-      // This prevents WebSocket from applying paper data before live mode is detected
-      if (!tradingModeKnownRef.current) {
-        console.log('⏳ Waiting for trading mode to be determined...');
-        return; // Don't apply any portfolio updates yet
+      // Phase 88: Use WebSocket tradingMode directly instead of waiting for REST API
+      // This fixes the issue where REST API failing blocks all data rendering
+      if (data.tradingMode) {
+        const isLive = data.tradingMode === 'live';
+        isLiveModeRef.current = isLive;
+        tradingModeKnownRef.current = true;
+        setIsLiveMode(isLive);
+        console.log(`📊 Trading mode determined from WebSocket: ${data.tradingMode}`);
       }
 
-      // Update portfolio with all available data - SKIP if in live mode
-      if (!isLiveModeRef.current) {
-        setPortfolio(prev => ({
-          ...prev,
-          balanceUsd: data.balance || prev.balanceUsd,
-          positions: data.positions || prev.positions,
-          trades: data.trades || prev.trades
-        }));
-      }
+      // Update portfolio with WebSocket data (works for both live and paper mode now)
+      // Phase 88: Always update portfolio from WebSocket regardless of REST API status
+      setPortfolio(prev => ({
+        ...prev,
+        balanceUsd: data.balance || prev.balanceUsd,
+        positions: data.positions || prev.positions,
+        trades: data.trades || prev.trades
+      }));
 
       // Update auto trade state
       if (data.enabled !== undefined) {
