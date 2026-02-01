@@ -396,16 +396,21 @@ export default function App() {
     }
   }, []);
 
-  const { isConnected: uiWsConnected, connectionStatus: uiWsStatus } = useUIWebSocket(
-    BACKEND_UI_WS_URL,
-    handlePositionUpdate,
-    undefined, // onSignal
-    undefined, // onPositionOpened
-    undefined, // onPositionClosed
-    handleKillSwitch,
-    handleWsLog,
-    handleInitialState
-  );
+  // Phase 94: DISABLED - /ws/ui was causing data conflicts with /ws/scanner
+  // Both were sending position data but with different values, causing flickering
+  // Now using ONLY /ws/scanner as the single source of truth
+  // const { isConnected: uiWsConnected, connectionStatus: uiWsStatus } = useUIWebSocket(
+  //   BACKEND_UI_WS_URL,
+  //   handlePositionUpdate,
+  //   undefined, // onSignal
+  //   undefined, // onPositionOpened
+  //   undefined, // onPositionClosed
+  //   handleKillSwitch,
+  //   handleWsLog,
+  //   handleInitialState
+  // );
+  const uiWsConnected = true; // Placeholder - scanner WS handles all data now
+  const uiWsStatus = 'connected'; // Placeholder
 
   // Phase 31: Fetch initial state from backend on page load (24/7 sync)
   useEffect(() => {

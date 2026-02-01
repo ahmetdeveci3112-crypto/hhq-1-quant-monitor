@@ -999,7 +999,9 @@ class LiveBinanceTrader:
             return trades[:limit]
             
         except Exception as e:
+            import traceback
             logger.error(f"Trade history fetch error: {e}")
+            logger.error(f"Trade history traceback: {traceback.format_exc()}")
             return []
 
     def get_status(self) -> dict:
