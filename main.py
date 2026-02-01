@@ -9843,11 +9843,25 @@ class PaperTradingEngine:
             logger.debug(f"Coin performance record error: {e}")
     
     async def _close_on_binance(self, symbol: str, side: str, amount: float):
-        """Helper to close position on Binance asynchronously."""
+        """Helper to close position on Binance asynchronously.
+        Phase 87: Now fetches actual Binance position size to prevent partial closes.
+        """
         try:
-            result = await live_binance_trader.close_position(symbol, side, amount)
+            # Phase 87: Get ACTUAL position size from Binance (not paper trader)
+            # This fixes the BULLA bug where paper size (57) != Binance size (60)
+            binance_positions = await live_binance_trader.get_positions()
+            actual_amount = amount  # fallback to paper amount
+            
+            for pos in binance_positions:
+                if pos.get('symbol') == symbol:
+                    actual_amount = pos.get('size', amount)
+                    if abs(actual_amount - amount) > 0.001:
+                        logger.warning(f"⚠️ Size mismatch: Paper={amount:.4f}, Binance={actual_amount:.4f} - using Binance size")
+                    break
+            
+            result = await live_binance_trader.close_position(symbol, side, actual_amount)
             if result:
-                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol}")
+                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f}")
             else:
                 logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
         except Exception as e:
