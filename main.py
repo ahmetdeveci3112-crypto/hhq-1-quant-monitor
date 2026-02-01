@@ -11355,12 +11355,30 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             "lastUpdate": datetime.now().timestamp()
         }
         
+        # Phase 78: Fetch balance from Binance immediately before sending initial state
+        initial_balance = global_paper_trader.balance
+        if live_binance_trader.enabled and initial_balance <= 0:
+            try:
+                balance_data = await live_binance_trader.get_balance()
+                if balance_data:
+                    initial_balance = balance_data.get('total', 0)
+                    global_paper_trader.balance = initial_balance
+                    global_paper_trader.liveBalance = {
+                        'walletBalance': balance_data.get('walletBalance', balance_data.get('total', 0)),
+                        'marginBalance': balance_data.get('marginBalance', balance_data.get('total', 0)),
+                        'availableBalance': balance_data.get('availableBalance', balance_data.get('free', 0)),
+                        'unrealizedPnl': balance_data.get('unrealizedPnl', 0)
+                    }
+                    logger.info(f"Phase 78: Fetched immediate balance for initial state: ${initial_balance:.2f}")
+            except Exception as e:
+                logger.warning(f"Phase 78: Failed to fetch immediate balance: {e}")
+        
         await websocket.send_json({
             "type": "scanner_update",
             "opportunities": filtered_opportunities,  # FILTERED opportunities
             "stats": current_stats,
             "portfolio": {
-                "balance": global_paper_trader.balance,
+                "balance": initial_balance,
                 "positions": global_paper_trader.positions,
                 "trades": global_paper_trader.trades,  # ALL trades
                 "stats": {
