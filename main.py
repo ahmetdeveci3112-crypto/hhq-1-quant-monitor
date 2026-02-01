@@ -1124,8 +1124,12 @@ async def binance_position_sync_loop():
                         logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} (manual/external position)")
                     else:
                         # Update existing position with current Binance data
+                        # Phase 88: Also sync SIZE to prevent close amount mismatches
                         for pos in global_paper_trader.positions:
                             if pos.get('symbol') == symbol and pos.get('isLive'):
+                                # Sync critical values from Binance (source of truth)
+                                pos['size'] = bp.get('size', pos.get('size'))  # Phase 88: Sync size!
+                                pos['sizeUsd'] = bp.get('sizeUsd', pos.get('sizeUsd'))
                                 pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
