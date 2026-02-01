@@ -648,11 +648,19 @@ class LiveBinanceTrader:
                     notional = abs(float(p.get('notional') or 0))
                     position_margin = float(raw_info.get('positionInitialMargin', 0) or raw_info.get('initialMargin', 0) or 0)
                     
-                    # Calculate leverage from notional/margin
+                    # Get raw leverage from Binance directly
+                    raw_leverage = int(p.get('leverage') or raw_info.get('leverage') or 1)
+                    
+                    # Calculate leverage from notional/margin (for verification)
                     if position_margin > 0:
                         calculated_leverage = int(round(notional / position_margin))
                     else:
-                        calculated_leverage = int(p.get('leverage') or 1)
+                        calculated_leverage = raw_leverage
+                    
+                    # Use raw Binance leverage instead of calculated (more accurate)
+                    final_leverage = raw_leverage
+                    
+                    logger.info(f"  📊 {symbol}: raw_lev={raw_leverage}x, calc_lev={calculated_leverage}x, margin=${position_margin:.2f}, notional=${notional:.2f}")
                     
                     # Calculate PnL percentage based on margin (ROI)
                     unrealized_pnl = float(p.get('unrealizedPnl') or 0)
@@ -716,7 +724,7 @@ class LiveBinanceTrader:
                         'markPrice': float(p.get('markPrice') or 0),
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
-                        'leverage': calculated_leverage,
+                        'leverage': final_leverage,  # Use raw Binance leverage, not calculated
                         'margin': position_margin,  # Add margin for UI
                         'liquidationPrice': float(p.get('liquidationPrice') or 0),
                         'marginType': p.get('marginMode', 'cross'),
