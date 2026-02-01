@@ -11417,17 +11417,45 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
         else:
             pnl_data = global_paper_trader.get_today_pnl()
         
+        # Phase 85: Progressive Data Loading - Send critical data FIRST (instant UI)
+        # Step 1: Send balance and positions immediately (what user cares about most)
         await websocket.send_json({
             "type": "scanner_update",
-            "opportunities": filtered_opportunities,  # FILTERED opportunities
+            "opportunities": [],  # Empty initially for faster first paint
             "stats": current_stats,
             "portfolio": {
                 "balance": initial_balance,
                 "positions": initial_positions,
-                "trades": global_paper_trader.trades,  # ALL trades
+                "trades": global_paper_trader.trades[-20:],  # Only last 20 trades initially
                 "stats": {
                     **global_paper_trader.stats, 
-                    **pnl_data,  # Use correct PnL source based on mode
+                    **pnl_data,
+                    "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
+                },
+                "logs": [],  # Logs can come later
+                "enabled": global_paper_trader.enabled
+            },
+            "tradingMode": "live" if live_binance_trader.enabled else "paper",
+            "timestamp": datetime.now().timestamp(),
+            "message": "Portfolio loaded"
+        })
+        
+        logger.info(f"Phase 85: Sent critical data first (balance + positions)")
+        
+        # Step 2: Small delay then send full data with opportunities
+        await asyncio.sleep(0.5)  # 500ms delay for better UX
+        
+        await websocket.send_json({
+            "type": "scanner_update",
+            "opportunities": filtered_opportunities,  # Now send all opportunities
+            "stats": current_stats,
+            "portfolio": {
+                "balance": initial_balance,
+                "positions": initial_positions,
+                "trades": global_paper_trader.trades,  # ALL trades now
+                "stats": {
+                    **global_paper_trader.stats, 
+                    **pnl_data,
                     "liveBalance": getattr(global_paper_trader, 'liveBalance', None)
                 },
                 "logs": global_paper_trader.logs[-100:],
@@ -11435,10 +11463,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             },
             "tradingMode": "live" if live_binance_trader.enabled else "paper",
             "timestamp": datetime.now().timestamp(),
-            "message": "State restored" if current_opportunities else "Scanner starting..."
+            "message": "Full state loaded"
         })
         
-        logger.info(f"Sent initial state: {len(current_opportunities)} opportunities")
+        logger.info(f"Phase 85: Sent full state with {len(filtered_opportunities)} opportunities")
         
         # Stream updates loop (scanner is running in background)
         while is_connected:

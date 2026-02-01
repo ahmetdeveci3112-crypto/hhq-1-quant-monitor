@@ -211,8 +211,32 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  // Paper Trading State - Initialize with 0 to prevent paper values flash
-  const [portfolio, setPortfolio] = useState<Portfolio>({
+  // ============================================================================
+  // PHASE 85: LocalStorage Cache for Instant Page Load
+  // ============================================================================
+  const CACHE_KEY = 'hhq_portfolio_cache';
+  const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache validity
+
+  // Load cached data immediately on mount (before any API calls)
+  const getCachedPortfolio = (): Portfolio | null => {
+    try {
+      const cached = localStorage.getItem(CACHE_KEY);
+      if (!cached) return null;
+      const { data, timestamp } = JSON.parse(cached);
+      if (Date.now() - timestamp > CACHE_TTL) {
+        localStorage.removeItem(CACHE_KEY);
+        return null;
+      }
+      return data.portfolio;
+    } catch {
+      return null;
+    }
+  };
+
+  const cachedPortfolio = getCachedPortfolio();
+
+  // Paper Trading State - Initialize from cache if available for instant render
+  const [portfolio, setPortfolio] = useState<Portfolio>(cachedPortfolio || {
     balanceUsd: 0,
     initialBalance: 0,
     positions: [],
@@ -892,6 +916,28 @@ export default function App() {
 
             // Update last update time
             setLastUpdateTime(new Date());
+
+            // Phase 85: Save to LocalStorage cache for instant page load
+            if (data.portfolio) {
+              try {
+                localStorage.setItem(CACHE_KEY, JSON.stringify({
+                  data: {
+                    portfolio: {
+                      balanceUsd: data.portfolio.balance || 0,
+                      positions: data.portfolio.positions || [],
+                      trades: data.portfolio.trades || [],
+                      stats: data.portfolio.stats || {},
+                      equityCurve: [],
+                      initialBalance: 0
+                    }
+                  },
+                  timestamp: Date.now()
+                }));
+              } catch (e) {
+                // LocalStorage might be full or unavailable
+                console.warn('Cache save failed:', e);
+              }
+            }
           }
         } catch (e) {
           console.error('Parse error:', e);
@@ -1100,8 +1146,15 @@ export default function App() {
               {/* Mobile: Grid Layout - Show loading when balance not ready */}
               <div className="grid grid-cols-2 gap-4 lg:hidden">
                 {portfolio.balanceUsd <= 0 ? (
-                  <div className="col-span-2 text-center py-4">
-                    <div className="text-slate-400 animate-pulse">Loading balance...</div>
+                  <div className="col-span-2 grid grid-cols-2 gap-4">
+                    <div className="col-span-2">
+                      <div className="h-3 w-20 bg-slate-700/50 rounded mb-2" />
+                      <div className="h-8 w-32 bg-slate-700/50 rounded animate-pulse" />
+                    </div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
                   </div>
                 ) : (
                   <>
@@ -1152,7 +1205,14 @@ export default function App() {
               {/* Desktop: Flex Layout - Loading state when balance not ready */}
               <div className="hidden lg:flex flex-wrap items-center justify-between gap-4">
                 {portfolio.balanceUsd <= 0 ? (
-                  <div className="text-slate-400 animate-pulse py-2">Loading balance from Binance...</div>
+                  <div className="flex items-center gap-8">
+                    <div><div className="h-3 w-20 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-28 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div className="h-8 w-px bg-slate-800" />
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                  </div>
                 ) : (
                   <>
                     <div className="flex items-center gap-8">
