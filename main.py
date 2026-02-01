@@ -960,6 +960,8 @@ class LiveBinanceTrader:
                 'limit': min(limit, 1000)
             })
             
+            logger.info(f"Trade history: Got {len(income_history) if income_history else 0} records from Binance API")
+            
             trades = []
             for income in income_history:
                 symbol = income.get('symbol', 'UNKNOWN')
