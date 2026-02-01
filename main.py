@@ -7887,21 +7887,75 @@ class SignalGenerator:
         score = 0
         reasons = []
         
-        # Layer 1: Z-Score (Primary Driver) - Base 45 pts + up to 10 bonus
-        # Reduced from 60+20 since VWAP and HTF layers now contribute
-        if abs(zscore) > effective_threshold:
-            # Base score
-            score += 45
-            
-            # Bonus based on Z-Score strength (0-10 pts extra)
-            zscore_excess = abs(zscore) - effective_threshold
-            zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
-            score += zscore_bonus
-            
-            reasons.append(f"Z({zscore:.1f})")
-            signal_side = "SHORT" if zscore > 0 else "LONG"
+        # =====================================================================
+        # PHASE 90: HURST-AWARE SIGNAL DIRECTION (Critical Fix)
+        # Previously: signal_side = "SHORT" if zscore > 0 else "LONG" (ignored Hurst)
+        # Now: Use regime-based strategy aligned with MTF Analyzer
+        # =====================================================================
+        
+        # Determine signal direction based on Hurst regime
+        signal_side = None
+        
+        # Mean Reversion Regime (Hurst < 0.45)
+        # Price tends to revert to mean, so:
+        # - zscore < -threshold (oversold) → LONG (buy the dip)
+        # - zscore > +threshold (overbought) → SHORT (sell the top)
+        if hurst < 0.45:
+            if zscore < -effective_threshold:
+                signal_side = "LONG"
+                reasons.append(f"MR_Z({zscore:.1f})")
+                score += 45
+            elif zscore > effective_threshold:
+                signal_side = "SHORT"
+                reasons.append(f"MR_Z(+{zscore:.1f})")
+                score += 45
+            else:
+                return None  # Z-Score not extreme enough
+        
+        # Trend Following Regime (Hurst > 0.55)
+        # Price tends to continue direction, so:
+        # - zscore > +threshold (positive momentum) → LONG (follow up trend)
+        # - zscore < -threshold (negative momentum) → SHORT (follow down trend)
+        elif hurst > 0.55:
+            if zscore > effective_threshold:
+                signal_side = "LONG"
+                reasons.append(f"TF_Z(+{zscore:.1f})")
+                score += 45
+            elif zscore < -effective_threshold:
+                signal_side = "SHORT"
+                reasons.append(f"TF_Z({zscore:.1f})")
+                score += 45
+            else:
+                return None  # Z-Score not extreme enough
+        
+        # Ranging Regime (0.45 <= Hurst <= 0.55)
+        # No clear regime, be more conservative - use higher threshold
         else:
-            return None # Fail fast
+            ranging_threshold = effective_threshold * 1.3  # 30% stricter
+            if abs(zscore) > ranging_threshold:
+                # Use mean reversion logic for ranging (safer)
+                if zscore < -ranging_threshold:
+                    signal_side = "LONG"
+                    reasons.append(f"RNG_Z({zscore:.1f})")
+                    score += 40  # Slightly lower score for uncertainty
+                elif zscore > ranging_threshold:
+                    signal_side = "SHORT"
+                    reasons.append(f"RNG_Z(+{zscore:.1f})")
+                    score += 40
+            else:
+                return None  # Not trading in uncertain regime
+        
+        if signal_side is None:
+            return None
+        
+        # Bonus based on Z-Score strength (0-10 pts extra)
+        zscore_excess = abs(zscore) - effective_threshold
+        zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
+        score += zscore_bonus
+        
+        # Log regime detection
+        regime_name = "MR" if hurst < 0.45 else ("TF" if hurst > 0.55 else "RNG")
+        logger.debug(f"Phase 90: {symbol} Regime={regime_name} Hurst={hurst:.2f} Z={zscore:.2f} → {signal_side}")
             
         # Layer 2: Order Book Imbalance (Confirmation) - Max 20 pts
         # Graduated scoring based on imbalance strength
