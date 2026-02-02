@@ -724,7 +724,7 @@ class LiveBinanceTrader:
                         'markPrice': float(p.get('markPrice') or 0),
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
-                        'leverage': calculated_leverage,  # notional/margin - accurate for cross margin
+                        'leverage': raw_leverage,  # Use Binance raw leverage, not calculated (cross margin causes calc issues)
                         'margin': position_margin,  # Add margin for UI
                         'liquidationPrice': float(p.get('liquidationPrice') or 0),
                         'marginType': p.get('marginMode', 'cross'),
