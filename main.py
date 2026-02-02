@@ -3225,7 +3225,7 @@ class UIStateCache:
             "portfolio": {
                 "balance": self.balance,
                 "positions": self.positions,
-                "trades": self.trades[-50:],
+                "trades": self.trades[-100:],
                 "stats": {
                     **self.pnl_data,
                     "liveBalance": self.live_balance,
