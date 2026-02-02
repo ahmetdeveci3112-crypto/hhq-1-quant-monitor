@@ -1083,7 +1083,7 @@ export default function App() {
                     <div>
                       <div className="text-xs text-slate-500 uppercase">Available</div>
                       <div className="text-base font-semibold text-cyan-400 font-mono">
-                        {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                        {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                       </div>
                     </div>
                     <div>
@@ -1144,7 +1144,7 @@ export default function App() {
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
                         <div className="text-base font-semibold text-cyan-400 font-mono">
-                          {formatCurrency(portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                          {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                         </div>
                       </div>
                       <div>

@@ -9,6 +9,7 @@ interface WalletPanelProps {
     positions: Position[];
     initialBalance: number;
     isLiveMode?: boolean;  // When true, use walletBalance directly from Binance
+    availableBalanceFromBinance?: number; // Phase 98: Real available balance from Binance API
 }
 
 const formatCurrency = (value: number): string => {
@@ -26,6 +27,7 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
     positions,
     initialBalance = 10000,
     isLiveMode = false,
+    availableBalanceFromBinance,
 }) => {
     // In live mode, use walletBalance directly from Binance
     // In paper mode, calculate: Initial Balance + Realized PnL
@@ -43,8 +45,10 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
         return sum + margin;
     }, 0);
 
-    // Available Balance = Margin Balance - Used Margin
-    const availableBalance = marginBalance - usedMargin;
+    // Available Balance = Use Binance value in live mode, else calculate
+    const availableBalance = isLiveMode && availableBalanceFromBinance !== undefined
+        ? availableBalanceFromBinance
+        : (marginBalance - usedMargin);
 
     return (
         <div className="bg-[#0B0E14] rounded-2xl border border-slate-800 p-4 shadow-xl">
