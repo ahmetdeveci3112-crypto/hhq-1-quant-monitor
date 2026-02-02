@@ -3225,7 +3225,7 @@ class UIStateCache:
             "portfolio": {
                 "balance": self.balance,
                 "positions": self.positions,
-                "trades": self.trades[-100:],
+                "trades": sorted(self.trades, key=lambda t: t.get('closeTime', 0), reverse=True),
                 "stats": {
                     **self.pnl_data,
                     "liveBalance": self.live_balance,
