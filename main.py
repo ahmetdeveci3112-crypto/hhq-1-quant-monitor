@@ -3107,6 +3107,82 @@ class WhaleTracker:
 whale_tracker = WhaleTracker()
 
 
+# ============================================================================
+# PHASE 98: UI STATE CACHE
+# Stores all UI-relevant data in memory, updated by background scanner.
+# WebSocket endpoints read from this cache instead of making fresh API calls.
+# ============================================================================
+
+class UIStateCache:
+    """
+    Cache for UI state - updated by background scanner every 3 seconds.
+    WebSocket endpoints read from this cache for instant data delivery.
+    
+    Benefits:
+    - Eliminates 3+ minute UI loading delay
+    - Reduces Binance API rate limit usage
+    - All UI clients see consistent data
+    """
+    
+    def __init__(self):
+        self.opportunities = []
+        self.stats = {
+            "totalCoins": 0,
+            "analyzedCoins": 0,
+            "longSignals": 0,
+            "shortSignals": 0,
+            "activeSignals": 0,
+            "lastUpdate": 0
+        }
+        self.balance = 0
+        self.live_balance = None
+        self.positions = []
+        self.trades = []
+        self.pnl_data = {
+            "todayPnl": 0,
+            "todayPnlPercent": 0,
+            "totalPnl": 0,
+            "totalPnlPercent": 0
+        }
+        self.logs = []
+        self.trading_mode = "paper"
+        self.last_update = 0
+        self.btc_state = {}
+        self.enabled = True
+        self._initialized = False
+    
+    def get_state(self) -> dict:
+        """Return complete UI state for WebSocket - instant, no API calls."""
+        return {
+            "type": "scanner_update",
+            "opportunities": self.opportunities,
+            "stats": self.stats,
+            "portfolio": {
+                "balance": self.balance,
+                "positions": self.positions,
+                "trades": self.trades[-50:],
+                "stats": {
+                    **self.pnl_data,
+                    "liveBalance": self.live_balance,
+                    "winRate": 0,
+                    "totalTrades": len(self.trades)
+                },
+                "logs": self.logs[-100:],
+                "enabled": self.enabled
+            },
+            "tradingMode": self.trading_mode,
+            "timestamp": self.last_update,
+            "message": "Cache data" if self._initialized else "Initializing..."
+        }
+    
+    def is_ready(self) -> bool:
+        """Check if cache has been populated at least once."""
+        return self._initialized and self.last_update > 0
+
+
+# Global UI State Cache instance
+ui_state_cache = UIStateCache()
+
 
 class MultiCoinScanner:
     """
@@ -3577,6 +3653,123 @@ multi_coin_scanner = MultiCoinScanner(max_coins=999)
 
 
 # ============================================================================
+# PHASE 98: UI CACHE UPDATE FUNCTION
+# Called by background scanner to populate cache with fresh Binance data.
+# ============================================================================
+
+async def update_ui_cache(opportunities: list, stats: dict):
+    """
+    Update UI state cache with latest scanner data and Binance info.
+    This is called every 3 seconds by the background scanner loop.
+    
+    Args:
+        opportunities: List of filtered coin opportunities from scanner
+        stats: Scanner statistics dict
+    """
+    global ui_state_cache
+    
+    try:
+        # Apply BTC filter to opportunities
+        filtered_opportunities = []
+        for opp in opportunities:
+            signal_action = opp.get('signalAction', 'NONE')
+            symbol = opp.get('symbol', '')
+            
+            if signal_action == 'NONE':
+                filtered_opportunities.append(opp)
+            else:
+                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
+                if btc_allowed:
+                    if btc_penalty > 0:
+                        original_score = opp.get('signalScore', 0)
+                        opp['signalScore'] = int(original_score * (1 - btc_penalty))
+                        opp['btcFilterNote'] = btc_reason
+                    filtered_opportunities.append(opp)
+                else:
+                    opp['signalAction'] = 'NONE'
+                    opp['signalScore'] = 0
+                    opp['btcFilterBlocked'] = btc_reason
+                    filtered_opportunities.append(opp)
+        
+        # Update opportunities and stats
+        ui_state_cache.opportunities = filtered_opportunities
+        
+        # Calculate signal counts from filtered opportunities
+        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG')
+        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT')
+        
+        ui_state_cache.stats = {
+            "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
+            "analyzedCoins": len(filtered_opportunities),
+            "longSignals": long_count,
+            "shortSignals": short_count,
+            "activeSignals": long_count + short_count,
+            "btcState": btc_filter.get_state(),
+            "lastUpdate": datetime.now().timestamp()
+        }
+        
+        # Fetch Binance data (live mode) or use paper trader data
+        if live_binance_trader.enabled:
+            try:
+                # Parallel fetch for speed
+                balance_task = asyncio.create_task(live_binance_trader.get_balance())
+                positions_task = asyncio.create_task(live_binance_trader.get_positions())
+                
+                balance_data = await balance_task
+                positions = await positions_task
+                
+                ui_state_cache.balance = balance_data.get('walletBalance', 0)
+                ui_state_cache.live_balance = balance_data
+                ui_state_cache.positions = sorted(positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                ui_state_cache.trading_mode = "live"
+                
+                # Cache PnL data (don't fetch every cycle - expensive)
+                if not ui_state_cache._initialized or datetime.now().timestamp() - ui_state_cache.last_update > 30:
+                    try:
+                        pnl_data = await live_binance_trader.get_pnl_from_binance()
+                        ui_state_cache.pnl_data = pnl_data
+                    except:
+                        pass
+                        
+            except Exception as e:
+                logger.warning(f"Binance data fetch error: {e}")
+        else:
+            # Paper trading mode
+            ui_state_cache.balance = global_paper_trader.balance
+            ui_state_cache.positions = global_paper_trader.positions
+            ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
+            ui_state_cache.trading_mode = "paper"
+        
+        # Fetch trades from SQLite
+        try:
+            sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
+            ui_state_cache.trades = []
+            for t in sqlite_trades:
+                ui_state_cache.trades.append({
+                    'symbol': t.get('symbol', 'UNKNOWN'),
+                    'side': t.get('side', 'LONG'),
+                    'entryPrice': t.get('entry_price', 0),
+                    'exitPrice': t.get('exit_price', 0),
+                    'pnl': t.get('pnl', 0),
+                    'closeTime': t.get('close_time', 0),
+                    'closeReason': t.get('close_reason', 'Unknown'),
+                    'leverage': t.get('leverage', 1),
+                    'sizeUsd': t.get('size_usd', 0)
+                })
+        except Exception as e:
+            logger.debug(f"SQLite trades fetch error: {e}")
+        
+        # Update logs and metadata
+        ui_state_cache.logs = global_paper_trader.logs[-100:]
+        ui_state_cache.enabled = global_paper_trader.enabled
+        ui_state_cache.last_update = datetime.now().timestamp()
+        ui_state_cache._initialized = True
+        
+    except Exception as e:
+        logger.error(f"UI cache update error: {e}")
+
+
+# ============================================================================
 # 24/7 BACKGROUND SCANNER LOOP
 # ============================================================================
 
@@ -3628,6 +3821,9 @@ async def background_scanner_loop():
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
                 stats = multi_coin_scanner.get_scanner_stats()
+                
+                # PHASE 98: Update UI cache with latest data (instant delivery to UI)
+                await update_ui_cache(opportunities, stats)
                 
                 # Update market regime with BTC price (from btc_filter OR from opportunities)
                 try:
@@ -11460,363 +11656,54 @@ async def paper_trading_close(position_id: str):
 @app.websocket("/ws/scanner")
 async def scanner_websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for streaming scanner updates to frontend.
-    Scanner runs 24/7 in background - this just streams the current state.
+    PHASE 98: Simplified WebSocket endpoint using UI State Cache.
+    
+    Reads from pre-populated cache instead of making fresh Binance API calls.
+    Cache is updated every 3 seconds by background_scanner_loop.
+    
+    Benefits:
+    - Instant connection (~0ms vs 3+ minutes before)
+    - No Binance API rate limit impact from UI connections
+    - All clients see consistent data
     """
     await websocket.accept()
-    logger.info("Scanner WebSocket client connected")
+    logger.info("🚀 Phase 98: Scanner WebSocket connected - using cache")
     
-    is_connected = True
-    stream_interval = 2  # Stream updates every 2 seconds (faster for real-time position tracking)
+    stream_interval = 2  # Stream cached data every 2 seconds
     
     try:
-        # =========================================================
-        # Phase 60c: Update BTC/ETH state before filtering
-        # =========================================================
-        try:
-            exchange_for_btc = multi_coin_scanner.exchange
-            # Fallback: Create exchange if not available
-            if not exchange_for_btc:
-                import ccxt.async_support as ccxt_async
-                exchange_for_btc = ccxt_async.binance({'enableRateLimit': True})
-                logger.info("📊 Created fallback exchange for BTC state update")
-            
-            await btc_filter.update_btc_state(exchange_for_btc)
-            
-            # Close fallback exchange if we created it
-            if not multi_coin_scanner.exchange and exchange_for_btc:
-                await exchange_for_btc.close()
-        except Exception as btc_update_err:
-            logger.warning(f"BTC state update error: {btc_update_err}")
-        
-        # Build current opportunities from existing analyzers
-        current_opportunities = []
-        for symbol, analyzer in multi_coin_scanner.analyzers.items():
-            opp = analyzer.opportunity.to_dict()
-            if opp.get('price', 0) > 0:  # Only include coins with valid price
-                current_opportunities.append(opp)
-        
-        # Sort by signal score
-        current_opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
-        
-        # =========================================================
-        # Phase 60b: Apply BTC Filter to opportunities for UI
-        # Block counter-trend signals from being displayed
-        # =========================================================
-        filtered_opportunities = []
-        for opp in current_opportunities:
-            signal_action = opp.get('signalAction', 'NONE')
-            symbol = opp.get('symbol', '')
-            
-            if signal_action == 'NONE':
-                # No signal - keep in list
-                filtered_opportunities.append(opp)
-            else:
-                # Has signal - apply BTC filter
-                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
-                if btc_allowed:
-                    # Apply penalty to score if needed
-                    if btc_penalty > 0:
-                        original_score = opp.get('signalScore', 0)
-                        opp['signalScore'] = int(original_score * (1 - btc_penalty))
-                        opp['btcFilterNote'] = btc_reason
-                    filtered_opportunities.append(opp)
-                else:
-                    # Signal blocked - convert to NONE so it doesn't show as active signal
-                    opp['signalAction'] = 'NONE'
-                    opp['signalScore'] = 0
-                    opp['btcFilterBlocked'] = btc_reason
-                    filtered_opportunities.append(opp)  # Keep coin but remove signal
-        
-        # Get current stats (recalculate based on filtered)
-        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG')
-        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT')
-        current_stats = {
-            "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner.coins else 0,
-            "analyzedCoins": len(filtered_opportunities),
-            "longSignals": long_count,
-            "shortSignals": short_count,
-            "activeSignals": long_count + short_count,
-            "btcState": btc_filter.get_state(),
-            "lastUpdate": datetime.now().timestamp()
-        }
-        
-        # =====================================================================
-        # Phase 97: PARALLEL DATA FETCHING - Major speed improvement
-        # Fetch Balance, Positions, and Trades concurrently (4-5s → ~1s)
-        # =====================================================================
-        start_time = datetime.now()
-        
-        async def fetch_balance():
-            """Fetch balance from Binance or paper trader."""
-            if live_binance_trader.enabled:
-                try:
-                    return await live_binance_trader.get_balance()
-                except Exception as e:
-                    logger.warning(f"Binance balance fetch failed: {e}")
-                    return {}
-            return {'walletBalance': global_paper_trader.balance}
-        
-        async def fetch_positions():
-            """Fetch positions from Binance, sorted newest first."""
-            if live_binance_trader.enabled:
-                try:
-                    pos = await live_binance_trader.get_positions()
-                    return sorted(pos, key=lambda p: p.get('openTime', 0), reverse=True)
-                except Exception as e:
-                    logger.warning(f"Binance positions fetch failed: {e}")
-            return []
-        
-        async def fetch_trades():
-            """Fetch trade history from SQLite."""
-            try:
-                sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
-                trades = []
-                for t in sqlite_trades:
-                    trades.append({
-                        'symbol': t.get('symbol', 'UNKNOWN'),
-                        'side': t.get('side', 'LONG'),
-                        'entryPrice': t.get('entry_price', 0),
-                        'exitPrice': t.get('exit_price', 0),
-                        'pnl': t.get('pnl', 0),
-                        'closeTime': t.get('close_time', 0),
-                        'closeReason': t.get('close_reason', 'Unknown'),
-                        'pnlFormatted': f"+${t.get('pnl', 0):.2f}" if t.get('pnl', 0) >= 0 else f"-${abs(t.get('pnl', 0)):.2f}",
-                        'leverage': t.get('leverage', 1),
-                        'sizeUsd': t.get('size_usd', 0)
-                    })
-                return trades
-            except Exception as e:
-                logger.warning(f"SQLite trade fetch failed: {e}")
-                return []
-        
-        # Start all tasks concurrently
-        balance_task = asyncio.create_task(fetch_balance())
-        positions_task = asyncio.create_task(fetch_positions())
-        trades_task = asyncio.create_task(fetch_trades())
-        
-        # Await all results
-        balance_result = await balance_task
-        initial_positions = await positions_task
-        initial_trades = await trades_task
-        
-        # Process balance result
-        if live_binance_trader.enabled:
-            initial_balance = balance_result.get('walletBalance', 0)
-            initial_live_balance = balance_result
+        # INSTANT: Send cached state immediately (no API calls!)
+        if ui_state_cache.is_ready():
+            await websocket.send_json(ui_state_cache.get_state())
+            logger.info(f"📦 Phase 98: Sent cached state instantly ({len(ui_state_cache.opportunities)} opportunities)")
         else:
-            initial_balance = balance_result.get('walletBalance', 0)
-            initial_live_balance = None
+            # Cache not ready yet - send empty state with loading message
+            await websocket.send_json({
+                "type": "scanner_update",
+                "opportunities": [],
+                "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
+                "portfolio": {"balance": 0, "positions": [], "trades": [], "stats": {}, "logs": [], "enabled": True},
+                "tradingMode": ui_state_cache.trading_mode,
+                "timestamp": datetime.now().timestamp(),
+                "message": "Cache initializing... (first scan in progress)"
+            })
+            logger.info("⏳ Phase 98: Cache not ready yet, sent empty state")
         
-        load_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Phase 97: Parallel load completed in {load_time:.2f}s - balance=${initial_balance:.2f}, positions={len(initial_positions)}, trades={len(initial_trades)}")
-        
-        # Get PnL data - use Binance for live mode, paper trades for paper mode
-        if live_binance_trader.enabled:
-            # Use cached Binance PnL or fetch fresh
-            pnl_data = getattr(live_binance_trader, 'cached_pnl', None)
-            if not pnl_data:
-                try:
-                    pnl_data = await live_binance_trader.get_pnl_from_binance()
-                    live_binance_trader.cached_pnl = pnl_data
-                except:
-                    pnl_data = {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0}
-        else:
-            pnl_data = global_paper_trader.get_today_pnl()
-        
-        # Phase 85: Progressive Data Loading - Send critical data FIRST (instant UI)
-        # Phase 88: Now using Binance data instead of paper trader
-        # Step 1: Send balance and positions immediately (what user cares about most)
-        await websocket.send_json({
-            "type": "scanner_update",
-            "opportunities": [],  # Empty initially for faster first paint
-            "stats": current_stats,
-            "portfolio": {
-                "balance": initial_balance,
-                "positions": initial_positions,
-                "trades": initial_trades[-20:],  # Phase 88: From SQLite
-                "stats": {
-                    **pnl_data,
-                    "liveBalance": initial_live_balance
-                },
-                "logs": [],  # Logs can come later
-                "enabled": True
-            },
-            "tradingMode": "live" if live_binance_trader.enabled else "paper",
-            "timestamp": datetime.now().timestamp(),
-            "message": "Portfolio loaded"
-        })
-        
-        logger.info(f"Phase 88: Sent critical data from Binance (balance + positions)")
-        
-        # Step 2: Small delay then send full data with opportunities
-        await asyncio.sleep(0.5)  # 500ms delay for better UX
-        
-        await websocket.send_json({
-            "type": "scanner_update",
-            "opportunities": filtered_opportunities,  # Now send all opportunities
-            "stats": current_stats,
-            "portfolio": {
-                "balance": initial_balance,
-                "positions": initial_positions,
-                "trades": initial_trades,  # Phase 88: From SQLite (all trades)
-                "stats": {
-                    **pnl_data,
-                    "liveBalance": initial_live_balance
-                },
-                "logs": global_paper_trader.logs[-100:],
-                "enabled": True
-            },
-            "tradingMode": "live" if live_binance_trader.enabled else "paper",
-            "timestamp": datetime.now().timestamp(),
-            "message": "Full state loaded"
-        })
-        
-        logger.info(f"Phase 85: Sent full state with {len(filtered_opportunities)} opportunities")
-        
-        # Stream updates loop (scanner is running in background)
-        while is_connected:
-            try:
-                # =========================================================
-                # Phase 60c: Periodic BTC/ETH state update
-                # =========================================================
-                try:
-                    exchange_for_btc = multi_coin_scanner.exchange
-                    if not exchange_for_btc:
-                        import ccxt.async_support as ccxt_async
-                        exchange_for_btc = ccxt_async.binance({'enableRateLimit': True})
-                    
-                    await btc_filter.update_btc_state(exchange_for_btc)
-                    
-                    if not multi_coin_scanner.exchange and exchange_for_btc:
-                        await exchange_for_btc.close()
-                except Exception:
-                    pass  # Silent fail, will retry next loop
-                
-                # Get latest opportunities from background scanner (no scanning here)
-                opportunities = []
-                for symbol, analyzer in multi_coin_scanner.analyzers.items():
-                    opp = analyzer.opportunity.to_dict()
-                    if opp.get('price', 0) > 0:
-                        opportunities.append(opp)
-                
-                opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
-                
-                # =========================================================
-                # Phase 60b: Apply BTC Filter to opportunities for UI
-                # =========================================================
-                filtered_opps = []
-                for opp in opportunities:
-                    signal_action = opp.get('signalAction', 'NONE')
-                    symbol = opp.get('symbol', '')
-                    
-                    if signal_action == 'NONE':
-                        filtered_opps.append(opp)
-                    else:
-                        btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
-                        if btc_allowed:
-                            if btc_penalty > 0:
-                                original_score = opp.get('signalScore', 0)
-                                opp['signalScore'] = int(original_score * (1 - btc_penalty))
-                                opp['btcFilterNote'] = btc_reason
-                            filtered_opps.append(opp)
-                        else:
-                            # Block signal - convert to NONE
-                            opp['signalAction'] = 'NONE'
-                            opp['signalScore'] = 0
-                            opp['btcFilterBlocked'] = btc_reason
-                            filtered_opps.append(opp)
-                
-                # Recalculate stats based on filtered
-                long_count = sum(1 for o in filtered_opps if o.get('signalAction') == 'LONG')
-                short_count = sum(1 for o in filtered_opps if o.get('signalAction') == 'SHORT')
-                stats = {
-                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner.coins else 0,
-                    "analyzedCoins": len(filtered_opps),
-                    "longSignals": long_count,
-                    "shortSignals": short_count,
-                    "activeSignals": long_count + short_count,
-                    "btcState": btc_filter.get_state(),
-                    "lastUpdate": datetime.now().timestamp()
-                }
-                
-                # Get PnL data - use cached Binance PnL for live mode
-                if live_binance_trader.enabled:
-                    pnl_data = getattr(live_binance_trader, 'cached_pnl', {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0})
-                else:
-                    pnl_data = global_paper_trader.get_today_pnl()
-                
-                # =====================================================================
-                # Phase 88: BINANCE-ONLY - Get positions and balance from Binance
-                # =====================================================================
-                if live_binance_trader.enabled:
-                    try:
-                        stream_positions = await live_binance_trader.get_positions()
-                        stream_positions = sorted(stream_positions, key=lambda p: p.get('openTime', 0), reverse=True)
-                    except:
-                        stream_positions = []
-                    
-                    try:
-                        stream_balance_data = await live_binance_trader.get_balance()
-                        stream_balance = stream_balance_data.get('walletBalance', 0)
-                        stream_live_balance = stream_balance_data
-                    except:
-                        stream_balance = 0
-                        stream_live_balance = None
-                else:
-                    # Fallback for paper mode (shouldn't happen)
-                    stream_positions = []
-                    stream_balance = global_paper_trader.balance
-                    stream_live_balance = None
-                
-                update_data = {
-                    "type": "scanner_update",
-                    "opportunities": filtered_opps,  # FILTERED opportunities
-                    "stats": stats,
-                    "portfolio": {
-                        "balance": stream_balance,
-                        "positions": stream_positions,  # From Binance
-                        "trades": initial_trades,  # Phase 88: From SQLite
-                        "stats": {
-                            # Phase 91: Use appropriate stats based on mode
-                            # Live mode: only use Binance PnL data, not paper stats
-                            "todayPnl": pnl_data.get('todayPnl', 0),
-                            "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
-                            "totalPnl": pnl_data.get('totalPnl', 0),
-                            "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
-                            "winRate": global_paper_trader.stats.get('winRate', 0),
-                            "totalTrades": global_paper_trader.stats.get('totalTrades', 0),
-                            "liveBalance": stream_live_balance
-                        },
-                        "logs": global_paper_trader.logs[-100:],  # Keep logs
-                        "enabled": global_paper_trader.enabled
-                    },
-                    "tradingMode": "live" if live_binance_trader.enabled else "paper",
-                    "timestamp": datetime.now().timestamp()
-                }
-                
-                await websocket.send_json(update_data)
-                await asyncio.sleep(stream_interval)
-                
-            except WebSocketDisconnect:
-                logger.info("Scanner WebSocket disconnected during streaming")
-                is_connected = False
-                break
-            except Exception as e:
-                if "close message" in str(e).lower() or "disconnect" in str(e).lower():
-                    logger.info("Scanner WebSocket connection closed")
-                    is_connected = False
-                    break
-                logger.error(f"Scanner loop error: {e}")
-                await asyncio.sleep(5)
-                
+        # Stream updates from cache (no Binance calls in this loop!)
+        while True:
+            await asyncio.sleep(stream_interval)
+            
+            # Simply send the current cache state
+            await websocket.send_json(ui_state_cache.get_state())
+            
     except WebSocketDisconnect:
         logger.info("Scanner WebSocket client disconnected")
     except Exception as e:
-        logger.error(f"Scanner WebSocket error: {e}")
+        if "close message" not in str(e).lower() and "disconnect" not in str(e).lower():
+            logger.error(f"Scanner WebSocket error: {e}")
     finally:
-        # NOTE: Scanner continues running in background - we don't stop it here
-        is_connected = False
+        # Scanner continues running in background - we don't stop it here
+        pass
 
 
 @app.websocket("/ws/ui")
