@@ -1212,12 +1212,77 @@ async def binance_position_sync_loop():
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
                                 break
                 
-                # Remove closed positions from engine that are no longer on Binance
+                # ================================================================
+                # Phase 100: Record externally closed positions to trade history
+                # Without this, manual closes on Binance don't appear in UI history
+                # ================================================================
                 binance_symbols = {p.get('symbol') for p in binance_positions}
-                global_paper_trader.positions = [
-                    p for p in global_paper_trader.positions 
-                    if not p.get('isLive') or p.get('symbol') in binance_symbols
-                ]
+                closed_positions = []
+                remaining_positions = []
+                
+                for p in global_paper_trader.positions:
+                    if p.get('isLive') and p.get('symbol') not in binance_symbols:
+                        # This position was closed externally on Binance
+                        closed_positions.append(p)
+                    else:
+                        remaining_positions.append(p)
+                
+                # Record closed positions to trade history
+                for pos in closed_positions:
+                    # Estimate exit price from last known mark price or entry
+                    exit_price = pos.get('markPrice', pos.get('entryPrice', 0))
+                    pnl = pos.get('unrealizedPnl', 0)
+                    pnl_percent = pos.get('unrealizedPnlPercent', 0)
+                    
+                    trade = {
+                        "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+                        "symbol": pos.get('symbol', 'UNKNOWN'),
+                        "side": pos.get('side', 'LONG'),
+                        "entryPrice": pos.get('entryPrice', 0),
+                        "exitPrice": exit_price,
+                        "size": pos.get('size', 0),
+                        "sizeUsd": pos.get('sizeUsd', 0),
+                        "pnl": pnl,
+                        "pnlPercent": pnl_percent,
+                        "openTime": pos.get('openTime', 0),
+                        "closeTime": int(datetime.now().timestamp() * 1000),
+                        "reason": "External Close (Binance)",
+                        "leverage": pos.get('leverage', 10),
+                        "isLive": True,
+                        "signalScore": pos.get('signalScore', 0),
+                        "mtfScore": pos.get('mtfScore', 0),
+                        "zScore": pos.get('zScore', 0),
+                        "spreadLevel": pos.get('spreadLevel', 'unknown'),
+                        "stopLoss": pos.get('stopLoss', 0),
+                        "takeProfit": pos.get('takeProfit', 0),
+                        "trailActivation": pos.get('trailActivation', 0),
+                        "trailingStop": pos.get('trailingStop', 0),
+                        "isTrailingActive": pos.get('isTrailingActive', False),
+                        "atr": pos.get('atr', 0),
+                    }
+                    global_paper_trader.trades.append(trade)
+                    
+                    # Save to SQLite
+                    try:
+                        asyncio.create_task(sqlite_manager.save_trade(trade))
+                    except Exception as e:
+                        logger.debug(f"SQLite save error: {e}")
+                    
+                    # Update stats
+                    global_paper_trader.stats['totalTrades'] += 1
+                    global_paper_trader.stats['totalPnl'] += pnl
+                    if pnl > 0:
+                        global_paper_trader.stats['winningTrades'] += 1
+                    else:
+                        global_paper_trader.stats['losingTrades'] += 1
+                    
+                    logger.info(f"📥 EXTERNAL CLOSE RECORDED: {pos['side']} {pos['symbol']} | PnL: ${pnl:.2f}")
+                
+                global_paper_trader.positions = remaining_positions
+                
+                if closed_positions:
+                    global_paper_trader.save_state()
+                    logger.info(f"✅ Recorded {len(closed_positions)} externally closed positions to trade history")
                 
                 # Sync timestamp
                 live_binance_trader.last_sync_time = int(datetime.now().timestamp() * 1000)
