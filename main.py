@@ -4410,75 +4410,40 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     signal['mtf_size_modifier'] = score_modifier
     
     # =====================================================
-    # DYNAMIC LEVERAGE (Cloud Scanner - WebSocket Parity)
-    # Calculate leverage based on MTF + PRICE + SPREAD + VOLATILITY
+    # PHASE 99: MTF LEVERAGE ADJUSTMENT (Bonus/Penalty Only)
+    # SignalGenerator already calculated unified leverage
+    # Here we only apply MTF confirmation bonus/penalty
     # =====================================================
     try:
-        import math
-        
         # Calculate TF count from scores (positive score = aligned)
         scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
         tf_count = sum(1 for s in scores.values() if s > 0)
         
-        # Base leverage from MTF agreement
+        # Get existing leverage from SignalGenerator (unified calculation)
+        current_leverage = signal.get('leverage', 25)
+        
+        # Apply MTF bonus/penalty (don't overwrite, just adjust)
         if tf_count >= 3:
-            base_leverage = 100  # All TFs aligned
+            mtf_mult = 1.2   # +20% for all TFs aligned
         elif tf_count >= 2:
-            base_leverage = 75   # 2 TFs aligned
+            mtf_mult = 1.0   # No change for 2 TFs
         elif tf_count >= 1:
-            base_leverage = 50   # 1 TF aligned
+            mtf_mult = 0.8   # -20% for only 1 TF
         else:
-            base_leverage = 25   # No TF aligned
+            mtf_mult = 0.6   # -40% for no TF aligned
         
-        # PRICE FACTOR: Logarithmic reduction for low-price coins
-        # $100+ → 1.0, $1 → 0.50, $0.01 → 0.30
-        if price > 0:
-            log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
-            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))
-        else:
-            price_factor = 1.0
+        adjusted_leverage = int(round(current_leverage * mtf_mult))
+        adjusted_leverage = max(3, min(75, adjusted_leverage))
         
-        # SPREAD FACTOR: High spread = lower leverage
-        spread_pct = signal.get('spreadPct', 0.05)
-        if spread_pct > 0:
-            spread_factor = max(0.5, 1.0 - spread_pct * 2)
-        else:
-            spread_factor = 1.0
-        
-        # VOLATILITY FACTOR: High ATR = lower leverage
-        # Phase 73: ATR% thresholds adjusted 5× to match observed values
-        # ATR as % of price: <10% = 1.0, 10-20% = 0.8, 20-30% = 0.6, 30-50% = 0.4, 50%+ = 0.3
-        volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 10.0
-        if volatility_pct <= 10.0:
-            volatility_factor = 1.0   # Low volatility - no reduction
-        elif volatility_pct <= 20.0:
-            volatility_factor = 0.8   # Normal volatility
-        elif volatility_pct <= 30.0:
-            volatility_factor = 0.6   # High volatility
-        elif volatility_pct <= 50.0:
-            volatility_factor = 0.4   # Very high volatility
-        else:
-            volatility_factor = 0.3   # Extreme volatility
-        
-        # COMBINED LEVERAGE: base × price × spread × volatility
-        dynamic_leverage = int(round(base_leverage * price_factor * spread_factor * volatility_factor))
-        dynamic_leverage = max(3, min(75, dynamic_leverage))  # Clamp 3-75x
-        
-        signal['leverage'] = dynamic_leverage
+        signal['leverage'] = adjusted_leverage
         signal['tf_count'] = tf_count
-        signal['price_factor'] = round(price_factor, 2)
-        signal['spread_factor'] = round(spread_factor, 2)
-        signal['volatility_factor'] = round(volatility_factor, 2)
-        signal['volatility_pct'] = round(volatility_pct, 2)
+        signal['mtf_leverage_mult'] = mtf_mult
         
-        # Log if any factor reduced leverage
-        if price_factor < 0.9 or spread_factor < 0.9 or volatility_factor < 0.9:
-            logger.info(f"📊 Leverage: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} × vol={volatility_factor:.2f} → {dynamic_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
-        else:
-            logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF:{tf_count}/3)")
+        # Log if MTF adjusted leverage
+        if mtf_mult != 1.0:
+            logger.info(f"📊 MTF Adjustment: {current_leverage}x × {mtf_mult:.1f} (TF:{tf_count}/3) → {adjusted_leverage}x | {symbol}")
     except Exception as lev_err:
-        logger.warning(f"Dynamic leverage error: {lev_err}")
-        signal['leverage'] = 25  # Fallback to safer 25x
+        logger.warning(f"MTF leverage adjustment error: {lev_err}")
     
     # =====================================================
     # VOLUME PROFILE BOOST (Cloud Scanner - WebSocket Parity)
@@ -8416,23 +8381,55 @@ class SignalGenerator:
         # Tüm konfirmasyonlar geçti - devam et
         
         # =====================================================================
-        # PHASE 29: SPREAD-BASED DYNAMIC PARAMETERS
+        # PHASE 99: UNIFIED DYNAMIC LEVERAGE (All Factors Combined)
+        # Combines: Spread + Price + Volatility + Balance Protection
+        # This is the SINGLE source of truth for leverage (UI + Binance)
         # =====================================================================
+        
+        import math
         
         # Get spread-adjusted parameters (includes leverage, SL/TP multipliers, pullback)
         spread_params = get_spread_adjusted_params(spread_pct, atr, price)
         
-        # Dynamic Leverage from Spread (low spread = high leverage)
-        spread_leverage = spread_params['leverage']
+        # Base leverage from Spread level (low spread = high leverage)
+        base_leverage = spread_params['leverage']
         
-        # Apply BalanceProtector leverage multiplier
+        # 1. PRICE FACTOR: Logarithmic reduction for low-price coins
+        # $100+ → 1.0, $1 → 0.50, $0.01 → 0.30 (higher manipulation risk)
+        if price > 0:
+            log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
+            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))
+        else:
+            price_factor = 1.0
+        
+        # 2. VOLATILITY FACTOR: High ATR = lower leverage
+        # ATR as % of price: <10% = 1.0, 10-20% = 0.8, 20-30% = 0.6, 30-50% = 0.4, 50%+ = 0.3
+        volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 10.0
+        if volatility_pct <= 10.0:
+            volatility_factor = 1.0   # Low volatility - no reduction
+        elif volatility_pct <= 20.0:
+            volatility_factor = 0.8   # Normal volatility
+        elif volatility_pct <= 30.0:
+            volatility_factor = 0.6   # High volatility
+        elif volatility_pct <= 50.0:
+            volatility_factor = 0.4   # Very high volatility
+        else:
+            volatility_factor = 0.3   # Extreme volatility
+        
+        # 3. BALANCE PROTECTION FACTOR
         leverage_mult = balance_protector.calculate_leverage_multiplier(
-            balance_protector.peak_balance  # Use peak as proxy for current
+            balance_protector.peak_balance
         )
-        final_leverage = int(spread_leverage * leverage_mult)
         
-        # Ensure leverage bounds
+        # COMBINED LEVERAGE: base × price × volatility × balance_protection
+        final_leverage = int(round(base_leverage * price_factor * volatility_factor * leverage_mult))
+        
+        # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
+        
+        # Log if any factor reduced leverage significantly
+        if price_factor < 0.9 or volatility_factor < 0.9 or leverage_mult < 0.9:
+            logger.info(f"📊 Unified Leverage: base={base_leverage}x × price={price_factor:.2f} × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
         
         # Use spread-based SL/TP multipliers (override regime-based)
         atr_sl = spread_params['sl_multiplier']
