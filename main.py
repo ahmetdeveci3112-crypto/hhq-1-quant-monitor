@@ -3731,7 +3731,7 @@ class MultiCoinScanner:
                     failed_count += 1
                     
             except Exception as e:
-                logger.debug(f"Failed to preload {symbol}: {e}")
+                logger.info(f"❌ Failed to preload {symbol}: {str(e)[:50]}")
                 failed_count += 1
                 continue
             
