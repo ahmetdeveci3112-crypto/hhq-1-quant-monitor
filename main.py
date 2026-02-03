@@ -8181,14 +8181,12 @@ class SignalGenerator:
             # Base score from Z-Score
             score += 45
             
-            # Hurst bonus: Higher score if Hurst confirms mean reversion tendency
+            # Phase 112: Only bonus for mean reversion regime, NO PENALTY
+            # Restores Phase 84 behavior when signals were working
             if hurst < 0.45:
                 score += 5  # Mean reversion regime - bonus for alignment
                 reasons.append(f"H_MR({hurst:.2f})")
-            elif hurst > 0.55:
-                score -= 5  # Trend regime - penalty (contrarian in trending market is riskier)
-                reasons.append(f"H_TF({hurst:.2f})")
-            # Ranging (0.45-0.55): no bonus/penalty
+            # Ranging (0.45-0.55) and Trending (>0.55): no bonus, NO PENALTY
         else:
             return None  # Z-Score not extreme enough
         
