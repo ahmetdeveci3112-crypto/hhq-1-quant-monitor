@@ -4176,13 +4176,18 @@ async def background_scanner_loop():
                 await asyncio.sleep(scan_interval)
                 
             except Exception as loop_error:
-                logger.error(f"Background scanner loop error: {loop_error}")
+                import traceback
+                logger.error(f"🔴 Scanner loop error: {loop_error}")
+                logger.error(f"🔴 Traceback:\n{traceback.format_exc()}")
                 await asyncio.sleep(5)  # Wait before retry
                 
     except asyncio.CancelledError:
         logger.info("Background Scanner Loop cancelled")
         multi_coin_scanner.running = False
     except Exception as e:
+        import traceback
+        logger.error(f"🔴 Scanner FATAL error: {e}")
+        logger.error(f"🔴 Traceback:\n{traceback.format_exc()}")
         logger.error(f"Background scanner fatal error: {e}")
         multi_coin_scanner.running = False
 
