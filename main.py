@@ -8380,26 +8380,18 @@ class SignalGenerator:
         
         # Dinamik eşikler hesapla (coin_stats varsa kullan, yoksa varsayılan)
         if coin_stats and coin_stats.get('sample_count', 0) >= 10:
-            # RSI dinamik eşik: ortalama + 1.5 * std
-            rsi_upper = min(80, coin_stats['rsi_avg'] + 1.5 * coin_stats['rsi_std'])
-            rsi_lower = max(20, coin_stats['rsi_avg'] - 1.5 * coin_stats['rsi_std'])
             # Volume dinamik eşik: ortalama - 1 * std (minimum kabul edilen)
             vol_threshold = max(0.3, coin_stats['volume_avg'] - coin_stats['volume_std'])
-            # Log dinamik eşikler
-            reasons.append(f"DynTH(RSI:{rsi_lower:.0f}-{rsi_upper:.0f},V:{vol_threshold:.1f}x)")
+            reasons.append(f"DynTH(V:{vol_threshold:.1f}x)")
         else:
             # Varsayılan eşikler (yeterli veri yok)
-            rsi_upper = 75
-            rsi_lower = 25
             vol_threshold = 0.5
         
-        # Konfirmasyon 1: RSI Kontrolü (DİNAMİK)
-        if signal_side == "LONG" and rsi > rsi_upper:
-            confirmation_passed = False
-            confirmation_fails.append(f"RSI_HIGH({rsi:.0f}>{rsi_upper:.0f})")
-        elif signal_side == "SHORT" and rsi < rsi_lower:
-            confirmation_passed = False
-            confirmation_fails.append(f"RSI_LOW({rsi:.0f}<{rsi_lower:.0f})")
+        # ===================================================================
+        # Phase 111: RSI KONTROLÜ KALDIRILDI
+        # Mean reversion sisteminde RSI extreme'leri beklenen durum.
+        # Z-Score zaten fiyat sapmasını ölçüyor - RSI gereksiz.
+        # ===================================================================
         
         # Konfirmasyon 2: Volume Kontrolü (DİNAMİK)
         if volume_ratio < vol_threshold:
