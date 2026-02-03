@@ -2707,7 +2707,9 @@ class LightweightCoinAnalyzer:
         closes_list = list(self.closes)
         
         # Calculate metrics
-        hurst = calculate_hurst(prices_list)
+        # Phase 124: Adjust Hurst window for small samples (<50 candles)
+        min_window = 5 if len(prices_list) < 50 else 10
+        hurst = calculate_hurst(prices_list, min_window=min_window)
         # Phase 122: Calculate Z-Score - lowered threshold to 20 closes for faster activation
         closes_count = len(self.closes)
         if closes_count >= 20:
@@ -2722,7 +2724,8 @@ class LightweightCoinAnalyzer:
             # Phase 122: Lowered from 20 to 5 spreads for faster activation
             # With 25 closes we get 6 spreads (index 19-24), enough for Z-Score
             if len(temp_spreads) >= 5:
-                zscore = calculate_zscore(temp_spreads)
+                # Phase 124: Pass explicit lookback to override default 20
+                zscore = calculate_zscore(temp_spreads, lookback=len(temp_spreads))
             else:
                 zscore = 0
         else:
