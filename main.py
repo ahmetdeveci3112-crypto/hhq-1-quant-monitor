@@ -10833,7 +10833,7 @@ class BinanceStreamer:
     async def fetch_ohlcv(self) -> list:
         """Fetch recent OHLCV for ATR calculation."""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, '1m', limit=30)
+            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, '1m', limit=100)
             return ohlcv
         except Exception as e:
             logger.error(f"OHLCV fetch error: {e}")
