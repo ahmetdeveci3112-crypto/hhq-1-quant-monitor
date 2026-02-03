@@ -8372,22 +8372,11 @@ class SignalGenerator:
         confirmation_fails = []
         
         # ===================================================================
-        # KONFİRMASYON 0: COİN BAZLI GÜNLÜK TREND (Score Penalty - Phase 109)
-        # Mean reversion sisteminde trend karşıtı trade normaldir.
-        # STRONG trend durumunda score'dan düş ama engelleme.
+        # Phase 110: COIN_TREND sadece pozisyon boyutunu etkiler
+        # Sinyal üretiminde hiç etkisi yok - coin_daily_trend sinyale eklenir
+        # Position sizing aşamasında kullanılır
         # ===================================================================
-        if coin_daily_trend == "STRONG_BEARISH" and signal_side == "LONG":
-            score -= 10  # Penalty for contrarian trade against strong trend
-            reasons.append("⚠️ TREND_PENALTY(-10)")
-        elif coin_daily_trend == "STRONG_BULLISH" and signal_side == "SHORT":
-            score -= 10  # Penalty for contrarian trade against strong trend
-            reasons.append("⚠️ TREND_PENALTY(-10)")
-        elif coin_daily_trend == "BEARISH" and signal_side == "LONG":
-            score -= 5  # Smaller penalty for weaker trend conflict
-            reasons.append(f"⚠️ trend_penalty(-5)")
-        elif coin_daily_trend == "BULLISH" and signal_side == "SHORT":
-            score -= 5  # Smaller penalty for weaker trend conflict
-            reasons.append(f"⚠️ trend_penalty(-5)")
+        # coin_daily_trend sinyale ekleniyor (aşağıda), burada işlem yok
         
         # Dinamik eşikler hesapla (coin_stats varsa kullan, yoksa varsayılan)
         if coin_stats and coin_stats.get('sample_count', 0) >= 10:
@@ -8581,6 +8570,26 @@ class SignalGenerator:
         )
         size_mult *= balance_size_mult
         
+        # =====================================================================
+        # PHASE 110: TREND-BASED POSITION SIZE REDUCTION
+        # Trend karşıtı trade'lerde pozisyon boyutunu azalt
+        # =====================================================================
+        trend_size_reduction = 1.0  # Default no reduction
+        if coin_daily_trend == "STRONG_BEARISH" and signal_side == "LONG":
+            trend_size_reduction = 0.7  # 30% smaller position
+            reasons.append("📉 TrendConflict(-30%)")
+        elif coin_daily_trend == "STRONG_BULLISH" and signal_side == "SHORT":
+            trend_size_reduction = 0.7  # 30% smaller position
+            reasons.append("📈 TrendConflict(-30%)")
+        elif coin_daily_trend == "BEARISH" and signal_side == "LONG":
+            trend_size_reduction = 0.85  # 15% smaller position
+            reasons.append("📉 trend_conflict(-15%)")
+        elif coin_daily_trend == "BULLISH" and signal_side == "SHORT":
+            trend_size_reduction = 0.85  # 15% smaller position
+            reasons.append("📈 trend_conflict(-15%)")
+        
+        size_mult *= trend_size_reduction
+        
         self.last_signal_time = now
         
         # Log spread level and leverage with ATR% for debugging
@@ -8604,7 +8613,9 @@ class SignalGenerator:
             'sizeMultiplier': size_mult,
             'leverage': final_leverage,  # Phase 29: Dynamic leverage
             'spreadLevel': spread_params['level'],
-            'pullbackPct': round(pullback_pct * 100, 2)
+            'pullbackPct': round(pullback_pct * 100, 2),
+            'coinDailyTrend': coin_daily_trend,  # Phase 110: For position sizing
+            'trendSizeReduction': trend_size_reduction  # Phase 110: Applied reduction
         }
 
 
