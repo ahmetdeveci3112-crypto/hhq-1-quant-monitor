@@ -8084,6 +8084,14 @@ class SignalGenerator:
         """
         now = datetime.now().timestamp()
         
+        # PHASE 102: Debug signal generation attempts (log every 100th)
+        if not hasattr(self, '_attempt_count'):
+            self._attempt_count = 0
+        self._attempt_count += 1
+        
+        if self._attempt_count % 100 == 1:
+            logger.info(f"🔬 SIGNAL_CHECK #{self._attempt_count}: {symbol} H={hurst:.2f} Z={zscore:.2f} threshold={global_paper_trader.z_score_threshold if 'global_paper_trader' in globals() else 1.5}")
+        
         # Check minimum interval
         if now - self.last_signal_time < self.min_signal_interval:
             return None
@@ -8093,6 +8101,7 @@ class SignalGenerator:
         # Kullanıcı talebiyle 7/24 sinyal üretimi aktif
         # Risk: Düşük likidite saatlerinde spread yüksek olabilir
         # ===================================================================
+
         
 
         # Phase 28: Dynamic threshold from coin profile
