@@ -2708,9 +2708,9 @@ class LightweightCoinAnalyzer:
         
         # Calculate metrics
         hurst = calculate_hurst(prices_list)
-        # Phase 119: Calculate Z-Score DIRECTLY from closes (bypass spreads deque issues)
+        # Phase 122: Calculate Z-Score - lowered threshold to 20 closes for faster activation
         closes_count = len(self.closes)
-        if closes_count >= 40:
+        if closes_count >= 20:
             # Calculate spreads on-the-fly from closes
             closes_list = list(self.closes)
             temp_spreads = []
@@ -2719,7 +2719,9 @@ class LightweightCoinAnalyzer:
                 spread = closes_list[i] - ma
                 temp_spreads.append(spread)
             
-            if len(temp_spreads) >= 20:
+            # Phase 122: Lowered from 20 to 5 spreads for faster activation
+            # With 25 closes we get 6 spreads (index 19-24), enough for Z-Score
+            if len(temp_spreads) >= 5:
                 zscore = calculate_zscore(temp_spreads)
             else:
                 zscore = 0
