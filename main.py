@@ -2708,32 +2708,29 @@ class LightweightCoinAnalyzer:
         
         # Calculate metrics
         hurst = calculate_hurst(prices_list)
-        # Phase 118: Debug zscore calculation with immediate retroactive fix
-        spreads_count = len(self.spreads)
+        # Phase 119: Calculate Z-Score DIRECTLY from closes (bypass spreads deque issues)
         closes_count = len(self.closes)
-        
-        # If we have enough closes but not enough spreads, calculate retroactively NOW
-        if spreads_count < 20 and closes_count >= 40:
-            # Retroactive calculation
-            self.spreads.clear()
+        if closes_count >= 40:
+            # Calculate spreads on-the-fly from closes
             closes_list = list(self.closes)
+            temp_spreads = []
             for i in range(19, len(closes_list)):
                 ma = np.mean(closes_list[max(0, i-19):i+1])
                 spread = closes_list[i] - ma
-                self.spreads.append(spread)
-            spreads_count = len(self.spreads)
-            logger.info(f"📊 {self.symbol} ANALYZE_FIX: Retroactive spreads - closes={closes_count}, new_spreads={spreads_count}")
-        
-        if spreads_count < 20:
+                temp_spreads.append(spread)
+            
+            if len(temp_spreads) >= 20:
+                zscore = calculate_zscore(temp_spreads)
+            else:
+                zscore = 0
+        else:
             zscore = 0
             if hasattr(self, '_zscore_debug_count'):
                 self._zscore_debug_count += 1
             else:
                 self._zscore_debug_count = 0
             if self._zscore_debug_count % 100 == 0:
-                logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} spreads_count={spreads_count}/20, prices={len(self.prices)}, closes={closes_count}")
-        else:
-            zscore = calculate_zscore(list(self.spreads))
+                logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} closes={closes_count}/40 needed")
         atr = calculate_atr(highs_list, lows_list, closes_list)
         
         self.opportunity.hurst = hurst
