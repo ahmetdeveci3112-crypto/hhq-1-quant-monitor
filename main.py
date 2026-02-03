@@ -2768,9 +2768,11 @@ class LightweightCoinAnalyzer:
             rsi_value = calculate_rsi(prices_list, period=14)
         
         # Calculate Volume Ratio for Layer 11 scoring
-        volume_ratio = 1.0  # Default average
-        if len(self.volumes) >= 21:
-            is_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
+        # Phase 123: Disabled faulty spike detection (mismatched units)
+        # We now use 24h Volume > $5M filter in generate_signal instead
+        volume_ratio = 1.0 
+        # if len(self.volumes) >= 21:
+        #    is_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
         
         # Update coin-specific statistics for dynamic thresholds
         self.rsi_history.append(rsi_value)
@@ -2806,7 +2808,8 @@ class LightweightCoinAnalyzer:
             volume_ratio=volume_ratio,  # Volume spike for Layer 11
             sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
             coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
-            coin_daily_trend=coin_daily_trend  # Coin's own daily trend (not BTC's)
+            coin_daily_trend=coin_daily_trend,  # Coin's own daily trend (not BTC's)
+            volume_24h=self.opportunity.volume_24h  # Phase 123: Pass 24h volume
         )
         
         if signal:
@@ -8157,7 +8160,8 @@ class SignalGenerator:
         volume_ratio: float = 1.0,  # Current volume / avg volume
         sweep_result: Optional[Dict] = None,  # Liquidity sweep detection result
         coin_stats: Optional[Dict] = None,  # Coin-specific stats for dynamic thresholds
-        coin_daily_trend: str = "NEUTRAL"  # Coin's own daily trend
+        coin_daily_trend: str = "NEUTRAL",  # Coin's own daily trend
+        volume_24h: float = 0.0  # Phase 123: 24h Volume for liquidity check
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -8455,10 +8459,19 @@ class SignalGenerator:
         # Z-Score zaten fiyat sapmasını ölçüyor - RSI gereksiz.
         # ===================================================================
         
-        # Konfirmasyon 2: Volume Kontrolü (DİNAMİK)
-        if volume_ratio < vol_threshold:
+        # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123)
+        # Eski volume_ratio kontrolü yerine 24h Hacim > $5M kontrolü
+        # Bu, düşük likiditeli "ölü" coinleri filtreler
+        min_volume = 5_000_000  # $5 Million min 24h volume
+        
+        if volume_24h < min_volume:
             confirmation_passed = False
-            confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
+            confirmation_fails.append(f"LOW_LIQ(24h_Vol=${volume_24h/1_000_000:.1f}M < $5M)")
+            
+        # Eski kod:
+        # if volume_ratio < vol_threshold:
+        #     confirmation_passed = False
+        #     confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
         
         # Konfirmasyon 3: Hurst Regime Kontrolü (SADECE UYARI - VETO DEĞİL)
         if hurst > 0.65:
