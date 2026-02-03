@@ -8168,9 +8168,6 @@ class SignalGenerator:
             self._attempt_count = 0
         self._attempt_count += 1
         
-        if self._attempt_count % 100 == 1:
-            logger.info(f"🔬 SIGNAL_CHECK #{self._attempt_count}: {symbol} H={hurst:.2f} Z={zscore:.2f} threshold={global_paper_trader.z_score_threshold if 'global_paper_trader' in globals() else 1.5}")
-        
         # Check minimum interval
         if now - self.last_signal_time < self.min_signal_interval:
             return None
@@ -8214,6 +8211,11 @@ class SignalGenerator:
         else:
             adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price)
             effective_threshold = adaptive_threshold * leverage_factor
+        
+        # Phase 120: Log AFTER effective_threshold is calculated
+        if self._attempt_count % 100 == 1:
+            exceeds = "✅ PASS" if abs(zscore) > effective_threshold else "❌ FAIL"
+            logger.info(f"🔬 SIGNAL_CHECK #{self._attempt_count}: {symbol} H={hurst:.2f} Z={zscore:.2f} eff_thresh={effective_threshold:.2f} {exceeds}")
         
         # 2. CONFIDENCE SCORING SYSTEM (0-100)
         score = 0
