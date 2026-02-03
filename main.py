@@ -8467,13 +8467,13 @@ class SignalGenerator:
         # ===================================================================
         
         # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123)
-        # Eski volume_ratio kontrolü yerine 24h Hacim > $5M kontrolü
-        # Bu, düşük likiditeli "ölü" coinleri filtreler
-        min_volume = 5_000_000  # $5 Million min 24h volume
+        # Eski volume_ratio kontrolü yerine 24h Hacim > $1M kontrolü (Phase 123)
+        # Bu, düşük likiditeli "ölü" coinleri filtreler (PTB/YB gibi mid-cap'lere izin verir)
+        min_volume = 1_000_000  # $1 Million min 24h volume
         
         if volume_24h < min_volume:
             confirmation_passed = False
-            confirmation_fails.append(f"LOW_LIQ(24h_Vol=${volume_24h/1_000_000:.1f}M < $5M)")
+            confirmation_fails.append(f"LOW_LIQ(24h_Vol=${volume_24h/1_000_000:.1f}M < $1M)")
             
         # Eski kod:
         # if volume_ratio < vol_threshold:
