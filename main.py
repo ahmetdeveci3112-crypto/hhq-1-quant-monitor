@@ -8160,62 +8160,37 @@ class SignalGenerator:
         reasons = []
         
         # =====================================================================
-        # PHASE 90: HURST-AWARE SIGNAL DIRECTION (Critical Fix)
-        # Previously: signal_side = "SHORT" if zscore > 0 else "LONG" (ignored Hurst)
-        # Now: Use regime-based strategy aligned with MTF Analyzer
+        # PHASE 108: SIMPLIFIED MEAN REVERSION SIGNAL DIRECTION
+        # Z-Score is designed for mean reversion - always use contrarian logic:
+        # - zscore > +threshold (overbought) → SHORT (price will revert down)
+        # - zscore < -threshold (oversold) → LONG (price will revert up)
+        # Hurst is used for SCORING only, not direction determination.
         # =====================================================================
         
-        # Determine signal direction based on Hurst regime
         signal_side = None
         
-        # Mean Reversion Regime (Hurst < 0.45)
-        # Price tends to revert to mean, so:
-        # - zscore < -threshold (oversold) → LONG (buy the dip)
-        # - zscore > +threshold (overbought) → SHORT (sell the top)
-        if hurst < 0.45:
-            if zscore < -effective_threshold:
-                signal_side = "LONG"
-                reasons.append(f"MR_Z({zscore:.1f})")
-                score += 45
-            elif zscore > effective_threshold:
-                signal_side = "SHORT"
-                reasons.append(f"MR_Z(+{zscore:.1f})")
-                score += 45
-            else:
-                return None  # Z-Score not extreme enough
-        
-        # Trend Following Regime (Hurst > 0.55)
-        # Price tends to continue direction, so:
-        # - zscore > +threshold (positive momentum) → LONG (follow up trend)
-        # - zscore < -threshold (negative momentum) → SHORT (follow down trend)
-        elif hurst > 0.55:
+        # Simple mean reversion logic (contrarian)
+        if abs(zscore) > effective_threshold:
             if zscore > effective_threshold:
-                signal_side = "LONG"
-                reasons.append(f"TF_Z(+{zscore:.1f})")
-                score += 45
-            elif zscore < -effective_threshold:
                 signal_side = "SHORT"
-                reasons.append(f"TF_Z({zscore:.1f})")
-                score += 45
-            else:
-                return None  # Z-Score not extreme enough
-        
-        # Ranging Regime (0.45 <= Hurst <= 0.55)
-        # No clear regime, be more conservative - use higher threshold
+                reasons.append(f"Z(+{zscore:.1f})")
+            else:  # zscore < -effective_threshold
+                signal_side = "LONG"
+                reasons.append(f"Z({zscore:.1f})")
+            
+            # Base score from Z-Score
+            score += 45
+            
+            # Hurst bonus: Higher score if Hurst confirms mean reversion tendency
+            if hurst < 0.45:
+                score += 5  # Mean reversion regime - bonus for alignment
+                reasons.append(f"H_MR({hurst:.2f})")
+            elif hurst > 0.55:
+                score -= 5  # Trend regime - penalty (contrarian in trending market is riskier)
+                reasons.append(f"H_TF({hurst:.2f})")
+            # Ranging (0.45-0.55): no bonus/penalty
         else:
-            ranging_threshold = effective_threshold * 1.0  # Phase 107: Reduced from 1.3 to 1.0 to allow signals
-            if abs(zscore) > ranging_threshold:
-                # Use mean reversion logic for ranging (safer)
-                if zscore < -ranging_threshold:
-                    signal_side = "LONG"
-                    reasons.append(f"RNG_Z({zscore:.1f})")
-                    score += 40  # Slightly lower score for uncertainty
-                elif zscore > ranging_threshold:
-                    signal_side = "SHORT"
-                    reasons.append(f"RNG_Z(+{zscore:.1f})")
-                    score += 40
-            else:
-                return None  # Not trading in uncertain regime
+            return None  # Z-Score not extreme enough
         
         if signal_side is None:
             return None
@@ -8225,9 +8200,8 @@ class SignalGenerator:
         zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
         score += zscore_bonus
         
-        # Log regime detection
-        regime_name = "MR" if hurst < 0.45 else ("TF" if hurst > 0.55 else "RNG")
-        logger.debug(f"Phase 90: {symbol} Regime={regime_name} Hurst={hurst:.2f} Z={zscore:.2f} → {signal_side}")
+        # Log signal direction determination
+        logger.debug(f"Phase 108: {symbol} H={hurst:.2f} Z={zscore:.2f} → {signal_side}")
             
         # Layer 2: Order Book Imbalance (Confirmation) - Max 20 pts
         # Graduated scoring based on imbalance strength
