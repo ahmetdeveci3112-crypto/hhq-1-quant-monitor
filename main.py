@@ -2675,6 +2675,13 @@ class LightweightCoinAnalyzer:
     
     def analyze(self, imbalance: float = 0, basis_pct: float = 0.0) -> Optional[dict]:
         """Analyze coin and generate signal if conditions met."""
+        # PHASE 103: Debug analyzer.analyze() calls
+        if not hasattr(self, '_analyze_count'):
+            self._analyze_count = 0
+        self._analyze_count += 1
+        if self._analyze_count % 500 == 1:
+            logger.info(f"🔍 ANALYZE #{self._analyze_count}: {self.symbol} prices={len(self.prices)}")
+        
         if len(self.prices) < 20:  # Reduced from 50 to 20 for faster startup
             return None
             
