@@ -3702,8 +3702,23 @@ class MultiCoinScanner:
             await self.fetch_all_futures_symbols()
         
         if not self.exchange:
-            logger.warning("No exchange available for OHLCV preloading")
-            return
+            logger.info("📊 Creating exchange for OHLCV preloading...")
+            try:
+                import ccxt.async_support as ccxt_async
+                api_key = os.environ.get('BINANCE_API_KEY', '')
+                api_secret = os.environ.get('BINANCE_SECRET', '')
+                exchange_config = {
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'future'}
+                }
+                if api_key and api_secret:
+                    exchange_config['apiKey'] = api_key
+                    exchange_config['secret'] = api_secret
+                self.exchange = ccxt_async.binance(exchange_config)
+                logger.info("✅ Exchange created for preload")
+            except Exception as e:
+                logger.error(f"❌ Failed to create exchange for preload: {e}")
+                return
         
         # Preload top N coins (most traded/popular)
         priority_coins = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 
