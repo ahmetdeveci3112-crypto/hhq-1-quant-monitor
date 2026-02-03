@@ -2618,14 +2618,16 @@ class LightweightCoinAnalyzer:
                 self.highs.append(high)
                 self.lows.append(low)
                 self.volumes.append(volume)
-                
-                # Calculate spread for Z-Score
-                if len(self.closes) >= 20:
-                    ma = np.mean(list(self.closes)[-20:])
-                    spread = close - ma
-                    self.spreads.append(spread)
             except Exception:
                 continue
+        
+        # Phase 114: Calculate spreads RETROACTIVELY after all candles are loaded
+        # This ensures we get 20+ spreads if we have 40+ candles
+        closes_list = list(self.closes)
+        for i in range(19, len(closes_list)):  # Start from index 19 (20th candle)
+            ma = np.mean(closes_list[max(0, i-19):i+1])  # 20-period MA ending at position i
+            spread = closes_list[i] - ma
+            self.spreads.append(spread)
         
         if len(self.prices) > 0:
             self.opportunity.price = self.prices[-1]
@@ -2646,7 +2648,7 @@ class LightweightCoinAnalyzer:
             if self.vwap_denominator > 0:
                 self.vwap = self.vwap_numerator / self.vwap_denominator
             
-            logger.debug(f"{self.symbol}: Preloaded {len(self.prices)} candles, VWAP: {self.vwap:.6f}")
+            logger.info(f"📊 {self.symbol}: Preloaded {len(self.prices)} candles, spreads={len(self.spreads)}")
         
     def update_price(self, price: float, high: float = None, low: float = None, volume: float = 0):
         """Update price data."""
