@@ -911,7 +911,7 @@ class LiveBinanceTrader:
                     if timestamp >= today_start_ms:
                         today_pnl += pnl
                         today_trades_count += 1
-                        logger.info(f"  📈 Today: {income_type} ${pnl:.4f} @ {timestamp}")
+                        # Removed noisy individual income logging (Phase 105)
             
             # Calculate percentages based on wallet balance
             wallet_balance = self.last_balance if self.last_balance > 0 else 100
@@ -3877,8 +3877,6 @@ async def background_scanner_loop():
                 if not hasattr(multi_coin_scanner, '_loop_iteration'):
                     multi_coin_scanner._loop_iteration = 0
                 multi_coin_scanner._loop_iteration += 1
-                if multi_coin_scanner._loop_iteration <= 3 or multi_coin_scanner._loop_iteration % 100 == 0:
-                    logger.info(f"🔄 SCAN_ITERATION #{multi_coin_scanner._loop_iteration}")
                 
                 # Update BTC trend for HTF scoring (every scan cycle)
                 try:
@@ -3900,6 +3898,15 @@ async def background_scanner_loop():
                 # Scan all coins
                 opportunities = await multi_coin_scanner.scan_all_coins()
                 stats = multi_coin_scanner.get_scanner_stats()
+                
+                # PHASE 105: Periodic scan summary log (first 5 iterations + every 50th)
+                loop_iter = multi_coin_scanner._loop_iteration
+                if loop_iter <= 5 or loop_iter % 50 == 0:
+                    # Get sample analyzer price count
+                    sample_prices = 0
+                    if multi_coin_scanner.analyzers and 'BTCUSDT' in multi_coin_scanner.analyzers:
+                        sample_prices = len(multi_coin_scanner.analyzers['BTCUSDT'].prices)
+                    logger.info(f"🔄 SCAN #{loop_iter}: {len(opportunities)} coins | BTC prices={sample_prices}")
                 
                 # PHASE 98: Update UI cache with latest data (instant delivery to UI)
                 await update_ui_cache(opportunities, stats)
