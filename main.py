@@ -8089,15 +8089,12 @@ class SignalGenerator:
             return None
         
         # ===================================================================
-        # SAAT BAZLI FİLTRE: Düşük likidite saatlerinde sinyal üretme
-        # 02:00-06:00 UTC arası spread yüksek, manipülasyon riski var
+        # SAAT BAZLI FİLTRE KALDIRILDI (Phase 101)
+        # Kullanıcı talebiyle 7/24 sinyal üretimi aktif
+        # Risk: Düşük likidite saatlerinde spread yüksek olabilir
         # ===================================================================
-        current_hour = datetime.utcnow().hour
-        if 2 <= current_hour < 6:
-            # Düşük likidite saatlerinde sadece BTC/ETH için sinyal üret
-            if symbol not in ["BTCUSDT", "ETHUSDT"]:
-                return None
         
+
         # Phase 28: Dynamic threshold from coin profile
         if coin_profile:
             base_threshold = coin_profile.get('optimal_threshold', 1.6)
