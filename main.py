@@ -8372,22 +8372,22 @@ class SignalGenerator:
         confirmation_fails = []
         
         # ===================================================================
-        # KONFİRMASYON 0: COİN BAZLI GÜNLÜK TREND FİLTRESİ
-        # Coin'in kendi trendi ters yöndeyse sinyali reddet
+        # KONFİRMASYON 0: COİN BAZLI GÜNLÜK TREND (Score Penalty - Phase 109)
+        # Mean reversion sisteminde trend karşıtı trade normaldir.
+        # STRONG trend durumunda score'dan düş ama engelleme.
         # ===================================================================
         if coin_daily_trend == "STRONG_BEARISH" and signal_side == "LONG":
-            confirmation_passed = False
-            confirmation_fails.append(f"COIN_TREND(STRONG_BEAR→LONG)")
-            reasons.append("🔻 Coin Daily: STRONG_BEARISH")
+            score -= 10  # Penalty for contrarian trade against strong trend
+            reasons.append("⚠️ TREND_PENALTY(-10)")
         elif coin_daily_trend == "STRONG_BULLISH" and signal_side == "SHORT":
-            confirmation_passed = False
-            confirmation_fails.append(f"COIN_TREND(STRONG_BULL→SHORT)")
-            reasons.append("🔺 Coin Daily: STRONG_BULLISH")
+            score -= 10  # Penalty for contrarian trade against strong trend
+            reasons.append("⚠️ TREND_PENALTY(-10)")
         elif coin_daily_trend == "BEARISH" and signal_side == "LONG":
-            # Uyarı ver ama reddetme (düşük güvenilirlik)
-            reasons.append(f"⚠️ CoinTrend(BEAR→LONG)")
+            score -= 5  # Smaller penalty for weaker trend conflict
+            reasons.append(f"⚠️ trend_penalty(-5)")
         elif coin_daily_trend == "BULLISH" and signal_side == "SHORT":
-            reasons.append(f"⚠️ CoinTrend(BULL→SHORT)")
+            score -= 5  # Smaller penalty for weaker trend conflict
+            reasons.append(f"⚠️ trend_penalty(-5)")
         
         # Dinamik eşikler hesapla (coin_stats varsa kullan, yoksa varsayılan)
         if coin_stats and coin_stats.get('sample_count', 0) >= 10:
