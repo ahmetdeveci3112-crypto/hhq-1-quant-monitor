@@ -4439,12 +4439,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if existing_position:
         signal_log_data['reject_reason'] = 'EXISTING_POSITION'
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
         return
     
     # Check max positions
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
         signal_log_data['reject_reason'] = 'MAX_POSITIONS'
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        logger.info(f"🚫 SKIPPING {symbol}: Max positions reached ({len(global_paper_trader.positions)})")
         return
     
     # Check blacklist
@@ -4452,6 +4454,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         signal_log_data['reject_reason'] = 'BLACKLISTED'
         signal_log_data['blacklisted'] = True
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        logger.info(f"🚫 SKIPPING {symbol}: Blacklisted")
         return
     
     # =====================================================
@@ -9169,6 +9172,7 @@ class PaperTradingEngine:
         # Check position + pending order limits
         total_exposure = len(self.positions) + len(self.pending_orders)
         if total_exposure >= self.max_positions:
+            logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
             return None  # Silently skip to avoid log spam
         
         # =========================================================================
@@ -9179,16 +9183,21 @@ class PaperTradingEngine:
         same_coin_same_dir_pend = [p for p in self.pending_orders if p.get('symbol') == trade_symbol and p.get('side') == side]
         
         if len(same_coin_same_dir_pos) + len(same_coin_same_dir_pend) >= 3:
+            logger.info(f"🚫 OPEN_POS SKIP: Scale-in limit reached for {trade_symbol} {side}")
             return None  # Silently skip scale-in limit
         
         # Check for existing pending order for same symbol (avoid duplicate pending)
         existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
+        existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
         if existing_pending:
+            logger.info(f"🚫 OPEN_POS SKIP: Pending order already exists for {trade_symbol}")
             return None  # Already have pending order for this symbol
         
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
+        same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
+            logger.info(f"🚫 OPEN_POS SKIP: Hedging disabled, opposite pos exists for {trade_symbol}")
             return None
         
         # ATR fallback
