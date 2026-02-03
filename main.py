@@ -7502,12 +7502,12 @@ class KillSwitchFaultTracker:
     - Full recovery in ~1.5 days instead of 5 days
     """
     
-    def __init__(self, penalty_per_fault: int = -15, decay_per_day: int = 10):
+    def __init__(self, penalty_per_fault: int = -5, decay_per_day: int = 10):
         self.faults: Dict[str, list] = {}  # symbol -> list of fault timestamps
-        self.penalty_per_fault = penalty_per_fault  # -15 points per kill switch (was -25)
-        self.decay_per_day = decay_per_day  # 10 points decay per 24h (was 5)
-        self.max_penalty = -50  # Maximum penalty cap (was -100)
-        self.block_hours = 2  # Block new positions for 2 hours after KS (was 4)
+        self.penalty_per_fault = penalty_per_fault  # -5 points per kill switch (Phase 121: was -15)
+        self.decay_per_day = decay_per_day  # 10 points decay per 24h
+        self.max_penalty = -30  # Maximum penalty cap (Phase 121: was -50)
+        self.block_hours = 4  # Block new positions for 4 hours after KS (Phase 121)
         logger.info(f"📋 KillSwitchFaultTracker: {penalty_per_fault} pts/fault, {decay_per_day} decay/day, {self.block_hours}h block")
     
     def load_from_trade_history(self, trades: list):
@@ -7555,7 +7555,7 @@ class KillSwitchFaultTracker:
         
         penalty = self.get_penalty(symbol)
         is_blocked = self.is_blocked(symbol)
-        block_status = "🚫 BLOCKED 24h" if is_blocked else ""
+        block_status = f"🚫 BLOCKED {self.block_hours}h" if is_blocked else ""
         logger.warning(f"📋 FAULT RECORDED: {symbol} ({reason}) - Penalty: {penalty}p {block_status}")
     
     def is_blocked(self, symbol: str) -> bool:
@@ -8399,7 +8399,7 @@ class SignalGenerator:
         # =====================================================================
         # Check if coin is BLOCKED (kill switch within last 24h)
         if kill_switch_fault_tracker.is_blocked(symbol):
-            logger.info(f"🚫 BLOCKED: {symbol} had kill switch within 24h - signal rejected")
+            logger.info(f"🚫 BLOCKED: {symbol} had kill switch within {kill_switch_fault_tracker.block_hours}h - signal rejected")
             return None
         
         # Apply penalty for coins that have previously triggered kill switch
