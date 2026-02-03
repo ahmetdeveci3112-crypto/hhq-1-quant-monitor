@@ -2708,8 +2708,22 @@ class LightweightCoinAnalyzer:
         
         # Calculate metrics
         hurst = calculate_hurst(prices_list)
-        # Phase 113: Debug zscore calculation
+        # Phase 118: Debug zscore calculation with immediate retroactive fix
         spreads_count = len(self.spreads)
+        closes_count = len(self.closes)
+        
+        # If we have enough closes but not enough spreads, calculate retroactively NOW
+        if spreads_count < 20 and closes_count >= 40:
+            # Retroactive calculation
+            self.spreads.clear()
+            closes_list = list(self.closes)
+            for i in range(19, len(closes_list)):
+                ma = np.mean(closes_list[max(0, i-19):i+1])
+                spread = closes_list[i] - ma
+                self.spreads.append(spread)
+            spreads_count = len(self.spreads)
+            logger.info(f"📊 {self.symbol} ANALYZE_FIX: Retroactive spreads - closes={closes_count}, new_spreads={spreads_count}")
+        
         if spreads_count < 20:
             zscore = 0
             if hasattr(self, '_zscore_debug_count'):
@@ -2717,7 +2731,7 @@ class LightweightCoinAnalyzer:
             else:
                 self._zscore_debug_count = 0
             if self._zscore_debug_count % 100 == 0:
-                logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} spreads_count={spreads_count}/20, prices={len(self.prices)}, closes={len(self.closes)}")
+                logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} spreads_count={spreads_count}/20, prices={len(self.prices)}, closes={closes_count}")
         else:
             zscore = calculate_zscore(list(self.spreads))
         atr = calculate_atr(highs_list, lows_list, closes_list)
