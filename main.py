@@ -3873,6 +3873,13 @@ async def background_scanner_loop():
         
         while True:
             try:
+                # PHASE 104: Track loop iterations
+                if not hasattr(multi_coin_scanner, '_loop_iteration'):
+                    multi_coin_scanner._loop_iteration = 0
+                multi_coin_scanner._loop_iteration += 1
+                if multi_coin_scanner._loop_iteration <= 3 or multi_coin_scanner._loop_iteration % 100 == 0:
+                    logger.info(f"🔄 SCAN_ITERATION #{multi_coin_scanner._loop_iteration}")
+                
                 # Update BTC trend for HTF scoring (every scan cycle)
                 try:
                     if multi_coin_scanner.exchange:
