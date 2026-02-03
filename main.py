@@ -8203,7 +8203,7 @@ class SignalGenerator:
         # Ranging Regime (0.45 <= Hurst <= 0.55)
         # No clear regime, be more conservative - use higher threshold
         else:
-            ranging_threshold = effective_threshold * 1.3  # 30% stricter
+            ranging_threshold = effective_threshold * 1.0  # Phase 107: Reduced from 1.3 to 1.0 to allow signals
             if abs(zscore) > ranging_threshold:
                 # Use mean reversion logic for ranging (safer)
                 if zscore < -ranging_threshold:
