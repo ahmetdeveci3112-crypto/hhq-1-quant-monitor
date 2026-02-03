@@ -8141,6 +8141,13 @@ class SignalGenerator:
             base_threshold = global_paper_trader.z_score_threshold if 'global_paper_trader' in globals() else 1.2
             min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
             is_backtest = False
+            # Phase 113: Debug log to trace min_score_required source
+            if hasattr(self, '_min_score_log_count'):
+                self._min_score_log_count += 1
+            else:
+                self._min_score_log_count = 0
+            if self._min_score_log_count % 100 == 0:
+                logger.info(f"📊 MIN_SCORE_DEBUG: min_score_required={min_score_required}, ai_optimizer_enabled={global_paper_trader.ai_optimizer_enabled if 'global_paper_trader' in globals() else 'N/A'}")
         
         # Leverage Scaling:
         # 10x = 1.0x factor (No change)
