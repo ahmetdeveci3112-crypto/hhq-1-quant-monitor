@@ -8346,6 +8346,13 @@ class SignalGenerator:
         # Sadece Z-Score, OB, VWAP, MTF (veto için), Liq Cascade, Basis, Whale, FVG, Breakout skorları kullanıldı
         
         if score < min_score_required:
+            # Debug log for signal rejection (every 50th to avoid spam)
+            if hasattr(self, '_reject_count'):
+                self._reject_count += 1
+            else:
+                self._reject_count = 1
+            if self._reject_count % 50 == 1:
+                logger.info(f"📊 SCORE_LOW: {symbol} {signal_side} score={score} < min={min_score_required} | Z={zscore:.2f} H={hurst:.2f} | reasons: {', '.join(reasons[:3])}")
             return None
         
         # =====================================================================
