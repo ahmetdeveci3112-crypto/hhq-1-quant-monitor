@@ -2713,10 +2713,11 @@ class LightweightCoinAnalyzer:
         # Phase 122: Calculate Z-Score - lowered threshold to 20 closes for faster activation
         closes_count = len(self.closes)
         if closes_count >= 20:
-            # Calculate spreads on-the-fly from closes
+            # Phase 125: Start calculating spreads from index 9 (using 10-period MA initially)
+            # This allows us to have ~11 spreads when we hit 20 closes, ensuring immediate Z-Score
             closes_list = list(self.closes)
             temp_spreads = []
-            for i in range(19, len(closes_list)):
+            for i in range(9, len(closes_list)):
                 ma = np.mean(closes_list[max(0, i-19):i+1])
                 spread = closes_list[i] - ma
                 temp_spreads.append(spread)
