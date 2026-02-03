@@ -2692,7 +2692,18 @@ class LightweightCoinAnalyzer:
         
         # Calculate metrics
         hurst = calculate_hurst(prices_list)
-        zscore = calculate_zscore(list(self.spreads)) if len(self.spreads) >= 20 else 0
+        # Phase 113: Debug zscore calculation
+        spreads_count = len(self.spreads)
+        if spreads_count < 20:
+            zscore = 0
+            if hasattr(self, '_zscore_debug_count'):
+                self._zscore_debug_count += 1
+            else:
+                self._zscore_debug_count = 0
+            if self._zscore_debug_count % 100 == 0:
+                logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} spreads_count={spreads_count}/20, prices={len(self.prices)}, closes={len(self.closes)}")
+        else:
+            zscore = calculate_zscore(list(self.spreads))
         atr = calculate_atr(highs_list, lows_list, closes_list)
         
         self.opportunity.hurst = hurst
