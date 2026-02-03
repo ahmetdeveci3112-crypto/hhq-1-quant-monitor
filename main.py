@@ -2660,10 +2660,24 @@ class LightweightCoinAnalyzer:
         self.lows.append(l)
         self.volumes.append(volume)
         
-        if len(self.closes) >= 20:
-            ma = np.mean(list(self.closes)[-20:])
-            spread = price - ma
-            self.spreads.append(spread)
+        # Phase 115: Smart spreads calculation
+        closes_len = len(self.closes)
+        if closes_len >= 20:
+            # If this is first time we have 40+ candles and spreads < 20, do retroactive calculation
+            if closes_len >= 40 and len(self.spreads) < 20:
+                # Retroactively calculate all spreads
+                self.spreads.clear()
+                closes_list = list(self.closes)
+                for i in range(19, len(closes_list)):
+                    ma = np.mean(closes_list[max(0, i-19):i+1])
+                    spread = closes_list[i] - ma
+                    self.spreads.append(spread)
+                logger.info(f"📊 {self.symbol}: Retroactive spreads calculated - closes={closes_len}, spreads={len(self.spreads)}")
+            else:
+                # Normal incremental spread calculation
+                ma = np.mean(list(self.closes)[-20:])
+                spread = price - ma
+                self.spreads.append(spread)
         
         # Update VWAP (Typical Price = (H+L+C)/3)
         typical_price = (h + l + price) / 3
