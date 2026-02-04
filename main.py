@@ -8264,9 +8264,11 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            # Use global paper trader settings for algorithm sensitivity
-            base_threshold = global_paper_trader.z_score_threshold if 'global_paper_trader' in globals() else 1.2
-            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
+            # Phase 128: Override UI threshold (typically 1.5) with lower value (0.8)
+            # UI value creates effective_threshold ~1.6 which is too high for typical Z-Scores (1.0-1.5)
+            # This ensures signals can actually pass the threshold check
+            base_threshold = 0.8  # Hardcoded for signal generation
+            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 50
             is_backtest = False
             # Phase 113: Debug log to trace min_score_required source
             if hasattr(self, '_min_score_log_count'):
