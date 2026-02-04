@@ -8386,37 +8386,45 @@ class SignalGenerator:
             reasons.append(f"VWAP({vwap_zscore:.1f})")
             
         # Layer 4: MTF Trend (Gatekeeper) - Max 20 pts
-        # Phase 129: HYBRID APPROACH - Consider BOTH BTC trend and Altcoin trend
-        # VETO only when both are against the signal, penalty when altcoin supports it
+        # Phase 131: DYNAMIC COIN_OVERRIDE - Penalty varies by altcoin trend STRENGTH
+        # STRONG altcoin trends can completely override BTC trend
         mtf_score = 0
         if signal_side == "LONG":
             if htf_trend == "STRONG_BEARISH":
-                # Phase 130: Reduced penalty for COIN_OVERRIDE (was -25, now -10)
-                # Allows LONG signals when altcoin is bullish despite bearish BTC
-                if coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]:
-                    mtf_score = -10  # Reduced penalty - altcoin opportunity
+                # Phase 131: Gradient penalty based on altcoin strength
+                if coin_daily_trend == "STRONG_BULLISH":
+                    mtf_score = 5  # BONUS! Strong altcoin overrides bearish BTC completely
+                    reasons.append("STRONG_OVERRIDE(BTC)")
+                elif coin_daily_trend == "BULLISH":
+                    mtf_score = -5  # Minor penalty - altcoin showing strength
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bearish
             elif htf_trend == "BEARISH":
-                if coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]:
-                    mtf_score = -5  # Minor penalty - altcoin showing strength
+                if coin_daily_trend == "STRONG_BULLISH":
+                    mtf_score = 10  # Bonus - strong altcoin vs weak BTC
+                elif coin_daily_trend == "BULLISH":
+                    mtf_score = 0  # Neutral - trends cancel out
                 else:
                     mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
             else: mtf_score = 20 # Bullish
         else: # SHORT
             if htf_trend == "STRONG_BULLISH":
-                # Phase 130: Reduced penalty for COIN_OVERRIDE (was -25, now -10)
-                # Allows SHORT signals when altcoin is bearish despite bullish BTC
-                if coin_daily_trend in ["BEARISH", "STRONG_BEARISH"]:
-                    mtf_score = -10  # Reduced penalty - altcoin opportunity
+                # Phase 131: Gradient penalty based on altcoin strength
+                if coin_daily_trend == "STRONG_BEARISH":
+                    mtf_score = 5  # BONUS! Strong altcoin overrides bullish BTC completely
+                    reasons.append("STRONG_OVERRIDE(BTC)")
+                elif coin_daily_trend == "BEARISH":
+                    mtf_score = -5  # Minor penalty - altcoin showing weakness
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bullish
             elif htf_trend == "BULLISH":
-                if coin_daily_trend in ["BEARISH", "STRONG_BEARISH"]:
-                    mtf_score = -5  # Minor penalty - altcoin showing weakness
+                if coin_daily_trend == "STRONG_BEARISH":
+                    mtf_score = 10  # Bonus - strong altcoin vs weak BTC
+                elif coin_daily_trend == "BEARISH":
+                    mtf_score = 0  # Neutral - trends cancel out
                 else:
                     mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
