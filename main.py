@@ -6569,6 +6569,41 @@ class TimeBasedPositionManager:
                                 actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
                 
                 # ===============================================
+                # PHASE 137: DYNAMIC BREAKEVEN STOP
+                # Kar belli bir seviyeye ulaştığında stop = entry
+                # Spread/volatiliteye göre dinamik eşik
+                # ===============================================
+                if unrealized_pnl > 0 and not pos.get('breakeven_activated', False):
+                    # Get spread level for dynamic threshold
+                    spread_level = pos.get('spread_level', 'Normal')
+                    
+                    # Dynamic breakeven threshold based on spread
+                    # Lower spread coins = activate breakeven earlier
+                    breakeven_thresholds = {
+                        'Very Low': 0.3,   # BTC/ETH - 0.3% kârda breakeven
+                        'Low': 0.4,
+                        'Normal': 0.5,     # Normal coins - 0.5% kârda
+                        'High': 0.8,
+                        'Very High': 1.2   # Meme coins - 1.2% kârda (daha geniş spread)
+                    }
+                    be_threshold = breakeven_thresholds.get(spread_level, 0.5)
+                    
+                    # Calculate profit percentage
+                    if entry_price > 0:
+                        if side == 'LONG':
+                            profit_pct = (current_price - entry_price) / entry_price * 100
+                        else:  # SHORT
+                            profit_pct = (entry_price - current_price) / entry_price * 100
+                        
+                        # If profit exceeds threshold, move stop to entry (breakeven)
+                        if profit_pct >= be_threshold:
+                            pos['breakeven_activated'] = True
+                            pos['stopLoss'] = entry_price
+                            logger.info(f"🔒 BREAKEVEN: {symbol} stop moved to entry ${entry_price:.4f} at {profit_pct:.2f}% profit (threshold: {be_threshold}%)")
+                            actions.setdefault("breakeven", []).append(f"{symbol}({profit_pct:.1f}%)")
+                
+
+                # ===============================================
                 # CASE 1: PROFITABLE - DYNAMIC PULLBACK TRAIL
                 # Phase 51: Spread-based dynamic pullback threshold
                 # ===============================================
