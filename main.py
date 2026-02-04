@@ -8264,11 +8264,10 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            # Phase 128: Override UI threshold (typically 1.5) with lower value (0.8)
-            # UI value creates effective_threshold ~1.6 which is too high for typical Z-Scores (1.0-1.5)
-            # This ensures signals can actually pass the threshold check
-            base_threshold = 0.8  # Hardcoded for signal generation
-            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 50
+            # Phase 128: Optimized values for balanced signal quality
+            # threshold=1.0 allows moderate Z-Scores through (better than 0.8 which was too permissive)
+            base_threshold = 1.0  # Optimized for quality over quantity
+            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
             is_backtest = False
             # Phase 113: Debug log to trace min_score_required source
             if hasattr(self, '_min_score_log_count'):
@@ -8320,9 +8319,9 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # Phase 128: Increased base score (60) to ensure signals can pass
-            # even with SMC/FVG penalties (-20) - previously 45 caused 32/55 fails
-            score += 60
+            # Phase 128: Optimized base score (45) for balanced signal quality
+            # Combined with threshold=1.0 and min_score=55, this creates proper filtering
+            score += 45
             
             # Phase 112: Only bonus for mean reversion regime, NO PENALTY
             # Restores Phase 84 behavior when signals were working
