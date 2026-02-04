@@ -8744,7 +8744,7 @@ class SignalGenerator:
         reasons.append(f"Lev({final_leverage}x)")
         
         # Debug: Log the actual ATR% value and what level it maps to
-        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% → Level={spread_params['level']} → Lev={spread_leverage}x (after BalProt: {final_leverage}x)")
+        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")
         
         # Phase 127: Log successful signal generation for tracing
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f}")
