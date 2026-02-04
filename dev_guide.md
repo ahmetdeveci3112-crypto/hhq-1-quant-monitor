@@ -7,6 +7,7 @@
 
 | Tarih | Commit | Açıklama |
 |-------|--------|----------|
+| 2026-02-04 | `081ed8f` | Phase 133 rollback sonrası stabil (Phase 135 öncesi) |
 | 2026-02-04 | `7e4230d` | Phase 133 sonrası stabil versiyon (Hurst VETO, Trend VETO, Auto-Breakeven) |
 
 **Rollback komutu:**
