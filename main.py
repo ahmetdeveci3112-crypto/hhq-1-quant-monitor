@@ -8264,9 +8264,9 @@ class SignalGenerator:
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
-            # Phase 128: Optimized values for balanced signal quality
-            # threshold=1.2 requires stronger Z-Score deviations for quality signals
-            base_threshold = 1.2  # Stricter: only strong signals pass
+            # Phase 132: Stricter thresholds to reduce signal count
+            # threshold=1.5 requires stronger Z-Score deviations
+            base_threshold = 1.5  # Higher threshold = fewer, stronger signals
             min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 45
             is_backtest = False
             # Phase 113: Debug log to trace min_score_required source
@@ -8319,9 +8319,9 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # Phase 130: Balanced base score (55) allows LONG signals with MTF penalty
-            # Combined with min_score=45 and COIN_OVERRIDE=-10, this creates fair balance
-            score += 55
+            # Phase 132: Reduced base score (45) - signals need more confluence
+            # Combined with threshold=1.5, creates proper filtering
+            score += 45
             
             # Phase 112: Only bonus for mean reversion regime, NO PENALTY
             # Restores Phase 84 behavior when signals were working
