@@ -3694,6 +3694,11 @@ class MultiCoinScanner:
         self.opportunities = opportunities
         self.active_signals = signals
         
+        # Phase 127: Log active signal count for tracing
+        if signals:
+            signal_symbols = [s.get('symbol', '?') for s in signals]
+            logger.info(f"📡 SCAN_RESULT: {len(signals)} active signals collected: {signal_symbols[:5]}{'...' if len(signals) > 5 else ''}")
+        
         return opportunities
     
     def get_scanner_stats(self) -> dict:
@@ -4406,6 +4411,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     symbol = signal.get('symbol', global_paper_trader.symbol)
     atr = signal.get('atr', 0)
     
+    # Phase 127: Log signal processing entry for tracing
+    logger.info(f"🔄 PROC_SIGNAL: Processing {symbol} {action} @ ${price:.4f}")
+    
     # Prepare signal data for logging
     signal_log_data = {
         'symbol': symbol,
@@ -4484,6 +4492,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + bonus)
             signal['btc_adjustment'] = btc_reason
             logger.info(f"✅ BTC BONUS: {action} {symbol} | Size: +{bonus*100:.0f}%")
+        else:
+            # Phase 127: Log pass when no penalty/bonus
+            logger.info(f"✅ BTC_FILTER PASS: {symbol} {action}")
             
     except Exception as btc_err:
         logger.warning(f"BTC Filter error: {btc_err}")
@@ -4549,6 +4560,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
         return
+    
+    # Phase 127: Log MTF confirmation pass
+    logger.info(f"✅ MTF_CONFIRMATION PASS: {symbol} {action} (score: {mtf_result.get('mtf_score', 0)})")
     
     # Signal is ACCEPTED
     signal_log_data['accepted'] = True
@@ -8672,6 +8686,9 @@ class SignalGenerator:
         
         # Debug: Log the actual ATR% value and what level it maps to
         logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% → Level={spread_params['level']} → Lev={spread_leverage}x (after BalProt: {final_leverage}x)")
+        
+        # Phase 127: Log successful signal generation for tracing
+        logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f}")
         
         return {
             'action': signal_side,
