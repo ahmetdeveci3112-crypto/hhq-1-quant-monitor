@@ -1731,53 +1731,6 @@ def get_dynamic_trail_params(
     
     return round(final_activation, 2), round(final_distance, 2)
 
-
-# =====================================================
-# PHASE 133: DYNAMIC AUTO-BREAKEVEN SYSTEM
-# Calculates when to move SL to entry based on
-# volatility and spread - higher risk = higher threshold
-# =====================================================
-def calculate_breakeven_threshold(volatility_pct: float, spread_level: str) -> float:
-    """
-    Calculate dynamic breakeven threshold based on volatility and spread.
-    
-    Low volatility + low spread = lock profit early (low %)
-    High volatility + high spread = wait for higher profit before lock (high %)
-    
-    Args:
-        volatility_pct: ATR as percentage of price (e.g., 15.0 for 15%)
-        spread_level: Spread category ('very_low', 'low', 'normal', 'medium', 'high', 'very_high')
-        
-    Returns:
-        PnL percentage threshold for breakeven activation (e.g., 2.0 = 2% profit)
-    """
-    # Base threshold by spread level
-    spread_thresholds = {
-        'very_low': 1.0,   # 1% profit → breakeven
-        'low': 1.5,        # 1.5%
-        'normal': 2.0,     # 2%
-        'medium': 2.5,     # 2.5%
-        'high': 3.5,       # 3.5%
-        'very_high': 5.0   # 5%
-    }
-    base = spread_thresholds.get(spread_level, 2.0)
-    
-    # Volatility adjustment multiplier
-    if volatility_pct <= 10:
-        vol_mult = 0.8   # Low volatility: lock earlier
-    elif volatility_pct <= 20:
-        vol_mult = 1.0   # Normal: no adjustment
-    elif volatility_pct <= 30:
-        vol_mult = 1.2   # Higher: give more room
-    else:
-        vol_mult = 1.5   # Very high: need more buffer
-    
-    threshold = base * vol_mult
-    
-    # Clamp to reasonable range: 0.5% - 8%
-    return max(0.5, min(8.0, threshold))
-
-
 def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: float = 0.0, spread_pct: float = 0.0) -> dict:
     """
     Get SL/TP/Trail/Leverage based on volatility (ATR as % of price).
@@ -4207,34 +4160,6 @@ async def background_scanner_loop():
                             # %2-5 kâr: standart, %5-10: sıkı, %10+: çok sıkı
                             # ===================================================================
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                            
-                            # ===================================================================
-                            # PHASE 133: AUTO-BREAKEVEN SYSTEM
-                            # When position reaches dynamic profit threshold, lock SL at entry
-                            # ===================================================================
-                            if not pos.get('breakeven_locked', False) and pnl_pct > 0:
-                                # Get volatility and spread from position
-                                vol_pct = pos.get('volatility_pct', 15.0)
-                                spread_lvl = pos.get('spreadLevel', 'normal')
-                                be_threshold = calculate_breakeven_threshold(vol_pct, spread_lvl)
-                                
-                                if pnl_pct >= be_threshold:
-                                    symbol = pos.get('symbol', 'UNKNOWN')
-                                    if pos['side'] == 'LONG':
-                                        # Set SL slightly above entry (0.1% buffer)
-                                        new_sl = entry_price * 1.001
-                                        if new_sl > pos.get('stopLoss', 0):
-                                            pos['stopLoss'] = new_sl
-                                            pos['breakeven_locked'] = True
-                                            logger.info(f"🛡️ BREAKEVEN: {symbol} LONG SL → ${entry_price:.4f} @ {pnl_pct:.1f}% profit (threshold: {be_threshold:.1f}%)")
-                                    else:  # SHORT
-                                        # Set SL slightly below entry (0.1% buffer)
-                                        new_sl = entry_price * 0.999
-                                        if new_sl < pos.get('stopLoss', float('inf')):
-                                            pos['stopLoss'] = new_sl
-                                            pos['breakeven_locked'] = True
-                                            logger.info(f"🛡️ BREAKEVEN: {symbol} SHORT SL → ${entry_price:.4f} @ {pnl_pct:.1f}% profit (threshold: {be_threshold:.1f}%)")
-                            
                             if pnl_pct >= 10.0:
                                 # Çok yüksek kâr: trail mesafesini %50'ye küçült
                                 dynamic_trail_distance = trail_distance * 0.5
@@ -8394,24 +8319,16 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # =====================================================================
-            # PHASE 133: HURST TRENDING REGIME VETO
-            # Hurst > 0.55 = trending market, mean reversion signals are RISKY
-            # In trending markets, contrarian trades often fail
-            # =====================================================================
-            if hurst > 0.55:
-                logger.info(f"🚫 HURST_VETO: {symbol} {signal_side} rejected - H={hurst:.2f} > 0.55 (trending regime)")
-                return None
-            
             # Phase 132: Reduced base score (45) - signals need more confluence
             # Combined with threshold=1.5, creates proper filtering
             score += 45
             
-            # Phase 112: Only bonus for mean reversion regime
+            # Phase 112: Only bonus for mean reversion regime, NO PENALTY
+            # Restores Phase 84 behavior when signals were working
             if hurst < 0.45:
                 score += 5  # Mean reversion regime - bonus for alignment
                 reasons.append(f"H_MR({hurst:.2f})")
-            # Ranging (0.45-0.55): no bonus, no penalty
+            # Ranging (0.45-0.55) and Trending (>0.55): no bonus, NO PENALTY
         else:
             return None  # Z-Score not extreme enough
         
@@ -8479,7 +8396,7 @@ class SignalGenerator:
                     mtf_score = 5  # BONUS! Strong altcoin overrides bearish BTC completely
                     reasons.append("STRONG_OVERRIDE(BTC)")
                 elif coin_daily_trend == "BULLISH":
-                    mtf_score = -15  # Penalty for weak bullish altcoin
+                    mtf_score = -5  # Minor penalty - altcoin showing strength
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bearish
@@ -8499,7 +8416,7 @@ class SignalGenerator:
                     mtf_score = 5  # BONUS! Strong altcoin overrides bullish BTC completely
                     reasons.append("STRONG_OVERRIDE(BTC)")
                 elif coin_daily_trend == "BEARISH":
-                    mtf_score = -15  # Penalty for weak bearish altcoin
+                    mtf_score = -5  # Minor penalty - altcoin showing weakness
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bullish
@@ -8831,16 +8748,24 @@ class SignalGenerator:
         size_mult *= balance_size_mult
         
         # =====================================================================
-        # PHASE 133: TREND CONFLICT VETO
-        # Replace size reduction with full VETO - don't fight the trend
+        # PHASE 110: TREND-BASED POSITION SIZE REDUCTION
+        # Trend karşıtı trade'lerde pozisyon boyutunu azalt
         # =====================================================================
-        if coin_daily_trend in ["STRONG_BULLISH", "BULLISH"] and signal_side == "SHORT":
-            logger.info(f"🚫 TREND_VETO: {symbol} SHORT rejected - coin trend is {coin_daily_trend}")
-            return None
+        trend_size_reduction = 1.0  # Default no reduction
+        if coin_daily_trend == "STRONG_BEARISH" and signal_side == "LONG":
+            trend_size_reduction = 0.7  # 30% smaller position
+            reasons.append("📉 TrendConflict(-30%)")
+        elif coin_daily_trend == "STRONG_BULLISH" and signal_side == "SHORT":
+            trend_size_reduction = 0.7  # 30% smaller position
+            reasons.append("📈 TrendConflict(-30%)")
+        elif coin_daily_trend == "BEARISH" and signal_side == "LONG":
+            trend_size_reduction = 0.85  # 15% smaller position
+            reasons.append("📉 trend_conflict(-15%)")
+        elif coin_daily_trend == "BULLISH" and signal_side == "SHORT":
+            trend_size_reduction = 0.85  # 15% smaller position
+            reasons.append("📈 trend_conflict(-15%)")
         
-        if coin_daily_trend in ["STRONG_BEARISH", "BEARISH"] and signal_side == "LONG":
-            logger.info(f"🚫 TREND_VETO: {symbol} LONG rejected - coin trend is {coin_daily_trend}")
-            return None
+        size_mult *= trend_size_reduction
         
         self.last_signal_time = now
         
