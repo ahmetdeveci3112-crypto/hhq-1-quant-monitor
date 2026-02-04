@@ -8265,8 +8265,8 @@ class SignalGenerator:
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
             # Phase 128: Optimized values for balanced signal quality
-            # threshold=1.0 allows moderate Z-Scores through (better than 0.8 which was too permissive)
-            base_threshold = 1.0  # Optimized for quality over quantity
+            # threshold=1.2 requires stronger Z-Score deviations for quality signals
+            base_threshold = 1.2  # Stricter: only strong signals pass
             min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
             is_backtest = False
             # Phase 113: Debug log to trace min_score_required source
