@@ -1388,15 +1388,19 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
     H < 0.45 → Mean-reverting market
     H ≈ 0.50 → Random walk
     """
-    if len(prices) < min_window * 2:
+    n = len(prices)
+    
+    # Phase 128: Relaxed minimum requirements
+    if n < min_window * 2:
+        logger.debug(f"Hurst: insufficient data ({n} < {min_window*2}), returning 0.5")
         return 0.5
     
     try:
         ts = np.array(prices)
-        n = len(ts)
         
         max_window = n // 4
         if max_window < min_window:
+            logger.debug(f"Hurst: max_window ({max_window}) < min_window ({min_window}), returning 0.5")
             return 0.5
             
         window_sizes = []
@@ -1421,6 +1425,7 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
                 rs_values.append(np.mean(rs_list))
         
         if len(window_sizes) < 3:
+            logger.debug(f"Hurst: insufficient window samples ({len(window_sizes)} < 3), returning 0.5")
             return 0.5
         
         log_windows = np.log(window_sizes)
@@ -1428,7 +1433,13 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
         coeffs = np.polyfit(log_windows, log_rs, 1)
         hurst = coeffs[0]
         
-        return max(0.3, min(0.7, hurst))
+        # Clamp to valid range
+        hurst = max(0.3, min(0.7, hurst))
+        
+        # Phase 128: Log actual Hurst calculation for debugging
+        logger.debug(f"Hurst calculated: {hurst:.3f} (n={n}, windows={len(window_sizes)})")
+        
+        return hurst
         
     except Exception as e:
         logger.warning(f"Hurst calculation error: {e}")
@@ -2710,6 +2721,11 @@ class LightweightCoinAnalyzer:
         # Phase 124: Adjust Hurst window for small samples (<50 candles)
         min_window = 5 if len(prices_list) < 50 else 10
         hurst = calculate_hurst(prices_list, min_window=min_window)
+        
+        # Phase 128: Log Hurst value for each coin (periodically to avoid spam)
+        if self._analyze_count <= 5 or self._analyze_count % 100 == 0:
+            logger.info(f"📈 HURST: {self.symbol} H={hurst:.3f} (prices={len(prices_list)}, min_win={min_window})")
+        
         # Phase 122: Calculate Z-Score - lowered threshold to 20 closes for faster activation
         closes_count = len(self.closes)
         if closes_count >= 20:
