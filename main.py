@@ -1433,8 +1433,9 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
         coeffs = np.polyfit(log_windows, log_rs, 1)
         hurst = coeffs[0]
         
-        # Clamp to valid range
-        hurst = max(0.3, min(0.7, hurst))
+        # Phase 128: Expanded clamp range (0.15-0.85) for natural per-coin variation
+        # Crypto markets are often strongly trending (H>0.7), need wider range
+        hurst = max(0.15, min(0.85, hurst))
         
         # Phase 128: Log actual Hurst calculation for debugging
         logger.debug(f"Hurst calculated: {hurst:.3f} (n={n}, windows={len(window_sizes)})")
@@ -8125,18 +8126,14 @@ def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float
     
     threshold = base_threshold
     
-    # 1. Hurst Factor (Phase 128)
-    # Mean-reverting coins (low Hurst) are ideal for our strategy
-    if hurst < 0.35:
-        hurst_factor = 0.7   # 30% easier entry (strong mean reversion)
-    elif hurst < 0.45:
-        hurst_factor = 0.85  # 15% easier entry (mild mean reversion)
-    elif hurst > 0.65:
-        hurst_factor = 1.3   # 30% harder entry (strong trend)
-    elif hurst > 0.55:
-        hurst_factor = 1.15  # 15% harder entry (mild trend)
-    else:
-        hurst_factor = 1.0   # Random walk - no adjustment
+    # 1. Hurst Factor (Phase 128) - CONTINUOUS SCALING
+    # Linear interpolation: H=0.2 → 0.6x factor, H=0.5 → 1.0x, H=0.8 → 1.4x
+    # Formula: factor = 1.0 + (hurst - 0.5) * 1.33
+    # This gives smoother, per-coin unique thresholds
+    hurst_factor = 1.0 + (hurst - 0.5) * 1.33
+    
+    # Clamp factor to reasonable bounds (0.6x to 1.4x)
+    hurst_factor = max(0.6, min(1.4, hurst_factor))
     
     threshold *= hurst_factor
     
