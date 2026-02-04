@@ -8386,16 +8386,37 @@ class SignalGenerator:
             reasons.append(f"VWAP({vwap_zscore:.1f})")
             
         # Layer 4: MTF Trend (Gatekeeper) - Max 20 pts
-        # Must NOT be opposing. Neutral is OK (+10), Aligned is Best (+20)
+        # Phase 129: HYBRID APPROACH - Consider BOTH BTC trend and Altcoin trend
+        # VETO only when both are against the signal, penalty when altcoin supports it
         mtf_score = 0
         if signal_side == "LONG":
-            if htf_trend == "STRONG_BEARISH": mtf_score = -100 # VETO
-            elif htf_trend == "BEARISH": mtf_score = -15  # Penalty for counter-trend
+            if htf_trend == "STRONG_BEARISH":
+                # Hybrid: Check if altcoin is bullish - if so, reduce penalty instead of VETO
+                if coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]:
+                    mtf_score = -25  # Heavy penalty but NOT VETO - altcoin opportunity
+                    reasons.append("COIN_OVERRIDE(BTC)")
+                else:
+                    mtf_score = -100  # VETO - both BTC and altcoin bearish
+            elif htf_trend == "BEARISH":
+                if coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]:
+                    mtf_score = -5  # Minor penalty - altcoin showing strength
+                else:
+                    mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
             else: mtf_score = 20 # Bullish
         else: # SHORT
-            if htf_trend == "STRONG_BULLISH": mtf_score = -100 # VETO
-            elif htf_trend == "BULLISH": mtf_score = -15  # Penalty for counter-trend
+            if htf_trend == "STRONG_BULLISH":
+                # Hybrid: Check if altcoin is bearish - if so, reduce penalty instead of VETO
+                if coin_daily_trend in ["BEARISH", "STRONG_BEARISH"]:
+                    mtf_score = -25  # Heavy penalty but NOT VETO - altcoin opportunity
+                    reasons.append("COIN_OVERRIDE(BTC)")
+                else:
+                    mtf_score = -100  # VETO - both BTC and altcoin bullish
+            elif htf_trend == "BULLISH":
+                if coin_daily_trend in ["BEARISH", "STRONG_BEARISH"]:
+                    mtf_score = -5  # Minor penalty - altcoin showing weakness
+                else:
+                    mtf_score = -15  # Penalty for counter-trend
             elif htf_trend == "NEUTRAL": mtf_score = 10
             else: mtf_score = 20 # Bearish
             
