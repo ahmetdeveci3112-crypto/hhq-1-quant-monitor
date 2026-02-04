@@ -8334,6 +8334,9 @@ class SignalGenerator:
         if signal_side is None:
             return None
         
+        # Phase 128: TRACE LOG - every signal that passes Z-Score threshold
+        logger.info(f"🎯 Z_PASS: {symbol} {signal_side} Z={zscore:.2f} H={hurst:.2f} score={score}")
+        
         # Bonus based on Z-Score strength (0-10 pts extra)
         zscore_excess = abs(zscore) - effective_threshold
         zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
