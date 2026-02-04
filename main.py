@@ -1461,6 +1461,88 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
 
 
 # ============================================================================
+# ADX (Average Directional Index) CALCULATION - Phase 137
+# ============================================================================
+
+def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
+    """
+    Calculate Average Directional Index (ADX) for trend strength measurement.
+    
+    Phase 137: ADX + Hurst kombinasyonu ile regime detection.
+    
+    ADX > 25 → Güçlü trend (mean reversion riskli)
+    ADX < 20 → Zayıf trend / Range (mean reversion için ideal)
+    ADX 20-25 → Geçiş bölgesi
+    """
+    n = len(highs)
+    
+    if n < period + 1:
+        return 25.0  # Neutral default
+    
+    try:
+        highs_arr = np.array(highs)
+        lows_arr = np.array(lows)
+        closes_arr = np.array(closes)
+        
+        # +DM, -DM ve True Range hesapla
+        plus_dm = []
+        minus_dm = []
+        tr = []
+        
+        for i in range(1, n):
+            high_diff = highs_arr[i] - highs_arr[i-1]
+            low_diff = lows_arr[i-1] - lows_arr[i]
+            
+            # +DM: Yukarı hareket daha büyükse ve pozitifse
+            if high_diff > low_diff and high_diff > 0:
+                plus_dm.append(high_diff)
+            else:
+                plus_dm.append(0)
+            
+            # -DM: Aşağı hareket daha büyükse ve pozitifse
+            if low_diff > high_diff and low_diff > 0:
+                minus_dm.append(low_diff)
+            else:
+                minus_dm.append(0)
+            
+            # True Range
+            tr_val = max(
+                highs_arr[i] - lows_arr[i],
+                abs(highs_arr[i] - closes_arr[i-1]),
+                abs(lows_arr[i] - closes_arr[i-1])
+            )
+            tr.append(tr_val)
+        
+        if len(tr) < period:
+            return 25.0
+        
+        # Smoothed averages (Wilder's smoothing - period average)
+        atr = sum(tr[-period:]) / period
+        
+        if atr == 0:
+            return 25.0
+        
+        plus_di = 100 * sum(plus_dm[-period:]) / (atr * period)
+        minus_di = 100 * sum(minus_dm[-period:]) / (atr * period)
+        
+        # DX hesapla
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            return 25.0
+        
+        dx = abs(plus_di - minus_di) / di_sum * 100
+        
+        # Clamp to reasonable bounds
+        adx = max(5.0, min(80.0, dx))
+        
+        return round(adx, 1)
+        
+    except Exception as e:
+        logger.warning(f"ADX calculation error: {e}")
+        return 25.0
+
+
+# ============================================================================
 # Z-SCORE CALCULATION
 # ============================================================================
 
@@ -2769,9 +2851,13 @@ class LightweightCoinAnalyzer:
                 logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} closes={closes_count}/40 needed")
         atr = calculate_atr(highs_list, lows_list, closes_list)
         
+        # Phase 137: Calculate ADX for regime detection
+        adx = calculate_adx(highs_list, lows_list, closes_list)
+        
         self.opportunity.hurst = hurst
         self.opportunity.zscore = zscore
         self.opportunity.atr = atr
+        self.opportunity.adx = adx  # Phase 137: ADX for regime detection
         self.opportunity.imbalance = imbalance
         
         # Phase 35: Calculate volatility as ATR percentage of price
@@ -6399,6 +6485,7 @@ class TimeBasedPositionManager:
             "trail_activated": [],
             "time_reduced": [],
             "time_closed": [],
+            "partial_tp": [],  # Phase 137: Partial take profit tracking
             "checked": 0
         }
         
@@ -6414,11 +6501,72 @@ class TimeBasedPositionManager:
                 unrealized_pnl = pos.get('unrealizedPnl', 0)
                 is_trailing_active = pos.get('isTrailingActive', False)
                 current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
+                entry_price = pos.get('entryPrice', current_price)
+                contracts = pos.get('contracts', 0)
                 
                 # Calculate position age in hours
                 age_hours = (current_time_ms - open_time) / (1000 * 60 * 60)
                 
                 actions["checked"] += 1
+                
+                # ===============================================
+                # PHASE 137: DYNAMIC PARTIAL TAKE PROFIT
+                # Spread ve volatiliteye göre dinamik TP seviyeleri
+                # ===============================================
+                if unrealized_pnl > 0 and contracts > 0:
+                    # Get spread level and ATR for dynamic TP calculation
+                    spread_level = pos.get('spread_level', 'Normal')
+                    atr = pos.get('atr', current_price * 0.02)
+                    
+                    # ATR as percentage of price
+                    atr_pct = (atr / current_price * 100) if current_price > 0 else 2.0
+                    
+                    # Spread multipliers for TP levels
+                    spread_mults = {
+                        'Very Low': 0.5,   # BTC/ETH - tighter TPs
+                        'Low': 0.75,
+                        'Normal': 1.0,
+                        'High': 1.5,
+                        'Very High': 2.5   # Meme coins - wider TPs
+                    }
+                    mult = spread_mults.get(spread_level, 1.0)
+                    
+                    # Dynamic base for TP levels: ATR_pct * multiplier
+                    base_tp_pct = atr_pct * mult
+                    
+                    # TP levels: 50%, 100%, 200% of base
+                    tp_levels = [
+                        {'pct': base_tp_pct * 0.5, 'close_pct': 0.25, 'key': 'tp1'},
+                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.25, 'key': 'tp2'},
+                        {'pct': base_tp_pct * 2.0, 'close_pct': 0.25, 'key': 'tp3'},
+                    ]
+                    
+                    # Current profit percentage
+                    if entry_price > 0:
+                        if side == 'LONG':
+                            profit_pct = (current_price - entry_price) / entry_price * 100
+                        else:  # SHORT
+                            profit_pct = (entry_price - current_price) / entry_price * 100
+                        
+                        # Track which TPs have been hit
+                        partial_tp_state = pos.get('partial_tp_state', {})
+                        
+                        for level in tp_levels:
+                            if profit_pct >= level['pct'] and not partial_tp_state.get(level['key'], False):
+                                # TP level hit - mark as closed
+                                partial_tp_state[level['key']] = True
+                                pos['partial_tp_state'] = partial_tp_state
+                                
+                                # Calculate contracts to close (25%)
+                                close_contracts = contracts * level['close_pct']
+                                
+                                # Update position contracts (reduce by 25%)
+                                pos['contracts'] = contracts - close_contracts
+                                pos['original_contracts'] = pos.get('original_contracts', contracts)
+                                
+                                # Log partial TP
+                                logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at {profit_pct:.2f}% profit (level: {level['key']}, base: {base_tp_pct:.2f}%)")
+                                actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
                 
                 # ===============================================
                 # CASE 1: PROFITABLE - DYNAMIC PULLBACK TRAIL
@@ -8565,6 +8713,24 @@ class SignalGenerator:
             elif poc_dist_pct < 5.0:
                 score += 5
                 reasons.append(f"POC_zone({poc_dist_pct:.1f}%)+5")
+        
+        # =====================================================================
+        # PHASE 137: ADX + HURST REGIME DETECTION
+        # SADECE BONUS - VETO YOK (Phase 133/134/135'teki hatayı önlemek için)
+        # =====================================================================
+        
+        # Layer 15: ADX + Hurst Regime Bonus
+        # ADX < 20 + Hurst < 0.45 → Range market → Mean reversion için ideal
+        # Get ADX from opportunity if available
+        adx = getattr(opportunity, 'adx', 25.0) if opportunity else 25.0
+        
+        if adx < 20 and hurst < 0.45:
+            # Strong range regime - ideal for mean reversion
+            score += 10
+            reasons.append(f"RANGE({adx:.0f},{hurst:.2f})+10")
+        elif adx > 25 and hurst > 0.55:
+            # Trend regime - only warning, NO VETO
+            reasons.append(f"TREND_WARN({adx:.0f},{hurst:.2f})")
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK

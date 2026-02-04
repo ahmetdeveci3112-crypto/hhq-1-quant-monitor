@@ -31,6 +31,12 @@ flyctl deploy --detach
 
 ---
 
+## ⚠️ Önemli Notlar
+
+> **AMS Makinesi:** Amsterdam (AMS) makinesi her zaman **STOPPED** durumunda kalmalıdır. Sadece Singapore (SIN) makinesi aktif olarak çalıştırılır.
+
+---
+
 ## 🎯 Proje Genel Bakış
 
 HHQ-1 Quant Monitor, 500+ kripto paritesinde gerçek zamanlı sinyal üretimi ve otomatik trading yapan bir platformdur.
