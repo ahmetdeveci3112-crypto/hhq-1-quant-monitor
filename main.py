@@ -8396,7 +8396,7 @@ class SignalGenerator:
                     mtf_score = 5  # BONUS! Strong altcoin overrides bearish BTC completely
                     reasons.append("STRONG_OVERRIDE(BTC)")
                 elif coin_daily_trend == "BULLISH":
-                    mtf_score = -5  # Minor penalty - altcoin showing strength
+                    mtf_score = -15  # Penalty for weak bullish altcoin
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bearish
@@ -8416,7 +8416,7 @@ class SignalGenerator:
                     mtf_score = 5  # BONUS! Strong altcoin overrides bullish BTC completely
                     reasons.append("STRONG_OVERRIDE(BTC)")
                 elif coin_daily_trend == "BEARISH":
-                    mtf_score = -5  # Minor penalty - altcoin showing weakness
+                    mtf_score = -15  # Penalty for weak bearish altcoin
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bullish
