@@ -300,6 +300,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-04 | 133 | Signal Filtering: Auto-breakeven, Hurst VETO (>0.55), Trend VETO |
 | 2026-02-02 | 99 | Unified Leverage: UI ve Binance için tek hesaplama |
 | 2026-02-02 | 100 | Trade History Fix: Harici kapatmalar kaydediliyor |
 | ... | ... | ... |
