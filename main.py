@@ -8092,23 +8092,47 @@ def calculate_vwap(closes: list, volumes: list, prices: list) -> float:
 # ADAPTIVE THRESHOLD (ATR-BASED)
 # ============================================================================
 
-def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float) -> float:
+def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float, hurst: float = 0.5) -> float:
     """
-    Adjust Z-Score threshold based on volatility (ATR).
-    High ATR -> Higher threshold (harder to enter)
-    Low ATR -> Lower threshold (easier to enter)
+    Adjust Z-Score threshold based on volatility (ATR) AND Hurst exponent.
+    
+    Hurst-based adjustment (Phase 128):
+    - Hurst < 0.4 (Mean Reverting) -> Lower threshold (easier to enter, MR strategy)
+    - Hurst = 0.5 (Random Walk) -> No change
+    - Hurst > 0.6 (Trending) -> Higher threshold (harder to enter, need stronger signal)
+    
+    ATR-based adjustment:
+    - High ATR -> Higher threshold (need bigger move in volatile markets)
+    - Low ATR -> Lower threshold (smaller moves are significant)
     """
     if price == 0: return base_threshold
     
+    threshold = base_threshold
+    
+    # 1. Hurst Factor (Phase 128)
+    # Mean-reverting coins (low Hurst) are ideal for our strategy
+    if hurst < 0.35:
+        hurst_factor = 0.7   # 30% easier entry (strong mean reversion)
+    elif hurst < 0.45:
+        hurst_factor = 0.85  # 15% easier entry (mild mean reversion)
+    elif hurst > 0.65:
+        hurst_factor = 1.3   # 30% harder entry (strong trend)
+    elif hurst > 0.55:
+        hurst_factor = 1.15  # 15% harder entry (mild trend)
+    else:
+        hurst_factor = 1.0   # Random walk - no adjustment
+    
+    threshold *= hurst_factor
+    
+    # 2. ATR Factor (existing logic)
     atr_pct = (atr / price) * 100
     
-    # Base ATR expected around 1-2% for BTC
-    if atr_pct > 2.0: # High volatility
-        return base_threshold * 1.3  # e.g. 1.5 -> 1.95
-    elif atr_pct < 0.5: # Low volatility
-        return base_threshold * 0.8  # e.g. 1.5 -> 1.2
+    if atr_pct > 2.0:  # High volatility
+        threshold *= 1.2  # 20% harder (was 30%)
+    elif atr_pct < 0.5:  # Low volatility
+        threshold *= 0.85  # 15% easier (was 20%)
     
-    return base_threshold
+    return threshold
 
 # ============================================================================
 # SIGNAL GENERATOR (4-Layer Logic)
@@ -8236,7 +8260,8 @@ class SignalGenerator:
         if is_backtest:
             effective_threshold = base_threshold
         else:
-            adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price)
+            # Phase 128: Pass hurst to calculate_adaptive_threshold for per-coin dynamic threshold
+            adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price, hurst)
             effective_threshold = adaptive_threshold * leverage_factor
         
         # Phase 120: Log AFTER effective_threshold is calculated
