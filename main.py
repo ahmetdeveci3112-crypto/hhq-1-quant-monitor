@@ -8505,8 +8505,66 @@ class SignalGenerator:
                  score -= 10
                  reasons.append("FakeoutRisk")
 
-        # Layer 10-14 artık SKOR VERMİYOR - bunlar KONFİRMASYON katmanları olarak aşağıda kontrol edilecek
-        # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
+        # =====================================================================
+        # PHASE 136: BONUS-ONLY SCORING LAYERS
+        # SADECE BONUS verir, asla penalty vermez - sinyal akışını bozmaz
+        # =====================================================================
+        
+        # Layer 10: RSI Momentum Bonus (+5/+8)
+        # LONG + oversold = bonus, SHORT + overbought = bonus
+        if signal_side == "LONG" and rsi < 35:
+            rsi_bonus = 8 if rsi < 25 else 5
+            score += rsi_bonus
+            reasons.append(f"RSI_OS({rsi:.0f})+{rsi_bonus}")
+        elif signal_side == "SHORT" and rsi > 65:
+            rsi_bonus = 8 if rsi > 75 else 5
+            score += rsi_bonus
+            reasons.append(f"RSI_OB({rsi:.0f})+{rsi_bonus}")
+        
+        # Layer 11: Volume Spike Bonus (+5/+8)
+        # volume_ratio is passed as parameter (default=1.0)
+        if volume_ratio >= 1.5:
+            vol_bonus = 8 if volume_ratio >= 2.0 else 5
+            score += vol_bonus
+            reasons.append(f"VOL({volume_ratio:.1f}x)+{vol_bonus}")
+        
+        # Layer 12: SMT Divergence Bonus (+10)
+        # Uses existing smt_divergence_detector.last_divergence (no new API call)
+        try:
+            smt_div_bonus = smt_divergence_detector.last_divergence
+            if smt_div_bonus and smt_div_bonus.get('divergence_type'):
+                smt_type = smt_div_bonus['divergence_type']
+                smt_age = datetime.now().timestamp() - smt_divergence_detector.divergence_time
+                if smt_age < 300:  # Son 5 dakika
+                    if smt_type == "BULLISH" and signal_side == "LONG":
+                        score += 10
+                        reasons.append("SMT_BULL+10")
+                    elif smt_type == "BEARISH" and signal_side == "SHORT":
+                        score += 10
+                        reasons.append("SMT_BEAR+10")
+        except Exception:
+            pass  # SMT detector not ready
+        
+        # Layer 13: VWAP Sweet Zone Bonus (+5)
+        # vwap_zscore is passed as parameter (default=0.0)
+        if vwap_zscore != 0:
+            vwap_dev = abs(vwap_zscore)
+            # Sweet spot: 0.5-2.0 sigma away from VWAP (ideal mean reversion)
+            if 0.5 <= vwap_dev <= 2.0:
+                score += 5
+                reasons.append(f"VWAP_ZONE({vwap_dev:.1f}σ)+5")
+        
+        # Layer 14: POC Proximity Bonus (+5/+8)
+        # coin_profile is passed as parameter (default=None)
+        if coin_profile and coin_profile.get('poc', 0) > 0:
+            poc = coin_profile['poc']
+            poc_dist_pct = abs(price - poc) / poc * 100
+            if poc_dist_pct < 2.0:
+                score += 8
+                reasons.append(f"POC_NEAR({poc_dist_pct:.1f}%)+8")
+            elif poc_dist_pct < 5.0:
+                score += 5
+                reasons.append(f"POC_zone({poc_dist_pct:.1f}%)+5")
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK
