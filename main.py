@@ -8588,8 +8588,91 @@ class SignalGenerator:
                  score -= 10
                  reasons.append("FakeoutRisk")
 
-        # Layer 10-14 artık SKOR VERMİYOR - bunlar KONFİRMASYON katmanları olarak aşağıda kontrol edilecek
-        # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
+        # =====================================================================
+        # PHASE 134: ENHANCED SCORING LAYERS (Previously unused indicators)
+        # =====================================================================
+        
+        # Layer 10: RSI Momentum Confirmation - Prevents premature entries
+        # LONG signals need RSI < 40 (oversold), SHORT signals need RSI > 60 (overbought)
+        if signal_side == "LONG":
+            if rsi < 35:
+                score += 10  # Strong oversold - good for mean reversion LONG
+                reasons.append(f"RSI_OS({rsi:.0f})")
+            elif rsi < 45:
+                score += 5   # Mild oversold
+                reasons.append(f"RSI_os({rsi:.0f})")
+            elif rsi > 55:
+                score -= 10  # Momentum still bullish, mean reversion risky
+                reasons.append(f"RSI_WARN({rsi:.0f})")
+        elif signal_side == "SHORT":
+            if rsi > 65:
+                score += 10  # Strong overbought - good for mean reversion SHORT
+                reasons.append(f"RSI_OB({rsi:.0f})")
+            elif rsi > 55:
+                score += 5   # Mild overbought
+                reasons.append(f"RSI_ob({rsi:.0f})")
+            elif rsi < 45:
+                score -= 10  # Momentum still bearish, mean reversion risky
+                reasons.append(f"RSI_WARN({rsi:.0f})")
+        
+        # Layer 11: Volume Spike Confirmation - High volume = strong signals
+        if volume_ratio >= 2.0:
+            score += 10  # Strong volume spike
+            reasons.append(f"VOL_SPIKE({volume_ratio:.1f}x)")
+        elif volume_ratio >= 1.5:
+            score += 5   # Moderate volume
+            reasons.append(f"VOL_up({volume_ratio:.1f}x)")
+        elif volume_ratio < 0.5:
+            score -= 5   # Very low volume = weak signal
+            reasons.append(f"VOL_LOW({volume_ratio:.1f}x)")
+        
+        # Layer 12: SMT Divergence (BTC/ETH correlation break)
+        smt_div = smt_divergence_detector.last_divergence
+        if smt_div and smt_div.get('divergence_type'):
+            div_type = smt_div['divergence_type']
+            div_strength = smt_div.get('strength', 0)
+            age = datetime.now().timestamp() - smt_divergence_detector.divergence_time
+            if age < 600:  # Last 10 minutes
+                if div_type == "BULLISH" and signal_side == "LONG":
+                    smt_bonus = int(10 * div_strength)
+                    score += smt_bonus
+                    reasons.append(f"SMT_DIV(BULL+{smt_bonus})")
+                elif div_type == "BEARISH" and signal_side == "SHORT":
+                    smt_bonus = int(10 * div_strength)
+                    score += smt_bonus
+                    reasons.append(f"SMT_DIV(BEAR+{smt_bonus})")
+                elif div_type == "BULLISH" and signal_side == "SHORT":
+                    score -= 5
+                    reasons.append("SMT_CONTRA(BULL)")
+                elif div_type == "BEARISH" and signal_side == "LONG":
+                    score -= 5
+                    reasons.append("SMT_CONTRA(BEAR)")
+        
+        # Layer 13: VWAP Deviation Filter
+        # Price too far from VWAP = risky for mean reversion
+        if vwap_zscore != 0:
+            vwap_dev = abs(vwap_zscore)
+            if 0.5 <= vwap_dev <= 2.0:
+                # This is the sweet spot for mean reversion
+                score += 5
+                reasons.append(f"VWAP_ZONE({vwap_dev:.1f}σ)")
+            elif vwap_dev > 3.0:
+                # Too extreme - could trend further
+                score -= 5
+                reasons.append(f"VWAP_EXTREME({vwap_dev:.1f}σ)")
+        
+        # Layer 14: Volume Profile POC Check
+        if coin_profile and 'poc' in coin_profile:
+            poc = coin_profile['poc']
+            if poc > 0:
+                poc_distance_pct = abs(price - poc) / poc * 100
+                if poc_distance_pct < 2.0:
+                    # Price near POC (high volume node) = strong support/resistance
+                    score += 8
+                    reasons.append(f"POC_NEAR({poc_distance_pct:.1f}%)")
+                elif poc_distance_pct < 5.0:
+                    score += 3
+                    reasons.append(f"POC_zone({poc_distance_pct:.1f}%)")
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK

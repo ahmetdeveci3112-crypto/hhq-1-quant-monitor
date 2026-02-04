@@ -1,7 +1,19 @@
 # HHQ-1 Quant Monitor - Developer Guide
 
 > **ÖNEMLİ:** Bu dosya projenin ana referans dokümanıdır. Her geliştirme öncesi buraya bakılmalıdır.
-> Son güncelleme: 2026-02-02
+> Son güncelleme: 2026-02-04
+
+## 🔒 Stabil Rollback Noktası
+
+| Tarih | Commit | Açıklama |
+|-------|--------|----------|
+| 2026-02-04 | `7e4230d` | Phase 133 sonrası stabil versiyon (Hurst VETO, Trend VETO, Auto-Breakeven) |
+
+**Rollback komutu:**
+```bash
+git checkout 7e4230d -- main.py
+flyctl deploy --detach
+```
 
 ---
 
