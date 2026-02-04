@@ -8588,62 +8588,8 @@ class SignalGenerator:
                  score -= 10
                  reasons.append("FakeoutRisk")
 
-        # =====================================================================
-        # PHASE 135: BONUS-ONLY SCORING LAYERS
-        # These layers ONLY ADD points, never subtract - to avoid blocking signals
-        # =====================================================================
-        
-        # Layer 10: RSI Momentum Bonus (only when RSI confirms mean reversion)
-        # LONG: RSI < 40 = oversold confirmation bonus
-        # SHORT: RSI > 60 = overbought confirmation bonus
-        if signal_side == "LONG" and rsi < 40:
-            rsi_bonus = 8 if rsi < 30 else 5
-            score += rsi_bonus
-            reasons.append(f"RSI_OS({rsi:.0f})+{rsi_bonus}")
-        elif signal_side == "SHORT" and rsi > 60:
-            rsi_bonus = 8 if rsi > 70 else 5
-            score += rsi_bonus
-            reasons.append(f"RSI_OB({rsi:.0f})+{rsi_bonus}")
-        
-        # Layer 11: Volume Spike Bonus (only when volume confirms)
-        if volume_ratio >= 1.5:
-            vol_bonus = 8 if volume_ratio >= 2.0 else 5
-            score += vol_bonus
-            reasons.append(f"VOL({volume_ratio:.1f}x)+{vol_bonus}")
-        
-        # Layer 12: SMT Divergence Bonus (only when divergence aligns with signal)
-        try:
-            smt_result = smt_divergence_detector.detect_divergence()
-            if smt_result and smt_result.get('divergence_type'):
-                div_type = smt_result['divergence_type']
-                div_bonus = smt_result.get('score_bonus', 0)
-                if div_type == "BULLISH" and signal_side == "LONG" and div_bonus > 0:
-                    score += min(div_bonus, 10)
-                    reasons.append(f"SMT_BULL+{min(div_bonus, 10)}")
-                elif div_type == "BEARISH" and signal_side == "SHORT" and div_bonus > 0:
-                    score += min(div_bonus, 10)
-                    reasons.append(f"SMT_BEAR+{min(div_bonus, 10)}")
-        except Exception:
-            pass  # SMT detector might not have enough data
-        
-        # Layer 13: VWAP Zone Bonus (price in favorable VWAP zone)
-        if vwap_zscore != 0:
-            vwap_dev = abs(vwap_zscore)
-            # Sweet spot: 0.5-2.0 sigma away from VWAP (good mean reversion setup)
-            if 0.5 <= vwap_dev <= 2.0:
-                score += 5
-                reasons.append(f"VWAP_ZONE({vwap_dev:.1f}σ)+5")
-        
-        # Layer 14: Volume Profile POC Bonus (price near high volume node)
-        if coin_profile and coin_profile.get('poc', 0) > 0:
-            poc = coin_profile['poc']
-            poc_dist_pct = abs(price - poc) / poc * 100
-            if poc_dist_pct < 2.0:
-                score += 8
-                reasons.append(f"POC_NEAR({poc_dist_pct:.1f}%)+8")
-            elif poc_dist_pct < 4.0:
-                score += 4
-                reasons.append(f"POC_zone({poc_dist_pct:.1f}%)+4")
+        # Layer 10-14 artık SKOR VERMİYOR - bunlar KONFİRMASYON katmanları olarak aşağıda kontrol edilecek
+        # RSI, Volume, Hurst, Liquidity Sweep, SMT Divergence
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK
