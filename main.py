@@ -8508,6 +8508,9 @@ class SignalGenerator:
                 logger.info(f"📊 SCORE_LOW: {symbol} {signal_side} score={score} < min={min_score_required} | Z={zscore:.2f} H={hurst:.2f} | reasons: {', '.join(reasons[:3])}")
             return None
         
+        # Phase 128: TRACE LOG - score check passed
+        logger.info(f"✅ SCORE_PASS: {symbol} {signal_side} score={score} >= min={min_score_required}")
+        
         # =====================================================================
         # AŞAMA 2: KONFİRMASYON FİLTRELERİ (Skor Vermez, Sadece Kontrol Eder)
         # Coin istatistiklerine göre dinamik eşikler kullanılır
