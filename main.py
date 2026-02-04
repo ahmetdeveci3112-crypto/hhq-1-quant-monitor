@@ -8267,7 +8267,7 @@ class SignalGenerator:
             # Phase 128: Optimized values for balanced signal quality
             # threshold=1.2 requires stronger Z-Score deviations for quality signals
             base_threshold = 1.2  # Stricter: only strong signals pass
-            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 55
+            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 45
             is_backtest = False
             # Phase 113: Debug log to trace min_score_required source
             if hasattr(self, '_min_score_log_count'):
@@ -8319,9 +8319,9 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # Phase 128: Optimized base score (45) for balanced signal quality
-            # Combined with threshold=1.0 and min_score=55, this creates proper filtering
-            score += 45
+            # Phase 130: Balanced base score (55) allows LONG signals with MTF penalty
+            # Combined with min_score=45 and COIN_OVERRIDE=-10, this creates fair balance
+            score += 55
             
             # Phase 112: Only bonus for mean reversion regime, NO PENALTY
             # Restores Phase 84 behavior when signals were working
@@ -8391,9 +8391,10 @@ class SignalGenerator:
         mtf_score = 0
         if signal_side == "LONG":
             if htf_trend == "STRONG_BEARISH":
-                # Hybrid: Check if altcoin is bullish - if so, reduce penalty instead of VETO
+                # Phase 130: Reduced penalty for COIN_OVERRIDE (was -25, now -10)
+                # Allows LONG signals when altcoin is bullish despite bearish BTC
                 if coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]:
-                    mtf_score = -25  # Heavy penalty but NOT VETO - altcoin opportunity
+                    mtf_score = -10  # Reduced penalty - altcoin opportunity
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bearish
@@ -8406,9 +8407,10 @@ class SignalGenerator:
             else: mtf_score = 20 # Bullish
         else: # SHORT
             if htf_trend == "STRONG_BULLISH":
-                # Hybrid: Check if altcoin is bearish - if so, reduce penalty instead of VETO
+                # Phase 130: Reduced penalty for COIN_OVERRIDE (was -25, now -10)
+                # Allows SHORT signals when altcoin is bearish despite bullish BTC
                 if coin_daily_trend in ["BEARISH", "STRONG_BEARISH"]:
-                    mtf_score = -25  # Heavy penalty but NOT VETO - altcoin opportunity
+                    mtf_score = -10  # Reduced penalty - altcoin opportunity
                     reasons.append("COIN_OVERRIDE(BTC)")
                 else:
                     mtf_score = -100  # VETO - both BTC and altcoin bullish
