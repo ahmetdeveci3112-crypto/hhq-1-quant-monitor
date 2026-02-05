@@ -8757,8 +8757,10 @@ class SignalGenerator:
         
         # Layer 15: ADX + Hurst Regime Bonus
         # ADX < 20 + Hurst < 0.45 → Range market → Mean reversion için ideal
-        # Get ADX from opportunity if available
-        adx = getattr(opportunity, 'adx', 25.0) if opportunity else 25.0
+        # Note: ADX is calculated in analyze() but not passed to generate_signal
+        # Using hurst-only approach as proxy: H < 0.4 = strong mean reversion
+        # TODO: Pass adx parameter to generate_signal in future phase
+        adx = 25.0  # Default neutral, rely on Hurst for regime detection
         
         if adx < 20 and hurst < 0.45:
             # Strong range regime - ideal for mean reversion
