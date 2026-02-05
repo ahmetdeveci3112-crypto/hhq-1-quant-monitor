@@ -89,6 +89,8 @@ export type CloseReason =
   | 'TIME_GRADUAL' | 'TIME_FORCE' | 'TIME_REDUCE_4H' | 'TIME_REDUCE_8H'
   // Recovery & Adverse conditions
   | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
+  // Phase 142: Portfolio Recovery Close
+  | 'RECOVERY_CLOSE_ALL'
   // Manual & Signal-based
   | 'MANUAL' | 'SIGNAL' | 'SIGNAL_REVERSAL_PROFIT'
   // External & System

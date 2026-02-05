@@ -79,6 +79,8 @@ const translateReason = (reason: string | undefined): string => {
     'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa/Kâra Dönüş',
     'ADVERSE_TIME_EXIT': '📉 Olumsuz: 8h+ Zararda → Kayıp Minimizasyonu',
     'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Aşıldı',
+    // Phase 142: Portfolio Recovery Close
+    'RECOVERY_CLOSE_ALL': '🔄 Recovery: 12h+ zararda → Tüm pozisyonlar kapatıldı',
 
     // ===== SIGNAL-BASED - SİNYAL BAZLI =====
     'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi: Kârda İken Trend Döndü',

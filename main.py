@@ -1102,6 +1102,32 @@ async def lifespan(app: FastAPI):
         logger.info("🔌 Binance connection closed")
 
 
+# ============================================================================
+# Phase 142: Helper function for coin ATR percentage
+# ============================================================================
+
+def _get_coin_atr_percent(symbol: str) -> float:
+    """
+    Get ATR as percentage of price for a coin.
+    Used by PortfolioRecoveryManager for dynamic trailing distance.
+    
+    Args:
+        symbol: Trading pair symbol (e.g., 'BTCUSDT')
+        
+    Returns:
+        ATR as percentage of price (e.g., 2.0 for 2%)
+    """
+    try:
+        if multi_coin_scanner and hasattr(multi_coin_scanner, 'opportunities'):
+            opp = multi_coin_scanner.opportunities.get(symbol)
+            if opp and hasattr(opp, 'atr') and hasattr(opp, 'price'):
+                if opp.price and opp.price > 0:
+                    return (opp.atr / opp.price) * 100
+    except Exception as e:
+        logger.debug(f"Could not get ATR for {symbol}: {e}")
+    return 2.0  # Default 2%
+
+
 async def binance_position_sync_loop():
     """
     Binance'den pozisyon/bakiye senkronizasyonu (her 5 saniye).
@@ -1126,6 +1152,46 @@ async def binance_position_sync_loop():
                     'availableBalance': balance.get('availableBalance', balance.get('free', 0)),
                     'unrealizedPnl': balance.get('unrealizedPnl', 0)
                 }
+                
+                # ================================================================
+                # Phase 142: Portfolio Recovery Trailing Check
+                # ================================================================
+                try:
+                    total_upnl = balance.get('unrealizedPnl', 0)
+                    
+                    # Get BTC/ETH ATR for dynamic trailing distance
+                    btc_atr_pct = _get_coin_atr_percent('BTCUSDT')
+                    eth_atr_pct = _get_coin_atr_percent('ETHUSDT')
+                    
+                    # Update recovery manager
+                    recovery_status = portfolio_recovery_manager.update(
+                        total_unrealized_pnl=total_upnl,
+                        btc_atr_pct=btc_atr_pct,
+                        eth_atr_pct=eth_atr_pct
+                    )
+                    
+                    # Check if we should close all positions
+                    if portfolio_recovery_manager.should_close_all():
+                        logger.warning(f"🔴 RECOVERY CLOSE: Closing all {len(global_paper_trader.positions)} positions!")
+                        positions_to_close = global_paper_trader.positions[:]  # Copy to avoid mutation
+                        closed_count = 0
+                        total_pnl = 0.0
+                        
+                        for pos in positions_to_close:
+                            try:
+                                current_price = pos.get('markPrice', pos.get('entryPrice', 0))
+                                pnl_before = pos.get('unrealizedPnl', 0)
+                                global_paper_trader.close_position(pos, current_price, "RECOVERY_CLOSE_ALL")
+                                closed_count += 1
+                                total_pnl += pnl_before
+                            except Exception as pe:
+                                logger.error(f"Error closing position {pos.get('symbol')}: {pe}")
+                        
+                        logger.warning(f"🔴 RECOVERY COMPLETED: Closed {closed_count} positions, Total PnL: ${total_pnl:.2f}")
+                        portfolio_recovery_manager.start_cooldown()
+                        
+                except Exception as re:
+                    logger.error(f"Portfolio recovery check error: {re}")
                 
                 # Pozisyonları güncelle (Binance'den) - FAST MODE to reduce API calls
                 # Phase 82: Use fast=True (1 API call instead of 21+)
@@ -4548,6 +4614,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if not global_paper_trader.enabled:
         return
     
+    # ================================================================
+    # Phase 142: Block signals during recovery cooldown
+    # ================================================================
+    if portfolio_recovery_manager.is_in_cooldown():
+        cooldown_remaining = portfolio_recovery_manager.get_cooldown_remaining()
+        logger.info(f"⏸️ RECOVERY COOLDOWN: Skipping signal {signal.get('symbol', '?')}, {cooldown_remaining:.1f}h remaining")
+        return None
+    
     action = signal.get('action', 'NONE')
     if action == 'NONE':
         return
@@ -6815,6 +6889,196 @@ class TimeBasedPositionManager:
 
 # Global TimeBasedPositionManager instance
 time_based_position_manager = TimeBasedPositionManager()
+
+
+# ============================================================================
+# PHASE 142: PORTFOLIO RECOVERY TRAILING
+# ============================================================================
+
+class PortfolioRecoveryManager:
+    """
+    Phase 142: Portfolio Recovery Trailing System
+    
+    Total Unrealized PnL 12+ saat ekside kalıp artıya dönerse,
+    trailing ile tüm pozisyonları kapatarak bakiyeyi korur.
+    
+    Mantık:
+    1. Total uPnL < 0 ise, underwater timer başlat
+    2. 12+ saat underwater → "Recovery Candidate" işaretle
+    3. uPnL >= +$0.50 olduğunda → Trailing aktifleştir
+    4. Trailing mesafesi = (BTC_ATR% + ETH_ATR%) / 2, min 1.5%, max 5%
+    5. Peak'ten geri çekilme > trailing distance → TÜM pozisyonları kapat
+    6. Kapatma sonrası 6 saat cooldown (yeni sinyal engeli)
+    """
+    
+    def __init__(self):
+        # State tracking
+        self.underwater_start_time = None      # When uPnL first went negative
+        self.is_recovery_candidate = False     # 12h+ underwater flag
+        self.recovery_trailing_active = False  # Trailing mode active
+        self.peak_positive_pnl = 0.0          # Highest positive uPnL seen during trailing
+        self.trailing_distance_pct = 2.5       # Dynamic, based on BTC/ETH ATR
+        self.cooldown_until = None            # Timestamp for cooldown end
+        self.should_trigger_close = False     # Flag for sync loop to close all
+        self.last_total_upnl = 0.0            # Last recorded total uPnL
+        
+        # Configuration
+        self.underwater_threshold_hours = 12   # Time needed underwater to become candidate
+        self.min_positive_threshold = 0.50     # Min $0.50 to activate trailing
+        self.min_trailing_pct = 1.5           # 1.5% minimum trailing distance
+        self.max_trailing_pct = 5.0           # 5.0% maximum trailing distance
+        self.cooldown_hours = 6               # Hours to wait after recovery close
+        
+        logger.info(f"🔄 PortfolioRecoveryManager initialized: {self.underwater_threshold_hours}h underwater → trailing → close all")
+    
+    def update(self, total_unrealized_pnl: float, btc_atr_pct: float, eth_atr_pct: float) -> str:
+        """
+        Main update method - called every sync cycle.
+        
+        Args:
+            total_unrealized_pnl: Total unrealized PnL across all positions
+            btc_atr_pct: BTC ATR as percentage of price
+            eth_atr_pct: ETH ATR as percentage of price
+            
+        Returns:
+            Status string for logging
+        """
+        self.last_total_upnl = total_unrealized_pnl
+        self.should_trigger_close = False  # Reset each cycle
+        now = datetime.now()
+        
+        # Check if in cooldown
+        if self.is_in_cooldown():
+            return "COOLDOWN"
+        
+        # ===== PHASE 1: UNDERWATER TRACKING =====
+        if total_unrealized_pnl < 0:
+            # Start or continue underwater tracking
+            if self.underwater_start_time is None:
+                self.underwater_start_time = now
+                logger.info(f"📊 RECOVERY TRACKING: Total uPnL negative (${total_unrealized_pnl:.2f}), starting timer")
+            
+            # Check if we've been underwater long enough
+            hours_underwater = (now - self.underwater_start_time).total_seconds() / 3600
+            
+            if hours_underwater >= self.underwater_threshold_hours and not self.is_recovery_candidate:
+                self.is_recovery_candidate = True
+                logger.warning(f"⚠️ RECOVERY CANDIDATE: {hours_underwater:.1f}h underwater, waiting for positive uPnL")
+            
+            # Reset trailing if we're still negative
+            if self.recovery_trailing_active:
+                logger.info(f"📊 RECOVERY: uPnL dropped negative again (${total_unrealized_pnl:.2f}), resetting trailing")
+                self.recovery_trailing_active = False
+                self.peak_positive_pnl = 0.0
+            
+            return f"UNDERWATER_{hours_underwater:.1f}h"
+        
+        # ===== PHASE 2: POSITIVE PNL CHECK =====
+        if total_unrealized_pnl >= self.min_positive_threshold:
+            
+            # If we're a recovery candidate and PnL turned positive, activate trailing
+            if self.is_recovery_candidate and not self.recovery_trailing_active:
+                # Calculate dynamic trailing distance
+                self.trailing_distance_pct = self._calculate_trailing_distance(btc_atr_pct, eth_atr_pct)
+                self.recovery_trailing_active = True
+                self.peak_positive_pnl = total_unrealized_pnl
+                
+                hours_was_underwater = (now - self.underwater_start_time).total_seconds() / 3600 if self.underwater_start_time else 0
+                logger.warning(f"🔄 RECOVERY ACTIVATED: uPnL +${total_unrealized_pnl:.2f} after {hours_was_underwater:.1f}h underwater! Trail: {self.trailing_distance_pct:.2f}%")
+            
+            # ===== PHASE 3: TRAILING LOGIC =====
+            if self.recovery_trailing_active:
+                # Update peak if higher
+                if total_unrealized_pnl > self.peak_positive_pnl:
+                    self.peak_positive_pnl = total_unrealized_pnl
+                    logger.info(f"📈 RECOVERY PEAK: New peak +${self.peak_positive_pnl:.2f}")
+                
+                # Calculate pullback percentage
+                # Pullback = (peak - current) / peak * 100
+                if self.peak_positive_pnl > 0:
+                    pullback_pct = ((self.peak_positive_pnl - total_unrealized_pnl) / self.peak_positive_pnl) * 100
+                    
+                    # Check if pullback exceeds trailing distance
+                    if pullback_pct >= self.trailing_distance_pct:
+                        logger.warning(f"🔴 RECOVERY TRIGGER: Pullback {pullback_pct:.2f}% >= trail {self.trailing_distance_pct:.2f}% | Peak: ${self.peak_positive_pnl:.2f} → Current: ${total_unrealized_pnl:.2f}")
+                        self.should_trigger_close = True
+                        return "CLOSE_TRIGGERED"
+                    
+                    return f"TRAILING_peak={self.peak_positive_pnl:.2f}_pullback={pullback_pct:.1f}%"
+        
+        # Not underwater and not in trailing - reset state
+        if total_unrealized_pnl >= 0 and not self.is_recovery_candidate:
+            self.underwater_start_time = None
+            return "NORMAL"
+        
+        return "MONITORING"
+    
+    def _calculate_trailing_distance(self, btc_atr_pct: float, eth_atr_pct: float) -> float:
+        """
+        Calculate dynamic trailing distance based on BTC/ETH average ATR.
+        
+        Higher volatility = larger trailing distance
+        Lower volatility = tighter trailing distance
+        """
+        avg_atr = (btc_atr_pct + eth_atr_pct) / 2
+        
+        # Clamp to min/max bounds
+        distance = max(self.min_trailing_pct, min(self.max_trailing_pct, avg_atr))
+        
+        logger.info(f"📐 RECOVERY TRAIL: BTC ATR={btc_atr_pct:.2f}%, ETH ATR={eth_atr_pct:.2f}% → Trail={distance:.2f}%")
+        return distance
+    
+    def should_close_all(self) -> bool:
+        """Check if recovery trailing has triggered a close all signal."""
+        return self.should_trigger_close
+    
+    def start_cooldown(self):
+        """Start cooldown period after recovery close."""
+        self.cooldown_until = datetime.now() + timedelta(hours=self.cooldown_hours)
+        self.reset_state()
+        logger.info(f"⏸️ RECOVERY COOLDOWN: Started {self.cooldown_hours}h cooldown until {self.cooldown_until}")
+    
+    def is_in_cooldown(self) -> bool:
+        """Check if new positions should be blocked."""
+        if self.cooldown_until is None:
+            return False
+        return datetime.now() < self.cooldown_until
+    
+    def get_cooldown_remaining(self) -> float:
+        """Get remaining cooldown time in hours."""
+        if self.cooldown_until is None:
+            return 0.0
+        remaining = (self.cooldown_until - datetime.now()).total_seconds() / 3600
+        return max(0.0, remaining)
+    
+    def reset_state(self):
+        """Reset all tracking state."""
+        self.underwater_start_time = None
+        self.is_recovery_candidate = False
+        self.recovery_trailing_active = False
+        self.peak_positive_pnl = 0.0
+        self.should_trigger_close = False
+    
+    def get_status(self) -> dict:
+        """Get current status for UI/logging."""
+        hours_underwater = 0.0
+        if self.underwater_start_time:
+            hours_underwater = (datetime.now() - self.underwater_start_time).total_seconds() / 3600
+        
+        return {
+            "type": "PORTFOLIO_RECOVERY",
+            "is_recovery_candidate": self.is_recovery_candidate,
+            "trailing_active": self.recovery_trailing_active,
+            "hours_underwater": round(hours_underwater, 1),
+            "peak_pnl": round(self.peak_positive_pnl, 2),
+            "trailing_distance_pct": round(self.trailing_distance_pct, 2),
+            "cooldown_remaining_hours": round(self.get_cooldown_remaining(), 1),
+            "last_upnl": round(self.last_total_upnl, 2)
+        }
+
+
+# Global PortfolioRecoveryManager instance
+portfolio_recovery_manager = PortfolioRecoveryManager()
 
 
 # ============================================================================
