@@ -511,6 +511,9 @@ class LiveBinanceTrader:
         self.last_positions = []
         self.last_sync_time = 0
         self.trading_mode = os.environ.get('TRADING_MODE', 'paper')  # paper, live
+        # Phase 146: Persistent trailing state for live positions
+        # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
+        self.trailing_state = {}
         logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
         
     async def initialize(self):
@@ -750,17 +753,53 @@ class LiveBinanceTrader:
                     trailing_stop = sl  # Initial trailing stop = SL
                     trail_distance = estimated_atr * adjusted_trail_distance
                     
-                    # Check if trailing should be active (based on ROI threshold)
+                    # ================================================================
+                    # Phase 146: Persistent Trailing State (server-side)
+                    # ================================================================
+                    # Get or create trailing state for this symbol
+                    if symbol not in self.trailing_state:
+                        self.trailing_state[symbol] = {
+                            'isActive': False,
+                            'trailingStop': sl,
+                            'peakPrice': mark_price,
+                            'activatedAt': None
+                        }
+                    
+                    trail_state = self.trailing_state[symbol]
                     roi_pct = pnl_percent
                     activation_threshold = 3.0 * exit_tightness  # Phase 144: ROI-based
-                    is_trailing_active = roi_pct >= activation_threshold
                     
-                    # If trailing active, calculate trailing stop
+                    # Once activated, stays active until position closes
+                    if not trail_state['isActive'] and roi_pct >= activation_threshold:
+                        trail_state['isActive'] = True
+                        trail_state['activatedAt'] = datetime.now().isoformat()
+                        trail_state['peakPrice'] = mark_price
+                        logger.info(f"🔄 TRAIL ACTIVATED: {symbol} ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                    
+                    is_trailing_active = trail_state['isActive']
+                    
+                    # Update trailing stop if active
                     if is_trailing_active:
                         if side == 'LONG':
-                            trailing_stop = mark_price - trail_distance
-                        else:
-                            trailing_stop = mark_price + trail_distance
+                            # Track peak price and adjust trailing stop
+                            if mark_price > trail_state['peakPrice']:
+                                trail_state['peakPrice'] = mark_price
+                            trailing_stop = trail_state['peakPrice'] - trail_distance
+                            # Keep the highest trailing stop
+                            if trailing_stop > trail_state['trailingStop']:
+                                trail_state['trailingStop'] = trailing_stop
+                                logger.debug(f"  📈 {symbol} LONG trailing stop raised to ${trailing_stop:.6f}")
+                        else:  # SHORT
+                            # Track lowest price (peak for short) and adjust trailing stop
+                            if mark_price < trail_state['peakPrice']:
+                                trail_state['peakPrice'] = mark_price
+                            trailing_stop = trail_state['peakPrice'] + trail_distance
+                            # Keep the lowest trailing stop for shorts
+                            if trailing_stop < trail_state['trailingStop'] or trail_state['trailingStop'] == sl:
+                                trail_state['trailingStop'] = trailing_stop
+                                logger.debug(f"  📉 {symbol} SHORT trailing stop lowered to ${trailing_stop:.6f}")
+                        
+                        trailing_stop = trail_state['trailingStop']
                     
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
