@@ -255,13 +255,76 @@ Gerçek leverage: `notional / margin` formülüyle hesaplanmalı.
 
 ---
 
-## ⚠️ Sık Karşılaşılan Sorunlar
+### Sinyal Gelmiyor - Detaylı Troubleshooting
 
-### Sinyal Gelmiyor
-1. Scanner çalışıyor mu? → `/scanner/status` endpoint
-2. WebSocket bağlı mı? → UI'da "Son: XX:XX" kontrolü
-3. Z-Score eşiği çok mu yüksek? → Settings'den düşür
-4. Market sakin mi? → Düşük volatilite dönemlerinde normal
+#### Adım 1: Log Akışını Kontrol Et
+
+Fly.io Metrics'te şu sorguları çalıştır:
+
+| Query | Log Çıkıyor mu? | Anlam |
+|-------|-----------------|-------|
+| `*Z_PASS*` | ✅ Evet | Z-Score threshold geçildi |
+| `*PRE_SCORE*` | ✅ Evet | Skor hesaplaması tamamlandı |
+| `*SCORE_PASS*` | ✅ Evet | Min skor aşıldı → Sinyal üretildi |
+| `*SCORE_LOW*` | ⚠️ Evet | Skor yetersiz → Sinyal reddedildi |
+
+#### Adım 2: Akış Noktalarını Belirle
+
+```
+Ticker → Z_PASS → Layer 1-15 → PRE_SCORE → SCORE Check → SCORE_PASS/LOW
+         ↑                        ↑              ↑
+         8522                    8791           8795
+```
+
+**Sorun Tanılama:**
+- Z_PASS var, PRE_SCORE yok → **Layer 1-15 arasında exception veya return None**
+- PRE_SCORE var, SCORE_PASS yok → **Min skor çok yüksek veya skor düşük**
+- Hiç log yok → **Scanner çalışmıyor**
+
+#### Adım 3: Yaygın Kök Nedenler
+
+| Sorun | Belirti | Çözüm |
+|-------|---------|-------|
+| Tanımsız değişken | Z_PASS var, PRE_SCORE yok | `generate_signal` fonksiyonunda tanımsız değişken referansı kontrol et |
+| Min skor çok yüksek | PRE_SCORE'da `score < min` | Settings'den min_score düşür (önerilen: 55-65) |
+| Kill Switch Block | `BLOCKED` logu görünür | 24 saat bekle veya kill_switch_fault_tracker temizle |
+| MTF VETO (-100) | Score negatif | BTC trend değişikliğini bekle |
+
+#### Adım 4: Phase 137'de Bulunan Kritik Bug (Referans)
+
+**Sorun:** Z_PASS logları çıkıyor ama PRE_SCORE asla görünmüyordu.
+
+**Kök Neden:** `generate_signal` fonksiyonunda (line ~8760) tanımsız `opportunity` değişkeni kullanılıyordu:
+```python
+# HATALI KOD:
+adx = getattr(opportunity, 'adx', 25.0) if opportunity else 25.0
+# ↑ opportunity bu fonksiyona parametre olarak geçirilmiyordu!
+```
+
+Bu satır her çalıştığında **NameError** fırlatıyordu ve tüm exception'lar sessizce yutulduğu için sinyaller kayboluyordu.
+
+**Çözüm:**
+```python
+# DÜZELTİLMİŞ KOD:
+adx = 25.0  # Parametresi olmayan değişken yerine default değer
+```
+
+**Öğrenilen Ders:** Yeni layer eklerken:
+1. Kullanılan tüm değişkenlerin fonksiyon scope'unda tanımlı olduğunu doğrula
+2. Parametre listesinde yoksa ve global değilse → NameError olur
+3. Test için `python3 -m py_compile main.py` yeterli değil, runtime error yakalanmaz
+
+#### Adım 5: Debug Log Ekleme
+
+Sinyal akışını takip etmek için trace log ekle:
+```python
+# Z_PASS sonrası, layer'ların başına:
+logger.info(f"📍 LAYER_X: {symbol} score={score}")
+
+# PRE_SCORE var ama sorun devam ediyorsa:
+logger.info(f"📍 PRE_SCORE: {symbol} score={score} min={min_score_required} | reasons: {reasons}")
+```
+
 
 ### Backend Yanıt Vermiyor
 1. Makineyi restart et: `flyctl machine restart <ID> --app hhq-1-quant-monitor`
