@@ -10937,10 +10937,19 @@ class PaperTradingEngine:
             # Get dynamic trail distance based on spread AND ROI
             dynamic_trail = self.get_dynamic_trail_distance(atr, roi_pct)
             
+            # ================================================================
+            # Phase 144: ROI-Based Trail Activation (with leverage + exit_tightness)
+            # ================================================================
+            # Base threshold: 3% leveraged ROI
+            # Multiplied by exit_tightness: lower = earlier activation, higher = later
+            base_activation_roi = 3.0  # %3 base threshold
+            activation_threshold = base_activation_roi * self.exit_tightness
+            
             if pos['side'] == 'LONG':
-                if current_price >= pos['trailActivation']:
+                # LONG: ROI must be >= threshold (positive ROI)
+                if roi_pct >= activation_threshold:
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAILING AKTİF: LONG @ ${current_price:.6f}")
+                        self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                 
                 if pos['isTrailingActive']:
@@ -10963,9 +10972,10 @@ class PaperTradingEngine:
                         self.close_position(pos, current_price, 'TP')
                     
             elif pos['side'] == 'SHORT':
-                if current_price <= pos['trailActivation']:
+                # SHORT: ROI must be >= threshold (positive ROI means price went down)
+                if roi_pct >= activation_threshold:
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAILING AKTİF: SHORT @ ${current_price:.6f}")
+                        self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                     
                 if pos['isTrailingActive']:
