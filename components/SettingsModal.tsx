@@ -43,23 +43,23 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
   // Entry tightness level helper
   const getEntryLevel = () => {
     const t = localSettings.entryTightness;
-    if (t <= 0.6) return { label: 'Çok Sıkı', color: 'text-rose-500', desc: 'Fiyat çok yakınsa gir, az pozisyon' };
-    if (t <= 0.8) return { label: 'Sıkı', color: 'text-orange-400', desc: 'Fiyat yakınsa gir' };
-    if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart pullback' };
-    if (t <= 2.0) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Daha geniş pullback' };
-    if (t <= 3.0) return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'Geniş pullback, çok pozisyon' };
-    return { label: 'Ultra Gevşek', color: 'text-fuchsia-400', desc: 'En geniş pullback, maksimum pozisyon' };
+    if (t <= 0.4) return { label: 'Çok Sıkı', color: 'text-rose-500', desc: 'Gerçek derin pullback bekle, az pozisyon' };
+    if (t <= 0.8) return { label: 'Sıkı', color: 'text-orange-400', desc: 'Belirgin pullback bekle' };
+    if (t <= 1.5) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart pullback' };
+    if (t <= 2.5) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Hafif pullback yeterli' };
+    if (t <= 4.0) return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'Minimal pullback, çok pozisyon' };
+    return { label: 'Ultra Gevşek', color: 'text-fuchsia-400', desc: 'Neredeyse sıfır pullback' };
   };
 
   // Exit tightness level helper
   const getExitLevel = () => {
     const t = localSettings.exitTightness;
-    if (t <= 0.4) return { label: 'Ultra Hızlı', color: 'text-fuchsia-500', desc: 'Çok erken çıkış, minimum SL/TP' };
-    if (t <= 0.6) return { label: 'Çok Hızlı', color: 'text-rose-500', desc: 'Hızlı çıkış, küçük SL/TP' };
+    if (t <= 0.3) return { label: 'Ultra Hızlı', color: 'text-fuchsia-500', desc: 'Çok erken çıkış, minimum SL/TP' };
+    if (t <= 0.5) return { label: 'Çok Hızlı', color: 'text-rose-500', desc: 'Hızlı çıkış, küçük SL/TP' };
     if (t <= 0.8) return { label: 'Hızlı', color: 'text-orange-400', desc: 'Erken çıkış' };
-    if (t <= 1.2) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP' };
-    if (t <= 1.6) return { label: 'Sabırlı', color: 'text-blue-400', desc: 'Daha geniş SL/TP' };
-    return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'En geniş SL/TP, uzun tutma' };
+    if (t <= 1.3) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP' };
+    if (t <= 2.0) return { label: 'Sabırlı', color: 'text-blue-400', desc: 'Geniş SL/TP, uzun tutma' };
+    return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'Maximum SL/TP, en uzun tutma' };
   };
 
   const sensitivity = getSensitivityLevel();
@@ -230,16 +230,16 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               </div>
               <input
                 type="range"
-                min="0.5"
-                max="4.0"
+                min="0.3"
+                max="6.0"
                 step="0.1"
                 value={localSettings.entryTightness}
                 onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500"
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                <span>0.5x (Sıkı = Az Pozisyon)</span>
-                <span>4.0x (Gevşek = Çok Pozisyon)</span>
+                <span>0.3x (Sıkı = Az Pozisyon)</span>
+                <span>6.0x (Gevşek = Çok Pozisyon)</span>
               </div>
             </div>
           </div>
@@ -267,16 +267,16 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               </div>
               <input
                 type="range"
-                min="0.3"
-                max="2.0"
+                min="0.2"
+                max="3.0"
                 step="0.1"
                 value={localSettings.exitTightness}
                 onChange={e => setLocalSettings({ ...localSettings, exitTightness: parseFloat(e.target.value) })}
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                <span>0.3x (Çok Hızlı = Küçük SL/TP)</span>
-                <span>2.0x (Sabırlı = Geniş SL/TP)</span>
+                <span>0.2x (Çok Hızlı = Küçük SL/TP)</span>
+                <span>3.0x (Sabırlı = Geniş SL/TP)</span>
               </div>
             </div>
           </div>
