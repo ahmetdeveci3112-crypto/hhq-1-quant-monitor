@@ -382,6 +382,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-05 | 145 | Live Position TP/SL/Trail Display |
 | 2026-02-05 | 144 | ROI-Based Trail Activation (leverage + exit_tightness) |
 | 2026-02-05 | 143 | Strong Trend Filter (4H 20 mum counter-trend penalty) |
 | 2026-02-05 | 142 | Portfolio Recovery Trailing System |
