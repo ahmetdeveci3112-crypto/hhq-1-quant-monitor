@@ -382,11 +382,221 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-05 | 141 | Size vs Contracts Standardization |
+| 2026-02-05 | 140 | Modular Architecture (backend/ package) |
+| 2026-02-05 | 139 | Type Consistency (CloseReason types) |
+| 2026-02-05 | 138 | Detailed Close Reasons with emojis |
 | 2026-02-04 | 134 | Enhanced Scoring: RSI momentum, Volume spike, SMT divergence, VWAP, POC |
 | 2026-02-04 | 133 | Signal Filtering: Auto-breakeven, Hurst VETO (>0.55), Trend VETO |
 | 2026-02-02 | 99 | Unified Leverage: UI ve Binance için tek hesaplama |
 | 2026-02-02 | 100 | Trade History Fix: Harici kapatmalar kaydediliyor |
-| ... | ... | ... |
+
+---
+
+## 📘 Phase 138-141 Detaylı Dokümantasyon
+
+### Phase 138: Detailed Close Reasons (Emoji System)
+
+**Amaç:** Trade kapanış nedenlerini daha okunabilir ve anlaşılır hale getirmek.
+
+**Eski sistem:**
+```python
+reason = "SL_HIT"  # Kısa ve belirsiz
+```
+
+**Yeni sistem:**
+```python
+reason = "🔴 SL: Ana SL tetiklendi @ $0.5432 (-%2.5)"  # Emoji + detaylı bilgi
+```
+
+**Reason Kategorileri:**
+| Kategori | Emoji | Örnekler |
+|----------|-------|----------|
+| Stop Loss | 🔴 🛑 | `🔴 SL: Ana SL tetiklendi` |
+| Take Profit | 🟢 ✅ | `🟢 TP: TP1 seviyesi @ $price` |
+| Trailing | 📈 | `📈 TRAIL: Trailing stop aktif` |
+| Kill Switch | ⚠️ 🚨 | `⚠️ KILL: Margin kaybı ≥%30` |
+| Time-Based | ⏰ ⏳ | `⏰ TIME: 4h kuralı (reduce)` |
+| Recovery | 🔄 | `🔄 RECOVERY: Başabaşa dönüş` |
+| Adverse | ⚡ | `⚡ ADVERSE: 8h+ zararda` |
+| Manual | 👤 | `👤 MANUAL: Kullanıcı kapattı` |
+| Emergency | 🚨 | `🚨 EMERGENCY: -%15 acil çıkış` |
+
+---
+
+### Phase 139: Type Consistency (TypeScript/Python Sync)
+
+**Problem:** 
+- `types.ts` sadece 8 CloseReason tanımlıyordu
+- Backend 20+ farklı reason kullanıyordu
+- UI'da bilinmeyen reason'lar gösterilmiyordu
+
+**Çözüm:**
+
+#### 1. `types.ts` Güncellemesi
+```typescript
+// Önceki (eksik):
+closeReason: 'SL' | 'TP' | 'TRAILING' | 'MANUAL' | 'SIGNAL' | 'TP1' | 'SL1' | 'RESCUE';
+
+// Yeni (kapsamlı):
+export type CloseReason = 
+  // Stop Loss variants
+  | 'SL' | 'SL_HIT' | 'EMERGENCY_SL'
+  // Take Profit variants  
+  | 'TP' | 'TP_HIT' | 'TP1'
+  // Trailing Stop
+  | 'TRAILING' | 'TRAILING_STOP'
+  // Kill Switch
+  | 'KILL_SWITCH_FULL' | 'KILL_SWITCH_PARTIAL'
+  // Time-based
+  | 'TIME_GRADUAL' | 'TIME_FORCE' | 'TIME_REDUCE_4H' | 'TIME_REDUCE_8H'
+  // Recovery & Adverse
+  | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
+  // External & Other
+  | 'EXTERNAL' | 'MANUAL' | 'BREAKEVEN' | 'RESCUE' | 'END' | 'SIGNAL';
+```
+
+#### 2. Trade Interface Güncellemesi
+```typescript
+export interface Trade {
+  // ... diğer alanlar
+  reason?: string;            // Primary field (backend'den)
+  closeReason?: CloseReason;  // Legacy compatibility
+}
+```
+
+#### 3. `translateReason` Fonksiyonu (`App.tsx`)
+```typescript
+const translateReason = (reason: string | undefined): string => {
+  // Phase 138 emoji reasons - already formatted
+  if (reason?.includes('🔴 SL:') || reason?.includes('🟢 TP:')) {
+    return reason;  // Pass through as-is
+  }
+  
+  const mapping: Record<string, string> = {
+    'SL': '🛑 SL: Trailing Stop Tetiklendi (3-tick onayı)',
+    'TP': '✅ TP: Hedef Fiyata Ulaşıldı (R:R oranı)',
+    'KILL_SWITCH_FULL': '🚨 KS Tam: Margin Kaybı ≥%50 → Tam Kapatma',
+    'TIME_REDUCE_4H': '⏰ Zaman: 4 Saat Kuralı (-%10 azaltma)',
+    // ... diğer mappings
+  };
+  
+  return mapping[reason] || reason;
+};
+```
+
+---
+
+### Phase 140: Modular Architecture
+
+**Problem:**
+- `main.py` 13,449 satır monolithic kod
+- Test, bakım ve geliştirme zorluğu
+- Paralel çalışma imkansız
+
+**Çözüm:** Backend'i modüler yapıya dönüştür
+
+#### Yeni Dizin Yapısı
+```
+backend/
+├── __init__.py
+├── core/
+│   ├── __init__.py
+│   └── config.py              ⭐ Merkezi konfigürasyon
+├── indicators/
+│   ├── __init__.py
+│   ├── atr.py                 ⭐ Average True Range
+│   ├── hurst.py               ⭐ Hurst Exponent
+│   ├── adx.py                 ⭐ ADX Trend Strength
+│   ├── rsi.py                 ⭐ Relative Strength Index
+│   └── zscore.py              ⭐ Z-Score Mean Reversion
+└── trading/
+    └── __init__.py            (gelecek için placeholder)
+```
+
+#### Config Kullanımı
+```python
+from backend.core.config import config
+
+# Trading parameters
+leverage = config.trading.default_leverage      # 10
+max_positions = config.trading.max_positions    # 50
+sl_multiplier = config.trading.sl_atr_multiplier  # 30.0
+
+# Kill switch thresholds
+first_reduction = config.kill_switch.first_reduction_pct  # -100%
+full_close = config.kill_switch.full_close_pct            # -150%
+
+# Scanner settings
+scan_interval = config.scanner.scan_interval_seconds  # 3
+excluded = config.scanner.excluded_coins  # ["USDCUSDT", ...]
+```
+
+#### Indicator Import
+```python
+from backend.indicators import (
+    calculate_hurst,
+    calculate_atr,
+    calculate_adx,
+    calculate_rsi,
+    calculate_zscore
+)
+
+# Usage
+hurst = calculate_hurst(prices)  # 0.15-0.85
+atr = calculate_atr(highs, lows, closes)  # Volatility value
+```
+
+---
+
+### Phase 141: Size vs Contracts Standardization
+
+**Problem:**
+- Binance API `contracts` döndürüyor
+- İç kod `size` bekliyor
+- Position close mismatch hataları
+
+**Çözüm:** Her pozisyonda HEM `size` HEM `contracts` tut
+
+#### 1. Binance Position Data (line ~724)
+```python
+# Eski:
+result.append({
+    'size': abs(contracts),
+    # ...
+})
+
+# Yeni:
+position_amount = abs(contracts)
+result.append({
+    'size': position_amount,        # İç kullanım
+    'contracts': position_amount,   # Binance uyumlu
+    # ...
+})
+```
+
+#### 2. Sync Logic (lines 1214-1215)
+```python
+# Her iki field da sync ediliyor
+position_size = bp.get('size', bp.get('contracts', pos.get('size')))
+pos['size'] = position_size
+pos['contracts'] = position_size
+```
+
+#### 3. Position Close İşlemleri
+```python
+# Fallback pattern
+amount = pos.get('contracts', pos.get('size', 0))
+```
+
+#### 4. TypeScript Position Interface
+```typescript
+export interface Position {
+  size: number;           // İç kullanım
+  contracts?: number;     // Binance uyumlu (optional)
+  // ...
+}
+```
 
 ---
 
@@ -407,3 +617,5 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
+> Son güncelleme: 2026-02-05 (Phase 138-141)
+
