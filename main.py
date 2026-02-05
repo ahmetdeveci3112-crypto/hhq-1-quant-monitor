@@ -6509,6 +6509,13 @@ class TimeBasedPositionManager:
                 
                 actions["checked"] += 1
                 
+                # Phase 137 DEBUG: Trace log before CASE checks (every 100th call to reduce spam)
+                if not hasattr(self, '_debug_count'):
+                    self._debug_count = 0
+                self._debug_count += 1
+                if self._debug_count % 100 == 1:
+                    logger.info(f"📊 POS_DEBUG: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} entry={entry_price:.4f} curr={current_price:.4f}")
+                
                 # ===============================================
                 # PHASE 137: DYNAMIC PARTIAL TAKE PROFIT
                 # Spread ve volatiliteye göre dinamik TP seviyeleri
