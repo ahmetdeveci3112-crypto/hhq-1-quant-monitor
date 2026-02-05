@@ -59,7 +59,8 @@ export interface Position {
   symbol: string;
   side: 'LONG' | 'SHORT';
   entryPrice: number;
-  size: number;           // Position size in base currency
+  size: number;           // Position size in base currency (internal usage)
+  contracts?: number;     // Phase 141: Binance-compatible field (same as size)
   sizeUsd: number;        // Position size in USD
   stopLoss: number;
   takeProfit: number;

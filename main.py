@@ -714,11 +714,16 @@ class LiveBinanceTrader:
                         except Exception as te:
                             logger.warning(f"Could not get trade history for {symbol}: {te}")
                     
+                    # Phase 141: Store both 'size' and 'contracts' for consistency
+                    # - 'contracts' is the Binance API field name
+                    # - 'size' is used internally throughout the codebase
+                    position_amount = abs(contracts)
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
                         'symbol': symbol,
                         'side': side,  # Use calculated side from CCXT/raw info
-                        'size': abs(contracts),
+                        'size': position_amount,        # Internal usage
+                        'contracts': position_amount,   # Phase 141: Binance-compatible field
                         'sizeUsd': notional,
                         'entryPrice': float(p.get('entryPrice') or 0),
                         'markPrice': float(p.get('markPrice') or 0),
@@ -1202,10 +1207,13 @@ async def binance_position_sync_loop():
                     else:
                         # Update existing position with current Binance data
                         # Phase 88: Also sync SIZE to prevent close amount mismatches
+                        # Phase 141: Sync CONTRACTS alongside SIZE for consistency
                         for pos in global_paper_trader.positions:
                             if pos.get('symbol') == symbol and pos.get('isLive'):
                                 # Sync critical values from Binance (source of truth)
-                                pos['size'] = bp.get('size', pos.get('size'))  # Phase 88: Sync size!
+                                position_size = bp.get('size', bp.get('contracts', pos.get('size')))
+                                pos['size'] = position_size      # Phase 88: Sync size!
+                                pos['contracts'] = position_size # Phase 141: Keep both in sync
                                 pos['sizeUsd'] = bp.get('sizeUsd', pos.get('sizeUsd'))
                                 pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
@@ -6389,7 +6397,8 @@ class PositionBasedKillSwitch:
         Reduce position size by specified percentage.
         Records partial close in trade history.
         """
-        original_size = pos.get('size', 0)
+        # Phase 141: Use contracts with size fallback for consistency
+        original_size = pos.get('contracts', pos.get('size', 0))
         original_size_usd = pos.get('sizeUsd', 0)
         reduction_size = original_size * reduction_pct
         reduction_size_usd = original_size_usd * reduction_pct
@@ -10806,7 +10815,8 @@ class PaperTradingEngine:
         if live_binance_trader.enabled and pos.get('isLive', False):
             symbol = pos.get('symbol', '')
             side = pos.get('side', 'LONG')
-            amount = pos.get('size', 0)
+            # Phase 141: Use contracts with size fallback for consistency with Binance API
+            amount = pos.get('contracts', pos.get('size', 0))
             
             logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
             
