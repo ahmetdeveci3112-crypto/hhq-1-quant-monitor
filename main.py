@@ -6645,11 +6645,15 @@ class TimeBasedPositionManager:
                 
                 # ===============================================
                 # CASE 2: LOSING AND STAGNANT - GRADUAL REDUCTION
+                # Phase 137 FIX: Changed elif to if - CASE 2 should run independently
                 # ===============================================
-                elif unrealized_pnl < 0:
+                if unrealized_pnl < 0:
                     # Initialize tracking for this position
                     if pos_id not in self.time_reductions:
                         self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
+                    
+                    # Phase 137 DEBUG: Trace log for CASE 2 entry
+                    logger.info(f"📊 TIME_CHECK: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} flags={pos.get('time_reduced_4h', False)}/{pos.get('time_reduced_8h', False)}")
                     
                     # Check each time threshold
                     for schedule in self.reduction_schedule:
