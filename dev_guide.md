@@ -382,6 +382,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-05 | 143 | Strong Trend Filter (4H 20 mum counter-trend penalty) |
 | 2026-02-05 | 142 | Portfolio Recovery Trailing System |
 | 2026-02-05 | 141 | Size vs Contracts Standardization |
 | 2026-02-05 | 140 | Modular Architecture (backend/ package) |
@@ -654,6 +655,39 @@ distance = clamp(avg_atr, 1.5%, 5.0%)
 
 ---
 
+## 📘 Phase 143: Strong Trend Filter
+
+**Amaç:** 4H timeframe'de güçlü trend olan coinlere karşı açılan counter-trend sinyalleri cezalandırmak ve pozisyon boyutunu küçültmek.
+
+**Problem:** HANAUSDT +400% yükselirken sistem SHORT açtı.
+
+**Çözüm:** Son 20 4H mum kapanışından fiyat değişimi hesapla → Sinyal yönü ile karşılaştır → Kademeli penalty uygula:
+
+| Fiyat Değişimi | Counter-Trend Penalty | Size Çarpanı |
+|----------------|----------------------|--------------|
+| <5% | 0 | 1.0x |
+| 5-10% | -10 pts | 0.75x |
+| 10-20% | -20 pts | 0.50x |
+| >20% | -30 pts | 0.25x |
+
+**Kod Yapısı:**
+```python
+# MTFScoringSystem class
+def calculate_strong_trend_penalty(price_change_pct, signal_action) -> (penalty, size_mult)
+# update_coin_trend() → price_change_4h_20 hesaplar
+# confirm_signal() → penalty uygular
+# open_position() → size_mult uygular
+```
+
+**Log Pattern'leri:**
+```
+⚠️ STRONG_TREND: +15.5% → SHORT penalized (-20, 50% size)
+📊 STRONG_TREND: +7.2% → SHORT penalized (-10, 75% size)
+📉 STRONG_TREND SIZE: 50% multiplier applied → size_mult=0.50
+```
+
+---
+
 ## 🔧 Yeni Geliştirme Kontrol Listesi
 
 Yeni bir özellik eklerken:
@@ -671,5 +705,6 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
-> Son güncelleme: 2026-02-05 (Phase 142)
+> Son güncelleme: 2026-02-05 (Phase 143)
+
 
