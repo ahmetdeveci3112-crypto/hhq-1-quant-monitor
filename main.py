@@ -1229,37 +1229,52 @@ async def binance_position_sync_loop():
                 
                 # Record closed positions to trade history
                 for pos in closed_positions:
-                    # Estimate exit price from last known mark price or entry
-                    exit_price = pos.get('markPrice', pos.get('entryPrice', 0))
-                    pnl = pos.get('unrealizedPnl', 0)
-                    pnl_percent = pos.get('unrealizedPnlPercent', 0)
+                    symbol = pos.get('symbol', 'UNKNOWN')
+                    engine_triggered = False  # Track if engine set the reason
                     
-                    trade = {
-                        "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
-                        "symbol": pos.get('symbol', 'UNKNOWN'),
-                        "side": pos.get('side', 'LONG'),
-                        "entryPrice": pos.get('entryPrice', 0),
-                        "exitPrice": exit_price,
-                        "size": pos.get('size', 0),
-                        "sizeUsd": pos.get('sizeUsd', 0),
-                        "pnl": pnl,
-                        "pnlPercent": pnl_percent,
-                        "openTime": pos.get('openTime', 0),
-                        "closeTime": int(datetime.now().timestamp() * 1000),
-                        "reason": "External Close (Binance)",
-                        "leverage": pos.get('leverage', 10),
-                        "isLive": True,
-                        "signalScore": pos.get('signalScore', 0),
-                        "mtfScore": pos.get('mtfScore', 0),
-                        "zScore": pos.get('zScore', 0),
-                        "spreadLevel": pos.get('spreadLevel', 'unknown'),
-                        "stopLoss": pos.get('stopLoss', 0),
-                        "takeProfit": pos.get('takeProfit', 0),
-                        "trailActivation": pos.get('trailActivation', 0),
-                        "trailingStop": pos.get('trailingStop', 0),
-                        "isTrailingActive": pos.get('isTrailingActive', False),
-                        "atr": pos.get('atr', 0),
-                    }
+                    # Phase 138: Check if engine set a pending reason
+                    if symbol in pending_close_reasons:
+                        # Use engine's reason and trade data
+                        reason_data = pending_close_reasons.pop(symbol)
+                        trade = reason_data.get('trade_data', {})
+                        # Update with actual Binance close data if available
+                        trade['closeTime'] = int(datetime.now().timestamp() * 1000)
+                        trade['reason'] = reason_data.get('reason', 'External Close (Binance)')
+                        engine_triggered = True
+                        logger.info(f"📋 REASON MATCHED: {symbol} = {reason_data.get('reason')}")
+                    else:
+                        # No pending reason - truly external close (manual from Binance)
+                        exit_price = pos.get('markPrice', pos.get('entryPrice', 0))
+                        pnl = pos.get('unrealizedPnl', 0)
+                        pnl_percent = pos.get('unrealizedPnlPercent', 0)
+                        
+                        trade = {
+                            "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+                            "symbol": symbol,
+                            "side": pos.get('side', 'LONG'),
+                            "entryPrice": pos.get('entryPrice', 0),
+                            "exitPrice": exit_price,
+                            "size": pos.get('size', 0),
+                            "sizeUsd": pos.get('sizeUsd', 0),
+                            "pnl": pnl,
+                            "pnlPercent": pnl_percent,
+                            "openTime": pos.get('openTime', 0),
+                            "closeTime": int(datetime.now().timestamp() * 1000),
+                            "reason": "External Close (Binance)",
+                            "leverage": pos.get('leverage', 10),
+                            "isLive": True,
+                            "signalScore": pos.get('signalScore', 0),
+                            "mtfScore": pos.get('mtfScore', 0),
+                            "zScore": pos.get('zScore', 0),
+                            "spreadLevel": pos.get('spreadLevel', 'unknown'),
+                            "stopLoss": pos.get('stopLoss', 0),
+                            "takeProfit": pos.get('takeProfit', 0),
+                            "trailActivation": pos.get('trailActivation', 0),
+                            "trailingStop": pos.get('trailingStop', 0),
+                            "isTrailingActive": pos.get('isTrailingActive', False),
+                            "atr": pos.get('atr', 0),
+                        }
+                    
                     global_paper_trader.trades.append(trade)
                     
                     # Save to SQLite
@@ -1268,15 +1283,16 @@ async def binance_position_sync_loop():
                     except Exception as e:
                         logger.debug(f"SQLite save error: {e}")
                     
-                    # Update stats
-                    global_paper_trader.stats['totalTrades'] += 1
-                    global_paper_trader.stats['totalPnl'] += pnl
-                    if pnl > 0:
-                        global_paper_trader.stats['winningTrades'] += 1
-                    else:
-                        global_paper_trader.stats['losingTrades'] += 1
+                    # Update stats only for external closes (engine already updated stats)
+                    if not engine_triggered:
+                        global_paper_trader.stats['totalTrades'] += 1
+                        global_paper_trader.stats['totalPnl'] += trade.get('pnl', 0)
+                        if trade.get('pnl', 0) > 0:
+                            global_paper_trader.stats['winningTrades'] += 1
+                        else:
+                            global_paper_trader.stats['losingTrades'] += 1
                     
-                    logger.info(f"📥 EXTERNAL CLOSE RECORDED: {pos['side']} {pos['symbol']} | PnL: ${pnl:.2f}")
+                    logger.info(f"📥 CLOSE RECORDED: {pos.get('side')} {symbol} | PnL: ${trade.get('pnl', 0):.2f} | Reason: {trade.get('reason')}")
                 
                 global_paper_trader.positions = remaining_positions
                 
@@ -10624,6 +10640,64 @@ class PaperTradingEngine:
                     if current_price <= pos['takeProfit']:
                         self.close_position(pos, current_price, 'TP')
 
+    def _format_detailed_reason(self, reason: str, pos: Dict, exit_price: float, pnl_percent: float) -> str:
+        """
+        Phase 138: Format detailed close reason for trade history.
+        
+        Returns a human-readable reason with specific trigger details.
+        """
+        symbol = pos.get('symbol', 'UNKNOWN')
+        entry_price = pos.get('entryPrice', 0)
+        sl = pos.get('stopLoss', 0)
+        tp = pos.get('takeProfit', 0)
+        trailing_stop = pos.get('trailingStop', 0)
+        peak_price = pos.get('peakPrice', pos.get('entryPrice', 0))
+        
+        # Calculate distance percentages
+        if entry_price > 0:
+            exit_vs_entry_pct = ((exit_price - entry_price) / entry_price) * 100
+            if pos.get('side') == 'SHORT':
+                exit_vs_entry_pct = -exit_vs_entry_pct
+        else:
+            exit_vs_entry_pct = 0
+        
+        reason_map = {
+            # Stop Loss variants
+            'SL': f"🔴 SL: Stop Loss Fiyatı Aşıldı ({pnl_percent:+.1f}%)",
+            'SL_HIT': f"🔴 SL: Stop Loss Tetiklendi @ ${exit_price:.4f} ({pnl_percent:+.1f}%)",
+            'EMERGENCY_SL': f"🚨 EMERGENCY: Acil Stop Loss ({pnl_percent:+.1f}%)",
+            
+            # Take Profit variants
+            'TP': f"🟢 TP: Take Profit Hedefi ({pnl_percent:+.1f}%)",
+            'TP_HIT': f"🟢 TP: Take Profit Tetiklendi @ ${exit_price:.4f} ({pnl_percent:+.1f}%)",
+            
+            # Trailing Stop
+            'TRAIL': f"📈 TRAIL: Trailing Stop ({pnl_percent:+.1f}%, peak'ten çekilme)",
+            'TRAILING_STOP': f"📈 TRAIL: Trailing Stop Tetiklendi ({pnl_percent:+.1f}%)",
+            
+            # Kill Switch
+            'KILL_SWITCH_FULL': f"⚠️ KILL: Kill Switch Tam Kapatma ({pnl_percent:+.1f}%)",
+            'KILL_SWITCH_PARTIAL': f"⚠️ KILL: Kill Switch Kısmi (%50, {pnl_percent:+.1f}%)",
+            
+            # Time-based
+            'TIME_REDUCE_4H': f"⏰ TIME: 4 Saat Kuralı (-10%, {pnl_percent:+.1f}%)",
+            'TIME_REDUCE_8H': f"⏰ TIME: 8 Saat Kuralı (-10%, {pnl_percent:+.1f}%)",
+            'TIME_GRADUAL': f"⏰ TIME: Kademeli Zaman Çıkışı ({pnl_percent:+.1f}%)",
+            'TIME_FORCE': f"⏰ TIME: Zorunlu Zaman Çıkışı ({pnl_percent:+.1f}%)",
+            
+            # Recovery & Adverse
+            'RECOVERY_EXIT': f"🔄 RECOVERY: Toparlanma Çıkışı ({pnl_percent:+.1f}%)",
+            'ADVERSE_TIME_EXIT': f"⚡ ADVERSE: Olumsuz Zaman Çıkışı ({pnl_percent:+.1f}%)",
+            
+            # Manual
+            'MANUAL': f"👤 MANUAL: Manuel Kapatma ({pnl_percent:+.1f}%)",
+            
+            # Signal Reversal
+            'SIGNAL_REVERSAL_PROFIT': f"🔄 REVERSAL: Sinyal Değişimi Karlı Çıkış ({pnl_percent:+.1f}%)",
+        }
+        
+        return reason_map.get(reason, f"📋 {reason} ({pnl_percent:+.1f}%)")
+
     def close_position(self, pos: Dict, exit_price: float, reason: str):
         """
         Close a position and record it in trade history.
@@ -10675,15 +10749,38 @@ class PaperTradingEngine:
             "slMultiplier": pos.get('slMultiplier', 0),
             "tpMultiplier": pos.get('tpMultiplier', 0),
         }
-        self.trades.append(trade)
         
-        # Save trade to SQLite (async, non-blocking)
-        try:
-            asyncio.create_task(sqlite_manager.save_trade(trade))
-        except Exception as e:
-            logger.debug(f"SQLite save error: {e}")
+        # Phase 138: LIVE positions - store reason for Binance sync, DON'T write trade yet
+        # Binance sync will detect the close and write trade with this reason
+        symbol = pos.get('symbol', 'UNKNOWN')
+        is_live = pos.get('isLive', False)
         
-        # Update Stats
+        if is_live:
+            # Store detailed reason for Binance sync to use
+            pnl_percent = (pnl / pos.get('sizeUsd', 1)) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0
+            detailed_reason = self._format_detailed_reason(reason, pos, exit_price, pnl_percent)
+            
+            pending_close_reasons[symbol] = {
+                "reason": detailed_reason,
+                "original_reason": reason,
+                "pnl": pnl,
+                "exitPrice": exit_price,
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "trade_data": trade  # Full trade data for Binance sync to use
+            }
+            logger.info(f"📋 PENDING REASON SET: {symbol} = {detailed_reason}")
+            # DON'T append to trades - Binance sync will do it
+        else:
+            # PAPER positions: write trade history as normal
+            self.trades.append(trade)
+            
+            # Save trade to SQLite (async, non-blocking)
+            try:
+                asyncio.create_task(sqlite_manager.save_trade(trade))
+            except Exception as e:
+                logger.debug(f"SQLite save error: {e}")
+        
+        # Update Stats (for both LIVE and PAPER)
         self.stats['totalTrades'] += 1
         self.stats['totalPnl'] += pnl
         if pnl > 0: 
@@ -11483,6 +11580,11 @@ async def server_ip():
 
 # Phase 16: Global Paper Trader for REST API access
 global_paper_trader = PaperTradingEngine()
+
+# Phase 138: Global dictionary to track close reasons for Binance sync
+# When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
+# Binance sync will use this to set proper reason when detecting closed position
+pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timestamp": int}}
 
 @app.get("/paper-trading/status")
 async def paper_trading_status():
