@@ -714,10 +714,54 @@ class LiveBinanceTrader:
                         except Exception as te:
                             logger.warning(f"Could not get trade history for {symbol}: {te}")
                     
-                    # Phase 141: Store both 'size' and 'contracts' for consistency
-                    # - 'contracts' is the Binance API field name
-                    # - 'size' is used internally throughout the codebase
                     position_amount = abs(contracts)
+                    entry_price = float(p.get('entryPrice') or 0)
+                    mark_price = float(p.get('markPrice') or 0)
+                    
+                    # ================================================================
+                    # Phase 145: Calculate dynamic TP/SL/Trail for live positions
+                    # ================================================================
+                    # Use same formulas as paper trading
+                    sl_atr_mult = 1.5  # Default SL ATR multiplier
+                    tp_atr_mult = 2.5  # Default TP ATR multiplier
+                    trail_activation_atr = 1.5
+                    trail_distance_atr = 1.0
+                    exit_tightness = global_paper_trader.exit_tightness if global_paper_trader else 1.0
+                    
+                    # Estimate ATR as ~1.5% of price (typical for crypto)
+                    estimated_atr = entry_price * 0.015
+                    
+                    # Apply exit_tightness multiplier
+                    adjusted_sl_atr = sl_atr_mult * exit_tightness
+                    adjusted_tp_atr = tp_atr_mult * exit_tightness
+                    adjusted_trail_activation = trail_activation_atr * exit_tightness
+                    adjusted_trail_distance = trail_distance_atr * exit_tightness
+                    
+                    # Calculate TP/SL based on side
+                    if side == 'LONG':
+                        sl = entry_price - (estimated_atr * adjusted_sl_atr)
+                        tp = entry_price + (estimated_atr * adjusted_tp_atr)
+                        trail_activation = entry_price + (estimated_atr * adjusted_trail_activation)
+                    else:  # SHORT
+                        sl = entry_price + (estimated_atr * adjusted_sl_atr)
+                        tp = entry_price - (estimated_atr * adjusted_tp_atr)
+                        trail_activation = entry_price - (estimated_atr * adjusted_trail_activation)
+                    
+                    trailing_stop = sl  # Initial trailing stop = SL
+                    trail_distance = estimated_atr * adjusted_trail_distance
+                    
+                    # Check if trailing should be active (based on ROI threshold)
+                    roi_pct = pnl_percent
+                    activation_threshold = 3.0 * exit_tightness  # Phase 144: ROI-based
+                    is_trailing_active = roi_pct >= activation_threshold
+                    
+                    # If trailing active, calculate trailing stop
+                    if is_trailing_active:
+                        if side == 'LONG':
+                            trailing_stop = mark_price - trail_distance
+                        else:
+                            trailing_stop = mark_price + trail_distance
+                    
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
                         'symbol': symbol,
@@ -725,8 +769,8 @@ class LiveBinanceTrader:
                         'size': position_amount,        # Internal usage
                         'contracts': position_amount,   # Phase 141: Binance-compatible field
                         'sizeUsd': notional,
-                        'entryPrice': float(p.get('entryPrice') or 0),
-                        'markPrice': float(p.get('markPrice') or 0),
+                        'entryPrice': entry_price,
+                        'markPrice': mark_price,
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
                         'leverage': calculated_leverage,  # notional/margin - accurate for cross margin
@@ -734,7 +778,15 @@ class LiveBinanceTrader:
                         'liquidationPrice': float(p.get('liquidationPrice') or 0),
                         'marginType': p.get('marginMode', 'cross'),
                         'openTime': open_time,  # Actual position open time from trade history
-                        'isLive': True  # Mark as live position
+                        'isLive': True,  # Mark as live position
+                        # Phase 145: Dynamic TP/SL/Trail values
+                        'stopLoss': sl,
+                        'takeProfit': tp,
+                        'trailActivation': trail_activation,
+                        'trailingStop': trailing_stop,
+                        'trailDistance': trail_distance,
+                        'isTrailingActive': is_trailing_active,
+                        'atr': estimated_atr
                     })
             
             logger.info(f"get_positions returning {len(result)} active positions")
