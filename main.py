@@ -8443,7 +8443,8 @@ class SignalGenerator:
         # Phase 28: Dynamic threshold from coin profile
         if coin_profile:
             base_threshold = coin_profile.get('optimal_threshold', 1.6)
-            min_score_required = coin_profile.get('min_score', 75)
+            # Phase 137 FIX: Reduced default min_score from 75 to 55 to allow more signals
+            min_score_required = coin_profile.get('min_score', 55)
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
         else:
@@ -8793,8 +8794,9 @@ class SignalGenerator:
                 self._reject_count += 1
             else:
                 self._reject_count = 1
-            if self._reject_count % 50 == 1:
-                logger.info(f"📊 SCORE_LOW: {symbol} {signal_side} score={score} < min={min_score_required} | Z={zscore:.2f} H={hurst:.2f} | reasons: {', '.join(reasons[:3])}")
+            # Phase 137 FIX: Log every 10th rejection instead of 50th for better visibility
+            if self._reject_count % 10 == 1:
+                logger.info(f"📊 SCORE_LOW: {symbol} {signal_side} score={score} < min={min_score_required} | Z={zscore:.2f} H={hurst:.2f} | reasons: {', '.join(reasons[:5])}")
             return None
         
         # Phase 128: TRACE LOG - score check passed
