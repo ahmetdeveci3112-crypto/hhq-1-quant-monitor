@@ -6663,6 +6663,19 @@ class TimeBasedPositionManager:
                     if pos_id not in self.time_reductions:
                         self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
                     
+                    # Phase 137 ONE-TIME FIX: Reset broken flags from old code
+                    # Old code used 'size' (always 0), never reduced, but flags got set somehow
+                    # Reset flags if position has contracts but hasn't actually been reduced
+                    if not hasattr(self, '_flags_reset_done'):
+                        self._flags_reset_done = True
+                        for p in paper_trader.positions:
+                            # If position has contracts (not reduced) but flags are True, reset them
+                            if p.get('contracts', 0) > 0:
+                                if p.get('time_reduced_4h', False) or p.get('time_reduced_8h', False):
+                                    logger.warning(f"📊 FLAG_RESET: {p.get('symbol')} resetting broken time reduction flags")
+                                    p['time_reduced_4h'] = False
+                                    p['time_reduced_8h'] = False
+                    
                     # Phase 137 DEBUG: Trace log for CASE 2 entry
                     logger.info(f"📊 TIME_CHECK: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} flags={pos.get('time_reduced_4h', False)}/{pos.get('time_reduced_8h', False)}")
                     
@@ -6678,9 +6691,12 @@ class TimeBasedPositionManager:
                         
                         # Check if we've passed this threshold and haven't reduced yet
                         if age_hours >= threshold_hours and not already_reduced_flag:
-                            # Reduce position
-                            reduction_amount = pos.get('size', 0) * reduction_pct
-                            reduction_usd = pos.get('sizeUsd', 0) * reduction_pct
+                            # Phase 137 FIX: Use 'contracts' (from Binance) instead of 'size'
+                            position_contracts = pos.get('contracts', pos.get('size', 0))
+                            position_notional = pos.get('notional', pos.get('sizeUsd', 0))
+                            
+                            reduction_amount = position_contracts * reduction_pct
+                            reduction_usd = position_notional * reduction_pct
                             
                             if reduction_amount > 0:
                                 # Calculate partial close PnL
@@ -6705,6 +6721,11 @@ class TimeBasedPositionManager:
                                 
                                 actions["time_reduced"].append(f"{symbol} {key} (-{reduction_pct*100:.0f}%)")
                                 logger.warning(f"📊 TIME REDUCE: {symbol} reduced {reduction_pct*100:.0f}% after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
+                                
+                                # Phase 137: For LIVE positions, log that Binance order should be sent
+                                # TODO: Implement async Binance partial close in a future phase
+                                if pos.get('isLive', False):
+                                    logger.warning(f"📊 TIME REDUCE LIVE: {symbol} needs manual close on Binance - {reduction_amount:.4f} contracts")
                                 
                                 # Log to paper trader
                                 paper_trader.add_log(f"⏰ TIME REDUCE: {symbol} -{reduction_pct*100:.0f}% after {threshold_hours}h")
