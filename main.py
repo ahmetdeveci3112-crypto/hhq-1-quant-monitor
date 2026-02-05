@@ -4122,6 +4122,10 @@ async def background_scanner_loop():
                         # Phase 49: Time-based position management
                         # Activates trailing early for profitable stagnant positions
                         # Gradually reduces losing stagnant positions
+                        
+                        # Phase 137 DEBUG: Trace log to verify check_positions is called
+                        logger.info(f"📊 TIME_MANAGER_CALL: positions={len(global_paper_trader.positions)}")
+                        
                         time_actions = time_based_position_manager.check_positions(global_paper_trader)
                         if time_actions.get('trail_activated') or time_actions.get('time_reduced'):
                             logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}")
