@@ -52,6 +52,7 @@ const INITIAL_STATS: PortfolioStats = {
 
 // Close reason to Turkish mapping with detailed algorithmic descriptions
 // Phase 58: Complete close reason mapping with specific algorithm criteria
+// Phase 139: Added all backend close reasons for consistency
 const translateReason = (reason: string | undefined): string => {
   if (!reason) return '-';
 
@@ -62,6 +63,7 @@ const translateReason = (reason: string | undefined): string => {
     'SL_HIT': '🛑 SL: Stop Loss Fiyatı Aşıldı',
     'TP_HIT': '✅ TP: Take Profit Fiyatı Yakalandı',
     'TRAILING': '📈 Trailing: Takip Eden SL Tetiklendi',
+    'TRAILING_STOP': '📈 Trailing: Trailing Stop Aktif',
 
     // ===== KILL SWITCH - MARGIN KAYBI LİMİTİ =====
     'KILL_SWITCH_FULL': '🚨 KS Tam: Margin Kaybı ≥%50 → Tam Kapatma',
@@ -70,6 +72,8 @@ const translateReason = (reason: string | undefined): string => {
     // ===== TIME-BASED - ZAMAN BAZLI ÇIKIŞ =====
     'TIME_GRADUAL': '⏳ Zaman: 12h+ Aşımı + 0.3 ATR Geri Çekilme',
     'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Kapatma',
+    'TIME_REDUCE_4H': '⏰ Zaman: 4 Saat Kuralı (-%10 azaltma)',
+    'TIME_REDUCE_8H': '⏰ Zaman: 8 Saat Kuralı (-%10 azaltma)',
 
     // ===== RECOVERY & ADVERSE - TOPARLANMA/OLUMSUZ =====
     'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa/Kâra Dönüş',
@@ -79,6 +83,7 @@ const translateReason = (reason: string | undefined): string => {
     // ===== SIGNAL-BASED - SİNYAL BAZLI =====
     'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi: Kârda İken Trend Döndü',
     'SIGNAL_REVERSAL': '↩️ Sinyal Tersi: Trend Yönü Değişti',
+    'SIGNAL': '📊 Sinyal: Algoritma Sinyali',
 
     // ===== MANUEL & DİĞER =====
     'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
@@ -86,18 +91,34 @@ const translateReason = (reason: string | undefined): string => {
     'RESCUE': '🆘 Kurtarma: Acil Durum Modu',
     'END': '🔚 Sistem: Oturum Sonlandırıldı',
     'EARLY_TRAIL': '📊 Erken Trail: Pullback Aktivasyon Çıkışı',
+
+    // ===== EXTERNAL & BINANCE =====
+    'EXTERNAL': '🔗 Harici: Binance\'den Manuel Kapatma',
+    'External Close (Binance)': '🔗 Harici: Binance\'den Kapatıldı',
+    'Binance PnL': '💰 Binance: Gerçekleşen PnL',
   };
 
-  // Partial matches for dynamic suffixes
+  // Partial matches for dynamic suffixes (Phase 138 detailed reasons)
+  if (reason.includes('🔴 SL:') || reason.includes('🟢 TP:') || reason.includes('📈 TRAIL:') ||
+    reason.includes('⚠️ KILL:') || reason.includes('⏰ TIME:') || reason.includes('🔄 RECOVERY:') ||
+    reason.includes('⚡ ADVERSE:') || reason.includes('👤 MANUAL:') || reason.includes('🚨 EMERGENCY:') ||
+    reason.includes('🔄 REVERSAL:')) {
+    // Phase 138 detailed reason - already formatted, return as-is
+    return reason;
+  }
+
   if (reason.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
   if (reason.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
   if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
+  if (reason.includes('TIME_REDUCE_4H')) return mapping['TIME_REDUCE_4H'];
+  if (reason.includes('TIME_REDUCE_8H')) return mapping['TIME_REDUCE_8H'];
   if (reason.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
   if (reason.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
   if (reason.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
   if (reason.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
   if (reason.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
   if (reason.includes('SIGNAL_REVERSAL')) return '↩️ Sinyal Tersi: Trend Döndü';
+  if (reason.includes('External Close')) return mapping['External Close (Binance)'];
 
   return mapping[reason] || reason;
 };

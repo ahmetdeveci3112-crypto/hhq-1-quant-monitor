@@ -74,6 +74,29 @@ export interface Position {
   sl1Hit?: boolean;
 }
 
+// Phase 139: Comprehensive close reason type matching all backend reasons
+export type CloseReason =
+  // Stop Loss variants
+  | 'SL' | 'SL_HIT' | 'EMERGENCY_SL'
+  // Take Profit variants  
+  | 'TP' | 'TP_HIT' | 'TP1'
+  // Trailing Stop
+  | 'TRAILING' | 'TRAILING_STOP'
+  // Kill Switch
+  | 'KILL_SWITCH_FULL' | 'KILL_SWITCH_PARTIAL'
+  // Time-based position management
+  | 'TIME_GRADUAL' | 'TIME_FORCE' | 'TIME_REDUCE_4H' | 'TIME_REDUCE_8H'
+  // Recovery & Adverse conditions
+  | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
+  // Manual & Signal-based
+  | 'MANUAL' | 'SIGNAL' | 'SIGNAL_REVERSAL_PROFIT'
+  // External & System
+  | 'EXTERNAL' | 'External Close (Binance)'
+  // Backtest specific
+  | 'RESCUE' | 'SL1' | 'END'
+  // Binance PnL
+  | 'Binance PnL';
+
 export interface Trade {
   id: string;
   symbol: string;
@@ -86,7 +109,9 @@ export interface Trade {
   pnlPercent: number;
   openTime: number;
   closeTime: number;
-  closeReason: 'SL' | 'TP' | 'TRAILING' | 'MANUAL' | 'SIGNAL' | 'TP1' | 'SL1' | 'RESCUE';
+  // Phase 139: Support both 'reason' (new) and 'closeReason' (legacy)
+  reason?: string;           // Primary field from backend
+  closeReason?: CloseReason; // Legacy compatibility
 }
 
 export interface EquityPoint {
