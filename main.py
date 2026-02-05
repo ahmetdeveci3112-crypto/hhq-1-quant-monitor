@@ -8788,6 +8788,9 @@ class SignalGenerator:
         # =====================================================================
         # Sadece Z-Score, OB, VWAP, MTF (veto için), Liq Cascade, Basis, Whale, FVG, Breakout skorları kullanıldı
         
+        # Phase 137 DEBUG: Trace log to confirm signals reach this point
+        logger.info(f"📍 PRE_SCORE: {symbol} {signal_side} score={score} min={min_score_required} | reasons: {','.join(reasons[:4])}")
+        
         if score < min_score_required:
             # Debug log for signal rejection (every 50th to avoid spam)
             if hasattr(self, '_reject_count'):
