@@ -382,6 +382,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-05 | 142 | Portfolio Recovery Trailing System |
 | 2026-02-05 | 141 | Size vs Contracts Standardization |
 | 2026-02-05 | 140 | Modular Architecture (backend/ package) |
 | 2026-02-05 | 139 | Type Consistency (CloseReason types) |
@@ -600,6 +601,59 @@ export interface Position {
 
 ---
 
+### Phase 142: Portfolio Recovery Trailing
+
+**Amaç:** Total Unrealized PnL 12+ saat ekside kalıp artıya dönerse, trailing ile tüm pozisyonları kapatarak bakiyeyi koru.
+
+**Mantık:**
+```
+uPnL < 0 → 12+ saat → Recovery Candidate → uPnL > +$0.50 → Trailing aktif → Pullback > Trail → TÜM KAPAT
+```
+
+**PortfolioRecoveryManager Class (line ~6820):**
+```python
+class PortfolioRecoveryManager:
+    # State
+    underwater_start_time = None    # uPnL ekside ne zaman başladı
+    is_recovery_candidate = False   # 12h+ underwater flag
+    recovery_trailing_active = False
+    peak_positive_pnl = 0.0
+    trailing_distance_pct = 2.5     # Dynamic (BTC/ETH ATR)
+    cooldown_until = None           # Kapatma sonrası bekleme
+    
+    # Config
+    underwater_threshold_hours = 12  # 12 saat ekside kal
+    min_positive_threshold = 0.50    # Min $0.50 artı
+    min_trailing_pct = 1.5          # Min %1.5 trail
+    max_trailing_pct = 5.0          # Max %5 trail
+    cooldown_hours = 6              # 6 saat cooldown
+```
+
+**Trailing Distance Hesabı:**
+```python
+avg_atr = (BTC_ATR% + ETH_ATR%) / 2
+distance = clamp(avg_atr, 1.5%, 5.0%)
+```
+
+**Entegrasyon Noktaları:**
+| Dosya | Satır | Açıklama |
+|-------|-------|----------|
+| `main.py` | 1130-1165 | Sync loop'ta recovery check |
+| `main.py` | 4595-4601 | Signal processing'de cooldown |
+| `main.py` | 1105-1128 | `_get_coin_atr_percent()` helper |
+
+**Log Pattern'leri:**
+```
+📊 RECOVERY TRACKING: uPnL negative, starting timer
+⚠️ RECOVERY CANDIDATE: 12h+ underwater
+🔄 RECOVERY ACTIVATED: Trailing started  
+📈 RECOVERY PEAK: New peak recorded
+🔴 RECOVERY TRIGGER: Closing all positions
+⏸️ RECOVERY COOLDOWN: Blocking signals (Xh remaining)
+```
+
+---
+
 ## 🔧 Yeni Geliştirme Kontrol Listesi
 
 Yeni bir özellik eklerken:
@@ -617,5 +671,5 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
-> Son güncelleme: 2026-02-05 (Phase 138-141)
+> Son güncelleme: 2026-02-05 (Phase 142)
 
