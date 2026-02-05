@@ -5107,6 +5107,47 @@ class MultiTimeframeConfirmation:
         
         return 0
     
+    def calculate_strong_trend_penalty(self, price_change_pct: float, signal_action: str) -> tuple:
+        """
+        Phase 143: Strong Trend Filter
+        
+        Son 20 4H mumdan hesaplanan fiyat değişimi > threshold ve
+        sinyal counter-trend ise penalty + size reduction uygula.
+        
+        Args:
+            price_change_pct: 20 4H mum boyunca fiyat değişimi (%)
+            signal_action: 'LONG' or 'SHORT'
+            
+        Returns:
+            (penalty_score: int, size_multiplier: float)
+        """
+        abs_change = abs(price_change_pct)
+        
+        # Trend yönü belirle
+        is_bullish = price_change_pct > 0
+        is_counter_trend = (is_bullish and signal_action == "SHORT") or \
+                           (not is_bullish and signal_action == "LONG")
+        
+        # Counter-trend değilse veya değişim < 5% ise penalty yok
+        if not is_counter_trend or abs_change < 5:
+            return (0, 1.0)
+        
+        # Tiered penalty sistemi
+        if abs_change >= 20:
+            # Very strong trend: -30 pts, 25% size
+            logger.warning(f"⚠️ STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-30, 25% size)")
+            return (-30, 0.25)
+        elif abs_change >= 10:
+            # Strong trend: -20 pts, 50% size
+            logger.warning(f"⚠️ STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-20, 50% size)")
+            return (-20, 0.50)
+        elif abs_change >= 5:
+            # Moderate trend: -10 pts, 75% size
+            logger.info(f"📊 STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-10, 75% size)")
+            return (-10, 0.75)
+        
+        return (0, 1.0)
+    
     async def update_coin_trend(self, symbol: str, exchange) -> dict:
         """Fetch 15m, 1h, 4h candles and calculate MTF data."""
         now = datetime.now().timestamp()
@@ -5148,9 +5189,18 @@ class MultiTimeframeConfirmation:
                 closes_4h = [c[4] for c in ohlcv_4h]
                 trend_4h = self.get_trend_from_closes(closes_4h)
                 result['trend_4h'] = trend_4h['trend']
+                
+                # Phase 143: Calculate price change over last 20 4H candles for Strong Trend Filter
+                if len(ohlcv_4h) >= 20:
+                    first_close = ohlcv_4h[-20][4]  # 20 candle ago
+                    last_close = ohlcv_4h[-1][4]    # Current
+                    price_change_pct = ((last_close - first_close) / first_close) * 100
+                    result['price_change_4h_20'] = round(price_change_pct, 2)
+                else:
+                    result['price_change_4h_20'] = 0.0
             
             self.coin_trends[symbol] = result
-            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}")
+            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}, 4h_20_chg={result.get('price_change_4h_20', 0):.1f}%")
             
         except Exception as e:
             logger.debug(f"MTF update failed for {symbol}: {e}")
@@ -5221,6 +5271,24 @@ class MultiTimeframeConfirmation:
             result['confirmed'] = False
             result['score_modifier'] = 0.0
             result['reason'] = f"MTF RED ({total_score}): çok güçlü karşı trend"
+        
+        # ================================================================
+        # Phase 143: Strong Trend Filter - Apply additional penalty
+        # ================================================================
+        price_change_4h_20 = trend_data.get('price_change_4h_20', 0.0)
+        strong_trend_penalty, strong_trend_size_mult = self.calculate_strong_trend_penalty(
+            price_change_4h_20, signal_action
+        )
+        
+        # Apply penalty to mtf_score
+        result['mtf_score'] += strong_trend_penalty
+        result['strong_trend_penalty'] = strong_trend_penalty
+        result['strong_trend_size_mult'] = strong_trend_size_mult
+        result['price_change_4h_20'] = price_change_4h_20
+        
+        # If strong trend penalty applied, adjust reason
+        if strong_trend_penalty < 0:
+            result['reason'] += f" | STRONG_TREND({price_change_4h_20:+.1f}%): {strong_trend_penalty}pts, {int(strong_trend_size_mult*100)}% size"
         
         return result
     
@@ -9940,6 +10008,12 @@ class PaperTradingEngine:
         dynamic_risk = self.get_dynamic_risk_per_trade()
         session_risk = session_manager.adjust_risk(dynamic_risk)
         size_mult = signal.get('sizeMultiplier', 1.0) if signal else 1.0
+        
+        # Phase 143: Apply Strong Trend size reduction
+        strong_trend_size_mult = signal.get('strong_trend_size_mult', 1.0) if signal else 1.0
+        size_mult = size_mult * strong_trend_size_mult
+        if strong_trend_size_mult < 1.0:
+            logger.info(f"📉 STRONG_TREND SIZE: {strong_trend_size_mult:.0%} multiplier applied → size_mult={size_mult:.2f}")
         
         # Calculate SL/TP based on pullback entry price
         # Apply exit_tightness: lower = quicker exit (smaller SL/TP), higher = hold longer (bigger SL/TP)
