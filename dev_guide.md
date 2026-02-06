@@ -382,6 +382,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-06 | 148 | Binance Trade History Sync (5 min periodic) |
 | 2026-02-06 | 147 | Live Position Trail Exit Execution |
 | 2026-02-05 | 146 | Live Trailing State Persistence |
 | 2026-02-05 | 145 | Live Position TP/SL/Trail Display |
