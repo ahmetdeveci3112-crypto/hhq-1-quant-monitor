@@ -1176,6 +1176,101 @@ class LiveBinanceTrader:
             logger.error(f"Trade history fetch error: {e}")
             logger.error(f"Trade history traceback: {traceback.format_exc()}")
             return []
+    
+    async def sync_closed_trades_from_binance(self, hours_back: int = 24) -> int:
+        """
+        Phase 148: Sync closed trades from Binance to trade history.
+        This captures trades that were missed (external closes, server restart).
+        Returns number of new trades synced.
+        """
+        if not self.enabled or not self.exchange:
+            return 0
+        
+        try:
+            import pytz
+            turkey_tz = pytz.timezone('Europe/Istanbul')
+            now = datetime.now(turkey_tz)
+            start_time = int((now - timedelta(hours=hours_back)).timestamp() * 1000)
+            
+            # Fetch REALIZED_PNL entries from Binance
+            income_history = await self.exchange.fapiPrivateGetIncome({
+                'incomeType': 'REALIZED_PNL',
+                'startTime': start_time,
+                'limit': 500
+            })
+            
+            if not income_history:
+                return 0
+            
+            # Get existing trade IDs to avoid duplicates
+            existing_ids = set()
+            if global_paper_trader:
+                for trade in global_paper_trader.trades:
+                    # Create unique ID from symbol + closeTime
+                    close_time = trade.get('closeTime', 0)
+                    symbol = trade.get('symbol', '')
+                    existing_ids.add(f"{symbol}_{close_time}")
+            
+            synced_count = 0
+            
+            for income in income_history:
+                symbol = income.get('symbol', 'UNKNOWN')
+                pnl = float(income.get('income', 0))
+                timestamp = int(income.get('time', 0))
+                
+                # Create unique ID
+                trade_id = f"{symbol}_{timestamp}"
+                
+                if trade_id in existing_ids:
+                    continue  # Already in trade history
+                
+                # Skip very small PnL (likely partial fills or dust)
+                if abs(pnl) < 0.01:
+                    continue
+                
+                close_time = datetime.fromtimestamp(timestamp / 1000, turkey_tz)
+                
+                # Create trade record
+                trade = {
+                    'id': f"BINANCE_{symbol}_{timestamp}",
+                    'symbol': symbol,
+                    'side': 'LONG' if pnl > 0 else 'SHORT',  # Estimate
+                    'entryPrice': 0,
+                    'exitPrice': 0,
+                    'size': 0,
+                    'sizeUsd': 0,
+                    'pnl': round(pnl, 4),
+                    'pnlPercent': 0,
+                    'openTime': timestamp - 3600000,  # Estimate: 1 hour before close
+                    'closeTime': timestamp,
+                    'reason': 'Synced from Binance',
+                    'leverage': 0,
+                    'isLive': True,
+                    'signalScore': 0,
+                    'mtfScore': 0
+                }
+                
+                if global_paper_trader:
+                    global_paper_trader.trades.append(trade)
+                    synced_count += 1
+                    existing_ids.add(trade_id)
+                    
+                    # Save to SQLite
+                    try:
+                        asyncio.create_task(sqlite_manager.save_trade(trade))
+                    except Exception as e:
+                        logger.debug(f"SQLite sync save error: {e}")
+            
+            if synced_count > 0:
+                logger.info(f"📥 BINANCE SYNC: Added {synced_count} missing trades from last {hours_back}h")
+                if global_paper_trader:
+                    global_paper_trader.save_state()
+            
+            return synced_count
+            
+        except Exception as e:
+            logger.error(f"sync_closed_trades_from_binance error: {e}")
+            return 0
 
     def get_status(self) -> dict:
         """Trader durumu."""
@@ -1557,6 +1652,24 @@ async def binance_position_sync_loop():
                     logger.info(f"✅ Sync: ${balance['total']:.2f} | {len(binance_positions)} pos | PnL today=${pnl_data.get('todayPnl', 0):.2f}")
                 except Exception as pe:
                     logger.warning(f"PnL cache refresh failed: {pe}")
+                
+                # ================================================================
+                # Phase 148: Periodic trade history sync from Binance
+                # Runs every 5 minutes (100 loops × 3s = 300s = 5 min)
+                # ================================================================
+                if not hasattr(live_binance_trader, '_trade_sync_counter'):
+                    live_binance_trader._trade_sync_counter = 0
+                
+                live_binance_trader._trade_sync_counter += 1
+                
+                if live_binance_trader._trade_sync_counter >= 100:  # Every 5 minutes
+                    live_binance_trader._trade_sync_counter = 0
+                    try:
+                        synced = await live_binance_trader.sync_closed_trades_from_binance(hours_back=24)
+                        if synced > 0:
+                            logger.info(f"📥 Trade history sync: {synced} new trades added")
+                    except Exception as tse:
+                        logger.warning(f"Trade history sync failed: {tse}")
                 
         except Exception as e:
             logger.error(f"Binance sync error: {e}")
