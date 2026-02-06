@@ -1528,6 +1528,23 @@ async def binance_position_sync_loop():
                 live_binance_trader.last_positions = binance_positions
                 
                 # ================================================================
+                # PHASE XXX: BREAKEVEN STOP & LOSS RECOVERY TRAIL
+                # Check live Binance positions for breakeven and recovery conditions
+                # ================================================================
+                try:
+                    if binance_positions and live_binance_trader.enabled:
+                        # Check breakeven conditions
+                        breakeven_actions = await breakeven_stop_manager.check_positions(binance_positions, live_binance_trader)
+                        if breakeven_actions.get('breakeven_activated') or breakeven_actions.get('breakeven_closed'):
+                            logger.info(f"🔒 Breakeven: activated={breakeven_actions['breakeven_activated']}, closed={breakeven_actions['breakeven_closed']}")
+                        
+                        # Check loss recovery trail conditions
+                        recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
+                        if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
+                            logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
+                except Exception as mgr_err:
+                    logger.warning(f"Position manager error: {mgr_err}")
+                
                 # Phase 72: Sync ALL Binance positions into PaperTradingEngine
                 # This ensures algorithm manages all positions (including manual)
                 # ================================================================
@@ -7512,6 +7529,330 @@ class PortfolioRecoveryManager:
 
 # Global PortfolioRecoveryManager instance
 portfolio_recovery_manager = PortfolioRecoveryManager()
+
+
+# ============================================================================
+# PHASE XXX: BREAKEVEN STOP MANAGER
+# Moves virtual stop to entry price when position reaches profit threshold
+# ============================================================================
+
+class BreakevenStopManager:
+    """
+    Breakeven Stop Management for LIVE Binance positions.
+    
+    When position reaches dynamic profit threshold (based on spread/volatility),
+    activates a virtual stop at entry price. If price returns to entry, closes position.
+    
+    Thresholds:
+    - Very Low spread (BTC/ETH): 0.5% profit → breakeven
+    - Low spread: 0.75% profit → breakeven
+    - Normal spread: 1.0% profit → breakeven  
+    - High spread: 1.5% profit → breakeven
+    - Very High spread (meme): 2.5% profit → breakeven
+    """
+    
+    def __init__(self):
+        # Track breakeven state per position: {symbol: {active: bool, entry_price: float, activation_time: datetime}}
+        self.breakeven_state = {}
+        
+        # Spread-based activation thresholds (% profit needed to activate breakeven)
+        self.activation_thresholds = {
+            'Very Low': 0.5,   # BTC/ETH - 0.5% profit triggers breakeven
+            'Low': 0.75,
+            'Normal': 1.0,
+            'High': 1.5,
+            'Very High': 2.5   # Meme coins - need more room
+        }
+        
+        # Breakeven buffer (slight profit to avoid slippage losses)
+        self.breakeven_buffer_pct = 0.05  # 0.05% above entry
+        
+        logger.info("📊 BreakevenStopManager initialized")
+    
+    async def check_positions(self, positions: list, live_trader) -> dict:
+        """
+        Check all Binance positions for breakeven conditions.
+        
+        Args:
+            positions: List of Binance positions from live_trader.get_positions()
+            live_trader: LiveBinanceTrader instance for closing positions
+            
+        Returns:
+            Summary of actions taken
+        """
+        actions = {
+            "breakeven_activated": [],
+            "breakeven_closed": [],
+            "checked": 0
+        }
+        
+        if not live_trader or not live_trader.enabled:
+            return actions
+        
+        for pos in positions:
+            try:
+                symbol = pos.get('symbol', '')
+                if not symbol:
+                    continue
+                    
+                side = pos.get('side', '')
+                entry_price = float(pos.get('entryPrice', 0))
+                current_price = float(pos.get('markPrice', pos.get('currentPrice', 0)))
+                contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
+                spread_level = pos.get('spread_level', 'Normal')
+                
+                if entry_price <= 0 or current_price <= 0 or contracts == 0:
+                    continue
+                
+                actions["checked"] += 1
+                
+                # Calculate profit percentage
+                if side == 'LONG':
+                    profit_pct = (current_price - entry_price) / entry_price * 100
+                else:  # SHORT
+                    profit_pct = (entry_price - current_price) / entry_price * 100
+                
+                # Get dynamic activation threshold based on spread level
+                activation_threshold = self.activation_thresholds.get(spread_level, 1.0)
+                
+                # State key
+                state_key = f"{symbol}_{side}"
+                
+                # Check if breakeven already activated for this position
+                state = self.breakeven_state.get(state_key, {})
+                
+                if not state.get('active', False):
+                    # Not yet activated - check if we should activate
+                    if profit_pct >= activation_threshold:
+                        # Activate breakeven!
+                        self.breakeven_state[state_key] = {
+                            'active': True,
+                            'entry_price': entry_price,
+                            'activation_price': current_price,
+                            'activation_time': datetime.now(),
+                            'spread_level': spread_level
+                        }
+                        actions["breakeven_activated"].append(symbol)
+                        logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
+                else:
+                    # Breakeven is active - check if price returned to entry
+                    breakeven_price = entry_price * (1 + self.breakeven_buffer_pct / 100) if side == "LONG" else entry_price * (1 - self.breakeven_buffer_pct / 100)
+                    
+                    should_close = False
+                    if side == 'LONG' and current_price <= breakeven_price:
+                        should_close = True
+                    elif side == 'SHORT' and current_price >= breakeven_price:
+                        should_close = True
+                    
+                    if should_close:
+                        # Close at breakeven!
+                        logger.warning(f"🔒 BREAKEVEN CLOSE: {symbol} {side} - price returned to entry")
+                        try:
+                            result = await live_trader.close_position(symbol, side, abs(contracts))
+                            if result:
+                                actions["breakeven_closed"].append(symbol)
+                                # Clear state
+                                del self.breakeven_state[state_key]
+                                logger.warning(f"✅ BREAKEVEN CLOSE SUCCESS: {symbol}")
+                            else:
+                                logger.error(f"❌ BREAKEVEN CLOSE FAILED: {symbol}")
+                        except Exception as e:
+                            logger.error(f"❌ BREAKEVEN CLOSE ERROR: {symbol} - {e}")
+                
+            except Exception as e:
+                logger.warning(f"Breakeven check error for position: {e}")
+        
+        return actions
+    
+    def get_status(self) -> dict:
+        """Get current breakeven status for UI."""
+        return {
+            "type": "BREAKEVEN_STOP",
+            "active_breakevens": len([s for s in self.breakeven_state.values() if s.get('active')]),
+            "positions_tracked": list(self.breakeven_state.keys())
+        }
+
+
+# Global BreakevenStopManager instance
+breakeven_stop_manager = BreakevenStopManager()
+
+
+# ============================================================================
+# PHASE XXX: LOSS RECOVERY TRAIL MANAGER  
+# Trails from loss recovery - when position recovers from deep loss, trail to lock in recovery
+# ============================================================================
+
+class LossRecoveryTrailManager:
+    """
+    Loss Recovery Trailing for LIVE Binance positions.
+    
+    When position is in deep loss but starts recovering, activates trailing to lock in recovery.
+    
+    Logic:
+    1. Position must be in significant loss (> threshold based on spread)
+    2. Position must recover at least 30% of the loss
+    3. Activate trailing - if gives back 50% of recovery, close
+    
+    Dynamic thresholds based on spread:
+    - Very Low spread: -3% loss triggers, trail after -2% recovery
+    - Low spread: -4% loss triggers
+    - Normal spread: -5% loss triggers  
+    - High spread: -7% loss triggers
+    - Very High spread: -10% loss triggers
+    """
+    
+    def __init__(self):
+        # Track recovery state: {symbol: {peak_loss: float, peak_recovery: float, trail_active: bool}}
+        self.recovery_state = {}
+        
+        # Spread-based loss thresholds (how deep loss before recovery tracking)
+        self.loss_thresholds = {
+            'Very Low': -3.0,   # BTC/ETH
+            'Low': -4.0,
+            'Normal': -5.0,
+            'High': -7.0,
+            'Very High': -10.0  # Meme coins - need more room
+        }
+        
+        # Recovery percentages
+        self.recovery_activation_pct = 0.30  # Must recover 30% of loss to activate trail
+        self.trail_giveback_pct = 0.50       # Close if gives back 50% of recovery
+        
+        logger.info("📊 LossRecoveryTrailManager initialized")
+    
+    async def check_positions(self, positions: list, live_trader) -> dict:
+        """
+        Check all Binance positions for loss recovery conditions.
+        
+        Args:
+            positions: List of Binance positions from live_trader.get_positions()
+            live_trader: LiveBinanceTrader instance for closing positions
+            
+        Returns:
+            Summary of actions taken
+        """
+        actions = {
+            "recovery_tracking": [],
+            "recovery_trail_activated": [],
+            "recovery_closed": [],
+            "checked": 0
+        }
+        
+        if not live_trader or not live_trader.enabled:
+            return actions
+        
+        for pos in positions:
+            try:
+                symbol = pos.get('symbol', '')
+                if not symbol:
+                    continue
+                    
+                side = pos.get('side', '')
+                entry_price = float(pos.get('entryPrice', 0))
+                current_price = float(pos.get('markPrice', pos.get('currentPrice', 0)))
+                contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
+                spread_level = pos.get('spread_level', 'Normal')
+                
+                if entry_price <= 0 or current_price <= 0 or contracts == 0:
+                    continue
+                
+                actions["checked"] += 1
+                
+                # Calculate profit percentage (negative = loss)
+                if side == 'LONG':
+                    pnl_pct = (current_price - entry_price) / entry_price * 100
+                else:  # SHORT
+                    pnl_pct = (entry_price - current_price) / entry_price * 100
+                
+                # Get dynamic loss threshold based on spread level
+                loss_threshold = self.loss_thresholds.get(spread_level, -5.0)
+                
+                # State key
+                state_key = f"{symbol}_{side}"
+                state = self.recovery_state.get(state_key, {})
+                
+                # === PHASE 1: Track peak loss ===
+                if pnl_pct < loss_threshold:
+                    # Position is in deep loss - start tracking
+                    peak_loss = min(state.get('peak_loss', 0), pnl_pct)
+                    self.recovery_state[state_key] = {
+                        'peak_loss': peak_loss,
+                        'peak_recovery': pnl_pct,  # Will be updated if recovers
+                        'trail_active': False,
+                        'spread_level': spread_level
+                    }
+                    if state_key not in [a for a in actions["recovery_tracking"]]:
+                        actions["recovery_tracking"].append(symbol)
+                
+                # === PHASE 2: Track recovery and activate trail ===
+                elif state.get('peak_loss', 0) < loss_threshold:
+                    peak_loss = state['peak_loss']
+                    
+                    # How much have we recovered?
+                    recovery_amount = pnl_pct - peak_loss  # Always positive if recovering
+                    total_loss_amount = abs(peak_loss)
+                    recovery_ratio = recovery_amount / total_loss_amount if total_loss_amount > 0 else 0
+                    
+                    # Update peak recovery if higher
+                    peak_recovery = max(state.get('peak_recovery', peak_loss), pnl_pct)
+                    state['peak_recovery'] = peak_recovery
+                    
+                    if not state.get('trail_active', False):
+                        # Check if we should activate trail
+                        if recovery_ratio >= self.recovery_activation_pct:
+                            state['trail_active'] = True
+                            state['trail_activation_pnl'] = pnl_pct
+                            self.recovery_state[state_key] = state
+                            actions["recovery_trail_activated"].append(symbol)
+                            logger.warning(f"🔄 RECOVERY TRAIL ACTIVATED: {symbol} {side} peak_loss={peak_loss:.2f}% current={pnl_pct:.2f}% recovered={recovery_ratio*100:.0f}%")
+                    else:
+                        # Trail is active - check if giving back too much
+                        peak_recovery_pnl = state['peak_recovery']
+                        recovery_from_peak = peak_recovery_pnl - peak_loss
+                        current_recovery = pnl_pct - peak_loss
+                        
+                        giveback_ratio = 1 - (current_recovery / recovery_from_peak) if recovery_from_peak > 0 else 0
+                        
+                        if giveback_ratio >= self.trail_giveback_pct:
+                            # Gave back too much - CLOSE!
+                            logger.warning(f"🔄 RECOVERY TRAIL CLOSE: {symbol} {side} - gave back {giveback_ratio*100:.0f}% of recovery")
+                            try:
+                                result = await live_trader.close_position(symbol, side, abs(contracts))
+                                if result:
+                                    actions["recovery_closed"].append(symbol)
+                                    # Clear state
+                                    del self.recovery_state[state_key]
+                                    logger.warning(f"✅ RECOVERY CLOSE SUCCESS: {symbol}")
+                                else:
+                                    logger.error(f"❌ RECOVERY CLOSE FAILED: {symbol}")
+                            except Exception as e:
+                                logger.error(f"❌ RECOVERY CLOSE ERROR: {symbol} - {e}")
+                        
+                        self.recovery_state[state_key] = state
+                
+                # === PHASE 3: Clear state if position turned profitable ===
+                elif pnl_pct > 0 and state_key in self.recovery_state:
+                    # Position is now profitable - clear recovery state
+                    del self.recovery_state[state_key]
+                    logger.info(f"📈 RECOVERY CLEARED: {symbol} now profitable at {pnl_pct:.2f}%")
+                
+            except Exception as e:
+                logger.warning(f"Recovery trail check error for position: {e}")
+        
+        return actions
+    
+    def get_status(self) -> dict:
+        """Get current recovery trail status for UI."""
+        return {
+            "type": "LOSS_RECOVERY_TRAIL",
+            "tracking_count": len(self.recovery_state),
+            "trail_active_count": len([s for s in self.recovery_state.values() if s.get('trail_active')]),
+            "positions_tracked": list(self.recovery_state.keys())
+        }
+
+
+# Global LossRecoveryTrailManager instance
+loss_recovery_trail_manager = LossRecoveryTrailManager()
 
 
 # ============================================================================
