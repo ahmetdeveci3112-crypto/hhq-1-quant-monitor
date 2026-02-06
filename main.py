@@ -618,23 +618,29 @@ class LiveBinanceTrader:
             
         try:
             positions = await self.exchange.fetch_positions()
-            logger.info(f"fetch_positions returned {len(positions)} items")
+            logger.info(f"fetch_positions returned {len(positions)} items from CCXT")
             result = []
+            skipped_count = 0
             
             for p in positions:
                 contracts = float(p.get('contracts') or 0)
-                if abs(contracts) > 0:
+                notional = float(p.get('notional') or 0)
+                raw_info = p.get('info', {})
+                raw_position_amt = float(raw_info.get('positionAmt', 0) or 0)
+                
+                # Check if position is active using multiple indicators
+                # Some CCXT versions may not populate 'contracts' correctly
+                is_active = abs(contracts) > 0 or abs(notional) > 0 or abs(raw_position_amt) > 0
+                
+                if is_active:
                     # CCXT symbol format: BTC/USDT:USDT -> BTCUSDT
                     symbol = p.get('symbol', '').replace('/USDT:USDT', 'USDT')
                     
-                    # Get raw Binance info for accurate data
-                    raw_info = p.get('info', {})
                     
                     # Determine side correctly:
                     # 1. Check CCXT side field first
                     # 2. Fall back to raw Binance positionAmt (negative = SHORT)
                     ccxt_side = p.get('side', '').upper()
-                    raw_position_amt = float(raw_info.get('positionAmt', 0) or 0)
                     
                     if ccxt_side in ['LONG', 'SHORT']:
                         side = ccxt_side
@@ -4339,6 +4345,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 ui_state_cache.live_balance = balance_data
                 ui_state_cache.positions = sorted(positions, key=lambda p: p.get('openTime', 0), reverse=True)
                 ui_state_cache.trading_mode = "live"
+                logger.info(f"📊 UI Cache updated: {len(positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
                 
                 # Cache PnL data (don't fetch every cycle - expensive)
                 if not ui_state_cache._initialized or datetime.now().timestamp() - ui_state_cache.last_update > 30:

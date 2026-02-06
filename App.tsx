@@ -1089,7 +1089,7 @@ export default function App() {
                     <div className="col-span-2">
                       <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
                       <div className="text-2xl font-bold text-white font-mono">
-                        {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                        {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                         <span className="text-sm text-slate-500 ml-1">USDT</span>
                       </div>
                     </div>
@@ -1099,8 +1099,8 @@ export default function App() {
                     </div>
                     <div>
                       <div className="text-xs text-slate-500 uppercase">Unrealized</div>
-                      <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                      <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                       </div>
                     </div>
                     <div>
@@ -1112,7 +1112,7 @@ export default function App() {
                     <div>
                       <div className="text-xs text-slate-500 uppercase">Used Margin</div>
                       <div className="text-base font-semibold text-amber-400 font-mono">
-                        {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                        {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                       </div>
                     </div>
                     <div>
@@ -1147,7 +1147,7 @@ export default function App() {
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
                         <div className="text-xl font-bold text-white font-mono">
-                          {formatCurrency(portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                          {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                           <span className="text-xs text-slate-500 ml-1">USDT</span>
                         </div>
                       </div>
@@ -1158,8 +1158,8 @@ export default function App() {
                       </div>
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>
-                        <div className={`text-base font-semibold font-mono ${portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0) >= 0 ? '+' : ''}{formatCurrency(portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
+                        <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                         </div>
                       </div>
                     </div>
@@ -1173,7 +1173,7 @@ export default function App() {
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Used Margin</div>
                         <div className="text-base font-semibold text-amber-400 font-mono">
-                          {formatCurrency(portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                          {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                         </div>
                       </div>
                       <div>
