@@ -1673,11 +1673,31 @@ async def binance_position_sync_loop():
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
                                 
-                                # FIX: Initialize trailDistance if missing (for old positions)
+                                # FIX: Initialize trail params if missing (for old positions)
+                                pos_atr = pos.get('atr', pos['entryPrice'] * 0.02)
+                                
                                 if not pos.get('trailDistance'):
-                                    pos_atr = pos.get('atr', pos['entryPrice'] * 0.02)
                                     pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr
                                     logger.info(f"📊 Trail fix: {symbol} trailDistance set to {pos['trailDistance']:.6f}")
+                                
+                                # FIX: For profitable positions, adjust trailActivation to entry so trail can activate
+                                mark_price = bp.get('markPrice', pos.get('markPrice', 0))
+                                entry_price = pos.get('entryPrice', 0)
+                                current_activation = pos.get('trailActivation', 0)
+                                
+                                if mark_price > 0 and entry_price > 0:
+                                    if pos['side'] == 'LONG' and mark_price > entry_price:
+                                        # Profitable LONG - set activation at entry to enable trail
+                                        if current_activation > mark_price:  # Activation too high
+                                            pos['trailActivation'] = entry_price
+                                            pos['isTrailingActive'] = True
+                                            logger.info(f"📊 Trail fix: {symbol} LONG profitable - trail activated!")
+                                    elif pos['side'] == 'SHORT' and mark_price < entry_price:
+                                        # Profitable SHORT - set activation at entry to enable trail
+                                        if current_activation < mark_price:  # Activation too low
+                                            pos['trailActivation'] = entry_price
+                                            pos['isTrailingActive'] = True
+                                            logger.info(f"📊 Trail fix: {symbol} SHORT profitable - trail activated!")
                                 break
                 
                 # ================================================================
