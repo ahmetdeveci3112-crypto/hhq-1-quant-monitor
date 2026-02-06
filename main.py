@@ -1647,6 +1647,7 @@ async def binance_position_sync_loop():
                             'stopLoss': stop_loss,
                             'takeProfit': take_profit,
                             'trailActivation': trail_activation,
+                            'trailDistance': atr * global_paper_trader.trail_distance_atr,  # FIX: Was missing!
                             'trailingStop': stop_loss,
                             'isTrailingActive': False,
                             'slConfirmCount': 0,
@@ -1671,6 +1672,12 @@ async def binance_position_sync_loop():
                                 pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
+                                
+                                # FIX: Initialize trailDistance if missing (for old positions)
+                                if not pos.get('trailDistance'):
+                                    pos_atr = pos.get('atr', pos['entryPrice'] * 0.02)
+                                    pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr
+                                    logger.info(f"📊 Trail fix: {symbol} trailDistance set to {pos['trailDistance']:.6f}")
                                 break
                 
                 # ================================================================
