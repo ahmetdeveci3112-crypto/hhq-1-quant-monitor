@@ -1528,6 +1528,51 @@ async def binance_position_sync_loop():
                 live_binance_trader.last_positions = binance_positions
                 
                 # ================================================================
+                # PHASE XXX: ENRICH POSITIONS WITH DYNAMIC SPREAD LEVEL
+                # Calculate spread_level from coin volatility (ATR %)
+                # ================================================================
+                for bp in binance_positions:
+                    try:
+                        symbol = bp.get('symbol', '')
+                        # Try to get analyzer for this coin to calculate volatility
+                        analyzer = multi_coin_scanner.analyzers.get(symbol) if hasattr(multi_coin_scanner, 'analyzers') else None
+                        
+                        if analyzer and hasattr(analyzer, 'highs') and hasattr(analyzer, 'lows') and hasattr(analyzer, 'closes'):
+                            # Calculate spread level from actual candle data
+                            highs = list(analyzer.highs)
+                            lows = list(analyzer.lows)
+                            closes = list(analyzer.closes)
+                            
+                            if len(closes) >= 14:
+                                atr_pct = calculate_atr_percentage(symbol, highs, lows, closes)
+                                bp['spread_level'] = calculate_spread_level(atr_pct=atr_pct)
+                                bp['atr_pct'] = atr_pct
+                            else:
+                                bp['spread_level'] = 'Normal'
+                                bp['atr_pct'] = 2.0
+                        else:
+                            # No analyzer - estimate from entry price (meme coins often have low prices)
+                            entry_price = float(bp.get('entryPrice', 1))
+                            if entry_price > 1000:  # BTC, ETH
+                                bp['spread_level'] = 'Very Low'
+                                bp['atr_pct'] = 0.8
+                            elif entry_price > 10:
+                                bp['spread_level'] = 'Low'
+                                bp['atr_pct'] = 1.5
+                            elif entry_price > 0.1:
+                                bp['spread_level'] = 'Normal'
+                                bp['atr_pct'] = 3.0
+                            elif entry_price > 0.001:
+                                bp['spread_level'] = 'High'
+                                bp['atr_pct'] = 5.0
+                            else:
+                                bp['spread_level'] = 'Very High'
+                                bp['atr_pct'] = 10.0
+                    except Exception as enrich_err:
+                        bp['spread_level'] = 'Normal'
+                        bp['atr_pct'] = 2.0
+                
+                # ================================================================
                 # PHASE XXX: BREAKEVEN STOP & LOSS RECOVERY TRAIL
                 # Check live Binance positions for breakeven and recovery conditions
                 # ================================================================
@@ -2007,6 +2052,104 @@ def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> tu
     except Exception as e:
         logger.warning(f"ADX calculation error: {e}")
         return 25.0, "NEUTRAL", 0.0, 0.0
+
+
+# ============================================================================
+# DYNAMIC SPREAD LEVEL CALCULATION - Based on ATR/Volatility
+# ============================================================================
+
+def calculate_spread_level(atr_pct: float = None, highs: list = None, lows: list = None, closes: list = None) -> str:
+    """
+    Calculate spread level based on price volatility (ATR as % of price).
+    
+    Args:
+        atr_pct: Pre-calculated ATR as percentage of price (optional)
+        highs, lows, closes: Raw price data to calculate volatility (optional)
+        
+    Returns:
+        Spread level: 'Very Low', 'Low', 'Normal', 'High', 'Very High'
+        
+    Thresholds (based on typical crypto volatility):
+    - Very Low: ATR < 1% (BTC, ETH)
+    - Low: ATR 1-2%
+    - Normal: ATR 2-4%
+    - High: ATR 4-7%  
+    - Very High: ATR > 7% (meme coins)
+    """
+    
+    # Calculate volatility from candle data if not provided
+    if atr_pct is None and highs and lows and closes:
+        try:
+            n = min(len(highs), len(lows), len(closes))
+            if n >= 14:
+                # Calculate ATR from last 14 candles
+                tr_values = []
+                for i in range(1, min(15, n)):
+                    tr = max(
+                        highs[-i] - lows[-i],
+                        abs(highs[-i] - closes[-i-1]) if i < n-1 else highs[-i] - lows[-i],
+                        abs(lows[-i] - closes[-i-1]) if i < n-1 else highs[-i] - lows[-i]
+                    )
+                    tr_values.append(tr)
+                
+                if tr_values:
+                    atr = sum(tr_values) / len(tr_values)
+                    price = closes[-1] if closes else 1
+                    atr_pct = (atr / price * 100) if price > 0 else 2.0
+        except Exception:
+            pass
+    
+    # Default to Normal if calculation failed
+    if atr_pct is None:
+        return 'Normal'
+    
+    # Map ATR percentage to spread level
+    if atr_pct < 1.0:
+        return 'Very Low'   # BTC, ETH - stable majors
+    elif atr_pct < 2.0:
+        return 'Low'        # Large caps
+    elif atr_pct < 4.0:
+        return 'Normal'     # Mid caps
+    elif atr_pct < 7.0:
+        return 'High'       # Small caps, volatile
+    else:
+        return 'Very High'  # Meme coins, very volatile
+
+
+def calculate_atr_percentage(symbol: str, highs: list, lows: list, closes: list, period: int = 14) -> float:
+    """
+    Calculate ATR as percentage of current price.
+    Used for dynamic spread level and position management.
+    
+    Returns: ATR percentage (e.g., 2.5 means 2.5% volatility)
+    """
+    if len(closes) < period + 1:
+        return 2.0  # Default to 2% if not enough data
+    
+    try:
+        tr_values = []
+        for i in range(1, min(period + 1, len(closes))):
+            tr = max(
+                highs[-i] - lows[-i],
+                abs(highs[-i] - closes[-i-1]),
+                abs(lows[-i] - closes[-i-1])
+            )
+            tr_values.append(tr)
+        
+        if not tr_values:
+            return 2.0
+            
+        atr = sum(tr_values) / len(tr_values)
+        current_price = closes[-1]
+        
+        if current_price <= 0:
+            return 2.0
+            
+        return (atr / current_price) * 100
+        
+    except Exception as e:
+        logger.warning(f"ATR percentage calculation error for {symbol}: {e}")
+        return 2.0
 
 
 # ============================================================================
