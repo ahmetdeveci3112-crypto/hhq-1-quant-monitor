@@ -800,6 +800,42 @@ class LiveBinanceTrader:
                                 logger.debug(f"  📉 {symbol} SHORT trailing stop lowered to ${trailing_stop:.6f}")
                         
                         trailing_stop = trail_state['trailingStop']
+                        
+                        # ================================================================
+                        # Phase 147: Check if trailing stop is HIT and close position
+                        # ================================================================
+                        should_close = False
+                        close_reason = ""
+                        
+                        if side == 'LONG':
+                            # LONG: price drops below trailing stop
+                            if mark_price <= trailing_stop:
+                                should_close = True
+                                close_reason = f"TRAIL_STOP_HIT: mark ${mark_price:.6f} <= trail ${trailing_stop:.6f}"
+                        else:  # SHORT
+                            # SHORT: price rises above trailing stop
+                            if mark_price >= trailing_stop:
+                                should_close = True
+                                close_reason = f"TRAIL_STOP_HIT: mark ${mark_price:.6f} >= trail ${trailing_stop:.6f}"
+                        
+                        if should_close:
+                            logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
+                            logger.warning(f"   📊 ROI: {pnl_percent:.1f}% | PnL: ${unrealized_pnl:.2f}")
+                            
+                            # Queue for closing - don't close directly in get_positions to avoid blocking
+                            if not hasattr(self, 'pending_closes'):
+                                self.pending_closes = []
+                            
+                            self.pending_closes.append({
+                                'symbol': symbol,
+                                'side': side,
+                                'amount': position_amount,
+                                'reason': close_reason,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            
+                            # Clear trailing state after close triggered
+                            del self.trailing_state[symbol]
                     
                     result.append({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
@@ -827,6 +863,14 @@ class LiveBinanceTrader:
                         'isTrailingActive': is_trailing_active,
                         'atr': estimated_atr
                     })
+            
+            # Phase 147: Process pending closes
+            if hasattr(self, 'pending_closes') and self.pending_closes:
+                for close_order in self.pending_closes:
+                    logger.info(f"🔄 Processing pending close: {close_order['symbol']}")
+                    # Note: This will be executed on next tick - positions will close async
+                    asyncio.create_task(self._execute_pending_close(close_order))
+                self.pending_closes = []
             
             logger.info(f"get_positions returning {len(result)} active positions")
             self.last_positions = result
@@ -937,6 +981,30 @@ class LiveBinanceTrader:
             
         except Exception as e:
             logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} | Error: {e}")
+            return None
+    
+    async def _execute_pending_close(self, close_order: dict):
+        """Execute a pending close order from trailing stop hit."""
+        try:
+            symbol = close_order['symbol']
+            side = close_order['side']
+            amount = close_order['amount']
+            reason = close_order['reason']
+            
+            logger.info(f"🔴 EXECUTING TRAIL CLOSE: {symbol} {side}")
+            logger.info(f"   📋 Reason: {reason}")
+            
+            result = await self.close_position(symbol, side, amount)
+            
+            if result:
+                logger.info(f"✅ TRAIL CLOSE SUCCESS: {symbol} | Order ID: {result.get('id')}")
+            else:
+                logger.error(f"❌ TRAIL CLOSE FAILED: {symbol}")
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ _execute_pending_close error: {e}")
             return None
     
     async def close_all_positions(self) -> list:
