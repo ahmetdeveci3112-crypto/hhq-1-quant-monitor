@@ -617,6 +617,71 @@ class LiveBinanceTrader:
             return []
             
         try:
+            # Use Binance fapiPrivateV2GetPositionRisk directly - fapiPrivateGetAccount returns 404
+            raw_positions = None
+            try:
+                raw_positions = await self.exchange.fapiPrivateV2GetPositionRisk()
+                logger.info(f"Binance API returned {len(raw_positions)} position entries")
+            except Exception as e:
+                logger.warning(f"Direct API failed ({e}), using CCXT fetch_positions")
+                raw_positions = None
+            
+            if raw_positions:
+                # Process direct Binance API response
+                result = []
+                skipped_symbols = []
+                for p in raw_positions:
+                    position_amt = float(p.get('positionAmt', 0) or 0)
+                    symbol = p.get('symbol', '')
+                    if abs(position_amt) > 0:
+                        symbol = p.get('symbol', '')
+                        side = 'LONG' if position_amt > 0 else 'SHORT'
+                        entry_price = float(p.get('entryPrice', 0) or 0)
+                        unrealized_pnl = float(p.get('unRealizedProfit', 0) or 0)
+                        notional = abs(float(p.get('notional', 0) or 0))
+                        leverage = int(p.get('leverage', 1) or 1)
+                        position_margin = float(p.get('isolatedMargin', 0) or p.get('initialMargin', 0) or 0)
+                        if position_margin == 0 and notional > 0 and leverage > 0:
+                            position_margin = notional / leverage
+                        
+                        # Calculate PnL percentage
+                        pnl_percent = (unrealized_pnl / position_margin * 100) if position_margin > 0 else 0
+                        
+                        result.append({
+                            'symbol': symbol,
+                            'side': side,
+                            'entryPrice': entry_price,
+                            'sizeUsd': notional,
+                            'unrealizedPnl': unrealized_pnl,
+                            'pnlPercent': pnl_percent,
+                            'leverage': leverage,
+                            'initialMargin': position_margin,
+                            'contracts': abs(position_amt),
+                            'openTime': int(datetime.now().timestamp() * 1000)  # Will be updated below
+                        })
+                    else:
+                        # Track symbols with 0 positionAmt
+                        if symbol.endswith('USDT'):
+                            skipped_symbols.append(f"{symbol}:{position_amt}")
+                            # Log detailed info for suspected missing positions
+                            if any(x in symbol for x in ['HANA', 'BUSDT', 'FLOKI', 'PORTAL', 'MEGA']):
+                                notional = float(p.get('notional', 0) or 0)
+                                entry = float(p.get('entryPrice', 0) or 0)
+                                pnl = float(p.get('unRealizedProfit', 0) or 0)
+                                logger.warning(f"🔍 Suspected missing: {symbol} posAmt={position_amt} notional={notional} entry={entry} pnl={pnl}")
+                
+                # Log any skipped USDT symbols (these might be the missing ones)
+                if skipped_symbols:
+                    logger.info(f"⚠️ Skipped {len(skipped_symbols)} positions with positionAmt=0")
+                
+                # Log ALL active position symbols for debugging
+                active_symbols = sorted([r['symbol'] for r in result])
+                logger.info(f"📋 Active positions ({len(result)}): {', '.join(active_symbols)}")
+                
+                logger.info(f"get_positions returning {len(result)} active positions (direct API)")
+                return sorted(result, key=lambda x: x.get('openTime', 0), reverse=True)
+            
+            # Fallback to CCXT if direct API failed
             positions = await self.exchange.fetch_positions()
             logger.info(f"fetch_positions returned {len(positions)} items from CCXT")
             result = []
@@ -1832,20 +1897,28 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
 # ADX (Average Directional Index) CALCULATION - Phase 137
 # ============================================================================
 
-def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
+def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> tuple:
     """
-    Calculate Average Directional Index (ADX) for trend strength measurement.
+    Calculate Average Directional Index (ADX) for trend strength and direction.
     
     Phase 137: ADX + Hurst kombinasyonu ile regime detection.
+    Phase XXX: Extended to return trend direction for signal filtering.
     
     ADX > 25 → Güçlü trend (mean reversion riskli)
     ADX < 20 → Zayıf trend / Range (mean reversion için ideal)
     ADX 20-25 → Geçiş bölgesi
+    
+    Returns:
+        tuple: (adx, trend_direction, plus_di, minus_di)
+        - adx: Trend strength (5-80)
+        - trend_direction: "BULLISH" if +DI > -DI, "BEARISH" if -DI > +DI, else "NEUTRAL"
+        - plus_di: Positive Directional Indicator
+        - minus_di: Negative Directional Indicator
     """
     n = len(highs)
     
     if n < period + 1:
-        return 25.0  # Neutral default
+        return 25.0, "NEUTRAL", 0.0, 0.0  # Neutral default
     
     try:
         highs_arr = np.array(highs)
@@ -1882,13 +1955,13 @@ def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> fl
             tr.append(tr_val)
         
         if len(tr) < period:
-            return 25.0
+            return 25.0, "NEUTRAL", 0.0, 0.0
         
         # Smoothed averages (Wilder's smoothing - period average)
         atr = sum(tr[-period:]) / period
         
         if atr == 0:
-            return 25.0
+            return 25.0, "NEUTRAL", 0.0, 0.0
         
         plus_di = 100 * sum(plus_dm[-period:]) / (atr * period)
         minus_di = 100 * sum(minus_dm[-period:]) / (atr * period)
@@ -1896,18 +1969,27 @@ def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> fl
         # DX hesapla
         di_sum = plus_di + minus_di
         if di_sum == 0:
-            return 25.0
+            return 25.0, "NEUTRAL", plus_di, minus_di
         
         dx = abs(plus_di - minus_di) / di_sum * 100
         
         # Clamp to reasonable bounds
         adx = max(5.0, min(80.0, dx))
         
-        return round(adx, 1)
+        # Determine trend direction based on +DI vs -DI
+        di_diff = plus_di - minus_di
+        if di_diff > 5:  # Significant bullish directional movement
+            trend_direction = "BULLISH"
+        elif di_diff < -5:  # Significant bearish directional movement
+            trend_direction = "BEARISH"
+        else:
+            trend_direction = "NEUTRAL"
+        
+        return round(adx, 1), trend_direction, round(plus_di, 1), round(minus_di, 1)
         
     except Exception as e:
         logger.warning(f"ADX calculation error: {e}")
-        return 25.0
+        return 25.0, "NEUTRAL", 0.0, 0.0
 
 
 # ============================================================================
@@ -3219,13 +3301,14 @@ class LightweightCoinAnalyzer:
                 logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} closes={closes_count}/40 needed")
         atr = calculate_atr(highs_list, lows_list, closes_list)
         
-        # Phase 137: Calculate ADX for regime detection
-        adx = calculate_adx(highs_list, lows_list, closes_list)
+        # Phase 137: Calculate ADX for regime detection - now returns tuple with trend direction
+        adx, adx_trend, plus_di, minus_di = calculate_adx(highs_list, lows_list, closes_list)
         
         self.opportunity.hurst = hurst
         self.opportunity.zscore = zscore
         self.opportunity.atr = atr
         self.opportunity.adx = adx  # Phase 137: ADX for regime detection
+        self.opportunity.adx_trend = adx_trend  # Trend direction: BULLISH/BEARISH/NEUTRAL
         self.opportunity.imbalance = imbalance
         
         # Phase 35: Calculate volatility as ATR percentage of price
@@ -3256,11 +3339,11 @@ class LightweightCoinAnalyzer:
             rsi_value = calculate_rsi(prices_list, period=14)
         
         # Calculate Volume Ratio for Layer 11 scoring
-        # Phase 123: Disabled faulty spike detection (mismatched units)
-        # We now use 24h Volume > $5M filter in generate_signal instead
-        volume_ratio = 1.0 
-        # if len(self.volumes) >= 21:
-        #    is_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
+        # Phase XXX: Re-enabled volume spike detection for breakout warning
+        volume_ratio = 1.0
+        is_volume_spike = False
+        if len(self.volumes) >= 21:
+            is_volume_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
         
         # Update coin-specific statistics for dynamic thresholds
         self.rsi_history.append(rsi_value)
@@ -3279,7 +3362,7 @@ class LightweightCoinAnalyzer:
         # Get coin's own daily trend (not BTC's)
         coin_daily_trend, coin_daily_change = self.get_daily_trend()
         
-        # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend
+        # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
@@ -3297,7 +3380,10 @@ class LightweightCoinAnalyzer:
             sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
             coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
             coin_daily_trend=coin_daily_trend,  # Coin's own daily trend (not BTC's)
-            volume_24h=self.opportunity.volume_24h  # Phase 123: Pass 24h volume
+            volume_24h=self.opportunity.volume_24h,  # Phase 123: Pass 24h volume
+            adx=adx,  # ADX value for trend strength
+            adx_trend=adx_trend,  # Trend direction: BULLISH/BEARISH/NEUTRAL
+            is_volume_spike=is_volume_spike  # Volume breakout detection
         )
         
         if signal:
@@ -9087,7 +9173,10 @@ class SignalGenerator:
         sweep_result: Optional[Dict] = None,  # Liquidity sweep detection result
         coin_stats: Optional[Dict] = None,  # Coin-specific stats for dynamic thresholds
         coin_daily_trend: str = "NEUTRAL",  # Coin's own daily trend
-        volume_24h: float = 0.0  # Phase 123: 24h Volume for liquidity check
+        volume_24h: float = 0.0,  # Phase 123: 24h Volume for liquidity check
+        adx: float = 25.0,  # ADX value for trend strength
+        adx_trend: str = "NEUTRAL",  # Trend direction: BULLISH/BEARISH/NEUTRAL
+        is_volume_spike: bool = False  # Volume breakout detection
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -9190,6 +9279,36 @@ class SignalGenerator:
         
         if signal_side is None:
             return None
+        
+        # =====================================================================
+        # STRONG TREND PROTECTION (ADX-based filter)
+        # When ADX > 30, it indicates a strong trend - reject counter-trend signals
+        # This prevents losses like LYNUSDT SHORT during strong bullish rallies
+        # =====================================================================
+        ADX_STRONG_TREND_THRESHOLD = 30  # ADX above this = strong trend
+        
+        if adx > ADX_STRONG_TREND_THRESHOLD:
+            # Strong trend detected - reject signals against the trend
+            if adx_trend == "BULLISH" and signal_side == "SHORT":
+                logger.warning(f"⚠️ STRONG_TREND_FILTER: Rejecting {symbol} SHORT - ADX={adx:.1f} trend={adx_trend}")
+                return None
+            elif adx_trend == "BEARISH" and signal_side == "LONG":
+                logger.warning(f"⚠️ STRONG_TREND_FILTER: Rejecting {symbol} LONG - ADX={adx:.1f} trend={adx_trend}")
+                return None
+            else:
+                # Signal aligns with trend - this is good, add bonus
+                score += 5
+                reasons.append(f"ADX_ALIGN({adx:.0f})")
+        
+        # Volume spike warning (for breakout detection)
+        if is_volume_spike:
+            # Volume spike during strong trend = breakout confirmation
+            if adx > 25:
+                score += 5  # Trend + volume spike = strong continuation
+                reasons.append(f"VOL_SPIKE(trend)")
+            else:
+                # Volume spike without clear trend - could be reversal or manipulation
+                logger.info(f"📊 VOLUME_SPIKE: {symbol} vol_ratio={volume_ratio:.1f}x without strong trend")
         
         # Phase 128: TRACE LOG - every signal that passes Z-Score threshold
         logger.info(f"🎯 Z_PASS: {symbol} {signal_side} Z={zscore:.2f} H={hurst:.2f} score={score}")
