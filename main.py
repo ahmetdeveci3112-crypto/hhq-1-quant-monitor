@@ -4888,19 +4888,34 @@ async def background_scanner_loop():
                             trail_distance = pos.get('trailDistance', 0)
                             
                             # ===================================================================
-                            # DYNAMIC TRAILING: Kâr arttıkça trail mesafesi küçülür
+                            # VOLATILITY-BASED TRAIL: Coin volatilitesine göre trail mesafesi
+                            # Düşük volatilite (BTC/ETH) = sıkı trail, Yüksek volatilite = geniş trail
+                            # ===================================================================
+                            spread_level = pos.get('spread_level', 'Normal')
+                            volatility_multipliers = {
+                                'Very Low': 0.7,    # BTC, ETH - sıkı trail (ani spike yok)
+                                'Low': 0.85,        # Major altcoinler
+                                'Normal': 1.0,      # Orta volatilite
+                                'High': 1.3,        # Yüksek volatilite
+                                'Very High': 1.6    # Meme coins - geniş trail (volatilite yüksek)
+                            }
+                            volatility_mult = volatility_multipliers.get(spread_level, 1.0)
+                            volatility_adjusted_distance = trail_distance * volatility_mult
+                            
+                            # ===================================================================
+                            # PROFIT-BASED TRAIL: Kâr arttıkça trail mesafesi sıkılaşır
                             # %2-5 kâr: standart, %5-10: sıkı, %10+: çok sıkı
                             # ===================================================================
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
                             if pnl_pct >= 10.0:
                                 # Çok yüksek kâr: trail mesafesini %50'ye küçült
-                                dynamic_trail_distance = trail_distance * 0.5
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.5
                             elif pnl_pct >= 5.0:
                                 # Yüksek kâr: trail mesafesini %75'e küçült
-                                dynamic_trail_distance = trail_distance * 0.75
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.75
                             else:
-                                # Normal: standart trail mesafesi
-                                dynamic_trail_distance = trail_distance
+                                # Normal: volatilite ayarlı mesafe
+                                dynamic_trail_distance = volatility_adjusted_distance
                             
                             if pos['side'] == 'LONG' and current_price > trail_activation:
                                 new_trailing = current_price - dynamic_trail_distance
@@ -5135,13 +5150,25 @@ async def position_price_update_loop():
                         trail_activation = pos.get('trailActivation', entry_price)
                         trail_distance = pos.get('trailDistance', 0)
                         
+                        # Volatility-based trail distance (same logic as main loop)
+                        spread_level = pos.get('spread_level', 'Normal')
+                        volatility_multipliers = {
+                            'Very Low': 0.7,    # BTC, ETH - sıkı trail
+                            'Low': 0.85,
+                            'Normal': 1.0,
+                            'High': 1.3,
+                            'Very High': 1.6    # Meme coins - geniş trail
+                        }
+                        volatility_mult = volatility_multipliers.get(spread_level, 1.0)
+                        dynamic_trail_distance = trail_distance * volatility_mult
+                        
                         if pos['side'] == 'LONG' and current_price > trail_activation:
-                            new_trailing = current_price - trail_distance
+                            new_trailing = current_price - dynamic_trail_distance
                             if new_trailing > trailing_stop:
                                 pos['trailingStop'] = new_trailing
                                 pos['isTrailingActive'] = True
                         elif pos['side'] == 'SHORT' and current_price < trail_activation:
-                            new_trailing = current_price + trail_distance
+                            new_trailing = current_price + dynamic_trail_distance
                             if new_trailing < trailing_stop:
                                 pos['trailingStop'] = new_trailing
                                 pos['isTrailingActive'] = True
