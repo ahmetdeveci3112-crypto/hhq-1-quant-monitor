@@ -3335,6 +3335,62 @@ class LightweightCoinAnalyzer:
             logger.warning(f"Daily trend calculation error for {self.symbol}: {e}")
             return "NEUTRAL", 0.0
     
+    def calculate_volatility(self) -> tuple:
+        """
+        Close-to-close volatilite hesapla.
+        Log return standard deviation kullanarak gerçek zamanlı volatilite ölçümü.
+        
+        Returns:
+            (volatility_pct: float, trail_multiplier: float)
+            - volatility_pct: Yıllık volatilite yüzdesi (0-200+)
+            - trail_multiplier: Trail distance çarpanı (0.6 - 2.0)
+        """
+        MIN_BARS = 20  # En az 20 bar gerekli
+        
+        if len(self.closes) < MIN_BARS:
+            return 2.0, 1.0  # Yeterli veri yoksa varsayılan
+        
+        try:
+            closes = list(self.closes)
+            
+            # Log returns hesapla: ln(close[i] / close[i-1])
+            log_returns = []
+            for i in range(1, len(closes)):
+                if closes[i-1] > 0 and closes[i] > 0:
+                    log_return = np.log(closes[i] / closes[i-1])
+                    log_returns.append(log_return)
+            
+            if len(log_returns) < MIN_BARS - 1:
+                return 2.0, 1.0
+            
+            # Volatilite = std(log_returns) * sqrt(bars_per_year)
+            # 5 dakika mum → 288 bar/gün → 105,120 bar/yıl
+            std_return = np.std(log_returns)
+            annualized_vol = std_return * np.sqrt(105120) * 100  # Yüzde olarak
+            
+            # Günlük volatilite (daha pratik)
+            daily_vol = std_return * np.sqrt(288) * 100  # % olarak
+            
+            # Trail çarpanı hesapla
+            # Düşük volatilite (<%2 günlük) = sıkı trail (0.6x)
+            # Yüksek volatilite (>%8 günlük) = geniş trail (2.0x)
+            if daily_vol < 1.5:
+                trail_mult = 0.6   # BTC/ETH seviyesi - çok sıkı
+            elif daily_vol < 3.0:
+                trail_mult = 0.8   # Major altcoin
+            elif daily_vol < 5.0:
+                trail_mult = 1.0   # Normal
+            elif daily_vol < 8.0:
+                trail_mult = 1.4   # Volatil
+            else:
+                trail_mult = 2.0   # Meme coin - çok geniş
+            
+            return daily_vol, trail_mult
+            
+        except Exception as e:
+            logger.warning(f"Volatility calculation error for {self.symbol}: {e}")
+            return 2.0, 1.0
+    
     def preload_historical_data(self, ohlcv_data: list):
         """
         Preload historical OHLCV data for immediate Z-Score/Hurst calculation.
@@ -4888,18 +4944,27 @@ async def background_scanner_loop():
                             trail_distance = pos.get('trailDistance', 0)
                             
                             # ===================================================================
-                            # VOLATILITY-BASED TRAIL: Coin volatilitesine göre trail mesafesi
-                            # Düşük volatilite (BTC/ETH) = sıkı trail, Yüksek volatilite = geniş trail
+                            # REAL-TIME VOLATILITY-BASED TRAIL
+                            # ATR yüzdesi üzerinden gerçek zamanlı volatilite hesaplama
                             # ===================================================================
-                            spread_level = pos.get('spread_level', 'Normal')
-                            volatility_multipliers = {
-                                'Very Low': 0.7,    # BTC, ETH - sıkı trail (ani spike yok)
-                                'Low': 0.85,        # Major altcoinler
-                                'Normal': 1.0,      # Orta volatilite
-                                'High': 1.3,        # Yüksek volatilite
-                                'Very High': 1.6    # Meme coins - geniş trail (volatilite yüksek)
-                            }
-                            volatility_mult = volatility_multipliers.get(spread_level, 1.0)
+                            pos_atr = pos.get('atr', entry_price * 0.02)
+                            atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
+                            
+                            # Volatilite çarpanı: ATR % bazlı dinamik hesaplama
+                            # Düşük ATR% (<1.5) = sıkı trail, Yüksek ATR% (>6) = geniş trail
+                            if atr_pct < 1.0:
+                                volatility_mult = 0.6   # BTC/ETH - çok düşük volatilite
+                            elif atr_pct < 1.5:
+                                volatility_mult = 0.75  # Major altcoin
+                            elif atr_pct < 2.5:
+                                volatility_mult = 1.0   # Normal volatilite
+                            elif atr_pct < 4.0:
+                                volatility_mult = 1.3   # Volatil
+                            elif atr_pct < 6.0:
+                                volatility_mult = 1.6   # Yüksek volatilite
+                            else:
+                                volatility_mult = 2.0   # Meme coin - çok yüksek volatilite
+                            
                             volatility_adjusted_distance = trail_distance * volatility_mult
                             
                             # ===================================================================
@@ -5150,16 +5215,23 @@ async def position_price_update_loop():
                         trail_activation = pos.get('trailActivation', entry_price)
                         trail_distance = pos.get('trailDistance', 0)
                         
-                        # Volatility-based trail distance (same logic as main loop)
-                        spread_level = pos.get('spread_level', 'Normal')
-                        volatility_multipliers = {
-                            'Very Low': 0.7,    # BTC, ETH - sıkı trail
-                            'Low': 0.85,
-                            'Normal': 1.0,
-                            'High': 1.3,
-                            'Very High': 1.6    # Meme coins - geniş trail
-                        }
-                        volatility_mult = volatility_multipliers.get(spread_level, 1.0)
+                        # Real-time ATR% based volatility (same as main loop)
+                        pos_atr = pos.get('atr', entry_price * 0.02)
+                        atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
+                        
+                        if atr_pct < 1.0:
+                            volatility_mult = 0.6
+                        elif atr_pct < 1.5:
+                            volatility_mult = 0.75
+                        elif atr_pct < 2.5:
+                            volatility_mult = 1.0
+                        elif atr_pct < 4.0:
+                            volatility_mult = 1.3
+                        elif atr_pct < 6.0:
+                            volatility_mult = 1.6
+                        else:
+                            volatility_mult = 2.0
+                        
                         dynamic_trail_distance = trail_distance * volatility_mult
                         
                         if pos['side'] == 'LONG' and current_price > trail_activation:
