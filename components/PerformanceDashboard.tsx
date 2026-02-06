@@ -32,16 +32,26 @@ const translateReason = (reason: string): string => {
         'SL_HIT': '🛑 SL: Stop Loss Fiyatı Aşıldı',
         'TP_HIT': '✅ TP: Take Profit Fiyatı Yakalandı',
 
+        // ===== BREAKEVEN STOP (YENİ) =====
+        'BREAKEVEN_CLOSE': '🔒 BE: Fiyat Entry\'ye Döndü → Breakeven Kapatma',
+        'BREAKEVEN_ACTIVATED': '🔒 BE: Breakeven Aktif (SL=Entry)',
+
+        // ===== LOSS RECOVERY TRAIL (YENİ) =====
+        'RECOVERY_TRAIL_CLOSE': '🔄 RT: Toparlanmanın %50\'sini Geri Verdi → Kapatma',
+        'RECOVERY_TRAIL_ACTIVATED': '🔄 RT: Derin Zarardan Toparlanma Trailing Başladı',
+
         // ===== KILL SWITCH - GÜNLÜK ZARAR LİMİTİ =====
-        'KILL_SWITCH_FULL': '🚨 KS Tam: Margin Kaybı ≥%50 → Tam Kapatma',
-        'KILL_SWITCH_PARTIAL': '⚠️ KS Kısmi: Margin Kaybı ≥%30 → %50 Küçültme',
+        'KILL_SWITCH_FULL': '🚨 KS: Margin Kaybı ≥%50 → Tam Kapatma',
+        'KILL_SWITCH_PARTIAL': '⚠️ KS: Margin Kaybı ≥%30 → %50 Küçültme',
 
         // ===== TIME-BASED - ZAMAN BAZLI =====
         'TIME_GRADUAL': '⏳ Zaman: 12h Aşımı + 0.3 ATR Geri Çekilme',
         'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Çıkış',
+        'EARLY_TRAIL': '📊 Erken Trail: Kârda Stagnasyon Tespiti',
 
         // ===== RECOVERY & ADVERSE =====
         'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa Dönüş',
+        'RECOVERY_CLOSE_ALL': '🔴 Portfolio Recovery: Tüm Pozisyonlar Kapatıldı',
         'ADVERSE_TIME_EXIT': '📉 Olumsuz: 8h+ Zararda Kaldı',
         'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Limiti',
 
@@ -53,18 +63,25 @@ const translateReason = (reason: string): string => {
         'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
     };
 
-    // Partial match for dynamic reasons
+    // Partial match for dynamic reasons - order matters (most specific first)
+    if (reason?.includes('BREAKEVEN_CLOSE')) return mapping['BREAKEVEN_CLOSE'];
+    if (reason?.includes('BREAKEVEN')) return '🔒 BE: Breakeven Stop Tetiklendi';
+    if (reason?.includes('RECOVERY_TRAIL_CLOSE')) return mapping['RECOVERY_TRAIL_CLOSE'];
+    if (reason?.includes('RECOVERY_TRAIL')) return '🔄 RT: Loss Recovery Trail Aktif';
     if (reason?.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
     if (reason?.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
-    if (reason?.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
+    if (reason?.includes('KILL_SWITCH')) return '🚨 KS: Margin Zarar Limiti Aşıldı';
     if (reason?.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
     if (reason?.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
+    if (reason?.includes('EARLY_TRAIL')) return mapping['EARLY_TRAIL'];
+    if (reason?.includes('RECOVERY_CLOSE_ALL')) return mapping['RECOVERY_CLOSE_ALL'];
     if (reason?.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
     if (reason?.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
     if (reason?.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
 
     return mapping[reason] || reason || '-';
 };
+
 
 export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     const [summary, setSummary] = useState<any>(null);

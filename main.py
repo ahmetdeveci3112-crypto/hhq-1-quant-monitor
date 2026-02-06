@@ -7791,6 +7791,14 @@ class BreakevenStopManager:
                         # Close at breakeven!
                         logger.warning(f"🔒 BREAKEVEN CLOSE: {symbol} {side} - price returned to entry")
                         try:
+                            # Set reason for trade history before closing
+                            pending_close_reasons[symbol] = {
+                                "reason": f"BREAKEVEN_CLOSE: {spread_level} spread, activated at +{activation_threshold}%",
+                                "original_reason": "BREAKEVEN_CLOSE",
+                                "pnl": 0,  # Approximate
+                                "exitPrice": current_price,
+                                "timestamp": int(datetime.now().timestamp() * 1000)
+                            }
                             result = await live_trader.close_position(symbol, side, abs(contracts))
                             if result:
                                 actions["breakeven_closed"].append(symbol)
@@ -7960,6 +7968,14 @@ class LossRecoveryTrailManager:
                             # Gave back too much - CLOSE!
                             logger.warning(f"🔄 RECOVERY TRAIL CLOSE: {symbol} {side} - gave back {giveback_ratio*100:.0f}% of recovery")
                             try:
+                                # Set reason for trade history before closing
+                                pending_close_reasons[symbol] = {
+                                    "reason": f"RECOVERY_TRAIL_CLOSE: peak_loss={peak_loss:.1f}%, recovered to {peak_recovery_pnl:.1f}%, gave back {giveback_ratio*100:.0f}%",
+                                    "original_reason": "RECOVERY_TRAIL_CLOSE",
+                                    "pnl": 0,  # Will be calculated by Binance sync
+                                    "exitPrice": current_price,
+                                    "timestamp": int(datetime.now().timestamp() * 1000)
+                                }
                                 result = await live_trader.close_position(symbol, side, abs(contracts))
                                 if result:
                                     actions["recovery_closed"].append(symbol)
