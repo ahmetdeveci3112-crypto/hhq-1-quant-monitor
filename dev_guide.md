@@ -382,6 +382,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-06 | 147 | Live Position Trail Exit Execution |
 | 2026-02-05 | 146 | Live Trailing State Persistence |
 | 2026-02-05 | 145 | Live Position TP/SL/Trail Display |
 | 2026-02-05 | 144 | ROI-Based Trail Activation (leverage + exit_tightness) |
