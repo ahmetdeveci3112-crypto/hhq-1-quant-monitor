@@ -27,32 +27,34 @@ interface Props {
 const translateReason = (reason: string): string => {
     const mapping: Record<string, string> = {
         // ===== STOP LOSS / TAKE PROFIT =====
-        'SL': '🛑 SL: Trailing Stop Tetiklendi',
-        'TP': '✅ TP: Hedef Fiyata Ulaşıldı',
-        'SL_HIT': '🛑 SL: Stop Loss Fiyatı Aşıldı',
-        'TP_HIT': '✅ TP: Take Profit Fiyatı Yakalandı',
+        'SL': '🛑 Stop Loss Tetiklendi',
+        'TP': '✅ Take Profit Ulaşıldı',
+        'SL_HIT': '🛑 Stop Loss: 3 Tick Onayı ile Kapatıldı',
+        'TP_HIT': '✅ Take Profit: Hedef Fiyata Ulaşıldı',
 
-        // ===== BREAKEVEN STOP (YENİ) =====
-        'BREAKEVEN_CLOSE': '🔒 BE: Fiyat Entry\'ye Döndü → Breakeven Kapatma',
-        'BREAKEVEN_ACTIVATED': '🔒 BE: Breakeven Aktif (SL=Entry)',
+        // ===== BREAKEVEN STOP =====
+        'BREAKEVEN_CLOSE': '🔒 Breakeven: Fiyat Giriş Noktasına Döndü',
 
-        // ===== LOSS RECOVERY TRAIL (YENİ) =====
-        'RECOVERY_TRAIL_CLOSE': '🔄 RT: Toparlanmanın %50\'sini Geri Verdi → Kapatma',
-        'RECOVERY_TRAIL_ACTIVATED': '🔄 RT: Derin Zarardan Toparlanma Trailing Başladı',
+        // ===== LOSS RECOVERY TRAIL =====
+        'RECOVERY_TRAIL_CLOSE': '🔄 Zarar Toparlanması: Kazancın %50\'sini Geri Verdi',
 
-        // ===== KILL SWITCH - GÜNLÜK ZARAR LİMİTİ =====
-        'KILL_SWITCH_FULL': '🚨 KS: Margin Kaybı ≥%50 → Tam Kapatma',
-        'KILL_SWITCH_PARTIAL': '⚠️ KS: Margin Kaybı ≥%30 → %50 Küçültme',
+        // ===== KILL SWITCH - MARGIN ZARAR LİMİTİ =====
+        'KILL_SWITCH_FULL': '🚨 Kill Switch: Margin Kaybı ≥%50 → Tam Kapatma',
+        'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: Margin Kaybı ≥%30 → %50 Küçültme',
 
         // ===== TIME-BASED - ZAMAN BAZLI =====
-        'TIME_GRADUAL': '⏳ Zaman: 12h Aşımı + 0.3 ATR Geri Çekilme',
+        'TIME_REDUCE_4H': '⏰ Zaman: 4 Saat Zararda → %10 Küçültme',
+        'TIME_REDUCE_8H': '⏰ Zaman: 8 Saat Zararda → %10 Küçültme',
+        'TIME_GRADUAL': '⏳ Zaman: 12h Aşımı + ATR Geri Çekilme',
         'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Çıkış',
         'EARLY_TRAIL': '📊 Erken Trail: Kârda Stagnasyon Tespiti',
 
-        // ===== RECOVERY & ADVERSE =====
+        // ===== PORTFOLIO RECOVERY =====
+        'RECOVERY_CLOSE_ALL': '🔴 Portfolio Recovery: 12h Underwater → Pozitife Dönüş',
         'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa Dönüş',
-        'RECOVERY_CLOSE_ALL': '🔴 Portfolio Recovery: Tüm Pozisyonlar Kapatıldı',
-        'ADVERSE_TIME_EXIT': '📉 Olumsuz: 8h+ Zararda Kaldı',
+
+        // ===== ADVERSE & EMERGENCY =====
+        'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman: 8+ Saat Zararda Kaldı',
         'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Limiti',
 
         // ===== SIGNAL-BASED =====
@@ -61,25 +63,45 @@ const translateReason = (reason: string): string => {
 
         // ===== MANUEL =====
         'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
+        'MANUAL_CLOSE': '👤 Manuel Kapatma',
     };
 
-    // Partial match for dynamic reasons - order matters (most specific first)
-    if (reason?.includes('BREAKEVEN_CLOSE')) return mapping['BREAKEVEN_CLOSE'];
-    if (reason?.includes('BREAKEVEN')) return '🔒 BE: Breakeven Stop Tetiklendi';
-    if (reason?.includes('RECOVERY_TRAIL_CLOSE')) return mapping['RECOVERY_TRAIL_CLOSE'];
-    if (reason?.includes('RECOVERY_TRAIL')) return '🔄 RT: Loss Recovery Trail Aktif';
-    if (reason?.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
-    if (reason?.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
-    if (reason?.includes('KILL_SWITCH')) return '🚨 KS: Margin Zarar Limiti Aşıldı';
-    if (reason?.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
-    if (reason?.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
-    if (reason?.includes('EARLY_TRAIL')) return mapping['EARLY_TRAIL'];
-    if (reason?.includes('RECOVERY_CLOSE_ALL')) return mapping['RECOVERY_CLOSE_ALL'];
-    if (reason?.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
-    if (reason?.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
-    if (reason?.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
+    if (!reason) return '-';
 
-    return mapping[reason] || reason || '-';
+    // Partial match for dynamic reasons - order matters (most specific first)
+    // TIME_REDUCE patterns
+    if (reason.includes('TIME_REDUCE_4H')) return mapping['TIME_REDUCE_4H'];
+    if (reason.includes('TIME_REDUCE_8H')) return mapping['TIME_REDUCE_8H'];
+    if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Bazlı Küçültme';
+
+    // BREAKEVEN patterns
+    if (reason.includes('BREAKEVEN_CLOSE')) return mapping['BREAKEVEN_CLOSE'];
+    if (reason.includes('BREAKEVEN')) return '🔒 Breakeven Stop Tetiklendi';
+
+    // RECOVERY patterns
+    if (reason.includes('RECOVERY_TRAIL_CLOSE')) return mapping['RECOVERY_TRAIL_CLOSE'];
+    if (reason.includes('RECOVERY_TRAIL')) return '🔄 Zarar Toparlanma Trail Aktif';
+    if (reason.includes('RECOVERY_CLOSE_ALL')) return mapping['RECOVERY_CLOSE_ALL'];
+    if (reason.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
+
+    // KILL SWITCH patterns
+    if (reason.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
+    if (reason.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
+    if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
+    if (reason.includes('KILL')) return '🚨 Kill Switch Tetiklendi';
+
+    // TIME patterns
+    if (reason.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
+    if (reason.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
+    if (reason.includes('EARLY_TRAIL')) return mapping['EARLY_TRAIL'];
+
+    // Other patterns
+    if (reason.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
+    if (reason.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
+    if (reason.includes('MANUAL')) return mapping['MANUAL'];
+    if (reason.includes('SIGNAL_REVERSAL')) return mapping['SIGNAL_REVERSAL'];
+
+    return mapping[reason] || reason;
 };
 
 
