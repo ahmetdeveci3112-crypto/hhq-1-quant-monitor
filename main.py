@@ -503,54 +503,177 @@ class SQLiteManager:
             await db.commit()
     
     async def save_binance_trade(self, trade_data: dict):
-        """Save a Binance trade from Income API for historical analysis."""
+        """
+        Phase 152: Save Binance trade with enrichment from position_closes.
+        Before saving, try to match with position_closes for better close reason.
+        """
         async with aiosqlite.connect(self.db_path) as db:
+            symbol = trade_data.get('symbol')
+            close_time = trade_data.get('closeTime', 0)
+            close_reason = trade_data.get('closeReason', 'Closed')
+            entry_price = trade_data.get('entryPrice', 0)
+            exit_price = trade_data.get('exitPrice', 0)
+            side = trade_data.get('side', 'LONG')
+            leverage = trade_data.get('leverage', 1)
+            size_usd = trade_data.get('sizeUsd', 0)
+            
+            # Phase 152: Enrich from position_closes if close_reason is generic
+            if close_reason in ('Closed', 'Position closed on Binance', 'Historical (from Binance)'):
+                try:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute('''
+                        SELECT * FROM position_closes 
+                        WHERE symbol = ? AND ABS(timestamp - ?) < 300000
+                        ORDER BY ABS(timestamp - ?) ASC LIMIT 1
+                    ''', (symbol, close_time, close_time)) as cursor:
+                        pc = await cursor.fetchone()
+                        if pc:
+                            close_reason = pc['original_reason'] or pc['reason'] or close_reason
+                            if pc['entry_price'] and pc['entry_price'] > 0:
+                                entry_price = pc['entry_price']
+                            if pc['exit_price'] and pc['exit_price'] > 0:
+                                exit_price = pc['exit_price']
+                            if pc['side']:
+                                side = pc['side']
+                            if pc['leverage'] and pc['leverage'] > 0:
+                                leverage = pc['leverage']
+                            if pc['size_usd'] and pc['size_usd'] > 0:
+                                size_usd = pc['size_usd']
+                            logger.info(f"📋 Enriched trade {symbol} with close reason: {close_reason}")
+                except Exception as e:
+                    logger.debug(f"Enrichment lookup failed: {e}")
+            
             await db.execute('''
                 INSERT OR REPLACE INTO binance_trades (
                     income_id, symbol, side, entry_price, exit_price, pnl, pnl_percent,
                     margin, leverage, size_usd, close_reason, close_time, raw_data
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                trade_data.get('incomeId', str(trade_data.get('closeTime', 0))),
-                trade_data.get('symbol'),
-                trade_data.get('side'),
-                trade_data.get('entryPrice', 0),
-                trade_data.get('exitPrice', 0),
+                trade_data.get('incomeId', str(close_time)),
+                symbol,
+                side,
+                entry_price,
+                exit_price,
                 trade_data.get('pnl', 0),
                 trade_data.get('roi', 0),
                 trade_data.get('margin', 0),
-                trade_data.get('leverage', 1),
-                trade_data.get('sizeUsd', 0),
-                trade_data.get('closeReason', 'Closed'),
-                trade_data.get('closeTime', 0),
+                leverage,
+                size_usd,
+                close_reason,
+                close_time,
                 json.dumps(trade_data)
             ))
             await db.commit()
     
     async def get_binance_trades(self, limit: int = 200) -> list:
-        """Get recent trades from binance_trades table in frontend-compatible format."""
+        """
+        Phase 152: Get trades from SQLite with position_closes JOIN for enriched data.
+        Reads directly from binance_trades columns + enriches with position_closes.
+        """
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
+                
+                # LEFT JOIN position_closes to get proper close reasons
+                # Match by symbol + timestamp within 5 minute window
                 async with db.execute('''
-                    SELECT raw_data, close_reason, pnl FROM binance_trades 
-                    ORDER BY close_time DESC LIMIT ?
+                    SELECT 
+                        bt.symbol, bt.side, bt.entry_price, bt.exit_price, 
+                        bt.pnl, bt.pnl_percent, bt.margin, bt.leverage, 
+                        bt.size_usd, bt.close_reason, bt.close_time,
+                        pc.reason AS pc_reason, pc.original_reason AS pc_original_reason,
+                        pc.entry_price AS pc_entry, pc.exit_price AS pc_exit,
+                        pc.side AS pc_side, pc.leverage AS pc_leverage,
+                        pc.size_usd AS pc_size_usd, pc.margin AS pc_margin,
+                        pc.roi AS pc_roi
+                    FROM binance_trades bt
+                    LEFT JOIN position_closes pc 
+                        ON bt.symbol = pc.symbol 
+                        AND ABS(bt.close_time - pc.timestamp) < 300000
+                    ORDER BY bt.close_time DESC 
+                    LIMIT ?
                 ''', (limit,)) as cursor:
                     rows = await cursor.fetchall()
+                    
                     trades = []
+                    seen = set()  # Dedup by symbol+close_time
+                    
                     for row in rows:
+                        dedup_key = f"{row['symbol']}_{row['close_time']}"
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+                        
+                        # Use position_closes data for enrichment (priority)
+                        close_reason = row['close_reason'] or 'Closed'
+                        reason_detail = close_reason
+                        entry_price = row['entry_price'] or 0
+                        exit_price = row['exit_price'] or 0
+                        side = row['side'] or 'LONG'
+                        leverage = row['leverage'] or 10
+                        size_usd = row['size_usd'] or 0
+                        margin = row['margin'] or 0
+                        pnl = row['pnl'] or 0
+                        roi = row['pnl_percent'] or 0
+                        
+                        # Enrich from position_closes if available
+                        if row['pc_reason'] and row['pc_reason'] != 'Closed':
+                            close_reason = row['pc_reason']
+                            reason_detail = row['pc_original_reason'] or row['pc_reason']
+                        if row['pc_entry'] and row['pc_entry'] > 0:
+                            entry_price = row['pc_entry']
+                        if row['pc_exit'] and row['pc_exit'] > 0:
+                            exit_price = row['pc_exit']
+                        if row['pc_side']:
+                            side = row['pc_side']
+                        if row['pc_leverage'] and row['pc_leverage'] > 0:
+                            leverage = row['pc_leverage']
+                        if row['pc_size_usd'] and row['pc_size_usd'] > 0:
+                            size_usd = row['pc_size_usd']
+                        if row['pc_margin'] and row['pc_margin'] > 0:
+                            margin = row['pc_margin']
+                        if row['pc_roi'] and row['pc_roi'] != 0:
+                            roi = row['pc_roi']
+                        
+                        # Recalculate margin/roi if needed
+                        if margin == 0 and size_usd > 0 and leverage > 0:
+                            margin = size_usd / leverage
+                        if roi == 0 and margin > 0 and pnl != 0:
+                            roi = (pnl / margin * 100)
+                        
+                        close_time_ms = row['close_time'] or 0
                         try:
-                            trade = json.loads(row['raw_data'])
-                            # Ensure close reason from DB is used (may have been updated)
-                            if row['close_reason'] and row['close_reason'] != 'Closed':
-                                trade['closeReason'] = row['close_reason']
-                                trade['reason'] = row['close_reason']
-                            trades.append(trade)
+                            turkey_tz = pytz.timezone('Europe/Istanbul')
+                            ct = datetime.fromtimestamp(close_time_ms / 1000, turkey_tz)
+                            time_str = ct.strftime('%H:%M:%S')
+                            date_str = ct.strftime('%m/%d')
                         except:
-                            pass
+                            time_str = ''
+                            date_str = ''
+                        
+                        trades.append({
+                            'symbol': row['symbol'],
+                            'side': side,
+                            'entryPrice': round(entry_price, 8) if entry_price else 0,
+                            'exitPrice': round(exit_price, 8) if exit_price else 0,
+                            'pnl': round(pnl, 4),
+                            'closeTime': close_time_ms,
+                            'closeReason': close_reason,
+                            'pnlFormatted': f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}",
+                            'timestamp': close_time_ms,
+                            'time': time_str,
+                            'date': date_str,
+                            'type': 'CLOSE',
+                            'margin': round(margin, 4),
+                            'leverage': leverage,
+                            'sizeUsd': round(size_usd, 2),
+                            'roi': round(roi, 2),
+                            'reason': reason_detail
+                        })
+                    
                     return trades
         except Exception as e:
-            logger.debug(f"get_binance_trades error: {e}")
+            logger.error(f"get_binance_trades error: {e}")
             return []
     
     async def save_leverage(self, symbol: str, leverage: int):
