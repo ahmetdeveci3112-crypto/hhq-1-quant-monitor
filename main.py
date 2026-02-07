@@ -506,7 +506,7 @@ class SQLiteManager:
         """Save a Binance trade from Income API for historical analysis."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
-                INSERT OR IGNORE INTO binance_trades (
+                INSERT OR REPLACE INTO binance_trades (
                     income_id, symbol, side, entry_price, exit_price, pnl, pnl_percent,
                     margin, leverage, size_usd, close_reason, close_time, raw_data
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -526,6 +526,32 @@ class SQLiteManager:
                 json.dumps(trade_data)
             ))
             await db.commit()
+    
+    async def get_binance_trades(self, limit: int = 200) -> list:
+        """Get recent trades from binance_trades table in frontend-compatible format."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT raw_data, close_reason, pnl FROM binance_trades 
+                    ORDER BY close_time DESC LIMIT ?
+                ''', (limit,)) as cursor:
+                    rows = await cursor.fetchall()
+                    trades = []
+                    for row in rows:
+                        try:
+                            trade = json.loads(row['raw_data'])
+                            # Ensure close reason from DB is used (may have been updated)
+                            if row['close_reason'] and row['close_reason'] != 'Closed':
+                                trade['closeReason'] = row['close_reason']
+                                trade['reason'] = row['close_reason']
+                            trades.append(trade)
+                        except:
+                            pass
+                    return trades
+        except Exception as e:
+            logger.debug(f"get_binance_trades error: {e}")
+            return []
     
     async def save_leverage(self, symbol: str, leverage: int):
         """Cache leverage for a symbol."""
@@ -1387,6 +1413,34 @@ class LiveBinanceTrader:
                 })
             
             logger.info(f"Found {len(position_closes)} position closes with non-zero PnL")
+            
+            # Phase 150: Aggregate partial fills — same symbol within ±5 seconds = single trade
+            aggregated_closes = []
+            i = 0
+            while i < len(position_closes):
+                current = position_closes[i]
+                agg_pnl = current['pnl']
+                agg_timestamp = current['timestamp']
+                j = i + 1
+                while j < len(position_closes):
+                    next_close = position_closes[j]
+                    if (next_close['symbol'] == current['symbol'] and 
+                        abs(next_close['timestamp'] - current['timestamp']) < 5000):  # ±5 seconds
+                        agg_pnl += next_close['pnl']
+                        agg_timestamp = max(agg_timestamp, next_close['timestamp'])  # Use latest
+                        j += 1
+                    else:
+                        break
+                aggregated_closes.append({
+                    'symbol': current['symbol'],
+                    'pnl': agg_pnl,
+                    'timestamp': agg_timestamp,
+                    'partial_count': j - i
+                })
+                i = j
+            
+            logger.info(f"Phase 150: Aggregated {len(position_closes)} fills → {len(aggregated_closes)} trades")
+            position_closes = aggregated_closes
             
             # Step 2: For each closed position, try to get trade details
             trades = []
@@ -5235,15 +5289,24 @@ async def update_ui_cache(opportunities: list, stats: dict):
             ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
             ui_state_cache.trading_mode = "paper"
         
-        # Phase 157: Binance trade history is PRIMARY source - always try first
+        # Phase 150: Trade history — SQLite first, then Binance delta
         now = datetime.now().timestamp()
         time_since_last_fetch = now - ui_state_cache.last_binance_trade_fetch
         triggered = ui_state_cache.pending_trade_fetch_time > 0 and now >= ui_state_cache.pending_trade_fetch_time
         periodic = time_since_last_fetch > 60
         
+        # Phase 150: Startup instant load from SQLite
+        if not ui_state_cache.trades:
+            try:
+                sqlite_trades = await sqlite_manager.get_binance_trades(limit=200)
+                if sqlite_trades:
+                    ui_state_cache.trades = sqlite_trades
+                    logger.info(f"📊 INSTANT_LOAD: {len(sqlite_trades)} trades from SQLite (no API call)")
+            except Exception as e:
+                logger.debug(f"SQLite instant load error: {e}")
+        
         should_fetch_binance = live_binance_trader.enabled and (triggered or periodic)
         
-        # ALWAYS log - no condition
         logger.info(f"📊 TRADE_CHECK: should={should_fetch_binance}, enabled={live_binance_trader.enabled}, triggered={triggered}, periodic={periodic}, since={time_since_last_fetch:.0f}s")
         
         if should_fetch_binance:
@@ -5269,25 +5332,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 logger.error(f"📊 BINANCE_ERROR: {e}")
                 logger.error(f"📊 TRACEBACK: {traceback.format_exc()}")
         
-        # If no Binance trades available, fall back to SQLite
-        if not ui_state_cache.trades:
-            try:
-                sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
-                for t in sqlite_trades:
-                    ui_state_cache.trades.append({
-                        'symbol': t.get('symbol', 'UNKNOWN'),
-                        'side': t.get('side', 'LONG'),
-                        'entryPrice': t.get('entry_price', 0),
-                        'exitPrice': t.get('exit_price', 0),
-                        'pnl': t.get('pnl', 0),
-                        'closeTime': t.get('close_time', 0),
-                        'closeReason': t.get('close_reason', 'Unknown'),
-                        'leverage': t.get('leverage', 1),
-                        'sizeUsd': t.get('size_usd', 0)
-                    })
-                logger.info(f"📊 SQLITE_FALLBACK: Using {len(sqlite_trades)} SQLite trades")
-            except Exception as e:
-                logger.info(f"📊 SQLITE_ERROR: {e}")
+        # Phase 150: Old fallback removed — SQLite instant load handles this at startup
         
         logger.info(f"📊 UI_CACHE_END: trades={len(ui_state_cache.trades)}, initialized={ui_state_cache._initialized}")
         
