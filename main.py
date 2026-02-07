@@ -8459,8 +8459,14 @@ class BreakevenStopManager:
             'Very High': 2.5   # Meme coins - need more room
         }
         
-        # Breakeven buffer (slight profit to avoid slippage losses)
-        self.breakeven_buffer_pct = 0.05  # 0.05% above entry
+        # Phase 151: Dynamic breakeven buffer based on spread level
+        self.breakeven_buffers = {
+            'Very Low': 0.03,   # BTC/ETH — $30 @ $100k
+            'Low':      0.05,   # SOL, AVAX
+            'Normal':   0.08,   # Mid-cap
+            'High':     0.12,   # Low liquidity
+            'Very High': 0.20   # Meme coins — wide buffer
+        }
         
         logger.info("📊 BreakevenStopManager initialized")
     
@@ -8531,7 +8537,9 @@ class BreakevenStopManager:
                         logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
                 else:
                     # Breakeven is active - check if price returned to entry
-                    breakeven_price = entry_price * (1 + self.breakeven_buffer_pct / 100) if side == "LONG" else entry_price * (1 - self.breakeven_buffer_pct / 100)
+                    # Phase 151: Dynamic buffer based on spread level
+                    buffer_pct = self.breakeven_buffers.get(spread_level, 0.08)
+                    breakeven_price = entry_price * (1 + buffer_pct / 100) if side == "LONG" else entry_price * (1 - buffer_pct / 100)
                     
                     should_close = False
                     if side == 'LONG' and current_price <= breakeven_price:
@@ -12566,8 +12574,10 @@ class PaperTradingEngine:
             self.update_progressive_sl(pos, current_price, atr)
             
             # 4. Loss Recovery Mode
-            if self.check_loss_recovery(pos, current_price, atr):
-                continue
+            # Phase 151: Skip for live positions — handled by LossRecoveryTrailManager (more sophisticated)
+            if not pos.get('isLive', False):
+                if self.check_loss_recovery(pos, current_price, atr):
+                    continue
             
             # ===== ORIGINAL TRAILING LOGIC (spread-aware + ROI-aware) =====
             
@@ -12588,9 +12598,16 @@ class PaperTradingEngine:
             # ================================================================
             # Phase 144: ROI-Based Trail Activation (with leverage + exit_tightness)
             # ================================================================
-            # Base threshold: 3% leveraged ROI
-            # Multiplied by exit_tightness: lower = earlier activation, higher = later
-            base_activation_roi = 3.0  # %3 base threshold
+            # Phase 151: Spread-based trail activation ROI
+            # Low volatility coins → earlier activation, high volatility → later
+            spread_activation_map = {
+                'Very Low': 2.0,   # BTC/ETH — low vol, early trail
+                'Low':      3.0,
+                'Normal':   4.0,
+                'High':     6.0,   # High spread = later trail
+                'Very High': 8.0   # Meme — very volatile, late trail
+            }
+            base_activation_roi = spread_activation_map.get(pos.get('spread_level', 'Normal'), 4.0)
             activation_threshold = base_activation_roi * self.exit_tightness
             
             if pos['side'] == 'LONG':
