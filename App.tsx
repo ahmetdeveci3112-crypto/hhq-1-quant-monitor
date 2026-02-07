@@ -35,7 +35,7 @@ const BACKEND_SCANNER_WS_URL = import.meta.env.VITE_BACKEND_WS_URL?.replace('/ws
 const BACKEND_UI_WS_URL = isProduction ? `${FLY_IO_BACKEND}/ws/ui` : `${LOCAL_BACKEND}/ws/ui`;
 const BACKEND_API_URL = import.meta.env.VITE_BACKEND_API_URL || (isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000');
 
-const INITIAL_BALANCE = 10000;
+
 
 const INITIAL_STATS: PortfolioStats = {
   totalTrades: 0,
@@ -1429,8 +1429,9 @@ export default function App() {
                   <div className="text-center py-8 text-slate-600 text-xs">No trades yet</div>
                 ) : (
                   portfolio.trades.slice(0, 50).map((trade, i) => {
-                    const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
-                    const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
+                    // Use pre-calculated ROI from backend, or calculate if not available
+                    const roi = (trade as any).roi !== undefined ? (trade as any).roi :
+                      ((trade as any).margin && (trade as any).margin > 0 ? (trade.pnl / (trade as any).margin) * 100 : 0);
                     const isLong = trade.side === 'LONG';
                     const isWin = trade.pnl >= 0;
                     return (
@@ -1485,8 +1486,9 @@ export default function App() {
                       </tr>
                     ) : (
                       portfolio.trades.map((trade, i) => {
-                        const margin = (trade as any).margin || ((trade as any).sizeUsd || 100) / ((trade as any).leverage || 10);
-                        const roi = margin > 0 ? (trade.pnl / margin) * 100 : 0;
+                        // Use pre-calculated ROI from backend, or calculate if not available
+                        const roi = (trade as any).roi !== undefined ? (trade as any).roi :
+                          ((trade as any).margin && (trade as any).margin > 0 ? (trade.pnl / (trade as any).margin) * 100 : 0);
                         return (
                           <tr key={i} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
                             <td className="py-3 px-4 text-slate-400 font-mono text-xs">

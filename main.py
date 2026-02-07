@@ -27,6 +27,7 @@ import ccxt.async_support as ccxt_async
 import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
+import pytz
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -182,6 +183,57 @@ class SQLiteManager:
                     htf_trend TEXT,
                     status TEXT DEFAULT 'OPEN',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Binance trade history - her realized PnL income kaydı
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS binance_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    income_id TEXT UNIQUE,
+                    symbol TEXT NOT NULL,
+                    side TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    pnl REAL NOT NULL,
+                    pnl_percent REAL,
+                    margin REAL,
+                    leverage INTEGER,
+                    size_usd REAL,
+                    close_reason TEXT,
+                    close_time INTEGER NOT NULL,
+                    raw_data TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Position close events - her pozisyon kapatma kaydı
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS position_closes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    original_reason TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    pnl REAL,
+                    leverage INTEGER,
+                    size_usd REAL,
+                    margin REAL,
+                    roi REAL,
+                    timestamp INTEGER NOT NULL,
+                    matched_to_income INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Leverage cache - pozisyon leverage bilgilerini sakla
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS leverage_cache (
+                    symbol TEXT PRIMARY KEY,
+                    leverage INTEGER NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
@@ -399,9 +451,117 @@ class SQLiteManager:
                     VALUES (?, ?, CURRENT_TIMESTAMP)
                 ''', (key, json.dumps(value)))
             await db.commit()
+    
+    async def save_position_close(self, close_data: dict):
+        """Save a position close event for trade history matching."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO position_closes (
+                    symbol, side, reason, original_reason, entry_price, exit_price,
+                    pnl, leverage, size_usd, margin, roi, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                close_data.get('symbol'),
+                close_data.get('side'),
+                close_data.get('reason', 'Closed'),
+                close_data.get('original_reason', 'Closed'),
+                close_data.get('entryPrice', 0),
+                close_data.get('exitPrice', 0),
+                close_data.get('pnl', 0),
+                close_data.get('leverage', 10),
+                close_data.get('sizeUsd', 0),
+                close_data.get('margin', 0),
+                close_data.get('roi', 0),
+                close_data.get('timestamp', int(datetime.now().timestamp() * 1000))
+            ))
+            await db.commit()
+            logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')}")
+    
+    async def get_pending_close_reason(self, symbol: str, close_time: int, window_minutes: int = 30) -> dict:
+        """Get pending close reason from SQLite for a symbol within time window."""
+        window_ms = window_minutes * 60 * 1000
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('''
+                SELECT * FROM position_closes 
+                WHERE symbol = ? AND matched_to_income = 0
+                AND ABS(timestamp - ?) < ?
+                ORDER BY ABS(timestamp - ?) ASC
+                LIMIT 1
+            ''', (symbol, close_time, window_ms, close_time)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+    
+    async def mark_close_matched(self, close_id: int):
+        """Mark a position close as matched to Binance income."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE position_closes SET matched_to_income = 1 WHERE id = ?
+            ''', (close_id,))
+            await db.commit()
+    
+    async def save_binance_trade(self, trade_data: dict):
+        """Save a Binance trade from Income API for historical analysis."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR IGNORE INTO binance_trades (
+                    income_id, symbol, side, entry_price, exit_price, pnl, pnl_percent,
+                    margin, leverage, size_usd, close_reason, close_time, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade_data.get('incomeId', str(trade_data.get('closeTime', 0))),
+                trade_data.get('symbol'),
+                trade_data.get('side'),
+                trade_data.get('entryPrice', 0),
+                trade_data.get('exitPrice', 0),
+                trade_data.get('pnl', 0),
+                trade_data.get('roi', 0),
+                trade_data.get('margin', 0),
+                trade_data.get('leverage', 1),
+                trade_data.get('sizeUsd', 0),
+                trade_data.get('closeReason', 'Closed'),
+                trade_data.get('closeTime', 0),
+                json.dumps(trade_data)
+            ))
+            await db.commit()
+    
+    async def save_leverage(self, symbol: str, leverage: int):
+        """Cache leverage for a symbol."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO leverage_cache (symbol, leverage, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (symbol, leverage))
+            await db.commit()
+    
+    async def get_leverage(self, symbol: str) -> int:
+        """Get cached leverage for a symbol."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('''
+                SELECT leverage FROM leverage_cache WHERE symbol = ?
+            ''', (symbol,)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return row[0]
+                return 10  # Default leverage
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
+
+
+def safe_create_task(coro, name="unnamed"):
+    """Create an asyncio task with exception logging instead of silent swallowing."""
+    task = asyncio.create_task(coro)
+    def _handle_exception(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error(f"🔥 Background task '{name}' failed: {exc}")
+    task.add_done_callback(_handle_exception)
+    return task
 
 
 # ============================================================================
@@ -656,8 +816,10 @@ class LiveBinanceTrader:
                             'pnlPercent': pnl_percent,
                             'leverage': leverage,
                             'initialMargin': position_margin,
+                            'size': abs(position_amt),           # Phase 149: Fix missing size field
                             'contracts': abs(position_amt),
-                            'openTime': int(datetime.now().timestamp() * 1000)  # Will be updated below
+                            'markPrice': float(p.get('markPrice', entry_price) or entry_price),  # Phase 149: Add markPrice
+                            'openTime': int(p.get('updateTime', datetime.now().timestamp() * 1000))  # Phase 150: Use Binance updateTime
                         })
                     else:
                         # Track symbols with 0 positionAmt
@@ -1111,7 +1273,7 @@ class LiveBinanceTrader:
             }
         
         try:
-            import pytz
+            # pytz imported globally
             
             # Turkey timezone (UTC+3)
             turkey_tz = pytz.timezone('Europe/Istanbul')
@@ -1174,7 +1336,7 @@ class LiveBinanceTrader:
     async def get_trade_history(self, limit: int = 50, days_back: int = 7) -> list:
         """
         Binance Futures'dan trade history çek.
-        Uses income history with REALIZED_PNL type for closed trades.
+        Uses userTrades API to get entry/exit prices and combines with Income API for PnL.
         Returns list of trades in frontend-compatible format.
         """
         logger.info(f"get_trade_history called: enabled={self.enabled}, exchange={self.exchange is not None}")
@@ -1184,57 +1346,213 @@ class LiveBinanceTrader:
             return []
         
         try:
-            import pytz
+            # pytz imported globally
+            from datetime import timedelta
+            from collections import defaultdict
+            
             turkey_tz = pytz.timezone('Europe/Istanbul')
             now = datetime.now(turkey_tz)
-            
-            # Get income history (REALIZED_PNL = closed trades)
             start_time = int((now - timedelta(days=days_back)).timestamp() * 1000)
             
-            # Try direct fapiPrivateGetIncome call
-            logger.info(f"Calling fapiPrivateGetIncome with startTime={start_time}")
-            
+            # Step 1: Get all Income records (REALIZED_PNL) - these represent closed positions
+            logger.info(f"Fetching income history from {days_back} days back...")
             income_history = await self.exchange.fapiPrivateGetIncome({
                 'incomeType': 'REALIZED_PNL',
                 'startTime': start_time,
-                'limit': min(limit, 1000)
+                'limit': min(limit * 2, 1000)  # Fetch more to ensure coverage
             })
             
-            logger.info(f"Trade history: Got {len(income_history) if income_history else 0} records from Binance API")
-            
             if not income_history:
-                logger.warning("Trade history: Income history returned empty/None")
+                logger.warning("Trade history: No income history found")
                 return []
             
-            trades = []
+            logger.info(f"Got {len(income_history)} income records")
+            
+            # Group income by symbol to get unique closed positions
+            # Each income record represents a partial or full position close
+            position_closes = []
+            
             for income in income_history:
                 symbol = income.get('symbol', 'UNKNOWN')
                 pnl = float(income.get('income', 0))
                 timestamp = int(income.get('time', 0))
+                
+                if pnl == 0:
+                    continue  # Skip zero PnL (partial fills without actual close)
+                
+                position_closes.append({
+                    'symbol': symbol,
+                    'pnl': pnl,
+                    'timestamp': timestamp
+                })
+            
+            logger.info(f"Found {len(position_closes)} position closes with non-zero PnL")
+            
+            # Step 2: For each closed position, try to get trade details
+            trades = []
+            processed_symbols = set()
+            
+            for close_info in position_closes:
+                symbol = close_info['symbol']
+                pnl = close_info['pnl']
+                timestamp = close_info['timestamp']
                 close_time = datetime.fromtimestamp(timestamp / 1000, turkey_tz)
                 
-                # Frontend-compatible format with all required fields
+                # Try to get user trades for this symbol to get entry/exit prices
+                entry_price = 0.0
+                exit_price = 0.0
+                side = 'LONG' if pnl > 0 else 'SHORT'  # Default guess based on PnL
+                leverage = 1
+                size_usd = 0.0
+                qty = 0.0
+                
+                # Fetch trades for this symbol around the close time
+                try:
+                    # Get trades from a window around this close
+                    trade_start = timestamp - (60 * 60 * 1000)  # 1 hour before
+                    trade_end = timestamp + (60 * 1000)  # 1 minute after
+                    
+                    user_trades = await self.exchange.fapiPrivateGetUserTrades({
+                        'symbol': symbol,
+                        'startTime': trade_start,
+                        'endTime': trade_end,
+                        'limit': 100
+                    })
+                    
+                    if user_trades and len(user_trades) > 0:
+                        # Find the closing trade (closest to timestamp, reducing position)
+                        # Trades with 'SELL' for LONG positions or 'BUY' for SHORT positions
+                        for t in user_trades:
+                            t_time = int(t.get('time', 0))
+                            t_side = t.get('side', '')
+                            t_price = float(t.get('price', 0))
+                            t_qty = float(t.get('qty', 0))
+                            realized = float(t.get('realizedPnl', 0))
+                            
+                            # If this trade has realized PnL matching our close, it's the exit
+                            if abs(realized - pnl) < 0.01 and t_price > 0:
+                                exit_price = t_price
+                                qty = t_qty
+                                # If selling, was LONG. If buying, was SHORT
+                                side = 'LONG' if t_side == 'SELL' else 'SHORT'
+                                break
+                            # Fallback: use the last trade before close time
+                            elif t_time <= timestamp and t_price > 0:
+                                exit_price = t_price
+                                qty = t_qty
+                                side = 'LONG' if t_side == 'SELL' else 'SHORT'
+                        
+                        # Try to find entry price from earlier trades
+                        entry_side = 'BUY' if side == 'LONG' else 'SELL'
+                        for t in reversed(user_trades):
+                            if t.get('side') == entry_side and float(t.get('price', 0)) > 0:
+                                entry_price = float(t.get('price', 0))
+                                break
+                        
+                        # If we found exit but no entry, estimate from PnL
+                        if exit_price > 0 and entry_price == 0 and qty > 0:
+                            # PnL = (exit - entry) * qty for LONG, (entry - exit) * qty for SHORT
+                            if side == 'LONG':
+                                entry_price = exit_price - (pnl / qty) if qty > 0 else 0
+                            else:
+                                entry_price = exit_price + (pnl / qty) if qty > 0 else 0
+                        
+                        size_usd = exit_price * qty if exit_price > 0 and qty > 0 else 0
+                
+                except Exception as e:
+                    logger.debug(f"Could not fetch trades for {symbol}: {e}")
+                
+                # Get close reason from pending_close_reasons if available
+                close_reason = 'Closed'
+                reason_detail = 'Position closed on Binance'
+                matched_close_id = None
+                
+                # First try in-memory pending_close_reasons
+                if symbol in pending_close_reasons:
+                    reason_data = pending_close_reasons.get(symbol, {})
+                    reason_timestamp = reason_data.get('timestamp', 0)
+                    # Match if within 30 minutes of close (extended from 5 min)
+                    if abs(timestamp - reason_timestamp) < 30 * 60 * 1000:
+                        close_reason = reason_data.get('reason', close_reason)
+                        reason_detail = reason_data.get('original_reason', reason_detail)
+                        # Use trade data from our system if available
+                        trade_data = reason_data.get('trade_data', {})
+                        if trade_data:
+                            if trade_data.get('entryPrice', 0) > 0:
+                                entry_price = trade_data.get('entryPrice')
+                            if trade_data.get('exitPrice', 0) > 0:
+                                exit_price = trade_data.get('exitPrice')
+                            if trade_data.get('side'):
+                                side = trade_data.get('side')
+                            if trade_data.get('leverage', 0) > 0:
+                                leverage = trade_data.get('leverage')
+                            if trade_data.get('sizeUsd', 0) > 0:
+                                size_usd = trade_data.get('sizeUsd')
+                            # Override PnL from trade_data if available (more accurate)
+                            if trade_data.get('pnl') is not None:
+                                pnl = trade_data.get('pnl')
+                
+                # If not found in memory, try SQLite (for persistence after restart)
+                if reason_detail == 'Position closed on Binance':
+                    try:
+                        sqlite_close = await sqlite_manager.get_pending_close_reason(symbol, timestamp, window_minutes=60)
+                        if sqlite_close:
+                            close_reason = sqlite_close.get('reason', close_reason)
+                            reason_detail = sqlite_close.get('original_reason', reason_detail)
+                            matched_close_id = sqlite_close.get('id')
+                            # Use SQLite data
+                            if sqlite_close.get('entry_price', 0) > 0:
+                                entry_price = sqlite_close.get('entry_price')
+                            if sqlite_close.get('exit_price', 0) > 0:
+                                exit_price = sqlite_close.get('exit_price')
+                            if sqlite_close.get('side'):
+                                side = sqlite_close.get('side')
+                            if sqlite_close.get('leverage', 0) > 0:
+                                leverage = sqlite_close.get('leverage')
+                            if sqlite_close.get('size_usd', 0) > 0:
+                                size_usd = sqlite_close.get('size_usd')
+                            if sqlite_close.get('pnl') is not None:
+                                pnl = sqlite_close.get('pnl')
+                            logger.info(f"📋 Matched trade with SQLite close reason: {symbol} - {reason_detail}")
+                    except Exception as e:
+                        logger.debug(f"SQLite close reason lookup failed: {e}")
+                
+                # Calculate margin and ROI (Binance style: ROI = PnL / Margin * 100)
+                margin = size_usd / leverage if leverage > 0 and size_usd > 0 else 0
+                roi = (pnl / margin * 100) if margin > 0 else 0
+                
+                # Frontend-compatible format
                 trade = {
-                    # Required by frontend
                     'symbol': symbol,
-                    'side': 'LONG' if pnl > 0 else 'SHORT',  # Guess based on PnL
-                    'entryPrice': 0,  # Not available from income history
-                    'exitPrice': 0,   # Not available from income history
+                    'side': side,
+                    'entryPrice': round(entry_price, 8) if entry_price else 0,
+                    'exitPrice': round(exit_price, 8) if exit_price else 0,
                     'pnl': round(pnl, 4),
                     'closeTime': timestamp,
-                    'closeReason': 'Binance PnL',
-                    # Additional fields
+                    'closeReason': close_reason,
                     'pnlFormatted': f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}",
                     'timestamp': timestamp,
                     'time': close_time.strftime('%H:%M:%S'),
                     'date': close_time.strftime('%Y-%m-%d'),
                     'type': 'CLOSE',
-                    'margin': 0,  # Not available
-                    'leverage': 1,
-                    'sizeUsd': 0,
-                    'reason': 'Realized PnL from Binance'
+                    'margin': round(margin, 4),
+                    'leverage': leverage,
+                    'sizeUsd': round(size_usd, 2),
+                    'roi': round(roi, 2),  # Pre-calculated ROI for frontend
+                    'reason': reason_detail
                 }
                 trades.append(trade)
+                
+                # Save to SQLite for historical analysis
+                try:
+                    trade_for_sqlite = trade.copy()
+                    trade_for_sqlite['incomeId'] = f"{symbol}_{timestamp}"
+                    safe_create_task(sqlite_manager.save_binance_trade(trade_for_sqlite))
+                    # Mark matched position close as matched
+                    if matched_close_id:
+                        safe_create_task(sqlite_manager.mark_close_matched(matched_close_id))
+                except Exception as e:
+                    logger.debug(f"SQLite trade save error: {e}")
             
             # Sort by timestamp descending (newest first)
             trades.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -1258,7 +1576,7 @@ class LiveBinanceTrader:
             return 0
         
         try:
-            import pytz
+            # pytz imported globally
             turkey_tz = pytz.timezone('Europe/Istanbul')
             now = datetime.now(turkey_tz)
             start_time = int((now - timedelta(hours=hours_back)).timestamp() * 1000)
@@ -1328,7 +1646,7 @@ class LiveBinanceTrader:
                     
                     # Save to SQLite
                     try:
-                        asyncio.create_task(sqlite_manager.save_trade(trade))
+                        safe_create_task(sqlite_manager.save_trade(trade))
                     except Exception as e:
                         logger.debug(f"SQLite sync save error: {e}")
             
@@ -1341,6 +1659,103 @@ class LiveBinanceTrader:
             
         except Exception as e:
             logger.error(f"sync_closed_trades_from_binance error: {e}")
+            return 0
+    
+    async def backfill_trade_history_to_sqlite(self, limit: int = 1000):
+        """
+        Backfill last N trades from Binance Income API to SQLite.
+        Called once at startup to populate historical data.
+        """
+        if not self.enabled or not self.exchange:
+            logger.info("Backfill skipped: Binance trader not enabled")
+            return 0
+        
+        try:
+            # pytz imported globally
+            turkey_tz = pytz.timezone('Europe/Istanbul')
+            
+            # Fetch last 1000 REALIZED_PNL entries (max allowed by Binance)
+            logger.info(f"📥 Starting Binance trade history backfill (limit={limit})...")
+            
+            income_history = await self.exchange.fapiPrivateGetIncome({
+                'incomeType': 'REALIZED_PNL',
+                'limit': limit
+            })
+            
+            if not income_history:
+                logger.warning("Backfill: No income history found")
+                return 0
+            
+            saved_count = 0
+            
+            for income in income_history:
+                symbol = income.get('symbol', 'UNKNOWN')
+                pnl = float(income.get('income', 0))
+                timestamp = int(income.get('time', 0))
+                
+                # Skip very small PnL
+                if abs(pnl) < 0.01:
+                    continue
+                
+                close_time = datetime.fromtimestamp(timestamp / 1000, turkey_tz)
+                
+                # Check if we have close reason from SQLite
+                close_reason = 'Closed'
+                reason_detail = 'Historical (from Binance)'
+                entry_price = 0
+                exit_price = 0
+                side = 'LONG' if pnl > 0 else 'SHORT'
+                leverage = await sqlite_manager.get_leverage(symbol)  # Get cached leverage or default
+                size_usd = 0
+                
+                # Try to find matching close from position_closes table
+                try:
+                    sqlite_close = await sqlite_manager.get_pending_close_reason(symbol, timestamp, window_minutes=60)
+                    if sqlite_close:
+                        close_reason = sqlite_close.get('reason', close_reason)
+                        reason_detail = sqlite_close.get('original_reason', reason_detail)
+                        entry_price = sqlite_close.get('entry_price', 0)
+                        exit_price = sqlite_close.get('exit_price', 0)
+                        side = sqlite_close.get('side', side)
+                        leverage = sqlite_close.get('leverage', leverage)
+                        size_usd = sqlite_close.get('size_usd', 0)
+                except:
+                    pass
+                
+                # Calculate margin and ROI
+                margin = size_usd / leverage if leverage > 0 and size_usd > 0 else abs(pnl) / 0.1  # Estimate
+                roi = (pnl / margin * 100) if margin > 0 else 0
+                
+                # Save to SQLite
+                trade_data = {
+                    'incomeId': f"{symbol}_{timestamp}",
+                    'symbol': symbol,
+                    'side': side,
+                    'entryPrice': entry_price,
+                    'exitPrice': exit_price,
+                    'pnl': round(pnl, 4),
+                    'roi': round(roi, 2),
+                    'margin': round(margin, 4),
+                    'leverage': leverage,
+                    'sizeUsd': round(size_usd, 2),
+                    'closeReason': close_reason,
+                    'closeTime': timestamp
+                }
+                
+                try:
+                    await sqlite_manager.save_binance_trade(trade_data)
+                    saved_count += 1
+                except Exception as e:
+                    # Likely duplicate, skip
+                    pass
+            
+            logger.info(f"📊 Binance backfill complete: {saved_count}/{len(income_history)} trades saved to SQLite")
+            return saved_count
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"backfill_trade_history_to_sqlite error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return 0
 
     def get_status(self) -> dict:
@@ -1388,6 +1803,9 @@ async def lifespan(app: FastAPI):
                 # Start Binance position sync loop
                 binance_sync_task = asyncio.create_task(binance_position_sync_loop())
                 logger.info("🔄 Binance position sync loop started!")
+                
+                # Backfill last 1000 trades to SQLite (one-time on startup)
+                asyncio.create_task(live_binance_trader.backfill_trade_history_to_sqlite(1000))
             else:
                 logger.error("❌ LiveBinanceTrader failed to initialize!")
         except Exception as e:
@@ -1603,7 +2021,36 @@ async def binance_position_sync_loop():
                         # New position (manual or from previous session) - add with default params
                         entry_price = bp.get('entryPrice', 0)
                         mark_price = bp.get('markPrice', entry_price)
-                        atr = entry_price * 0.02  # Estimate 2% ATR if unknown
+                        
+                        # ================================================================
+                        # Phase 151: Dynamic volatility calculation for synced positions
+                        # ================================================================
+                        # Get ticker data for volatility estimation
+                        tickers = binance_ws_manager.get_tickers([symbol])
+                        ticker = tickers.get(symbol) if tickers else None
+                        
+                        if ticker and entry_price > 0:
+                            # Estimate ATR from 24h high/low range (rough approximation)
+                            high_24h = float(ticker.get('high', entry_price * 1.02))
+                            low_24h = float(ticker.get('low', entry_price * 0.98))
+                            estimated_atr = (high_24h - low_24h) / 3  # ~3 ATR in 24h range
+                            volatility_pct = (estimated_atr / entry_price) * 100 if entry_price > 0 else 2.0
+                        else:
+                            # Fallback to 2% estimate
+                            estimated_atr = entry_price * 0.02
+                            volatility_pct = 2.0
+                        
+                        atr = estimated_atr
+                        
+                        # Get dynamic trail parameters based on volatility
+                        trail_activation_atr, trail_distance_atr = get_dynamic_trail_params(
+                            volatility_pct=volatility_pct,
+                            hurst=0.5,  # Default neutral
+                            price=entry_price,
+                            spread_pct=0.0
+                        )
+                        
+                        logger.info(f"📊 Volatility calc: {symbol} ATR%={volatility_pct:.2f}% → trail_act={trail_activation_atr}x, trail_dist={trail_distance_atr}x")
                         
                         # Calculate default exit parameters
                         # IMPORTANT: If position is already profitable, set TP beyond CURRENT price
@@ -1614,28 +2061,28 @@ async def binance_position_sync_loop():
                                 # TP beyond current price, SL at breakeven or below entry
                                 stop_loss = entry_price  # Breakeven
                                 take_profit = mark_price + (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = mark_price + (atr * 0.5)  # Near current price
+                                trail_activation = entry_price  # Phase 150: Start trail at entry for profitable positions
                             else:
                                 stop_loss = entry_price - (atr * global_paper_trader.sl_atr / 10)
                                 take_profit = entry_price + (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = entry_price + (atr * global_paper_trader.trail_activation_atr)
+                                trail_activation = entry_price + (atr * trail_activation_atr)  # Phase 151: Dynamic
                         else:
                             # For SHORT: if mark < entry, position is profitable
                             if mark_price < entry_price:
                                 # TP beyond current price, SL at breakeven or above entry
                                 stop_loss = entry_price  # Breakeven
                                 take_profit = mark_price - (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = mark_price - (atr * 0.5)  # Near current price
+                                trail_activation = entry_price  # Phase 150: Start trail at entry for profitable positions
                             else:
                                 stop_loss = entry_price + (atr * global_paper_trader.sl_atr / 10)
                                 take_profit = entry_price - (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = entry_price - (atr * global_paper_trader.trail_activation_atr)
+                                trail_activation = entry_price - (atr * trail_activation_atr)  # Phase 151: Dynamic
                         
                         new_pos = {
                             'id': bp.get('id', f"BIN_{symbol}_{int(datetime.now().timestamp())}"),
                             'symbol': symbol,
                             'side': bp.get('side', 'LONG'),
-                            'size': bp.get('size', 0),
+                            'size': bp.get('size', bp.get('contracts', 0)),  # Phase 149: Fallback to contracts
                             'sizeUsd': bp.get('sizeUsd', 0),
                             'entryPrice': entry_price,
                             'markPrice': bp.get('markPrice', entry_price),
@@ -1647,23 +2094,30 @@ async def binance_position_sync_loop():
                             'stopLoss': stop_loss,
                             'takeProfit': take_profit,
                             'trailActivation': trail_activation,
-                            'trailDistance': atr * global_paper_trader.trail_distance_atr,  # FIX: Was missing!
+                            'trailDistance': atr * trail_distance_atr,  # Phase 151: Dynamic trail distance
                             'trailingStop': stop_loss,
-                            'isTrailingActive': False,
+                            'isTrailingActive': (bp['side'] == 'LONG' and mark_price > entry_price) or (bp['side'] == 'SHORT' and mark_price < entry_price),  # Phase 150: Auto-activate for profitable
                             'slConfirmCount': 0,
                             'atr': atr,
+                            'volatilityPct': volatility_pct,  # Phase 151: Store for reference
+                            'dynamicTrailActivation': trail_activation_atr,  # Phase 151: Store multiplier
+                            'dynamicTrailDistance': trail_distance_atr,  # Phase 151: Store multiplier
                             'isLive': True,
                             'isSynced': True,  # Mark as synced from Binance
                         }
                         
                         global_paper_trader.positions.append(new_pos)
-                        logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} (manual/external position)")
+                        logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} | Vol:{volatility_pct:.1f}% Trail:{trail_activation_atr}x/{trail_distance_atr}x")
                     else:
                         # Update existing position with current Binance data
                         # Phase 88: Also sync SIZE to prevent close amount mismatches
                         # Phase 141: Sync CONTRACTS alongside SIZE for consistency
                         for pos in global_paper_trader.positions:
-                            if pos.get('symbol') == symbol and pos.get('isLive'):
+                            # Phase 155: Match by symbol only (ignore isLive for existing Binance positions)
+                            if pos.get('symbol') == symbol:
+                                # FORCE isLive=True for all Binance positions
+                                pos['isLive'] = True
+                                
                                 # Sync critical values from Binance (source of truth)
                                 position_size = bp.get('size', bp.get('contracts', pos.get('size')))
                                 pos['size'] = position_size      # Phase 88: Sync size!
@@ -1673,31 +2127,70 @@ async def binance_position_sync_loop():
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
                                 
-                                # FIX: Initialize trail params if missing (for old positions)
-                                pos_atr = pos.get('atr', pos['entryPrice'] * 0.02)
+                                # DEBUG: Log what we're updating
+                                logger.debug(f"📊 Sync update: {symbol} SL={pos.get('stopLoss', 'NONE')} TP={pos.get('takeProfit', 'NONE')} Trail={pos.get('isTrailingActive', 'NONE')}")
                                 
-                                if not pos.get('trailDistance'):
-                                    pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr
-                                    logger.info(f"📊 Trail fix: {symbol} trailDistance set to {pos['trailDistance']:.6f}")
-                                
-                                # FIX: For profitable positions, adjust trailActivation to entry so trail can activate
                                 mark_price = bp.get('markPrice', pos.get('markPrice', 0))
                                 entry_price = pos.get('entryPrice', 0)
-                                current_activation = pos.get('trailActivation', 0)
                                 
+                                # Phase 154: Initialize ALL exit params if missing
+                                pos_atr = pos.get('atr', entry_price * 0.02) if entry_price > 0 else 0
+                                
+                                # Initialize ATR if missing
+                                if not pos.get('atr') and entry_price > 0:
+                                    pos['atr'] = entry_price * 0.02  # 2% default ATR
+                                    pos_atr = pos['atr']
+                                
+                                # Initialize SL if missing or zero
+                                if not pos.get('stopLoss') or pos.get('stopLoss', 0) == 0:
+                                    sl_mult = global_paper_trader.sl_multiplier
+                                    if pos['side'] == 'LONG':
+                                        pos['stopLoss'] = entry_price - (pos_atr * sl_mult)
+                                    else:
+                                        pos['stopLoss'] = entry_price + (pos_atr * sl_mult)
+                                    logger.info(f"📊 Exit fix: {symbol} stopLoss set to {pos['stopLoss']:.6f}")
+                                
+                                # Initialize TP if missing or zero
+                                if not pos.get('takeProfit') or pos.get('takeProfit', 0) == 0:
+                                    tp_mult = global_paper_trader.tp_multiplier
+                                    if pos['side'] == 'LONG':
+                                        pos['takeProfit'] = entry_price + (pos_atr * tp_mult)
+                                    else:
+                                        pos['takeProfit'] = entry_price - (pos_atr * tp_mult)
+                                    logger.info(f"📊 Exit fix: {symbol} takeProfit set to {pos['takeProfit']:.6f}")
+                                
+                                # Initialize trailActivation if missing
+                                if not pos.get('trailActivation') or pos.get('trailActivation', 0) == 0:
+                                    trail_act_mult = global_paper_trader.trail_activation_atr
+                                    if pos['side'] == 'LONG':
+                                        pos['trailActivation'] = entry_price + (pos_atr * trail_act_mult)
+                                    else:
+                                        pos['trailActivation'] = entry_price - (pos_atr * trail_act_mult)
+                                    logger.info(f"📊 Exit fix: {symbol} trailActivation set to {pos['trailActivation']:.6f}")
+                                
+                                # Initialize trailDistance if missing
+                                if not pos.get('trailDistance'):
+                                    pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr
+                                    logger.info(f"📊 Exit fix: {symbol} trailDistance set to {pos['trailDistance']:.6f}")
+                                
+                                # Initialize trailingStop if missing (use SL as initial value)
+                                if not pos.get('trailingStop'):
+                                    pos['trailingStop'] = pos.get('stopLoss', 0)
+                                
+                                # Phase 154: Force trail activation for profitable positions
                                 if mark_price > 0 and entry_price > 0:
                                     if pos['side'] == 'LONG' and mark_price > entry_price:
-                                        # Profitable LONG - set activation at entry to enable trail
-                                        if current_activation > mark_price:  # Activation too high
-                                            pos['trailActivation'] = entry_price
+                                        # Profitable LONG - ALWAYS activate trail
+                                        pos['trailActivation'] = entry_price  # Set at entry
+                                        if not pos.get('isTrailingActive', False):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} LONG profitable - trail activated!")
+                                            logger.info(f"📊 Trail fix: {symbol} LONG +{((mark_price/entry_price)-1)*100:.1f}% - trail activated!")
                                     elif pos['side'] == 'SHORT' and mark_price < entry_price:
-                                        # Profitable SHORT - set activation at entry to enable trail
-                                        if current_activation < mark_price:  # Activation too low
-                                            pos['trailActivation'] = entry_price
+                                        # Profitable SHORT - ALWAYS activate trail
+                                        pos['trailActivation'] = entry_price  # Set at entry
+                                        if not pos.get('isTrailingActive', False):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} SHORT profitable - trail activated!")
+                                            logger.info(f"📊 Trail fix: {symbol} SHORT +{((entry_price/mark_price)-1)*100:.1f}% - trail activated!")
                                 break
                 
                 # ================================================================
@@ -1767,7 +2260,7 @@ async def binance_position_sync_loop():
                     
                     # Save to SQLite
                     try:
-                        asyncio.create_task(sqlite_manager.save_trade(trade))
+                        safe_create_task(sqlite_manager.save_trade(trade))
                     except Exception as e:
                         logger.debug(f"SQLite save error: {e}")
                     
@@ -2542,23 +3035,6 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
         "trail_multiplier": params["trail"],
         "level": "very_high"
     }
-
-# Backwards compatibility alias
-def get_spread_adjusted_params(spread_pct: float, atr: float, price: float = 0.0) -> dict:
-    """Alias for get_volatility_adjusted_params for backwards compatibility.
-    
-    IMPORTANT: volatility_pct should be ATR as percentage of price, NOT spread_pct.
-    spread_pct is bid-ask spread (typically 0.05-0.5%)
-    volatility_pct is ATR/price*100 (typically 10-50% for observed data)
-    """
-    # FIX: Calculate actual volatility_pct from ATR and price
-    if price > 0 and atr > 0:
-        volatility_pct = (atr / price) * 100
-    else:
-        volatility_pct = 15.0  # Default to mid-range if unknown
-    
-    return get_volatility_adjusted_params(volatility_pct, atr, price, spread_pct)
-
 
 
 class MultiTimeframeAnalyzer:
@@ -4070,6 +4546,7 @@ class UIStateCache:
         self.live_balance = None
         self.positions = []
         self.trades = []
+        self.binance_trades = []  # Phase 157: Trades fetched from Binance
         self.pnl_data = {
             "todayPnl": 0,
             "todayPnlPercent": 0,
@@ -4082,6 +4559,14 @@ class UIStateCache:
         self.btc_state = {}
         self.enabled = True
         self._initialized = False
+        # Phase 157: Delayed trade history fetch after position close
+        self.pending_trade_fetch_time = 0  # Unix timestamp when to fetch
+        self.last_binance_trade_fetch = 0  # Last successful fetch time
+    
+    def trigger_trade_fetch(self, delay_seconds: int = 3):
+        """Schedule a Binance trade history fetch after delay."""
+        self.pending_trade_fetch_time = datetime.now().timestamp() + delay_seconds
+        logger.info(f"📊 Trade history fetch scheduled in {delay_seconds}s")
     
     def get_state(self) -> dict:
         """Return complete UI state for WebSocket - instant, no API calls."""
@@ -4620,6 +5105,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
     """
     global ui_state_cache
     
+    # Phase 157: Debug - log every call
+    logger.info(f"🔄 update_ui_cache CALLED: {len(opportunities)} opportunities, live={live_binance_trader.enabled}")
+    
     try:
         # Apply BTC filter to opportunities
         filtered_opportunities = []
@@ -4670,11 +5158,65 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 balance_data = await balance_task
                 positions = await positions_task
                 
+                # Phase 155: Merge Binance positions with exit params from global_paper_trader
+                # global_paper_trader.positions has TP/SL/Trail data from sync loop
+                merged_positions = []
+                paper_positions = {p.get('symbol'): p for p in global_paper_trader.positions}
+                
+                for bp in positions:
+                    symbol = bp.get('symbol', '')
+                    paper_pos = paper_positions.get(symbol, {})
+                    
+                    # Start with Binance data
+                    merged = dict(bp)
+                    
+                    # Merge exit parameters from paper trader (if available)
+                    if paper_pos:
+                        merged['stopLoss'] = paper_pos.get('stopLoss', bp.get('stopLoss', 0))
+                        merged['takeProfit'] = paper_pos.get('takeProfit', bp.get('takeProfit', 0))
+                        merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
+                        merged['trailActivation'] = paper_pos.get('trailActivation', 0)
+                        merged['atr'] = paper_pos.get('atr', 0)
+                        
+                        # Phase 156: isTrailingActive must be based on CURRENT profitability from Binance
+                        mark_price = bp.get('markPrice', 0)
+                        entry_price = bp.get('entryPrice', 0)
+                        side = bp.get('side', 'LONG')
+                        
+                        if mark_price > 0 and entry_price > 0:
+                            if side == 'LONG':
+                                # Trail active only if currently profitable (mark > entry)
+                                merged['isTrailingActive'] = mark_price > entry_price
+                            else:
+                                # SHORT: Trail active only if mark < entry
+                                merged['isTrailingActive'] = mark_price < entry_price
+                        else:
+                            merged['isTrailingActive'] = False
+                    else:
+                        # No paper position - calculate default exit params
+                        entry = bp.get('entryPrice', 0)
+                        atr = entry * 0.02 if entry > 0 else 0  # 2% default ATR
+                        sl_mult = getattr(global_paper_trader, 'sl_multiplier', 2.0)  # Default 2x ATR
+                        tp_mult = getattr(global_paper_trader, 'tp_multiplier', 3.0)  # Default 3x ATR
+                        
+                        if bp.get('side') == 'LONG':
+                            merged['stopLoss'] = entry - (atr * sl_mult)
+                            merged['takeProfit'] = entry + (atr * tp_mult)
+                        else:
+                            merged['stopLoss'] = entry + (atr * sl_mult)
+                            merged['takeProfit'] = entry - (atr * tp_mult)
+                        
+                        merged['trailingStop'] = merged['stopLoss']
+                        merged['isTrailingActive'] = False
+                        merged['atr'] = atr
+                    
+                    merged_positions.append(merged)
+                
                 ui_state_cache.balance = balance_data.get('walletBalance', 0)
                 ui_state_cache.live_balance = balance_data
-                ui_state_cache.positions = sorted(positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
                 ui_state_cache.trading_mode = "live"
-                logger.info(f"📊 UI Cache updated: {len(positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
+                logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
                 
                 # Cache PnL data (don't fetch every cycle - expensive)
                 if not ui_state_cache._initialized or datetime.now().timestamp() - ui_state_cache.last_update > 30:
@@ -4693,24 +5235,61 @@ async def update_ui_cache(opportunities: list, stats: dict):
             ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
             ui_state_cache.trading_mode = "paper"
         
-        # Fetch trades from SQLite
-        try:
-            sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
-            ui_state_cache.trades = []
-            for t in sqlite_trades:
-                ui_state_cache.trades.append({
-                    'symbol': t.get('symbol', 'UNKNOWN'),
-                    'side': t.get('side', 'LONG'),
-                    'entryPrice': t.get('entry_price', 0),
-                    'exitPrice': t.get('exit_price', 0),
-                    'pnl': t.get('pnl', 0),
-                    'closeTime': t.get('close_time', 0),
-                    'closeReason': t.get('close_reason', 'Unknown'),
-                    'leverage': t.get('leverage', 1),
-                    'sizeUsd': t.get('size_usd', 0)
-                })
-        except Exception as e:
-            logger.debug(f"SQLite trades fetch error: {e}")
+        # Phase 157: Binance trade history is PRIMARY source - always try first
+        now = datetime.now().timestamp()
+        time_since_last_fetch = now - ui_state_cache.last_binance_trade_fetch
+        triggered = ui_state_cache.pending_trade_fetch_time > 0 and now >= ui_state_cache.pending_trade_fetch_time
+        periodic = time_since_last_fetch > 60
+        
+        should_fetch_binance = live_binance_trader.enabled and (triggered or periodic)
+        
+        # ALWAYS log - no condition
+        logger.info(f"📊 TRADE_CHECK: should={should_fetch_binance}, enabled={live_binance_trader.enabled}, triggered={triggered}, periodic={periodic}, since={time_since_last_fetch:.0f}s")
+        
+        if should_fetch_binance:
+            try:
+                logger.info(f"📊 BINANCE_FETCH: Starting Binance trade history fetch (limit=1000, days=7)...")
+                # Fetch up to 1000 trades to get the most recent ones after sorting
+                binance_trades = await live_binance_trader.get_trade_history(limit=1000, days_back=7)
+                logger.info(f"📊 BINANCE_RESULT: Got {len(binance_trades) if binance_trades else 0} trades")
+                if binance_trades and len(binance_trades) > 0:
+                    # Log first and last trade timestamps for debugging
+                    first_trade = binance_trades[0] if binance_trades else {}
+                    last_trade = binance_trades[-1] if binance_trades else {}
+                    logger.info(f"📊 BINANCE_DATES: First trade={first_trade.get('date', 'N/A')} {first_trade.get('time', 'N/A')}, Last trade={last_trade.get('date', 'N/A')} {last_trade.get('time', 'N/A')}")
+                    
+                    # Binance is primary - use directly (already sorted by timestamp desc)
+                    ui_state_cache.binance_trades = binance_trades
+                    ui_state_cache.trades = binance_trades  # Use Binance directly!
+                    ui_state_cache.last_binance_trade_fetch = now
+                    ui_state_cache.pending_trade_fetch_time = 0  # Reset trigger
+                    logger.info(f"📊 BINANCE_SUCCESS: Using {len(binance_trades)} Binance trades as primary source")
+            except Exception as e:
+                import traceback
+                logger.error(f"📊 BINANCE_ERROR: {e}")
+                logger.error(f"📊 TRACEBACK: {traceback.format_exc()}")
+        
+        # If no Binance trades available, fall back to SQLite
+        if not ui_state_cache.trades:
+            try:
+                sqlite_trades = await sqlite_manager.get_recent_trades(limit=500)
+                for t in sqlite_trades:
+                    ui_state_cache.trades.append({
+                        'symbol': t.get('symbol', 'UNKNOWN'),
+                        'side': t.get('side', 'LONG'),
+                        'entryPrice': t.get('entry_price', 0),
+                        'exitPrice': t.get('exit_price', 0),
+                        'pnl': t.get('pnl', 0),
+                        'closeTime': t.get('close_time', 0),
+                        'closeReason': t.get('close_reason', 'Unknown'),
+                        'leverage': t.get('leverage', 1),
+                        'sizeUsd': t.get('size_usd', 0)
+                    })
+                logger.info(f"📊 SQLITE_FALLBACK: Using {len(sqlite_trades)} SQLite trades")
+            except Exception as e:
+                logger.info(f"📊 SQLITE_ERROR: {e}")
+        
+        logger.info(f"📊 UI_CACHE_END: trades={len(ui_state_cache.trades)}, initialized={ui_state_cache._initialized}")
         
         # Update logs and metadata
         ui_state_cache.logs = global_paper_trader.logs[-100:]
@@ -4982,16 +5561,21 @@ async def background_scanner_loop():
                                 # Normal: volatilite ayarlı mesafe
                                 dynamic_trail_distance = volatility_adjusted_distance
                             
-                            if pos['side'] == 'LONG' and current_price > trail_activation:
-                                new_trailing = current_price - dynamic_trail_distance
-                                if new_trailing > trailing_stop:
-                                    pos['trailingStop'] = new_trailing
-                                    pos['isTrailingActive'] = True
-                            elif pos['side'] == 'SHORT' and current_price < trail_activation:
-                                new_trailing = current_price + dynamic_trail_distance
-                                if new_trailing < trailing_stop:
-                                    pos['trailingStop'] = new_trailing
-                                    pos['isTrailingActive'] = True
+                            if pos['side'] == 'LONG':
+                                # Phase 153: For LONG, activate trail when price > entry (profitable)
+                                # or when price > trail_activation (whichever comes first)
+                                if current_price > entry_price or current_price > trail_activation:
+                                    new_trailing = current_price - dynamic_trail_distance
+                                    if new_trailing > trailing_stop:
+                                        pos['trailingStop'] = new_trailing
+                                        pos['isTrailingActive'] = True
+                            elif pos['side'] == 'SHORT':
+                                # Phase 153: For SHORT, activate trail when price < entry (profitable)
+                                if current_price < entry_price or current_price < trail_activation:
+                                    new_trailing = current_price + dynamic_trail_distance
+                                    if new_trailing < trailing_stop:
+                                        pos['trailingStop'] = new_trailing
+                                        pos['isTrailingActive'] = True
                                     
                     except Exception as pos_error:
                         logger.debug(f"Position update error: {pos_error}")
@@ -5315,14 +5899,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Don't open new position if we already have one in this symbol
     if existing_position:
         signal_log_data['reject_reason'] = 'EXISTING_POSITION'
-        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
         return
     
     # Check max positions
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
         signal_log_data['reject_reason'] = 'MAX_POSITIONS'
-        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 SKIPPING {symbol}: Max positions reached ({len(global_paper_trader.positions)})")
         return
     
@@ -5330,7 +5914,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if global_paper_trader.is_coin_blacklisted(symbol):
         signal_log_data['reject_reason'] = 'BLACKLISTED'
         signal_log_data['blacklisted'] = True
-        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 SKIPPING {symbol}: Blacklisted")
         return
     
@@ -5342,7 +5926,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         
         if not btc_allowed:
             signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
-            asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
             logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason}")
             return
         
@@ -5383,7 +5967,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             # %50+ penalty varsa sinyali reddet
             if long_penalty >= 0.5:
                 signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
-                asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
                 logger.info(f"🚫 REGIME BLOCK: {action} {symbol} - TRENDING_DOWN blocks LONGs")
                 return
             else:
@@ -5426,7 +6010,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     if not mtf_result['confirmed']:
         signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
-        asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
         return
     
@@ -5435,7 +6019,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Signal is ACCEPTED
     signal_log_data['accepted'] = True
-    asyncio.create_task(sqlite_manager.save_signal(signal_log_data))
+    safe_create_task(sqlite_manager.save_signal(signal_log_data))
     
     # Log MTF score info
     mtf_score = mtf_result.get('mtf_score', 0)
@@ -6655,7 +7239,7 @@ class BTCCorrelationFilter:
         if len(self.spread_history) < 20:
             return 0.0
         
-        import numpy as np
+        # numpy already imported globally
         spread_array = np.array(self.spread_history[-self.spread_window:])
         mean = np.mean(spread_array)
         std = np.std(spread_array)
@@ -7091,7 +7675,7 @@ class PositionBasedKillSwitch:
     def reset_for_new_day(self, current_balance: float):
         """Reset for new trading day."""
         # Phase 60: Use Turkey timezone (UTC+3)
-        import pytz
+        # pytz imported globally
         turkey_tz = pytz.timezone('Europe/Istanbul')
         today = datetime.now(turkey_tz).date()
         if self.last_reset_date != today:
@@ -7143,18 +7727,15 @@ class PositionBasedKillSwitch:
                     actions["skipped_profitable"].append(symbol)
                     continue
                 
-                # Calculate POSITION LOSS as % of INVESTED MARGIN (unleveraged)
-                # Example: $174 margin, $90 loss = -51.7% position loss
-                position_loss_pct = (unrealized_pnl / initial_margin) * 100
+                # Phase 152: Use LEVERAGED ROI instead of unleveraged margin loss
+                # unrealizedPnlPercent is already leveraged (pnl / sizeUsd * 100 * leverage)
+                position_loss_pct = pos.get('unrealizedPnlPercent', 0)
                 
                 # Get DYNAMIC thresholds based on this position's leverage
                 first_threshold, full_threshold = self.get_dynamic_thresholds(leverage)
                 
-                # Also get leveraged ROI for logging comparison
-                leveraged_roi = pos.get('unrealizedPnlPercent', 0)
-                
                 # Log for debugging with dynamic thresholds
-                logger.info(f"🎯 Kill switch check {symbol} [{leverage}x]: Loss={position_loss_pct:.1f}% | Thresholds: {first_threshold:.0f}%/{full_threshold:.0f}%")
+                logger.info(f"🎯 Kill switch check {symbol} [{leverage}x]: ROI={position_loss_pct:.1f}% | Thresholds: {first_threshold:.0f}%/{full_threshold:.0f}%")
                 
                 # Check loss thresholds using POSITION LOSS with DYNAMIC thresholds
                 if position_loss_pct <= full_threshold:
@@ -7925,6 +8506,15 @@ class BreakevenStopManager:
                                 "exitPrice": current_price,
                                 "timestamp": int(datetime.now().timestamp() * 1000)
                             }
+                            # Persist to SQLite so data survives restart
+                            safe_create_task(sqlite_manager.save_position_close({
+                                'symbol': symbol,
+                                'side': side,
+                                'reason': 'BREAKEVEN_CLOSE',
+                                'original_reason': 'BREAKEVEN_CLOSE',
+                                'exitPrice': current_price,
+                                'timestamp': int(datetime.now().timestamp() * 1000)
+                            }), name=f"persist_breakeven_{symbol}")
                             result = await live_trader.close_position(symbol, side, abs(contracts))
                             if result:
                                 actions["breakeven_closed"].append(symbol)
@@ -8102,6 +8692,15 @@ class LossRecoveryTrailManager:
                                     "exitPrice": current_price,
                                     "timestamp": int(datetime.now().timestamp() * 1000)
                                 }
+                                # Persist to SQLite so data survives restart
+                                safe_create_task(sqlite_manager.save_position_close({
+                                    'symbol': symbol,
+                                    'side': side,
+                                    'reason': 'RECOVERY_TRAIL_CLOSE',
+                                    'original_reason': 'RECOVERY_TRAIL_CLOSE',
+                                    'exitPrice': current_price,
+                                    'timestamp': int(datetime.now().timestamp() * 1000)
+                                }), name=f"persist_recovery_{symbol}")
                                 result = await live_trader.close_position(symbol, side, abs(contracts))
                                 if result:
                                     actions["recovery_closed"].append(symbol)
@@ -10316,7 +10915,13 @@ class SignalGenerator:
         import math
         
         # Get spread-adjusted parameters (includes leverage, SL/TP multipliers, pullback)
-        spread_params = get_spread_adjusted_params(spread_pct, atr, price)
+        # Get volatility-adjusted parameters (includes leverage, SL/TP multipliers, pullback)
+        # Calculate actual volatility_pct from ATR and price
+        if price > 0 and atr > 0:
+            volatility_pct = (atr / price) * 100
+        else:
+            volatility_pct = 15.0  # Default to mid-range if unknown
+        spread_params = get_volatility_adjusted_params(volatility_pct, atr, price, spread_pct)
         
         # Base leverage from Spread level (low spread = high leverage)
         base_leverage = spread_params['leverage']
@@ -10487,46 +11092,8 @@ class SignalGenerator:
 # ============================================================================
 
 
-class WhaleDetector:
-    """
-    Detects large market participants using real-time Aggregated Trades.
-    Tracks 'Net Whale Volume' (Buy Vol - Sell Vol) for trades > threshold.
-    """
-    def __init__(self, threshold_usd: float = 100000.0, window_size: int = 300):
-        self.threshold = threshold_usd
-        self.window_size = window_size # Seconds tracking window (5 mins)
-        self.trades = [] # List of (timestamp, net_volume)
-        self.net_vol_history = [] # For Z-Score calculation
-        self.current_net_vol = 0.0
-        
-    def process_trade(self, price: float, quantity: float, is_buyer_maker: bool, timestamp: int):
-        usd_value = price * quantity
-        if usd_value < self.threshold:
-            return
-            
-        # Buyer Maker = True -> SELL (Whale Selling into Bids)
-        # Buyer Maker = False -> BUY (Whale Buying from Asks)
-        vol_signed = -usd_value if is_buyer_maker else usd_value
-        
-        self.trades.append((timestamp, vol_signed))
-        self.cleanup_old_trades(timestamp)
-        self.update_metrics()
-        
-    def cleanup_old_trades(self, current_time: int):
-        cutoff = current_time - (self.window_size * 1000) # milliseconds
-        self.trades = [t for t in self.trades if t[0] > cutoff]
-        
-    def update_metrics(self):
-        self.current_net_vol = sum(t[1] for t in self.trades)
-        self.net_vol_history.append(self.current_net_vol)
-        if len(self.net_vol_history) > 1000: self.net_vol_history.pop(0)
-        
-    def get_zscore(self) -> float:
-        if len(self.net_vol_history) < 20: return 0.0
-        mean = np.mean(self.net_vol_history)
-        std = np.std(self.net_vol_history)
-        if std == 0: return 0.0
-        return (self.current_net_vol - mean) / std
+# WhaleDetector removed — WhaleTracker (L4412) is the active implementation
+# See project_analysis.md #5 for details
 
 class PaperTradingEngine:
     """
@@ -10562,6 +11129,8 @@ class PaperTradingEngine:
         self.tp_atr = 20
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
+        self.sl_multiplier = 2.0  # ATR multiplier for SL (used in sync loop)
+        self.tp_multiplier = 3.0  # ATR multiplier for TP (used in sync loop)
         # Phase 22: Multi-position config
         self.max_positions = 50  # Allow up to 50 positions
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
@@ -10606,7 +11175,7 @@ class PaperTradingEngine:
         Calculate today's PnL based on Turkey timezone (UTC+3).
         Returns dict with todayPnl (dollar) and todayPnlPercent.
         """
-        import pytz
+        # pytz imported globally
         
         # Turkey timezone (UTC+3)
         turkey_tz = pytz.timezone('Europe/Istanbul')
@@ -10729,7 +11298,7 @@ class PaperTradingEngine:
         
         # Save to SQLite (async, non-blocking)
         try:
-            asyncio.create_task(sqlite_manager.add_log(timestamp, message, ts))
+            safe_create_task(sqlite_manager.add_log(timestamp, message, ts))
         except Exception:
             pass  # Ignore if event loop not running
     
@@ -11608,7 +12177,7 @@ class PaperTradingEngine:
     def check_daily_drawdown(self) -> bool:
         """Pause trading if daily loss exceeds limit."""
         # Phase 60: Use Turkey timezone (UTC+3) for consistency with get_today_pnl
-        import pytz
+        # pytz imported globally
         turkey_tz = pytz.timezone('Europe/Istanbul')
         now_turkey = datetime.now(turkey_tz)
         today_start = now_turkey.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -11722,11 +12291,21 @@ class PaperTradingEngine:
             logger.error(f"Failed to save state: {e}")
 
     def reset(self):
-        """Reset paper trading to initial state."""
-        self.balance = 10000.0
+        """Reset paper trading to initial state.
+        In live mode, preserves Binance balance instead of hardcoding 10000.
+        """
+        # Live modda Binance balance'ını koru, paper modda 10000 kullan
+        if live_binance_trader.enabled and hasattr(self, 'balance') and self.balance > 0:
+            reset_balance = self.balance  # Keep current Binance balance
+            logger.info(f"🔄 Reset: Keeping live balance ${reset_balance:.2f}")
+        else:
+            reset_balance = 10000.0
+        
+        self.balance = reset_balance
+        self.initial_balance = reset_balance
         self.positions = []
         self.trades = []
-        self.equity_curve = [{"time": int(datetime.now().timestamp() * 1000), "balance": 10000.0, "drawdown": 0.0}]
+        self.equity_curve = [{"time": int(datetime.now().timestamp() * 1000), "balance": reset_balance, "drawdown": 0.0}]
         self.stats = {
             "totalTrades": 0, "winningTrades": 0, "losingTrades": 0, "winRate": 0.0,
             "totalPnl": 0.0, "maxDrawdown": 0.0, "profitFactor": 0.0
@@ -12138,8 +12717,12 @@ class PaperTradingEngine:
         
         if is_live:
             # Store detailed reason for Binance sync to use
-            pnl_percent = (pnl / pos.get('sizeUsd', 1)) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0
-            detailed_reason = self._format_detailed_reason(reason, pos, exit_price, pnl_percent)
+            leverage = pos.get('leverage', 10)
+            size_usd = pos.get('sizeUsd', 0)
+            margin = size_usd / leverage if leverage > 0 and size_usd > 0 else 0
+            roi = (pnl / margin * 100) if margin > 0 else 0  # Leveraged ROI
+            
+            detailed_reason = self._format_detailed_reason(reason, pos, exit_price, roi)
             
             pending_close_reasons[symbol] = {
                 "reason": detailed_reason,
@@ -12150,6 +12733,27 @@ class PaperTradingEngine:
                 "trade_data": trade  # Full trade data for Binance sync to use
             }
             logger.info(f"📋 PENDING REASON SET: {symbol} = {detailed_reason}")
+            
+            # Also save to SQLite for persistent storage
+            try:
+                close_data = {
+                    'symbol': symbol,
+                    'side': pos.get('side', 'LONG'),
+                    'reason': detailed_reason,
+                    'original_reason': reason,
+                    'entryPrice': pos.get('entryPrice', 0),
+                    'exitPrice': exit_price,
+                    'pnl': pnl,
+                    'leverage': leverage,
+                    'sizeUsd': size_usd,
+                    'margin': margin,
+                    'roi': roi,
+                    'timestamp': int(datetime.now().timestamp() * 1000)
+                }
+                safe_create_task(sqlite_manager.save_position_close(close_data))
+            except Exception as e:
+                logger.debug(f"SQLite position close save error: {e}")
+            
             # DON'T append to trades - Binance sync will do it
         else:
             # PAPER positions: write trade history as normal
@@ -12157,7 +12761,7 @@ class PaperTradingEngine:
             
             # Save trade to SQLite (async, non-blocking)
             try:
-                asyncio.create_task(sqlite_manager.save_trade(trade))
+                safe_create_task(sqlite_manager.save_trade(trade))
             except Exception as e:
                 logger.debug(f"SQLite save error: {e}")
         
@@ -12200,6 +12804,9 @@ class PaperTradingEngine:
                     loop.run_until_complete(self._close_on_binance(symbol, side, amount))
             except RuntimeError:
                 asyncio.run(self._close_on_binance(symbol, side, amount))
+            
+            # Phase 157: Schedule Binance trade history fetch after close
+            ui_state_cache.trigger_trade_fetch(delay_seconds=3)
         
         # Phase 52: Post-trade tracking for 24h analysis
         try:

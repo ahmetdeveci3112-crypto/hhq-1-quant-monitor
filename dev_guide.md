@@ -1,12 +1,13 @@
 # HHQ-1 Quant Monitor - Developer Guide
 
 > **ÖNEMLİ:** Bu dosya projenin ana referans dokümanıdır. Her geliştirme öncesi buraya bakılmalıdır.
-> Son güncelleme: 2026-02-04
+> Son güncelleme: 2026-02-07
 
 ## 🔒 Stabil Rollback Noktası
 
 | Tarih | Commit | Açıklama |
 |-------|--------|----------|
+| 2026-02-07 | `cee1faa` | Pre-refactor stabil — Backfill, SQLite logging, dynamic trail çalışıyor |
 | 2026-02-04 | `081ed8f` | Phase 133 rollback sonrası stabil (Phase 135 öncesi) |
 | 2026-02-04 | `7e4230d` | Phase 133 sonrası stabil versiyon (Hurst VETO, Trend VETO, Auto-Breakeven) |
 
@@ -382,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-07 | 149 | Code Quality Refactor: safe_create_task, pending_close_reasons persist, WhaleDetector cleanup |
 | 2026-02-06 | 148 | Binance Trade History Sync (5 min periodic) |
 | 2026-02-06 | 147 | Live Position Trail Exit Execution |
 | 2026-02-05 | 146 | Live Trailing State Persistence |
@@ -710,6 +712,6 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
-> Son güncelleme: 2026-02-05 (Phase 143)
+> Son güncelleme: 2026-02-07 (Phase 149)
 
 
