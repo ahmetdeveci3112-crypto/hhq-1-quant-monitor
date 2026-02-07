@@ -10542,16 +10542,13 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # Phase 132: Reduced base score (45) - signals need more confluence
-            # Combined with threshold=1.5, creates proper filtering
-            score += 45
+            # Phase 152: Base score 50 — Z-Score güçlü sinyal, 1 aligned katman yeterli
+            score += 50
             
-            # Phase 112: Only bonus for mean reversion regime, NO PENALTY
-            # Restores Phase 84 behavior when signals were working
+            # Phase 152: Hurst etkisi artık SADECE threshold'da (calculate_adaptive_threshold)
+            # Scoring'deki çifte etki kaldırıldı — tutarlılık için
             if hurst < 0.45:
-                score += 5  # Mean reversion regime - bonus for alignment
-                reasons.append(f"H_MR({hurst:.2f})")
-            # Ranging (0.45-0.55) and Trending (>0.55): no bonus, NO PENALTY
+                reasons.append(f"H_MR({hurst:.2f})")  # Log only, no score change
         else:
             return None  # Z-Score not extreme enough
         
@@ -10638,53 +10635,35 @@ class SignalGenerator:
             vwap_aligned = True
             reasons.append(f"VWAP({vwap_zscore:.1f})")
             
-        # Layer 4: MTF Trend (Gatekeeper) - Max 20 pts
-        # Phase 131: DYNAMIC COIN_OVERRIDE - Penalty varies by altcoin trend STRENGTH
-        # STRONG altcoin trends can completely override BTC trend
+        # Layer 4: Coin Daily Trend (Max 15 pts)
+        # Phase 152: COIN-ONLY — BTC kontrolü should_allow_signal'da yapılıyor (çifte filtre fixlendi)
+        # Sadece coin'in kendi daily trend'ine göre skor
         mtf_score = 0
         if signal_side == "LONG":
-            if htf_trend == "STRONG_BEARISH":
-                # Phase 131: Gradient penalty based on altcoin strength
-                if coin_daily_trend == "STRONG_BULLISH":
-                    mtf_score = 5  # BONUS! Strong altcoin overrides bearish BTC completely
-                    reasons.append("STRONG_OVERRIDE(BTC)")
-                elif coin_daily_trend == "BULLISH":
-                    mtf_score = -5  # Minor penalty - altcoin showing strength
-                    reasons.append("COIN_OVERRIDE(BTC)")
-                else:
-                    mtf_score = -100  # VETO - both BTC and altcoin bearish
-            elif htf_trend == "BEARISH":
-                if coin_daily_trend == "STRONG_BULLISH":
-                    mtf_score = 10  # Bonus - strong altcoin vs weak BTC
-                elif coin_daily_trend == "BULLISH":
-                    mtf_score = 0  # Neutral - trends cancel out
-                else:
-                    mtf_score = -15  # Penalty for counter-trend
-            elif htf_trend == "NEUTRAL": mtf_score = 10
-            else: mtf_score = 20 # Bullish
+            if coin_daily_trend == "STRONG_BULLISH":
+                mtf_score = 15
+            elif coin_daily_trend == "BULLISH":
+                mtf_score = 10
+            elif coin_daily_trend == "NEUTRAL":
+                mtf_score = 0
+            elif coin_daily_trend == "BEARISH":
+                mtf_score = -10
+            elif coin_daily_trend == "STRONG_BEARISH":
+                mtf_score = -20  # Güçlü penalty ama VETO değil
         else: # SHORT
-            if htf_trend == "STRONG_BULLISH":
-                # Phase 131: Gradient penalty based on altcoin strength
-                if coin_daily_trend == "STRONG_BEARISH":
-                    mtf_score = 5  # BONUS! Strong altcoin overrides bullish BTC completely
-                    reasons.append("STRONG_OVERRIDE(BTC)")
-                elif coin_daily_trend == "BEARISH":
-                    mtf_score = -5  # Minor penalty - altcoin showing weakness
-                    reasons.append("COIN_OVERRIDE(BTC)")
-                else:
-                    mtf_score = -100  # VETO - both BTC and altcoin bullish
-            elif htf_trend == "BULLISH":
-                if coin_daily_trend == "STRONG_BEARISH":
-                    mtf_score = 10  # Bonus - strong altcoin vs weak BTC
-                elif coin_daily_trend == "BEARISH":
-                    mtf_score = 0  # Neutral - trends cancel out
-                else:
-                    mtf_score = -15  # Penalty for counter-trend
-            elif htf_trend == "NEUTRAL": mtf_score = 10
-            else: mtf_score = 20 # Bearish
+            if coin_daily_trend == "STRONG_BEARISH":
+                mtf_score = 15
+            elif coin_daily_trend == "BEARISH":
+                mtf_score = 10
+            elif coin_daily_trend == "NEUTRAL":
+                mtf_score = 0
+            elif coin_daily_trend == "BULLISH":
+                mtf_score = -10
+            elif coin_daily_trend == "STRONG_BULLISH":
+                mtf_score = -20  # Güçlü penalty ama VETO değil
             
         score += mtf_score
-        reasons.append(f"MTF({htf_trend})")
+        reasons.append(f"COIN_TREND({coin_daily_trend}={mtf_score})")
         
         # Layer 5: Liquidation Cascade (Bonus) - Max 15 pts
         # Uses real-time liquidation stream from Binance
@@ -10825,11 +10804,8 @@ class SignalGenerator:
         # =====================================================================
         
         # Layer 15: ADX + Hurst Regime Bonus
-        # ADX < 20 + Hurst < 0.45 → Range market → Mean reversion için ideal
-        # Note: ADX is calculated in analyze() but not passed to generate_signal
-        # Using hurst-only approach as proxy: H < 0.4 = strong mean reversion
-        # TODO: Pass adx parameter to generate_signal in future phase
-        adx = 25.0  # Default neutral, rely on Hurst for regime detection
+        # Phase 152: ADX artık fonksiyon parametresi olarak alınıyor (L10455)
+        # Override kaldırıldı — gerçek ADX değeri kullanılır
         
         if adx < 20 and hurst < 0.45:
             # Strong range regime - ideal for mean reversion
@@ -10977,17 +10953,10 @@ class SignalGenerator:
         spread_params = get_volatility_adjusted_params(volatility_pct, atr, price, spread_pct)
         
         # Base leverage from Spread level (low spread = high leverage)
+        # Phase 152: price_factor get_volatility_adjusted_params'da hesaplanıyor (çifte hesaplama fixlendi)
         base_leverage = spread_params['leverage']
         
-        # 1. PRICE FACTOR: Logarithmic reduction for low-price coins
-        # $100+ → 1.0, $1 → 0.50, $0.01 → 0.30 (higher manipulation risk)
-        if price > 0:
-            log_price = math.log10(max(price, 0.0001))  # -4 to ~5 range
-            price_factor = max(0.3, min(1.0, (log_price + 2) / 4))
-        else:
-            price_factor = 1.0
-        
-        # 2. VOLATILITY FACTOR: High ATR = lower leverage
+        # 1. VOLATILITY FACTOR: High ATR = lower leverage
         # ATR as % of price: <10% = 1.0, 10-20% = 0.8, 20-30% = 0.6, 30-50% = 0.4, 50%+ = 0.3
         volatility_pct = (atr / price * 100) if price > 0 and atr > 0 else 10.0
         if volatility_pct <= 10.0:
@@ -11001,20 +10970,21 @@ class SignalGenerator:
         else:
             volatility_factor = 0.3   # Extreme volatility
         
-        # 3. BALANCE PROTECTION FACTOR
+        # 2. BALANCE PROTECTION FACTOR
         leverage_mult = balance_protector.calculate_leverage_multiplier(
             balance_protector.peak_balance
         )
         
-        # COMBINED LEVERAGE: base × price × volatility × balance_protection
-        final_leverage = int(round(base_leverage * price_factor * volatility_factor * leverage_mult))
+        # COMBINED LEVERAGE: base × volatility × balance_protection
+        # Phase 152: price_factor kaldırıldı — get_volatility_adjusted_params zaten uyguluyor
+        final_leverage = int(round(base_leverage * volatility_factor * leverage_mult))
         
         # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
         
         # Log if any factor reduced leverage significantly
-        if price_factor < 0.9 or volatility_factor < 0.9 or leverage_mult < 0.9:
-            logger.info(f"📊 Unified Leverage: base={base_leverage}x × price={price_factor:.2f} × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
+        if volatility_factor < 0.9 or leverage_mult < 0.9:
+            logger.info(f"📊 Unified Leverage: base={base_leverage}x × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
         
         # Use spread-based SL/TP multipliers (override regime-based)
         atr_sl = spread_params['sl_multiplier']
