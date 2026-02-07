@@ -11030,6 +11030,26 @@ class SignalGenerator:
         # Limit pullback to max 2.5%
         pullback_pct = min(0.025, pullback_pct)
         
+        # =====================================================================
+        # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
+        # ADX > 30 (güçlü trend) + Hurst > 0.55 (trending rejim) + 
+        # Coin daily trend aligned → Direkt market entry, pullback yok
+        # =====================================================================
+        strong_momentum = (
+            adx > 30 and
+            hurst > 0.55 and
+            (
+                (signal_side == "LONG" and coin_daily_trend in ["BULLISH", "STRONG_BULLISH"]) or
+                (signal_side == "SHORT" and coin_daily_trend in ["BEARISH", "STRONG_BEARISH"])
+            )
+        )
+        
+        if strong_momentum:
+            original_pullback = pullback_pct
+            pullback_pct = 0.0  # Market entry — no pullback
+            reasons.append(f"⚡ MOMENTUM_ENTRY(ADX={adx:.0f},H={hurst:.2f})")
+            logger.info(f"⚡ MOMENTUM ENTRY: {symbol} {signal_side} — pullback {original_pullback*100:.1f}%→0% | ADX={adx:.1f} H={hurst:.2f} trend={coin_daily_trend}")
+        
         if signal_side == "LONG":
             ideal_entry = price * (1 - pullback_pct)
             sl = ideal_entry - (atr * atr_sl) - spread_buffer
