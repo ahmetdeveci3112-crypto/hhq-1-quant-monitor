@@ -10603,25 +10603,20 @@ class SignalGenerator:
         
 
         # Phase 28: Dynamic threshold from coin profile
+        # Phase 152 FIX: User's min_confidence_score is always the floor
+        user_min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 65
+        
         if coin_profile:
             base_threshold = coin_profile.get('optimal_threshold', 1.6)
-            # Phase 137 FIX: Reduced default min_score from 75 to 55 to allow more signals
-            min_score_required = coin_profile.get('min_score', 55)
+            # Phase 152: coin_profile min_score cannot go below user's setting
+            coin_min = coin_profile.get('min_score', 55)
+            min_score_required = max(coin_min, user_min_score)
             is_backtest = coin_profile.get('is_backtest', False)
-            logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required}")
+            logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required} (coin={coin_min}, user={user_min_score})")
         else:
-            # Phase 132: Stricter thresholds to reduce signal count
-            # threshold=1.5 requires stronger Z-Score deviations
-            base_threshold = 1.5  # Higher threshold = fewer, stronger signals
-            min_score_required = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 45
+            base_threshold = 1.5
+            min_score_required = user_min_score
             is_backtest = False
-            # Phase 113: Debug log to trace min_score_required source
-            if hasattr(self, '_min_score_log_count'):
-                self._min_score_log_count += 1
-            else:
-                self._min_score_log_count = 0
-            if self._min_score_log_count % 100 == 0:
-                logger.info(f"📊 MIN_SCORE_DEBUG: min_score_required={min_score_required}, ai_optimizer_enabled={global_paper_trader.ai_optimizer_enabled if 'global_paper_trader' in globals() else 'N/A'}")
         
         # Leverage Scaling:
         # 10x = 1.0x factor (No change)
