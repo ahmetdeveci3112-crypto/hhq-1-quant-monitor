@@ -5539,6 +5539,13 @@ async def background_scanner_loop():
                 # PHASE 98: Update UI cache with latest data (instant delivery to UI)
                 await update_ui_cache(opportunities, stats)
                 
+                # Phase 152: Periodic status summary to UI logs (every ~60 sec)
+                if loop_iter % 20 == 0 and 'global_paper_trader' in globals():
+                    pt = global_paper_trader
+                    active_sigs = len(multi_coin_scanner.active_signals)
+                    total_pnl = sum(p.get('unrealizedPnl', 0) for p in pt.positions)
+                    pt.add_log(f"📊 DURUM: {len(pt.positions)} poz | {active_sigs} sinyal | Bakiye: ${pt.balance:.0f} | Açık PnL: ${total_pnl:.2f}")
+                
                 # Update market regime with BTC price (from btc_filter OR from opportunities)
                 try:
                     btc_price = btc_filter.btc_price
@@ -8294,8 +8301,7 @@ class TimeBasedPositionManager:
                                 if pos.get('isLive', False):
                                     logger.warning(f"📊 TIME REDUCE LIVE: {symbol} needs manual close on Binance - {reduction_amount:.4f} contracts")
                                 
-                                # Log to paper trader
-                                paper_trader.add_log(f"⏰ TIME REDUCE: {symbol} -{reduction_pct*100:.0f}% after {threshold_hours}h")
+                                # Phase 152: Don't spam UI logs — summary log added at end of cycle
                                 
                                 # ===== RECORD AS TRADE FOR HISTORY =====
                                 close_reason = f"TIME_REDUCE_{key.upper()}"
@@ -8338,6 +8344,11 @@ class TimeBasedPositionManager:
             actions["time_closed"] = positions_to_remove
             logger.info(f"📊 TIME CLOSE: Removed {len(positions_to_remove)} fully closed positions")
             paper_trader.save_state()
+        
+        # Phase 152: Single summary log for UI instead of per-position spam
+        if actions.get("time_reduced"):
+            symbols = [r.split()[0] for r in actions["time_reduced"]]
+            paper_trader.add_log(f"⏰ TIME REDUCE: {len(symbols)} poz küçültüldü: {', '.join(symbols[:5])}{'...' if len(symbols) > 5 else ''}")
         
         # Cleanup old tracking data for closed positions
         active_pos_ids = {p.get('id') for p in paper_trader.positions}
