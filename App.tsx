@@ -1039,7 +1039,7 @@ export default function App() {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
-          signalCount={opportunities.filter(o => o.signalAction !== 'NONE' && o.signalScore >= 45).length}
+          signalCount={opportunities.filter(o => o.signalAction !== 'NONE' && o.signalScore >= (settings.minConfidenceScore || 40)).length}
           aiTrackingCount={optimizerStats.trackingCount}
         />
 
@@ -1543,6 +1543,7 @@ export default function App() {
                 signals={opportunities}
                 onMarketOrder={handleMarketOrder}
                 entryTightness={settings.entryTightness}
+                minConfidenceScore={settings.minConfidenceScore || 40}
               />
             </div>
           )

@@ -6,6 +6,7 @@ interface ActiveSignalsPanelProps {
     signals: CoinOpportunity[];
     onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number) => Promise<void>;
     entryTightness?: number;
+    minConfidenceScore?: number;
 }
 
 const formatPrice = (price: number): string => {
@@ -38,13 +39,13 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
 
 type SortKey = 'score' | 'symbol' | 'price' | 'zScore' | 'hurst' | 'side';
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0 }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40 }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
 
     const activeSignals = signals
-        .filter(s => s.signalAction !== 'NONE' && s.signalScore >= 45)
+        .filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore)
         .sort((a, b) => {
             let compare = 0;
             switch (sortKey) {
