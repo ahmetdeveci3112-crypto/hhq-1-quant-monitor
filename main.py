@@ -3944,6 +3944,7 @@ class CoinOpportunity:
         self.atr: float = 0.0
         self.last_update: float = 0.0
         self.leverage: int = 10  # Default leverage, updated by SignalGenerator
+        self.pullback_pct: float = 0.0  # Pullback percentage for signal
     
     def to_dict(self) -> dict:
         return {
@@ -3960,7 +3961,8 @@ class CoinOpportunity:
             "lastSignalTime": self.last_signal_time,
             "atr": self.atr,
             "lastUpdate": self.last_update,
-            "leverage": self.leverage  # Phase 73: Include leverage in UI data
+            "leverage": self.leverage,  # Phase 73: Include leverage in UI data
+            "pullbackPct": round(self.pullback_pct, 2)
         }
 
 
@@ -4399,6 +4401,7 @@ class LightweightCoinAnalyzer:
             self.opportunity.signal_score = signal.get('confidenceScore', 0)
             self.opportunity.signal_action = signal.get('action', 'NONE')
             self.opportunity.leverage = signal.get('leverage', 10)  # Phase 73: Pass leverage to UI
+            self.opportunity.pullback_pct = signal.get('pullbackPct', 0)  # Pullback % for UI
             self.opportunity.last_signal_time = datetime.now().timestamp()
             return signal
         else:

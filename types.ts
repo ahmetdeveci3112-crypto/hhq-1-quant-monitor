@@ -281,6 +281,7 @@ export interface CoinOpportunity {
   atr: number;
   lastUpdate: number;
   leverage?: number;  // Phase 73: Backend-calculated leverage based on volatility
+  pullbackPct?: number;  // Pullback percentage for entry
 }
 
 export interface ScannerStats {

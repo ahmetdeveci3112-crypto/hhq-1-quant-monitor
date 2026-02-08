@@ -142,6 +142,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
+                        <span className="text-amber-400">PB:{(signal.pullbackPct || spreadInfo.pullback).toFixed(1)}%</span>
                         <span className="flex items-center gap-1 text-slate-500">
                             <Clock className="w-2.5 h-2.5" />{formatTime(signal.lastSignalTime)}
                         </span>
@@ -209,6 +210,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <SortHeader label="Z-Score" sortKeyName="zScore" align="right" />
                             <SortHeader label="Hurst" sortKeyName="hurst" align="right" />
                             <th className="py-3 px-3 font-medium text-center">Lev</th>
+                            <th className="py-3 px-3 font-medium text-center">PB%</th>
+                            <th className="py-3 px-3 font-medium text-center">Bounce%</th>
                             <th className="py-3 px-3 font-medium text-center">Spread</th>
                             <th className="py-3 px-3 font-medium text-center">Time</th>
                             <th className="py-3 px-3 font-medium text-right">Action</th>
@@ -217,7 +220,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     <tbody>
                         {activeSignals.length === 0 ? (
                             <tr>
-                                <td colSpan={11} className="py-16 text-center text-slate-600">
+                                <td colSpan={14} className="py-16 text-center text-slate-600">
                                     <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
                                     <p>No active signals</p>
                                 </td>
@@ -230,6 +233,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                     ? signal.price * (1 - spreadInfo.pullback / 100)
                                     : signal.price * (1 + spreadInfo.pullback / 100);
                                 const isLoading = loadingSymbol === signal.symbol;
+                                // Calculate bounce % from ATR and Hurst
+                                const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
+                                const hurstFactor = Math.max(0.2, 0.8 - Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4)) * 0.6);
+                                const bouncePct = atrPct * hurstFactor * Math.sqrt(Math.max(0.5, entryTightness));
+                                const pbPct = signal.pullbackPct || spreadInfo.pullback;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -267,6 +275,16 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                         </td>
                                         <td className="py-2.5 px-3 text-center">
                                             <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{signal.leverage || spreadInfo.leverage}x</span>
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center">
+                                            <span className={`text-[10px] font-mono font-semibold ${pbPct > 0 ? 'text-amber-400' : 'text-slate-500'}`}>
+                                                {pbPct > 0 ? `${pbPct.toFixed(1)}%` : 'MKT'}
+                                            </span>
+                                        </td>
+                                        <td className="py-2.5 px-3 text-center">
+                                            <span className={`text-[10px] font-mono font-semibold ${bouncePct > 0.5 ? 'text-cyan-400' : 'text-slate-500'}`}>
+                                                {bouncePct.toFixed(2)}%
+                                            </span>
                                         </td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">{spreadInfo.level}</td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">
