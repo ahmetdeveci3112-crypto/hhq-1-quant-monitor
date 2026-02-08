@@ -142,7 +142,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
-                        <span className="text-amber-400">PB:{(signal.pullbackPct || spreadInfo.pullback).toFixed(1)}%</span>
+                        <span className="text-amber-400">PB:{Math.abs((entryPrice - signal.price) / signal.price * 100).toFixed(1)}%</span>
                         <span className="flex items-center gap-1 text-slate-500">
                             <Clock className="w-2.5 h-2.5" />{formatTime(signal.lastSignalTime)}
                         </span>
@@ -233,11 +233,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                     ? signal.price * (1 - spreadInfo.pullback / 100)
                                     : signal.price * (1 + spreadInfo.pullback / 100);
                                 const isLoading = loadingSymbol === signal.symbol;
-                                // Calculate bounce % from ATR and Hurst
+                                // PB%: Actual pullback = distance from price to entry
+                                const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
+                                // Bounce%: Confirmation threshold (fraction of ATR based on trend strength)
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const hurstFactor = Math.max(0.2, 0.8 - Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4)) * 0.6);
-                                const bouncePct = atrPct * hurstFactor * Math.sqrt(Math.max(0.5, entryTightness));
-                                const pbPct = signal.pullbackPct || spreadInfo.pullback;
+                                const trendFactor = Math.max(0.2, 0.8 - (Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4)) * 0.4 + Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2)) * 0.2) * 0.6);
+                                const bouncePct = atrPct * trendFactor;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
