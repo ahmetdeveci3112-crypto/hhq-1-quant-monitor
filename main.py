@@ -1076,11 +1076,11 @@ class LiveBinanceTrader:
                         # Calculate PnL percentage
                         pnl_percent = (unrealized_pnl / position_margin * 100) if position_margin > 0 else 0
                         
-                        # Phase 160: Use cached openTime if available (survives reduce)
-                        cached_ot = self.open_time_cache.get(symbol)
-                        if cached_ot:
-                            open_time_val = cached_ot
-                        else:
+                        # Read openTime from SQLite (single source of truth)
+                        try:
+                            db_ot = await db_manager.get_position_open_time(symbol)
+                            open_time_val = db_ot if db_ot else int(p.get('updateTime', datetime.now().timestamp() * 1000))
+                        except:
                             open_time_val = int(p.get('updateTime', datetime.now().timestamp() * 1000))
                         result.append({
                             'symbol': symbol,
