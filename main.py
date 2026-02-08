@@ -12618,6 +12618,15 @@ class PaperTradingEngine:
                 bounce_cancel_distance = atr * base_cancel * et_mult
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
                 
+                # Phase 160: Cap bounce at 60% of pullback distance
+                # Bounce can never exceed pullback — otherwise price needs to go above signal price to confirm
+                pullback_distance = abs(entry_price - order.get('signalPrice', entry_price))
+                if pullback_distance > 0:
+                    max_bounce = pullback_distance * 0.6
+                    if bounce_confirm_distance > max_bounce:
+                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (60% of pullback {pullback_distance:.6f})")
+                        bounce_confirm_distance = max_bounce
+                
                 # Calculate percentage equivalents for logging
                 confirm_pct = (bounce_confirm_distance / entry_price * 100) if entry_price > 0 else 0
                 cancel_pct = (bounce_cancel_distance / entry_price * 100) if entry_price > 0 else 0

@@ -238,7 +238,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 // Bounce%: Confirmation threshold (fraction of ATR based on trend strength)
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const trendFactor = Math.max(0.2, 0.8 - (Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4)) * 0.4 + Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2)) * 0.2) * 0.6);
-                                const bouncePct = atrPct * trendFactor;
+                                // Cap bounce at 60% of pullback (bounce can never exceed pullback)
+                                const rawBounce = atrPct * trendFactor;
+                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.6) : rawBounce;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
