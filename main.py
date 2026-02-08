@@ -980,6 +980,12 @@ class LiveBinanceTrader:
                     # Sort newest → oldest (reverse chronological)
                     sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)), reverse=True)
                     
+                    # Debug: log first trade's buyer field to diagnose type issues
+                    if sorted_trades:
+                        sample = sorted_trades[0]
+                        raw_buyer = sample.get('buyer')
+                        logger.info(f"📂 {symbol}: posAmt={current_amt}, trades={len(sorted_trades)}, buyer_field={raw_buyer} (type={type(raw_buyer).__name__})")
+                    
                     # REVERSE CUMULATIVE SUM
                     # Start from current position amount and walk backwards
                     cum_qty = current_amt  # e.g. +1.5 for LONG, -0.8 for SHORT
@@ -987,8 +993,15 @@ class LiveBinanceTrader:
                     
                     for i, t in enumerate(sorted_trades):
                         qty = float(t.get('qty', 0))
-                        is_buyer = t.get('buyer', False)
+                        raw_buyer = t.get('buyer', False)
                         trade_time = int(t.get('time', 0))
+                        
+                        # CRITICAL: Binance raw API may return buyer as string "true"/"false"
+                        # Python treats "false" as truthy! Must explicitly check.
+                        if isinstance(raw_buyer, str):
+                            is_buyer = raw_buyer.lower() == 'true'
+                        else:
+                            is_buyer = bool(raw_buyer)
                         
                         # Reverse the trade: if it was a BUY, subtract qty; if SELL, add qty
                         if is_buyer:
@@ -1003,6 +1016,9 @@ class LiveBinanceTrader:
                             logger.info(f"📂 {symbol}: cumQty→0 at trade {i+1}/{len(sorted_trades)}, openTime={datetime.fromtimestamp(trade_time/1000)}")
                             break
                     
+                    if not open_time:
+                        logger.info(f"📂 {symbol}: cumQty={cum_qty:.6f} after all {len(sorted_trades)} trades (never reached 0)")
+                    
                     if open_time:
                         self.open_time_cache[symbol] = open_time
                         filled += 1
@@ -1011,7 +1027,7 @@ class LiveBinanceTrader:
                         earliest = int(sorted_trades[-1].get('time', 0))
                         self.open_time_cache[symbol] = earliest
                         filled += 1
-                        logger.info(f"📂 {symbol}: cumQty never reached 0 (pos older than history), using earliest={datetime.fromtimestamp(earliest/1000)}")
+                        logger.info(f"📂 {symbol}: using earliest trade as fallback: {datetime.fromtimestamp(earliest/1000)}")
                         
                 except Exception as e:
                     logger.warning(f"⚠️ {symbol}: trade fetch error: {e}")
@@ -1020,6 +1036,7 @@ class LiveBinanceTrader:
             
             if filled > 0:
                 self._save_open_time_cache()
+                logger.info(f"📂 Cache saved to {self._get_open_time_cache_path()}")
             
             total = len(self.open_time_cache)
             logger.info(f"📂 OpenTime done: {filled} new, {total} total cached")
@@ -1289,8 +1306,14 @@ class LiveBinanceTrader:
                                 
                                 for t in sorted_trades:
                                     qty = float(t.get('qty', 0))
-                                    is_buyer = t.get('buyer', False)
+                                    raw_buyer = t.get('buyer', False)
                                     trade_time = int(t.get('time', 0))
+                                    
+                                    # CRITICAL: Binance raw API returns buyer as string "true"/"false"
+                                    if isinstance(raw_buyer, str):
+                                        is_buyer = raw_buyer.lower() == 'true'
+                                    else:
+                                        is_buyer = bool(raw_buyer)
                                     
                                     if is_buyer:
                                         cum_qty -= qty
