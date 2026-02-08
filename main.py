@@ -11737,18 +11737,26 @@ class SignalGenerator:
             reasons.append(f"SpreadProt({spread_pct:.2f}%)")
         
         # =====================================================================
-        # PHASE 29: SPREAD-BASED PULLBACK
+        # PHASE 160: ATR+SPREAD PULLBACK (replaces old spread-only pullback)
+        # Pullback = (ATR% × pullback_factor) + (Spread% × 0.5)
+        # ATR% = coin's natural volatility → scales pullback depth
+        # Spread% = liquidity buffer → slippage protection
         # =====================================================================
         
-        # Use spread-based pullback from parameters
-        pullback_pct = spread_params['pullback']
+        # ATR as percentage of price
+        atr_pct = (atr / price) if price > 0 else 0  # e.g., 0.075 for 7.5%
+        
+        # Pullback = ATR component + Spread component
+        pullback_factor = 0.4  # Use 40% of ATR as pullback base
+        spread_factor = 0.5    # Use 50% of spread as slippage buffer
+        pullback_pct = (atr_pct * pullback_factor) + (spread_pct / 100 * spread_factor)
         
         # Additional pullback for extreme volatility
         if volatility_ratio > 2.0:
             pullback_pct += 0.005  # +0.5%
         
-        # Limit pullback to max 2.5%
-        pullback_pct = min(0.025, pullback_pct)
+        # Limit pullback to max 10% (ATR-based can go higher than old spread-based)
+        pullback_pct = min(0.10, pullback_pct)
         
         # =====================================================================
         # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
@@ -11825,10 +11833,10 @@ class SignalGenerator:
         reasons.append(f"Lev({final_leverage}x)")
         
         # Debug: Log the actual ATR% value and what level it maps to
-        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")
+        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% PB%={pullback_pct*100:.2f}% (ATR:{atr_pct*100:.1f}%+Spread:{spread_pct:.2f}%) → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")
         
         # Phase 127: Log successful signal generation for tracing
-        logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f}")
+        logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
         
         return {
             'action': signal_side,
@@ -11844,7 +11852,8 @@ class SignalGenerator:
             'sizeMultiplier': size_mult,
             'leverage': final_leverage,  # Phase 29: Dynamic leverage
             'spreadLevel': spread_params['level'],
-            'pullbackPct': round(pullback_pct * 100, 2),
+            'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
+            'atrPct': round(atr_pct * 100, 2),  # Phase 160: Raw ATR% for bounce calc
             'coinDailyTrend': coin_daily_trend,  # Phase 110: For position sizing
             'trendSizeReduction': trend_size_reduction,  # Phase 110: Applied reduction
             # Phase 153: ADX and Hurst for dynamic bounce confirmation
@@ -12578,60 +12587,61 @@ class PaperTradingEngine:
                     order['bounceStartPrice'] = current_price
                     order['bounceStartVolume'] = current_volume  # Volume snapshot
                     order['bouncePriceHistory'] = [current_price]  # Track price trend
-                    # Pre-calculate bounce thresholds for logging
-                    import math
-                    et = max(0.5, self.entry_tightness)
-                    et_mult = math.sqrt(et)
-                    base_cf = 0.8 - (min(1.0, max(0.0, (order.get('adx', 0) - 15) / 45)) * 0.6 + min(1.0, max(0.0, (order.get('hurst', 0.5) - 0.35) / 0.4)) * 0.4) * 0.6
-                    bounce_pct = (atr * base_cf * et_mult) / entry_price * 100 if entry_price > 0 else 0
-                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% | ET={et:.1f}x")
-                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% ET={et} vol={current_volume:.0f}")
+                    # Pre-calculate bounce thresholds for logging (Phase 160: ATR-only)
+                    order_adx = order.get('adx', 0)
+                    order_hurst = order.get('hurst', 0.5)
+                    adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
+                    hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
+                    trend_s = adx_s * 0.6 + hurst_s * 0.4
+                    bf = 0.20 - trend_s * 0.10  # bounce factor
+                    bounce_dist = atr * bf
+                    # Cap at 50% of pullback
+                    pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
+                    if pb_dist > 0:
+                        bounce_dist = min(bounce_dist, pb_dist * 0.5)
+                    bounce_pct = (bounce_dist / entry_price * 100) if entry_price > 0 else 0
+                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% (ATR×{bf:.2f})")
+                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% vol={current_volume:.0f}")
             else:
                 # Step 2: Waiting for bounce confirmation
-                # Phase 153: Dynamic bounce threshold based on ADX + Hurst + entry_tightness
-                # Strong trend (high ADX + high Hurst) → smaller bounce needed
-                # Weak trend (low ADX + low Hurst) → larger bounce needed
-                # Higher entry_tightness → easier entry → smaller bounce required
+                # Phase 160: ATR-ONLY BOUNCE (replaces old ATR×trend×ET formula)
+                # Bounce = ATR × bounce_factor × trend_modifier
+                # ET does NOT affect bounce (only pullback uses ET)
+                # Bounce is always capped at 50% of pullback distance
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
                 
                 # Trend strength: 0.0 (very weak) to 1.0 (very strong)
-                # ADX component: 0-100 → normalize to 0-1 (clip at 60)
                 adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))  # 15→0, 60→1
-                # Hurst component: 0.3-0.8 → normalize to 0-1
                 hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))  # 0.35→0, 0.75→1
-                # Combined trend strength (ADX weighted 60%, Hurst 40%)
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
                 
-                # Apply entry_tightness: higher ET = easier entry = STRICTER bounce needed
-                # ET 2.6x means multiply bounce by sqrt(2.6) ≈ 1.6x (smoothed)
+                # Bounce factor: strong trend → smaller bounce needed
+                # Range: 0.10 (strong trend) to 0.20 (weak trend) × ATR
+                bounce_factor = 0.20 - trend_strength * 0.10  # 0.10 to 0.20
+                bounce_confirm_distance = atr * bounce_factor  # NO et_mult!
+                
+                # Cancel distance: how far below entry before giving up
                 import math
                 et = max(0.5, self.entry_tightness)
-                et_mult = math.sqrt(et)  # sqrt smoothing: 2.6→1.6, 1.0→1.0, 0.5→0.7
-                
-                # Base bounce distances (before entry_tightness)
-                base_confirm = 0.8 - trend_strength * 0.6  # Range: 0.2 to 0.8 ×ATR
                 base_cancel = 0.7 + trend_strength * 0.8   # Range: 0.7 to 1.5 ×ATR
-                
-                # Apply entry_tightness: MULTIPLY (higher ET = bigger bounce needed)
-                bounce_confirm_distance = atr * base_confirm * et_mult
-                bounce_cancel_distance = atr * base_cancel * et_mult
+                bounce_cancel_distance = atr * base_cancel
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
                 
-                # Phase 160: Cap bounce at 60% of pullback distance
-                # Bounce can never exceed pullback — otherwise price needs to go above signal price to confirm
+                # Cap bounce at 50% of pullback distance
+                # Bounce can NEVER exceed pullback — that would require price to go above signal price
                 pullback_distance = abs(entry_price - order.get('signalPrice', entry_price))
                 if pullback_distance > 0:
-                    max_bounce = pullback_distance * 0.6
+                    max_bounce = pullback_distance * 0.5
                     if bounce_confirm_distance > max_bounce:
-                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (60% of pullback {pullback_distance:.6f})")
+                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (50% of pullback {pullback_distance:.6f})")
                         bounce_confirm_distance = max_bounce
                 
                 # Calculate percentage equivalents for logging
                 confirm_pct = (bounce_confirm_distance / entry_price * 100) if entry_price > 0 else 0
                 cancel_pct = (bounce_cancel_distance / entry_price * 100) if entry_price > 0 else 0
                 
-                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} str={trend_strength:.2f} ET={et:.1f}x | confirm={base_confirm/et:.2f}×ATR(≈{confirm_pct:.2f}%) cancel={base_cancel/et:.2f}×ATR(≈{cancel_pct:.2f}%)")
+                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} str={trend_strength:.2f} | confirm={bounce_factor:.2f}×ATR(≈{confirm_pct:.2f}%) cancel={base_cancel:.2f}×ATR(≈{cancel_pct:.2f}%)")
                 bounce_start = order.get('bounceStartTime', current_time)
                 bounce_start_volume = order.get('bounceStartVolume', 0)
                 

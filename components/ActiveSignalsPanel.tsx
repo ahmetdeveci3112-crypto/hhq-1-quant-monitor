@@ -235,12 +235,16 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 // PB%: Actual pullback = distance from price to entry
                                 const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Bounce%: Confirmation threshold (fraction of ATR based on trend strength)
+                                // Bounce%: ATR-only confirmation (Phase 160)
+                                // bounce_factor: 0.10 (strong trend) to 0.20 (weak trend) × ATR
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const trendFactor = Math.max(0.2, 0.8 - (Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4)) * 0.4 + Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2)) * 0.2) * 0.6);
-                                // Cap bounce at 60% of pullback (bounce can never exceed pullback)
-                                const rawBounce = atrPct * trendFactor;
-                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.6) : rawBounce;
+                                const hurstStr = Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4));
+                                const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
+                                const trendStr = hurstStr * 0.6 + zStr * 0.4;
+                                const bounceFactor = 0.20 - trendStr * 0.10;
+                                const rawBounce = atrPct * bounceFactor;
+                                // Cap at 50% of pullback (bounce can NEVER exceed pullback)
+                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.5) : rawBounce;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
