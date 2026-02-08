@@ -189,13 +189,13 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 <div className="bg-gradient-to-br from-fuchsia-900/50 to-fuchsia-800/30 border border-fuchsia-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <Bot className="w-4 h-4 sm:w-5 sm:h-5 text-fuchsia-400" />
-                        <span className="text-xs sm:text-sm text-fuchsia-300">Son 7 Gün</span>
+                        <span className="text-xs sm:text-sm text-fuchsia-300">Bugün (Binance)</span>
                     </div>
-                    <div className={`text-lg sm:text-2xl font-bold ${(summary?.recentPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        ${summary?.recentPnl?.toFixed(2) || '0.00'}
+                    <div className={`text-lg sm:text-2xl font-bold ${(summary?.binanceTodayPnl ?? summary?.recentPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        ${(summary?.binanceTodayPnl ?? summary?.recentPnl)?.toFixed(2) || '0.00'}
                     </div>
-                    <div className="text-[10px] sm:text-xs text-fuchsia-400 mt-1">
-                        {summary?.recentTrades || 0} trade | WR %{summary?.recentWinRate?.toFixed(0) || '0'}
+                    <div className="text-[10px] sm:text-xs text-fuchsia-400 mt-1 truncate">
+                        {summary?.binanceTodayPnlPct !== undefined ? `${summary.binanceTodayPnlPct >= 0 ? '+' : ''}${summary.binanceTodayPnlPct.toFixed(2)}%` : ''} | 7g: ${summary?.recentPnl?.toFixed(0) || '0'}
                     </div>
                 </div>
 

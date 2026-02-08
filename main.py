@@ -14983,6 +14983,27 @@ async def get_performance_summary():
         avg_loss = sum(losses) / len(losses)
     profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else 0
     
+    # Get today's PnL from Binance income API (includes FUNDING_FEE + COMMISSION)
+    binance_today_pnl = 0
+    binance_today_pnl_pct = 0
+    binance_total_pnl_income = 0
+    try:
+        if live_binance_trader.enabled:
+            # Use cached PnL if available (updated every scan cycle)
+            cached = getattr(live_binance_trader, 'cached_pnl', None)
+            if cached:
+                binance_today_pnl = cached.get('todayPnl', 0)
+                binance_today_pnl_pct = cached.get('todayPnlPercent', 0)
+                binance_total_pnl_income = cached.get('totalPnl', 0)
+            else:
+                # Fetch fresh if no cache
+                pnl_data = await live_binance_trader.get_pnl_from_binance()
+                binance_today_pnl = pnl_data.get('todayPnl', 0)
+                binance_today_pnl_pct = pnl_data.get('todayPnlPercent', 0)
+                binance_total_pnl_income = pnl_data.get('totalPnl', 0)
+    except Exception as e:
+        logger.debug(f"Binance today PnL fetch error: {e}")
+    
     return JSONResponse({
         "success": True,
         "source": source,
@@ -15000,7 +15021,10 @@ async def get_performance_summary():
         "closeReasons": reason_stats,
         "coinStats": coin_performance_tracker.get_stats_for_optimizer(),
         "optimizerEnabled": parameter_optimizer.enabled,
-        "lastOptimization": parameter_optimizer.last_optimization
+        "lastOptimization": parameter_optimizer.last_optimization,
+        "binanceTodayPnl": round(binance_today_pnl, 2),
+        "binanceTodayPnlPct": round(binance_today_pnl_pct, 2),
+        "binanceTotalPnlIncome": round(binance_total_pnl_income, 2)
     })
 
 @app.post("/scanner/start")
