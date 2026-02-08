@@ -11969,13 +11969,18 @@ class PaperTradingEngine:
                     order['bounceStartPrice'] = current_price
                     order['bounceStartVolume'] = current_volume  # Volume snapshot
                     order['bouncePriceHistory'] = [current_price]  # Track price trend
-                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | ATR=${atr:.6f} | Vol=${current_volume/1e6:.1f}M")
-                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} vol={current_volume:.0f}")
+                    # Pre-calculate bounce thresholds for logging
+                    et = max(0.5, self.entry_tightness)
+                    base_cf = 0.8 - (min(1.0, max(0.0, (order.get('adx', 0) - 15) / 45)) * 0.6 + min(1.0, max(0.0, (order.get('hurst', 0.5) - 0.35) / 0.4)) * 0.4) * 0.6
+                    bounce_pct = (atr * base_cf / et) / entry_price * 100 if entry_price > 0 else 0
+                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% | ET={et:.1f}x")
+                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% ET={et} vol={current_volume:.0f}")
             else:
                 # Step 2: Waiting for bounce confirmation
-                # Phase 153: Dynamic bounce threshold based on ADX + Hurst
+                # Phase 153: Dynamic bounce threshold based on ADX + Hurst + entry_tightness
                 # Strong trend (high ADX + high Hurst) → smaller bounce needed
                 # Weak trend (low ADX + low Hurst) → larger bounce needed
+                # Higher entry_tightness → easier entry → smaller bounce required
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
                 
@@ -11987,13 +11992,24 @@ class PaperTradingEngine:
                 # Combined trend strength (ADX weighted 60%, Hurst 40%)
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
                 
-                # Bounce confirm distance: strong trend → 0.2×ATR, weak trend → 0.8×ATR
-                bounce_confirm_distance = atr * (0.8 - trend_strength * 0.6)  # Range: 0.2 to 0.8
-                # Bounce cancel distance: strong trend → 1.5×ATR (more patient), weak → 0.7×ATR (quick cancel)
-                bounce_cancel_distance = atr * (0.7 + trend_strength * 0.8)  # Range: 0.7 to 1.5
+                # Apply entry_tightness: higher = easier entry = less bounce needed
+                # entry_tightness 2.6x means divide bounce requirement by 2.6
+                et = max(0.5, self.entry_tightness)  # Floor at 0.5 to avoid huge bounce
+                
+                # Base bounce distances (before entry_tightness)
+                base_confirm = 0.8 - trend_strength * 0.6  # Range: 0.2 to 0.8 ×ATR
+                base_cancel = 0.7 + trend_strength * 0.8   # Range: 0.7 to 1.5 ×ATR
+                
+                # Apply entry_tightness multiplier
+                bounce_confirm_distance = atr * (base_confirm / et)
+                bounce_cancel_distance = atr * (base_cancel / et)
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
                 
-                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} strength={trend_strength:.2f} confirm={bounce_confirm_distance/atr:.2f}×ATR cancel={bounce_cancel_distance/atr:.2f}×ATR")
+                # Calculate percentage equivalents for logging
+                confirm_pct = (bounce_confirm_distance / entry_price * 100) if entry_price > 0 else 0
+                cancel_pct = (bounce_cancel_distance / entry_price * 100) if entry_price > 0 else 0
+                
+                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} str={trend_strength:.2f} ET={et:.1f}x | confirm={base_confirm/et:.2f}×ATR(≈{confirm_pct:.2f}%) cancel={base_cancel/et:.2f}×ATR(≈{cancel_pct:.2f}%)")
                 bounce_start = order.get('bounceStartTime', current_time)
                 bounce_start_volume = order.get('bounceStartVolume', 0)
                 
