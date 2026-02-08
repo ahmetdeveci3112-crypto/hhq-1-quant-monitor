@@ -6009,7 +6009,7 @@ async def background_scanner_loop():
                         # Phase 137 DEBUG: Trace log to verify check_positions is called
                         logger.info(f"📊 TIME_MANAGER_CALL: positions={len(global_paper_trader.positions)}")
                         
-                        time_actions = time_based_position_manager.check_positions(global_paper_trader)
+                        time_actions = await time_based_position_manager.check_positions(global_paper_trader)
                         if time_actions.get('trail_activated') or time_actions.get('time_reduced'):
                             logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}")
                     
@@ -8497,7 +8497,7 @@ class TimeBasedPositionManager:
         
         logger.info("📊 TimeBasedPositionManager initialized")
     
-    def check_positions(self, paper_trader) -> dict:
+    async def check_positions(self, paper_trader) -> dict:
         """
         Check all positions for time-based management.
         Returns summary of actions taken.
@@ -8739,10 +8739,16 @@ class TimeBasedPositionManager:
                                 actions["time_reduced"].append(f"{symbol} {key} (-{reduction_pct*100:.0f}%)")
                                 logger.warning(f"📊 TIME REDUCE: {symbol} reduced {reduction_pct*100:.0f}% after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
                                 
-                                # Phase 137: For LIVE positions, log that Binance order should be sent
-                                # TODO: Implement async Binance partial close in a future phase
+                                # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False):
-                                    logger.warning(f"📊 TIME REDUCE LIVE: {symbol} needs manual close on Binance - {reduction_amount:.4f} contracts")
+                                    try:
+                                        result = await live_binance_trader.close_position(symbol, side, reduction_amount)
+                                        if result:
+                                            logger.warning(f"📊 TIME REDUCE LIVE ✅: {symbol} closed {reduction_pct*100:.0f}% on Binance ({reduction_amount:.4f} contracts) | Order: {result.get('id')}")
+                                        else:
+                                            logger.error(f"❌ TIME REDUCE LIVE FAILED: {symbol} - close_position returned None")
+                                    except Exception as e:
+                                        logger.error(f"❌ TIME REDUCE LIVE ERROR: {symbol} - {e}")
                                 
                                 # Phase 152: Don't spam UI logs — summary log added at end of cycle
                                 
