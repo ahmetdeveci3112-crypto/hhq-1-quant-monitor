@@ -48,7 +48,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     if (t <= 1.5) return { label: 'Normal', color: 'text-amber-400', desc: 'Standart pullback + bounce filtresi' };
     if (t <= 2.5) return { label: 'Geniş', color: 'text-orange-400', desc: 'Geniş pullback + sıkı bounce kontrolü' };
     if (t <= 4.0) return { label: 'Çok Geniş', color: 'text-rose-400', desc: 'Derin pullback, seçici giriş' };
-    return { label: 'Ultra Geniş', color: 'text-rose-500', desc: 'En derin pullback, en az pozisyon' };
+    if (t <= 6.0) return { label: 'Ultra Geniş', color: 'text-rose-500', desc: 'En derin pullback, en az pozisyon' };
+    if (t <= 15.0) return { label: 'Ekstrem', color: 'text-fuchsia-400', desc: 'Çok derin pullback, çok az giriş' };
+    return { label: 'Maksimum', color: 'text-fuchsia-500', desc: 'Sadece mükemmel fırsatlara giriş' };
   };
 
   // Exit tightness level helper
@@ -59,7 +61,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     if (t <= 0.8) return { label: 'Hızlı', color: 'text-orange-400', desc: 'Erken çıkış' };
     if (t <= 1.3) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP' };
     if (t <= 2.0) return { label: 'Sabırlı', color: 'text-blue-400', desc: 'Geniş SL/TP, uzun tutma' };
-    return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'Maximum SL/TP, en uzun tutma' };
+    if (t <= 3.0) return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'Maximum SL/TP, en uzun tutma' };
+    if (t <= 8.0) return { label: 'Ekstrem Sabırlı', color: 'text-fuchsia-400', desc: 'Çok geniş SL/TP, uzun vade' };
+    return { label: 'Maksimum', color: 'text-fuchsia-500', desc: 'En geniş SL/TP, en uzun tutma süresi' };
   };
 
   const sensitivity = getSensitivityLevel();
@@ -231,7 +235,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.3"
-                max="6.0"
+                max="30.0"
                 step="0.1"
                 value={localSettings.entryTightness}
                 onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
@@ -239,7 +243,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.3x (Dar = Kolay Giriş)</span>
-                <span>6.0x (Geniş = Seçici Giriş)</span>
+                <span>30.0x (Geniş = Seçici Giriş)</span>
               </div>
             </div>
           </div>
@@ -268,7 +272,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.2"
-                max="3.0"
+                max="15.0"
                 step="0.1"
                 value={localSettings.exitTightness}
                 onChange={e => setLocalSettings({ ...localSettings, exitTightness: parseFloat(e.target.value) })}
@@ -276,7 +280,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.2x (Çok Hızlı = Küçük SL/TP)</span>
-                <span>3.0x (Sabırlı = Geniş SL/TP)</span>
+                <span>15.0x (Sabırlı = Geniş SL/TP)</span>
               </div>
             </div>
           </div>
