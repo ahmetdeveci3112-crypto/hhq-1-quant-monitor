@@ -3990,6 +3990,9 @@ class LightweightCoinAnalyzer:
         self.rsi_history: deque = deque(maxlen=100)  # Son 100 RSI değeri
         self.volume_ratio_history: deque = deque(maxlen=100)  # Son 100 volume ratio
         self.hurst_history: deque = deque(maxlen=100)  # Son 100 Hurst değeri
+        
+        # Phase 156: Order book imbalance trend tracking
+        self.imbalance_history: deque = deque(maxlen=100)  # Son ~5 dk imbalance kaydı
     
     def get_coin_stats(self) -> dict:
         """
@@ -4024,6 +4027,28 @@ class LightweightCoinAnalyzer:
         stats['sample_count'] = min(len(self.rsi_history), len(self.volume_ratio_history), len(self.hurst_history))
         
         return stats
+    
+    def _get_imbalance_trend(self) -> float:
+        """
+        Phase 156: Son ~5 dk bid/ask imbalance trendi.
+        Recent avg - Old avg = trend direction.
+        > 0 → alıcı baskısı artıyor (LONG'a bonus)
+        < 0 → satıcı baskısı artıyor (SHORT'a bonus)
+        """
+        if len(self.imbalance_history) < 20:
+            return 0.0
+        
+        imb_list = list(self.imbalance_history)
+        recent = imb_list[-10:]  # Son 10 tick
+        older = imb_list[-30:-10] if len(imb_list) >= 30 else imb_list[:-10]
+        
+        if not older:
+            return 0.0
+        
+        recent_avg = sum(recent) / len(recent)
+        older_avg = sum(older) / len(older)
+        
+        return recent_avg - older_avg
     
     def get_daily_trend(self) -> tuple:
         """
@@ -4287,6 +4312,9 @@ class LightweightCoinAnalyzer:
         self.opportunity.adx_trend = adx_trend  # Trend direction: BULLISH/BEARISH/NEUTRAL
         self.opportunity.imbalance = imbalance
         
+        # Phase 156: Record imbalance for short-term trend tracking
+        self.imbalance_history.append(imbalance)
+        
         # Phase 35: Calculate volatility as ATR percentage of price
         # This is the TRUE volatility measure - no artificial capping
         # BTC typically ~1.5%, SOL ~2.5%, DOGE ~4%, meme coins 5%+
@@ -4359,7 +4387,9 @@ class LightweightCoinAnalyzer:
             volume_24h=self.opportunity.volume_24h,  # Phase 123: Pass 24h volume
             adx=adx,  # ADX value for trend strength
             adx_trend=adx_trend,  # Trend direction: BULLISH/BEARISH/NEUTRAL
-            is_volume_spike=is_volume_spike  # Volume breakout detection
+            is_volume_spike=is_volume_spike,  # Volume breakout detection
+            market_regime=market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
+            ob_imbalance_trend=self._get_imbalance_trend(),  # Phase 156: Short-term OB flow
         )
         
         if signal:
@@ -10684,7 +10714,9 @@ class SignalGenerator:
         volume_24h: float = 0.0,  # Phase 123: 24h Volume for liquidity check
         adx: float = 25.0,  # ADX value for trend strength
         adx_trend: str = "NEUTRAL",  # Trend direction: BULLISH/BEARISH/NEUTRAL
-        is_volume_spike: bool = False  # Volume breakout detection
+        is_volume_spike: bool = False,  # Volume breakout detection
+        market_regime: str = "RANGING",  # Phase 156: Market regime from MarketRegimeDetector
+        ob_imbalance_trend: float = 0.0,  # Phase 156: Short-term order book imbalance trend
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -11011,6 +11043,26 @@ class SignalGenerator:
                 score += 5
                 reasons.append(f"VWAP_ZONE({vwap_dev:.1f}σ)+5")
         
+        # =====================================================================
+        # PHASE 156: LAYER 16 — ORDER BOOK IMBALANCE TREND (Short-term Flow)
+        # Son 5 dakika bid/ask imbalance trend'i — alıcı/satıcı baskısını ölçer
+        # =====================================================================
+        if abs(ob_imbalance_trend) > 2.0:
+            if signal_side == "LONG" and ob_imbalance_trend > 2.0:
+                ib_bonus = 8 if ob_imbalance_trend > 5.0 else 5
+                score += ib_bonus
+                reasons.append(f"IB_TREND(+{ob_imbalance_trend:.1f})+{ib_bonus}")
+            elif signal_side == "SHORT" and ob_imbalance_trend < -2.0:
+                ib_bonus = 8 if ob_imbalance_trend < -5.0 else 5
+                score += ib_bonus
+                reasons.append(f"IB_TREND({ob_imbalance_trend:.1f})+{ib_bonus}")
+            elif signal_side == "LONG" and ob_imbalance_trend < -5.0:
+                score -= 5
+                reasons.append(f"IB_CONTRA({ob_imbalance_trend:.1f})-5")
+            elif signal_side == "SHORT" and ob_imbalance_trend > 5.0:
+                score -= 5
+                reasons.append(f"IB_CONTRA({ob_imbalance_trend:.1f})-5")
+        
         # Layer 14: POC Proximity Bonus (+5/+8)
         # coin_profile is passed as parameter (default=None)
         if coin_profile and coin_profile.get('poc', 0) > 0:
@@ -11039,6 +11091,34 @@ class SignalGenerator:
         elif adx > 25 and hurst > 0.55:
             # Trend regime - only warning, NO VETO
             reasons.append(f"TREND_WARN({adx:.0f},{hurst:.2f})")
+        
+        # =====================================================================
+        # PHASE 156: REGIME-SIGNAL VETO FILTER
+        # Trend rejiminde karşı yönlü mean-reversion sinyallerini veto et
+        # VOLATILE rejimde min_score'u artır
+        # =====================================================================
+        
+        # Veto 1: Coin-level trend regime (ADX + Hurst)
+        # ADX > 30 VE Hurst > 0.55 → güçlü trend, MR sinyali riskli
+        is_coin_trending = adx > 30 and hurst > 0.55
+        
+        if is_coin_trending:
+            # Trend yönüne karşı sinyal = VETO
+            if adx_trend == "BULLISH" and signal_side == "SHORT":
+                logger.info(f"🚫 REGIME_VETO: {symbol} SHORT rejected — coin in BULLISH trend (ADX={adx:.0f}, H={hurst:.2f})")
+                return None
+            elif adx_trend == "BEARISH" and signal_side == "LONG":
+                logger.info(f"🚫 REGIME_VETO: {symbol} LONG rejected — coin in BEARISH trend (ADX={adx:.0f}, H={hurst:.2f})")
+                return None
+        
+        # Veto 2: Macro VOLATILE rejimde daha yüksek conviction iste
+        if market_regime == "VOLATILE":
+            volatile_boost = int(min_score_required * 0.15)  # %15 artır
+            min_score_required += volatile_boost
+            reasons.append(f"VOL_STRICT(+{volatile_boost})")
+            if score < min_score_required:
+                logger.info(f"🚫 VOLATILE_VETO: {symbol} {signal_side} score={score} < volatile_min={min_score_required}")
+                return None
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK

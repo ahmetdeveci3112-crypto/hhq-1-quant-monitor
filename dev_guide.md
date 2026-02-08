@@ -751,3 +751,17 @@ AI Optimizer tamamen yeniden yazıldı. Eski AGGRESSIVE/DEFENSIVE mod sistemi ka
 ### SQLite Migration
 - `trades` tablosuna `settings_snapshot TEXT DEFAULT "{}"` kolonu eklendi (auto-migration)
 
+---
+
+## Phase 156: Sinyal Kalitesi İyileştirme
+
+### Rejim-Sinyal Veto Filtresi
+- **Coin-level trend veto**: ADX > 30 VE Hurst > 0.55 → güçlü trend rejimi. Trend karşıtı mean-reversion sinyalleri otomatik olarak reddedilir.
+- **VOLATILE rejim boost**: Makro piyasa VOLATILE rejimde iken, `min_score_required` %15 artırılır. Daha yüksek conviction gerekir.
+- Yeni parametre: `market_regime` → `generate_signal()` (L10688)
+
+### Layer 16: Order Book Imbalance Trend
+- `LightweightCoinAnalyzer.imbalance_history` deque'u ile son ~100 tick'in bid/ask imbalance değerleri kaydedilir.
+- `_get_imbalance_trend()`: Son 10 tick'in ortalaması vs önceki 20 tick → kısa vadeli alıcı/satıcı baskısı trendi.
+- Aynı yönde trend → +5/+8 puan bonus, ters yönde → -5 penalty.
+- Yeni parametre: `ob_imbalance_trend` → `generate_signal()` (L10689)
