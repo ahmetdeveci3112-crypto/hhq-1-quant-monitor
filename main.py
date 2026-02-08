@@ -6085,14 +6085,18 @@ async def background_scanner_loop():
                             trailing_stop = pos.get('trailingStop', sl)
                             
                             # =========================================================
-                            # SPIKE BYPASS: 3-Tick Confirmation for Stop Loss
-                            # SL only triggers after 3 consecutive ticks below SL level
+                            # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
+                            # SL triggers ONLY after 5 consecutive ticks AND 30 seconds
+                            # of sustained breach. Protects against 1-min wick spikes.
                             # =========================================================
-                            SL_CONFIRMATION_REQUIRED = 3  # Ticks required to confirm SL
+                            SL_CONFIRMATION_TICKS = 5  # Ticks required
+                            SL_CONFIRMATION_SECONDS = 30  # Minimum seconds in SL zone
                             
-                            # Initialize confirmation counter if not exists
+                            # Initialize confirmation state
                             if 'slConfirmCount' not in pos:
                                 pos['slConfirmCount'] = 0
+                            if 'slBreachStartTime' not in pos:
+                                pos['slBreachStartTime'] = 0
                             
                             # Check if price is in SL zone
                             sl_breached = False
@@ -6101,20 +6105,27 @@ async def background_scanner_loop():
                             elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
                                 sl_breached = True
                             
+                            now_ts = datetime.now().timestamp()
                             if sl_breached:
+                                # Start timer on first breach
+                                if pos['slConfirmCount'] == 0:
+                                    pos['slBreachStartTime'] = now_ts
                                 pos['slConfirmCount'] += 1
-                                logger.debug(f"SL breach tick {pos['slConfirmCount']}/{SL_CONFIRMATION_REQUIRED} for {pos.get('symbol', '?')}")
+                                breach_duration = now_ts - pos['slBreachStartTime']
+                                logger.debug(f"SL breach tick {pos['slConfirmCount']}/{SL_CONFIRMATION_TICKS} ({breach_duration:.0f}s/{SL_CONFIRMATION_SECONDS}s) for {pos.get('symbol', '?')}")
                                 
-                                # Only close if confirmed (3 consecutive ticks in SL zone)
-                                if pos['slConfirmCount'] >= SL_CONFIRMATION_REQUIRED:
-                                    logger.info(f"🔴 SL CONFIRMED after {SL_CONFIRMATION_REQUIRED} ticks: {pos.get('symbol', '?')}")
+                                # Close only if BOTH conditions met: enough ticks AND enough time
+                                if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
+                                    logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
                                     global_paper_trader.close_position(pos, current_price, 'SL_HIT')
                                     continue
                             else:
                                 # Price recovered - reset counter (spike bypassed!)
                                 if pos['slConfirmCount'] > 0:
-                                    logger.debug(f"⚡ Spike bypassed for {pos.get('symbol', '?')} - price recovered")
+                                    bypass_duration = now_ts - pos['slBreachStartTime']
+                                    logger.info(f"⚡ Spike bypassed for {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
                                 pos['slConfirmCount'] = 0
+                                pos['slBreachStartTime'] = 0
                             
                             # TP Hit (immediate - no confirmation needed for profits)
                             if pos['side'] == 'LONG' and current_price >= tp:
@@ -6360,30 +6371,37 @@ async def position_price_update_loop():
                         tp = pos.get('takeProfit', 0)
                         trailing_stop = pos.get('trailingStop', sl)
                         
-                        # SPIKE BYPASS: 3-Tick Confirmation for Stop Loss
-                        SL_CONFIRMATION_REQUIRED = 3
+                        # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation
+                        SL_CONFIRMATION_TICKS = 5
+                        SL_CONFIRMATION_SECONDS = 30
                         
                         if 'slConfirmCount' not in pos:
                             pos['slConfirmCount'] = 0
+                        if 'slBreachStartTime' not in pos:
+                            pos['slBreachStartTime'] = 0
                         
-                        # Check if price is in SL zone
                         sl_breached = False
                         if pos['side'] == 'LONG' and current_price <= trailing_stop:
                             sl_breached = True
                         elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
                             sl_breached = True
                         
+                        now_ts = datetime.now().timestamp()
                         if sl_breached:
+                            if pos['slConfirmCount'] == 0:
+                                pos['slBreachStartTime'] = now_ts
                             pos['slConfirmCount'] += 1
-                            if pos['slConfirmCount'] >= SL_CONFIRMATION_REQUIRED:
-                                logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f}")
+                            breach_duration = now_ts - pos['slBreachStartTime']
+                            if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
+                                logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
                                 global_paper_trader.close_position(pos, current_price, 'SL_HIT')
                                 continue
                         else:
-                            # Price recovered - spike bypassed
                             if pos['slConfirmCount'] > 0:
-                                logger.debug(f"⚡ Spike bypassed (fast): {symbol}")
+                                bypass_duration = now_ts - pos['slBreachStartTime']
+                                logger.info(f"⚡ Spike bypassed (fast): {symbol} | {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
                             pos['slConfirmCount'] = 0
+                            pos['slBreachStartTime'] = 0
                         
                         # TP Hit Check (immediate - no confirmation for profits)
                         if pos['side'] == 'LONG' and current_price >= tp:
@@ -13441,16 +13459,25 @@ class PaperTradingEngine:
                         pos['trailingStop'] = new_sl
                         pos['stopLoss'] = new_sl
                 
-                # SPIKE BYPASS: 3-Tick Confirmation for SL
+                # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
                     pos['slConfirmCount'] = 0
+                if 'slBreachStartTime' not in pos:
+                    pos['slBreachStartTime'] = 0
                 
+                now_ts = datetime.now().timestamp()
                 if current_price <= pos['stopLoss']:
+                    if pos['slConfirmCount'] == 0:
+                        pos['slBreachStartTime'] = now_ts
                     pos['slConfirmCount'] += 1
-                    if pos['slConfirmCount'] >= 3:
+                    breach_duration = now_ts - pos['slBreachStartTime']
+                    if pos['slConfirmCount'] >= 5 and breach_duration >= 30:
                         self.close_position(pos, current_price, 'SL')
                 else:
+                    if pos['slConfirmCount'] > 0:
+                        self.add_log(f"⚡ Spike bypassed: {pos['symbol']} LONG | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
+                    pos['slBreachStartTime'] = 0
                     if current_price >= pos['takeProfit']:
                         self.close_position(pos, current_price, 'TP')
                     
@@ -13467,16 +13494,25 @@ class PaperTradingEngine:
                         pos['trailingStop'] = new_sl
                         pos['stopLoss'] = new_sl
                 
-                # SPIKE BYPASS: 3-Tick Confirmation for SL
+                # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
                     pos['slConfirmCount'] = 0
+                if 'slBreachStartTime' not in pos:
+                    pos['slBreachStartTime'] = 0
                 
+                now_ts = datetime.now().timestamp()
                 if current_price >= pos['stopLoss']:
+                    if pos['slConfirmCount'] == 0:
+                        pos['slBreachStartTime'] = now_ts
                     pos['slConfirmCount'] += 1
-                    if pos['slConfirmCount'] >= 3:
+                    breach_duration = now_ts - pos['slBreachStartTime']
+                    if pos['slConfirmCount'] >= 5 and breach_duration >= 30:
                         self.close_position(pos, current_price, 'SL')
                 else:
+                    if pos['slConfirmCount'] > 0:
+                        self.add_log(f"⚡ Spike bypassed: {pos['symbol']} SHORT | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
+                    pos['slBreachStartTime'] = 0
                     if current_price <= pos['takeProfit']:
                         self.close_position(pos, current_price, 'TP')
 
