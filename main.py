@@ -5747,9 +5747,10 @@ async def update_ui_cache(opportunities: list, stats: dict):
         # Update opportunities and stats
         ui_state_cache.opportunities = filtered_opportunities
         
-        # Calculate signal counts from filtered opportunities
-        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG')
-        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT')
+        # Calculate signal counts from filtered opportunities (only those above min confidence threshold)
+        min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
+        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG' and o.get('signalScore', 0) >= min_score)
+        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT' and o.get('signalScore', 0) >= min_score)
         
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
