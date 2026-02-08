@@ -11933,19 +11933,130 @@ class PaperTradingEngine:
                     self.add_log(f"✅ SIGNAL CONFIRMED: {side} {symbol} @ ${current_price:.4f} (5dk bekleme tamamlandı)")
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
             
-            # Check if price reached entry level (only after confirmation)
-            should_execute = False
-            if side == 'LONG':
-                # For LONG, we want price to pull back DOWN to entry price
-                if current_price <= entry_price:
-                    should_execute = True
-            else:
-                # For SHORT, we want price to pull back UP to entry price
-                if current_price >= entry_price:
-                    should_execute = True
+            # =================================================================
+            # Phase 153: BOUNCE + VOLUME CONFIRMATION
+            # Instead of executing immediately when price hits entry,
+            # wait for a bounce in signal direction + volume confirmation
+            # =================================================================
+            bounce_waiting = order.get('bounceWaiting', False)
+            atr = order.get('atr', entry_price * 0.01)
             
-            if should_execute:
-                await self.execute_pending_order(order, current_price)
+            # Get current volume data from opportunities
+            current_volume = 0
+            for opp in opportunities:
+                if opp.get('symbol') == symbol:
+                    current_volume = opp.get('volume24h', opp.get('volume_24h', 0))
+                    break
+            
+            if not bounce_waiting:
+                # Step 1: Check if price reached pullback entry level
+                reached_entry = False
+                if side == 'LONG' and current_price <= entry_price:
+                    reached_entry = True
+                elif side == 'SHORT' and current_price >= entry_price:
+                    reached_entry = True
+                
+                if reached_entry:
+                    # Mark as bounce waiting — don't enter yet!
+                    order['bounceWaiting'] = True
+                    order['bounceStartTime'] = current_time
+                    order['bounceStartPrice'] = current_price
+                    order['bounceStartVolume'] = current_volume  # Volume snapshot
+                    order['bouncePriceHistory'] = [current_price]  # Track price trend
+                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | ATR=${atr:.6f} | Vol=${current_volume/1e6:.1f}M")
+                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} vol={current_volume:.0f}")
+            else:
+                # Step 2: Waiting for bounce confirmation
+                bounce_confirm_distance = atr * 0.5   # Need 0.5×ATR recovery
+                bounce_cancel_distance = atr * 1.0    # Cancel if 1×ATR against
+                bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
+                bounce_start = order.get('bounceStartTime', current_time)
+                bounce_start_volume = order.get('bounceStartVolume', 0)
+                
+                # Track price history for trend detection (keep last 10)
+                price_history = order.get('bouncePriceHistory', [])
+                price_history.append(current_price)
+                if len(price_history) > 10:
+                    price_history = price_history[-10:]
+                order['bouncePriceHistory'] = price_history
+                
+                # Volume confirmation: is current volume higher than at bounce start?
+                # volume_ratio > 0.8 means volume didn't significantly drop (buying interest exists)
+                # volume_ratio > 1.2 means volume actually increased (strong confirmation)
+                volume_ok = True  # Default pass if no volume data
+                volume_ratio = 1.0
+                if bounce_start_volume and bounce_start_volume > 0 and current_volume > 0:
+                    volume_ratio = current_volume / bounce_start_volume
+                    # Volume should not have collapsed (> 80% of start) 
+                    volume_ok = volume_ratio >= 0.8
+                
+                # Price trend: are last few prices trending in signal direction?
+                price_trending = False
+                if len(price_history) >= 3:
+                    recent = price_history[-3:]
+                    if side == 'LONG':
+                        # Price should be going UP (each tick higher than previous)
+                        price_trending = recent[-1] > recent[0]
+                    else:
+                        # Price should be going DOWN
+                        price_trending = recent[-1] < recent[0]
+                
+                elapsed_ms = current_time - bounce_start
+                elapsed_secs = elapsed_ms / 1000
+                
+                if side == 'LONG':
+                    # Bounce confirmed: price recovered above entry + 0.5×ATR AND volume ok
+                    if current_price >= entry_price + bounce_confirm_distance:
+                        if volume_ok and price_trending:
+                            vol_str = f"Vol={volume_ratio:.1f}x" if bounce_start_volume > 0 else "Vol=N/A"
+                            self.add_log(f"✅ BOUNCE OK: {side} {symbol} @ ${current_price:.6f} ({elapsed_secs:.0f}s) | {vol_str}")
+                            logger.info(f"✅ BOUNCE CONFIRMED: {side} {symbol} bounce={current_price:.6f} entry={entry_price:.6f} vol_ratio={volume_ratio:.2f}")
+                            await self.execute_pending_order(order, current_price)
+                            continue
+                        elif not volume_ok:
+                            # Price bounced but volume dried up — weak bounce, cancel
+                            self.pending_orders.remove(order)
+                            self.add_log(f"❌ BOUNCE WEAK: {side} {symbol} fiyat döndü ama hacim düşük ({volume_ratio:.1f}x)")
+                            logger.info(f"❌ BOUNCE WEAK VOLUME: {side} {symbol} vol_ratio={volume_ratio:.2f}")
+                            continue
+                    
+                    # Cancel: dropped too far below entry (1×ATR)
+                    if current_price < entry_price - bounce_cancel_distance:
+                        self.pending_orders.remove(order)
+                        self.add_log(f"❌ BOUNCE FAIL: {side} {symbol} düşüş devam ediyor (${current_price:.6f})")
+                        logger.info(f"❌ BOUNCE FAIL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
+                        continue
+                        
+                else:  # SHORT
+                    if current_price <= entry_price - bounce_confirm_distance:
+                        if volume_ok and price_trending:
+                            vol_str = f"Vol={volume_ratio:.1f}x" if bounce_start_volume > 0 else "Vol=N/A"
+                            self.add_log(f"✅ BOUNCE OK: {side} {symbol} @ ${current_price:.6f} ({elapsed_secs:.0f}s) | {vol_str}")
+                            logger.info(f"✅ BOUNCE CONFIRMED: {side} {symbol} bounce={current_price:.6f} entry={entry_price:.6f} vol_ratio={volume_ratio:.2f}")
+                            await self.execute_pending_order(order, current_price)
+                            continue
+                        elif not volume_ok:
+                            self.pending_orders.remove(order)
+                            self.add_log(f"❌ BOUNCE WEAK: {side} {symbol} fiyat döndü ama hacim düşük ({volume_ratio:.1f}x)")
+                            logger.info(f"❌ BOUNCE WEAK VOLUME: {side} {symbol} vol_ratio={volume_ratio:.2f}")
+                            continue
+                    
+                    if current_price > entry_price + bounce_cancel_distance:
+                        self.pending_orders.remove(order)
+                        self.add_log(f"❌ BOUNCE FAIL: {side} {symbol} yükseliş devam ediyor (${current_price:.6f})")
+                        logger.info(f"❌ BOUNCE FAIL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
+                        continue
+                
+                # Timeout check: 15 minutes without bounce
+                if elapsed_ms > bounce_timeout_ms:
+                    self.pending_orders.remove(order)
+                    self.add_log(f"⏰ BOUNCE TIMEOUT: {side} {symbol} (15dk bounce olmadı)")
+                    logger.info(f"⏰ BOUNCE TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s")
+                    continue
+                
+                # Periodic log during wait (every ~30s)
+                if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
+                    logger.debug(f"⏳ BOUNCE WAITING: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} vol_ratio={volume_ratio:.1f}x trend={'↑' if price_trending else '↓'}")
     
     async def execute_pending_order(self, order: dict, fill_price: float):
         """Execute a pending order at the fill price."""
