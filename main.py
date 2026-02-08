@@ -934,10 +934,11 @@ class LiveBinanceTrader:
             logger.warning(f"⚠️ Could not save open_time_cache: {e}")
     
     async def _populate_open_time_cache(self):
-        """Fetch real openTime from trade history for all current positions.
+        """Fetch real openTime for all current positions.
+        Priority: 1) SQLite positions table 2) Trade history API
         Called once on startup to fill any gaps in the cache."""
         try:
-            # Get all current positions
+            # Get all current positions from Binance
             positions = await self.exchange.fapiPrivateV3GetPositionRisk()
             active_symbols = []
             for p in positions:
@@ -951,38 +952,74 @@ class LiveBinanceTrader:
                 return
             
             filled = 0
-            for symbol, side in active_symbols:
-                if symbol in self.open_time_cache:
-                    continue  # Already cached
-                
-                try:
-                    # Fetch trades from last 30 days
-                    thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
-                    trades = await self.exchange.fapiPrivateGetUserTrades({
-                        'symbol': symbol,
-                        'startTime': thirty_days_ago,
-                        'limit': 1000
-                    })
-                    
-                    if trades:
-                        sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
-                        # Find earliest trade matching position direction
-                        for t in sorted_trades:
-                            is_buyer = t.get('buyer', False)
-                            if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
-                                open_time = int(t.get('time', 0))
-                                self.open_time_cache[symbol] = open_time
+            
+            # Step 1: Try SQLite positions table first (most reliable source)
+            try:
+                import aiosqlite
+                db_path = '/data/trading.db' if os.path.exists('/data') else 'trading.db'
+                async with aiosqlite.connect(db_path) as db:
+                    for symbol, side in active_symbols:
+                        if symbol in self.open_time_cache:
+                            continue
+                        
+                        # Query: get open_time for this symbol with status='OPEN'
+                        cursor = await db.execute(
+                            'SELECT open_time FROM positions WHERE symbol=? AND status=? ORDER BY open_time ASC LIMIT 1',
+                            (symbol, 'OPEN')
+                        )
+                        row = await cursor.fetchone()
+                        if row and row[0] and row[0] > 0:
+                            self.open_time_cache[symbol] = int(row[0])
+                            filled += 1
+                            logger.info(f"📂 SQLite openTime for {symbol}: {datetime.fromtimestamp(row[0]/1000)}")
+                        else:
+                            # Also try without status filter (old records might not have status)
+                            cursor = await db.execute(
+                                'SELECT open_time FROM positions WHERE symbol=? ORDER BY open_time DESC LIMIT 1',
+                                (symbol,)
+                            )
+                            row = await cursor.fetchone()
+                            if row and row[0] and row[0] > 0:
+                                self.open_time_cache[symbol] = int(row[0])
                                 filled += 1
-                                logger.info(f"📂 Populated openTime for {symbol}: {datetime.fromtimestamp(open_time/1000)}")
-                                break
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not fetch trades for {symbol}: {e}")
+                                logger.info(f"📂 SQLite openTime (any) for {symbol}: {datetime.fromtimestamp(row[0]/1000)}")
                 
-                await asyncio.sleep(0.1)  # Rate limit
+                if filled > 0:
+                    logger.info(f"📂 Loaded {filled} openTime entries from SQLite")
+            except Exception as e:
+                logger.warning(f"⚠️ SQLite openTime query failed: {e}")
+            
+            # Step 2: For any remaining symbols not in cache, try trade history API
+            remaining = [(s, side) for s, side in active_symbols if s not in self.open_time_cache]
+            if remaining:
+                logger.info(f"📂 {len(remaining)} symbols not in SQLite, trying trade history API...")
+                for symbol, side in remaining:
+                    try:
+                        thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
+                        trades = await self.exchange.fapiPrivateGetUserTrades({
+                            'symbol': symbol,
+                            'startTime': thirty_days_ago,
+                            'limit': 1000
+                        })
+                        
+                        if trades:
+                            sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                            for t in sorted_trades:
+                                is_buyer = t.get('buyer', False)
+                                if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
+                                    open_time = int(t.get('time', 0))
+                                    self.open_time_cache[symbol] = open_time
+                                    filled += 1
+                                    logger.info(f"📂 TradeHistory openTime for {symbol}: {datetime.fromtimestamp(open_time/1000)}")
+                                    break
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not fetch trades for {symbol}: {e}")
+                    
+                    await asyncio.sleep(0.1)  # Rate limit
             
             if filled > 0:
                 self._save_open_time_cache()
-                logger.info(f"📂 Populated {filled} openTime entries from trade history")
+                logger.info(f"📂 Total populated: {filled} openTime entries (cache now has {len(self.open_time_cache)})")
         except Exception as e:
             logger.warning(f"⚠️ Could not populate open_time_cache: {e}")
         
