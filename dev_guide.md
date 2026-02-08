@@ -712,6 +712,42 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
-> Son güncelleme: 2026-02-07 (Phase 149)
+> Son güncelleme: 2026-02-08 (Phase 155)
 
+---
+
+## Phase 155: AI Optimizer Yeniden Tasarım
+
+### Değişiklik Özeti
+AI Optimizer tamamen yeniden yazıldı. Eski AGGRESSIVE/DEFENSIVE mod sistemi kaldırılıp, PnL-korelasyon bazlı gradient optimizer getirildi.
+
+### Yeni Mimari
+
+1. **Trade Settings Snapshot** — Her pozisyon açılışında mevcut ayarlar (`entry_tightness`, `z_score_threshold`, `min_score_low`, `min_score_high`, `max_positions`) kaydedilir ve trade kaydına yazılır.
+
+2. **PerformanceAnalyzer (PnL-Korelasyon)** — Her parametre için kârlı vs zararlı trade'lerin ortalama değerlerini karşılaştırır. PnL-ağırlıklı target hesaplar.
+
+3. **ParameterOptimizer (Gradient-Bazlı)** — Target'a doğru her döngüde mesafenin %20'si kadar yaklaşır. Max step ve güvenlik limitleri ile kontrol edilir.
+
+### Kaldırılan Dead Code
+- `exit_tightness` — Optimizer'dan ve current_settings'ten kaldırıldı (hiçbir hesaplamada kullanılmıyordu)
+- `sl_atr`, `tp_atr`, `trail_activation_atr`, `trail_distance_atr` — Optimizer kontrolünden çıkarıldı (dinamik volatilite bazlı hesaplanıyor)
+- `kill_switch_first_reduction`, `kill_switch_full_close` — Optimizer'dan kaldırıldı (leverage bazlı dinamik hesaplanıyor)
+
+### Düzeltilen Buglar
+- **`applied.keys()` crash** — `apply_recommendations` artık dict döndürüyor (önce boolean döndürüyor, `.keys()` crash'e neden oluyordu)
+- **Yanlış SL/TP limitleri** — SL/TP optimizer kontrolünden çıkarıldı (default 30 vs limit 1-4 uyumsuzluğu)
+- **Ters `entry_tightness` mantığı** — AGGRESSIVE/DEFENSIVE mod kaldırılıp gradient sisteme geçildi
+
+### Optimize Edilen Parametreler
+| Parametre | Limit Min | Limit Max | Max Step |
+|-----------|-----------|-----------|----------|
+| `entry_tightness` | 0.5 | 4.0 | 0.2 |
+| `z_score_threshold` | 0.8 | 2.5 | 0.1 |
+| `min_score_low` | 30 | 60 | 3 |
+| `min_score_high` | 60 | 95 | 3 |
+| `max_positions` | 2 | 15 | 1 |
+
+### SQLite Migration
+- `trades` tablosuna `settings_snapshot TEXT DEFAULT "{}"` kolonu eklendi (auto-migration)
 

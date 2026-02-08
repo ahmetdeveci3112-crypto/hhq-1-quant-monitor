@@ -270,6 +270,11 @@ class SQLiteManager:
                 await db.execute('ALTER TABLE trades ADD COLUMN spread_level TEXT DEFAULT "unknown"')
             except:
                 pass
+            # Phase 155: AI Optimizer — settings snapshot per trade
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN settings_snapshot TEXT DEFAULT "{}"')
+            except:
+                pass
             await db.commit()
             
             self._initialized = True
@@ -5886,22 +5891,16 @@ async def background_scanner_loop():
                                 'min_score_low': global_paper_trader.min_score_low,
                                 'min_score_high': global_paper_trader.min_score_high,
                                 'entry_tightness': global_paper_trader.entry_tightness,
-                                'exit_tightness': global_paper_trader.exit_tightness,
-                                'sl_atr': global_paper_trader.sl_atr,
-                                'tp_atr': global_paper_trader.tp_atr,
-                                'trail_activation_atr': global_paper_trader.trail_activation_atr,
-                                'trail_distance_atr': global_paper_trader.trail_distance_atr,
                                 'max_positions': global_paper_trader.max_positions,
-                                'kill_switch_first_reduction': daily_kill_switch.first_reduction_pct,
-                                'kill_switch_full_close': daily_kill_switch.full_close_pct,
                             }
                             optimization = parameter_optimizer.optimize(analysis, current_settings)
                             
-                            # Log AI analysis with PnL and mode
-                            mode = optimization.get('mode', 'N/A')
+                            # Log AI analysis
                             total_pnl = analysis.get('total_pnl', 0)
-                            logger.info(f"🤖 AI [{mode}]: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | Regime {regime}")
-                            global_paper_trader.add_log(f"🤖 AI [{mode}]: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | PF {analysis.get('profit_factor', 0):.2f}")
+                            corr_count = optimization.get('correlations_count', 0)
+                            snapshots = optimization.get('trades_with_snapshot', 0)
+                            logger.info(f"🤖 AI: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | Correlations: {corr_count} | Snapshots: {snapshots}")
+                            global_paper_trader.add_log(f"🤖 AI: PnL ${total_pnl:.0f} | WR {analysis.get('win_rate', 0):.0f}% | PF {analysis.get('profit_factor', 0):.2f}")
                             
                             if optimization.get('changes'):
                                 global_paper_trader.add_log(f"🤖 Öneri: {', '.join(optimization.get('changes', [])[:3])}")
@@ -5909,7 +5908,7 @@ async def background_scanner_loop():
                             if optimization.get('recommendations') and parameter_optimizer.enabled:
                                 applied = parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
                                 if applied:
-                                    logger.info(f"🤖 AI Optimizer: Settings applied - {list(applied.keys())}")
+                                    logger.info(f"🤖 AI Optimizer: Applied {list(applied.keys())}")
                                     global_paper_trader.add_log(f"🤖 Ayarlar güncellendi ✅")
                         else:
                             logger.info("🤖 AI Optimizer: No analysis data available")
@@ -9281,27 +9280,33 @@ class PostTradeTracker:
 
 
 # ============================================================================
-# PHASE 52: ADAPTIVE TRADING SYSTEM - PERFORMANCE ANALYZER
+# PHASE 155: AI OPTIMIZER - PnL-CORRELATED PERFORMANCE ANALYZER
 # ============================================================================
 
 class PerformanceAnalyzer:
     """
-    Son trade'leri analiz ederek optimizasyon verisi üretir.
+    Phase 155: PnL-korelasyon bazlı analiz.
+    Her parametre için kârlı vs zararlı trade'lerin ortalama değerlerini karşılaştırır.
+    Target = kârlı trade'lerin PnL-ağırlıklı ortalaması.
     """
+    
+    # AI Optimizer'ın kontrol ettiği parametreler
+    OPTIMIZABLE_PARAMS = ['entry_tightness', 'z_score_threshold', 'min_score_low', 'min_score_high', 'max_positions']
     
     def __init__(self):
         self.last_analysis = None
-        self.analysis_interval_minutes = 60  # Her saat analiz
-        logger.info("📈 PerformanceAnalyzer initialized")
+        self.last_correlations = None
+        self.analysis_interval_minutes = 60
+        logger.info("📈 PerformanceAnalyzer initialized (Phase 155: PnL-Correlation)")
     
     def analyze(self, trades: list, post_trade_stats: dict = None) -> dict:
-        """Son trade'leri analiz et."""
+        """Son trade'leri analiz et — genel istatistikler + parametre korelasyonu."""
         if not trades:
             return {}
         
-        recent_trades = trades[-100:]  # Son 100 trade
+        recent_trades = trades[-100:]
         
-        # Temel istatistikler
+        # === GENEL İSTATİSTİKLER ===
         winners = [t for t in recent_trades if t.get('pnl', 0) > 0]
         losers = [t for t in recent_trades if t.get('pnl', 0) < 0]
         
@@ -9309,6 +9314,7 @@ class PerformanceAnalyzer:
         avg_winner = sum(t.get('pnl', 0) for t in winners) / len(winners) if winners else 0
         avg_loser = sum(t.get('pnl', 0) for t in losers) / len(losers) if losers else 0
         profit_factor = abs(avg_winner * len(winners)) / abs(avg_loser * len(losers)) if losers and avg_loser != 0 else 999
+        total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
         
         # Coin bazlı performans
         coin_performance = {}
@@ -9322,7 +9328,6 @@ class PerformanceAnalyzer:
                 coin_performance[symbol]['losses'] += 1
             coin_performance[symbol]['pnl'] += t.get('pnl', 0)
         
-        # En iyi/kötü coinler
         sorted_coins = sorted(coin_performance.items(), key=lambda x: x[1]['pnl'], reverse=True)
         top_coins = [c[0] for c in sorted_coins[:5] if c[1]['pnl'] > 0]
         worst_coins = [c[0] for c in sorted_coins[-5:] if c[1]['pnl'] < 0]
@@ -9338,14 +9343,13 @@ class PerformanceAnalyzer:
             if t.get('pnl', 0) > 0:
                 reason_performance[reason]['wins'] += 1
         
-        # Phase 57: Kill Switch tetikleme oranı
         kill_switch_trades = [t for t in recent_trades if 'KILL_SWITCH' in str(t.get('reason', '')) or 'KILL_SWITCH' in str(t.get('closeReason', ''))]
         kill_switch_rate = len(kill_switch_trades) / len(recent_trades) * 100 if recent_trades else 0
         
-        # Toplam PnL hesapla
-        total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
+        # === PHASE 155: PARAMETRE KORELASYON ANALİZİ ===
+        correlations = self._analyze_settings_correlation(recent_trades)
+        self.last_correlations = correlations
         
-        # Use Turkey timezone for analysis timestamp
         from zoneinfo import ZoneInfo
         turkey_tz = ZoneInfo('Europe/Istanbul')
         turkey_time = datetime.now(turkey_tz)
@@ -9353,7 +9357,7 @@ class PerformanceAnalyzer:
         analysis = {
             'timestamp': turkey_time.strftime('%d.%m.%Y %H:%M:%S'),
             'trade_count': len(recent_trades),
-            'total_pnl': round(total_pnl, 2),  # PnL-bazlı AI kararı için
+            'total_pnl': round(total_pnl, 2),
             'win_rate': round(win_rate, 1),
             'avg_winner': round(avg_winner, 2),
             'avg_loser': round(avg_loser, 2),
@@ -9363,53 +9367,143 @@ class PerformanceAnalyzer:
             'reason_performance': reason_performance,
             'early_exit_rate': post_trade_stats.get('early_exit_rate', 0) if post_trade_stats else 0,
             'kill_switch_rate': round(kill_switch_rate, 1),
+            # Phase 155: Korelasyon verileri
+            'correlations': correlations,
+            'trades_with_snapshot': len([t for t in recent_trades if t.get('settingsSnapshot')]),
         }
         
         self.last_analysis = analysis
-        logger.info(f"📈 ANALYSIS: WR {win_rate:.1f}% | PF {profit_factor:.2f} | KS Rate {kill_switch_rate:.1f}% | Top: {top_coins[:3]} | Worst: {worst_coins[:3]}")
+        
+        corr_summary = ""
+        if correlations:
+            corr_parts = [f"{p}: {d.get('direction', '?')}" for p, d in correlations.items()]
+            corr_summary = f" | Corr: {', '.join(corr_parts[:3])}"
+        
+        logger.info(f"📈 ANALYSIS: PnL ${total_pnl:.0f} | WR {win_rate:.1f}% | PF {profit_factor:.2f} | Snapshots: {analysis['trades_with_snapshot']}{corr_summary}")
         
         return analysis
+    
+    def _analyze_settings_correlation(self, trades: list) -> dict:
+        """
+        Phase 155: Her parametre için kârlı trade'lerdeki ortalama vs zararlı trade'lerdeki ortalama.
+        PnL-ağırlıklı ortalama kullanır — büyük kârlar daha fazla etki eder.
+        """
+        # Sadece settings snapshot'ı olan trade'leri kullan
+        trades_with_snapshot = [t for t in trades if t.get('settingsSnapshot') and isinstance(t.get('settingsSnapshot'), dict) and len(t.get('settingsSnapshot', {})) > 0]
+        
+        if len(trades_with_snapshot) < 10:
+            logger.debug(f"📈 Correlation: Not enough trades with snapshot ({len(trades_with_snapshot)}/10 min)")
+            return {}
+        
+        winners = [t for t in trades_with_snapshot if t.get('pnl', 0) > 0]
+        losers = [t for t in trades_with_snapshot if t.get('pnl', 0) < 0]
+        
+        if len(winners) < 3 or len(losers) < 3:
+            logger.debug(f"📈 Correlation: Not enough winners({len(winners)}) or losers({len(losers)})")
+            return {}
+        
+        correlations = {}
+        
+        for param in self.OPTIMIZABLE_PARAMS:
+            # Winner değerleri (PnL-ağırlıklı ortalama)
+            winner_data = [(t['settingsSnapshot'].get(param), t.get('pnl', 0)) 
+                          for t in winners if t['settingsSnapshot'].get(param) is not None]
+            # Loser değerleri (basit ortalama — zarar miktarı eşit ağırlıklı)
+            loser_data = [(t['settingsSnapshot'].get(param), t.get('pnl', 0)) 
+                         for t in losers if t['settingsSnapshot'].get(param) is not None]
+            
+            if len(winner_data) < 3 or len(loser_data) < 3:
+                continue
+            
+            # PnL-ağırlıklı winner ortalaması (büyük kârlar daha fazla çeker)
+            total_winner_pnl = sum(pnl for _, pnl in winner_data)
+            if total_winner_pnl > 0:
+                winner_avg = sum(val * pnl for val, pnl in winner_data) / total_winner_pnl
+            else:
+                winner_avg = sum(val for val, _ in winner_data) / len(winner_data)
+            
+            # Basit loser ortalaması
+            loser_avg = sum(val for val, _ in loser_data) / len(loser_data)
+            
+            # Tüm trade'lerin ortalaması (referans)
+            all_avg = sum(val for val, _ in winner_data + loser_data) / len(winner_data + loser_data)
+            
+            # Target: kârlı trade'lerin ortalamasına doğru git
+            target = winner_avg
+            direction = 'UP' if winner_avg > loser_avg else 'DOWN'
+            
+            correlations[param] = {
+                'winner_avg': round(winner_avg, 3),
+                'loser_avg': round(loser_avg, 3),
+                'all_avg': round(all_avg, 3),
+                'target': round(target, 3),
+                'direction': direction,
+                'winner_count': len(winner_data),
+                'loser_count': len(loser_data),
+                'confidence': min(len(winner_data), len(loser_data)),  # How many data points
+            }
+        
+        if correlations:
+            logger.info(f"📈 CORRELATIONS: {len(correlations)} params analyzed from {len(trades_with_snapshot)} trades")
+        
+        return correlations
 
 
 # ============================================================================
-# PHASE 52: ADAPTIVE TRADING SYSTEM - PARAMETER OPTIMIZER
+# PHASE 155: AI OPTIMIZER - GRADIENT-BASED PARAMETER OPTIMIZER
 # ============================================================================
 
 class ParameterOptimizer:
     """
-    Analiz sonuçlarına göre parametreleri otomatik optimize eder.
+    Phase 155: Korelasyon bazlı gradient optimizer.
+    
+    Mantık:
+    1. PerformanceAnalyzer her parametre için kârlı/zararlı trade ortalamalarını hesaplar
+    2. Target = kârlı trade'lerin PnL-ağırlıklı ortalaması
+    3. Her döngüde mevcut değeri target'a doğru küçük adımlarla kaydır
+    4. Güvenlik limitleri ve max step ile kontrol et
+    
+    Sadece settings modal'dan aktif edildiğinde çalışır (self.enabled = False default).
     """
     
     def __init__(self):
         self.last_optimization = None
         self.optimization_history = []
-        self.enabled = False  # Varsayılan kapalı
+        self.enabled = False  # Varsayılan KAPALI — sadece settings modal'dan açılır
         
-        # Güvenlik sınırları - TÜM AYARLAR
+        # Güvenlik sınırları — sadece gerçekten optimize edilen parametreler
         self.limits = {
-            # Sinyal kalitesi
+            'entry_tightness': (0.5, 4.0),
             'z_score_threshold': (0.8, 2.5),
             'min_score_low': (30, 60),
             'min_score_high': (60, 95),
-            # Giriş/Çıkış
-            'entry_tightness': (0.5, 4.0),
-            'exit_tightness': (0.3, 2.0),
-            # Risk yönetimi
-            'sl_atr': (1.0, 4.0),
-            'tp_atr': (1.5, 6.0),
-            'trail_activation_atr': (1.0, 3.0),
-            'trail_distance_atr': (0.3, 2.0),
-            # Pozisyon yönetimi
             'max_positions': (2, 15),
-            # Kill Switch - REMOVED (now dynamic per-position based on leverage)
         }
         
-        logger.info("🤖 ParameterOptimizer initialized (disabled by default)")
+        # Max step — bir döngüde maksimum değişim (ani sıçrama önleme)
+        self.max_steps = {
+            'entry_tightness': 0.2,
+            'z_score_threshold': 0.1,
+            'min_score_low': 3,
+            'min_score_high': 3,
+            'max_positions': 1,
+        }
+        
+        # Step ratio — target'a her döngüde mesafenin kaçta kaçı kadar yaklaş
+        self.step_ratio = 0.20  # %20 — yavaş ve güvenli
+        
+        logger.info("🤖 ParameterOptimizer initialized (Phase 155: Gradient-based, disabled by default)")
     
     def optimize(self, analysis: dict, current_settings: dict) -> dict:
         """
-        PnL-bazlı optimizasyon: Kâr/zarar durumuna göre tüm ayarları kontrol eder.
-        Win rate değil, net PnL ana karar faktörüdür.
+        Korelasyon verilerine göre parametreleri target'a doğru kaydır.
+        
+        Args:
+            analysis: PerformanceAnalyzer'dan gelen analiz (correlations dahil)
+            current_settings: Mevcut paper_trader ayarları
+        
+        Returns:
+            dict: timestamp, recommendations, changes, applied bilgileri
         """
         if not analysis:
             return {}
@@ -9417,146 +9511,75 @@ class ParameterOptimizer:
         recommendations = {}
         changes = []
         
-        # === ANA METRİKLER ===
-        total_pnl = analysis.get('total_pnl', 0)  # Son dönem toplam PnL
-        win_rate = analysis.get('win_rate', 50)
-        profit_factor = analysis.get('profit_factor', 1.0)
-        kill_switch_rate = analysis.get('kill_switch_rate', 0)
-        early_exit_rate = analysis.get('early_exit_rate', 0)
-        market_regime = analysis.get('market_regime', 'RANGING')
+        correlations = analysis.get('correlations', {})
+        total_pnl = analysis.get('total_pnl', 0)
+        trades_with_snapshot = analysis.get('trades_with_snapshot', 0)
         
-        # === PnL-BAZLI DURUM TESPİTİ ===
-        # Kârda = agresif, Zararda = defansif
-        if total_pnl > 50:  # $50+ kâr
-            mode = 'AGGRESSIVE'
-        elif total_pnl > 0:  # 0-$50 kâr
-            mode = 'NEUTRAL_UP'
-        elif total_pnl > -50:  # 0 ile -$50 arası zarar
-            mode = 'NEUTRAL_DOWN'
-        else:  # -$50'den fazla zarar
-            mode = 'DEFENSIVE'
-        
-        # Profit factor da kontrol et
-        if profit_factor < 0.8:  # Zarar eden sistem
-            mode = 'DEFENSIVE'
-        elif profit_factor > 2.0:  # Çok karlı sistem
-            mode = 'AGGRESSIVE'
-        
-        logger.info(f"🤖 AI Mode: {mode} | PnL: ${total_pnl:.2f} | WR: {win_rate:.1f}% | PF: {profit_factor:.2f}")
-        
-        # === AYAR OPTİMİZASYONU ===
-        
-        # 1. Z-Score Threshold
-        current_z = current_settings.get('z_score_threshold', 1.2)
-        if mode == 'AGGRESSIVE':
-            target_z = max(self.limits['z_score_threshold'][0], current_z - 0.1)
-        elif mode == 'DEFENSIVE':
-            target_z = min(self.limits['z_score_threshold'][1], current_z + 0.1)
+        # Yeterli veri yoksa sadece log yaz, öneri üretme
+        if not correlations:
+            logger.info(f"🤖 OPTIMIZER: No correlations yet (snapshots: {trades_with_snapshot}) — collecting data")
         else:
-            target_z = current_z
-        if abs(target_z - current_z) >= 0.1:
-            recommendations['z_score_threshold'] = round(target_z, 1)
-            changes.append(f"z_score: {current_z}→{target_z}")
-        
-        # 2. Min Score Range
-        current_low = current_settings.get('min_score_low', 50)
-        current_high = current_settings.get('min_score_high', 70)
-        if mode == 'AGGRESSIVE':
-            new_low = max(self.limits['min_score_low'][0], current_low - 5)
-            new_high = max(self.limits['min_score_high'][0], current_high - 5)
-        elif mode == 'DEFENSIVE':
-            new_low = min(self.limits['min_score_low'][1], current_low + 5)
-            new_high = min(self.limits['min_score_high'][1], current_high + 5)
-        else:
-            new_low, new_high = current_low, current_high
-        if new_low != current_low or new_high != current_high:
-            recommendations['min_score_low'] = int(new_low)
-            recommendations['min_score_high'] = int(new_high)
-            changes.append(f"min_score: {current_low}-{current_high}→{new_low}-{new_high}")
-        
-        # 3. Entry Tightness
-        current_entry = current_settings.get('entry_tightness', 1.0)
-        if mode == 'AGGRESSIVE':
-            new_entry = min(self.limits['entry_tightness'][1], current_entry + 0.3)
-        elif mode == 'DEFENSIVE':
-            new_entry = max(self.limits['entry_tightness'][0], current_entry - 0.2)
-        else:
-            new_entry = current_entry
-        if abs(new_entry - current_entry) >= 0.2:
-            recommendations['entry_tightness'] = round(new_entry, 1)
-            changes.append(f"entry: {current_entry}→{new_entry}")
-        
-        # 4. Exit Tightness
-        current_exit = current_settings.get('exit_tightness', 1.0)
-        if mode == 'AGGRESSIVE':
-            new_exit = min(self.limits['exit_tightness'][1], current_exit + 0.2)
-        elif mode == 'DEFENSIVE':
-            new_exit = max(self.limits['exit_tightness'][0], current_exit - 0.1)
-        else:
-            new_exit = current_exit
-        if abs(new_exit - current_exit) >= 0.1:
-            recommendations['exit_tightness'] = round(new_exit, 1)
-            changes.append(f"exit: {current_exit}→{new_exit}")
-        
-        # 5. SL/TP ATR
-        current_sl = current_settings.get('sl_atr', 2.0)
-        current_tp = current_settings.get('tp_atr', 3.0)
-        if mode == 'AGGRESSIVE':
-            new_sl = min(self.limits['sl_atr'][1], current_sl + 0.3)
-            new_tp = min(self.limits['tp_atr'][1], current_tp + 0.5)
-        elif mode == 'DEFENSIVE':
-            new_sl = max(self.limits['sl_atr'][0], current_sl - 0.2)
-            new_tp = max(self.limits['tp_atr'][0], current_tp - 0.3)
-        else:
-            new_sl, new_tp = current_sl, current_tp
-        if abs(new_sl - current_sl) >= 0.2:
-            recommendations['sl_atr'] = round(new_sl, 1)
-            changes.append(f"sl_atr: {current_sl}→{new_sl}")
-        if abs(new_tp - current_tp) >= 0.3:
-            recommendations['tp_atr'] = round(new_tp, 1)
-            changes.append(f"tp_atr: {current_tp}→{new_tp}")
-        
-        # 6. Trail Distance
-        current_trail = current_settings.get('trail_distance_atr', 1.0)
-        if early_exit_rate > 50:
-            new_trail = min(self.limits['trail_distance_atr'][1], current_trail + 0.2)
-            recommendations['trail_distance_atr'] = round(new_trail, 1)
-            changes.append(f"trail: +0.2 (erken çıkış %{early_exit_rate:.0f})")
-        elif early_exit_rate < 20 and early_exit_rate > 0:
-            new_trail = max(self.limits['trail_distance_atr'][0], current_trail - 0.1)
-            recommendations['trail_distance_atr'] = round(new_trail, 1)
-            changes.append(f"trail: -0.1")
-        
-        # 7. Max Positions
-        current_max = current_settings.get('max_positions', 5)
-        if mode == 'AGGRESSIVE':
-            new_max = min(self.limits['max_positions'][1], current_max + 2)
-        elif mode == 'DEFENSIVE':
-            new_max = max(self.limits['max_positions'][0], current_max - 2)
-        else:
-            new_max = current_max
-        if new_max != current_max:
-            recommendations['max_positions'] = int(new_max)
-            changes.append(f"max_pos: {current_max}→{new_max}")
-        
-        # 8. Kill Switch - REMOVED (now dynamic based on leverage per-position)
-        # Kill switch thresholds are automatically calculated in PositionBasedKillSwitch
-        # based on each position's leverage, no longer needs AI adjustment
+            # === GRADIENT-BAZLI OPTİMİZASYON ===
+            for param, corr_data in correlations.items():
+                current_val = current_settings.get(param)
+                target_val = corr_data.get('target')
+                confidence = corr_data.get('confidence', 0)
+                
+                if current_val is None or target_val is None:
+                    continue
+                
+                # Minimum confidence: en az 5 veri noktası
+                if confidence < 5:
+                    continue
+                
+                # Mesafe hesapla
+                distance = target_val - current_val
+                
+                # Küçük adımla yaklaş (mesafenin %20'si, max step ile sınırlı)
+                max_step = self.max_steps.get(param, 0.2)
+                step = distance * self.step_ratio
+                step = max(-max_step, min(max_step, step))
+                
+                new_val = current_val + step
+                
+                # Güvenlik limitleri uygula
+                limits = self.limits.get(param)
+                if limits:
+                    new_val = max(limits[0], min(limits[1], new_val))
+                
+                # Integer parametreler (max_positions, min_score)
+                if param in ('max_positions', 'min_score_low', 'min_score_high'):
+                    new_val = int(round(new_val))
+                else:
+                    new_val = round(new_val, 2)
+                
+                # Değişim anlamlı mı? (minimum threshold)
+                min_change = {
+                    'entry_tightness': 0.05,
+                    'z_score_threshold': 0.05,
+                    'min_score_low': 1,
+                    'min_score_high': 1,
+                    'max_positions': 1,
+                }.get(param, 0.01)
+                
+                if abs(new_val - current_val) >= min_change:
+                    recommendations[param] = new_val
+                    direction = corr_data.get('direction', '?')
+                    changes.append(f"{param}: {current_val}→{new_val} (win_avg={corr_data.get('winner_avg', '?')}, {direction})")
         
         # === SONUÇ ===
-        # Use Turkey timezone (UTC+3)
         from zoneinfo import ZoneInfo
         turkey_tz = ZoneInfo('Europe/Istanbul')
         turkey_time = datetime.now(turkey_tz)
         
         result = {
             'timestamp': turkey_time.strftime('%d.%m.%Y %H:%M:%S'),
-            'mode': mode,
             'total_pnl': total_pnl,
             'recommendations': recommendations,
             'changes': changes,
             'applied': False,
-            'market_regime': market_regime
+            'correlations_count': len(correlations),
+            'trades_with_snapshot': trades_with_snapshot,
         }
         
         self.last_optimization = result
@@ -9565,82 +9588,64 @@ class ParameterOptimizer:
             self.optimization_history = self.optimization_history[-50:]
         
         if changes:
-            logger.info(f"🤖 OPTIMIZER ({mode}): {len(changes)} öneri - {', '.join(changes)}")
+            logger.info(f"🤖 OPTIMIZER: {len(changes)} gradient changes — {', '.join(changes[:3])}")
         
         return result
     
-    def apply_recommendations(self, paper_trader, recommendations: dict):
-        """Tüm optimizasyon önerilerini uygula (sadece enabled ise)."""
+    def apply_recommendations(self, paper_trader, recommendations: dict) -> dict:
+        """
+        Optimizasyon önerilerini uygula (sadece enabled ise).
+        
+        Returns:
+            dict: Uygulanan ayarlar {param_name: new_value} veya boş dict
+        """
         if not self.enabled:
-            logger.info("🤖 OPTIMIZER: Auto-mode disabled, skipping apply")
-            return False
+            logger.info("🤖 OPTIMIZER: Disabled — skipping apply")
+            return {}
         
-        applied = []
+        if not recommendations:
+            return {}
         
-        # Sinyal kalitesi
-        if 'z_score_threshold' in recommendations:
-            paper_trader.z_score_threshold = recommendations['z_score_threshold']
-            applied.append('z_score')
+        applied = {}
         
-        if 'min_score_low' in recommendations:
-            paper_trader.min_score_low = recommendations['min_score_low']
-            applied.append('min_low')
+        # Phase 155: Sadece optimize edilen parametreler
+        param_map = {
+            'entry_tightness': 'entry_tightness',
+            'z_score_threshold': 'z_score_threshold',
+            'min_score_low': 'min_score_low',
+            'min_score_high': 'min_score_high',
+            'max_positions': 'max_positions',
+        }
         
-        if 'min_score_high' in recommendations:
-            paper_trader.min_score_high = recommendations['min_score_high']
-            applied.append('min_high')
-        
-        # Giriş/Çıkış
-        if 'entry_tightness' in recommendations:
-            paper_trader.entry_tightness = recommendations['entry_tightness']
-            applied.append('entry')
-        
-        if 'exit_tightness' in recommendations:
-            paper_trader.exit_tightness = recommendations['exit_tightness']
-            applied.append('exit')
-        
-        # Risk yönetimi
-        if 'sl_atr' in recommendations:
-            paper_trader.sl_atr = recommendations['sl_atr']
-            applied.append('sl_atr')
-        
-        if 'tp_atr' in recommendations:
-            paper_trader.tp_atr = recommendations['tp_atr']
-            applied.append('tp_atr')
-        
-        if 'trail_activation_atr' in recommendations:
-            paper_trader.trail_activation_atr = recommendations['trail_activation_atr']
-            applied.append('trail_act')
-        
-        if 'trail_distance_atr' in recommendations:
-            paper_trader.trail_distance_atr = recommendations['trail_distance_atr']
-            applied.append('trail_dist')
-        
-        # Pozisyon yönetimi
-        if 'max_positions' in recommendations:
-            paper_trader.max_positions = recommendations['max_positions']
-            applied.append('max_pos')
-        
-        # Kill Switch - REMOVED (now dynamic per-position based on leverage)
-        # No longer applied from recommendations
+        for param, attr_name in param_map.items():
+            if param in recommendations:
+                old_val = getattr(paper_trader, attr_name, None)
+                new_val = recommendations[param]
+                setattr(paper_trader, attr_name, new_val)
+                applied[param] = {'old': old_val, 'new': new_val}
         
         if applied:
-            logger.info(f"🤖 OPTIMIZER: Applied {len(applied)} settings: {applied}")
-            paper_trader.add_log(f"🤖 AI güncelledi: {', '.join(applied)}")
+            applied_summary = ", ".join(f"{p}: {d['old']}→{d['new']}" for p, d in applied.items())
+            logger.info(f"🤖 OPTIMIZER APPLIED: {applied_summary}")
+            paper_trader.add_log(f"🤖 AI güncelledi: {applied_summary}")
             paper_trader.save_state()
-            # Mark as applied in last_optimization
+            
+            # Mark as applied
             if self.last_optimization:
                 self.last_optimization['applied'] = True
-                self.last_optimization['applied_at'] = datetime.now().isoformat()
-                self.last_optimization['applied_settings'] = applied
+                from zoneinfo import ZoneInfo
+                turkey_tz = ZoneInfo('Europe/Istanbul')
+                self.last_optimization['applied_at'] = datetime.now(turkey_tz).strftime('%d.%m.%Y %H:%M:%S')
+                self.last_optimization['applied_settings'] = list(applied.keys())
         
-        return len(applied) > 0
+        return applied
     
     def get_status(self) -> dict:
         return {
             'enabled': self.enabled,
             'last_optimization': self.last_optimization,
             'history_count': len(self.optimization_history),
+            'correlations': performance_analyzer.last_correlations if performance_analyzer else None,
         }
 
 
@@ -11922,6 +11927,20 @@ class PaperTradingEngine:
         # Signal Confirmation: 5 dakika bekleme süresi - trend değişikliğini filtreler
         signal_confirmation_delay_seconds = 300  # 5 dakika
         
+        # Phase 155: AI Optimizer — snapshot settings at trade open time
+        settings_snapshot = {
+            'entry_tightness': self.entry_tightness,
+            'z_score_threshold': self.z_score_threshold,
+            'min_score_low': self.min_score_low,
+            'min_score_high': self.min_score_high,
+            'max_positions': self.max_positions,
+            'market_regime': market_regime_detector.current_regime if 'market_regime_detector' in dir() or True else 'UNKNOWN',
+        }
+        try:
+            settings_snapshot['market_regime'] = market_regime_detector.current_regime
+        except:
+            settings_snapshot['market_regime'] = 'UNKNOWN'
+        
         pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
@@ -11951,7 +11970,9 @@ class PaperTradingEngine:
             "hurst": signal.get('hurst', 0.5) if signal else 0.5,
             # Dynamic trail params (per-coin)
             "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
-            "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr
+            "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr,
+            # Phase 155: AI Optimizer settings snapshot
+            "settingsSnapshot": settings_snapshot,
         }
         
         self.pending_orders.append(pending_order)
@@ -13137,6 +13158,8 @@ class PaperTradingEngine:
             "atr": pos.get('atr', 0),
             "slMultiplier": pos.get('slMultiplier', 0),
             "tpMultiplier": pos.get('tpMultiplier', 0),
+            # Phase 155: AI Optimizer settings snapshot from open time
+            "settingsSnapshot": pos.get('settingsSnapshot', {}),
         }
         
         # Phase 138: LIVE positions - store reason for Binance sync, DON'T write trade yet
@@ -14269,14 +14292,7 @@ async def optimizer_run_now():
                 'min_score_low': global_paper_trader.min_score_low,
                 'min_score_high': global_paper_trader.min_score_high,
                 'entry_tightness': global_paper_trader.entry_tightness,
-                'exit_tightness': global_paper_trader.exit_tightness,
-                'sl_atr': global_paper_trader.sl_atr,
-                'tp_atr': global_paper_trader.tp_atr,
-                'trail_activation_atr': global_paper_trader.trail_activation_atr,
-                'trail_distance_atr': global_paper_trader.trail_distance_atr,
                 'max_positions': global_paper_trader.max_positions,
-                'kill_switch_first_reduction': daily_kill_switch.first_reduction_pct,
-                'kill_switch_full_close': daily_kill_switch.full_close_pct,
             }
             optimization = parameter_optimizer.optimize(analysis, current_settings)
             
