@@ -43,12 +43,12 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
   // Entry tightness level helper
   const getEntryLevel = () => {
     const t = localSettings.entryTightness;
-    if (t <= 0.4) return { label: 'Çok Sıkı', color: 'text-rose-500', desc: 'Gerçek derin pullback bekle, az pozisyon' };
-    if (t <= 0.8) return { label: 'Sıkı', color: 'text-orange-400', desc: 'Belirgin pullback bekle' };
-    if (t <= 1.5) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart pullback' };
-    if (t <= 2.5) return { label: 'Gevşek', color: 'text-blue-400', desc: 'Hafif pullback yeterli' };
-    if (t <= 4.0) return { label: 'Çok Gevşek', color: 'text-indigo-400', desc: 'Minimal pullback, çok pozisyon' };
-    return { label: 'Ultra Gevşek', color: 'text-fuchsia-400', desc: 'Neredeyse sıfır pullback' };
+    if (t <= 0.4) return { label: 'Dar', color: 'text-emerald-400', desc: 'Küçük pullback, kolay giriş' };
+    if (t <= 0.8) return { label: 'Dar-Orta', color: 'text-blue-400', desc: 'Hafif pullback beklenir' };
+    if (t <= 1.5) return { label: 'Normal', color: 'text-amber-400', desc: 'Standart pullback + bounce filtresi' };
+    if (t <= 2.5) return { label: 'Geniş', color: 'text-orange-400', desc: 'Geniş pullback + sıkı bounce kontrolü' };
+    if (t <= 4.0) return { label: 'Çok Geniş', color: 'text-rose-400', desc: 'Derin pullback, seçici giriş' };
+    return { label: 'Ultra Geniş', color: 'text-rose-500', desc: 'En derin pullback, en az pozisyon' };
   };
 
   // Exit tightness level helper
@@ -225,7 +225,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
 
             <div>
               <div className="flex justify-between items-center mb-2">
-                <label className="text-sm text-slate-300">Giriş Sıkılığı</label>
+                <label className="text-sm text-slate-300">Giriş Genişliği</label>
                 <span className="text-sm font-mono text-amber-400">{localSettings.entryTightness.toFixed(1)}x</span>
               </div>
               <input
@@ -238,8 +238,8 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500"
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                <span>0.3x (Sıkı = Az Pozisyon)</span>
-                <span>6.0x (Gevşek = Çok Pozisyon)</span>
+                <span>0.3x (Dar = Kolay Giriş)</span>
+                <span>6.0x (Geniş = Seçici Giriş)</span>
               </div>
             </div>
           </div>
