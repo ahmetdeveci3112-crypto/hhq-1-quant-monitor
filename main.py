@@ -11255,7 +11255,10 @@ class SignalGenerator:
             'spreadLevel': spread_params['level'],
             'pullbackPct': round(pullback_pct * 100, 2),
             'coinDailyTrend': coin_daily_trend,  # Phase 110: For position sizing
-            'trendSizeReduction': trend_size_reduction  # Phase 110: Applied reduction
+            'trendSizeReduction': trend_size_reduction,  # Phase 110: Applied reduction
+            # Phase 153: ADX and Hurst for dynamic bounce confirmation
+            'adx': adx,
+            'hurst': hurst
         }
 
 
@@ -11850,6 +11853,9 @@ class PaperTradingEngine:
             "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
             "atr": atr,
             "confirmed": False,  # Henüz konfirme edilmedi
+            # Phase 153: ADX and Hurst for dynamic bounce threshold
+            "adx": signal.get('adx', 0) if signal else 0,
+            "hurst": signal.get('hurst', 0.5) if signal else 0.5,
             # Dynamic trail params (per-coin)
             "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
             "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr
@@ -11967,9 +11973,27 @@ class PaperTradingEngine:
                     logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} vol={current_volume:.0f}")
             else:
                 # Step 2: Waiting for bounce confirmation
-                bounce_confirm_distance = atr * 0.5   # Need 0.5×ATR recovery
-                bounce_cancel_distance = atr * 1.0    # Cancel if 1×ATR against
+                # Phase 153: Dynamic bounce threshold based on ADX + Hurst
+                # Strong trend (high ADX + high Hurst) → smaller bounce needed
+                # Weak trend (low ADX + low Hurst) → larger bounce needed
+                order_adx = order.get('adx', 0)
+                order_hurst = order.get('hurst', 0.5)
+                
+                # Trend strength: 0.0 (very weak) to 1.0 (very strong)
+                # ADX component: 0-100 → normalize to 0-1 (clip at 60)
+                adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))  # 15→0, 60→1
+                # Hurst component: 0.3-0.8 → normalize to 0-1
+                hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))  # 0.35→0, 0.75→1
+                # Combined trend strength (ADX weighted 60%, Hurst 40%)
+                trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
+                
+                # Bounce confirm distance: strong trend → 0.2×ATR, weak trend → 0.8×ATR
+                bounce_confirm_distance = atr * (0.8 - trend_strength * 0.6)  # Range: 0.2 to 0.8
+                # Bounce cancel distance: strong trend → 1.5×ATR (more patient), weak → 0.7×ATR (quick cancel)
+                bounce_cancel_distance = atr * (0.7 + trend_strength * 0.8)  # Range: 0.7 to 1.5
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
+                
+                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} strength={trend_strength:.2f} confirm={bounce_confirm_distance/atr:.2f}×ATR cancel={bounce_cancel_distance/atr:.2f}×ATR")
                 bounce_start = order.get('bounceStartTime', current_time)
                 bounce_start_volume = order.get('bounceStartVolume', 0)
                 
