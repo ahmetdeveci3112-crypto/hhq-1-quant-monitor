@@ -899,6 +899,9 @@ class LiveBinanceTrader:
         # Phase 146: Persistent trailing state for live positions
         # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
         self.trailing_state = {}
+        # Phase 160: Cache real openTime per symbol to survive reduce/sync
+        # Key: symbol, Value: timestamp_ms (int)
+        self.open_time_cache = {}
         logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
         
     async def initialize(self):
@@ -1032,6 +1035,12 @@ class LiveBinanceTrader:
                         # Calculate PnL percentage
                         pnl_percent = (unrealized_pnl / position_margin * 100) if position_margin > 0 else 0
                         
+                        # Phase 160: Use cached openTime if available (survives reduce)
+                        cached_ot = self.open_time_cache.get(symbol)
+                        if cached_ot:
+                            open_time_val = cached_ot
+                        else:
+                            open_time_val = int(p.get('updateTime', datetime.now().timestamp() * 1000))
                         result.append({
                             'symbol': symbol,
                             'side': side,
@@ -1044,7 +1053,7 @@ class LiveBinanceTrader:
                             'size': abs(position_amt),           # Phase 149: Fix missing size field
                             'contracts': abs(position_amt),
                             'markPrice': float(p.get('markPrice', entry_price) or entry_price),  # Phase 149: Add markPrice
-                            'openTime': int(p.get('updateTime', datetime.now().timestamp() * 1000))  # Phase 150: Use Binance updateTime
+                            'openTime': open_time_val
                         })
                     else:
                         # Track symbols with 0 positionAmt
@@ -1134,8 +1143,11 @@ class LiveBinanceTrader:
                     # Fetch recent trades for this symbol to find when position was opened
                     open_time = int(datetime.now().timestamp() * 1000)  # Default to now
                     
-                    # Phase 79: Skip expensive openTime lookup in fast mode
-                    if not fast:
+                    # Phase 160: Check cache first (survives reduce operations)
+                    cached_ot = self.open_time_cache.get(symbol)
+                    if cached_ot:
+                        open_time = cached_ot
+                    elif not fast:
                         try:
                             # Fetch trades from last 7 days for more accurate open time
                             seven_days_ago = int((datetime.now().timestamp() - 7*24*60*60) * 1000)
@@ -1166,6 +1178,7 @@ class LiveBinanceTrader:
                                 
                                 if earliest_matching:
                                     open_time = earliest_matching
+                                    self.open_time_cache[symbol] = open_time  # Phase 160: Cache it
                                     logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
                                 else:
                                     # Fallback: Use oldest trade time if position predates our history
