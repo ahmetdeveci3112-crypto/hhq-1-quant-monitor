@@ -11745,9 +11745,11 @@ class PaperTradingEngine:
         # Get pullback entry price from signal and apply entry_tightness
         if signal and 'entryPrice' in signal:
             base_pullback_pct = signal.get('pullbackPct', 0)
-            # Apply entry_tightness: HIGHER = EASIER entry (smaller pullback)
-            # Formula: divide by entry_tightness (4.0x = pullback/4 = %75 daha az bekleme)
-            adjusted_pullback_pct = base_pullback_pct / max(0.1, self.entry_tightness)
+            # Apply entry_tightness: HIGHER = WIDER pullback (more distance from signal price)
+            # Formula: multiply by sqrt(entry_tightness) for smooth scaling
+            import math
+            et_mult = math.sqrt(max(0.5, self.entry_tightness))  # sqrt smoothing: 2.6→1.6, 1.0→1.0
+            adjusted_pullback_pct = base_pullback_pct * et_mult
             
             # Recalculate entry price with adjusted pullback
             if side == 'LONG':
