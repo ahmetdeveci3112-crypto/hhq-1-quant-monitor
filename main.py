@@ -11970,9 +11970,11 @@ class PaperTradingEngine:
                     order['bounceStartVolume'] = current_volume  # Volume snapshot
                     order['bouncePriceHistory'] = [current_price]  # Track price trend
                     # Pre-calculate bounce thresholds for logging
+                    import math
                     et = max(0.5, self.entry_tightness)
+                    et_mult = math.sqrt(et)
                     base_cf = 0.8 - (min(1.0, max(0.0, (order.get('adx', 0) - 15) / 45)) * 0.6 + min(1.0, max(0.0, (order.get('hurst', 0.5) - 0.35) / 0.4)) * 0.4) * 0.6
-                    bounce_pct = (atr * base_cf / et) / entry_price * 100 if entry_price > 0 else 0
+                    bounce_pct = (atr * base_cf * et_mult) / entry_price * 100 if entry_price > 0 else 0
                     self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% | ET={et:.1f}x")
                     logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% ET={et} vol={current_volume:.0f}")
             else:
@@ -11992,17 +11994,19 @@ class PaperTradingEngine:
                 # Combined trend strength (ADX weighted 60%, Hurst 40%)
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
                 
-                # Apply entry_tightness: higher = easier entry = less bounce needed
-                # entry_tightness 2.6x means divide bounce requirement by 2.6
-                et = max(0.5, self.entry_tightness)  # Floor at 0.5 to avoid huge bounce
+                # Apply entry_tightness: higher ET = easier entry = STRICTER bounce needed
+                # ET 2.6x means multiply bounce by sqrt(2.6) ≈ 1.6x (smoothed)
+                import math
+                et = max(0.5, self.entry_tightness)
+                et_mult = math.sqrt(et)  # sqrt smoothing: 2.6→1.6, 1.0→1.0, 0.5→0.7
                 
                 # Base bounce distances (before entry_tightness)
                 base_confirm = 0.8 - trend_strength * 0.6  # Range: 0.2 to 0.8 ×ATR
                 base_cancel = 0.7 + trend_strength * 0.8   # Range: 0.7 to 1.5 ×ATR
                 
-                # Apply entry_tightness multiplier
-                bounce_confirm_distance = atr * (base_confirm / et)
-                bounce_cancel_distance = atr * (base_cancel / et)
+                # Apply entry_tightness: MULTIPLY (higher ET = bigger bounce needed)
+                bounce_confirm_distance = atr * base_confirm * et_mult
+                bounce_cancel_distance = atr * base_cancel * et_mult
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
                 
                 # Calculate percentage equivalents for logging
