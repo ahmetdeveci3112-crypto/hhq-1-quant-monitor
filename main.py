@@ -899,10 +899,92 @@ class LiveBinanceTrader:
         # Phase 146: Persistent trailing state for live positions
         # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
         self.trailing_state = {}
-        # Phase 160: Cache real openTime per symbol to survive reduce/sync
+        # Phase 160: Cache real openTime per symbol to survive reduce/sync/restart
         # Key: symbol, Value: timestamp_ms (int)
-        self.open_time_cache = {}
-        logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
+        # Persisted to /data/open_time_cache.json on Fly.io
+        self.open_time_cache = self._load_open_time_cache()
+        logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode} | OpenTimeCache: {len(self.open_time_cache)} entries")
+    
+    def _get_open_time_cache_path(self):
+        """Get the path for persistent open_time_cache file."""
+        if os.path.exists('/data'):
+            return '/data/open_time_cache.json'
+        return 'open_time_cache.json'
+    
+    def _load_open_time_cache(self) -> dict:
+        """Load open_time_cache from disk (survives restart/deploy)."""
+        cache_path = self._get_open_time_cache_path()
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path, 'r') as f:
+                    data = json.load(f)
+                logger.info(f"📂 Loaded open_time_cache from {cache_path}: {len(data)} entries")
+                return {k: int(v) for k, v in data.items()}
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load open_time_cache: {e}")
+        return {}
+    
+    def _save_open_time_cache(self):
+        """Save open_time_cache to disk."""
+        cache_path = self._get_open_time_cache_path()
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(self.open_time_cache, f)
+        except Exception as e:
+            logger.warning(f"⚠️ Could not save open_time_cache: {e}")
+    
+    async def _populate_open_time_cache(self):
+        """Fetch real openTime from trade history for all current positions.
+        Called once on startup to fill any gaps in the cache."""
+        try:
+            # Get all current positions
+            positions = await self.exchange.fapiPrivateV3GetPositionRisk()
+            active_symbols = []
+            for p in positions:
+                position_amt = float(p.get('positionAmt', 0) or 0)
+                if abs(position_amt) > 0:
+                    symbol = p.get('symbol', '')
+                    side = 'LONG' if position_amt > 0 else 'SHORT'
+                    active_symbols.append((symbol, side))
+            
+            if not active_symbols:
+                return
+            
+            filled = 0
+            for symbol, side in active_symbols:
+                if symbol in self.open_time_cache:
+                    continue  # Already cached
+                
+                try:
+                    # Fetch trades from last 30 days
+                    thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
+                    trades = await self.exchange.fapiPrivateGetUserTrades({
+                        'symbol': symbol,
+                        'startTime': thirty_days_ago,
+                        'limit': 1000
+                    })
+                    
+                    if trades:
+                        sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                        # Find earliest trade matching position direction
+                        for t in sorted_trades:
+                            is_buyer = t.get('buyer', False)
+                            if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
+                                open_time = int(t.get('time', 0))
+                                self.open_time_cache[symbol] = open_time
+                                filled += 1
+                                logger.info(f"📂 Populated openTime for {symbol}: {datetime.fromtimestamp(open_time/1000)}")
+                                break
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not fetch trades for {symbol}: {e}")
+                
+                await asyncio.sleep(0.1)  # Rate limit
+            
+            if filled > 0:
+                self._save_open_time_cache()
+                logger.info(f"📂 Populated {filled} openTime entries from trade history")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not populate open_time_cache: {e}")
         
     async def initialize(self):
         """Binance bağlantısını başlat."""
@@ -938,6 +1020,10 @@ class LiveBinanceTrader:
             
             self.enabled = True
             self.initialized = True
+            
+            # Phase 160: Populate openTime cache from trade history on startup
+            await self._populate_open_time_cache()
+            
             return True
             
         except Exception as e:
@@ -1149,11 +1235,11 @@ class LiveBinanceTrader:
                         open_time = cached_ot
                     elif not fast:
                         try:
-                            # Fetch trades from last 7 days for more accurate open time
-                            seven_days_ago = int((datetime.now().timestamp() - 7*24*60*60) * 1000)
+                            # Fetch trades from last 30 days for more accurate open time
+                            thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
                             trades = await self.exchange.fapiPrivateGetUserTrades({
                                 'symbol': symbol,
-                                'startTime': seven_days_ago,
+                                'startTime': thirty_days_ago,
                                 'limit': 500  # Fetch more trades to find older positions
                             })
                             
@@ -1178,7 +1264,8 @@ class LiveBinanceTrader:
                                 
                                 if earliest_matching:
                                     open_time = earliest_matching
-                                    self.open_time_cache[symbol] = open_time  # Phase 160: Cache it
+                                    self.open_time_cache[symbol] = open_time  # Phase 160: Cache + persist
+                                    self._save_open_time_cache()
                                     logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
                                 else:
                                     # Fallback: Use oldest trade time if position predates our history
