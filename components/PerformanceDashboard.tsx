@@ -152,13 +152,20 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     return (
         <div className="space-y-6">
             {/* Summary Cards */}
+            {/* Source Badge */}
+            {summary?.source === 'binance' && (
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full border border-amber-500/30">📊 Binance Verisi</span>
+                </div>
+            )}
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4">
                 <div className="bg-gradient-to-br from-emerald-900/50 to-emerald-800/30 border border-emerald-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <TrendingUp className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-400" />
                         <span className="text-xs sm:text-sm text-emerald-300">Toplam Kâr</span>
                     </div>
-                    <div className="text-lg sm:text-2xl font-bold text-white">
+                    <div className={`text-lg sm:text-2xl font-bold ${(summary?.totalPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         ${summary?.totalPnl?.toFixed(2) || '0.00'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-emerald-400 mt-1">
@@ -175,7 +182,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         %{summary?.winRate?.toFixed(1) || '0'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-blue-400 mt-1 truncate">
-                        Son 7g: %{summary?.recentWinRate?.toFixed(1) || '0'}
+                        {summary?.winningTrades || 0}W / {summary?.losingTrades || 0}L
                     </div>
                 </div>
 
@@ -188,20 +195,20 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         ${summary?.recentPnl?.toFixed(2) || '0.00'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-fuchsia-400 mt-1">
-                        {summary?.recentTrades || 0} trade
+                        {summary?.recentTrades || 0} trade | WR %{summary?.recentWinRate?.toFixed(0) || '0'}
                     </div>
                 </div>
 
                 <div className="bg-gradient-to-br from-amber-900/50 to-amber-800/30 border border-amber-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <Trophy className="w-4 h-4 sm:w-5 sm:h-5 text-amber-400" />
-                        <span className="text-xs sm:text-sm text-amber-300">Takip</span>
+                        <span className="text-xs sm:text-sm text-amber-300">Profit Factor</span>
                     </div>
-                    <div className="text-lg sm:text-2xl font-bold text-white">
-                        {coinStats?.coins || 0}
+                    <div className={`text-lg sm:text-2xl font-bold ${(summary?.profitFactor || 0) >= 1 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {summary?.profitFactor?.toFixed(2) || '0.00'}
                     </div>
-                    <div className="text-[10px] sm:text-xs text-amber-400 mt-1">
-                        {coinStats?.blocked_coins?.length || 0} bloklu
+                    <div className="text-[10px] sm:text-xs text-amber-400 mt-1 truncate">
+                        W ${summary?.avgWin?.toFixed(2) || '0'} / L ${summary?.avgLoss?.toFixed(2) || '0'}
                     </div>
                 </div>
             </div>
@@ -338,17 +345,17 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         <Trophy className="w-4 h-4" />
                         En İyi Coinler
                     </h3>
-                    {coinStats?.best_performers?.length ? (
+                    {(coinStats?.bestCoins || coinStats?.best_performers)?.length ? (
                         <div className="space-y-2">
-                            {coinStats.best_performers.slice(0, 5).map((coin: CoinPerformer, i: number) => (
+                            {(coinStats.bestCoins || coinStats.best_performers).slice(0, 5).map((coin: any, i: number) => (
                                 <div key={i} className="flex items-center justify-between py-1 border-b border-slate-700/50">
                                     <div className="flex items-center gap-2">
-                                        <span className="text-white font-medium">{coin.symbol.replace('USDT', '')}</span>
+                                        <span className="text-white font-medium">{(coin.symbol || '').replace('USDT', '')}</span>
                                         <span className="text-xs text-slate-400">{coin.trades} trade</span>
                                     </div>
                                     <div className="flex items-center gap-3">
                                         <span className="text-xs text-emerald-400">%{coin.win_rate}</span>
-                                        <span className="text-emerald-400 font-mono">${coin.total_pnl.toFixed(0)}</span>
+                                        <span className="text-emerald-400 font-mono">${(coin.total_pnl || 0).toFixed(2)}</span>
                                     </div>
                                 </div>
                             ))}
@@ -364,20 +371,17 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         <AlertTriangle className="w-4 h-4" />
                         En Kötü Coinler
                     </h3>
-                    {coinStats?.worst_performers?.length ? (
+                    {(coinStats?.worstCoins || coinStats?.worst_performers)?.length ? (
                         <div className="space-y-2">
-                            {coinStats.worst_performers.slice(0, 5).map((coin: CoinPerformer, i: number) => (
+                            {(coinStats.worstCoins || coinStats.worst_performers).slice(0, 5).map((coin: any, i: number) => (
                                 <div key={i} className="flex items-center justify-between py-1 border-b border-slate-700/50">
                                     <div className="flex items-center gap-2">
-                                        <span className="text-white font-medium">{coin.symbol.replace('USDT', '')}</span>
+                                        <span className="text-white font-medium">{(coin.symbol || '').replace('USDT', '')}</span>
                                         <span className="text-xs text-slate-400">{coin.trades} trade</span>
-                                        {coin.penalty && coin.penalty > 0 && (
-                                            <span className="text-xs bg-rose-500/20 text-rose-400 px-1 rounded">-{coin.penalty}</span>
-                                        )}
                                     </div>
                                     <div className="flex items-center gap-3">
                                         <span className="text-xs text-rose-400">%{coin.win_rate}</span>
-                                        <span className="text-rose-400 font-mono">${coin.total_pnl.toFixed(0)}</span>
+                                        <span className="text-rose-400 font-mono">${(coin.total_pnl || 0).toFixed(2)}</span>
                                     </div>
                                 </div>
                             ))}
