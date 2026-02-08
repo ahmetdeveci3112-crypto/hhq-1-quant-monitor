@@ -1058,11 +1058,12 @@ class LiveBinanceTrader:
             logger.info(f"✅ Binance Futures bağlantısı başarılı!")
             logger.info(f"💰 Kullanılabilir Bakiye: ${self.last_balance:.2f} USDT")
             
+            # Phase 160: Populate openTime cache BEFORE enabling
+            # This prevents race condition where get_positions returns before cache is ready
+            await self._populate_open_time_cache()
+            
             self.enabled = True
             self.initialized = True
-            
-            # Phase 160: Populate openTime cache from trade history on startup
-            await self._populate_open_time_cache()
             
             return True
             
