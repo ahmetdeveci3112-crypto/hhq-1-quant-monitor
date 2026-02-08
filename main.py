@@ -934,34 +934,38 @@ class LiveBinanceTrader:
             logger.warning(f"⚠️ Could not save open_time_cache: {e}")
     
     async def _populate_open_time_cache(self):
-        """Fetch real openTime for all current positions using net position reconstruction.
-        Algorithm: Walk trades chronologically, track cumulative qty.
-        When cumQty=0 and next trade opens a new position, that's the openTime.
-        Called once on startup to fill any gaps in the cache."""
+        """Fetch real openTime using Reverse Cumulative Sum algorithm.
+        
+        Algorithm:
+        1. Get current positionAmt from Binance (e.g. 1.5 BTC LONG)
+        2. Fetch userTrades for that symbol, sorted newest→oldest
+        3. Start with cumQty = current positionAmt
+        4. Walk backwards: subtract each trade's qty (reverse the trade)
+        5. When cumQty reaches 0 → the NEXT trade (chronologically) opened the position
+        6. That trade's 'time' = position openTime
+        """
         try:
             positions = await self.exchange.fapiPrivateV3GetPositionRisk()
-            active_symbols = []
+            active = []
             for p in positions:
-                position_amt = float(p.get('positionAmt', 0) or 0)
-                if abs(position_amt) > 0:
+                pos_amt = float(p.get('positionAmt', 0) or 0)
+                if abs(pos_amt) > 1e-10:
                     symbol = p.get('symbol', '')
-                    side = 'LONG' if position_amt > 0 else 'SHORT'
-                    active_symbols.append((symbol, side))
+                    active.append((symbol, pos_amt))
             
-            if not active_symbols:
+            if not active:
                 logger.info("📂 No active positions to populate openTime for")
                 return
             
-            logger.info(f"📂 Populating openTime for {len(active_symbols)} active positions...")
+            logger.info(f"📂 Populating openTime for {len(active)} positions (Reverse CumSum)...")
             filled = 0
             
-            for symbol, side in active_symbols:
+            for symbol, current_amt in active:
                 if symbol in self.open_time_cache:
-                    logger.debug(f"📂 {symbol}: already cached → {datetime.fromtimestamp(self.open_time_cache[symbol]/1000)}")
                     continue
                 
                 try:
-                    # Fetch trades from last 30 days
+                    # Fetch trades (newest first by default, but we sort to be safe)
                     thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
                     trades = await self.exchange.fapiPrivateGetUserTrades({
                         'symbol': symbol,
@@ -970,61 +974,57 @@ class LiveBinanceTrader:
                     })
                     
                     if not trades:
-                        logger.warning(f"📂 {symbol}: no trade history found in last 30 days")
+                        logger.warning(f"📂 {symbol}: no trade history in 30 days")
                         continue
                     
-                    # Sort trades chronologically (oldest first)
-                    sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                    # Sort newest → oldest (reverse chronological)
+                    sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)), reverse=True)
                     
-                    # NET POSITION RECONSTRUCTION:
-                    # Walk through all trades and track cumulative quantity.
-                    # Every time cumQty crosses through 0, the next trade in the 
-                    # same direction as current position is the "open" of a new position.
-                    cum_qty = 0.0
+                    # REVERSE CUMULATIVE SUM
+                    # Start from current position amount and walk backwards
+                    cum_qty = current_amt  # e.g. +1.5 for LONG, -0.8 for SHORT
                     open_time = None
                     
-                    for t in sorted_trades:
+                    for i, t in enumerate(sorted_trades):
                         qty = float(t.get('qty', 0))
                         is_buyer = t.get('buyer', False)
                         trade_time = int(t.get('time', 0))
                         
-                        # Signed qty: positive for BUY, negative for SELL
-                        signed_qty = qty if is_buyer else -qty
+                        # Reverse the trade: if it was a BUY, subtract qty; if SELL, add qty
+                        if is_buyer:
+                            cum_qty -= qty
+                        else:
+                            cum_qty += qty
                         
-                        prev_cum = cum_qty
-                        cum_qty += signed_qty
-                        
-                        # Detect position opening: cumQty was 0 (or crossed 0) and now has magnitude
-                        if abs(prev_cum) < 1e-10 and abs(cum_qty) > 1e-10:
-                            # New position started with this trade
+                        # Check if we reached zero (position didn't exist before this point)
+                        if abs(cum_qty) < 1e-10:
+                            # This trade was the first one that opened the current position
                             open_time = trade_time
-                        elif prev_cum * cum_qty < 0:
-                            # Position flipped direction (crossed through 0)
-                            open_time = trade_time
+                            logger.info(f"📂 {symbol}: cumQty→0 at trade {i+1}/{len(sorted_trades)}, openTime={datetime.fromtimestamp(trade_time/1000)}")
+                            break
                     
                     if open_time:
                         self.open_time_cache[symbol] = open_time
                         filled += 1
-                        logger.info(f"📂 {symbol}: openTime={datetime.fromtimestamp(open_time/1000)} (net reconstruction from {len(sorted_trades)} trades)")
                     else:
-                        # Fallback: use earliest trade time
-                        earliest = int(sorted_trades[0].get('time', 0))
+                        # Position older than 30-day trade history — use earliest trade
+                        earliest = int(sorted_trades[-1].get('time', 0))
                         self.open_time_cache[symbol] = earliest
                         filled += 1
-                        logger.info(f"📂 {symbol}: openTime={datetime.fromtimestamp(earliest/1000)} (fallback: earliest trade)")
+                        logger.info(f"📂 {symbol}: cumQty never reached 0 (pos older than history), using earliest={datetime.fromtimestamp(earliest/1000)}")
                         
                 except Exception as e:
-                    logger.warning(f"⚠️ Could not fetch trades for {symbol}: {e}")
+                    logger.warning(f"⚠️ {symbol}: trade fetch error: {e}")
                 
-                await asyncio.sleep(0.1)  # Rate limit
+                await asyncio.sleep(0.1)
             
             if filled > 0:
                 self._save_open_time_cache()
             
-            cached_count = len(self.open_time_cache)
-            logger.info(f"📂 OpenTime population complete: {filled} new + {cached_count - filled} cached = {cached_count} total")
+            total = len(self.open_time_cache)
+            logger.info(f"📂 OpenTime done: {filled} new, {total} total cached")
         except Exception as e:
-            logger.warning(f"⚠️ Could not populate open_time_cache: {e}")
+            logger.warning(f"⚠️ populate_open_time_cache error: {e}")
         
     async def initialize(self):
         """Binance bağlantısını başlat."""
@@ -1267,7 +1267,6 @@ class LiveBinanceTrader:
                         pnl_percent = float(p.get('percentage') or 0)
                     
                     # Get position open time from trade history
-                    # Fetch recent trades for this symbol to find when position was opened
                     open_time = int(datetime.now().timestamp() * 1000)  # Default to now
                     
                     # Phase 160: Check cache first (survives reduce operations)
@@ -1276,42 +1275,38 @@ class LiveBinanceTrader:
                         open_time = cached_ot
                     elif not fast:
                         try:
-                            # Fetch trades from last 30 days for more accurate open time
+                            # Reverse Cumulative Sum: start from current positionAmt, walk backwards
                             thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
                             trades = await self.exchange.fapiPrivateGetUserTrades({
                                 'symbol': symbol,
                                 'startTime': thirty_days_ago,
-                                'limit': 500  # Fetch more trades to find older positions
+                                'limit': 1000
                             })
                             
                             if trades and len(trades) > 0:
-                                # Sort trades by time (oldest first)
-                                sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)))
+                                sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)), reverse=True)
+                                cum_qty = raw_position_amt  # Start from current position
                                 
-                                # Strategy: Find the earliest trade that opened current position
-                                # For LONG: Look for first BUY that started the position
-                                # For SHORT: Look for first SELL that started the position
-                            
-                                # Simple approach: Find earliest trade matching position direction
-                                earliest_matching = None
                                 for t in sorted_trades:
+                                    qty = float(t.get('qty', 0))
                                     is_buyer = t.get('buyer', False)
                                     trade_time = int(t.get('time', 0))
                                     
-                                    # Match direction: LONG = buyer, SHORT = !buyer
-                                    if (side == 'LONG' and is_buyer) or (side == 'SHORT' and not is_buyer):
-                                        earliest_matching = trade_time
-                                        break  # Found the oldest matching trade
-                                
-                                if earliest_matching:
-                                    open_time = earliest_matching
-                                    self.open_time_cache[symbol] = open_time  # Phase 160: Cache + persist
-                                    self._save_open_time_cache()
-                                    logger.info(f"  Position {symbol} opened at: {datetime.fromtimestamp(open_time/1000)}")
+                                    if is_buyer:
+                                        cum_qty -= qty
+                                    else:
+                                        cum_qty += qty
+                                    
+                                    if abs(cum_qty) < 1e-10:
+                                        open_time = trade_time
+                                        self.open_time_cache[symbol] = open_time
+                                        self._save_open_time_cache()
+                                        logger.info(f"  Position {symbol} openTime={datetime.fromtimestamp(open_time/1000)} (RevCumSum)")
+                                        break
                                 else:
-                                    # Fallback: Use oldest trade time if position predates our history
-                                    open_time = int(sorted_trades[0].get('time', open_time))
-                                    logger.info(f"  Position {symbol} history starts at: {datetime.fromtimestamp(open_time/1000)}")
+                                    # Position older than history
+                                    open_time = int(sorted_trades[-1].get('time', open_time))
+                                    logger.info(f"  Position {symbol} older than history, using earliest={datetime.fromtimestamp(open_time/1000)}")
                                     
                         except Exception as te:
                             logger.warning(f"Could not get trade history for {symbol}: {te}")
