@@ -14794,35 +14794,93 @@ async def optimizer_run_now():
 
 @app.get("/performance/coins")
 async def get_coin_performance():
-    """Get coin-based performance statistics."""
+    """Get coin-based performance statistics — Binance verisi öncelikli."""
+    # Binance verisi varsa onu kullan
+    try:
+        binance_trades = await sqlite_manager.get_binance_trades(limit=500)
+        if binance_trades and len(binance_trades) >= 5:
+            coin_stats = {}
+            for t in binance_trades:
+                sym = t.get('symbol', 'UNKNOWN').replace('USDT', '')
+                if sym not in coin_stats:
+                    coin_stats[sym] = {'wins': 0, 'losses': 0, 'total_pnl': 0, 'trades': 0}
+                coin_stats[sym]['trades'] += 1
+                pnl = t.get('pnl', 0)
+                coin_stats[sym]['total_pnl'] += pnl
+                if pnl > 0:
+                    coin_stats[sym]['wins'] += 1
+                else:
+                    coin_stats[sym]['losses'] += 1
+            
+            # Calculate WR
+            for sym, data in coin_stats.items():
+                total = data['wins'] + data['losses']
+                data['win_rate'] = round((data['wins'] / total * 100) if total > 0 else 0, 1)
+                data['avg_pnl'] = round(data['total_pnl'] / data['trades'], 4) if data['trades'] > 0 else 0
+                data['total_pnl'] = round(data['total_pnl'], 2)
+            
+            # Sort by total PnL
+            best_coins = sorted(coin_stats.items(), key=lambda x: x[1]['total_pnl'], reverse=True)[:10]
+            worst_coins = sorted(coin_stats.items(), key=lambda x: x[1]['total_pnl'])[:10]
+            
+            return JSONResponse({
+                "success": True,
+                "source": "binance",
+                "bestCoins": [{"symbol": s, **d} for s, d in best_coins],
+                "worstCoins": [{"symbol": s, **d} for s, d in worst_coins],
+                "totalCoins": len(coin_stats),
+                "totalTrades": len(binance_trades)
+            })
+    except Exception as e:
+        logger.debug(f"Binance coin perf error: {e}")
+    
+    # Fallback to paper trader
     return JSONResponse({
         "success": True,
+        "source": "paper",
         **coin_performance_tracker.get_all_stats()
     })
 
 @app.get("/performance/daily")
 async def get_daily_performance():
-    """Get daily PnL data for charts."""
+    """Get daily PnL data for charts — Binance verisi öncelikli."""
     import pytz
     turkey_tz = pytz.timezone('Europe/Istanbul')
     
-    trades = global_paper_trader.trades
+    # Try Binance trades first
+    trades = []
+    source = "paper"
+    try:
+        binance_trades = await sqlite_manager.get_binance_trades(limit=1000)
+        if binance_trades and len(binance_trades) >= 5:
+            trades = binance_trades
+            source = "binance"
+    except Exception as e:
+        logger.debug(f"Binance daily perf error: {e}")
+    
+    # Fallback to paper trades
+    if not trades:
+        trades = global_paper_trader.trades
+        source = "paper"
     
     # Group trades by day (using Turkey timezone)
     daily_pnl = {}
     for trade in trades:
-        close_time = trade.get('closeTime', 0)
-        if close_time:
-            # Phase 60: Use Turkey timezone for date grouping
-            utc_dt = datetime.utcfromtimestamp(close_time / 1000).replace(tzinfo=pytz.UTC)
-            turkey_dt = utc_dt.astimezone(turkey_tz)
-            day = turkey_dt.strftime('%Y-%m-%d')
-            if day not in daily_pnl:
-                daily_pnl[day] = {'pnl': 0, 'trades': 0, 'wins': 0}
-            daily_pnl[day]['pnl'] += trade.get('pnl', 0)
-            daily_pnl[day]['trades'] += 1
-            if trade.get('pnl', 0) > 0:
-                daily_pnl[day]['wins'] += 1
+        close_time = trade.get('closeTime', trade.get('close_time', 0))
+        pnl = trade.get('pnl', 0)
+        if close_time and close_time > 0:
+            try:
+                utc_dt = datetime.utcfromtimestamp(close_time / 1000).replace(tzinfo=pytz.UTC)
+                turkey_dt = utc_dt.astimezone(turkey_tz)
+                day = turkey_dt.strftime('%Y-%m-%d')
+                if day not in daily_pnl:
+                    daily_pnl[day] = {'pnl': 0, 'trades': 0, 'wins': 0}
+                daily_pnl[day]['pnl'] += pnl
+                daily_pnl[day]['trades'] += 1
+                if pnl > 0:
+                    daily_pnl[day]['wins'] += 1
+            except:
+                pass
     
     # Convert to list sorted by date
     daily_list = []
@@ -14843,6 +14901,7 @@ async def get_daily_performance():
     
     return JSONResponse({
         "success": True,
+        "source": source,
         "dailyPnl": daily_list[-30:],  # Last 30 days
         "totalDays": len(daily_list)
     })
@@ -14853,25 +14912,37 @@ async def get_optimizer_history():
     history = parameter_optimizer.optimization_history[-20:]  # Last 20
     return JSONResponse({
         "success": True,
-        "history": history,
-        "totalOptimizations": len(parameter_optimizer.optimization_history)
+        "history": history
     })
 
 @app.get("/performance/summary")
 async def get_performance_summary():
-    """Get comprehensive performance summary for dashboard."""
-    trades = global_paper_trader.trades
-    stats = global_paper_trader.stats
+    """Get comprehensive performance summary — Binance verisi öncelikli."""
     
-    # Use stats.totalPnl (correct realized PnL) but trades list length for count
+    # Try Binance trades first
+    trades = []
+    source = "paper"
+    try:
+        binance_trades = await sqlite_manager.get_binance_trades(limit=1000)
+        if binance_trades and len(binance_trades) >= 5:
+            trades = binance_trades
+            source = "binance"
+    except Exception as e:
+        logger.debug(f"Binance summary error: {e}")
+    
+    # Fallback to paper trades
+    if not trades:
+        trades = global_paper_trader.trades
+        source = "paper"
+    
     total_trades = len(trades)
-    total_pnl = stats.get('totalPnl', 0)  # Use stats - this tracks realized PnL correctly
-    winning_trades = stats.get('winningTrades', 0)
+    total_pnl = sum(t.get('pnl', 0) for t in trades)
+    winning_trades = len([t for t in trades if t.get('pnl', 0) > 0])
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
     
     # Recent performance (last 7 days)
     week_ago = datetime.now().timestamp() * 1000 - (7 * 24 * 60 * 60 * 1000)
-    recent_trades = [t for t in trades if t.get('closeTime', 0) > week_ago]
+    recent_trades = [t for t in trades if t.get('closeTime', t.get('close_time', 0)) > week_ago]
     recent_pnl = sum(t.get('pnl', 0) for t in recent_trades)
     recent_wins = len([t for t in recent_trades if t.get('pnl', 0) > 0])
     recent_wr = (recent_wins / len(recent_trades) * 100) if recent_trades else 0
@@ -14879,22 +14950,55 @@ async def get_performance_summary():
     # Close reason breakdown
     reason_stats = {}
     for t in trades:
-        reason = t.get('reason', 'UNKNOWN')
+        reason = t.get('closeReason', t.get('reason', 'UNKNOWN'))
+        # Normalize reason
+        if 'SL' in str(reason).upper() or 'STOP' in str(reason).upper():
+            reason = 'SL_HIT'
+        elif 'TP' in str(reason).upper() or 'TAKE' in str(reason).upper():
+            reason = 'TP_HIT'
+        elif 'TRAIL' in str(reason).upper():
+            reason = 'TRAILING'
+        elif 'BREAKEVEN' in str(reason).upper():
+            reason = 'BREAKEVEN'
+        elif 'TIME' in str(reason).upper():
+            reason = 'TIME_EXIT'
+        
         if reason not in reason_stats:
             reason_stats[reason] = {'count': 0, 'pnl': 0}
         reason_stats[reason]['count'] += 1
         reason_stats[reason]['pnl'] += t.get('pnl', 0)
     
+    # Round reason PnL
+    for r in reason_stats:
+        reason_stats[r]['pnl'] = round(reason_stats[r]['pnl'], 2)
+    
+    # Average trade metrics
+    avg_win = 0
+    avg_loss = 0
+    wins = [t.get('pnl', 0) for t in trades if t.get('pnl', 0) > 0]
+    losses = [t.get('pnl', 0) for t in trades if t.get('pnl', 0) < 0]
+    if wins:
+        avg_win = sum(wins) / len(wins)
+    if losses:
+        avg_loss = sum(losses) / len(losses)
+    profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else 0
+    
     return JSONResponse({
         "success": True,
+        "source": source,
         "totalPnl": round(total_pnl, 2),
         "totalTrades": total_trades,
         "winRate": round(win_rate, 1),
+        "winningTrades": winning_trades,
+        "losingTrades": total_trades - winning_trades,
         "recentPnl": round(recent_pnl, 2),
         "recentTrades": len(recent_trades),
         "recentWinRate": round(recent_wr, 1),
-        "coinStats": coin_performance_tracker.get_stats_for_optimizer(),
+        "avgWin": round(avg_win, 4),
+        "avgLoss": round(avg_loss, 4),
+        "profitFactor": round(profit_factor, 2),
         "closeReasons": reason_stats,
+        "coinStats": coin_performance_tracker.get_stats_for_optimizer(),
         "optimizerEnabled": parameter_optimizer.enabled,
         "lastOptimization": parameter_optimizer.last_optimization
     })
