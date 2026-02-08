@@ -764,4 +764,33 @@ AI Optimizer tamamen yeniden yazıldı. Eski AGGRESSIVE/DEFENSIVE mod sistemi ka
 - `LightweightCoinAnalyzer.imbalance_history` deque'u ile son ~100 tick'in bid/ask imbalance değerleri kaydedilir.
 - `_get_imbalance_trend()`: Son 10 tick'in ortalaması vs önceki 20 tick → kısa vadeli alıcı/satıcı baskısı trendi.
 - Aynı yönde trend → +5/+8 puan bonus, ters yönde → -5 penalty.
-- Yeni parametre: `ob_imbalance_trend` → `generate_signal()` (L10689)
+- Yeni parametre: `ob_imbalance_trend` → `generate_signal()`
+
+---
+
+## Phase 157: Funding Rate + Trade Pattern Analizi
+
+### FundingOITracker
+- Binance `premiumIndex` API'den tüm coinlerin funding rate'ini tek çağrıda çeker (5 dk cache)
+- **Extreme funding** (>%0.08): kalabalıkla aynı yönde sinyal **VETOlanır** (FUNDING_VETO)
+- **Yüksek funding** (>%0.03): contrarian bonus +8, crowd penalty -5
+- **Normal funding** (>%0.01): hafif contrarian bonus +3
+- Extreme contrarian squeeze: +10 bonus
+
+### TradePatternAnalyzer
+- Kapanmış trade'lerden öğrenme (1 saat cache, min 20 trade)
+- **Coin WR**: düşük WR coin'e -5~-15 penalty, yüksek WR coin'e +5 bonus
+- **Side WR**: LONG vs SHORT win rate karşılaştırması, zayıf tarafa -5 penalty
+- **Score bins**: hangi skor aralığında daha çok kazanıyoruz analizi
+- **Saat bazlı WR**: hangi saatlerde daha başarılıyız analizi
+
+### Layer 17: Funding Rate Contrarian Scoring
+- `generate_signal()` → `funding_rate` parametresi
+- Funding extreme → veto, yüksek → ±8, normal → ±3
+
+### Layer 18: Trade Pattern Penalty/Bonus
+- `generate_signal()` → `coin_wr_penalty` parametresi
+- Side penalty generate_signal içinde hesaplanır (`signal_side` orada bilinir)
+
+### API Endpoint
+- `GET /trade-analysis`: Trade pattern analizi + funding durumu

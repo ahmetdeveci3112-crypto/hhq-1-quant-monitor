@@ -4390,6 +4390,9 @@ class LightweightCoinAnalyzer:
             is_volume_spike=is_volume_spike,  # Volume breakout detection
             market_regime=market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
             ob_imbalance_trend=self._get_imbalance_trend(),  # Phase 156: Short-term OB flow
+            funding_rate=funding_oi_tracker.funding_rates.get(self.symbol, 0.0),  # Phase 157
+            coin_wr_penalty=trade_pattern_analyzer.get_coin_penalty(self.symbol),  # Phase 157
+            side_wr_penalty=0,  # Phase 157: calculated inside generate_signal where signal_side is known
         )
         
         if signal:
@@ -4803,7 +4806,311 @@ whale_tracker = WhaleTracker()
 
 
 # ============================================================================
-# PHASE 98: UI STATE CACHE
+# PHASE 157: FUNDING RATE + OPEN INTEREST TRACKER
+# Binance premiumIndex API'den funding rate çeker, sinyal skorlamasında kullanır.
+# ============================================================================
+
+class FundingOITracker:
+    """
+    Phase 157: Funding Rate + Open Interest tracker.
+    
+    Funding Rate:
+    - Pozitif (+) = çoğunluk LONG → SHORT sinyali güçlenir (contrarian)
+    - Negatif (-) = çoğunluk SHORT → LONG sinyali güçlenir (contrarian)
+    - Extreme (>0.08% veya <-0.08%) = kalabalıkla aynı yöne sinyal VETOlanır
+    
+    5 dk cache — her çağrıda API'ye gitmez.
+    """
+    
+    def __init__(self):
+        self.funding_rates: Dict[str, float] = {}  # symbol -> funding rate
+        self.last_fetch_time: float = 0
+        self.fetch_interval: float = 300  # 5 dakika
+        self.fetch_count: int = 0
+        self.last_error: str = ""
+        logger.info("💰 FundingOITracker initialized (Phase 157)")
+    
+    async def fetch_funding_rates(self, exchange) -> bool:
+        """Tüm coinlerin funding rate'ini tek API çağrısıyla çek."""
+        now = datetime.now().timestamp()
+        if now - self.last_fetch_time < self.fetch_interval:
+            return True  # Cache hala geçerli
+        
+        try:
+            # Binance premiumIndex — tek çağrıda tüm coinler
+            response = await exchange.fetch(
+                'https://fapi.binance.com/fapi/v1/premiumIndex'
+            )
+            
+            if isinstance(response, list):
+                for item in response:
+                    symbol = item.get('symbol', '')
+                    if symbol.endswith('USDT'):
+                        rate = float(item.get('lastFundingRate', 0))
+                        self.funding_rates[symbol] = rate
+                
+                self.last_fetch_time = now
+                self.fetch_count += 1
+                self.last_error = ""
+                
+                if self.fetch_count <= 3 or self.fetch_count % 20 == 0:
+                    # Sample: BTC funding
+                    btc_rate = self.funding_rates.get('BTCUSDT', 0)
+                    logger.info(f"💰 Funding rates updated: {len(self.funding_rates)} coins | BTC={btc_rate*100:.4f}% | fetch #{self.fetch_count}")
+                
+                return True
+            
+        except Exception as e:
+            self.last_error = str(e)[:100]
+            if self.fetch_count < 5:
+                logger.warning(f"💰 Funding rate fetch error: {self.last_error}")
+            return False
+        
+        return False
+    
+    def get_funding_signal(self, symbol: str, signal_side: str) -> tuple:
+        """
+        Funding rate'e göre sinyal bonus/penalty/veto döndür.
+        
+        Returns:
+            (score_adjustment: int, reason: str, should_veto: bool)
+        """
+        rate = self.funding_rates.get(symbol, 0)
+        
+        if rate == 0:
+            return (0, "", False)
+        
+        rate_pct = rate * 100  # Yüzdeye çevir
+        abs_rate = abs(rate_pct)
+        
+        # EXTREME funding — kalabalıkla aynı yönde sinyal VETOla
+        if abs_rate > 0.08:
+            if rate_pct > 0 and signal_side == "LONG":
+                # Herkes LONG + biz de LONG = tehlikeli
+                return (-15, f"FR_EXTREME(+{rate_pct:.3f}%)", True)
+            elif rate_pct < 0 and signal_side == "SHORT":
+                # Herkes SHORT + biz de SHORT = tehlikeli
+                return (-15, f"FR_EXTREME({rate_pct:.3f}%)", True)
+            elif rate_pct > 0 and signal_side == "SHORT":
+                # Herkes LONG + biz SHORT = contrarian squeeze oynaması
+                return (10, f"FR_SQUEEZE(+{rate_pct:.3f}%)", False)
+            elif rate_pct < 0 and signal_side == "LONG":
+                # Herkes SHORT + biz LONG = contrarian squeeze oynaması
+                return (10, f"FR_SQUEEZE({rate_pct:.3f}%)", False)
+        
+        # Yüksek funding — contrarian bonus
+        if abs_rate > 0.03:
+            if rate_pct > 0 and signal_side == "SHORT":
+                return (8, f"FR_HIGH(+{rate_pct:.3f}%)", False)
+            elif rate_pct < 0 and signal_side == "LONG":
+                return (8, f"FR_HIGH({rate_pct:.3f}%)", False)
+            elif rate_pct > 0 and signal_side == "LONG":
+                return (-5, f"FR_CROWD(+{rate_pct:.3f}%)", False)
+            elif rate_pct < 0 and signal_side == "SHORT":
+                return (-5, f"FR_CROWD({rate_pct:.3f}%)", False)
+        
+        # Normal funding — hafif contrarian bonus
+        if abs_rate > 0.01:
+            if rate_pct > 0 and signal_side == "SHORT":
+                return (3, f"FR(+{rate_pct:.3f}%)", False)
+            elif rate_pct < 0 and signal_side == "LONG":
+                return (3, f"FR({rate_pct:.3f}%)", False)
+        
+        return (0, "", False)
+    
+    def get_status(self) -> dict:
+        """Tracker durumunu döndür."""
+        return {
+            "coins_tracked": len(self.funding_rates),
+            "last_fetch": self.last_fetch_time,
+            "fetch_count": self.fetch_count,
+            "last_error": self.last_error,
+            "btc_funding": self.funding_rates.get('BTCUSDT', 0) * 100,
+            "eth_funding": self.funding_rates.get('ETHUSDT', 0) * 100,
+        }
+
+# Global Funding+OI Tracker
+funding_oi_tracker = FundingOITracker()
+
+
+# ============================================================================
+# PHASE 157: TRADE PATTERN ANALYZER
+# Kapanmış trade'lerden öğrenme — coin/saat/side bazlı WR analizi.
+# ============================================================================
+
+class TradePatternAnalyzer:
+    """
+    Phase 157: Kapanmış trade pattern analizi.
+    
+    Hangi koşullarda kazanıyoruz/kaybediyoruz sorusuna sistematik cevap.
+    Min 20 trade gerektirir — yetersiz veriyle penalty uygulanmaz.
+    """
+    
+    MIN_TRADES = 20  # Minimum trade sayısı
+    MIN_COIN_TRADES = 5  # Coin bazlı minimum
+    
+    def __init__(self):
+        self.last_analysis = None
+        self.coin_wr: Dict[str, dict] = {}  # symbol -> {wins, losses, wr}
+        self.hour_wr: Dict[int, dict] = {}  # hour -> {wins, losses, wr}
+        self.side_wr: Dict[str, dict] = {}  # LONG/SHORT -> {wins, losses, wr}
+        self.score_bins: Dict[str, dict] = {}  # score_range -> {wins, losses, wr}
+        self.analysis_time: float = 0
+        self.analysis_interval: float = 3600  # 1 saat
+        logger.info("📊 TradePatternAnalyzer initialized (Phase 157)")
+    
+    def analyze(self, trades: list) -> dict:
+        """Kapanmış trade pattern analizi."""
+        now = datetime.now().timestamp()
+        if now - self.analysis_time < self.analysis_interval and self.last_analysis:
+            return self.last_analysis
+        
+        if len(trades) < self.MIN_TRADES:
+            return {"status": "insufficient_data", "trades_needed": self.MIN_TRADES - len(trades)}
+        
+        # Son 100 trade'i analiz et
+        recent = trades[-100:] if len(trades) > 100 else trades
+        
+        # Coin bazlı WR
+        self.coin_wr = {}
+        for t in recent:
+            sym = t.get('symbol', 'UNKNOWN')
+            pnl = t.get('pnl', 0)
+            if sym not in self.coin_wr:
+                self.coin_wr[sym] = {'wins': 0, 'losses': 0, 'total_pnl': 0}
+            if pnl > 0:
+                self.coin_wr[sym]['wins'] += 1
+            else:
+                self.coin_wr[sym]['losses'] += 1
+            self.coin_wr[sym]['total_pnl'] += pnl
+        
+        # WR hesapla
+        for sym, data in self.coin_wr.items():
+            total = data['wins'] + data['losses']
+            data['wr'] = (data['wins'] / total * 100) if total > 0 else 50
+            data['total'] = total
+        
+        # Saat bazlı WR
+        self.hour_wr = {}
+        for t in recent:
+            close_time = t.get('closeTime', 0)
+            if close_time > 0:
+                hour = datetime.fromtimestamp(close_time / 1000).hour
+                if hour not in self.hour_wr:
+                    self.hour_wr[hour] = {'wins': 0, 'losses': 0}
+                if t.get('pnl', 0) > 0:
+                    self.hour_wr[hour]['wins'] += 1
+                else:
+                    self.hour_wr[hour]['losses'] += 1
+        
+        for hour, data in self.hour_wr.items():
+            total = data['wins'] + data['losses']
+            data['wr'] = (data['wins'] / total * 100) if total > 0 else 50
+            data['total'] = total
+        
+        # Side bazlı WR
+        self.side_wr = {'LONG': {'wins': 0, 'losses': 0}, 'SHORT': {'wins': 0, 'losses': 0}}
+        for t in recent:
+            side = t.get('side', 'LONG')
+            if side in self.side_wr:
+                if t.get('pnl', 0) > 0:
+                    self.side_wr[side]['wins'] += 1
+                else:
+                    self.side_wr[side]['losses'] += 1
+        
+        for side, data in self.side_wr.items():
+            total = data['wins'] + data['losses']
+            data['wr'] = (data['wins'] / total * 100) if total > 0 else 50
+            data['total'] = total
+        
+        # Score bazlı WR
+        self.score_bins = {}
+        for t in recent:
+            score = t.get('signalScore', 0)
+            if score < 60:
+                bin_name = "50-59"
+            elif score < 70:
+                bin_name = "60-69"
+            elif score < 80:
+                bin_name = "70-79"
+            else:
+                bin_name = "80+"
+            
+            if bin_name not in self.score_bins:
+                self.score_bins[bin_name] = {'wins': 0, 'losses': 0}
+            if t.get('pnl', 0) > 0:
+                self.score_bins[bin_name]['wins'] += 1
+            else:
+                self.score_bins[bin_name]['losses'] += 1
+        
+        for bin_name, data in self.score_bins.items():
+            total = data['wins'] + data['losses']
+            data['wr'] = (data['wins'] / total * 100) if total > 0 else 50
+            data['total'] = total
+        
+        self.analysis_time = now
+        
+        # Özet
+        total_trades = len(recent)
+        total_wins = sum(1 for t in recent if t.get('pnl', 0) > 0)
+        overall_wr = (total_wins / total_trades * 100) if total_trades > 0 else 50
+        
+        # En kötü/iyi coinler
+        worst_coins = [s for s, d in self.coin_wr.items() 
+                       if d['total'] >= self.MIN_COIN_TRADES and d['wr'] < 35]
+        best_coins = [s for s, d in self.coin_wr.items() 
+                      if d['total'] >= self.MIN_COIN_TRADES and d['wr'] > 65]
+        
+        self.last_analysis = {
+            "status": "ok",
+            "total_trades": total_trades,
+            "overall_wr": overall_wr,
+            "worst_coins": worst_coins,
+            "best_coins": best_coins,
+            "coin_count": len(self.coin_wr),
+            "side_wr": {k: v['wr'] for k, v in self.side_wr.items()},
+            "score_bins": {k: v['wr'] for k, v in self.score_bins.items()},
+        }
+        
+        logger.info(f"📊 TradePattern: {total_trades} trades | WR={overall_wr:.0f}% | worst={worst_coins[:3]} | best={best_coins[:3]}")
+        
+        return self.last_analysis
+    
+    def get_coin_penalty(self, symbol: str) -> int:
+        """Düşük WR coin'e penalty döndür."""
+        data = self.coin_wr.get(symbol)
+        if not data or data['total'] < self.MIN_COIN_TRADES:
+            return 0
+        
+        wr = data['wr']
+        if wr < 25:
+            return -15  # Çok kötü — güçlü penalty
+        elif wr < 35:
+            return -10  # Kötü
+        elif wr < 40:
+            return -5   # Ortalamanın altı
+        elif wr > 70:
+            return 5    # İyi coin — hafif bonus
+        
+        return 0
+    
+    def get_side_penalty(self, side: str) -> int:
+        """Düşük WR taraf için penalty."""
+        data = self.side_wr.get(side)
+        if not data or data.get('total', 0) < 10:
+            return 0
+        
+        wr = data['wr']
+        if wr < 35:
+            return -5  # Bu taraf zayıf
+        elif wr > 65:
+            return 3   # Bu taraf güçlü
+        
+        return 0
+
+# Global Trade Pattern Analyzer
+trade_pattern_analyzer = TradePatternAnalyzer()
+
 # Stores all UI-relevant data in memory, updated by background scanner.
 # WebSocket endpoints read from this cache instead of making fresh API calls.
 # ============================================================================
@@ -5622,6 +5929,20 @@ async def background_scanner_loop():
                         await btc_filter.update_btc_state(multi_coin_scanner.exchange)
                 except Exception as e:
                     logger.debug(f"BTC filter update error: {e}")
+                
+                # Phase 157: Fetch funding rates (cached — only calls API every 5 min)
+                try:
+                    if multi_coin_scanner.exchange:
+                        await funding_oi_tracker.fetch_funding_rates(multi_coin_scanner.exchange)
+                except Exception as e:
+                    logger.debug(f"Funding rate fetch error: {e}")
+                
+                # Phase 157: Trade pattern analysis (cached — only runs every 1 hour)
+                try:
+                    if hasattr(global_paper_trader, 'trades') and global_paper_trader.trades:
+                        trade_pattern_analyzer.analyze(global_paper_trader.trades)
+                except Exception as e:
+                    logger.debug(f"Trade pattern analysis error: {e}")
                 
                 # Refresh coin list every 30 minutes to catch new listings
                 now = datetime.now().timestamp()
@@ -10717,6 +11038,9 @@ class SignalGenerator:
         is_volume_spike: bool = False,  # Volume breakout detection
         market_regime: str = "RANGING",  # Phase 156: Market regime from MarketRegimeDetector
         ob_imbalance_trend: float = 0.0,  # Phase 156: Short-term order book imbalance trend
+        funding_rate: float = 0.0,  # Phase 157: Funding rate for contrarian scoring
+        coin_wr_penalty: int = 0,  # Phase 157: Coin WR penalty from trade pattern analysis
+        side_wr_penalty: int = 0,  # Phase 157: Side WR penalty from trade pattern analysis
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -11062,6 +11386,32 @@ class SignalGenerator:
             elif signal_side == "SHORT" and ob_imbalance_trend > 5.0:
                 score -= 5
                 reasons.append(f"IB_CONTRA({ob_imbalance_trend:.1f})-5")
+        
+        # =====================================================================
+        # PHASE 157: LAYER 17 — FUNDING RATE CONTRARIAN SCORING
+        # Funding rate'e göre contrarian bonus/penalty/veto
+        # =====================================================================
+        if funding_rate != 0:
+            fr_adj, fr_reason, fr_veto = funding_oi_tracker.get_funding_signal(symbol, signal_side)
+            if fr_veto:
+                logger.info(f"🚫 FUNDING_VETO: {symbol} {signal_side} — {fr_reason}")
+                return None
+            if fr_adj != 0:
+                score += fr_adj
+                reasons.append(f"{fr_reason}{'+' if fr_adj > 0 else ''}{fr_adj}")
+        
+        # =====================================================================
+        # PHASE 157: LAYER 18 — TRADE PATTERN PENALTY/BONUS
+        # Kapanmış trade analizi — düşük WR coin/side'a penalty
+        # =====================================================================
+        if coin_wr_penalty != 0:
+            score += coin_wr_penalty
+            reasons.append(f"COIN_WR({coin_wr_penalty:+d})")
+        # Side penalty — calculated here where signal_side is known
+        actual_side_penalty = trade_pattern_analyzer.get_side_penalty(signal_side)
+        if actual_side_penalty != 0:
+            score += actual_side_penalty
+            reasons.append(f"SIDE_WR({actual_side_penalty:+d})")
         
         # Layer 14: POC Proximity Bonus (+5/+8)
         # coin_profile is passed as parameter (default=None)
@@ -14316,6 +14666,20 @@ async def optimizer_toggle():
         "enabled": parameter_optimizer.enabled, 
         "message": f"Auto-optimizer {status}"
     })
+
+@app.get("/trade-analysis")
+async def trade_analysis():
+    """Phase 157: Trade pattern analysis + funding status."""
+    analysis = trade_pattern_analyzer.last_analysis or {"status": "not_run"}
+    funding = funding_oi_tracker.get_status()
+    return {
+        "tradeAnalysis": analysis,
+        "funding": funding,
+        "coinWr": {k: {"wr": v["wr"], "total": v["total"], "pnl": v.get("total_pnl", 0)} 
+                   for k, v in trade_pattern_analyzer.coin_wr.items() if v.get("total", 0) >= 3},
+        "hourWr": {str(k): {"wr": v["wr"], "total": v["total"]} 
+                   for k, v in trade_pattern_analyzer.hour_wr.items()},
+    }
 
 @app.get("/optimizer/status")
 async def optimizer_status():
