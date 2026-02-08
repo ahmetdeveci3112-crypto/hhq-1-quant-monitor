@@ -237,6 +237,20 @@ class SQLiteManager:
                 )
             ''')
             
+            # Phase 154: Breakeven states - survive deploy/restart
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS breakeven_states (
+                    state_key TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    activation_price REAL NOT NULL,
+                    activation_time TEXT NOT NULL,
+                    spread_level TEXT DEFAULT 'Normal',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             await db.commit()
             
             # Phase 49: Migration - Add new columns to trades table if they don't exist
@@ -695,6 +709,49 @@ class SQLiteManager:
                 if row:
                     return row[0]
                 return 10  # Default leverage
+    
+    # ================================================================
+    # Phase 154: Breakeven State Persistence
+    # ================================================================
+    async def save_breakeven_state(self, state_key: str, symbol: str, side: str, 
+                                    entry_price: float, activation_price: float,
+                                    activation_time: str, spread_level: str = 'Normal'):
+        """Save breakeven state to SQLite."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO breakeven_states 
+                (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level))
+            await db.commit()
+        logger.info(f"💾 Breakeven state saved: {state_key}")
+    
+    async def delete_breakeven_state(self, state_key: str):
+        """Delete breakeven state from SQLite."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('DELETE FROM breakeven_states WHERE state_key = ?', (state_key,))
+            await db.commit()
+        logger.info(f"🗑️ Breakeven state deleted: {state_key}")
+    
+    async def load_breakeven_states(self) -> dict:
+        """Load all breakeven states from SQLite."""
+        states = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level FROM breakeven_states') as cursor:
+                    async for row in cursor:
+                        states[row[0]] = {
+                            'active': True,
+                            'entry_price': row[3],
+                            'activation_price': row[4],
+                            'activation_time': row[5],
+                            'spread_level': row[6]
+                        }
+            if states:
+                logger.info(f"📂 Loaded {len(states)} breakeven states from SQLite: {list(states.keys())}")
+        except Exception as e:
+            logger.error(f"Failed to load breakeven states: {e}")
+        return states
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -1964,6 +2021,10 @@ async def lifespan(app: FastAPI):
     # Initialize SQLite database
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
+    
+    # Phase 154: Load persisted breakeven states
+    await breakeven_stop_manager.load_from_sqlite()
+    logger.info(f"🔒 Breakeven states loaded: {len(breakeven_stop_manager.breakeven_state)} active")
     
     # Initialize LiveBinanceTrader (if TRADING_MODE is live)
     # Note: Read TRADING_MODE here (after secrets are loaded) and update the trader
@@ -8604,6 +8665,16 @@ class BreakevenStopManager:
         
         logger.info("📊 BreakevenStopManager initialized")
     
+    async def load_from_sqlite(self):
+        """Load persisted breakeven states from SQLite on startup."""
+        try:
+            loaded = await sqlite_manager.load_breakeven_states()
+            if loaded:
+                self.breakeven_state.update(loaded)
+                logger.warning(f"🔒 Restored {len(loaded)} breakeven states from SQLite: {list(loaded.keys())}")
+        except Exception as e:
+            logger.error(f"Failed to load breakeven states: {e}")
+    
     async def check_positions(self, positions: list, live_trader) -> dict:
         """
         Check all Binance positions for breakeven conditions.
@@ -8669,6 +8740,11 @@ class BreakevenStopManager:
                         }
                         actions["breakeven_activated"].append(symbol)
                         logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
+                        # Phase 154: Persist to SQLite
+                        safe_create_task(sqlite_manager.save_breakeven_state(
+                            state_key, symbol, side, entry_price, current_price,
+                            datetime.now().isoformat(), spread_level
+                        ), name=f"persist_breakeven_{symbol}")
                 else:
                     # Breakeven is active - check if price returned to entry
                     # Phase 151: Dynamic buffer based on spread level
@@ -8705,8 +8781,9 @@ class BreakevenStopManager:
                             result = await live_trader.close_position(symbol, side, abs(contracts))
                             if result:
                                 actions["breakeven_closed"].append(symbol)
-                                # Clear state
+                                # Clear state from memory and SQLite
                                 del self.breakeven_state[state_key]
+                                safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_breakeven_{symbol}")
                                 logger.warning(f"✅ BREAKEVEN CLOSE SUCCESS: {symbol}")
                             else:
                                 logger.error(f"❌ BREAKEVEN CLOSE FAILED: {symbol}")
