@@ -496,6 +496,7 @@ class SQLiteManager:
         window_ms = window_minutes * 60 * 1000
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            # Step 1: Try unmatched records first
             async with db.execute('''
                 SELECT * FROM position_closes 
                 WHERE symbol = ? AND matched_to_income = 0
@@ -506,7 +507,20 @@ class SQLiteManager:
                 row = await cursor.fetchone()
                 if row:
                     return dict(row)
-                return None
+            
+            # Step 2: Fallback — check ALL records (even matched ones)
+            # This handles cases where funding/fee incomes matched the record first
+            async with db.execute('''
+                SELECT * FROM position_closes 
+                WHERE symbol = ? AND ABS(timestamp - ?) < ?
+                ORDER BY ABS(timestamp - ?) ASC
+                LIMIT 1
+            ''', (symbol, close_time, window_ms, close_time)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    logger.debug(f"📋 Fallback match for {symbol}: reason={dict(row).get('reason')}")
+                    return dict(row)
+            return None
     
     async def mark_close_matched(self, close_id: int):
         """Mark a position close as matched to Binance income."""
@@ -537,7 +551,7 @@ class SQLiteManager:
                     db.row_factory = aiosqlite.Row
                     async with db.execute('''
                         SELECT * FROM position_closes 
-                        WHERE symbol = ? AND ABS(timestamp - ?) < 300000
+                        WHERE symbol = ? AND ABS(timestamp - ?) < 3600000
                         ORDER BY ABS(timestamp - ?) ASC LIMIT 1
                     ''', (symbol, close_time, close_time)) as cursor:
                         pc = await cursor.fetchone()
