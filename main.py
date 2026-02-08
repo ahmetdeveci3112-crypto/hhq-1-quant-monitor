@@ -182,9 +182,17 @@ class SQLiteManager:
                     atr REAL,
                     htf_trend TEXT,
                     status TEXT DEFAULT 'OPEN',
+                    close_time INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Migrate: add close_time column if missing
+            try:
+                await db.execute('ALTER TABLE positions ADD COLUMN close_time INTEGER')
+                logger.info("📂 Added close_time column to positions table")
+            except:
+                pass  # Column already exists
             
             # Binance trade history - her realized PnL income kaydı
             await db.execute('''
@@ -445,13 +453,48 @@ class SQLiteManager:
             ))
             await db.commit()
     
-    async def close_position_in_db(self, position_id: str):
-        """Mark a position as closed in database."""
+    async def close_position_in_db(self, position_id: str, symbol: str = None):
+        """Mark a position as closed in database with close_time."""
+        close_time = int(datetime.now().timestamp() * 1000)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                UPDATE positions SET status = 'CLOSED' WHERE id = ?
-            ''', (position_id,))
+            if position_id:
+                await db.execute('''
+                    UPDATE positions SET status = 'CLOSED', close_time = ? WHERE id = ?
+                ''', (close_time, position_id))
+            elif symbol:
+                await db.execute('''
+                    UPDATE positions SET status = 'CLOSED', close_time = ? 
+                    WHERE symbol = ? AND status = 'OPEN'
+                ''', (close_time, symbol))
             await db.commit()
+            logger.info(f"📂 Position closed in DB: id={position_id} symbol={symbol}")
+    
+    async def get_position_open_time(self, symbol: str) -> int:
+        """Get open_time for an active position by symbol from SQLite."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT open_time FROM positions WHERE symbol=? AND status='OPEN' ORDER BY open_time DESC LIMIT 1",
+                    (symbol,)
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.warning(f"⚠️ get_position_open_time error for {symbol}: {e}")
+            return None
+    
+    async def get_all_open_times(self) -> dict:
+        """Get open_times for ALL active positions in one query. Returns {symbol: open_time_ms}."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT symbol, open_time FROM positions WHERE status='OPEN'"
+                )
+                rows = await cursor.fetchall()
+                return {row[0]: row[1] for row in rows}
+        except Exception as e:
+            logger.warning(f"⚠️ get_all_open_times error: {e}")
+            return {}
     
     async def get_all_settings(self) -> dict:
         """Get all settings from database."""
@@ -896,153 +939,11 @@ class LiveBinanceTrader:
         self.last_positions = []
         self.last_sync_time = 0
         self.trading_mode = os.environ.get('TRADING_MODE', 'paper')  # paper, live
-        # Phase 146: Persistent trailing state for live positions
+         # Phase 146: Persistent trailing state for live positions
         # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
         self.trailing_state = {}
-        # Phase 160: Cache real openTime per symbol to survive reduce/sync/restart
-        # Key: symbol, Value: timestamp_ms (int)
-        # Persisted to /data/open_time_cache.json on Fly.io
-        self.open_time_cache = self._load_open_time_cache()
-        logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode} | OpenTimeCache: {len(self.open_time_cache)} entries")
+        logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
     
-    def _get_open_time_cache_path(self):
-        """Get the path for persistent open_time_cache file."""
-        if os.path.exists('/data'):
-            return '/data/open_time_cache.json'
-        return 'open_time_cache.json'
-    
-    def _load_open_time_cache(self) -> dict:
-        """Load open_time_cache from disk (survives restart/deploy)."""
-        cache_path = self._get_open_time_cache_path()
-        try:
-            if os.path.exists(cache_path):
-                with open(cache_path, 'r') as f:
-                    data = json.load(f)
-                logger.info(f"📂 Loaded open_time_cache from {cache_path}: {len(data)} entries")
-                return {k: int(v) for k, v in data.items()}
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load open_time_cache: {e}")
-        return {}
-    
-    def _save_open_time_cache(self):
-        """Save open_time_cache to disk."""
-        cache_path = self._get_open_time_cache_path()
-        try:
-            with open(cache_path, 'w') as f:
-                json.dump(self.open_time_cache, f)
-        except Exception as e:
-            logger.warning(f"⚠️ Could not save open_time_cache: {e}")
-    
-    async def _populate_open_time_cache(self):
-        """Fetch real openTime using Reverse Cumulative Sum algorithm.
-        
-        Algorithm:
-        1. Get current positionAmt from Binance (e.g. 1.5 BTC LONG)
-        2. Fetch userTrades for that symbol, sorted newest→oldest
-        3. Start with cumQty = current positionAmt
-        4. Walk backwards: subtract each trade's qty (reverse the trade)
-        5. When cumQty reaches 0 → the NEXT trade (chronologically) opened the position
-        6. That trade's 'time' = position openTime
-        """
-        try:
-            positions = await self.exchange.fapiPrivateV3GetPositionRisk()
-            active = []
-            for p in positions:
-                pos_amt = float(p.get('positionAmt', 0) or 0)
-                if abs(pos_amt) > 1e-10:
-                    symbol = p.get('symbol', '')
-                    active.append((symbol, pos_amt))
-            
-            if not active:
-                logger.info("📂 No active positions to populate openTime for")
-                return
-            
-            logger.info(f"📂 Populating openTime for {len(active)} positions (Reverse CumSum)...")
-            filled = 0
-            
-            for symbol, current_amt in active:
-                if symbol in self.open_time_cache:
-                    continue
-                
-                try:
-                    # Fetch trades (newest first by default, but we sort to be safe)
-                    thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
-                    trades = await self.exchange.fapiPrivateGetUserTrades({
-                        'symbol': symbol,
-                        'startTime': thirty_days_ago,
-                        'limit': 1000
-                    })
-                    
-                    if not trades:
-                        logger.warning(f"📂 {symbol}: no trade history in 30 days")
-                        continue
-                    
-                    # Sort newest → oldest (reverse chronological)
-                    sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)), reverse=True)
-                    
-                    # Debug: log first trade's buyer field to diagnose type issues
-                    if sorted_trades:
-                        sample = sorted_trades[0]
-                        raw_buyer = sample.get('buyer')
-                        logger.info(f"📂 {symbol}: posAmt={current_amt}, trades={len(sorted_trades)}, buyer_field={raw_buyer} (type={type(raw_buyer).__name__})")
-                    
-                    # REVERSE CUMULATIVE SUM
-                    # Start from current position amount and walk backwards
-                    cum_qty = current_amt  # e.g. +1.5 for LONG, -0.8 for SHORT
-                    open_time = None
-                    
-                    for i, t in enumerate(sorted_trades):
-                        qty = float(t.get('qty', 0))
-                        raw_buyer = t.get('buyer', False)
-                        trade_time = int(t.get('time', 0))
-                        
-                        # CRITICAL: Binance raw API may return buyer as string "true"/"false"
-                        # Python treats "false" as truthy! Must explicitly check.
-                        if isinstance(raw_buyer, str):
-                            is_buyer = raw_buyer.lower() == 'true'
-                        else:
-                            is_buyer = bool(raw_buyer)
-                        
-                        # Reverse the trade: if it was a BUY, subtract qty; if SELL, add qty
-                        if is_buyer:
-                            cum_qty -= qty
-                        else:
-                            cum_qty += qty
-                        
-                        # Check if we reached zero (position didn't exist before this point)
-                        if abs(cum_qty) < 1e-10:
-                            # This trade was the first one that opened the current position
-                            open_time = trade_time
-                            logger.info(f"📂 {symbol}: cumQty→0 at trade {i+1}/{len(sorted_trades)}, openTime={datetime.fromtimestamp(trade_time/1000)}")
-                            break
-                    
-                    if not open_time:
-                        logger.info(f"📂 {symbol}: cumQty={cum_qty:.6f} after all {len(sorted_trades)} trades (never reached 0)")
-                    
-                    if open_time:
-                        self.open_time_cache[symbol] = open_time
-                        filled += 1
-                    else:
-                        # Position older than 30-day trade history — use earliest trade
-                        earliest = int(sorted_trades[-1].get('time', 0))
-                        self.open_time_cache[symbol] = earliest
-                        filled += 1
-                        logger.info(f"📂 {symbol}: using earliest trade as fallback: {datetime.fromtimestamp(earliest/1000)}")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ {symbol}: trade fetch error: {e}")
-                
-                await asyncio.sleep(0.1)
-            
-            if filled > 0:
-                self._save_open_time_cache()
-                logger.info(f"📂 Cache saved to {self._get_open_time_cache_path()}")
-            
-            total = len(self.open_time_cache)
-            logger.info(f"📂 OpenTime done: {filled} new, {total} total cached")
-        except Exception as e:
-            logger.warning(f"⚠️ populate_open_time_cache error: {e}")
-        
     async def initialize(self):
         """Binance bağlantısını başlat."""
         self.last_error = None  # Reset error
@@ -1074,10 +975,6 @@ class LiveBinanceTrader:
             
             logger.info(f"✅ Binance Futures bağlantısı başarılı!")
             logger.info(f"💰 Kullanılabilir Bakiye: ${self.last_balance:.2f} USDT")
-            
-            # Phase 160: Populate openTime cache BEFORE enabling
-            # This prevents race condition where get_positions returns before cache is ready
-            await self._populate_open_time_cache()
             
             self.enabled = True
             self.initialized = True
@@ -1283,56 +1180,16 @@ class LiveBinanceTrader:
                     else:
                         pnl_percent = float(p.get('percentage') or 0)
                     
-                    # Get position open time from trade history
+                    # Get position open time from SQLite
                     open_time = int(datetime.now().timestamp() * 1000)  # Default to now
                     
-                    # Phase 160: Check cache first (survives reduce operations)
-                    cached_ot = self.open_time_cache.get(symbol)
-                    if cached_ot:
-                        open_time = cached_ot
-                    elif not fast:
-                        try:
-                            # Reverse Cumulative Sum: start from current positionAmt, walk backwards
-                            thirty_days_ago = int((datetime.now().timestamp() - 30*24*60*60) * 1000)
-                            trades = await self.exchange.fapiPrivateGetUserTrades({
-                                'symbol': symbol,
-                                'startTime': thirty_days_ago,
-                                'limit': 1000
-                            })
-                            
-                            if trades and len(trades) > 0:
-                                sorted_trades = sorted(trades, key=lambda t: int(t.get('time', 0)), reverse=True)
-                                cum_qty = raw_position_amt  # Start from current position
-                                
-                                for t in sorted_trades:
-                                    qty = float(t.get('qty', 0))
-                                    raw_buyer = t.get('buyer', False)
-                                    trade_time = int(t.get('time', 0))
-                                    
-                                    # CRITICAL: Binance raw API returns buyer as string "true"/"false"
-                                    if isinstance(raw_buyer, str):
-                                        is_buyer = raw_buyer.lower() == 'true'
-                                    else:
-                                        is_buyer = bool(raw_buyer)
-                                    
-                                    if is_buyer:
-                                        cum_qty -= qty
-                                    else:
-                                        cum_qty += qty
-                                    
-                                    if abs(cum_qty) < 1e-10:
-                                        open_time = trade_time
-                                        self.open_time_cache[symbol] = open_time
-                                        self._save_open_time_cache()
-                                        logger.info(f"  Position {symbol} openTime={datetime.fromtimestamp(open_time/1000)} (RevCumSum)")
-                                        break
-                                else:
-                                    # Position older than history
-                                    open_time = int(sorted_trades[-1].get('time', open_time))
-                                    logger.info(f"  Position {symbol} older than history, using earliest={datetime.fromtimestamp(open_time/1000)}")
-                                    
-                        except Exception as te:
-                            logger.warning(f"Could not get trade history for {symbol}: {te}")
+                    # Read from SQLite positions table (single source of truth)
+                    try:
+                        db_open_time = await db_manager.get_position_open_time(symbol)
+                        if db_open_time:
+                            open_time = db_open_time
+                    except Exception as e:
+                        logger.warning(f"Could not get openTime from SQLite for {symbol}: {e}")
                     
                     position_amount = abs(contracts)
                     entry_price = float(p.get('entryPrice') or 0)
@@ -12993,6 +12850,13 @@ class PaperTradingEngine:
         
         self.positions.append(new_position)
         
+        # Save to SQLite for persistent openTime tracking
+        try:
+            await db_manager.save_open_position(new_position)
+            logger.info(f"📂 Position saved to SQLite: {symbol} openTime={new_position.get('openTime')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
+        
         # Calculate how much better than signal price we got
         signal_price = order.get('signalPrice', fill_price)
         if side == 'LONG':
@@ -13574,6 +13438,13 @@ class PaperTradingEngine:
         self.balance -= initial_margin
         
         self.positions.append(new_position)
+        
+        # Save to SQLite for persistent openTime tracking
+        try:
+            asyncio.create_task(db_manager.save_open_position(new_position))
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
+        
         self.add_log(f"🚀 POZİSYON AÇILDI: {signal['action']} {self.symbol} @ ${current_price:.4f} | {adjusted_leverage}x | SL:${signal['sl']:.4f} TP:${signal['tp']:.4f}")
         self.save_state()
         logger.info(f"🚀 OPEN POSITION: {signal['action']} {self.symbol} @ {current_price} | {adjusted_leverage}x | Size: ${position_size_usd:.2f}")
@@ -13807,6 +13678,14 @@ class PaperTradingEngine:
         # Remove from positions list
         if pos in self.positions:
             self.positions.remove(pos)
+        
+        # Update SQLite: mark position as CLOSED with close_time
+        try:
+            pos_id = pos.get('id', '')
+            pos_symbol = pos.get('symbol', '')
+            asyncio.create_task(db_manager.close_position_in_db(pos_id, pos_symbol))
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to close position in SQLite: {e}")
         
         # Record trade
         trade = {
