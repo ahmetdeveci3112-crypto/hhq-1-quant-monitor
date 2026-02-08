@@ -5995,7 +5995,7 @@ async def background_scanner_loop():
                     # Phase 36 IMPROVED: Position-based kill switch check
                     # Checks each position individually, applies gradual reduction
                     if global_paper_trader.positions:
-                        kill_switch_actions = daily_kill_switch.check_positions(global_paper_trader)
+                        kill_switch_actions = await daily_kill_switch.check_positions(global_paper_trader)
                         # Log and broadcast if any actions were taken
                         if kill_switch_actions.get('reduced') or kill_switch_actions.get('closed'):
                             logger.info(f"🚨 Kill Switch Actions: Reduced={kill_switch_actions['reduced']}, Closed={kill_switch_actions['closed']}")
@@ -8302,7 +8302,7 @@ class PositionBasedKillSwitch:
             self.partially_closed.clear()
             logger.info(f"📅 New trading day (Turkey): Starting balance ${current_balance:.2f}")
     
-    def check_positions(self, paper_trader) -> dict:
+    async def check_positions(self, paper_trader) -> dict:
         """
         Check all positions and apply gradual reduction or close.
         Uses POSITION-BASED UNLEVERAGED LOSS percentage: (PnL / invested_margin) * 100
@@ -8359,6 +8359,7 @@ class PositionBasedKillSwitch:
                 if position_loss_pct <= full_threshold:
                     # Full close threshold reached
                     paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
+                    # Note: close_position already handles Binance close for isLive positions
                     actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                     logger.warning(f"🚨 KILL SWITCH FULL [{leverage}x]: Closed {side} {symbol} at {position_loss_pct:.1f}% loss (threshold: {full_threshold:.0f}%)")
                     # Phase 48: Record fault for this coin
@@ -8371,7 +8372,7 @@ class PositionBasedKillSwitch:
                     if not already_reduced:
                         # First reduction - close 50%
                         pos['kill_switch_reduced'] = True  # Mark as reduced
-                        self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
+                        await self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
                         self.partially_closed[pos_id] = 1  # Keep for backwards compat
                         actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                         logger.warning(f"⚠️ KILL SWITCH REDUCE [{leverage}x]: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% loss (threshold: {first_threshold:.0f}%)")
@@ -8384,10 +8385,11 @@ class PositionBasedKillSwitch:
         
         return actions
     
-    def _reduce_position(self, paper_trader, pos: dict, current_price: float, reduction_pct: float):
+    async def _reduce_position(self, paper_trader, pos: dict, current_price: float, reduction_pct: float):
         """
         Reduce position size by specified percentage.
         Records partial close in trade history.
+        For LIVE positions, sends actual Binance partial close order.
         """
         # Phase 141: Use contracts with size fallback for consistency
         original_size = pos.get('contracts', pos.get('size', 0))
@@ -8398,6 +8400,7 @@ class PositionBasedKillSwitch:
         # Calculate PnL for the reduced portion
         entry_price = pos.get('entryPrice', current_price)
         side = pos.get('side', 'LONG')
+        symbol = pos.get('symbol', '')
         
         if side == 'LONG':
             price_diff = current_price - entry_price
@@ -8406,6 +8409,17 @@ class PositionBasedKillSwitch:
         
         pnl = reduction_size * price_diff
         pnl_pct = (price_diff / entry_price) * 100 if entry_price > 0 else 0
+        
+        # LIVE positions: Execute actual Binance partial close
+        if pos.get('isLive', False) and reduction_size > 0:
+            try:
+                result = await live_binance_trader.close_position(symbol, side, reduction_size)
+                if result:
+                    logger.warning(f"📊 KILL_SWITCH LIVE ✅: {symbol} reduced {reduction_pct*100:.0f}% on Binance ({reduction_size:.4f} contracts) | Order: {result.get('id')}")
+                else:
+                    logger.error(f"❌ KILL_SWITCH LIVE FAILED: {symbol} - close_position returned None")
+            except Exception as e:
+                logger.error(f"❌ KILL_SWITCH LIVE ERROR: {symbol} - {e}")
         
         # Update balance with initial margin portion + PnL
         # Initial Margin = sizeUsd / leverage
@@ -8423,7 +8437,7 @@ class PositionBasedKillSwitch:
         # Record partial close in trade history
         partial_trade = {
             "id": f"{pos.get('id', '')}_PARTIAL",
-            "symbol": pos.get('symbol', ''),
+            "symbol": symbol,
             "side": side,
             "entryPrice": entry_price,
             "exitPrice": current_price,
@@ -8437,7 +8451,7 @@ class PositionBasedKillSwitch:
             "leverage": pos.get('leverage', 10)
         }
         paper_trader.trades.append(partial_trade)
-        paper_trader.add_log(f"⚠️ PARTIAL CLOSE: {side} {pos.get('symbol', '')} reduced by 50% | PnL: ${pnl:.2f}")
+        paper_trader.add_log(f"⚠️ PARTIAL CLOSE: {side} {symbol} reduced by {reduction_pct*100:.0f}% | PnL: ${pnl:.2f}")
     
     def get_status(self, current_balance: float) -> dict:
         """Get kill switch status for UI."""
@@ -8587,6 +8601,17 @@ class TimeBasedPositionManager:
                                 
                                 # Calculate contracts to close (25%)
                                 close_contracts = contracts * level['close_pct']
+                                
+                                # LIVE positions: Execute actual Binance partial close
+                                if pos.get('isLive', False) and close_contracts > 0:
+                                    try:
+                                        result = await live_binance_trader.close_position(symbol, side, close_contracts)
+                                        if result:
+                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at {profit_pct:.2f}% profit | Order: {result.get('id')}")
+                                        else:
+                                            logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
+                                    except Exception as e:
+                                        logger.error(f"❌ PARTIAL_TP LIVE ERROR: {symbol} - {e}")
                                 
                                 # Update position contracts (reduce by 25%)
                                 pos['contracts'] = contracts - close_contracts
