@@ -6247,6 +6247,58 @@ async def background_scanner_loop():
                             pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
                             pos['currentPrice'] = current_price  # Store for frontend
                             
+                            # =========================================================
+                            # Phase 183: PENDING LIMIT CLOSE MONITOR
+                            # Check if any pending limit orders (TP/Trail) have filled
+                            # or timed out → market fallback
+                            # =========================================================
+                            pending = pos.get('pending_limit_close')
+                            if pending and pos.get('isLive', False) and live_binance_trader.enabled:
+                                order_id = pending.get('order_id')
+                                placed_at = pending.get('placed_at', 0)
+                                timeout = pending.get('timeout_seconds', 60)
+                                reason = pending.get('reason', 'TP_HIT')
+                                elapsed = datetime.now().timestamp() - placed_at
+                                
+                                try:
+                                    order_status = await live_binance_trader.check_order_status(pos_symbol, order_id)
+                                    status = order_status.get('status', 'unknown')
+                                    
+                                    if status == 'closed':
+                                        # Limit filled! Close with fill price
+                                        fill_price = order_status.get('average', pending.get('limit_price', current_price))
+                                        logger.warning(f"✅ LIMIT_FILLED: {pos_symbol} {pos['side']} @ ${fill_price:.6f} | Reason: {reason} | Elapsed: {elapsed:.0f}s")
+                                        del pos['pending_limit_close']
+                                        global_paper_trader.close_position(pos, fill_price, reason)
+                                        continue
+                                    elif status == 'canceled' or status == 'expired':
+                                        # Order was externally cancelled
+                                        logger.warning(f"⚠️ LIMIT_CANCELLED: {pos_symbol} order {order_id} — market close")
+                                        del pos['pending_limit_close']
+                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        continue
+                                    elif elapsed >= timeout:
+                                        # TIMEOUT → cancel limit + market close
+                                        logger.warning(f"⏰ LIMIT_TIMEOUT: {pos_symbol} {reason} not filled in {elapsed:.0f}s → cancel + market")
+                                        await live_binance_trader.cancel_order(pos_symbol, order_id)
+                                        del pos['pending_limit_close']
+                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        continue
+                                    else:
+                                        # Still open — skip this position's SL/TP checks
+                                        continue
+                                except Exception as e:
+                                    logger.error(f"Limit monitor error {pos_symbol}: {e}")
+                                    if elapsed >= timeout:
+                                        # Timeout reached even with error — force market close
+                                        try:
+                                            await live_binance_trader.cancel_order(pos_symbol, order_id)
+                                        except:
+                                            pass
+                                        del pos['pending_limit_close']
+                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        continue
+                            
                             # Check SL/TP
                             sl = pos.get('stopLoss', 0)
                             tp = pos.get('takeProfit', 0)
@@ -6284,9 +6336,40 @@ async def background_scanner_loop():
                                 
                                 # Close only if BOTH conditions met: enough ticks AND enough time
                                 if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
-                                    logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                    global_paper_trader.close_position(pos, current_price, 'SL_HIT')
-                                    continue
+                                    # Phase 183: Hybrid — limit for liquid, market for illiquid
+                                    spread_level = pos.get('spread_level', 'Normal')
+                                    is_trailing_hit = pos.get('isTrailingActive', False)
+                                    
+                                    if is_trailing_hit and spread_level in ('Very Low', 'Low') and pos.get('isLive', False) and live_binance_trader.enabled and not pos.get('pending_limit_close'):
+                                        # Liquid coin trailing stop → try limit order
+                                        try:
+                                            contracts = abs(pos.get('contracts', pos.get('size', 0)))
+                                            limit_result = await live_binance_trader.close_position_limit(
+                                                pos_symbol, pos['side'], contracts, trailing_stop
+                                            )
+                                            if limit_result and limit_result.get('id'):
+                                                pos['pending_limit_close'] = {
+                                                    'order_id': limit_result['id'],
+                                                    'placed_at': datetime.now().timestamp(),
+                                                    'limit_price': trailing_stop,
+                                                    'reason': 'TRAIL_SL_HIT',
+                                                    'timeout_seconds': 45,
+                                                }
+                                                logger.warning(f"📙 TRAIL_LIMIT: {pos_symbol} {pos['side']} limit @ ${trailing_stop:.6f} (liquid coin, saves slippage)")
+                                                continue
+                                            else:
+                                                logger.warning(f"📙 TRAIL_LIMIT_FAIL: {pos_symbol} limit failed, market close")
+                                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                                continue
+                                        except Exception as e:
+                                            logger.error(f"Trail limit error {pos_symbol}: {e}")
+                                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                            continue
+                                    else:
+                                        # Illiquid coin or regular SL → market close (execution certainty)
+                                        logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
+                                        global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                        continue
                             else:
                                 # Price recovered - reset counter (spike bypassed!)
                                 if pos['slConfirmCount'] > 0:
@@ -6295,13 +6378,47 @@ async def background_scanner_loop():
                                 pos['slConfirmCount'] = 0
                                 pos['slBreachStartTime'] = 0
                             
-                            # TP Hit (immediate - no confirmation needed for profits)
+                            # =========================================================
+                            # Phase 183: TP_HIT → Limit Order (saves slippage)
+                            # Place limit at TP price. If unfilled, price went higher = more profit.
+                            # Market fallback after 60 seconds.
+                            # =========================================================
+                            tp_hit = False
                             if pos['side'] == 'LONG' and current_price >= tp:
-                                global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-                                continue
+                                tp_hit = True
                             elif pos['side'] == 'SHORT' and current_price <= tp:
-                                global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-                                continue
+                                tp_hit = True
+                            
+                            if tp_hit and not pos.get('pending_limit_close'):
+                                if pos.get('isLive', False) and live_binance_trader.enabled:
+                                    try:
+                                        contracts = abs(pos.get('contracts', pos.get('size', 0)))
+                                        limit_result = await live_binance_trader.close_position_limit(
+                                            pos_symbol, pos['side'], contracts, tp
+                                        )
+                                        if limit_result and limit_result.get('id'):
+                                            pos['pending_limit_close'] = {
+                                                'order_id': limit_result['id'],
+                                                'placed_at': datetime.now().timestamp(),
+                                                'limit_price': tp,
+                                                'reason': 'TP_HIT',
+                                                'timeout_seconds': 60,
+                                            }
+                                            logger.warning(f"📗 TP_LIMIT: {pos_symbol} {pos['side']} limit @ ${tp:.6f} (saves slippage vs market)")
+                                            continue
+                                        else:
+                                            # Limit failed → immediate market close
+                                            logger.warning(f"📗 TP_LIMIT_FAIL: {pos_symbol} limit failed, falling back to market")
+                                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                            continue
+                                    except Exception as e:
+                                        logger.error(f"TP limit error {pos_symbol}: {e}")
+                                        global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                        continue
+                                else:
+                                    # Paper trading → immediate close
+                                    global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                    continue
                             
                             # Update trailing stop if in profit
                             trail_activation = pos.get('trailActivation', entry_price)
