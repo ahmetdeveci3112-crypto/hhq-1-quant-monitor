@@ -1754,15 +1754,15 @@ class LiveBinanceTrader:
                 # Try to get user trades for this symbol to get entry/exit prices
                 entry_price = 0.0
                 exit_price = 0.0
-                side = 'LONG' if pnl > 0 else 'SHORT'  # Default guess based on PnL
+                side = 'LONG'  # Phase 181: Default, will be corrected by actual trade data below
                 leverage = 1
                 size_usd = 0.0
                 qty = 0.0
                 
                 # Fetch trades for this symbol around the close time
                 try:
-                    # Get trades from a window around this close
-                    trade_start = timestamp - (60 * 60 * 1000)  # 1 hour before
+                    # Phase 181: Get trades from wider window (7 days for entry, 1 min for close)
+                    trade_start = timestamp - (7 * 24 * 60 * 60 * 1000)  # 7 days before (entry may be old)
                     trade_end = timestamp + (60 * 1000)  # 1 minute after
                     
                     user_trades = await self.exchange.fapiPrivateGetUserTrades({
@@ -2601,6 +2601,8 @@ async def binance_position_sync_loop():
                             "sizeUsd": pos.get('sizeUsd', 0),
                             "pnl": pnl,
                             "pnlPercent": pnl_percent,
+                            "margin": pos.get('initialMargin', (pos.get('sizeUsd', 0) / pos.get('leverage', 10)) if pos.get('leverage', 10) > 0 else 0),
+                            "roi": (pnl / pos.get('initialMargin', (pos.get('sizeUsd', 0) / pos.get('leverage', 10)) if pos.get('leverage', 10) > 0 else 1) * 100) if pos.get('initialMargin', 0) > 0 or pos.get('sizeUsd', 0) > 0 else 0,
                             "openTime": pos.get('openTime', 0),
                             "closeTime": int(datetime.now().timestamp() * 1000),
                             "reason": "External Close (Binance)",
@@ -6010,12 +6012,62 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     last_trade = binance_trades[-1] if binance_trades else {}
                     logger.info(f"📊 BINANCE_DATES: First trade={first_trade.get('date', 'N/A')} {first_trade.get('time', 'N/A')}, Last trade={last_trade.get('date', 'N/A')} {last_trade.get('time', 'N/A')}")
                     
-                    # Binance is primary - use directly (already sorted by timestamp desc)
+                    # Phase 181: MERGE strategy — engine trades are source of truth
+                    # Engine trades have accurate entry/exit/PnL from close_position()
+                    # Binance trades fill gaps for manual/external closes
+                    
+                    # Build lookup of engine-recorded trades by symbol+timestamp
+                    engine_trades = global_paper_trader.trades
+                    engine_lookup = {}
+                    for et in engine_trades:
+                        key = f"{et.get('symbol', '')}_{et.get('closeTime', 0)}"
+                        engine_lookup[key] = et
+                    
+                    merged_trades = []
+                    binance_matched = set()
+                    
+                    # First pass: use Binance trades but overlay engine data where available
+                    for bt in binance_trades:
+                        bt_symbol = bt.get('symbol', '')
+                        bt_time = bt.get('closeTime', bt.get('timestamp', 0))
+                        
+                        # Try to find matching engine trade (within 5-minute window)
+                        matched_engine = None
+                        for et in engine_trades:
+                            et_symbol = et.get('symbol', '')
+                            et_time = et.get('closeTime', 0)
+                            if et_symbol == bt_symbol and abs(et_time - bt_time) < 5 * 60 * 1000:
+                                matched_engine = et
+                                binance_matched.add(id(et))
+                                break
+                        
+                        if matched_engine:
+                            # Use engine data (more accurate entry/exit/pnl)
+                            # but keep Binance reason/closeReason if engine has generic reason
+                            merged = dict(matched_engine)
+                            if bt.get('closeReason'):
+                                merged['closeReason'] = merged.get('closeReason') or bt.get('closeReason')
+                            # Ensure roi and margin are present
+                            if 'roi' not in merged and 'margin' in merged and merged.get('margin', 0) > 0:
+                                merged['roi'] = round(merged.get('pnl', 0) / merged['margin'] * 100, 2)
+                            merged_trades.append(merged)
+                        else:
+                            # Pure Binance trade (manual close, no engine record)
+                            merged_trades.append(bt)
+                    
+                    # Second pass: add engine trades not matched to any Binance trade
+                    for et in engine_trades:
+                        if id(et) not in binance_matched:
+                            merged_trades.append(et)
+                    
+                    # Sort by closeTime descending
+                    merged_trades.sort(key=lambda t: t.get('closeTime', t.get('timestamp', 0)), reverse=True)
+                    
                     ui_state_cache.binance_trades = binance_trades
-                    ui_state_cache.trades = binance_trades  # Use Binance directly!
+                    ui_state_cache.trades = merged_trades
                     ui_state_cache.last_binance_trade_fetch = now
                     ui_state_cache.pending_trade_fetch_time = 0  # Reset trigger
-                    logger.info(f"📊 BINANCE_SUCCESS: Using {len(binance_trades)} Binance trades as primary source")
+                    logger.info(f"📊 MERGE_SUCCESS: {len(binance_trades)} Binance + {len(engine_trades)} engine → {len(merged_trades)} merged trades")
             except Exception as e:
                 import traceback
                 logger.error(f"📊 BINANCE_ERROR: {e}")
@@ -9368,12 +9420,34 @@ class BreakevenStopManager:
                             logger.warning(f"✅ BREAKEVEN LIMIT FILLED: {symbol} {side} @ ${fill_price} | PnL: ${real_pnl:.4f}")
                             
                             # Record trade with real data
+                            # Phase 181: Include full trade_data so Binance sync records correctly
+                            size_usd = pos.get('sizeUsd', 0)
+                            leverage_val = pos.get('leverage', 10)
+                            margin_val = size_usd / leverage_val if leverage_val > 0 and size_usd > 0 else 0
+                            roi_val = (real_pnl / margin_val * 100) if margin_val > 0 else 0
+                            
                             pending_close_reasons[symbol] = {
                                 "reason": f"BREAKEVEN_CLOSE: {spread_level} spread, limit filled @ ${fill_price}",
                                 "original_reason": "BREAKEVEN_CLOSE",
                                 "pnl": round(real_pnl, 4),
                                 "exitPrice": fill_price,
-                                "timestamp": int(datetime.now().timestamp() * 1000)
+                                "timestamp": int(datetime.now().timestamp() * 1000),
+                                "trade_data": {
+                                    "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "entryPrice": entry_price,
+                                    "exitPrice": fill_price,
+                                    "size": abs(state.get('contracts', 0)),
+                                    "sizeUsd": size_usd,
+                                    "pnl": round(real_pnl, 4),
+                                    "pnlPercent": roi_val,
+                                    "margin": round(margin_val, 4),
+                                    "roi": round(roi_val, 2),
+                                    "openTime": pos.get('openTime', 0),
+                                    "leverage": leverage_val,
+                                    "isLive": True,
+                                }
                             }
                             safe_create_task(sqlite_manager.save_position_close({
                                 'symbol': symbol,
@@ -9576,13 +9650,40 @@ class LossRecoveryTrailManager:
                             # Gave back too much - CLOSE!
                             logger.warning(f"🔄 RECOVERY TRAIL CLOSE: {symbol} {side} - gave back {giveback_ratio*100:.0f}% of recovery")
                             try:
-                                # Set reason for trade history before closing
+                                # Phase 181: Set reason with full trade_data for trade history
+                                size_usd = pos.get('sizeUsd', 0)
+                                leverage_val = pos.get('leverage', 10)
+                                margin_val = size_usd / leverage_val if leverage_val > 0 and size_usd > 0 else 0
+                                
+                                # Calculate actual PnL from prices
+                                if side == 'LONG':
+                                    actual_pnl = (current_price - entry_price) * abs(contracts)
+                                else:
+                                    actual_pnl = (entry_price - current_price) * abs(contracts)
+                                roi_val = (actual_pnl / margin_val * 100) if margin_val > 0 else 0
+                                
                                 pending_close_reasons[symbol] = {
                                     "reason": f"RECOVERY_TRAIL_CLOSE: peak_loss={peak_loss:.1f}%, recovered to {peak_recovery_pnl:.1f}%, gave back {giveback_ratio*100:.0f}%",
                                     "original_reason": "RECOVERY_TRAIL_CLOSE",
-                                    "pnl": 0,  # Will be calculated by Binance sync
+                                    "pnl": round(actual_pnl, 4),
                                     "exitPrice": current_price,
-                                    "timestamp": int(datetime.now().timestamp() * 1000)
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                    "trade_data": {
+                                        "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+                                        "symbol": symbol,
+                                        "side": side,
+                                        "entryPrice": entry_price,
+                                        "exitPrice": current_price,
+                                        "size": abs(contracts),
+                                        "sizeUsd": size_usd,
+                                        "pnl": round(actual_pnl, 4),
+                                        "pnlPercent": round(roi_val, 2),
+                                        "margin": round(margin_val, 4),
+                                        "roi": round(roi_val, 2),
+                                        "openTime": pos.get('openTime', 0),
+                                        "leverage": leverage_val,
+                                        "isLive": True,
+                                    }
                                 }
                                 # Persist to SQLite so data survives restart
                                 safe_create_task(sqlite_manager.save_position_close({
@@ -13860,6 +13961,8 @@ class PaperTradingEngine:
             "sizeUsd": pos.get('sizeUsd', 0),
             "pnl": pnl,
             "pnlPercent": (pnl / pos.get('sizeUsd', 1)) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0,
+            "margin": initial_margin,
+            "roi": (pnl / initial_margin * 100) if initial_margin > 0 else 0,
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
