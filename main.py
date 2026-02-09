@@ -12602,6 +12602,18 @@ class PaperTradingEngine:
                     et_mult = math.sqrt(max(0.5, self.entry_tightness))  # 1.0→1.0x, 1.8→1.34x
                     trail_entry_dist *= et_mult
                     
+                    # Phase 176: Coin-specific spread multiplier
+                    # Higher spread = noisier price action = need larger reversal to confirm
+                    order_spread = order.get('spreadLevel', 'normal').lower()
+                    spread_trail_mult = {
+                        'very low': 0.7,   # BTC/ETH — clean price action, tight reversal
+                        'low': 0.85,       # Large caps
+                        'normal': 1.0,     # Standard
+                        'high': 1.3,       # Mid/small caps — more noise
+                        'very high': 1.6,  # Meme coins — heavy noise filtering
+                    }.get(order_spread, 1.0)
+                    trail_entry_dist *= spread_trail_mult
+                    
                     # Cap at 25% of pullback distance
                     pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
                     if pb_dist > 0:
@@ -12610,8 +12622,8 @@ class PaperTradingEngine:
                     order['trailEntryDistance'] = trail_entry_dist
                     
                     trail_pct = (trail_entry_dist / entry_price * 100) if entry_price > 0 else 0
-                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f}×ET{et_mult:.2f})")
-                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness}")
+                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f}×ET{et_mult:.2f}×SP{spread_trail_mult:.1f})")
+                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness} spread={order_spread}×{spread_trail_mult}")
             else:
                 # Step 2: Trailing entry active — track extreme and check reversal
                 # This mirrors Trail TP: track peakPrice, trigger when price drops by trail_distance

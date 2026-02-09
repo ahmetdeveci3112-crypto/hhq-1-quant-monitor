@@ -245,6 +245,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 // Apply entry_tightness (sqrt smoothing)
                                 const etMult = Math.sqrt(Math.max(0.5, entryTightness));
                                 rawTrail *= etMult;
+                                // Phase 176: Coin-specific spread multiplier
+                                const spreadTrailMult: Record<string, number> = {
+                                    'Very Low': 0.7, 'Low': 0.85, 'Normal': 1.0, 'High': 1.3, 'Very High': 1.6
+                                };
+                                rawTrail *= spreadTrailMult[spreadInfo.level] ?? 1.0;
                                 // Cap at 25% of pullback
                                 const trailPct = pbPct > 0 ? Math.min(rawTrail, pbPct * 0.25) : rawTrail;
 
