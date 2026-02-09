@@ -236,8 +236,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 // PB%: Actual pullback = distance from price to entry
                                 const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Bounce%: Phase 170 — Reduced bounce for better fill rate
-                                // bounce_factor: 0.05 (strong trend) to 0.10 (weak trend) × ATR
+                                // Reversal%: Phase 175 — Trailing Entry (mirrors Trail TP)
+                                // trail_entry_distance: 0.05 (strong trend) to 0.10 (weak trend) × ATR
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const hurstStr = Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4));
                                 const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));

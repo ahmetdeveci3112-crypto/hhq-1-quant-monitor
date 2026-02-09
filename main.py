@@ -12562,21 +12562,15 @@ class PaperTradingEngine:
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
             
             # =================================================================
-            # Phase 153: BOUNCE + VOLUME CONFIRMATION
-            # Instead of executing immediately when price hits entry,
-            # wait for a bounce in signal direction + volume confirmation
+            # Phase 175: TRAILING ENTRY (mirrors Trailing Take Profit logic)
+            # Instead of bounce+volume+trending, simply track bottom/peak
+            # and trigger when price reverses by trail_entry_distance.
+            # Same concept as trail TP but inverted for entries.
             # =================================================================
-            bounce_waiting = order.get('bounceWaiting', False)
+            trailing_entry_active = order.get('trailingEntryActive', False)
             atr = order.get('atr', entry_price * 0.01)
             
-            # Get current volume data from opportunities
-            current_volume = 0
-            for opp in opportunities:
-                if opp.get('symbol') == symbol:
-                    current_volume = opp.get('volume24h', opp.get('volume_24h', 0))
-                    break
-            
-            if not bounce_waiting:
+            if not trailing_entry_active:
                 # Step 1: Check if price reached pullback entry level
                 reached_entry = False
                 if side == 'LONG' and current_price <= entry_price:
@@ -12585,154 +12579,108 @@ class PaperTradingEngine:
                     reached_entry = True
                 
                 if reached_entry:
-                    # Mark as bounce waiting — don't enter yet!
-                    order['bounceWaiting'] = True
-                    order['bounceStartTime'] = current_time
-                    order['bounceStartPrice'] = current_price
-                    order['bounceStartVolume'] = current_volume  # Volume snapshot
-                    order['bouncePriceHistory'] = [current_price]  # Track price trend
-                    # Pre-calculate bounce thresholds for logging
-                    # Phase 170: Reduced bounce — use 0.05-0.10×ATR (was 0.10-0.20)
+                    # Start trailing entry — track the extreme price
+                    order['trailingEntryActive'] = True
+                    order['trailEntryStartTime'] = current_time
+                    # Initialize extreme price (bottom for LONG, peak for SHORT)
+                    order['extremePrice'] = current_price
+                    
+                    # Calculate trail_entry_distance (same as trail TP's trail_distance)
                     order_adx = order.get('adx', 0)
                     order_hurst = order.get('hurst', 0.5)
                     adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
                     hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                     trend_s = adx_s * 0.6 + hurst_s * 0.4
-                    bf = 0.10 - trend_s * 0.05  # bounce factor: 0.05-0.10 (was 0.10-0.20)
-                    bounce_dist = atr * bf
-                    # Cap at 25% of pullback (was 50%)
+                    
+                    # Trail entry distance: 0.05-0.10 × ATR (trend-adjusted)
+                    trail_factor = 0.10 - trend_s * 0.05
+                    trail_entry_dist = atr * trail_factor
+                    
+                    # Cap at 25% of pullback distance
                     pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
                     if pb_dist > 0:
-                        bounce_dist = min(bounce_dist, pb_dist * 0.25)
-                    bounce_pct = (bounce_dist / entry_price * 100) if entry_price > 0 else 0
-                    self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% (ATR×{bf:.2f})")
-                    logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% vol={current_volume:.0f}")
+                        trail_entry_dist = min(trail_entry_dist, pb_dist * 0.25)
+                    
+                    order['trailEntryDistance'] = trail_entry_dist
+                    
+                    trail_pct = (trail_entry_dist / entry_price * 100) if entry_price > 0 else 0
+                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f})")
+                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}%")
             else:
-                # Step 2: Waiting for bounce confirmation
-                # Phase 170: REDUCED BOUNCE (was Phase 160 ATR×0.10-0.20)
-                # Bounce = ATR × bounce_factor (0.05-0.10)
-                # Smaller bounce = more fills while still confirming direction
-                # Capped at 25% of pullback (was 50%)
+                # Step 2: Trailing entry active — track extreme and check reversal
+                # This mirrors Trail TP: track peakPrice, trigger when price drops by trail_distance
+                # Here: track bottomPrice (LONG) or peakPrice (SHORT), trigger on reversal
+                
+                trail_entry_distance = order.get('trailEntryDistance', atr * 0.08)
+                extreme_price = order.get('extremePrice', current_price)
+                trail_start = order.get('trailEntryStartTime', current_time)
+                trail_timeout_ms = 15 * 60 * 1000  # 15 minute timeout
+                
+                # Cancel distance: how far from entry before giving up
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
-                
-                # Trend strength: 0.0 (very weak) to 1.0 (very strong)
-                adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))  # 15→0, 60→1
-                hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))  # 0.35→0, 0.75→1
+                adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))
+                hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
+                base_cancel = 0.7 + trend_strength * 0.8
+                cancel_distance = atr * base_cancel
                 
-                # Bounce factor: strong trend → smaller bounce needed
-                # Range: 0.05 (strong trend) to 0.10 (weak trend) × ATR
-                bounce_factor = 0.10 - trend_strength * 0.05  # 0.05 to 0.10 (was 0.10-0.20)
-                bounce_confirm_distance = atr * bounce_factor
-                
-                # Cancel distance: how far below entry before giving up
-                import math
-                et = max(0.5, self.entry_tightness)
-                base_cancel = 0.7 + trend_strength * 0.8   # Range: 0.7 to 1.5 ×ATR
-                bounce_cancel_distance = atr * base_cancel
-                bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
-                
-                # Cap bounce at 25% of pullback distance (was 50%)
-                pullback_distance = abs(entry_price - order.get('signalPrice', entry_price))
-                if pullback_distance > 0:
-                    max_bounce = pullback_distance * 0.25  # 25% cap (was 50%)
-                    if bounce_confirm_distance > max_bounce:
-                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (25% of pullback {pullback_distance:.6f})")
-                        bounce_confirm_distance = max_bounce
-                
-                # Calculate percentage equivalents for logging
-                confirm_pct = (bounce_confirm_distance / entry_price * 100) if entry_price > 0 else 0
-                cancel_pct = (bounce_cancel_distance / entry_price * 100) if entry_price > 0 else 0
-                
-                logger.debug(f"⏳ BOUNCE CALC: {symbol} ADX={order_adx:.1f} H={order_hurst:.2f} str={trend_strength:.2f} | confirm={bounce_factor:.2f}×ATR(≈{confirm_pct:.2f}%) cancel={base_cancel:.2f}×ATR(≈{cancel_pct:.2f}%)")
-                bounce_start = order.get('bounceStartTime', current_time)
-                bounce_start_volume = order.get('bounceStartVolume', 0)
-                
-                # Track price history for trend detection (keep last 10)
-                price_history = order.get('bouncePriceHistory', [])
-                price_history.append(current_price)
-                if len(price_history) > 10:
-                    price_history = price_history[-10:]
-                order['bouncePriceHistory'] = price_history
-                
-                # Volume confirmation: is current volume higher than at bounce start?
-                # volume_ratio > 0.8 means volume didn't significantly drop (buying interest exists)
-                # volume_ratio > 1.2 means volume actually increased (strong confirmation)
-                volume_ok = True  # Default pass if no volume data
-                volume_ratio = 1.0
-                if bounce_start_volume and bounce_start_volume > 0 and current_volume > 0:
-                    volume_ratio = current_volume / bounce_start_volume
-                    # Volume should not have collapsed (> 80% of start) 
-                    volume_ok = volume_ratio >= 0.8
-                
-                # Price trend: are last few prices trending in signal direction?
-                price_trending = False
-                if len(price_history) >= 3:
-                    recent = price_history[-3:]
-                    if side == 'LONG':
-                        # Price should be going UP (each tick higher than previous)
-                        price_trending = recent[-1] > recent[0]
-                    else:
-                        # Price should be going DOWN
-                        price_trending = recent[-1] < recent[0]
-                
-                elapsed_ms = current_time - bounce_start
+                elapsed_ms = current_time - trail_start
                 elapsed_secs = elapsed_ms / 1000
                 
                 if side == 'LONG':
-                    # Bounce confirmed: price recovered above entry + 0.5×ATR AND volume ok
-                    if current_price >= entry_price + bounce_confirm_distance:
-                        if volume_ok and price_trending:
-                            vol_str = f"Vol={volume_ratio:.1f}x" if bounce_start_volume > 0 else "Vol=N/A"
-                            self.add_log(f"✅ BOUNCE OK: {side} {symbol} @ ${current_price:.6f} ({elapsed_secs:.0f}s) | {vol_str}")
-                            logger.info(f"✅ BOUNCE CONFIRMED: {side} {symbol} bounce={current_price:.6f} entry={entry_price:.6f} vol_ratio={volume_ratio:.2f}")
-                            await self.execute_pending_order(order, current_price)
-                            continue
-                        elif not volume_ok:
-                            # Price bounced but volume dried up — weak bounce, cancel
-                            self.pending_orders.remove(order)
-                            self.add_log(f"❌ BOUNCE WEAK: {side} {symbol} fiyat döndü ama hacim düşük ({volume_ratio:.1f}x)")
-                            logger.info(f"❌ BOUNCE WEAK VOLUME: {side} {symbol} vol_ratio={volume_ratio:.2f}")
-                            continue
+                    # Track bottom price (like trail TP tracks peak)
+                    if current_price < extreme_price:
+                        order['extremePrice'] = current_price
+                        extreme_price = current_price
                     
-                    # Cancel: dropped too far below entry (1×ATR)
-                    if current_price < entry_price - bounce_cancel_distance:
-                        self.pending_orders.remove(order)
-                        self.add_log(f"❌ BOUNCE FAIL: {side} {symbol} düşüş devam ediyor (${current_price:.6f})")
-                        logger.info(f"❌ BOUNCE FAIL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
+                    # Reversal confirmed: price rose from bottom by trail_entry_distance
+                    if current_price >= extreme_price + trail_entry_distance:
+                        reversal_pct = ((current_price - extreme_price) / extreme_price * 100) if extreme_price > 0 else 0
+                        self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Bottom=${extreme_price:.6f} +{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
+                        logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} bottom=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
+                        await self.execute_pending_order(order, current_price)
                         continue
-                        
-                else:  # SHORT
-                    if current_price <= entry_price - bounce_confirm_distance:
-                        if volume_ok and price_trending:
-                            vol_str = f"Vol={volume_ratio:.1f}x" if bounce_start_volume > 0 else "Vol=N/A"
-                            self.add_log(f"✅ BOUNCE OK: {side} {symbol} @ ${current_price:.6f} ({elapsed_secs:.0f}s) | {vol_str}")
-                            logger.info(f"✅ BOUNCE CONFIRMED: {side} {symbol} bounce={current_price:.6f} entry={entry_price:.6f} vol_ratio={volume_ratio:.2f}")
-                            await self.execute_pending_order(order, current_price)
-                            continue
-                        elif not volume_ok:
-                            self.pending_orders.remove(order)
-                            self.add_log(f"❌ BOUNCE WEAK: {side} {symbol} fiyat döndü ama hacim düşük ({volume_ratio:.1f}x)")
-                            logger.info(f"❌ BOUNCE WEAK VOLUME: {side} {symbol} vol_ratio={volume_ratio:.2f}")
-                            continue
                     
-                    if current_price > entry_price + bounce_cancel_distance:
+                    # Cancel: dropped too far below entry
+                    if current_price < entry_price - cancel_distance:
                         self.pending_orders.remove(order)
-                        self.add_log(f"❌ BOUNCE FAIL: {side} {symbol} yükseliş devam ediyor (${current_price:.6f})")
-                        logger.info(f"❌ BOUNCE FAIL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
+                        self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
+                        logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
                         continue
                 
-                # Timeout check: 15 minutes without bounce
-                if elapsed_ms > bounce_timeout_ms:
+                else:  # SHORT
+                    # Track peak price (like trail TP tracks peak for short)
+                    if current_price > extreme_price:
+                        order['extremePrice'] = current_price
+                        extreme_price = current_price
+                    
+                    # Reversal confirmed: price dropped from peak by trail_entry_distance
+                    if current_price <= extreme_price - trail_entry_distance:
+                        reversal_pct = ((extreme_price - current_price) / extreme_price * 100) if extreme_price > 0 else 0
+                        self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Peak=${extreme_price:.6f} -{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
+                        logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} peak=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
+                        await self.execute_pending_order(order, current_price)
+                        continue
+                    
+                    # Cancel: rose too far above entry
+                    if current_price > entry_price + cancel_distance:
+                        self.pending_orders.remove(order)
+                        self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
+                        logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
+                        continue
+                
+                # Timeout check
+                if elapsed_ms > trail_timeout_ms:
                     self.pending_orders.remove(order)
-                    self.add_log(f"⏰ BOUNCE TIMEOUT: {side} {symbol} (15dk bounce olmadı)")
-                    logger.info(f"⏰ BOUNCE TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s")
+                    self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı)")
+                    logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s")
                     continue
                 
-                # Periodic log during wait (every ~30s)
+                # Periodic log (every ~30s)
+                trail_pct = (trail_entry_distance / entry_price * 100) if entry_price > 0 else 0
                 if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
-                    logger.debug(f"⏳ BOUNCE WAITING: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} vol_ratio={volume_ratio:.1f}x trend={'↑' if price_trending else '↓'}")
+                    logger.debug(f"📍 TRAIL ENTRY WAIT: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} extreme=${extreme_price:.6f} dist={trail_pct:.2f}%")
     
     async def execute_pending_order(self, order: dict, fill_price: float):
         """Execute a pending order at the fill price."""
