@@ -211,8 +211,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <SortHeader label="Z-Score" sortKeyName="zScore" align="right" />
                             <SortHeader label="Hurst" sortKeyName="hurst" align="right" />
                             <th className="py-3 px-3 font-medium text-center">Lev</th>
-                            <th className="py-3 px-3 font-medium text-center">PB%</th>
-                            <th className="py-3 px-3 font-medium text-center">Bounce%</th>
+                            <th className="py-3 px-3 font-medium text-center">Trail Entry</th>
                             <th className="py-3 px-3 font-medium text-center">Spread</th>
                             <th className="py-3 px-3 font-medium text-center">Time</th>
                             <th className="py-3 px-3 font-medium text-right">Action</th>
@@ -236,16 +235,18 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 // PB%: Actual pullback = distance from price to entry
                                 const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Reversal%: Phase 175 — Trailing Entry (mirrors Trail TP)
-                                // trail_entry_distance: 0.05 (strong trend) to 0.10 (weak trend) × ATR
+                                // Phase 175: Trail Entry — mirrors Trail TP logic
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const hurstStr = Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4));
                                 const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
                                 const trendStr = hurstStr * 0.6 + zStr * 0.4;
-                                const bounceFactor = 0.10 - trendStr * 0.05;  // 0.05-0.10 (was 0.10-0.20)
-                                const rawBounce = atrPct * bounceFactor;
-                                // Cap at 25% of pullback (was 50%)
-                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.25) : rawBounce;
+                                const trailFactor = 0.10 - trendStr * 0.05;
+                                let rawTrail = atrPct * trailFactor;
+                                // Apply entry_tightness (sqrt smoothing)
+                                const etMult = Math.sqrt(Math.max(0.5, entryTightness));
+                                rawTrail *= etMult;
+                                // Cap at 25% of pullback
+                                const trailPct = pbPct > 0 ? Math.min(rawTrail, pbPct * 0.25) : rawTrail;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -285,14 +286,18 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{signal.leverage || spreadInfo.leverage}x</span>
                                         </td>
                                         <td className="py-2.5 px-3 text-center">
-                                            <span className={`text-[10px] font-mono font-semibold ${pbPct > 0 ? 'text-amber-400' : 'text-slate-500'}`}>
-                                                {pbPct > 0 ? `${pbPct.toFixed(1)}%` : 'MKT'}
-                                            </span>
-                                        </td>
-                                        <td className="py-2.5 px-3 text-center">
-                                            <span className={`text-[10px] font-mono font-semibold ${bouncePct > 0.5 ? 'text-cyan-400' : 'text-slate-500'}`}>
-                                                {bouncePct.toFixed(2)}%
-                                            </span>
+                                            {pbPct > 0 ? (
+                                                <div className="flex flex-col items-center gap-0.5">
+                                                    <span className="text-[10px] font-mono font-semibold text-amber-400">
+                                                        {isLong ? '↓' : '↑'}{pbPct.toFixed(1)}%
+                                                    </span>
+                                                    <span className="text-[10px] font-mono font-semibold text-cyan-400">
+                                                        {isLong ? '↑' : '↓'}{trailPct.toFixed(2)}%
+                                                    </span>
+                                                </div>
+                                            ) : (
+                                                <span className="text-[10px] font-mono text-slate-500">MKT</span>
+                                            )}
                                         </td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">{spreadInfo.level}</td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">
