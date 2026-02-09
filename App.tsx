@@ -1208,8 +1208,7 @@ export default function App() {
                 ) : (
                   [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
-                    const storedCurrentPrice = (pos as any).currentPrice;
-                    const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
+                    const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
                     const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                     const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                     const isLong = pos.side === 'LONG';
@@ -1301,8 +1300,7 @@ export default function App() {
                     ) : (
                       [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                         const opportunity = opportunities.find(o => o.symbol === pos.symbol);
-                        const storedCurrentPrice = (pos as any).currentPrice;
-                        const currentPrice = (storedCurrentPrice && storedCurrentPrice > 0) ? storedCurrentPrice : (opportunity?.price || pos.entryPrice);
+                        const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
                         const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                         const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                         const isLong = pos.side === 'LONG';
