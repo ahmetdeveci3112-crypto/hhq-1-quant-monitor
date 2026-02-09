@@ -8823,16 +8823,17 @@ class TimeBasedPositionManager:
                     # Get spread level for dynamic threshold
                     spread_level = pos.get('spread_level', 'Normal')
                     
-                    # Dynamic breakeven threshold based on spread
-                    # Lower spread coins = activate breakeven earlier
+                    # Phase 182: Dynamic breakeven threshold based on spread
+                    # These are LOWER than BreakevenStopManager (safety net)
+                    # SL moves to entry, actual limit close happens at higher threshold
                     breakeven_thresholds = {
-                        'Very Low': 0.3,   # BTC/ETH - 0.3% kârda breakeven
-                        'Low': 0.4,
-                        'Normal': 0.5,     # Normal coins - 0.5% kârda
-                        'High': 0.8,
-                        'Very High': 1.2   # Meme coins - 1.2% kârda (daha geniş spread)
+                        'Very Low': 0.8,   # BTC/ETH - was 0.3%
+                        'Low': 1.2,        # was 0.4%
+                        'Normal': 1.5,     # was 0.5%
+                        'High': 2.5,       # was 0.8%
+                        'Very High': 3.5   # Meme coins - was 1.2%
                     }
-                    be_threshold = breakeven_thresholds.get(spread_level, 0.5)
+                    be_threshold = breakeven_thresholds.get(spread_level, 1.5)
                     
                     # Calculate profit percentage
                     if entry_price > 0:
@@ -9251,25 +9252,30 @@ class BreakevenStopManager:
         # Track breakeven state per position: {symbol: {active: bool, entry_price: float, activation_time: datetime}}
         self.breakeven_state = {}
         
-        # Spread-based activation thresholds (% profit needed to activate breakeven)
-        self.activation_thresholds = {
-            'Very Low': 0.5,   # BTC/ETH - 0.5% profit triggers breakeven
-            'Low': 0.75,
-            'Normal': 1.0,
-            'High': 1.5,
-            'Very High': 2.5   # Meme coins - need more room
+        # Phase 182: ATR-based dynamic activation thresholds
+        # Activation = max(floor, ATR_pct * atr_mult)
+        # This ensures breakeven only activates after a move meaningful for that coin's volatility
+        self.activation_config = {
+            'Very Low':  {'floor': 1.0, 'atr_mult': 1.5},   # BTC: max(1.0%, ATR*1.5)
+            'Low':       {'floor': 1.5, 'atr_mult': 1.8},   # SOL/AVAX
+            'Normal':    {'floor': 2.0, 'atr_mult': 2.0},   # Mid-cap
+            'High':      {'floor': 3.0, 'atr_mult': 2.5},   # Low liquidity
+            'Very High': {'floor': 4.0, 'atr_mult': 3.0},   # Meme coins
         }
         
-        # Phase 151: Dynamic breakeven buffer based on spread level
-        self.breakeven_buffers = {
-            'Very Low': 0.03,   # BTC/ETH — $30 @ $100k
-            'Low':      0.05,   # SOL, AVAX
-            'Normal':   0.08,   # Mid-cap
-            'High':     0.12,   # Low liquidity
-            'Very High': 0.20   # Meme coins — wide buffer
+        # Phase 182: Fee buffer — limit order placed above entry to cover round-trip fees
+        self.fee_buffers = {
+            'Very Low':  0.0005,  # 0.05%
+            'Low':       0.001,   # 0.10%
+            'Normal':    0.0015,  # 0.15%
+            'High':      0.002,   # 0.20%
+            'Very High': 0.003,   # 0.30%
         }
         
-        logger.info("📊 BreakevenStopManager initialized")
+        # Phase 182: Minimum age before breakeven can activate (minutes)
+        self.min_breakeven_age_minutes = 30
+        
+        logger.info("📊 BreakevenStopManager v2 initialized (ATR-based)")
     
     async def load_from_sqlite(self):
         """Load persisted breakeven states from SQLite on startup."""
@@ -9324,8 +9330,18 @@ class BreakevenStopManager:
                 else:  # SHORT
                     profit_pct = (entry_price - current_price) / entry_price * 100
                 
-                # Get dynamic activation threshold based on spread level
-                activation_threshold = self.activation_thresholds.get(spread_level, 1.0)
+                # Phase 182: ATR-based dynamic activation threshold
+                atr = float(pos.get('atr', entry_price * 0.02))  # Default 2% if no ATR
+                atr_pct = (atr / entry_price) * 100 if entry_price > 0 else 2.0
+                config = self.activation_config.get(spread_level, {'floor': 2.0, 'atr_mult': 2.0})
+                activation_threshold = max(config['floor'], atr_pct * config['atr_mult'])
+                
+                # Phase 182: Minimum hold time guard (30 min)
+                open_time = pos.get('openTime', 0)
+                if open_time > 0:
+                    age_minutes = (datetime.now().timestamp() * 1000 - open_time) / 60000
+                else:
+                    age_minutes = 999  # Unknown age, don't block
                 
                 # State key
                 state_key = f"{symbol}_{side}"
@@ -9335,13 +9351,23 @@ class BreakevenStopManager:
                 
                 if not state.get('active', False):
                     # Not yet activated - check if we should activate
+                    if age_minutes < self.min_breakeven_age_minutes:
+                        # Too young — skip breakeven (let trade develop)
+                        continue
+                    
                     if profit_pct >= activation_threshold:
-                        # Phase 179: Activate breakeven AND place limit order immediately
-                        logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
+                        # Phase 182: Calculate limit price with fee buffer
+                        fee_buffer = self.fee_buffers.get(spread_level, 0.0015)
+                        if side == 'LONG':
+                            limit_price = entry_price * (1 + fee_buffer)
+                        else:
+                            limit_price = entry_price * (1 - fee_buffer)
                         
-                        # Place limit close order at entry price (exact breakeven, no slippage)
+                        logger.warning(f"🔒 BREAKEVEN v2: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold:.2f}% (ATR={atr_pct:.2f}%, floor={config['floor']}%, spread={spread_level}) | Limit @ ${limit_price:.6f} (entry+{fee_buffer*100:.2f}%)")
+                        
+                        # Place limit close order at entry + fee buffer
                         limit_result = await live_trader.close_position_limit(
-                            symbol, side, abs(contracts), entry_price
+                            symbol, side, abs(contracts), limit_price
                         )
                         
                         order_id = limit_result.get('id') if limit_result else None
