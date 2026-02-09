@@ -1424,7 +1424,7 @@ class LiveBinanceTrader:
             return None
     
     async def close_position(self, symbol: str, side: str, amount: float) -> dict:
-        """Pozisyon kapat (reduceOnly=True)."""
+        """Pozisyon kapat (reduceOnly=True) — Market order."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, close rejected")
             return None
@@ -1456,6 +1456,90 @@ class LiveBinanceTrader:
         except Exception as e:
             logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} | Error: {e}")
             return None
+    
+    async def close_position_limit(self, symbol: str, side: str, amount: float, price: float) -> dict:
+        """
+        Phase 179: Place a LIMIT close order at exact price (no slippage).
+        Used for breakeven close — order sits on book until filled.
+        """
+        if not self.enabled or not self.exchange:
+            logger.error("❌ LiveBinanceTrader not enabled, limit close rejected")
+            return None
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            close_side = 'sell' if side == 'LONG' else 'buy'
+            
+            # Price precision: match market requirements
+            markets = await self.exchange.load_markets()
+            market = markets.get(ccxt_symbol)
+            if market:
+                price = self.exchange.price_to_precision(ccxt_symbol, price)
+                amount = self.exchange.amount_to_precision(ccxt_symbol, amount)
+            
+            order = await self.exchange.create_limit_order(
+                ccxt_symbol,
+                close_side,
+                float(amount),
+                float(price),
+                params={
+                    'reduceOnly': True,
+                    'timeInForce': 'GTC'  # Good-Till-Cancel
+                }
+            )
+            
+            order_id = order.get('id', 'N/A')
+            logger.warning(f"🔒 BREAKEVEN LIMIT ORDER: {side} {symbol} @ ${price} | Amount: {amount} | Order: {order_id}")
+            
+            return {
+                'id': order_id,
+                'symbol': symbol,
+                'side': side,
+                'amount': float(amount),
+                'price': float(price),
+                'status': order.get('status', 'open'),
+                'timestamp': int(datetime.now().timestamp() * 1000)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ BREAKEVEN LIMIT ORDER FAILED: {side} {symbol} @ ${price} | Error: {e}")
+            return None
+    
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Phase 179: Cancel an open order."""
+        if not self.enabled or not self.exchange:
+            return False
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            await self.exchange.cancel_order(order_id, ccxt_symbol)
+            logger.info(f"🗑️ Order cancelled: {symbol} #{order_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Cancel order failed: {symbol} #{order_id} - {e}")
+            return False
+    
+    async def check_order_status(self, symbol: str, order_id: str) -> dict:
+        """Phase 179: Check if a limit order has been filled."""
+        if not self.enabled or not self.exchange:
+            return {'status': 'unknown'}
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            order = await self.exchange.fetch_order(order_id, ccxt_symbol)
+            return {
+                'status': order.get('status', 'unknown'),  # open, closed, canceled
+                'filled': float(order.get('filled', 0)),
+                'remaining': float(order.get('remaining', 0)),
+                'average': float(order.get('average', 0)),  # Average fill price
+                'price': float(order.get('price', 0)),
+            }
+        except Exception as e:
+            logger.warning(f"⚠️ Check order status failed: {symbol} #{order_id} - {e}")
+            return {'status': 'error', 'error': str(e)}
     
     async def _execute_pending_close(self, close_order: dict):
         """Execute a pending close order from trailing stop hit."""
@@ -9233,65 +9317,106 @@ class BreakevenStopManager:
                 if not state.get('active', False):
                     # Not yet activated - check if we should activate
                     if profit_pct >= activation_threshold:
-                        # Activate breakeven!
+                        # Phase 179: Activate breakeven AND place limit order immediately
+                        logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
+                        
+                        # Place limit close order at entry price (exact breakeven, no slippage)
+                        limit_result = await live_trader.close_position_limit(
+                            symbol, side, abs(contracts), entry_price
+                        )
+                        
+                        order_id = limit_result.get('id') if limit_result else None
+                        
                         self.breakeven_state[state_key] = {
                             'active': True,
                             'entry_price': entry_price,
                             'activation_price': current_price,
                             'activation_time': datetime.now(),
-                            'spread_level': spread_level
+                            'spread_level': spread_level,
+                            'order_id': order_id,  # Phase 179: Track limit order
+                            'contracts': abs(contracts),
                         }
                         actions["breakeven_activated"].append(symbol)
-                        logger.warning(f"🔒 BREAKEVEN ACTIVATED: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold}% (spread={spread_level})")
+                        
                         # Phase 154: Persist to SQLite
                         safe_create_task(sqlite_manager.save_breakeven_state(
                             state_key, symbol, side, entry_price, current_price,
                             datetime.now().isoformat(), spread_level
                         ), name=f"persist_breakeven_{symbol}")
+                        
+                        if not limit_result:
+                            logger.error(f"❌ BREAKEVEN LIMIT ORDER FAILED: {symbol} - will retry next cycle")
                 else:
-                    # Breakeven is active - check if price returned to entry
-                    # Phase 151: Dynamic buffer based on spread level
-                    buffer_pct = self.breakeven_buffers.get(spread_level, 0.08)
-                    breakeven_price = entry_price * (1 + buffer_pct / 100) if side == "LONG" else entry_price * (1 - buffer_pct / 100)
+                    # Phase 179: Breakeven active — monitor limit order status
+                    order_id = state.get('order_id')
                     
-                    should_close = False
-                    if side == 'LONG' and current_price <= breakeven_price:
-                        should_close = True
-                    elif side == 'SHORT' and current_price >= breakeven_price:
-                        should_close = True
-                    
-                    if should_close:
-                        # Close at breakeven!
-                        logger.warning(f"🔒 BREAKEVEN CLOSE: {symbol} {side} - price returned to entry")
-                        try:
-                            # Set reason for trade history before closing
+                    if order_id:
+                        # Check if limit order has been filled
+                        order_status = await live_trader.check_order_status(symbol, order_id)
+                        status = order_status.get('status', 'unknown')
+                        
+                        if status == 'closed':
+                            # Limit order filled! True breakeven achieved
+                            fill_price = order_status.get('average', entry_price)
+                            
+                            # Calculate real PnL
+                            if side == 'LONG':
+                                real_pnl = (fill_price - entry_price) * state.get('contracts', 0)
+                            else:
+                                real_pnl = (entry_price - fill_price) * state.get('contracts', 0)
+                            
+                            logger.warning(f"✅ BREAKEVEN LIMIT FILLED: {symbol} {side} @ ${fill_price} | PnL: ${real_pnl:.4f}")
+                            
+                            # Record trade with real data
                             pending_close_reasons[symbol] = {
-                                "reason": f"BREAKEVEN_CLOSE: {spread_level} spread, activated at +{activation_threshold}%",
+                                "reason": f"BREAKEVEN_CLOSE: {spread_level} spread, limit filled @ ${fill_price}",
                                 "original_reason": "BREAKEVEN_CLOSE",
-                                "pnl": 0,  # Approximate
-                                "exitPrice": current_price,
+                                "pnl": round(real_pnl, 4),
+                                "exitPrice": fill_price,
                                 "timestamp": int(datetime.now().timestamp() * 1000)
                             }
-                            # Persist to SQLite so data survives restart
                             safe_create_task(sqlite_manager.save_position_close({
                                 'symbol': symbol,
                                 'side': side,
                                 'reason': 'BREAKEVEN_CLOSE',
                                 'original_reason': 'BREAKEVEN_CLOSE',
-                                'exitPrice': current_price,
+                                'exitPrice': fill_price,
+                                'pnl': round(real_pnl, 4),
                                 'timestamp': int(datetime.now().timestamp() * 1000)
                             }), name=f"persist_breakeven_{symbol}")
-                            result = await live_trader.close_position(symbol, side, abs(contracts))
-                            if result:
-                                actions["breakeven_closed"].append(symbol)
-                                # Clear state from memory and SQLite
-                                del self.breakeven_state[state_key]
-                                safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_breakeven_{symbol}")
-                                logger.warning(f"✅ BREAKEVEN CLOSE SUCCESS: {symbol}")
-                            else:
-                                logger.error(f"❌ BREAKEVEN CLOSE FAILED: {symbol}")
-                        except Exception as e:
-                            logger.error(f"❌ BREAKEVEN CLOSE ERROR: {symbol} - {e}")
+                            
+                            actions["breakeven_closed"].append(symbol)
+                            del self.breakeven_state[state_key]
+                            safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_breakeven_{symbol}")
+                            
+                        elif status == 'canceled':
+                            # Order was cancelled externally — clean up
+                            logger.warning(f"⚠️ BREAKEVEN ORDER CANCELLED: {symbol} - clearing state")
+                            del self.breakeven_state[state_key]
+                            safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_breakeven_{symbol}")
+                            
+                        elif status == 'error':
+                            # Could not check — retry next cycle
+                            logger.debug(f"⏳ BREAKEVEN ORDER CHECK FAILED: {symbol} #{order_id} - will retry")
+                            
+                        # else: status == 'open' — still waiting, do nothing
+                        
+                    else:
+                        # No order ID — retry placing limit order
+                        logger.warning(f"🔄 BREAKEVEN RETRY: {symbol} - no order ID, placing limit order")
+                        limit_result = await live_trader.close_position_limit(
+                            symbol, side, abs(contracts), entry_price
+                        )
+                        if limit_result:
+                            state['order_id'] = limit_result.get('id')
+                    
+                    # Safety: if position no longer exists on Binance, cancel order & clean up
+                    if contracts == 0 and order_id:
+                        logger.warning(f"🧹 BREAKEVEN CLEANUP: {symbol} - position gone, cancelling order")
+                        await live_trader.cancel_order(symbol, order_id)
+                        if state_key in self.breakeven_state:
+                            del self.breakeven_state[state_key]
+                        safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_breakeven_{symbol}")
                 
             except Exception as e:
                 logger.warning(f"Breakeven check error for position: {e}")
