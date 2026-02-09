@@ -6012,62 +6012,29 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     last_trade = binance_trades[-1] if binance_trades else {}
                     logger.info(f"📊 BINANCE_DATES: First trade={first_trade.get('date', 'N/A')} {first_trade.get('time', 'N/A')}, Last trade={last_trade.get('date', 'N/A')} {last_trade.get('time', 'N/A')}")
                     
-                    # Phase 181: MERGE strategy — engine trades are source of truth
-                    # Engine trades have accurate entry/exit/PnL from close_position()
-                    # Binance trades fill gaps for manual/external closes
+                    # Phase 181 v2: SQLite-primary approach
+                    # 1. Save each Binance trade to SQLite (enrichment happens in save_binance_trade)
+                    # 2. Reload from SQLite (get_binance_trades does LEFT JOIN with position_closes)
+                    # This ensures dedup + enrichment from engine close data
                     
-                    # Build lookup of engine-recorded trades by symbol+timestamp
-                    engine_trades = global_paper_trader.trades
-                    engine_lookup = {}
-                    for et in engine_trades:
-                        key = f"{et.get('symbol', '')}_{et.get('closeTime', 0)}"
-                        engine_lookup[key] = et
-                    
-                    merged_trades = []
-                    binance_matched = set()
-                    
-                    # First pass: use Binance trades but overlay engine data where available
+                    saved_count = 0
                     for bt in binance_trades:
-                        bt_symbol = bt.get('symbol', '')
-                        bt_time = bt.get('closeTime', bt.get('timestamp', 0))
-                        
-                        # Try to find matching engine trade (within 5-minute window)
-                        matched_engine = None
-                        for et in engine_trades:
-                            et_symbol = et.get('symbol', '')
-                            et_time = et.get('closeTime', 0)
-                            if et_symbol == bt_symbol and abs(et_time - bt_time) < 5 * 60 * 1000:
-                                matched_engine = et
-                                binance_matched.add(id(et))
-                                break
-                        
-                        if matched_engine:
-                            # Use engine data (more accurate entry/exit/pnl)
-                            # but keep Binance reason/closeReason if engine has generic reason
-                            merged = dict(matched_engine)
-                            if bt.get('closeReason'):
-                                merged['closeReason'] = merged.get('closeReason') or bt.get('closeReason')
-                            # Ensure roi and margin are present
-                            if 'roi' not in merged and 'margin' in merged and merged.get('margin', 0) > 0:
-                                merged['roi'] = round(merged.get('pnl', 0) / merged['margin'] * 100, 2)
-                            merged_trades.append(merged)
-                        else:
-                            # Pure Binance trade (manual close, no engine record)
-                            merged_trades.append(bt)
+                        try:
+                            bt_copy = bt.copy()
+                            bt_copy['incomeId'] = f"{bt.get('symbol', 'UNK')}_{bt.get('closeTime', bt.get('timestamp', 0))}"
+                            await sqlite_manager.save_binance_trade(bt_copy)
+                            saved_count += 1
+                        except Exception as e:
+                            logger.debug(f"Save trade error: {e}")
                     
-                    # Second pass: add engine trades not matched to any Binance trade
-                    for et in engine_trades:
-                        if id(et) not in binance_matched:
-                            merged_trades.append(et)
-                    
-                    # Sort by closeTime descending
-                    merged_trades.sort(key=lambda t: t.get('closeTime', t.get('timestamp', 0)), reverse=True)
+                    # Reload from SQLite — this is the canonical source with enrichment
+                    sqlite_trades = await sqlite_manager.get_binance_trades(limit=200)
                     
                     ui_state_cache.binance_trades = binance_trades
-                    ui_state_cache.trades = merged_trades
+                    ui_state_cache.trades = sqlite_trades
                     ui_state_cache.last_binance_trade_fetch = now
-                    ui_state_cache.pending_trade_fetch_time = 0  # Reset trigger
-                    logger.info(f"📊 MERGE_SUCCESS: {len(binance_trades)} Binance + {len(engine_trades)} engine → {len(merged_trades)} merged trades")
+                    ui_state_cache.pending_trade_fetch_time = 0
+                    logger.info(f"📊 SQLITE_PRIMARY: Saved {saved_count} Binance trades → Loaded {len(sqlite_trades)} enriched trades from SQLite")
             except Exception as e:
                 import traceback
                 logger.error(f"📊 BINANCE_ERROR: {e}")
@@ -9452,10 +9419,15 @@ class BreakevenStopManager:
                             safe_create_task(sqlite_manager.save_position_close({
                                 'symbol': symbol,
                                 'side': side,
-                                'reason': 'BREAKEVEN_CLOSE',
+                                'reason': f"BREAKEVEN_CLOSE: {spread_level} spread, limit filled @ ${fill_price}",
                                 'original_reason': 'BREAKEVEN_CLOSE',
+                                'entryPrice': entry_price,
                                 'exitPrice': fill_price,
                                 'pnl': round(real_pnl, 4),
+                                'leverage': pos.get('leverage', 10),
+                                'sizeUsd': pos.get('sizeUsd', 0),
+                                'margin': round(margin_val, 4),
+                                'roi': round(roi_val, 2),
                                 'timestamp': int(datetime.now().timestamp() * 1000)
                             }), name=f"persist_breakeven_{symbol}")
                             
@@ -9689,9 +9661,15 @@ class LossRecoveryTrailManager:
                                 safe_create_task(sqlite_manager.save_position_close({
                                     'symbol': symbol,
                                     'side': side,
-                                    'reason': 'RECOVERY_TRAIL_CLOSE',
+                                    'reason': f"RECOVERY_TRAIL_CLOSE: peak_loss={peak_loss:.1f}%, recovered to {peak_recovery_pnl:.1f}%, gave back {giveback_ratio*100:.0f}%",
                                     'original_reason': 'RECOVERY_TRAIL_CLOSE',
+                                    'entryPrice': entry_price,
                                     'exitPrice': current_price,
+                                    'pnl': round(actual_pnl, 4),
+                                    'leverage': pos.get('leverage', 10),
+                                    'sizeUsd': pos.get('sizeUsd', 0),
+                                    'margin': round(margin_val, 4),
+                                    'roi': round(roi_val, 2),
                                     'timestamp': int(datetime.now().timestamp() * 1000)
                                 }), name=f"persist_recovery_{symbol}")
                                 result = await live_trader.close_position(symbol, side, abs(contracts))
