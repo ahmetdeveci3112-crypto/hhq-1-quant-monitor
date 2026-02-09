@@ -236,16 +236,16 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 // PB%: Actual pullback = distance from price to entry
                                 const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Bounce%: ATR-only confirmation (Phase 160)
-                                // bounce_factor: 0.10 (strong trend) to 0.20 (weak trend) × ATR
+                                // Bounce%: Phase 170 — Reduced bounce for better fill rate
+                                // bounce_factor: 0.05 (strong trend) to 0.10 (weak trend) × ATR
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const hurstStr = Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4));
                                 const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
                                 const trendStr = hurstStr * 0.6 + zStr * 0.4;
-                                const bounceFactor = 0.20 - trendStr * 0.10;
+                                const bounceFactor = 0.10 - trendStr * 0.05;  // 0.05-0.10 (was 0.10-0.20)
                                 const rawBounce = atrPct * bounceFactor;
-                                // Cap at 50% of pullback (bounce can NEVER exceed pullback)
-                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.5) : rawBounce;
+                                // Cap at 25% of pullback (was 50%)
+                                const bouncePct = pbPct > 0 ? Math.min(rawBounce, pbPct * 0.25) : rawBounce;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>

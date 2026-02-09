@@ -12591,27 +12591,28 @@ class PaperTradingEngine:
                     order['bounceStartPrice'] = current_price
                     order['bounceStartVolume'] = current_volume  # Volume snapshot
                     order['bouncePriceHistory'] = [current_price]  # Track price trend
-                    # Pre-calculate bounce thresholds for logging (Phase 160: ATR-only)
+                    # Pre-calculate bounce thresholds for logging
+                    # Phase 170: Reduced bounce — use 0.05-0.10×ATR (was 0.10-0.20)
                     order_adx = order.get('adx', 0)
                     order_hurst = order.get('hurst', 0.5)
                     adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
                     hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                     trend_s = adx_s * 0.6 + hurst_s * 0.4
-                    bf = 0.20 - trend_s * 0.10  # bounce factor
+                    bf = 0.10 - trend_s * 0.05  # bounce factor: 0.05-0.10 (was 0.10-0.20)
                     bounce_dist = atr * bf
-                    # Cap at 50% of pullback
+                    # Cap at 25% of pullback (was 50%)
                     pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
                     if pb_dist > 0:
-                        bounce_dist = min(bounce_dist, pb_dist * 0.5)
+                        bounce_dist = min(bounce_dist, pb_dist * 0.25)
                     bounce_pct = (bounce_dist / entry_price * 100) if entry_price > 0 else 0
                     self.add_log(f"⏳ BOUNCE WAIT: {side} {symbol} @ ${current_price:.6f} | Bounce≥{bounce_pct:.2f}% (ATR×{bf:.2f})")
                     logger.info(f"⏳ BOUNCE WAIT START: {side} {symbol} entry=${entry_price:.6f} current=${current_price:.6f} bounce_pct={bounce_pct:.2f}% vol={current_volume:.0f}")
             else:
                 # Step 2: Waiting for bounce confirmation
-                # Phase 160: ATR-ONLY BOUNCE (replaces old ATR×trend×ET formula)
-                # Bounce = ATR × bounce_factor × trend_modifier
-                # ET does NOT affect bounce (only pullback uses ET)
-                # Bounce is always capped at 50% of pullback distance
+                # Phase 170: REDUCED BOUNCE (was Phase 160 ATR×0.10-0.20)
+                # Bounce = ATR × bounce_factor (0.05-0.10)
+                # Smaller bounce = more fills while still confirming direction
+                # Capped at 25% of pullback (was 50%)
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
                 
@@ -12621,9 +12622,9 @@ class PaperTradingEngine:
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
                 
                 # Bounce factor: strong trend → smaller bounce needed
-                # Range: 0.10 (strong trend) to 0.20 (weak trend) × ATR
-                bounce_factor = 0.20 - trend_strength * 0.10  # 0.10 to 0.20
-                bounce_confirm_distance = atr * bounce_factor  # NO et_mult!
+                # Range: 0.05 (strong trend) to 0.10 (weak trend) × ATR
+                bounce_factor = 0.10 - trend_strength * 0.05  # 0.05 to 0.10 (was 0.10-0.20)
+                bounce_confirm_distance = atr * bounce_factor
                 
                 # Cancel distance: how far below entry before giving up
                 import math
@@ -12632,13 +12633,12 @@ class PaperTradingEngine:
                 bounce_cancel_distance = atr * base_cancel
                 bounce_timeout_ms = 15 * 60 * 1000    # 15 minute timeout
                 
-                # Cap bounce at 50% of pullback distance
-                # Bounce can NEVER exceed pullback — that would require price to go above signal price
+                # Cap bounce at 25% of pullback distance (was 50%)
                 pullback_distance = abs(entry_price - order.get('signalPrice', entry_price))
                 if pullback_distance > 0:
-                    max_bounce = pullback_distance * 0.5
+                    max_bounce = pullback_distance * 0.25  # 25% cap (was 50%)
                     if bounce_confirm_distance > max_bounce:
-                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (50% of pullback {pullback_distance:.6f})")
+                        logger.debug(f"🔧 BOUNCE CAP: {symbol} bounce {bounce_confirm_distance:.6f} → {max_bounce:.6f} (25% of pullback {pullback_distance:.6f})")
                         bounce_confirm_distance = max_bounce
                 
                 # Calculate percentage equivalents for logging
