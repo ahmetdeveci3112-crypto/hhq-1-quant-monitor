@@ -3952,7 +3952,8 @@ class CoinOpportunity:
         self.signal_action: str = "NONE"  # LONG/SHORT/NONE
         self.zscore: float = 0.0
         self.hurst: float = 0.5
-        self.spread_pct: float = 0.0
+        self.spread_pct: float = 0.0  # ATR-based volatility % (legacy)
+        self.bid_ask_spread_pct: float = 0.05  # Real bid-ask spread %
         self.imbalance: float = 0.0
         self.volume_24h: float = 0.0
         self.price_change_24h: float = 0.0
@@ -3970,7 +3971,8 @@ class CoinOpportunity:
             "signalAction": self.signal_action,
             "zscore": round(self.zscore, 2),
             "hurst": round(self.hurst, 2),
-            "spreadPct": round(self.spread_pct, 4),
+            "spreadPct": round(self.bid_ask_spread_pct, 4),  # Real bid-ask spread
+            "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
             "priceChange24h": round(self.price_change_24h, 2),
@@ -4391,7 +4393,7 @@ class LightweightCoinAnalyzer:
             imbalance=imbalance,
             price=self.opportunity.price,
             atr=atr,
-            spread_pct=self.opportunity.spread_pct,
+            spread_pct=self.opportunity.bid_ask_spread_pct,  # Phase 177: Real bid-ask spread
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             basis_pct=basis_pct,
@@ -5576,6 +5578,13 @@ class MultiCoinScanner:
                 analyzer.update_price(price, high, low, volume)
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
+                
+                # Phase 177: Calculate real bid-ask spread from WebSocket ticker
+                bid = ticker.get('bid', 0)
+                ask = ticker.get('ask', 0)
+                if bid > 0 and ask > 0:
+                    bid_ask_spread = ((ask - bid) / bid) * 100  # Percentage
+                    analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))

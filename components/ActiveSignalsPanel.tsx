@@ -23,16 +23,16 @@ const formatTime = (timestamp: number | null): string => {
 };
 
 const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level: string; pullback: number; leverage: number } => {
-    // spreadPct from backend = ATR/price × 100 (volatility %)
-    // BTC ~1.0-1.5%, ETH/SOL ~2.0-3.5%, mid caps ~4-6%, small caps ~6-10%, meme 10%+
+    // spreadPct from backend = real bid-ask spread % from Binance WebSocket
+    // BTC ~0.005%, ETH ~0.01%, mid caps ~0.03-0.08%, small caps ~0.1-0.2%, meme ~0.3%+
     let basePullback: number;
     let leverage: number;
     let level: string;
 
-    if (spreadPct <= 1.5) { level = 'Very Low'; basePullback = 0.3; leverage = 50; }
-    else if (spreadPct <= 3.0) { level = 'Low'; basePullback = 0.6; leverage = 25; }
-    else if (spreadPct <= 5.0) { level = 'Normal'; basePullback = 1.0; leverage = 10; }
-    else if (spreadPct <= 8.0) { level = 'High'; basePullback = 1.5; leverage = 5; }
+    if (spreadPct <= 0.015) { level = 'Very Low'; basePullback = 0.3; leverage = 50; }
+    else if (spreadPct <= 0.05) { level = 'Low'; basePullback = 0.6; leverage = 25; }
+    else if (spreadPct <= 0.12) { level = 'Normal'; basePullback = 1.0; leverage = 10; }
+    else if (spreadPct <= 0.25) { level = 'High'; basePullback = 1.5; leverage = 5; }
     else { level = 'Very High'; basePullback = 2.0; leverage = 3; }
 
     const adjustedPullback = basePullback * entryTightness;
@@ -93,7 +93,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     // Mobile Card Component
     const SignalCard = ({ signal, key: _key }: { signal: CoinOpportunity; key?: string }) => {
         const isLong = signal.signalAction === 'LONG';
-        const spreadInfo = getSpreadInfo(signal.spreadPct || 5, entryTightness);
+        const spreadInfo = getSpreadInfo(signal.spreadPct || 0.05, entryTightness);
         // Use backend leverage if available, fallback to local calculation
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = isLong
@@ -230,7 +230,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         ) : (
                             activeSignals.map((signal) => {
                                 const isLong = signal.signalAction === 'LONG';
-                                const spreadInfo = getSpreadInfo(signal.spreadPct || 5, entryTightness);
+                                const spreadInfo = getSpreadInfo(signal.spreadPct || 0.05, entryTightness);
                                 const entryPrice = isLong
                                     ? signal.price * (1 - spreadInfo.pullback / 100)
                                     : signal.price * (1 + spreadInfo.pullback / 100);
