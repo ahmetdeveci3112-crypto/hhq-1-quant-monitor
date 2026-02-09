@@ -2308,10 +2308,15 @@ async def binance_position_sync_loop():
                             low_24h = float(ticker.get('low', entry_price * 0.98))
                             estimated_atr = (high_24h - low_24h) / 3  # ~3 ATR in 24h range
                             volatility_pct = (estimated_atr / entry_price) * 100 if entry_price > 0 else 2.0
+                            # Phase 178: Real bid-ask spread from WS ticker
+                            bid = float(ticker.get('bid', 0))
+                            ask = float(ticker.get('ask', 0))
+                            sync_spread_pct = ((ask - bid) / bid * 100) if bid > 0 and ask > 0 else 0.05
                         else:
                             # Fallback to 2% estimate
                             estimated_atr = entry_price * 0.02
                             volatility_pct = 2.0
+                            sync_spread_pct = 0.05
                         
                         atr = estimated_atr
                         
@@ -2320,7 +2325,7 @@ async def binance_position_sync_loop():
                             volatility_pct=volatility_pct,
                             hurst=0.5,  # Default neutral
                             price=entry_price,
-                            spread_pct=0.0
+                            spread_pct=sync_spread_pct  # Phase 178: Real spread
                         )
                         
                         logger.info(f"📊 Volatility calc: {symbol} ATR%={volatility_pct:.2f}% → trail_act={trail_activation_atr}x, trail_dist={trail_distance_atr}x")
@@ -4013,6 +4018,14 @@ class LightweightCoinAnalyzer:
         
         # Phase 156: Order book imbalance trend tracking
         self.imbalance_history: deque = deque(maxlen=100)  # Son ~5 dk imbalance kaydı
+        
+        # Phase 178: Tick aggregation for proper candle-like high/low/volume
+        self._tick_high: float = 0.0
+        self._tick_low: float = float('inf')
+        self._tick_volume: float = 0.0
+        self._tick_count: int = 0
+        self._last_candle_time: float = 0.0
+        self._candle_interval: int = 300  # 5-minute candles (matches preload)
     
     def get_coin_stats(self) -> dict:
         """
@@ -4229,43 +4242,73 @@ class LightweightCoinAnalyzer:
             logger.info(f"📊 {self.symbol}: Preloaded {len(self.prices)} candles, spreads={len(self.spreads)}")
         
     def update_price(self, price: float, high: float = None, low: float = None, volume: float = 0):
-        """Update price data."""
-        self.prices.append(price)
-        self.closes.append(price)
-        h = high or price
-        l = low or price
-        self.highs.append(h)
-        self.lows.append(l)
-        self.volumes.append(volume)
+        """
+        Update price data with tick aggregation for proper candle construction.
         
-        # Phase 115: Smart spreads calculation
-        closes_len = len(self.closes)
-        if closes_len >= 20:
-            # If this is first time we have 40+ candles and spreads < 20, do retroactive calculation
-            if closes_len >= 40 and len(self.spreads) < 20:
-                # Retroactively calculate all spreads
-                self.spreads.clear()
-                closes_list = list(self.closes)
-                for i in range(19, len(closes_list)):
-                    ma = np.mean(closes_list[max(0, i-19):i+1])
-                    spread = closes_list[i] - ma
-                    self.spreads.append(spread)
-                logger.info(f"📊 {self.symbol}: Retroactive spreads calculated - closes={closes_len}, spreads={len(self.spreads)}")
-            else:
-                # Normal incremental spread calculation
-                ma = np.mean(list(self.closes)[-20:])
-                spread = price - ma
-                self.spreads.append(spread)
+        Phase 178: Instead of appending 24H high/low from WS ticker every tick,
+        accumulate ticks and create proper 5-minute candles with real per-candle
+        high/low/volume data. This fixes ATR/ADX inflation.
+        """
+        now = datetime.now().timestamp()
         
-        # Update VWAP (Typical Price = (H+L+C)/3)
-        typical_price = (h + l + price) / 3
-        self.vwap_numerator += typical_price * volume
-        self.vwap_denominator += volume
-        if self.vwap_denominator > 0:
-            self.vwap = self.vwap_numerator / self.vwap_denominator
-            
+        # Always update display price immediately
         self.opportunity.price = price
-        self.opportunity.last_update = datetime.now().timestamp()
+        self.opportunity.last_update = now
+        
+        # Track tick min/max/volume within current candle window
+        self._tick_high = max(self._tick_high, price)
+        if self._tick_low == float('inf'):
+            self._tick_low = price
+        else:
+            self._tick_low = min(self._tick_low, price)
+        self._tick_volume += volume
+        self._tick_count += 1
+        
+        # Initialize candle timer on first call
+        if self._last_candle_time == 0:
+            self._last_candle_time = now
+        
+        # Close candle every _candle_interval seconds
+        elapsed = now - self._last_candle_time
+        if elapsed >= self._candle_interval and self._tick_count > 1:
+            # Append completed candle data
+            self.prices.append(price)
+            self.closes.append(price)
+            self.highs.append(self._tick_high)
+            self.lows.append(self._tick_low)
+            self.volumes.append(self._tick_volume)
+            
+            # Update VWAP with proper candle data (Typical Price = (H+L+C)/3)
+            typical_price = (self._tick_high + self._tick_low + price) / 3
+            self.vwap_numerator += typical_price * self._tick_volume
+            self.vwap_denominator += self._tick_volume
+            if self.vwap_denominator > 0:
+                self.vwap = self.vwap_numerator / self.vwap_denominator
+            
+            # Phase 115: Smart spreads calculation
+            closes_len = len(self.closes)
+            if closes_len >= 20:
+                if closes_len >= 40 and len(self.spreads) < 20:
+                    # Retroactively calculate all spreads
+                    self.spreads.clear()
+                    closes_list = list(self.closes)
+                    for i in range(19, len(closes_list)):
+                        ma = np.mean(closes_list[max(0, i-19):i+1])
+                        spread = closes_list[i] - ma
+                        self.spreads.append(spread)
+                    logger.info(f"📊 {self.symbol}: Retroactive spreads calculated - closes={closes_len}, spreads={len(self.spreads)}")
+                else:
+                    # Normal incremental spread calculation
+                    ma = np.mean(list(self.closes)[-20:])
+                    spread = price - ma
+                    self.spreads.append(spread)
+            
+            # Reset tick accumulators for next candle
+            self._tick_high = price
+            self._tick_low = price
+            self._tick_volume = 0.0
+            self._tick_count = 0
+            self._last_candle_time = now
     
     def analyze(self, imbalance: float = 0, basis_pct: float = 0.0) -> Optional[dict]:
         """Analyze coin and generate signal if conditions met."""
@@ -4497,7 +4540,8 @@ class BinanceWebSocketManager:
             self.tickers[symbol] = {
                 'last': float(ticker.get('c', 0)),  # Close price
                 'percentage': float(ticker.get('P', 0)),  # Price change percent
-                'quoteVolume': float(ticker.get('q', 0)),  # Quote volume
+                'quoteVolume': float(ticker.get('q', 0)),  # Quote volume (USDT)
+                'baseVolume': float(ticker.get('v', 0)),  # Base asset volume (Phase 178)
                 'high': float(ticker.get('h', 0)),  # High
                 'low': float(ticker.get('l', 0)),  # Low
                 'bid': float(ticker.get('b', 0)),  # Best bid price
@@ -4508,16 +4552,8 @@ class BinanceWebSocketManager:
                 'timestamp': int(ticker.get('E', 0))  # Event time
             }
         
-        # Update SMT Divergence detector with BTC and ETH data
-        if 'BTCUSDT' in self.tickers and 'ETHUSDT' in self.tickers:
-            btc = self.tickers['BTCUSDT']
-            eth = self.tickers['ETHUSDT']
-            smt_divergence_detector.update_prices(
-                btc_high=btc['high'], btc_low=btc['low'], btc_close=btc['last'],
-                eth_high=eth['high'], eth_low=eth['low'], eth_close=eth['last']
-            )
-            # Detect divergence periodically
-            smt_divergence_detector.detect_divergence()
+        # Phase 178: SMT Divergence moved to update_btc_eth_state() for candle-based data
+        # Using 24H high/low from ticker gave false swing high/low detection
         
         self.last_update = datetime.now().timestamp()
     
@@ -7518,6 +7554,31 @@ class BTCCorrelationFilter:
                     
             except Exception as eth_err:
                 logger.debug(f"ETH fetch error: {eth_err}")
+            
+            # =================================================================
+            # Phase 178: SMT Divergence with candle-based data
+            # Uses BTC 15m and ETH 30m OHLCV for proper swing high/low detection
+            # (Moved from WS ticker which used 24H high/low = wrong)
+            # =================================================================
+            try:
+                if ohlcv_15m and len(ohlcv_15m) >= 2:
+                    # Clear old ticker-based data and feed candle data
+                    for i, btc_candle in enumerate(ohlcv_15m):
+                        _, _, btc_h, btc_l, btc_c, _ = btc_candle
+                        # Use ETH 30m if available, otherwise estimate from ticker
+                        eth_h, eth_l, eth_c = btc_h, btc_l, btc_c  # fallback
+                        if eth_30m and i < len(eth_30m):
+                            _, _, eth_h, eth_l, eth_c, _ = eth_30m[i]
+                        elif eth_1h and len(eth_1h) > 0:
+                            _, _, eth_h, eth_l, eth_c, _ = eth_1h[-1]
+                        
+                        smt_divergence_detector.update_prices(
+                            btc_high=btc_h, btc_low=btc_l, btc_close=btc_c,
+                            eth_high=eth_h, eth_low=eth_l, eth_close=eth_c
+                        )
+                    smt_divergence_detector.detect_divergence()
+            except Exception as smt_err:
+                logger.debug(f"SMT update error: {smt_err}")
             
             # =================================================================
             # Phase 60: EMERGENCY MODE - Extreme market conditions
