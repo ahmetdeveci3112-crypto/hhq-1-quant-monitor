@@ -3210,10 +3210,11 @@ MTF_MIN_AGREEMENT = 4  # Minimum TF agreement required
 # Phase 73: ATR% thresholds adjusted 5× higher to match observed values
 # Observed ATR% in production: 13-55% (higher than typical due to 4h OHLCV source)
 # Low volatility = tighter stops, higher leverage | High volatility = wider stops, lower leverage
+# Phase 184: Leverage reduced to safer levels for small accounts
 VOLATILITY_LEVELS = {
-    "very_low":  {"max_atr_pct": 10.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 50, "pullback": 0.003},  # <10% = 50x
-    "low":       {"max_atr_pct": 20.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 25, "pullback": 0.006},  # <20% = 25x
-    "normal":    {"max_atr_pct": 30.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 10, "pullback": 0.012},  # <30% = 10x
+    "very_low":  {"max_atr_pct": 10.0,  "trail": 0.5, "sl": 1.5, "tp": 2.5, "leverage": 15, "pullback": 0.003},  # <10% = 15x (was 50x)
+    "low":       {"max_atr_pct": 20.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 10, "pullback": 0.006},  # <20% = 10x (was 25x)
+    "normal":    {"max_atr_pct": 30.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 7,  "pullback": 0.012},  # <30% = 7x (was 10x)
     "high":      {"max_atr_pct": 50.0,  "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.018},  # <50% = 5x
     "very_high": {"max_atr_pct": 100,   "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 50%+ = 3x
 }
@@ -6950,7 +6951,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         
         # Apply MTF bonus/penalty (don't overwrite, just adjust)
         if tf_count >= 3:
-            mtf_mult = 1.2   # +20% for all TFs aligned
+            mtf_mult = 1.1   # Phase 184: +10% for all TFs aligned (was +20%)
         elif tf_count >= 2:
             mtf_mult = 1.0   # No change for 2 TFs
         elif tf_count >= 1:
@@ -6959,7 +6960,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             mtf_mult = 0.6   # -40% for no TF aligned
         
         adjusted_leverage = int(round(current_leverage * mtf_mult))
-        adjusted_leverage = max(3, min(75, adjusted_leverage))
+        adjusted_leverage = max(3, min(50, adjusted_leverage))  # Phase 184: cap 75→50
         
         signal['leverage'] = adjusted_leverage
         signal['tf_count'] = tf_count
@@ -11425,24 +11426,24 @@ def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float
     
     threshold = base_threshold
     
-    # 1. Hurst Factor (Phase 128) - CONTINUOUS SCALING
-    # Linear interpolation: H=0.2 → 0.6x factor, H=0.5 → 1.0x, H=0.8 → 1.4x
-    # Formula: factor = 1.0 + (hurst - 0.5) * 1.33
-    # This gives smoother, per-coin unique thresholds
-    hurst_factor = 1.0 + (hurst - 0.5) * 1.33
+    # 1. Hurst Factor (Phase 184) - NARROWED RANGE for more signals
+    # Linear interpolation: H=0.2 → 0.8x factor, H=0.5 → 1.0x, H=0.8 → 1.2x
+    # Narrower range (was 0.6x-1.4x) so hurst doesn't over-inflate threshold
+    hurst_factor = 1.0 + (hurst - 0.5) * 0.67
     
-    # Clamp factor to reasonable bounds (0.6x to 1.4x)
-    hurst_factor = max(0.6, min(1.4, hurst_factor))
+    # Clamp factor to narrower bounds (0.8x to 1.2x)
+    hurst_factor = max(0.8, min(1.2, hurst_factor))
     
     threshold *= hurst_factor
     
     # 2. ATR Factor (existing logic)
     atr_pct = (atr / price) * 100
     
+    # Phase 184: Reduced ATR inflation (was 1.2x → 1.1x)
     if atr_pct > 2.0:  # High volatility
-        threshold *= 1.2  # 20% harder (was 30%)
+        threshold *= 1.1  # 10% harder (was 20%)
     elif atr_pct < 0.5:  # Low volatility
-        threshold *= 0.85  # 15% easier (was 20%)
+        threshold *= 0.85  # 15% easier
     
     return threshold
 
@@ -11627,7 +11628,7 @@ class SignalGenerator:
         # When ADX > 30, it indicates a strong trend - reject counter-trend signals
         # This prevents losses like LYNUSDT SHORT during strong bullish rallies
         # =====================================================================
-        ADX_STRONG_TREND_THRESHOLD = 30  # ADX above this = strong trend
+        ADX_STRONG_TREND_THRESHOLD = 40  # Phase 184: Raised from 30 to reject fewer signals
         
         if adx > ADX_STRONG_TREND_THRESHOLD:
             # Strong trend detected - reject signals against the trend
