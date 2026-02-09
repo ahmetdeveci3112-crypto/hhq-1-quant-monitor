@@ -12596,6 +12596,12 @@ class PaperTradingEngine:
                     trail_factor = 0.10 - trend_s * 0.05
                     trail_entry_dist = atr * trail_factor
                     
+                    # Apply entry_tightness: mirrors exit_tightness in Trail TP
+                    # Higher entry_tightness = require bigger reversal = more conservative
+                    import math
+                    et_mult = math.sqrt(max(0.5, self.entry_tightness))  # 1.0→1.0x, 1.8→1.34x
+                    trail_entry_dist *= et_mult
+                    
                     # Cap at 25% of pullback distance
                     pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
                     if pb_dist > 0:
@@ -12604,8 +12610,8 @@ class PaperTradingEngine:
                     order['trailEntryDistance'] = trail_entry_dist
                     
                     trail_pct = (trail_entry_dist / entry_price * 100) if entry_price > 0 else 0
-                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f})")
-                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}%")
+                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f}×ET{et_mult:.2f})")
+                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness}")
             else:
                 # Step 2: Trailing entry active — track extreme and check reversal
                 # This mirrors Trail TP: track peakPrice, trigger when price drops by trail_distance
