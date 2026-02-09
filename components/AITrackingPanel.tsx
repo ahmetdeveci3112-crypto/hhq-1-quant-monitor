@@ -40,13 +40,21 @@ interface OptimizerStats {
 
 interface MarketRegime {
     currentRegime: string;
+    trendDirection?: string;
     lastUpdate: string | null;
     priceCount: number;
     params: {
         min_score_adjustment: number;
         trail_distance_mult: number;
+        sl_atr_mult?: number;
+        tp_atr_mult?: number;
+        long_bonus?: number;
+        short_penalty?: number;
+        long_penalty?: number;
+        short_bonus?: number;
         description: string;
     };
+    recentChanges?: { from: string; to: string; time: string }[];
 }
 
 interface Props {
@@ -59,10 +67,12 @@ interface Props {
 
 const getRegimeStyle = (regime: string) => {
     switch (regime) {
-        case 'TRENDING': return { color: 'text-emerald-400', bg: 'bg-emerald-500/20', icon: '📈' };
-        case 'VOLATILE': return { color: 'text-rose-400', bg: 'bg-rose-500/20', icon: '🔥' };
-        case 'QUIET': return { color: 'text-blue-400', bg: 'bg-blue-500/20', icon: '😴' };
-        default: return { color: 'text-amber-400', bg: 'bg-amber-500/20', icon: '↔️' };
+        case 'TRENDING_UP': return { color: 'text-emerald-400', bg: 'bg-emerald-500/20', icon: '🐂', label: 'BULL' };
+        case 'TRENDING_DOWN': return { color: 'text-rose-400', bg: 'bg-rose-500/20', icon: '🐻', label: 'BEAR' };
+        case 'TRENDING': return { color: 'text-blue-400', bg: 'bg-blue-500/20', icon: '📊', label: 'TRENDING' };
+        case 'VOLATILE': return { color: 'text-orange-400', bg: 'bg-orange-500/20', icon: '🔥', label: 'VOLATILE' };
+        case 'QUIET': return { color: 'text-sky-400', bg: 'bg-sky-500/20', icon: '😴', label: 'QUIET' };
+        default: return { color: 'text-amber-400', bg: 'bg-amber-500/20', icon: '↔️', label: 'RANGING' };
     }
 };
 
@@ -126,25 +136,62 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             <span className="text-3xl">{regimeStyle.icon}</span>
                             <div>
                                 <div className={`text-lg font-bold ${regimeStyle.color}`}>
-                                    {marketRegime.currentRegime}
+                                    {regimeStyle.label}
                                 </div>
                                 <div className="text-xs text-slate-400">
                                     {marketRegime.params?.description || 'Piyasa Durumu'}
                                 </div>
                             </div>
                         </div>
-                        <div className="text-right">
-                            <div className="text-xs text-slate-400">Min Score Adj</div>
-                            <div className={`font-bold ${marketRegime.params?.min_score_adjustment > 0 ? 'text-rose-400' : marketRegime.params?.min_score_adjustment < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
-                                {marketRegime.params?.min_score_adjustment > 0 ? '+' : ''}{marketRegime.params?.min_score_adjustment || 0}
+                        <div className="flex items-center gap-4">
+                            {/* BTC Trend Direction */}
+                            {marketRegime.trendDirection && (
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500 uppercase">BTC Trend</div>
+                                    <div className={`text-sm font-bold ${marketRegime.trendDirection === 'UP' ? 'text-emerald-400' :
+                                            marketRegime.trendDirection === 'DOWN' ? 'text-rose-400' : 'text-slate-400'
+                                        }`}>
+                                        {marketRegime.trendDirection === 'UP' ? '▲ UP' :
+                                            marketRegime.trendDirection === 'DOWN' ? '▼ DOWN' : '— NEUTRAL'}
+                                    </div>
+                                </div>
+                            )}
+                            {/* Regime Params */}
+                            <div className="flex gap-3">
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500">Score</div>
+                                    <div className={`text-sm font-bold ${(marketRegime.params?.min_score_adjustment || 0) > 0 ? 'text-rose-400' : (marketRegime.params?.min_score_adjustment || 0) < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
+                                        {(marketRegime.params?.min_score_adjustment || 0) > 0 ? '+' : ''}{marketRegime.params?.min_score_adjustment || 0}
+                                    </div>
+                                </div>
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500">Trail</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.trail_distance_mult?.toFixed(1) || '1.0'}</div>
+                                </div>
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500">SL</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.sl_atr_mult?.toFixed(1) || '1.0'}</div>
+                                </div>
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500">TP</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.tp_atr_mult?.toFixed(1) || '1.0'}</div>
+                                </div>
                             </div>
                         </div>
                     </div>
-                    {marketRegime.lastUpdate && (
-                        <div className="text-xs text-slate-500 mt-2">
-                            Son güncelleme: {new Date(marketRegime.lastUpdate).toLocaleTimeString('tr-TR')}
-                        </div>
-                    )}
+                    <div className="flex items-center justify-between mt-2">
+                        {marketRegime.lastUpdate && (
+                            <div className="text-[10px] text-slate-500">
+                                Son: {new Date(marketRegime.lastUpdate).toLocaleTimeString('tr-TR')} | {marketRegime.priceCount} fiyat
+                            </div>
+                        )}
+                        {/* Recent regime change */}
+                        {marketRegime.recentChanges && marketRegime.recentChanges.length > 0 && (
+                            <div className="text-[10px] text-slate-500">
+                                Son değişim: {marketRegime.recentChanges[marketRegime.recentChanges.length - 1].from} → {marketRegime.recentChanges[marketRegime.recentChanges.length - 1].to}
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
 
