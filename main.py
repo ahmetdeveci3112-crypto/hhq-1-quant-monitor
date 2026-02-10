@@ -6266,8 +6266,19 @@ async def background_scanner_loop():
                                     status = order_status.get('status', 'unknown')
                                     
                                     if status == 'closed':
-                                        # Limit filled! Close with fill price
+                                        # Phase 185: Check for partial fills
                                         fill_price = order_status.get('average', pending.get('limit_price', current_price))
+                                        remaining_amt = order_status.get('remaining', 0)
+                                        filled_amt = order_status.get('filled', 0)
+                                        
+                                        if remaining_amt > 0:
+                                            # Partial fill → market close remainder
+                                            logger.warning(f"⚠️ LIMIT_PARTIAL: {pos_symbol} filled={filled_amt:.4f} remaining={remaining_amt:.4f} → market closing rest")
+                                            try:
+                                                await live_binance_trader.close_position(pos_symbol, pos['side'], remaining_amt)
+                                            except Exception as pf_err:
+                                                logger.error(f"❌ Partial fill market close error: {pf_err}")
+                                        
                                         logger.warning(f"✅ LIMIT_FILLED: {pos_symbol} {pos['side']} @ ${fill_price:.6f} | Reason: {reason} | Elapsed: {elapsed:.0f}s")
                                         del pos['pending_limit_close']
                                         global_paper_trader.close_position(pos, fill_price, reason)
@@ -6592,9 +6603,9 @@ async def position_price_update_loop():
     Runs every 2 seconds to update prices ONLY for coins with open positions.
     This is 5x faster than the main scanner loop for critical position monitoring.
     """
-    logger.info("⚡ Position Price Updater started - 2s interval")
+    logger.info("⚡ Position Price Updater started - 1.5s interval (Phase 185)")
     
-    update_interval = 2  # Update every 2 seconds for fast SL/TP/trailing reactions
+    update_interval = 1.5  # Phase 185: Reduced from 2s for faster reactions
     
     # Wait for app to fully initialize
     await asyncio.sleep(5)
@@ -6651,6 +6662,54 @@ async def position_price_update_loop():
                         pos['unrealizedPnl'] = round(pnl, 6)
                         pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
                         pos['currentPrice'] = current_price
+                        
+                        # Phase 185: Check pending limit closes in fast loop
+                        pending = pos.get('pending_limit_close')
+                        if pending and pos.get('isLive', False) and live_binance_trader.enabled:
+                            order_id = pending.get('order_id')
+                            placed_at = pending.get('placed_at', 0)
+                            timeout = pending.get('timeout_seconds', 60)
+                            reason = pending.get('reason', 'TP_HIT')
+                            elapsed = datetime.now().timestamp() - placed_at
+                            
+                            try:
+                                order_check = await live_binance_trader.check_order_status(symbol, order_id)
+                                chk_status = order_check.get('status', 'unknown')
+                                
+                                if chk_status == 'closed':
+                                    fill_price = order_check.get('average', pending.get('limit_price', current_price))
+                                    remaining_amt = order_check.get('remaining', 0)
+                                    if remaining_amt > 0:
+                                        logger.warning(f"⚠️ FAST_PARTIAL: {symbol} remaining={remaining_amt:.4f} → market close")
+                                        try:
+                                            await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                                        except:
+                                            pass
+                                    logger.warning(f"✅ FAST_LIMIT_FILLED: {symbol} @ ${fill_price:.6f} | {reason} | {elapsed:.0f}s")
+                                    del pos['pending_limit_close']
+                                    global_paper_trader.close_position(pos, fill_price, reason)
+                                    continue
+                                elif chk_status in ('canceled', 'expired'):
+                                    del pos['pending_limit_close']
+                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    continue
+                                elif elapsed >= timeout:
+                                    logger.warning(f"⏰ FAST_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
+                                    await live_binance_trader.cancel_order(symbol, order_id)
+                                    del pos['pending_limit_close']
+                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    continue
+                                else:
+                                    continue  # Still pending — skip SL/TP checks
+                            except Exception as pe:
+                                if elapsed >= timeout:
+                                    try:
+                                        await live_binance_trader.cancel_order(symbol, order_id)
+                                    except:
+                                        pass
+                                    del pos['pending_limit_close']
+                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    continue
                         
                         # Check SL/TP exits with SPIKE BYPASS
                         sl = pos.get('stopLoss', 0)
@@ -9381,13 +9440,15 @@ class BreakevenStopManager:
             'Very High': {'floor': 4.0, 'atr_mult': 3.0},   # Meme coins
         }
         
-        # Phase 182: Fee buffer — limit order placed above entry to cover round-trip fees
+        # Phase 185: Fee buffer increased — minimum 0.5% for all levels
+        # Prevents partial fills on low-liquidity coins (ZKUSDT bug)
+        # Limit placed further from entry → fills completely before price reverses
         self.fee_buffers = {
-            'Very Low':  0.0005,  # 0.05%
-            'Low':       0.001,   # 0.10%
-            'Normal':    0.0015,  # 0.15%
-            'High':      0.002,   # 0.20%
-            'Very High': 0.003,   # 0.30%
+            'Very Low':  0.005,   # 0.50% (was 0.05%)
+            'Low':       0.005,   # 0.50% (was 0.10%)
+            'Normal':    0.006,   # 0.60% (was 0.15%)
+            'High':      0.008,   # 0.80% (was 0.20%)
+            'Very High': 0.010,   # 1.00% (was 0.30%)
         }
         
         # Phase 182: Minimum age before breakeven can activate (minutes)
@@ -9519,8 +9580,25 @@ class BreakevenStopManager:
                         status = order_status.get('status', 'unknown')
                         
                         if status == 'closed':
-                            # Limit order filled! True breakeven achieved
+                            # Phase 185: Check for partial fills!
+                            filled_amount = order_status.get('filled', 0)
+                            remaining_amount = order_status.get('remaining', 0)
                             fill_price = order_status.get('average', entry_price)
+                            total_contracts = state.get('contracts', abs(contracts))
+                            
+                            # If remaining > 0, limit only partially filled → market close the rest
+                            if remaining_amount > 0 and remaining_amount > total_contracts * 0.01:
+                                logger.warning(f"⚠️ BREAKEVEN PARTIAL FILL: {symbol} filled={filled_amount:.4f} remaining={remaining_amount:.4f} → market closing remainder")
+                                try:
+                                    market_result = await live_trader.close_position(symbol, side, remaining_amount)
+                                    if market_result:
+                                        logger.warning(f"✅ BREAKEVEN REMAINDER CLOSED: {symbol} {remaining_amount:.4f} contracts via market")
+                                    else:
+                                        logger.error(f"❌ BREAKEVEN REMAINDER FAILED: {symbol} — orphaned {remaining_amount:.4f} contracts!")
+                                except Exception as mkt_err:
+                                    logger.error(f"❌ BREAKEVEN MARKET FALLBACK ERROR: {symbol} — {mkt_err}")
+                            
+                            # Limit order filled (fully or partially)! Record breakeven
                             
                             # Calculate real PnL
                             if side == 'LONG':
