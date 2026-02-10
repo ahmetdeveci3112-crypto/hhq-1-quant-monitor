@@ -2540,6 +2540,18 @@ async def lifespan(app: FastAPI):
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
     
+    # Phase 187b: Load ALL trades from SQLite into paper_trader.trades
+    # This ensures WebSocket/REST endpoints serve complete historical data from the start
+    try:
+        sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
+        if sqlite_trades:
+            global_paper_trader.trades = sqlite_trades
+            logger.info(f"📊 Phase 187b: Loaded {len(sqlite_trades)} trades from SQLite into memory")
+        else:
+            logger.info("📊 Phase 187b: No trades found in SQLite")
+    except Exception as e:
+        logger.error(f"📊 Phase 187b: Failed to load trades from SQLite: {e}")
+    
     # Phase 154: Load persisted breakeven states
     await breakeven_stop_manager.load_from_sqlite()
     logger.info(f"🔒 Breakeven states loaded: {len(breakeven_stop_manager.breakeven_state)} active")
