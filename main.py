@@ -283,6 +283,32 @@ class SQLiteManager:
                 await db.execute('ALTER TABLE trades ADD COLUMN settings_snapshot TEXT DEFAULT "{}"')
             except:
                 pass
+            
+            # Phase 186: Comprehensive trade data persistence — all missing columns
+            migration_columns = [
+                ('stop_loss', 'REAL DEFAULT 0'),
+                ('take_profit', 'REAL DEFAULT 0'),
+                ('atr', 'REAL DEFAULT 0'),
+                ('trailing_stop', 'REAL DEFAULT 0'),
+                ('trail_activation', 'REAL DEFAULT 0'),
+                ('is_trailing_active', 'INTEGER DEFAULT 0'),
+                ('margin', 'REAL DEFAULT 0'),
+                ('roi', 'REAL DEFAULT 0'),
+                ('is_live', 'INTEGER DEFAULT 0'),
+                ('entry_method', 'TEXT DEFAULT "MARKET"'),
+                ('entry_slippage', 'REAL DEFAULT 0'),
+                ('entry_spread', 'REAL DEFAULT 0'),
+                ('binance_fill_price', 'REAL DEFAULT 0'),
+                ('binance_order_id', 'TEXT'),
+                ('hurst', 'REAL DEFAULT 0.5'),
+                ('adx', 'REAL DEFAULT 0'),
+                ('pullback_pct', 'REAL DEFAULT 0'),
+            ]
+            for col_name, col_type in migration_columns:
+                try:
+                    await db.execute(f'ALTER TABLE trades ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass  # Column already exists
             await db.commit()
             
             self._initialized = True
@@ -307,12 +333,17 @@ class SQLiteManager:
                 return default
     
     async def save_trade(self, trade: dict):
-        """Save a completed trade."""
+        """Save a completed trade — Phase 186: ALL fields persisted."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
                 INSERT OR REPLACE INTO trades 
-                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, open_time, close_time, close_reason, leverage, signal_score, mtf_score, z_score, spread_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, 
+                 open_time, close_time, close_reason, leverage, signal_score, mtf_score, z_score, 
+                 spread_level, settings_snapshot,
+                 stop_loss, take_profit, atr, trailing_stop, trail_activation, is_trailing_active,
+                 margin, roi, is_live, entry_method, entry_slippage, entry_spread, 
+                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade.get('id'),
                 trade.get('symbol'),
@@ -330,7 +361,26 @@ class SQLiteManager:
                 trade.get('signalScore', 0),
                 trade.get('mtfScore', 0),
                 trade.get('zScore', 0),
-                trade.get('spreadLevel', 'unknown')
+                trade.get('spreadLevel', 'unknown'),
+                json.dumps(trade.get('settingsSnapshot', {})),
+                # Phase 186: New fields
+                trade.get('stopLoss', 0),
+                trade.get('takeProfit', 0),
+                trade.get('atr', 0),
+                trade.get('trailingStop', 0),
+                trade.get('trailActivation', 0),
+                1 if trade.get('isTrailingActive', False) else 0,
+                trade.get('margin', 0),
+                trade.get('roi', 0),
+                1 if trade.get('isLive', False) else 0,
+                trade.get('entry_method', 'MARKET'),
+                trade.get('entry_slippage', 0),
+                trade.get('entry_spread', 0),
+                trade.get('binance_fill_price', 0),
+                trade.get('binance_order_id', ''),
+                trade.get('hurst', 0.5),
+                trade.get('adx', 0),
+                trade.get('pullbackPct', 0),
             ))
             await db.commit()
     
@@ -14440,6 +14490,15 @@ class PaperTradingEngine:
             "tpMultiplier": pos.get('tpMultiplier', 0),
             # Phase 155: AI Optimizer settings snapshot from open time
             "settingsSnapshot": pos.get('settingsSnapshot', {}),
+            # Phase 186: Execution quality + complete position data
+            "entry_method": pos.get('entry_method', 'MARKET'),
+            "entry_slippage": pos.get('entry_slippage', 0),
+            "entry_spread": pos.get('entry_spread', 0),
+            "binance_fill_price": pos.get('binance_fill_price', 0),
+            "binance_order_id": pos.get('binance_order_id', ''),
+            "hurst": pos.get('hurst', 0.5),
+            "adx": pos.get('adx', 0),
+            "pullbackPct": pos.get('pullbackPct', 0),
         }
         
         # Phase 138: LIVE positions - store reason for Binance sync, DON'T write trade yet
