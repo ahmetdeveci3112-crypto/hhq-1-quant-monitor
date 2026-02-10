@@ -6398,13 +6398,13 @@ async def update_ui_cache(opportunities: list, stats: dict):
         triggered = ui_state_cache.pending_trade_fetch_time > 0 and now >= ui_state_cache.pending_trade_fetch_time
         periodic = time_since_last_fetch > 60
         
-        # Phase 150: Startup instant load from SQLite
+        # Phase 187b: Startup instant load from SQLite trades table (full data)
         if not ui_state_cache.trades:
             try:
-                sqlite_trades = await sqlite_manager.get_binance_trades(limit=200)
+                sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
                 if sqlite_trades:
                     ui_state_cache.trades = sqlite_trades
-                    logger.info(f"📊 INSTANT_LOAD: {len(sqlite_trades)} trades from SQLite (no API call)")
+                    logger.info(f"📊 INSTANT_LOAD: {len(sqlite_trades)} trades from SQLite trades table (full data)")
             except Exception as e:
                 logger.debug(f"SQLite instant load error: {e}")
         
@@ -6439,14 +6439,14 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         except Exception as e:
                             logger.debug(f"Save trade error: {e}")
                     
-                    # Reload from SQLite — this is the canonical source with enrichment
-                    sqlite_trades = await sqlite_manager.get_binance_trades(limit=200)
+                    # Phase 187b: Reload from trades table — canonical source with full data
+                    sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
                     
                     ui_state_cache.binance_trades = binance_trades
                     ui_state_cache.trades = sqlite_trades
                     ui_state_cache.last_binance_trade_fetch = now
                     ui_state_cache.pending_trade_fetch_time = 0
-                    logger.info(f"📊 SQLITE_PRIMARY: Saved {saved_count} Binance trades → Loaded {len(sqlite_trades)} enriched trades from SQLite")
+                    logger.info(f"📊 Phase 187b: Saved {saved_count} Binance trades → Loaded {len(sqlite_trades)} from trades table (full data)")
             except Exception as e:
                 import traceback
                 logger.error(f"📊 BINANCE_ERROR: {e}")
