@@ -1369,7 +1369,7 @@ class LiveBinanceTrader:
             return True  # Often fails if already set, which is OK
     
     async def place_market_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
-        """Market emir gönder."""
+        """Market emir gönder — Phase 186: with execution quality logging."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, order rejected")
             return None
@@ -1380,12 +1380,17 @@ class LiveBinanceTrader:
             # Kaldıraç ayarla
             await self.set_leverage(symbol, leverage)
             
-            # Fiyat çek ve miktar hesapla
+            # Phase 186: Capture pre-order book state
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             price = ticker['last']
+            best_bid = ticker.get('bid', price)
+            best_ask = ticker.get('ask', price)
+            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
+            spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
+            
             amount = size_usd / price
             
-            # Minimum lot size kontrolü (Binance gereksinimleri)
+            # Minimum lot size kontrolü
             markets = await self.exchange.load_markets()
             market = markets.get(ccxt_symbol)
             if market:
@@ -1393,6 +1398,8 @@ class LiveBinanceTrader:
                 if amount < min_amount:
                     logger.warning(f"⚠️ Amount {amount} below minimum {min_amount}, adjusting...")
                     amount = min_amount
+            
+            send_time = datetime.now().timestamp()
             
             # Emir gönder
             order_side = 'buy' if side == 'LONG' else 'sell'
@@ -1403,28 +1410,209 @@ class LiveBinanceTrader:
                 params={'reduceOnly': False}
             )
             
+            fill_time = datetime.now().timestamp()
+            avg_fill = float(order.get('average', price))
+            fee_cost = float(order.get('fee', {}).get('cost', 0))
+            
+            # Phase 186: Calculate slippage
+            if side == 'LONG':
+                reference = best_ask if best_ask else price
+                slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else 0
+            else:
+                reference = best_bid if best_bid else price
+                slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else 0
+            
+            latency_ms = (fill_time - send_time) * 1000
+            
             logger.info(f"📤 BINANCE ORDER SENT: {side} {symbol}")
             logger.info(f"   💵 Size: ${size_usd:.2f} | Amount: {amount:.6f}")
             logger.info(f"   📊 Leverage: {leverage}x | Price: ${price:.4f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
+            logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} MARKET | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
             
             return {
                 'id': order.get('id'),
                 'symbol': symbol,
                 'side': side,
                 'amount': amount,
-                'price': price,
+                'price': avg_fill,  # Use actual fill price
                 'cost': size_usd,
                 'status': order.get('status', 'filled'),
-                'timestamp': int(datetime.now().timestamp() * 1000)
+                'timestamp': int(datetime.now().timestamp() * 1000),
+                'slippage_pct': slippage_pct,
+                'spread_pct': spread_pct,
+                'fee': fee_cost,
             }
             
         except Exception as e:
             logger.error(f"❌ BINANCE ORDER FAILED: {side} {symbol} | Error: {e}")
             return None
     
+    async def place_limit_entry_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
+        """
+        Phase 186: Limit entry with aggressive pricing + 3s timeout → market fallback.
+        LONG: limit at best_ask + 2 ticks (crosses spread slightly for fast fill)
+        SHORT: limit at best_bid - 2 ticks
+        """
+        if not self.enabled or not self.exchange:
+            logger.error("❌ LiveBinanceTrader not enabled, order rejected")
+            return None
+            
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            await self.set_leverage(symbol, leverage)
+            
+            # Fetch ticker for pricing
+            ticker = await self.exchange.fetch_ticker(ccxt_symbol)
+            price = ticker['last']
+            best_bid = ticker.get('bid', price)
+            best_ask = ticker.get('ask', price)
+            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
+            spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
+            
+            amount = size_usd / price
+            
+            # Minimum lot size
+            markets = await self.exchange.load_markets()
+            market = markets.get(ccxt_symbol)
+            tick_size = 0.0001  # Default
+            if market:
+                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+                if amount < min_amount:
+                    amount = min_amount
+                # Get price tick size
+                tick_size = market.get('precision', {}).get('price', 0.0001)
+                if isinstance(tick_size, int):
+                    tick_size = 10 ** (-tick_size)  # ccxt sometimes returns precision as decimal places
+            
+            # Aggressive limit pricing: cross the spread slightly
+            order_side = 'buy' if side == 'LONG' else 'sell'
+            if side == 'LONG':
+                limit_price = best_ask + (tick_size * 2)  # 2 ticks above ask
+            else:
+                limit_price = best_bid - (tick_size * 2)  # 2 ticks below bid
+            
+            limit_price = float(self.exchange.price_to_precision(ccxt_symbol, limit_price))
+            amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
+            
+            send_time = datetime.now().timestamp()
+            
+            # Send limit order (IOC would be better but GTC + cancel is more portable)
+            order = await self.exchange.create_limit_order(
+                ccxt_symbol,
+                order_side,
+                amount,
+                limit_price,
+                params={'reduceOnly': False, 'timeInForce': 'GTC'}
+            )
+            
+            order_id = order.get('id')
+            logger.info(f"📤 LIMIT ENTRY: {side} {symbol} @ ${limit_price:.6f} | Amount: {amount}")
+            
+            # Wait 3 seconds for fill
+            await asyncio.sleep(3)
+            
+            # Check fill status
+            order_check = await self.exchange.fetch_order(order_id, ccxt_symbol)
+            status = order_check.get('status', 'unknown')
+            filled = float(order_check.get('filled', 0))
+            remaining = float(order_check.get('remaining', 0))
+            avg_fill = float(order_check.get('average', 0))
+            
+            fill_time = datetime.now().timestamp()
+            latency_ms = (fill_time - send_time) * 1000
+            
+            if status == 'closed' and remaining <= 0:
+                # Fully filled via limit! Best case — reduced slippage
+                fee_cost = float(order_check.get('fee', {}).get('cost', 0))
+                
+                if side == 'LONG':
+                    slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else 0
+                else:
+                    slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
+                
+                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT_FILLED | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                
+                return {
+                    'id': order_id,
+                    'symbol': symbol,
+                    'side': side,
+                    'amount': filled,
+                    'price': avg_fill,
+                    'cost': size_usd,
+                    'status': 'filled',
+                    'timestamp': int(datetime.now().timestamp() * 1000),
+                    'slippage_pct': slippage_pct,
+                    'spread_pct': spread_pct,
+                    'fee': fee_cost,
+                    'entry_method': 'LIMIT',
+                }
+            
+            else:
+                # Not fully filled — cancel remainder and market fallback
+                if filled > 0:
+                    logger.warning(f"⚠️ LIMIT_PARTIAL_ENTRY: {side} {symbol} filled={filled:.4f} remaining={remaining:.4f}")
+                
+                # Cancel unfilled portion
+                try:
+                    await self.exchange.cancel_order(order_id, ccxt_symbol)
+                except:
+                    pass  # May already be filled/cancelled
+                
+                if remaining > 0:
+                    # Market fallback for unfilled portion
+                    logger.warning(f"🔄 LIMIT→MARKET FALLBACK: {side} {symbol} | {remaining:.4f} unfilled → market")
+                    try:
+                        fallback_order = await self.exchange.create_market_order(
+                            ccxt_symbol,
+                            order_side,
+                            remaining,
+                            params={'reduceOnly': False}
+                        )
+                        fallback_fill = float(fallback_order.get('average', price))
+                        
+                        # Weighted average fill price
+                        if filled > 0:
+                            total_filled = filled + float(fallback_order.get('filled', remaining))
+                            avg_fill = (avg_fill * filled + fallback_fill * float(fallback_order.get('filled', remaining))) / total_filled if total_filled > 0 else fallback_fill
+                        else:
+                            avg_fill = fallback_fill
+                            
+                    except Exception as fb_err:
+                        logger.error(f"❌ MARKET FALLBACK FAILED: {side} {symbol} | {fb_err}")
+                        if filled <= 0:
+                            return None  # Total failure
+                        # If partially filled via limit, continue with what we have
+                
+                if side == 'LONG':
+                    slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else 0
+                else:
+                    slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
+                
+                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT→MKT | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                
+                return {
+                    'id': order_id,
+                    'symbol': symbol,
+                    'side': side,
+                    'amount': filled + remaining,  # Total intended
+                    'price': avg_fill,
+                    'cost': size_usd,
+                    'status': 'filled',
+                    'timestamp': int(datetime.now().timestamp() * 1000),
+                    'slippage_pct': slippage_pct,
+                    'spread_pct': spread_pct,
+                    'entry_method': 'LIMIT_MKT_FALLBACK',
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ LIMIT ENTRY FAILED: {side} {symbol} | {e} — falling back to market")
+            # Full market fallback on any error
+            return await self.place_market_order(symbol, side, size_usd, leverage)
+    
     async def close_position(self, symbol: str, side: str, amount: float) -> dict:
-        """Pozisyon kapat (reduceOnly=True) — Market order."""
+        """Pozisyon kapat (reduceOnly=True) — Market order. Phase 186: with exec logging."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, close rejected")
             return None
@@ -1432,6 +1620,18 @@ class LiveBinanceTrader:
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         
         try:
+            # Phase 186: Capture pre-close book state
+            try:
+                ticker = await self.exchange.fetch_ticker(ccxt_symbol)
+                best_bid = ticker.get('bid', 0)
+                best_ask = ticker.get('ask', 0)
+                mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else ticker.get('last', 0)
+                spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
+            except:
+                best_bid = best_ask = mid_price = spread_pct = 0
+            
+            send_time = datetime.now().timestamp()
+            
             # Kapanış emri - ters yönde reduceOnly
             close_side = 'sell' if side == 'LONG' else 'buy'
             order = await self.exchange.create_market_order(
@@ -1441,8 +1641,22 @@ class LiveBinanceTrader:
                 params={'reduceOnly': True}
             )
             
+            fill_time = datetime.now().timestamp()
+            avg_fill = float(order.get('average', 0))
+            fee_cost = float(order.get('fee', {}).get('cost', 0))
+            latency_ms = (fill_time - send_time) * 1000
+            
+            # Slippage: for CLOSE, selling LONG hits bid, buying SHORT hits ask
+            if side == 'LONG':
+                reference = best_bid if best_bid else avg_fill
+                slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else 0
+            else:
+                reference = best_ask if best_ask else avg_fill
+                slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else 0
+            
             logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
+            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
             
             return {
                 'id': order.get('id'),
@@ -1450,7 +1664,9 @@ class LiveBinanceTrader:
                 'side': side,
                 'amount': amount,
                 'status': order.get('status', 'filled'),
-                'timestamp': int(datetime.now().timestamp() * 1000)
+                'timestamp': int(datetime.now().timestamp() * 1000),
+                'slippage_pct': slippage_pct,
+                'fee': fee_cost,
             }
             
         except Exception as e:
@@ -13272,13 +13488,35 @@ class PaperTradingEngine:
         
         # =====================================================================
         # LIVE TRADING: Send order to Binance before creating local position
+        # Phase 186: Limit entry + pre-trade spread filter
         # =====================================================================
         if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
             try:
-                logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance...")
+                # Phase 186 Feature C: Pre-trade spread filter
+                ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
+                try:
+                    pre_ticker = await live_binance_trader.exchange.fetch_ticker(ccxt_sym)
+                    pre_bid = pre_ticker.get('bid', 0)
+                    pre_ask = pre_ticker.get('ask', 0)
+                    pre_mid = (pre_bid + pre_ask) / 2 if pre_bid and pre_ask else 0
+                    pre_spread = ((pre_ask - pre_bid) / pre_mid * 100) if pre_mid > 0 else 0
+                    
+                    ENTRY_SPREAD_LIMIT = 0.3  # Max 0.3% spread for entry
+                    if pre_spread > ENTRY_SPREAD_LIMIT:
+                        logger.warning(f"🚫 SPREAD_FILTER: Rejecting {side} {symbol} entry — spread={pre_spread:.3f}% > {ENTRY_SPREAD_LIMIT}% (bid=${pre_bid:.6f} ask=${pre_ask:.6f})")
+                        self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped (spread {pre_spread:.2f}% too wide)")
+                        # Return order to pending for retry
+                        if order not in self.pending_orders:
+                            self.pending_orders.append(order)
+                        return
+                except Exception as sf_err:
+                    logger.debug(f"Spread filter check error: {sf_err}")
+                    # Continue with entry if spread check fails
                 
-                # Use await for proper async execution
-                result = await live_binance_trader.place_market_order(
+                logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance (LIMIT entry)...")
+                
+                # Phase 186 Feature B: Use limit entry with market fallback
+                result = await live_binance_trader.place_limit_entry_order(
                     symbol=symbol,
                     side=side,
                     size_usd=order['sizeUsd'],
@@ -13287,9 +13525,29 @@ class PaperTradingEngine:
                 
                 if result:
                     new_position['binance_order_id'] = result.get('id')
-                    new_position['binance_fill_price'] = result.get('price', fill_price)
+                    actual_fill = result.get('price', fill_price)
+                    new_position['binance_fill_price'] = actual_fill
                     new_position['isLive'] = True
-                    logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')}")
+                    new_position['entry_method'] = result.get('entry_method', 'MARKET')
+                    new_position['entry_slippage'] = result.get('slippage_pct', 0)
+                    new_position['entry_spread'] = result.get('spread_pct', 0)
+                    logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')} | method={result.get('entry_method', 'MARKET')}")
+                    
+                    # Phase 186: Update entryPrice + SL/TP if actual fill differs
+                    if abs(actual_fill - fill_price) / fill_price > 0.001:
+                        new_position['entryPrice'] = actual_fill
+                        # Recalculate SL/TP with actual fill
+                        if side == 'LONG':
+                            new_position['stopLoss'] = actual_fill - (atr * adjusted_sl_atr)
+                            new_position['takeProfit'] = actual_fill + (atr * adjusted_tp_atr)
+                            new_position['trailActivation'] = actual_fill + (atr * adjusted_trail_activation_atr)
+                            new_position['trailingStop'] = new_position['stopLoss']
+                        else:
+                            new_position['stopLoss'] = actual_fill + (atr * adjusted_sl_atr)
+                            new_position['takeProfit'] = actual_fill - (atr * adjusted_tp_atr)
+                            new_position['trailActivation'] = actual_fill - (atr * adjusted_trail_activation_atr)
+                            new_position['trailingStop'] = new_position['stopLoss']
+                        logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${new_position['stopLoss']:.6f} TP=${new_position['takeProfit']:.6f}")
                 else:
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
                     self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi (yetersiz bakiye veya symbol hatası)")
