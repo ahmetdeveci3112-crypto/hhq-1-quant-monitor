@@ -309,6 +309,29 @@ class SQLiteManager:
                     await db.execute(f'ALTER TABLE trades ADD COLUMN {col_name} {col_type}')
                 except:
                     pass  # Column already exists
+            
+            # Phase 187: position_closes needs settings data too
+            pc_migration_columns = [
+                ('stop_loss', 'REAL DEFAULT 0'),
+                ('take_profit', 'REAL DEFAULT 0'),
+                ('atr', 'REAL DEFAULT 0'),
+                ('trailing_stop', 'REAL DEFAULT 0'),
+                ('trail_activation', 'REAL DEFAULT 0'),
+                ('settings_snapshot', 'TEXT DEFAULT "{}"'),
+                ('entry_method', 'TEXT DEFAULT "MARKET"'),
+                ('entry_slippage', 'REAL DEFAULT 0'),
+                ('entry_spread', 'REAL DEFAULT 0'),
+                ('signal_score', 'INTEGER DEFAULT 0'),
+                ('spread_level', 'TEXT DEFAULT "unknown"'),
+                ('binance_fill_price', 'REAL DEFAULT 0'),
+                ('hurst', 'REAL DEFAULT 0.5'),
+                ('trade_id', 'TEXT'),
+            ]
+            for col_name, col_type in pc_migration_columns:
+                try:
+                    await db.execute(f'ALTER TABLE position_closes ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
             await db.commit()
             
             self._initialized = True
@@ -565,13 +588,16 @@ class SQLiteManager:
             await db.commit()
     
     async def save_position_close(self, close_data: dict):
-        """Save a position close event for trade history matching."""
+        """Phase 187: Save position close with ALL trade data + settings."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
                 INSERT INTO position_closes (
                     symbol, side, reason, original_reason, entry_price, exit_price,
-                    pnl, leverage, size_usd, margin, roi, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pnl, leverage, size_usd, margin, roi, timestamp,
+                    stop_loss, take_profit, atr, trailing_stop, trail_activation,
+                    settings_snapshot, entry_method, entry_slippage, entry_spread,
+                    signal_score, spread_level, binance_fill_price, hurst, trade_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 close_data.get('symbol'),
                 close_data.get('side'),
@@ -584,7 +610,22 @@ class SQLiteManager:
                 close_data.get('sizeUsd', 0),
                 close_data.get('margin', 0),
                 close_data.get('roi', 0),
-                close_data.get('timestamp', int(datetime.now().timestamp() * 1000))
+                close_data.get('timestamp', int(datetime.now().timestamp() * 1000)),
+                # Phase 187: Settings + execution data
+                close_data.get('stopLoss', 0),
+                close_data.get('takeProfit', 0),
+                close_data.get('atr', 0),
+                close_data.get('trailingStop', 0),
+                close_data.get('trailActivation', 0),
+                json.dumps(close_data.get('settingsSnapshot', {})),
+                close_data.get('entry_method', 'MARKET'),
+                close_data.get('entry_slippage', 0),
+                close_data.get('entry_spread', 0),
+                close_data.get('signalScore', 0),
+                close_data.get('spreadLevel', 'unknown'),
+                close_data.get('binance_fill_price', 0),
+                close_data.get('hurst', 0.5),
+                close_data.get('trade_id', ''),
             ))
             await db.commit()
             logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')}")
@@ -14525,7 +14566,7 @@ class PaperTradingEngine:
             }
             logger.info(f"📋 PENDING REASON SET: {symbol} = {detailed_reason}")
             
-            # Also save to SQLite for persistent storage
+            # Phase 187: Save to position_closes with ALL settings data
             try:
                 close_data = {
                     'symbol': symbol,
@@ -14539,13 +14580,37 @@ class PaperTradingEngine:
                     'sizeUsd': size_usd,
                     'margin': margin,
                     'roi': roi,
-                    'timestamp': int(datetime.now().timestamp() * 1000)
+                    'timestamp': int(datetime.now().timestamp() * 1000),
+                    # Phase 187: Complete settings + execution data
+                    'stopLoss': pos.get('stopLoss', 0),
+                    'takeProfit': pos.get('takeProfit', 0),
+                    'atr': pos.get('atr', 0),
+                    'trailingStop': pos.get('trailingStop', 0),
+                    'trailActivation': pos.get('trailActivation', 0),
+                    'settingsSnapshot': pos.get('settingsSnapshot', {}),
+                    'entry_method': pos.get('entry_method', 'MARKET'),
+                    'entry_slippage': pos.get('entry_slippage', 0),
+                    'entry_spread': pos.get('entry_spread', 0),
+                    'signalScore': pos.get('signalScore', 0),
+                    'spreadLevel': pos.get('spreadLevel', 'unknown'),
+                    'binance_fill_price': pos.get('binance_fill_price', 0),
+                    'hurst': pos.get('hurst', 0.5),
+                    'trade_id': trade.get('id', ''),
                 }
                 safe_create_task(sqlite_manager.save_position_close(close_data))
             except Exception as e:
                 logger.debug(f"SQLite position close save error: {e}")
             
-            # DON'T append to trades - Binance sync will do it
+            # Phase 187: ALSO save LIVE trades to trades table!
+            # Previously only position_closes got the data, trades table was skipped
+            try:
+                safe_create_task(sqlite_manager.save_trade(trade))
+                logger.info(f"💾 LIVE trade saved to trades table: {symbol} PnL={pnl:.4f}")
+            except Exception as e:
+                logger.debug(f"SQLite LIVE trade save error: {e}")
+            
+            # Still append to in-memory trades for frontend
+            self.trades.append(trade)
         else:
             # PAPER positions: write trade history as normal
             self.trades.append(trade)
