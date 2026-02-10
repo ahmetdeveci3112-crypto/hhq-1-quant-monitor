@@ -417,6 +417,98 @@ class SQLiteManager:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
     
+    async def get_full_trade_history(self, limit: int = 0) -> list:
+        """
+        Phase 187b: Get ALL trades from SQLite with full data.
+        Returns frontend-compatible format with all 35 fields.
+        limit=0 means no limit (all trades).
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                if limit > 0:
+                    query = 'SELECT * FROM trades ORDER BY close_time DESC LIMIT ?'
+                    params = (limit,)
+                else:
+                    query = 'SELECT * FROM trades ORDER BY close_time DESC'
+                    params = ()
+                
+                async with db.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
+                    trades = []
+                    for row in rows:
+                        d = dict(row)
+                        # Parse settings_snapshot from JSON string
+                        try:
+                            if d.get('settings_snapshot') and isinstance(d['settings_snapshot'], str):
+                                d['settings_snapshot'] = json.loads(d['settings_snapshot'])
+                        except:
+                            d['settings_snapshot'] = {}
+                        
+                        # Frontend-compatible format
+                        turkey_tz = pytz.timezone('Europe/Istanbul')
+                        close_ts = d.get('close_time', 0)
+                        if close_ts and close_ts > 0:
+                            close_dt = datetime.fromtimestamp(close_ts / 1000, tz=turkey_tz)
+                            time_str = close_dt.strftime('%H:%M')
+                            date_str = close_dt.strftime('%d/%m')
+                        else:
+                            time_str = ''
+                            date_str = ''
+                        
+                        pnl = d.get('pnl', 0) or 0
+                        margin = d.get('margin', 0) or 0
+                        roi = d.get('roi', 0) or 0
+                        
+                        trade = {
+                            'id': d.get('id', ''),
+                            'symbol': (d.get('symbol', '') or '').replace('USDT', ''),
+                            'symbolFull': d.get('symbol', ''),
+                            'side': d.get('side', 'LONG'),
+                            'entryPrice': d.get('entry_price', 0) or 0,
+                            'exitPrice': d.get('exit_price', 0) or 0,
+                            'pnl': round(pnl, 4),
+                            'pnlFormatted': f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}",
+                            'pnlPercent': d.get('pnl_percent', 0) or 0,
+                            'roi': round(roi, 2),
+                            'margin': round(margin, 4),
+                            'leverage': d.get('leverage', 10) or 10,
+                            'sizeUsd': round(d.get('size_usd', 0) or 0, 2),
+                            'closeTime': close_ts,
+                            'openTime': d.get('open_time', 0) or 0,
+                            'time': time_str,
+                            'date': date_str,
+                            'timestamp': close_ts,
+                            'closeReason': d.get('close_reason', 'Closed') or 'Closed',
+                            'reason': d.get('close_reason', 'Closed') or 'Closed',
+                            'type': 'CLOSE',
+                            # Phase 187b: Full data
+                            'stopLoss': d.get('stop_loss', 0) or 0,
+                            'takeProfit': d.get('take_profit', 0) or 0,
+                            'atr': d.get('atr', 0) or 0,
+                            'trailingStop': d.get('trailing_stop', 0) or 0,
+                            'trailActivation': d.get('trail_activation', 0) or 0,
+                            'isTrailingActive': bool(d.get('is_trailing_active', 0)),
+                            'spreadLevel': d.get('spread_level', 'unknown'),
+                            'signalScore': d.get('signal_score', 0) or 0,
+                            'mtfScore': d.get('mtf_score', 0) or 0,
+                            'zScore': d.get('z_score', 0) or 0,
+                            'entryMethod': d.get('entry_method', 'MARKET'),
+                            'entrySlippage': d.get('entry_slippage', 0) or 0,
+                            'entrySpread': d.get('entry_spread', 0) or 0,
+                            'binanceFillPrice': d.get('binance_fill_price', 0) or 0,
+                            'isLive': bool(d.get('is_live', 0)),
+                            'hurst': d.get('hurst', 0.5) or 0.5,
+                            'settingsSnapshot': d.get('settings_snapshot', {}),
+                        }
+                        trades.append(trade)
+                    
+                    logger.info(f"📊 SQLite trade history: returning {len(trades)} trades")
+                    return trades
+        except Exception as e:
+            logger.error(f"get_full_trade_history error: {e}")
+            return []
+    
     async def add_log(self, time: str, message: str, ts: int):
         """Add a log entry."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -15485,10 +15577,11 @@ async def live_trading_status():
         balance = await live_binance_trader.get_balance()
         positions = await live_binance_trader.get_positions()
         pnl_data = await live_binance_trader.get_pnl_from_binance()
-        # Phase 93: Add trade history
-        logger.info("Phase 93: Calling get_trade_history...")
-        trades = await live_binance_trader.get_trade_history(limit=50, days_back=7)
-        logger.info(f"Phase 93: Got {len(trades) if trades else 0} trades from get_trade_history")
+        # Phase 187b: Trade history from SQLite (full data, no limit)
+        # Previously: get_trade_history(limit=50, days_back=7) from Binance Income API
+        # Now: all trades from SQLite with entry/exit prices, reasons, settings
+        trades = await sqlite_manager.get_full_trade_history(limit=0)
+        logger.info(f"Phase 187b: Got {len(trades)} trades from SQLite")
         
         return JSONResponse({
             "enabled": True,
@@ -15504,8 +15597,9 @@ async def live_trading_status():
             "totalPnl": pnl_data.get('totalPnl', 0),
             "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
             "todayTradesCount": pnl_data.get('todayTradesCount', 0),
-            # Phase 93: Trade history
-            "trades": trades
+            # Phase 187b: Full trade history from SQLite
+            "trades": trades,
+            "tradeCount": len(trades),
         })
     except Exception as e:
         return JSONResponse({
