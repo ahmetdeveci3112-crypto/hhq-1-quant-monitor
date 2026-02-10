@@ -2348,8 +2348,9 @@ class LiveBinanceTrader:
             if global_paper_trader:
                 for trade in global_paper_trader.trades:
                     # Create unique ID from symbol + closeTime
+                    # Phase 188: Use symbolFull if available (get_full_trade_history strips USDT)
                     close_time = trade.get('closeTime', 0)
-                    symbol = trade.get('symbol', '')
+                    symbol = trade.get('symbolFull', trade.get('symbol', ''))
                     existing_ids.add(f"{symbol}_{close_time}")
             
             synced_count = 0
@@ -2891,11 +2892,19 @@ async def binance_position_sync_loop():
                                 # FORCE isLive=True for all Binance positions
                                 pos['isLive'] = True
                                 
+                                # Phase 188: Cooldown after partial close — don't overwrite size
+                                # for 30 seconds to prevent duplicate reduction orders
+                                partial_close_ts = pos.get('_partial_close_ts', 0)
+                                cooldown_active = (datetime.now().timestamp() - partial_close_ts) < 30 if partial_close_ts > 0 else False
+                                
                                 # Sync critical values from Binance (source of truth)
                                 position_size = bp.get('size', bp.get('contracts', pos.get('size')))
-                                pos['size'] = position_size      # Phase 88: Sync size!
-                                pos['contracts'] = position_size # Phase 141: Keep both in sync
-                                pos['sizeUsd'] = bp.get('sizeUsd', pos.get('sizeUsd'))
+                                if not cooldown_active:
+                                    pos['size'] = position_size      # Phase 88: Sync size!
+                                    pos['contracts'] = position_size # Phase 141: Keep both in sync
+                                    pos['sizeUsd'] = bp.get('sizeUsd', pos.get('sizeUsd'))
+                                else:
+                                    logger.info(f"⏸️ SYNC_COOLDOWN: {symbol} skipping size sync ({30 - (datetime.now().timestamp() - partial_close_ts):.0f}s remaining)")
                                 pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
@@ -9196,6 +9205,8 @@ class PositionBasedKillSwitch:
             try:
                 result = await live_binance_trader.close_position(symbol, side, reduction_size)
                 if result:
+                    # Phase 188: Set cooldown to prevent Binance sync from restoring old size
+                    pos['_partial_close_ts'] = datetime.now().timestamp()
                     logger.warning(f"📊 KILL_SWITCH LIVE ✅: {symbol} reduced {reduction_pct*100:.0f}% on Binance ({reduction_size:.4f} contracts) | Order: {result.get('id')}")
                 else:
                     logger.error(f"❌ KILL_SWITCH LIVE FAILED: {symbol} - close_position returned None")
@@ -9388,6 +9399,8 @@ class TimeBasedPositionManager:
                                     try:
                                         result = await live_binance_trader.close_position(symbol, side, close_contracts)
                                         if result:
+                                            # Phase 188: Set cooldown to prevent Binance sync from restoring old size
+                                            pos['_partial_close_ts'] = datetime.now().timestamp()
                                             logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at {profit_pct:.2f}% profit | Order: {result.get('id')}")
                                         else:
                                             logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
@@ -9481,8 +9494,10 @@ class TimeBasedPositionManager:
                 # ===============================================
                 # CASE 2: LOSING AND STAGNANT - GRADUAL REDUCTION
                 # Phase 137 FIX: Changed elif to if - CASE 2 should run independently
+                # Phase 188: SKIP for LIVE positions — Kill Switch handles risk management
+                # Time-based reduction on live causes duplicate Binance orders due to sync overwrite
                 # ===============================================
-                if unrealized_pnl < 0:
+                if unrealized_pnl < 0 and not pos.get('isLive', False):
                     # Initialize tracking for this position
                     if pos_id not in self.time_reductions:
                         self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
