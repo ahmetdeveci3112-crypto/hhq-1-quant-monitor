@@ -22,6 +22,9 @@ COPY requirements.txt .
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install pandas-ta separately (not on PyPI with version specifiers, installs from GitHub if available)
+RUN pip install --no-cache-dir pandas_ta || echo "pandas-ta install failed, using manual fallback"
+
 # Copy the rest of the application
 COPY . .
 
