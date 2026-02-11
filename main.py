@@ -29,14 +29,6 @@ import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
 import pytz
-# Phase 193: pandas-ta for enhanced technical indicators
-try:
-    import pandas_ta as pta
-    PANDAS_TA_AVAILABLE = True
-    logger.info("✅ pandas-ta loaded successfully")
-except ImportError:
-    PANDAS_TA_AVAILABLE = False
-    logger.warning("⚠️ pandas-ta not installed, using manual TA calculations")
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +40,15 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Phase 193: pandas-ta for enhanced technical indicators
+try:
+    import pandas_ta as pta
+    PANDAS_TA_AVAILABLE = True
+    logger.info("✅ pandas-ta loaded successfully")
+except ImportError:
+    PANDAS_TA_AVAILABLE = False
+    logger.warning("⚠️ pandas-ta not installed, using manual TA calculations")
 
 # Phase 193: Import new modules (graceful fallback)
 try:
