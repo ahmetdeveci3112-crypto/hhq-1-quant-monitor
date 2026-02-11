@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Save, Zap, TrendingUp, Target, LogOut, Bot, ShieldAlert } from 'lucide-react';
+import { X, Save, Zap, TrendingUp, Target, LogOut, Bot, ShieldAlert, Brain, FlaskConical } from 'lucide-react';
 import { SystemSettings } from '../types';
 
 interface OptimizerStats {
@@ -15,9 +15,17 @@ interface Props {
   onSave: (s: SystemSettings) => void;
   optimizerStats?: OptimizerStats;
   onToggleOptimizer?: () => void;
+  phase193Status?: {
+    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
+    freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string };
+    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string };
+  } | null;
+  onSLGuardSettings?: (s: any) => void;
+  onFreqAIRetrain?: () => void;
+  onHyperoptRun?: (n: number) => void;
 }
 
-export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer }) => {
+export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
   // Sync localSettings when settings prop changes (AI made changes)
@@ -476,6 +484,153 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   ) : null;
                 })()}
+              </div>
+            </div>
+          )}
+
+          {/* Phase 193: Module Controls Section */}
+          {phase193Status && (
+            <div>
+              <h3 className="text-sm font-semibold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4" />
+                6. Phase 193 Modüller
+              </h3>
+
+              <div className="space-y-4">
+                {/* StoplossGuard */}
+                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-orange-400" />
+                      <span className="text-sm font-medium text-white">StoplossGuard</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.stoploss_guard.global_locked
+                          ? 'bg-rose-500/20 text-rose-400'
+                          : 'bg-emerald-500/20 text-emerald-400'
+                        }`}>
+                        {phase193Status.stoploss_guard.global_locked ? '🔒 Kilitli' : '🟢 Açık'}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => onSLGuardSettings?.({ enabled: !phase193Status.stoploss_guard.enabled })}
+                      className={`relative w-12 h-6 rounded-full transition-colors ${phase193Status.stoploss_guard.enabled ? 'bg-orange-600' : 'bg-slate-600'
+                        }`}
+                    >
+                      <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${phase193Status.stoploss_guard.enabled ? 'translate-x-6' : ''
+                        }`} />
+                    </button>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Lookback</span>
+                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.lookback_minutes || 60} dk</span>
+                      </div>
+                      <input
+                        type="range" min="30" max="120" step="10"
+                        value={phase193Status.stoploss_guard.lookback_minutes || 60}
+                        onChange={e => onSLGuardSettings?.({ lookback_minutes: parseInt(e.target.value) })}
+                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Maks SL Sayısı</span>
+                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.max_stoplosses || 3}</span>
+                      </div>
+                      <input
+                        type="range" min="2" max="10" step="1"
+                        value={phase193Status.stoploss_guard.max_stoplosses || 3}
+                        onChange={e => onSLGuardSettings?.({ max_stoplosses: parseInt(e.target.value) })}
+                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Cooldown</span>
+                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.cooldown_minutes || 30} dk</span>
+                      </div>
+                      <input
+                        type="range" min="10" max="60" step="5"
+                        value={phase193Status.stoploss_guard.cooldown_minutes || 30}
+                        onChange={e => onSLGuardSettings?.({ cooldown_minutes: parseInt(e.target.value) })}
+                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* FreqAI */}
+                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <Brain className="w-4 h-4 text-purple-400" />
+                      <span className="text-sm font-medium text-white">FreqAI ML</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.freqai.is_trained ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-500/20 text-slate-400'
+                        }`}>
+                        {phase193Status.freqai.is_trained ? '✅ Eğitildi' : '⏳ Eğitilmedi'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 mb-3">
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Accuracy</div>
+                      <div className="text-sm font-bold text-purple-400">
+                        {phase193Status.freqai.accuracy ? `${(phase193Status.freqai.accuracy * 100).toFixed(1)}%` : '—'}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">F1</div>
+                      <div className="text-sm font-bold text-purple-400">
+                        {phase193Status.freqai.f1_score ? phase193Status.freqai.f1_score.toFixed(3) : '—'}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Samples</div>
+                      <div className="text-sm font-bold text-slate-300">{phase193Status.freqai.training_samples || 0}</div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={onFreqAIRetrain}
+                    className="w-full text-xs font-bold py-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/30 hover:bg-purple-500/20 transition-colors"
+                  >
+                    🧠 Yeniden Eğit
+                  </button>
+                </div>
+
+                {/* Hyperopt */}
+                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <FlaskConical className="w-4 h-4 text-cyan-400" />
+                      <span className="text-sm font-medium text-white">Hyperopt</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.hyperopt.is_optimized ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-500/20 text-slate-400'
+                        }`}>
+                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize' : '⏳ Bekleniyor'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mb-3">
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Best Score</div>
+                      <div className="text-sm font-bold text-cyan-400">
+                        {phase193Status.hyperopt.best_score?.toFixed(3) || '—'}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">İyileşme</div>
+                      <div className={`text-sm font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
+                        {phase193Status.hyperopt.improvement_pct ? `+${phase193Status.hyperopt.improvement_pct.toFixed(1)}%` : '—'}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => onHyperoptRun?.(100)}
+                    className="w-full text-xs font-bold py-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+                  >
+                    🔬 Optimize Et (100 Trial)
+                  </button>
+                </div>
               </div>
             </div>
           )}

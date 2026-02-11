@@ -5,7 +5,7 @@ import {
   BarChart3, TrendingUp, TrendingDown, ArrowUpRight, ArrowDownRight,
   AlertTriangle, CheckCircle2, XCircle, Terminal, Zap, LineChart,
   ChevronDown, Layers, Wind, ShieldAlert, Target, Info, Network,
-  Radio, RotateCcw, Waves, Search, Radar
+  Radio, RotateCcw, Waves, Search, Radar, Lock, Brain, FlaskConical
 } from 'lucide-react';
 import {
   MarketRegime, Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
@@ -332,6 +332,15 @@ export default function App() {
     avgMissedProfit: 0,
     avgAvoidedLoss: 0
   });
+
+  // Phase 193: Module status state
+  const [phase193Status, setPhase193Status] = useState<{
+    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
+    freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
+    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string };
+    ws_manager: { enabled: boolean; connected?: boolean };
+    pandas_ta: boolean;
+  } | null>(null);
 
   // Phase 53: Market Regime state
   const [marketRegime, setMarketRegime] = useState<{
@@ -698,6 +707,81 @@ export default function App() {
     return () => clearInterval(interval);
   }, [activeTab]);
 
+  // Phase 193: Fetch module status
+  useEffect(() => {
+    const fetchPhase193Status = async () => {
+      try {
+        const res = await fetch(`${BACKEND_API_URL}/phase193/status`);
+        if (res.ok) {
+          const data = await res.json();
+          setPhase193Status(data);
+        }
+      } catch (err) {
+        console.error('Phase 193 status fetch error:', err);
+      }
+    };
+
+    fetchPhase193Status();
+    const interval = setInterval(fetchPhase193Status, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Phase 193: StoplossGuard settings update
+  const handleSLGuardSettings = useCallback(async (settings: { lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number; enabled?: boolean }) => {
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/phase193/stoploss-guard/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPhase193Status(prev => prev ? { ...prev, stoploss_guard: data } : prev);
+        addLog(`🛡️ SL Guard ayarları güncellendi`);
+      }
+    } catch (err) {
+      addLog('❌ SL Guard ayar güncelleme hatası');
+    }
+  }, [addLog]);
+
+  // Phase 193: FreqAI retrain
+  const handleFreqAIRetrain = useCallback(async () => {
+    try {
+      addLog('🧠 FreqAI yeniden eğitim başlatılıyor...');
+      const res = await fetch(`${BACKEND_API_URL}/phase193/freqai/retrain`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          addLog('✅ FreqAI model yeniden eğitildi');
+          setPhase193Status(prev => prev ? { ...prev, freqai: { ...prev.freqai, ...data.status } } : prev);
+        } else {
+          addLog('⚠️ FreqAI eğitim başarısız (yeterli veri yok olabilir)');
+        }
+      }
+    } catch (err) {
+      addLog('❌ FreqAI retrain hatası');
+    }
+  }, [addLog]);
+
+  // Phase 193: Hyperopt run
+  const handleHyperoptRun = useCallback(async (nTrials: number = 100) => {
+    try {
+      addLog(`🔬 Hyperopt optimizasyon başlatılıyor (${nTrials} trial)...`);
+      const res = await fetch(`${BACKEND_API_URL}/phase193/hyperopt/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ n_trials: nTrials })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        addLog(`✅ Hyperopt tamamlandı: score=${data.best_score?.toFixed(4) || '?'}`);
+        setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, is_optimized: true, ...data } } : prev);
+      }
+    } catch (err) {
+      addLog('❌ Hyperopt çalıştırma hatası');
+    }
+  }, [addLog]);
+
   // Phase 52: Toggle AI Optimizer
   const toggleOptimizer = async () => {
     try {
@@ -948,6 +1032,10 @@ export default function App() {
           onSave={setSettings}
           optimizerStats={optimizerStats}
           onToggleOptimizer={toggleOptimizer}
+          phase193Status={phase193Status}
+          onSLGuardSettings={handleSLGuardSettings}
+          onFreqAIRetrain={handleFreqAIRetrain}
+          onHyperoptRun={handleHyperoptRun}
         />
       )}
 
@@ -990,6 +1078,14 @@ export default function App() {
               )}
             </div>
           </div>
+
+          {/* Phase 193: SL Guard Lock Badge */}
+          {phase193Status?.stoploss_guard?.global_locked && (
+            <div className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-rose-500/10 border border-rose-500/30 rounded-lg animate-pulse">
+              <Lock className="w-3.5 h-3.5 text-rose-400" />
+              <span className="text-[10px] font-bold text-rose-400 uppercase">SL Guard</span>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
@@ -1562,21 +1658,142 @@ export default function App() {
         {/* AI TRACKING TAB */}
         {
           activeTab === 'ai' && (
-            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-              <AITrackingPanel
-                stats={{
-                  enabled: optimizerStats.enabled ?? false,
-                  trackingCount: optimizerStats.trackingCount ?? 0,
-                  completedCount: optimizerStats.completedCount ?? 0,
-                  earlyExitRate: optimizerStats.earlyExitRate ?? 0,
-                  avgMissedProfit: optimizerStats.avgMissedProfit ?? 0,
-                  avgAvoidedLoss: optimizerStats.avgAvoidedLoss ?? 0
-                }}
-                tracking={optimizerStats.trackingList ?? []}
-                analyses={optimizerStats.recentAnalyses ?? []}
-                onToggle={toggleOptimizer}
-                marketRegime={marketRegime || undefined}
-              />
+            <div className="space-y-4">
+              <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+                <AITrackingPanel
+                  stats={{
+                    enabled: optimizerStats.enabled ?? false,
+                    trackingCount: optimizerStats.trackingCount ?? 0,
+                    completedCount: optimizerStats.completedCount ?? 0,
+                    earlyExitRate: optimizerStats.earlyExitRate ?? 0,
+                    avgMissedProfit: optimizerStats.avgMissedProfit ?? 0,
+                    avgAvoidedLoss: optimizerStats.avgAvoidedLoss ?? 0
+                  }}
+                  tracking={optimizerStats.trackingList ?? []}
+                  analyses={optimizerStats.recentAnalyses ?? []}
+                  onToggle={toggleOptimizer}
+                  marketRegime={marketRegime || undefined}
+                />
+              </div>
+
+              {/* Phase 193: Module Status Cards */}
+              {phase193Status && (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* StoplossGuard Card */}
+                  <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                        <ShieldAlert className="w-4 h-4 text-orange-400" />
+                        SL Guard
+                      </h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.stoploss_guard.global_locked
+                          ? 'bg-rose-500/20 text-rose-400 animate-pulse'
+                          : phase193Status.stoploss_guard.enabled
+                            ? 'bg-emerald-500/20 text-emerald-400'
+                            : 'bg-slate-500/20 text-slate-400'
+                        }`}>
+                        {phase193Status.stoploss_guard.global_locked ? '🔒 LOCKED' : phase193Status.stoploss_guard.enabled ? '🟢 Aktif' : '⚫ Pasif'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">Son SL</div>
+                        <div className="text-lg font-bold text-orange-400">{phase193Status.stoploss_guard.recent_stoplosses}</div>
+                      </div>
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">Cooldown</div>
+                        <div className="text-lg font-bold text-slate-300">
+                          {phase193Status.stoploss_guard.cooldown_remaining
+                            ? `${Math.ceil(phase193Status.stoploss_guard.cooldown_remaining / 60)}dk`
+                            : '—'}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-2 text-[10px] text-slate-500">
+                      {phase193Status.stoploss_guard.lookback_minutes || 60}dk'da max {phase193Status.stoploss_guard.max_stoplosses || 3} SL → {phase193Status.stoploss_guard.cooldown_minutes || 30}dk duraklat
+                    </div>
+                  </div>
+
+                  {/* FreqAI Card */}
+                  <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                        <Brain className="w-4 h-4 text-purple-400" />
+                        FreqAI ML
+                      </h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.freqai.is_trained
+                          ? 'bg-emerald-500/20 text-emerald-400'
+                          : phase193Status.freqai.enabled
+                            ? 'bg-amber-500/20 text-amber-400'
+                            : 'bg-slate-500/20 text-slate-400'
+                        }`}>
+                        {phase193Status.freqai.is_trained ? '✅ Trained' : phase193Status.freqai.enabled ? '⏳ Waiting' : '⚫ Pasif'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">Accuracy</div>
+                        <div className="text-lg font-bold text-purple-400">
+                          {phase193Status.freqai.accuracy ? `${(phase193Status.freqai.accuracy * 100).toFixed(1)}%` : '—'}
+                        </div>
+                      </div>
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">Samples</div>
+                        <div className="text-lg font-bold text-slate-300">
+                          {phase193Status.freqai.training_samples || 0}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleFreqAIRetrain}
+                      className="mt-3 w-full text-[10px] font-bold py-1.5 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/30 hover:bg-purple-500/20 transition-colors"
+                    >
+                      🧠 Yeniden Eğit
+                    </button>
+                  </div>
+
+                  {/* Hyperopt Card */}
+                  <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                        <FlaskConical className="w-4 h-4 text-cyan-400" />
+                        Hyperopt
+                      </h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.hyperopt.is_optimized
+                          ? 'bg-emerald-500/20 text-emerald-400'
+                          : phase193Status.hyperopt.enabled
+                            ? 'bg-amber-500/20 text-amber-400'
+                            : 'bg-slate-500/20 text-slate-400'
+                        }`}>
+                        {phase193Status.hyperopt.is_optimized ? '✅ Optimized' : phase193Status.hyperopt.enabled ? '⏳ Ready' : '⚫ Pasif'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">Best Score</div>
+                        <div className="text-lg font-bold text-cyan-400">
+                          {phase193Status.hyperopt.best_score?.toFixed(2) || '—'}
+                        </div>
+                      </div>
+                      <div className="bg-slate-800/50 rounded-lg p-2 text-center">
+                        <div className="text-[10px] text-slate-500">İyileşme</div>
+                        <div className={`text-lg font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'
+                          }`}>
+                          {phase193Status.hyperopt.improvement_pct
+                            ? `+${phase193Status.hyperopt.improvement_pct.toFixed(1)}%`
+                            : '—'}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleHyperoptRun(100)}
+                      className="mt-3 w-full text-[10px] font-bold py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+                    >
+                      🔬 Optimize Et (100 Trial)
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )
         }
