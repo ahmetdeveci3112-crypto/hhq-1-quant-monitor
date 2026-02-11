@@ -1,7 +1,7 @@
 # HHQ-1 Quant Monitor - Developer Guide
 
 > **ÖNEMLİ:** Bu dosya projenin ana referans dokümanıdır. Her geliştirme öncesi buraya bakılmalıdır.
-> Son güncelleme: 2026-02-07
+> Son güncelleme: 2026-02-11
 
 ## 🔒 Stabil Rollback Noktası
 
@@ -383,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-11 | 193 | Trading Kütüphane Entegrasyonları: pandas-ta, CCXT WS, StoplossGuard, FreqAI ML, Optuna Hyperopt |
 | 2026-02-07 | 149 | Code Quality Refactor: safe_create_task, pending_close_reasons persist, WhaleDetector cleanup |
 | 2026-02-06 | 148 | Binance Trade History Sync (5 min periodic) |
 | 2026-02-06 | 147 | Live Position Trail Exit Execution |
@@ -712,7 +713,7 @@ Yeni bir özellik eklerken:
 ---
 
 > **Not:** Bu dosya her önemli geliştirmeden sonra güncellenmelidir.
-> Son güncelleme: 2026-02-08 (Phase 155)
+> Son güncelleme: 2026-02-11 (Phase 193)
 
 ---
 
@@ -794,3 +795,566 @@ AI Optimizer tamamen yeniden yazıldı. Eski AGGRESSIVE/DEFENSIVE mod sistemi ka
 
 ### API Endpoint
 - `GET /trade-analysis`: Trade pattern analizi + funding durumu
+
+---
+
+## Phase 193: Trading Kütüphane Entegrasyonları (2026-02-11)
+
+> **Kapsamlı entegrasyon:** pandas-ta tabanlı indikatörler, CCXT Pro WebSocket, Freqtrade-ilhamlı risk yönetimi (StoplossGuard + FreqAI ML), Jesse-ilhamlı Optuna hyperopt.
+
+### 📚 Referans Kaynaklar ve Kütüphaneler
+
+Aşağıdaki kütüphaneler ve kaynaklar bu entegrasyonun temelini oluşturmuştur. İleride geri dönüp tekrar faydalanılabilir:
+
+| Kütüphane | Kullanım Amacı | PyPI / GitHub |
+|-----------|----------------|---------------|
+| **pandas-ta** | 130+ teknik indikatör (MACD, BB, StochRSI, EMA, VWAP) | [GitHub: twopirllc/pandas-ta](https://github.com/twopirllc/pandas-ta) |
+| **ccxt.pro** | WebSocket streaming ile gerçek zamanlı ticker/OHLCV | [GitHub: ccxt/ccxt](https://github.com/ccxt/ccxt) — [Pro Docs](https://docs.ccxt.com/#/ccxt.pro) |
+| **Freqtrade** | StoplossGuard pattern, FreqAI ML framework | [GitHub: freqtrade/freqtrade](https://github.com/freqtrade/freqtrade) — [FreqAI Docs](https://www.freqtrade.io/en/stable/freqai/) |
+| **Jesse** | Hyperparameter optimization yaklaşımı | [GitHub: jesse-ai/jesse](https://github.com/jesse-ai/jesse) — [Docs](https://docs.jesse.trade/) |
+| **Optuna** | Bayesian hyperparameter optimization framework | [GitHub: optuna/optuna](https://github.com/optuna/optuna) — [PyPI](https://pypi.org/project/optuna/) |
+| **LightGBM** | Gradient boosting ML framework (FreqAI modeli) | [GitHub: microsoft/LightGBM](https://github.com/microsoft/LightGBM) — [Docs](https://lightgbm.readthedocs.io/) |
+| **scikit-learn** | ML pipeline (scaler, split, metrics) | [PyPI](https://pypi.org/project/scikit-learn/) |
+
+**Freqtrade StoplossGuard kaynak kodu:**
+- [freqtrade/plugins/protections/stoploss_guard.py](https://github.com/freqtrade/freqtrade/blob/develop/freqtrade/plugins/protections/stoploss_guard.py)
+- Kullandığımız pattern: belirli sürede çok fazla SL tetiklenirse trading duraklat
+
+**FreqAI konsept:**
+- [FreqAI Introduction](https://www.freqtrade.io/en/stable/freqai/) — ML ile sinyal kalitesini tahmin etme
+- Kullandığımız yaklaşım: Trade outcome'ları (kârlı/zararlı) ile feature'ları eşleştir, LightGBM ile öğren
+
+**Jesse Hyperopt konsept:**
+- [Jesse Optimization](https://docs.jesse.trade/docs/optimize/hyperparameters.html) — Trading parametrelerini geçmiş verilerle optimize et
+- Kullandığımız yaklaşım: Optuna ile SL/TP/threshold parametrelerini Sharpe-like objective ile optimize et
+
+### 🏗️ Mimari Genel Bakış
+
+```mermaid
+graph TB
+    subgraph Phase193["Phase 193: Yeni Modüller"]
+        PTA["pandas-ta<br/>Enhanced Indicators"]
+        WS["ccxt_ws_manager.py<br/>WebSocket Streaming"]
+        SLG["StoplossFrequencyGuard<br/>Frekans Bazlı Koruma"]
+        FAI["freqai_adapter.py<br/>LightGBM ML"]
+        HO["hyperopt.py<br/>Optuna Optimization"]
+    end
+
+    subgraph Existing["Mevcut Sistem"]
+        CA["CoinAnalyzer.analyze()"]
+        GS["generate_signal()"]
+        CP["close_position()"]
+        API["FastAPI Endpoints"]
+    end
+
+    PTA --> CA
+    CA -->|enhanced_indicators| GS
+    SLG -->|is_locked check| GS
+    GS -->|4 new scoring layers| GS
+    CP -->|SL record| SLG
+    CP -->|trade record| FAI
+    CP -->|trade record| HO
+    HO -->|auto-optimize| HO
+    API -->|/phase193/*| Phase193
+```
+
+### Veri Akışı
+
+```
+Ticker → CoinAnalyzer.analyze()
+           ↓
+    calculate_enhanced_indicators() ← pandas-ta / manual fallback
+           ↓
+    generate_signal(enhanced_indicators=...)
+           ↓
+    ┌─ StoplossGuard.is_locked() → Reject if locked
+    ├─ Layer 19: MACD Cross (+8)
+    ├─ Layer 20: Bollinger Bands (+8)
+    ├─ Layer 21: Stochastic RSI (+8)
+    └─ Layer 22: EMA(8/21) Cross (+5)
+           ↓
+    Signal → Open Position → ... → close_position()
+                                       ↓
+                              ┌─ StoplossGuard.record_stoploss()
+                              ├─ FreqAI.record_trade(features, outcome)
+                              └─ Hyperopt.record_trade(trade_data)
+                                       ↓
+                              Auto-retrain (her 50 trade)
+                              Auto-optimize (her 100 trade)
+```
+
+---
+
+### Faz 1: pandas-ta İndikatör Zenginleştirme
+
+#### Dosyalar ve Satır Referansları
+
+| Dosya | Satır | Bileşen |
+|-------|-------|---------|
+| `main.py` | ~50 | `import pandas_ta as pta` (graceful fallback) |
+| `main.py` | ~3258-3430 | `calculate_enhanced_indicators()` fonksiyonu |
+| `main.py` | ~5108-5115 | `CoinAnalyzer.analyze()`'da çağrı noktası |
+| `main.py` | ~12599 | `generate_signal()` imzasında `enhanced_indicators` parametresi |
+| `main.py` | ~13020-13090 | Layer 19-22 scoring katmanları |
+
+#### `calculate_enhanced_indicators()` Fonksiyonu
+
+```python
+def calculate_enhanced_indicators(highs, lows, closes, volumes=None) -> dict:
+    """
+    Returns:
+        macd_histogram     : MACD histogram (positive=bullish)
+        macd_signal_cross  : 'BULLISH' / 'BEARISH' / 'NEUTRAL'
+        bb_position        : -1 to +1 (>1 = above upper band)
+        bb_width           : Band width % (volatility measure)
+        stoch_rsi_k        : 0-100 (<20=oversold, >80=overbought)
+        stoch_rsi_d        : Smoothed StochRSI
+        stoch_rsi_cross    : 'BULLISH' / 'BEARISH' / 'NEUTRAL'
+        ema_8, ema_21      : EMA values
+        ema_cross          : 'BULLISH' / 'BEARISH' / 'NEUTRAL'
+        vwap_value         : VWAP (if volumes available)
+    """
+```
+
+**Çift mod:** pandas-ta mevcutsa tam hesaplama, yoksa numpy/pandas ile basitleştirilmiş manual hesaplama. Fallback her zaman çalışır.
+
+#### 4 Yeni Scoring Katmanı
+
+| Layer | İndikatör | Max Bonus | Koşul | Mantık |
+|-------|-----------|-----------|-------|--------|
+| 19 | MACD Cross | +8 | MACD crossover sinyal yönünü onaylıyor | `macd_signal_cross == signal_side` |
+| 20 | Bollinger Bands | +8 | Fiyat BB ekstremlerinde | `bb_position < -0.8` (LONG) veya `> 0.8` (SHORT) |
+| 21 | Stochastic RSI | +8 | StochRSI crossover aşırı bölgede | `stoch_rsi_k < 20` (LONG) veya `> 80` (SHORT) |
+| 22 | EMA(8/21) Cross | +5 | Kısa vadeli trend onayı | `ema_cross == 'BULLISH'` (LONG) veya `'BEARISH'` (SHORT) |
+
+> **Önemli:** Tüm yeni katmanlar **sadece bonus** verir, veto **uygulamaz**. Mevcut sinyal mantığını kırmamak için tasarlanmıştır.
+
+#### pandas-ta Kullanım Örnekleri (İleride Referans İçin)
+
+```python
+import pandas_ta as pta
+
+# DataFrame oluştur
+df = pd.DataFrame({'high': highs, 'low': lows, 'close': closes, 'volume': volumes})
+
+# MACD
+macd = df.ta.macd(fast=12, slow=26, signal=9)
+# Sütunlar: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+
+# Bollinger Bands
+bb = df.ta.bbands(length=20, std=2)
+# Sütunlar: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0, BBP_20_2.0
+
+# Stochastic RSI
+stoch = df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3)
+# Sütunlar: STOCHRSIk_14_14_3_3, STOCHRSId_14_14_3_3
+
+# EMA
+ema8 = df.ta.ema(length=8)
+ema21 = df.ta.ema(length=21)
+
+# VWAP
+vwap = df.ta.vwap()
+
+# ATR (EMA smoothed — daha doğru)
+atr = df.ta.atr(length=14)
+
+# Tüm indikatörleri tek seferde
+df.ta.strategy("All")  # 130+ indikatör
+```
+
+---
+
+### Faz 2: CCXT Pro WebSocket Manager
+
+#### Dosya: `ccxt_ws_manager.py`
+
+| Bileşen | Açıklama |
+|---------|----------|
+| `CCXTWebSocketManager` class | Ana WebSocket yönetici sınıfı |
+| `watch_tickers()` | Ticker stream (real-time fiyat) |
+| `watch_ohlcv()` | OHLCV stream (mum verileri) |
+| `get_ticker()` | Cache'den ticker çek |
+| `get_ohlcv()` | Cache'den OHLCV çek |
+| `get_status()` | Sağlık durumu raporu |
+
+#### Mimari
+
+```mermaid
+flowchart LR
+    subgraph CCXT_WS["ccxt_ws_manager.py"]
+        WS[WebSocket Stream] --> Cache[In-Memory Cache]
+        Cache --> Stale{Stale Check<br/>30s ticker<br/>120s OHLCV}
+        Stale -->|Fresh| Return[Return Data]
+        Stale -->|Stale| REST[REST Fallback]
+    end
+
+    subgraph Reconnect["Auto-Reconnect"]
+        Fail[Connection Fail] --> Backoff[Exponential Backoff<br/>1s → 60s]
+        Backoff --> Retry[Retry Connect]
+    end
+```
+
+#### Konfigürasyon
+
+```python
+ccxt_ws_manager = CCXTWebSocketManager(
+    exchange_id='binanceusdm',     # Binance Futures
+    api_key=os.environ.get('BINANCE_API_KEY'),
+    api_secret=os.environ.get('BINANCE_API_SECRET'),
+    max_reconnect_delay=60,        # Max backoff süresi
+    ticker_staleness_seconds=30,   # Ticker cache süresi
+    ohlcv_staleness_seconds=120,   # OHLCV cache süresi
+)
+```
+
+#### ccxt.pro Referans (İleride Kullanım İçin)
+
+```python
+import ccxt.pro as ccxtpro
+
+# WebSocket exchange oluştur
+exchange = ccxtpro.binanceusdm({
+    'apiKey': '...',
+    'secret': '...',
+    'options': {'defaultType': 'future'},
+})
+
+# Ticker stream
+ticker = await exchange.watch_ticker('BTC/USDT')
+# Returns: {'last': 45000, 'bid': 44999, 'ask': 45001, 'volume': ...}
+
+# OHLCV stream
+ohlcv = await exchange.watch_ohlcv('BTC/USDT', '5m')
+# Returns: [[timestamp, open, high, low, close, volume], ...]
+
+# Multi-symbol ticker
+tickers = await exchange.watch_tickers(['BTC/USDT', 'ETH/USDT'])
+
+# Bağlantı kapat
+await exchange.close()
+```
+
+---
+
+### Faz 3: Freqtrade Risk Yönetimi + FreqAI
+
+#### A) StoplossFrequencyGuard (`main.py` ~L9460-9610)
+
+Freqtrade'in `StoplossGuard` plugin pattern'inden esinlenilmiştir.
+
+**Konsept:** Kill Switch margin bazlı (büyük tek kayıp), StoplossGuard frekans bazlı (art arda küçük kayıplar). İkisi **tamamlayıcı** koruma katmanları.
+
+```mermaid
+flowchart TD
+    SL[SL Tetiklendi] --> Record["record_stoploss(symbol)"]
+    Record --> Check{"Son 60dk'da<br/>3+ SL var mı?"}
+    Check -->|Hayır| OK[Devam Et]
+    Check -->|Evet| Lock["🔒 LOCK<br/>30dk tüm trading durdur"]
+    Lock --> Cooldown[Cooldown Timer]
+    Cooldown --> Unlock["🔓 UNLOCK<br/>Trading devam"]
+```
+
+**Sınıf yapısı:**
+```python
+class StoplossFrequencyGuard:
+    lookback_minutes: int = 60       # Son 60 dakika
+    max_stoplosses: int = 3          # Max 3 SL
+    cooldown_minutes: int = 30       # 30 dk duraklat
+    only_per_pair: bool = False      # False=global, True=coin-bazlı
+    enabled: bool = True
+
+    def record_stoploss(symbol, reason)   # SL olayını kaydet
+    def is_locked(symbol) -> bool         # Trading bloke mu?
+    def get_lock_reason(symbol) -> str    # Neden bloke?
+    def get_status() -> dict              # Durum raporu
+    def update_settings(data: dict)       # Ayarları güncelle
+```
+
+**Entegrasyon noktaları:**
+
+| Nokta | Dosya:Satır | Açıklama |
+|-------|-------------|----------|
+| Sinyal kontrolü | `main.py:~13098` | `generate_signal()` başında `is_locked()` check |
+| SL kaydı | `main.py:~15310` | `close_position()` sonrası `record_stoploss()` |
+| API | `main.py:~17000` | `POST /phase193/stoploss-guard/settings` |
+
+**Konfigürasyon API:**
+```bash
+curl -X POST https://hhq-1-quant-monitor.fly.dev/phase193/stoploss-guard/settings \
+  -H "Content-Type: application/json" \
+  -d '{"lookback_minutes": 45, "max_stoplosses": 5, "cooldown_minutes": 20}'
+```
+
+#### B) FreqAI Adapter (`freqai_adapter.py`)
+
+LightGBM binary classifier — trade outcome'larından öğrenen ML modeli.
+
+**Konsept:** Her trade kapanışında sinyal anındaki feature'ları + sonucu kaydet → Yeterli veri toplandığında (30+ trade) model eğit → Yeni sinyallerde ML confidence skoru üret.
+
+```mermaid
+flowchart LR
+    subgraph Training["Self-Training Loop"]
+        TradeClose["Trade Kapanışı"] --> Features["16 Feature<br/>Çıkar"]
+        Features --> Record["record_trade(<br/>features, is_profitable)"]
+        Record --> Count{"50 trade<br/>oldu mu?"}
+        Count -->|Evet| Train["_train()<br/>LightGBM fit"]
+        Count -->|Hayır| Wait[Bekle]
+    end
+
+    subgraph Prediction["Prediction"]
+        Signal["Yeni Sinyal"] --> Extract["Feature<br/>Çıkar"]
+        Extract --> Predict["predict_confidence()"]
+        Predict --> Score["0.0 - 1.0<br/>ML Confidence"]
+    end
+```
+
+**16 ML Feature:**
+```python
+FEATURE_NAMES = [
+    'zscore',          # Z-Score değeri
+    'hurst',           # Hurst exponent (0-1)
+    'rsi',             # RSI (0-100)
+    'adx',             # ADX trend gücü
+    'volume_ratio',    # Volume / avg_volume
+    'bb_position',     # Bollinger Band pozisyonu (-1 to +1)
+    'macd_histogram',  # MACD histogram
+    'stoch_rsi_k',     # Stochastic RSI %K
+    'ema_cross_bullish', # EMA crossover (0/1)
+    'vwap_zscore',     # VWAP z-score
+    'spread_pct',      # Spread yüzdesi
+    'funding_rate',    # Funding rate
+    'imbalance',       # Order book imbalance
+    'signal_score',    # Toplam sinyal skoru
+    'leverage',        # Uygulanan leverage
+    'atr_pct',         # ATR / Price yüzdesi
+]
+```
+
+**Model Detayları:**
+- **Algoritma:** LightGBM (gradient boosting) — hızlı, düşük bellek, yüksek accuracy
+- **Fallback:** LightGBM yoksa scikit-learn RandomForest
+- **Eğitim:** Chronological 80/20 split (look-ahead bias'ı önler)
+- **Metrikler:** Accuracy, F1-Score, Feature Importance (gain-based)
+- **Persistence:** Training data `./data/freqai_training_data.json`'a kaydedilir (son 1000 trade)
+- **Auto-retrain:** Her 50 trade'de otomatik yeniden eğitim
+
+**LightGBM Parametreleri:**
+```python
+params = {
+    'objective': 'binary',       # İkili sınıflandırma
+    'metric': 'binary_logloss',  # Log loss minimize
+    'boosting_type': 'gbdt',     # Gradient boosted trees
+    'num_leaves': 31,            # Tree karmaşıklığı
+    'learning_rate': 0.05,       # Öğrenme hızı
+    'feature_fraction': 0.8,     # Feature alt-örnekleme
+    'bagging_fraction': 0.8,     # Data alt-örnekleme
+    'bagging_freq': 5,           # Her 5 iterasyonda bag
+    'n_jobs': 1,                 # Tek thread (Fly.io)
+}
+# Early stopping: 10 round iyileşme yoksa dur
+```
+
+---
+
+### Faz 4: Jesse-İlhamlı Optuna Hyperopt
+
+#### Dosya: `hyperopt.py`
+
+**Konsept:** Geçmiş trade verilerini kullanarak optimal SL/TP ATR çarpanları, z-score eşikleri ve diğer parametreleri Bayesian optimization ile bul.
+
+```mermaid
+flowchart TD
+    Trades["Kapanmış Trade<br/>Verileri (500)"] --> Optuna["Optuna<br/>create_study()"]
+    Optuna --> Trial["Trial N/100"]
+    Trial --> Suggest["suggest_params()<br/>8 parametre"]
+    Suggest --> Simulate["_evaluate_with_params()<br/>Geçmiş trade'leri simüle et"]
+    Simulate --> Score["Sharpe-like Score<br/>= sharpe + log(PF) + √trades"]
+    Score --> Next{"Daha fazla<br/>trial?"}
+    Next -->|Evet| Trial
+    Next -->|Hayır| Best["best_params<br/>Kaydet"]
+```
+
+**Optimize Edilen 8 Parametre:**
+
+| Parametre | Açıklama | Min | Max | Default |
+|-----------|----------|-----|-----|---------|
+| `sl_atr` | Stop-loss ATR çarpanı | 1.0 | 5.0 | 2.0 |
+| `tp_atr` | Take-profit ATR çarpanı | 1.5 | 6.0 | 3.0 |
+| `exit_tightness` | Çıkış sıkılık faktörü | 0.5 | 2.0 | 1.2 |
+| `entry_tightness` | Giriş sıkılık faktörü | 0.5 | 2.0 | 1.8 |
+| `z_score_threshold` | Z-Score giriş eşiği | 0.8 | 3.0 | 1.6 |
+| `min_confidence` | Minimum sinyal skoru | 50 | 95 | 68 |
+| `trail_activation` | Trailing stop aktivasyon ATR | 0.5 | 3.0 | 1.5 |
+| `trail_distance` | Trailing stop mesafe ATR | 0.3 | 2.0 | 1.0 |
+
+**Objective Fonksiyonu:**
+```python
+# Sharpe-like ratio + Profit factor bonus + Trade count bonus
+score = (mean_pnl / std_pnl * sqrt(N)) + log(1 + profit_factor) + sqrt(N) * 0.1
+```
+- Sharpe-like: Risk-adjusted return
+- Profit factor: Toplam kazanç / toplam kayıp
+- Trade count: Çok az trade alıyorsa cezalandır (< 10 trade = -100)
+
+**Auto-Optimize:**
+- Her 100 trade kapanışında otomatik tetiklenir
+- 100 Optuna trial çalıştırır
+- En iyi parametreleri `./data/hyperopt_best_params.json`'a kaydeder
+- Default parametrelerle karşılaştırma yapar ve iyileşme yüzdesini loglar
+
+**Optuna Kullanım Referansı (İleride İçin):**
+```python
+import optuna
+
+# Study oluştur
+study = optuna.create_study(direction='maximize')
+
+# Default parametreleri ilk trial olarak ekle
+study.enqueue_trial({'param1': 1.0, 'param2': 2.0})
+
+# Optimize et
+study.optimize(objective_function, n_trials=100)
+
+# Sonuçlar
+print(study.best_trial.params)   # En iyi parametreler
+print(study.best_trial.value)    # En iyi skor
+print(study.trials_dataframe())  # Tüm trial'lar
+
+# Görselleştirme (local dev için)
+from optuna.visualization import plot_optimization_history, plot_param_importances
+plot_optimization_history(study)
+plot_param_importances(study)
+```
+
+---
+
+### 🔌 Yeni API Endpointleri
+
+| Method | Path | Açıklama | Örnek |
+|--------|------|----------|-------|
+| GET | `/phase193/status` | Tüm modül durumları | `curl .../phase193/status` |
+| POST | `/phase193/stoploss-guard/settings` | SL guard ayarlarını güncelle | Body: `{"max_stoplosses": 5}` |
+| POST | `/phase193/freqai/retrain` | ML modelini zorla eğit | Body yok |
+| POST | `/phase193/hyperopt/run` | Optimizasyon başlat | Body: `{"n_trials": 200}` |
+
+**Örnek `/phase193/status` yanıtı:**
+```json
+{
+  "stoploss_guard": {"enabled": true, "global_locked": false, "recent_stoplosses": 0},
+  "freqai": {"enabled": true, "is_trained": false, "sklearn_available": true, "lightgbm_available": true},
+  "hyperopt": {"enabled": true, "optuna_available": true, "is_optimized": false},
+  "ws_manager": {"ccxt_pro_available": true, "connected": false},
+  "pandas_ta": false
+}
+```
+
+---
+
+### 🔗 Post-Close Hook Entegrasyonu
+
+Trade kapandığında 3 modüle otomatik bildirim yapılır (`main.py:~15305-15346`):
+
+```python
+# close_position() sonrası:
+try:
+    # 1. SL guard — SL nedenli kapanışları kaydet
+    if 'SL' in reason.upper() or 'STOP' in reason.upper():
+        stoploss_frequency_guard.record_stoploss(symbol, reason)
+
+    # 2. FreqAI — ML eğitimi için trade feature'larını kaydet
+    if freqai_model and freqai_model.enabled:
+        freqai_model.record_trade(ml_features, pnl > 0)
+
+    # 3. Hyperopt — Parametre optimizasyonu için trade verisi kaydet
+    if hhq_hyperoptimizer and hhq_hyperoptimizer.enabled:
+        hhq_hyperoptimizer.record_trade(trade)
+        if hhq_hyperoptimizer.should_auto_optimize():
+            asyncio.create_task(hhq_hyperoptimizer.optimize())
+except Exception as e:
+    logger.warning(f"⚠️ Phase 193 post-close hook error: {e}")
+```
+
+---
+
+### 📦 Bağımlılık Değişiklikleri
+
+**requirements.txt:**
+```diff
++scikit-learn>=1.3.0
++lightgbm>=4.0.0
++optuna>=3.4.0
+```
+
+**Dockerfile:**
+```diff
+-FROM python:3.9-slim
++FROM python:3.11-slim
+ RUN apt-get update && apt-get install -y \
+     gcc \
++    g++ \
+     && rm -rf /var/lib/apt/lists/*
++RUN pip install --no-cache-dir pandas_ta || echo "pandas-ta fallback"
+```
+
+> **Not:** `pandas-ta` PyPI'de sürüm belirtilerek kurulamıyor, bu yüzden Dockerfile'da ayrı `pip install pandas_ta` ile kurulur. Başarısız olursa manual fallback hesaplamaları devreye girer.
+
+---
+
+### 🐛 Deploy Sırasında Bulunan ve Düzeltilen Hatalar
+
+| # | Hata | Kritiklik | Açıklama | Düzeltme |
+|---|------|-----------|----------|----------|
+| 1 | `import time` eksik | 🔴 CRASH | `StoplossFrequencyGuard` `time.time()` kullanıyor ama `import time` top-level'da yoktu | `import time` satır 21'e eklendi |
+| 2 | `FakeTrial` mock | 🟠 CRASH | Hyperopt default score karşılaştırmasında `type('FakeTrial')` mock kırılgandı | `_evaluate_with_params()` metodu ile refactor edildi |
+| 3 | `pandas-ta` PyPI'de yok | 🔴 BUILD FAIL | `pandas-ta>=0.3.14b1` pip'te bulunamıyor | requirements.txt'ten kaldırılıp Dockerfile'da ayrı install yapıldı |
+| 4 | `logger` tanımdan önce kullanım | 🔴 CRASH | pandas-ta import bloğu `logger.warning()` çağırıyordu ama `logger` henüz tanımlı değildi | Import sırası düzeltildi: önce logger, sonra pandas-ta |
+| 5 | Python 3.9 uyumsuzluk | 🔴 BUILD FAIL | lightgbm, optuna ve pandas-ta Python 3.10+ gerektiriyor | Dockerfile `python:3.9-slim` → `python:3.11-slim` |
+
+**Öğrenilen Dersler:**
+1. **Import sırası kritik:** Logger tanımlanmadan önce logger kullanan kod çalışmaz. `try/except ImportError` bloklarında bile!
+2. **PyPI kullanılabilirliği varsayılamaz:** Bazı paketler PyPI'de eski/kaldırılmış olabilir. Docker build'de test edilmeli.
+3. **Mock pattern'ler kırılgan:** `type()` ile dynamic class oluşturmak yerine, core logic'i ayrı metoda çıkar ve doğrudan çağır.
+4. **Python alt sürüm uyumluluğu:** ML kütüphaneleri genellikle Python 3.10+ ister. Docker base image güncel tutulmalı.
+5. **Graceful fallback her yerde:** Her yeni modül import'u `try/except` ile sarmalı, yoksa tek bir eksik paket tüm uygulamayı çökertir.
+
+---
+
+### 📝 Log Pattern'leri
+
+```
+# pandas-ta
+✅ pandas-ta loaded successfully
+⚠️ pandas-ta not installed, using manual TA calculations
+
+# StoplossFrequencyGuard
+🛑 SL_GUARD: BTCUSDT LONG rejected — Global lock: 3 SLs in 60min
+🔒 SL_GUARD: Global lock activated (3 SLs in 60min, cooldown 30min)
+🔓 SL_GUARD: Global lock expired
+
+# FreqAI
+✅ FreqAI trained (#3): accuracy=67.50%, f1=65.20%, samples=150
+FreqAI: Trade recorded (profitable=True, total=51, until_retrain=49)
+
+# Hyperopt
+🔬 Hyperopt starting: 100 trials, 200 trades
+✅ Hyperopt complete: score=2.3456 (default=1.8901, improvement=+24.1%)
+
+# Module imports
+✅ ccxt_ws_manager loaded
+✅ freqai_adapter loaded
+✅ hyperopt loaded
+⚠️ Phase 193 post-close hook error: ...
+```
+
+---
+
+### 🔮 Gelecek İyileştirmeler (TODO)
+
+- [ ] FreqAI confidence score'u `generate_signal()` scoring'e entegre et (Layer 23)
+- [ ] Hyperopt'un bulduğu best_params'ı otomatik olarak paper trader settings'e uygula
+- [ ] ccxt_ws_manager'ı ana scanner loop'a entegre et (REST polling → WS streaming)
+- [ ] pandas-ta Docker build'de çalışır hale getir (GitHub'dan pip install)
+- [ ] UI'da Phase 193 modül durumlarını göster (Settings panel)
+- [ ] StoplossGuard per-pair mode'u test et ve UI toggle ekle
+
