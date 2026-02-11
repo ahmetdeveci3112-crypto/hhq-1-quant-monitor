@@ -488,26 +488,26 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
           )}
 
-          {/* Phase 193: Module Controls Section */}
+          {/* Phase 193: Gelişmiş Modül Kontrolleri */}
           {phase193Status && (
             <div>
               <h3 className="text-sm font-semibold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
                 <ShieldAlert className="w-4 h-4" />
-                6. Phase 193 Modüller
+                6. Gelişmiş Risk & ML Modülleri
               </h3>
 
               <div className="space-y-4">
                 {/* StoplossGuard */}
                 <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <ShieldAlert className="w-4 h-4 text-orange-400" />
-                      <span className="text-sm font-medium text-white">StoplossGuard</span>
+                      <span className="text-sm font-medium text-white">Zarar Koruma Kalkanı</span>
                       <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.stoploss_guard.global_locked
-                          ? 'bg-rose-500/20 text-rose-400'
-                          : 'bg-emerald-500/20 text-emerald-400'
+                        ? 'bg-rose-500/20 text-rose-400'
+                        : 'bg-emerald-500/20 text-emerald-400'
                         }`}>
-                        {phase193Status.stoploss_guard.global_locked ? '🔒 Kilitli' : '🟢 Açık'}
+                        {phase193Status.stoploss_guard.global_locked ? '🔒 Kilitli — Yeni işlem engellendi' : '🟢 Aktif'}
                       </span>
                     </div>
                     <button
@@ -519,117 +519,153 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                         }`} />
                     </button>
                   </div>
+                  <p className="text-[10px] text-slate-500 mb-3">
+                    🛡️ Art arda stop-loss yediğinizde sistemi otomatik durdurur. Seri kayıpların önüne geçer.
+                  </p>
 
                   <div className="space-y-3">
                     <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                        <span>Lookback</span>
-                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.lookback_minutes || 60} dk</span>
+                      <div className="flex justify-between text-[10px] mb-1">
+                        <span className="text-slate-400">📊 Kontrol Penceresi</span>
+                        <span className="font-mono text-orange-400 font-bold">{phase193Status.stoploss_guard.lookback_minutes || 60} dakika</span>
                       </div>
+                      <p className="text-[9px] text-slate-600 mb-1">Son kaç dakikadaki SL'leri sayar. Kısa = daha hızlı tepki, uzun = daha toleranslı.</p>
                       <input
                         type="range" min="30" max="120" step="10"
                         value={phase193Status.stoploss_guard.lookback_minutes || 60}
                         onChange={e => onSLGuardSettings?.({ lookback_minutes: parseInt(e.target.value) })}
                         className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                       />
+                      <div className="flex justify-between text-[9px] text-slate-600 mt-0.5">
+                        <span>30dk (Hassas)</span>
+                        <span>120dk (Toleranslı)</span>
+                      </div>
                     </div>
                     <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                        <span>Maks SL Sayısı</span>
-                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.max_stoplosses || 3}</span>
+                      <div className="flex justify-between text-[10px] mb-1">
+                        <span className="text-slate-400">🚫 Maksimum SL Sayısı</span>
+                        <span className="font-mono text-orange-400 font-bold">{phase193Status.stoploss_guard.max_stoplosses || 3} adet</span>
                       </div>
+                      <p className="text-[9px] text-slate-600 mb-1">Bu kadar SL yenildiğinde sistem kilitlenerek yeni pozisyon açılmasını engeller.</p>
                       <input
                         type="range" min="2" max="10" step="1"
                         value={phase193Status.stoploss_guard.max_stoplosses || 3}
                         onChange={e => onSLGuardSettings?.({ max_stoplosses: parseInt(e.target.value) })}
                         className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                       />
+                      <div className="flex justify-between text-[9px] text-slate-600 mt-0.5">
+                        <span>2 (Çok sıkı)</span>
+                        <span>10 (Çok gevşek)</span>
+                      </div>
                     </div>
                     <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                        <span>Cooldown</span>
-                        <span className="font-mono text-orange-400">{phase193Status.stoploss_guard.cooldown_minutes || 30} dk</span>
+                      <div className="flex justify-between text-[10px] mb-1">
+                        <span className="text-slate-400">⏸️ Bekleme Süresi (Cooldown)</span>
+                        <span className="font-mono text-orange-400 font-bold">{phase193Status.stoploss_guard.cooldown_minutes || 30} dakika</span>
                       </div>
+                      <p className="text-[9px] text-slate-600 mb-1">Kilitlenmeden sonra piyasanın sakinleşmesi için beklenen süre. Süre sonunda otomatik açılır.</p>
                       <input
                         type="range" min="10" max="60" step="5"
                         value={phase193Status.stoploss_guard.cooldown_minutes || 30}
                         onChange={e => onSLGuardSettings?.({ cooldown_minutes: parseInt(e.target.value) })}
                         className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                       />
+                      <div className="flex justify-between text-[9px] text-slate-600 mt-0.5">
+                        <span>10dk (Kısa mola)</span>
+                        <span>60dk (Uzun mola)</span>
+                      </div>
                     </div>
+                  </div>
+
+                  {/* Durum Özeti */}
+                  <div className="mt-3 bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
+                    📋 <span className="text-amber-400">Kural:</span> Son {phase193Status.stoploss_guard.lookback_minutes || 60} dk'da {phase193Status.stoploss_guard.max_stoplosses || 3} SL yenilirse → {phase193Status.stoploss_guard.cooldown_minutes || 30} dk boyunca yeni işlem açılmaz
                   </div>
                 </div>
 
                 {/* FreqAI */}
                 <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <Brain className="w-4 h-4 text-purple-400" />
-                      <span className="text-sm font-medium text-white">FreqAI ML</span>
+                      <span className="text-sm font-medium text-white">Yapay Zeka Sinyal Filtresi</span>
                       <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.freqai.is_trained ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.freqai.is_trained ? '✅ Eğitildi' : '⏳ Eğitilmedi'}
+                        {phase193Status.freqai.is_trained ? '✅ Model Hazır' : '⏳ Eğitim Bekliyor'}
                       </span>
                     </div>
                   </div>
+                  <p className="text-[10px] text-slate-500 mb-3">
+                    🧠 Geçmiş trade verilerinden öğrenerek her sinyale güven skoru verir. Düşük kaliteli sinyalleri filtreler.
+                  </p>
                   <div className="grid grid-cols-3 gap-2 mb-3">
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">Accuracy</div>
+                      <div className="text-[10px] text-slate-500">Doğruluk</div>
                       <div className="text-sm font-bold text-purple-400">
-                        {phase193Status.freqai.accuracy ? `${(phase193Status.freqai.accuracy * 100).toFixed(1)}%` : '—'}
+                        {phase193Status.freqai.accuracy ? `%${(phase193Status.freqai.accuracy * 100).toFixed(1)}` : '—'}
                       </div>
+                      <div className="text-[8px] text-slate-600">Tahmin başarısı</div>
                     </div>
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">F1</div>
+                      <div className="text-[10px] text-slate-500">F1 Skoru</div>
                       <div className="text-sm font-bold text-purple-400">
                         {phase193Status.freqai.f1_score ? phase193Status.freqai.f1_score.toFixed(3) : '—'}
                       </div>
+                      <div className="text-[8px] text-slate-600">Denge metriği</div>
                     </div>
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">Samples</div>
+                      <div className="text-[10px] text-slate-500">Eğitim Verisi</div>
                       <div className="text-sm font-bold text-slate-300">{phase193Status.freqai.training_samples || 0}</div>
+                      <div className="text-[8px] text-slate-600">trade sayısı</div>
                     </div>
                   </div>
                   <button
                     onClick={onFreqAIRetrain}
                     className="w-full text-xs font-bold py-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/30 hover:bg-purple-500/20 transition-colors"
                   >
-                    🧠 Yeniden Eğit
+                    🧠 Modeli Yeniden Eğit
                   </button>
+                  <p className="text-[9px] text-slate-600 mt-1 text-center">Son trade verilerini kullanarak ML modelini günceller (min. 50 trade gerekli)</p>
                 </div>
 
                 {/* Hyperopt */}
                 <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <FlaskConical className="w-4 h-4 text-cyan-400" />
-                      <span className="text-sm font-medium text-white">Hyperopt</span>
+                      <span className="text-sm font-medium text-white">Parametre Optimizasyonu</span>
                       <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.hyperopt.is_optimized ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize' : '⏳ Bekleniyor'}
+                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize Edildi' : '⏳ Henüz Çalıştırılmadı'}
                       </span>
                     </div>
                   </div>
+                  <p className="text-[10px] text-slate-500 mb-3">
+                    🔬 Optuna ile Z-Score, SL/TP, entry/exit gibi parametreleri otomatik optimize eder. En iyi kombinasyonu bulur.
+                  </p>
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">Best Score</div>
+                      <div className="text-[10px] text-slate-500">En İyi Skor</div>
                       <div className="text-sm font-bold text-cyan-400">
                         {phase193Status.hyperopt.best_score?.toFixed(3) || '—'}
                       </div>
+                      <div className="text-[8px] text-slate-600">Sharpe benzeri metrik</div>
                     </div>
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">İyileşme</div>
+                      <div className="text-[10px] text-slate-500">İyileşme Oranı</div>
                       <div className={`text-sm font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
-                        {phase193Status.hyperopt.improvement_pct ? `+${phase193Status.hyperopt.improvement_pct.toFixed(1)}%` : '—'}
+                        {phase193Status.hyperopt.improvement_pct ? `+%${phase193Status.hyperopt.improvement_pct.toFixed(1)}` : '—'}
                       </div>
+                      <div className="text-[8px] text-slate-600">Öncekine göre</div>
                     </div>
                   </div>
                   <button
                     onClick={() => onHyperoptRun?.(100)}
                     className="w-full text-xs font-bold py-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
                   >
-                    🔬 Optimize Et (100 Trial)
+                    🔬 Otomatik Optimize Et (100 Deneme)
                   </button>
+                  <p className="text-[9px] text-slate-600 mt-1 text-center">100 farklı parametre kombinasyonu deneyerek en kârlı ayarları otomatik uygular</p>
                 </div>
               </div>
             </div>
