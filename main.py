@@ -2569,18 +2569,19 @@ async def lifespan(app: FastAPI):
             success = await live_binance_trader.initialize()
             if success:
                 logger.info("✅ LiveBinanceTrader ready for real trading!")
-                # Start Binance position sync loop
-                binance_sync_task = asyncio.create_task(binance_position_sync_loop())
-                logger.info("🔄 Binance position sync loop started!")
                 
                 # Backfill last 1000 trades to SQLite (one-time on startup)
                 asyncio.create_task(live_binance_trader.backfill_trade_history_to_sqlite(1000))
             else:
-                logger.error("❌ LiveBinanceTrader failed to initialize!")
+                logger.error("❌ LiveBinanceTrader failed to initialize! Sync loop will retry...")
         except Exception as e:
             logger.error(f"❌ CRITICAL: LiveBinanceTrader initialization error: {e}")
             import traceback
             logger.error(traceback.format_exc())
+        
+        # Phase 189: ALWAYS start sync loop - it has auto-reconnect logic
+        binance_sync_task = asyncio.create_task(binance_position_sync_loop())
+        logger.info("🔄 Binance position sync loop started (with auto-reconnect)!")
     else:
         logger.info("📄 Paper trading mode - no Binance connection")
     
@@ -2648,9 +2649,33 @@ async def binance_position_sync_loop():
     Phase 72: Tüm Binance pozisyonlarını (manuel dahil) algoritma yönetimi altına alır.
     """
     logger.info("🔄 Binance Position Sync Loop started")
+    reconnect_interval = 30  # seconds between reconnect attempts
+    last_reconnect_attempt = 0
     
     while True:
         try:
+            # Phase 189: Auto-reconnect if Binance connection lost or failed on startup
+            if not live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
+                now = datetime.now().timestamp()
+                if now - last_reconnect_attempt > reconnect_interval:
+                    last_reconnect_attempt = now
+                    logger.warning(f"🔌 RECONNECT: live_binance_trader.enabled=False, attempting reconnect...")
+                    try:
+                        success = await live_binance_trader.initialize()
+                        if success:
+                            logger.warning(f"✅ RECONNECT SUCCESS: Binance live trading restored!")
+                            # Clean ghost positions (no isLive flag) that accumulated while disconnected
+                            ghost_count = len([p for p in global_paper_trader.positions if not p.get('isLive')])
+                            if ghost_count > 0:
+                                global_paper_trader.positions = [p for p in global_paper_trader.positions if p.get('isLive')]
+                                logger.warning(f"🧹 CLEANUP: Removed {ghost_count} ghost positions (no isLive flag)")
+                        else:
+                            logger.error(f"❌ RECONNECT FAILED: {getattr(live_binance_trader, 'last_error', 'unknown')}")
+                    except Exception as re:
+                        logger.error(f"❌ RECONNECT ERROR: {re}")
+                await asyncio.sleep(3)
+                continue
+            
             if live_binance_trader.enabled:
                 # Bakiye güncelle
                 balance = await live_binance_trader.get_balance()
