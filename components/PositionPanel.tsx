@@ -16,9 +16,9 @@ export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClose
     const pnlColor = position.unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400';
     const sideColor = isLong ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30';
 
-    // Calculate distances
-    const slPercent = Math.abs(((currentPrice - position.stopLoss) / position.entryPrice) * 100);
-    const tpPercent = Math.abs(((position.takeProfit - currentPrice) / position.entryPrice) * 100);
+    // Phase 192: Calculate SL/TP distance from entry (not from current price)
+    const slPercent = Math.abs(((position.entryPrice - position.stopLoss) / position.entryPrice) * 100);
+    const tpPercent = Math.abs(((position.takeProfit - position.entryPrice) / position.entryPrice) * 100);
 
     // Calculate age
     const ageMs = Date.now() - position.openTime;
@@ -112,9 +112,9 @@ export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClose
                     )}
                     {(position as any).spreadLevel && (
                         <span className={`px-1 rounded text-[8px] ${(position as any).spreadLevel === 'very_low' ? 'bg-emerald-500/20 text-emerald-400' :
-                                (position as any).spreadLevel === 'low' ? 'bg-emerald-500/10 text-emerald-300' :
-                                    (position as any).spreadLevel === 'normal' ? 'bg-amber-500/10 text-amber-400' :
-                                        'bg-red-500/10 text-red-400'
+                            (position as any).spreadLevel === 'low' ? 'bg-emerald-500/10 text-emerald-300' :
+                                (position as any).spreadLevel === 'normal' ? 'bg-amber-500/10 text-amber-400' :
+                                    'bg-red-500/10 text-red-400'
                             }`}>{(position as any).spreadLevel}</span>
                     )}
                 </div>

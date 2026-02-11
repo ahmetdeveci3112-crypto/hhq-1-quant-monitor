@@ -2911,6 +2911,12 @@ async def binance_position_sync_loop():
                         # Update existing position with current Binance data
                         # Phase 88: Also sync SIZE to prevent close amount mismatches
                         # Phase 141: Sync CONTRACTS alongside SIZE for consistency
+                        # Phase 190: PROTECTED FIELDS — these are NEVER overwritten by sync:
+                        #   partial_tp_state, breakeven_activated, kill_switch_reduced,
+                        #   isTrailingActive, trailingStop, stopLoss, takeProfit,
+                        #   slConfirmCount, slBreachStartTime, highestProfit,
+                        #   gradual_exit_mode, recovery_mode, recovery_sl,
+                        #   time_reduced_4h, time_reduced_8h, _partial_close_ts
                         for pos in global_paper_trader.positions:
                             # Phase 155: Match by symbol only (ignore isLive for existing Binance positions)
                             if pos.get('symbol') == symbol:
@@ -2952,7 +2958,7 @@ async def binance_position_sync_loop():
                                 if not pos.get('stopLoss') or pos.get('stopLoss', 0) == 0:
                                     sl_mult = global_paper_trader.sl_multiplier
                                     if pos['side'] == 'LONG':
-                                        pos['stopLoss'] = entry_price - (pos_atr * sl_mult)
+                                        pos['stopLoss'] = max(entry_price * 0.01, entry_price - (pos_atr * sl_mult))
                                     else:
                                         pos['stopLoss'] = entry_price + (pos_atr * sl_mult)
                                     logger.info(f"📊 Exit fix: {symbol} stopLoss set to {pos['stopLoss']:.6f}")
@@ -2963,8 +2969,17 @@ async def binance_position_sync_loop():
                                     if pos['side'] == 'LONG':
                                         pos['takeProfit'] = entry_price + (pos_atr * tp_mult)
                                     else:
-                                        pos['takeProfit'] = entry_price - (pos_atr * tp_mult)
+                                        pos['takeProfit'] = max(entry_price * 0.01, entry_price - (pos_atr * tp_mult))
                                     logger.info(f"📊 Exit fix: {symbol} takeProfit set to {pos['takeProfit']:.6f}")
+                                
+                                # Phase 192: Fix existing negative SL/TP
+                                if pos.get('stopLoss', 0) < 0:
+                                    pos['stopLoss'] = entry_price * 0.01
+                                    pos['trailingStop'] = pos['stopLoss']
+                                    logger.warning(f"🔧 Phase 192: Fixed negative SL for {symbol}")
+                                if pos.get('takeProfit', 0) < 0:
+                                    pos['takeProfit'] = entry_price * 0.01
+                                    logger.warning(f"🔧 Phase 192: Fixed negative TP for {symbol}")
                                 
                                 # Initialize trailActivation if missing
                                 if not pos.get('trailActivation') or pos.get('trailActivation', 0) == 0:
@@ -3046,8 +3061,8 @@ async def binance_position_sync_loop():
                             "sizeUsd": pos.get('sizeUsd', 0),
                             "pnl": pnl,
                             "pnlPercent": pnl_percent,
-                            "margin": pos.get('initialMargin', (pos.get('sizeUsd', 0) / pos.get('leverage', 10)) if pos.get('leverage', 10) > 0 else 0),
-                            "roi": (pnl / pos.get('initialMargin', (pos.get('sizeUsd', 0) / pos.get('leverage', 10)) if pos.get('leverage', 10) > 0 else 1) * 100) if pos.get('initialMargin', 0) > 0 or pos.get('sizeUsd', 0) > 0 else 0,
+                            "margin": pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(pos.get('leverage', 10), 1)),
+                            "roi": (pnl / max(pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(pos.get('leverage', 10), 1)), 0.01)) * 100 if (pos.get('initialMargin', 0) > 0 or pos.get('sizeUsd', 0) > 0) else 0,
                             "openTime": pos.get('openTime', 0),
                             "closeTime": int(datetime.now().timestamp() * 1000),
                             "reason": "External Close (Binance)",
@@ -3115,6 +3130,14 @@ async def binance_position_sync_loop():
                 except Exception as pe:
                     logger.warning(f"PnL cache refresh failed: {pe}")
                 
+                # Phase 191: Update position symbols for WS callback
+                binance_ws_manager.position_symbols = set(
+                    p.get('symbol') for p in global_paper_trader.positions if p.get('symbol')
+                )
+                if binance_ws_manager.on_price_update is None:
+                    binance_ws_manager.on_price_update = on_position_price_update
+                    logger.info(f"⚡ Phase 191: WebSocket callback registered for {len(binance_ws_manager.position_symbols)} symbols")
+                
                 # ================================================================
                 # Phase 148: Periodic trade history sync from Binance
                 # Runs every 5 minutes (100 loops × 3s = 300s = 5 min)
@@ -3134,7 +3157,8 @@ async def binance_position_sync_loop():
                         logger.warning(f"Trade history sync failed: {tse}")
                 
         except Exception as e:
-            logger.error(f"Binance sync error: {e}")
+            import traceback
+            logger.error(f"Binance sync error: {e}\n{traceback.format_exc()}")
         
         # Phase 86: Reduced interval to 3s (was 10s) - utilizing ~60% of API capacity
         # Weight calculation: 20 calls/min × 40 weight = 800 weight/min (of 2400 limit)
@@ -5022,7 +5046,11 @@ class BinanceWebSocketManager:
         self.last_update = 0
         self.ws_url = "wss://fstream.binance.com/ws/!ticker@arr"
         self._reconnect_task = None
-        logger.info("BinanceWebSocketManager initialized")
+        # Phase 191: Callback pattern for real-time position updates
+        self.position_symbols: set = set()  # Aktif pozisyonlu semboller
+        self.on_price_update = None  # async callback(symbol, ticker_data)
+        self._pending_updates: list = []  # Bekleyen callback çağrıları
+        logger.info("BinanceWebSocketManager initialized (Phase 191: callback support)")
     
     async def connect(self):
         """Connect to Binance Futures WebSocket."""
@@ -5043,6 +5071,16 @@ class BinanceWebSocketManager:
                         try:
                             data = json.loads(message)
                             self._process_ticker_message(data)
+                            
+                            # Phase 191: Process pending position price updates
+                            if self._pending_updates:
+                                updates = self._pending_updates.copy()
+                                self._pending_updates.clear()
+                                for sym, tick in updates:
+                                    try:
+                                        await self.on_price_update(sym, tick)
+                                    except Exception as cb_err:
+                                        logger.debug(f"WS callback error {sym}: {cb_err}")
                         except json.JSONDecodeError:
                             continue
                             
@@ -5088,6 +5126,13 @@ class BinanceWebSocketManager:
         # Using 24H high/low from ticker gave false swing high/low detection
         
         self.last_update = datetime.now().timestamp()
+        
+        # Phase 191: Queue position price callbacks for async processing
+        if self.on_price_update and self.position_symbols:
+            for ticker in data:
+                sym = ticker.get('s', '')
+                if sym in self.position_symbols:
+                    self._pending_updates.append((sym, self.tickers[sym]))
     
     def get_tickers(self, symbols: list = None) -> dict:
         """Get current ticker data for specified symbols."""
@@ -6391,11 +6436,11 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         tp_mult = getattr(global_paper_trader, 'tp_multiplier', 3.0)  # Default 3x ATR
                         
                         if bp.get('side') == 'LONG':
-                            merged['stopLoss'] = entry - (atr * sl_mult)
+                            merged['stopLoss'] = max(entry * 0.01, entry - (atr * sl_mult))
                             merged['takeProfit'] = entry + (atr * tp_mult)
                         else:
                             merged['stopLoss'] = entry + (atr * sl_mult)
-                            merged['takeProfit'] = entry - (atr * tp_mult)
+                            merged['takeProfit'] = max(entry * 0.01, entry - (atr * tp_mult))
                         
                         merged['trailingStop'] = merged['stopLoss']
                         merged['isTrailingActive'] = False
@@ -6757,6 +6802,9 @@ async def background_scanner_loop():
                                         continue
                             
                             # Check SL/TP
+                            # Phase 190: Skip if limit close is pending (breakeven or TP)
+                            if pos.get('pending_limit_close'):
+                                continue
                             sl = pos.get('stopLoss', 0)
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
@@ -7037,9 +7085,173 @@ async def background_scanner_loop():
         logger.error(f"Background scanner fatal error: {e}")
         multi_coin_scanner.running = False
 
+# ============================================================================
+# PHASE 191: REAL-TIME WEBSOCKET POSITION PRICE CALLBACK
+# ============================================================================
+
+async def on_position_price_update(symbol: str, ticker: dict):
+    """
+    Phase 191: WebSocket'ten gelen her fiyat güncellemesinde çağrılır (~100ms).
+    Aktif pozisyonun fiyatını günceller ve SL/TP/trailing kontrol eder.
+    """
+    current_price = ticker.get('last', 0)
+    if current_price <= 0:
+        return
+    
+    for pos in list(global_paper_trader.positions):
+        if pos.get('symbol') != symbol:
+            continue
+        
+        # ---- Fiyat + PnL güncelle ----
+        entry_price = pos.get('entryPrice', current_price)
+        size = pos.get('size', 0)
+        size_usd = pos.get('sizeUsd', 0)
+        leverage = pos.get('leverage', 1)
+        
+        if pos['side'] == 'LONG':
+            pnl = (current_price - entry_price) * size
+        else:
+            pnl = (entry_price - current_price) * size
+        
+        pnl_percent = (pnl / size_usd) * 100 * leverage if size_usd > 0 else 0
+        
+        pos['currentPrice'] = current_price
+        pos['unrealizedPnl'] = round(pnl, 6)
+        pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
+        
+        # ---- Pending limit close varsa SL/TP atla ----
+        pending = pos.get('pending_limit_close')
+        if pending and pos.get('isLive', False) and live_binance_trader.enabled:
+            order_id = pending.get('order_id')
+            placed_at = pending.get('placed_at', 0)
+            timeout = pending.get('timeout_seconds', 60)
+            reason = pending.get('reason', 'TP_HIT')
+            elapsed = datetime.now().timestamp() - placed_at
+            
+            try:
+                order_check = await live_binance_trader.check_order_status(symbol, order_id)
+                chk_status = order_check.get('status', 'unknown')
+                
+                if chk_status == 'closed':
+                    fill_price = order_check.get('average', pending.get('limit_price', current_price))
+                    remaining_amt = order_check.get('remaining', 0)
+                    if remaining_amt > 0:
+                        try:
+                            await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                        except:
+                            pass
+                    logger.warning(f"✅ WS_LIMIT_FILLED: {symbol} @ ${fill_price:.6f} | {reason} | {elapsed:.0f}s")
+                    del pos['pending_limit_close']
+                    global_paper_trader.close_position(pos, fill_price, reason)
+                    continue
+                elif chk_status in ('canceled', 'expired'):
+                    del pos['pending_limit_close']
+                    global_paper_trader.close_position(pos, current_price, reason)
+                    continue
+                elif elapsed >= timeout:
+                    logger.warning(f"⏰ WS_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
+                    await live_binance_trader.cancel_order(symbol, order_id)
+                    del pos['pending_limit_close']
+                    global_paper_trader.close_position(pos, current_price, reason)
+                    continue
+                else:
+                    continue  # Still pending — skip SL/TP
+            except Exception as pe:
+                if elapsed >= timeout:
+                    try:
+                        await live_binance_trader.cancel_order(symbol, order_id)
+                    except:
+                        pass
+                    del pos['pending_limit_close']
+                    global_paper_trader.close_position(pos, current_price, reason)
+                    continue
+            continue  # pending_limit_close aktif, SL/TP atla
+        
+        if pos.get('pending_limit_close'):
+            continue
+        
+        # ---- SL/TP Kontrolü (Spike Bypass ile) ----
+        sl = pos.get('stopLoss', 0)
+        tp = pos.get('takeProfit', 0)
+        trailing_stop = pos.get('trailingStop', sl)
+        
+        SL_CONFIRMATION_TICKS = 5
+        SL_CONFIRMATION_SECONDS = 30
+        
+        if 'slConfirmCount' not in pos:
+            pos['slConfirmCount'] = 0
+        if 'slBreachStartTime' not in pos:
+            pos['slBreachStartTime'] = 0
+        
+        sl_breached = False
+        if pos['side'] == 'LONG' and current_price <= trailing_stop:
+            sl_breached = True
+        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+            sl_breached = True
+        
+        now_ts = datetime.now().timestamp()
+        if sl_breached:
+            if pos['slConfirmCount'] == 0:
+                pos['slBreachStartTime'] = now_ts
+            pos['slConfirmCount'] += 1
+            breach_duration = now_ts - pos['slBreachStartTime']
+            if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
+                logger.info(f"🔴 SL CONFIRMED (WS): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
+                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                continue
+        else:
+            if pos['slConfirmCount'] > 0:
+                bypass_duration = now_ts - pos['slBreachStartTime']
+                logger.info(f"⚡ Spike bypassed (WS): {symbol} | {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
+            pos['slConfirmCount'] = 0
+            pos['slBreachStartTime'] = 0
+        
+        # TP Hit Check (anında — kar için onay gerekmez)
+        if pos['side'] == 'LONG' and current_price >= tp:
+            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+            logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${current_price:.6f}")
+            continue
+        elif pos['side'] == 'SHORT' and current_price <= tp:
+            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+            logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f}")
+            continue
+        
+        # ---- Trailing Stop Güncelle ----
+        trail_activation = pos.get('trailActivation', entry_price)
+        trail_distance = pos.get('trailDistance', 0)
+        
+        pos_atr = pos.get('atr', entry_price * 0.02)
+        atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
+        
+        if atr_pct < 1.0:
+            volatility_mult = 0.6
+        elif atr_pct < 1.5:
+            volatility_mult = 0.75
+        elif atr_pct < 2.5:
+            volatility_mult = 1.0
+        elif atr_pct < 4.0:
+            volatility_mult = 1.3
+        elif atr_pct < 6.0:
+            volatility_mult = 1.6
+        else:
+            volatility_mult = 2.0
+        
+        dynamic_trail_distance = trail_distance * volatility_mult
+        
+        if pos['side'] == 'LONG' and current_price > trail_activation:
+            new_trailing = current_price - dynamic_trail_distance
+            if new_trailing > trailing_stop:
+                pos['trailingStop'] = new_trailing
+                pos['isTrailingActive'] = True
+        elif pos['side'] == 'SHORT' and current_price < trail_activation:
+            new_trailing = current_price + dynamic_trail_distance
+            if new_trailing < trailing_stop:
+                pos['trailingStop'] = new_trailing
+                pos['isTrailingActive'] = True
+
 
 # ============================================================================
-# PHASE 35: HIGH-FREQUENCY POSITION PRICE UPDATER
+# PHASE 35: HIGH-FREQUENCY POSITION PRICE UPDATER (BACKUP)
 # ============================================================================
 
 async def position_price_update_loop():
@@ -7050,7 +7262,7 @@ async def position_price_update_loop():
     """
     logger.info("⚡ Position Price Updater started - 1.5s interval (Phase 185)")
     
-    update_interval = 1.5  # Phase 185: Reduced from 2s for faster reactions
+    update_interval = 5.0  # Phase 191: Backup only — ana güncelleme WS callback'te
     
     # Wait for app to fully initialize
     await asyncio.sleep(5)
@@ -7157,6 +7369,9 @@ async def position_price_update_loop():
                                     continue
                         
                         # Check SL/TP exits with SPIKE BYPASS
+                        # Phase 190: Skip if limit close is pending (breakeven or TP)
+                        if pos.get('pending_limit_close'):
+                            continue
                         sl = pos.get('stopLoss', 0)
                         tp = pos.get('takeProfit', 0)
                         trailing_stop = pos.get('trailingStop', sl)
@@ -9440,40 +9655,9 @@ class TimeBasedPositionManager:
                                 logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at {profit_pct:.2f}% profit (level: {level['key']}, base: {base_tp_pct:.2f}%)")
                                 actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
                 
-                # ===============================================
-                # PHASE 137: DYNAMIC BREAKEVEN STOP
-                # Kar belli bir seviyeye ulaştığında stop = entry
-                # Spread/volatiliteye göre dinamik eşik
-                # ===============================================
-                if unrealized_pnl > 0 and not pos.get('breakeven_activated', False):
-                    # Get spread level for dynamic threshold
-                    spread_level = pos.get('spread_level', 'Normal')
-                    
-                    # Phase 182: Dynamic breakeven threshold based on spread
-                    # These are LOWER than BreakevenStopManager (safety net)
-                    # SL moves to entry, actual limit close happens at higher threshold
-                    breakeven_thresholds = {
-                        'Very Low': 0.8,   # BTC/ETH - was 0.3%
-                        'Low': 1.2,        # was 0.4%
-                        'Normal': 1.5,     # was 0.5%
-                        'High': 2.5,       # was 0.8%
-                        'Very High': 3.5   # Meme coins - was 1.2%
-                    }
-                    be_threshold = breakeven_thresholds.get(spread_level, 1.5)
-                    
-                    # Calculate profit percentage
-                    if entry_price > 0:
-                        if side == 'LONG':
-                            profit_pct = (current_price - entry_price) / entry_price * 100
-                        else:  # SHORT
-                            profit_pct = (entry_price - current_price) / entry_price * 100
-                        
-                        # If profit exceeds threshold, move stop to entry (breakeven)
-                        if profit_pct >= be_threshold:
-                            pos['breakeven_activated'] = True
-                            pos['stopLoss'] = entry_price
-                            logger.info(f"🔒 BREAKEVEN: {symbol} stop moved to entry ${entry_price:.4f} at {profit_pct:.2f}% profit (threshold: {be_threshold}%)")
-                            actions.setdefault("breakeven", []).append(f"{symbol}({profit_pct:.1f}%)")
+                # Phase 190: REMOVED duplicate breakeven (Phase 137)
+                # BreakevenStopManager handles this better with limit orders + fee buffer
+                # Old code moved SL to exact entry (no buffer) — caused commission losses
                 
 
                 # ===============================================
@@ -9522,7 +9706,8 @@ class TimeBasedPositionManager:
                 # Phase 188: SKIP for LIVE positions — Kill Switch handles risk management
                 # Time-based reduction on live causes duplicate Binance orders due to sync overwrite
                 # ===============================================
-                if unrealized_pnl < 0 and not pos.get('isLive', False):
+                # Phase 190: Enabled for LIVE positions (was paper-only)
+                if unrealized_pnl < 0:
                     # Initialize tracking for this position
                     if pos_id not in self.time_reductions:
                         self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
@@ -9698,13 +9883,14 @@ class PortfolioRecoveryManager:
         self.last_total_upnl = 0.0            # Last recorded total uPnL
         
         # Configuration
-        self.underwater_threshold_hours = 12   # Time needed underwater to become candidate
+        # Phase 190: Removed 12h wait — recovery candidate activates immediately
+        self.underwater_threshold_hours = 0    # Immediate — artıya geçince trail başlar
         self.min_positive_threshold = 0.50     # Min $0.50 to activate trailing
         self.min_trailing_pct = 1.5           # 1.5% minimum trailing distance
         self.max_trailing_pct = 5.0           # 5.0% maximum trailing distance
         self.cooldown_hours = 6               # Hours to wait after recovery close
         
-        logger.info(f"🔄 PortfolioRecoveryManager initialized: {self.underwater_threshold_hours}h underwater → trailing → close all")
+        logger.info(f"🔄 PortfolioRecoveryManager initialized: immediate trail on positive uPnL → close all")
     
     def update(self, total_unrealized_pnl: float, btc_atr_pct: float, eth_atr_pct: float) -> str:
         """
@@ -9883,12 +10069,13 @@ class BreakevenStopManager:
         # Phase 182: ATR-based dynamic activation thresholds
         # Activation = max(floor, ATR_pct * atr_mult)
         # This ensures breakeven only activates after a move meaningful for that coin's volatility
+        # Phase 190: Lowered activation thresholds for faster breakeven
         self.activation_config = {
-            'Very Low':  {'floor': 1.0, 'atr_mult': 1.5},   # BTC: max(1.0%, ATR*1.5)
-            'Low':       {'floor': 1.5, 'atr_mult': 1.8},   # SOL/AVAX
-            'Normal':    {'floor': 2.0, 'atr_mult': 2.0},   # Mid-cap
-            'High':      {'floor': 3.0, 'atr_mult': 2.5},   # Low liquidity
-            'Very High': {'floor': 4.0, 'atr_mult': 3.0},   # Meme coins
+            'Very Low':  {'floor': 0.5, 'atr_mult': 1.0},   # BTC: max(0.5%, ATR*1.0)
+            'Low':       {'floor': 0.7, 'atr_mult': 1.2},   # SOL/AVAX
+            'Normal':    {'floor': 1.0, 'atr_mult': 1.5},   # Mid-cap
+            'High':      {'floor': 1.5, 'atr_mult': 2.0},   # Low liquidity
+            'Very High': {'floor': 2.0, 'atr_mult': 2.5},   # Meme coins
         }
         
         # Phase 185: Fee buffer increased — minimum 0.5% for all levels
@@ -9902,8 +10089,8 @@ class BreakevenStopManager:
             'Very High': 0.010,   # 1.00% (was 0.30%)
         }
         
-        # Phase 182: Minimum age before breakeven can activate (minutes)
-        self.min_breakeven_age_minutes = 30
+        # Phase 190: Reduced min age from 30 to 5 minutes
+        self.min_breakeven_age_minutes = 5
         
         logger.info("📊 BreakevenStopManager v2 initialized (ATR-based)")
     
@@ -13245,6 +13432,11 @@ class PaperTradingEngine:
             self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
             return None
         
+        # Phase 191: Paper pozisyon açmayı engelle — sadece live
+        if not live_binance_trader.enabled:
+            logger.debug(f"📄 Paper trade skipped: {side} {symbol if symbol else self.symbol} (live only mode)")
+            return None
+        
         # Use provided symbol or default
         trade_symbol = symbol if symbol else self.symbol
         
@@ -13358,13 +13550,13 @@ class PaperTradingEngine:
         adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
-            sl = entry_price - (atr * adjusted_sl_atr)
+            sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
             tp = entry_price + (atr * adjusted_tp_atr)
             trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
         else:
             sl = entry_price + (atr * adjusted_sl_atr)
-            tp = entry_price - (atr * adjusted_tp_atr)
-            trail_activation = entry_price - (atr * adjusted_trail_activation_atr)
+            tp = max(entry_price * 0.01, entry_price - (atr * adjusted_tp_atr))
+            trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_activation_atr))
         
         trail_distance = atr * adjusted_trail_distance_atr
         
@@ -13685,13 +13877,13 @@ class PaperTradingEngine:
         adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
         
         if side == 'LONG':
-            sl = fill_price - (atr * adjusted_sl_atr)
+            sl = max(fill_price * 0.01, fill_price - (atr * adjusted_sl_atr))
             tp = fill_price + (atr * adjusted_tp_atr)
             trail_activation = fill_price + (atr * adjusted_trail_activation_atr)
         else:
             sl = fill_price + (atr * adjusted_sl_atr)
-            tp = fill_price - (atr * adjusted_tp_atr)
-            trail_activation = fill_price - (atr * adjusted_trail_activation_atr)
+            tp = max(fill_price * 0.01, fill_price - (atr * adjusted_tp_atr))
+            trail_activation = max(fill_price * 0.01, fill_price - (atr * adjusted_trail_activation_atr))
         
         trail_distance = atr * adjusted_trail_distance_atr
         
@@ -13773,14 +13965,14 @@ class PaperTradingEngine:
                         new_position['entryPrice'] = actual_fill
                         # Recalculate SL/TP with actual fill
                         if side == 'LONG':
-                            new_position['stopLoss'] = actual_fill - (atr * adjusted_sl_atr)
+                            new_position['stopLoss'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_sl_atr))
                             new_position['takeProfit'] = actual_fill + (atr * adjusted_tp_atr)
                             new_position['trailActivation'] = actual_fill + (atr * adjusted_trail_activation_atr)
                             new_position['trailingStop'] = new_position['stopLoss']
                         else:
                             new_position['stopLoss'] = actual_fill + (atr * adjusted_sl_atr)
-                            new_position['takeProfit'] = actual_fill - (atr * adjusted_tp_atr)
-                            new_position['trailActivation'] = actual_fill - (atr * adjusted_trail_activation_atr)
+                            new_position['takeProfit'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_tp_atr))
+                            new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
                             new_position['trailingStop'] = new_position['stopLoss']
                         logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${new_position['stopLoss']:.6f} TP=${new_position['takeProfit']:.6f}")
                 else:
@@ -14419,6 +14611,10 @@ class PaperTradingEngine:
             # Skip if already closed by another check
             if pos not in self.positions:
                 continue
+            
+            # Phase 190: Use per-position price (from fast loop WebSocket / Binance sync updates)
+            current_price = pos.get('currentPrice', pos.get('markPrice', current_price))
+            atr = pos.get('atr', current_price * 0.01)
                 
             # Calc PnL
             if pos['side'] == 'LONG':
@@ -16279,13 +16475,13 @@ async def paper_trading_update_settings(
             adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
             
             if side == 'LONG':
-                new_sl = entry_price - (atr * adjusted_sl_atr)
+                new_sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
                 new_tp = entry_price + (atr * adjusted_tp_atr)
                 new_trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
             else:  # SHORT
                 new_sl = entry_price + (atr * adjusted_sl_atr)
-                new_tp = entry_price - (atr * adjusted_tp_atr)
-                new_trail_activation = entry_price - (atr * adjusted_trail_activation_atr)
+                new_tp = max(entry_price * 0.01, entry_price - (atr * adjusted_tp_atr))
+                new_trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_activation_atr))
             
             new_trail_distance = atr * adjusted_trail_distance_atr
             
@@ -16344,6 +16540,10 @@ async def paper_trading_market_order(request: Request):
         # Check if we have room for more positions
         if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
             return JSONResponse({"success": False, "error": f"Max positions ({global_paper_trader.max_positions}) reached"})
+        
+        # Phase 191: Paper market order engelle
+        if not live_binance_trader.enabled:
+            return JSONResponse({"success": False, "error": "Paper trading deaktif — sadece live"}, status_code=400)
         
         # Get ATR from analyzer if available
         atr = price * 0.02  # Default 2% of price as fallback ATR
