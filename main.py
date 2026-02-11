@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 import websockets
 from collections import deque
 from datetime import datetime
@@ -28,6 +29,14 @@ import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
 import pytz
+# Phase 193: pandas-ta for enhanced technical indicators
+try:
+    import pandas_ta as pta
+    PANDAS_TA_AVAILABLE = True
+    logger.info("✅ pandas-ta loaded successfully")
+except ImportError:
+    PANDAS_TA_AVAILABLE = False
+    logger.warning("⚠️ pandas-ta not installed, using manual TA calculations")
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +48,28 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Phase 193: Import new modules (graceful fallback)
+try:
+    from ccxt_ws_manager import ccxt_ws_manager
+    logger.info("✅ ccxt_ws_manager loaded")
+except ImportError:
+    ccxt_ws_manager = None
+    logger.warning("⚠️ ccxt_ws_manager not available")
+
+try:
+    from freqai_adapter import freqai_model
+    logger.info("✅ freqai_adapter loaded")
+except ImportError:
+    freqai_model = None
+    logger.warning("⚠️ freqai_adapter not available")
+
+try:
+    from hyperopt import hhq_hyperoptimizer
+    logger.info("✅ hyperopt loaded")
+except ImportError:
+    hhq_hyperoptimizer = None
+    logger.warning("⚠️ hyperopt not available")
 
 # ============================================================================
 # SQLITE DATABASE MANAGER
@@ -3225,6 +3256,182 @@ def calculate_atr(highs: list, lows: list, closes: list, period: int = 14) -> fl
 
 
 # ============================================================================
+# PHASE 193: ENHANCED TECHNICAL INDICATORS (pandas-ta powered)
+# ============================================================================
+
+def calculate_enhanced_indicators(highs: list, lows: list, closes: list, volumes: list = None) -> dict:
+    """
+    Calculate a comprehensive set of technical indicators using pandas-ta.
+    Falls back to manual calculations if pandas-ta is not available.
+    
+    Returns dict with:
+        macd_histogram: MACD histogram value (positive=bullish momentum)
+        macd_signal_cross: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+        bb_position: Price position within Bollinger Bands (-1 to +1, >1 = above upper)
+        bb_width: Band width as % of price (volatility measure)
+        stoch_rsi_k: Stochastic RSI %K (0-100, <20=oversold, >80=overbought)
+        stoch_rsi_d: Stochastic RSI %D (smoothed)
+        stoch_rsi_cross: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+        atr_pta: ATR calculated by pandas-ta (more accurate EMA smoothing)
+        ema_8: 8-period EMA
+        ema_21: 21-period EMA
+        ema_cross: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+        vwap_value: VWAP if volumes available
+    """
+    result = {
+        'macd_histogram': 0.0,
+        'macd_signal_cross': 'NEUTRAL',
+        'bb_position': 0.0,
+        'bb_width': 0.0,
+        'stoch_rsi_k': 50.0,
+        'stoch_rsi_d': 50.0,
+        'stoch_rsi_cross': 'NEUTRAL',
+        'atr_pta': 0.0,
+        'ema_8': 0.0,
+        'ema_21': 0.0,
+        'ema_cross': 'NEUTRAL',
+        'vwap_value': 0.0,
+    }
+    
+    if len(closes) < 30:
+        return result
+    
+    try:
+        if PANDAS_TA_AVAILABLE:
+            df = pd.DataFrame({
+                'high': highs,
+                'low': lows,
+                'close': closes,
+            })
+            if volumes:
+                df['volume'] = volumes
+            
+            # MACD (12, 26, 9)
+            macd = df.ta.macd(fast=12, slow=26, signal=9)
+            if macd is not None and not macd.empty:
+                hist_col = [c for c in macd.columns if 'MACDh' in c or 'Histogram' in c.title()]
+                signal_col = [c for c in macd.columns if 'MACDs' in c]
+                macd_col = [c for c in macd.columns if c.startswith('MACD_')]
+                
+                if hist_col:
+                    result['macd_histogram'] = float(macd[hist_col[0]].iloc[-1] or 0)
+                
+                # MACD crossover detection
+                if macd_col and signal_col:
+                    macd_line = macd[macd_col[0]].iloc[-2:]
+                    signal_line = macd[signal_col[0]].iloc[-2:]
+                    if len(macd_line) >= 2 and len(signal_line) >= 2:
+                        prev_diff = float(macd_line.iloc[0] or 0) - float(signal_line.iloc[0] or 0)
+                        curr_diff = float(macd_line.iloc[1] or 0) - float(signal_line.iloc[1] or 0)
+                        if prev_diff <= 0 and curr_diff > 0:
+                            result['macd_signal_cross'] = 'BULLISH'
+                        elif prev_diff >= 0 and curr_diff < 0:
+                            result['macd_signal_cross'] = 'BEARISH'
+            
+            # Bollinger Bands (20, 2)
+            bbands = df.ta.bbands(length=20, std=2)
+            if bbands is not None and not bbands.empty:
+                upper_col = [c for c in bbands.columns if 'BBU' in c]
+                lower_col = [c for c in bbands.columns if 'BBL' in c]
+                mid_col = [c for c in bbands.columns if 'BBM' in c]
+                bw_col = [c for c in bbands.columns if 'BBB' in c]
+                
+                if upper_col and lower_col:
+                    upper = float(bbands[upper_col[0]].iloc[-1] or 0)
+                    lower = float(bbands[lower_col[0]].iloc[-1] or 0)
+                    price = closes[-1]
+                    band_range = upper - lower
+                    if band_range > 0:
+                        # -1 = at lower band, 0 = middle, +1 = at upper band
+                        result['bb_position'] = ((price - lower) / band_range) * 2 - 1
+                    if mid_col:
+                        mid = float(bbands[mid_col[0]].iloc[-1] or 0)
+                        if mid > 0:
+                            result['bb_width'] = (band_range / mid) * 100
+            
+            # Stochastic RSI (14, 14, 3, 3)
+            stochrsi = df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3)
+            if stochrsi is not None and not stochrsi.empty:
+                k_col = [c for c in stochrsi.columns if 'STOCHRSIk' in c]
+                d_col = [c for c in stochrsi.columns if 'STOCHRSId' in c]
+                
+                if k_col:
+                    result['stoch_rsi_k'] = float(stochrsi[k_col[0]].iloc[-1] or 50)
+                if d_col:
+                    result['stoch_rsi_d'] = float(stochrsi[d_col[0]].iloc[-1] or 50)
+                
+                # StochRSI crossover
+                if k_col and d_col and len(stochrsi) >= 2:
+                    prev_k = float(stochrsi[k_col[0]].iloc[-2] or 50)
+                    curr_k = result['stoch_rsi_k']
+                    prev_d = float(stochrsi[d_col[0]].iloc[-2] or 50)
+                    curr_d = result['stoch_rsi_d']
+                    if prev_k <= prev_d and curr_k > curr_d and curr_k < 30:
+                        result['stoch_rsi_cross'] = 'BULLISH'
+                    elif prev_k >= prev_d and curr_k < curr_d and curr_k > 70:
+                        result['stoch_rsi_cross'] = 'BEARISH'
+            
+            # ATR (14) — Wilder's smoothing (more accurate than SMA)
+            atr_result = df.ta.atr(length=14)
+            if atr_result is not None and not atr_result.empty:
+                result['atr_pta'] = float(atr_result.iloc[-1] or 0)
+            
+            # EMA 8 & 21 crossover
+            ema8 = df.ta.ema(length=8)
+            ema21 = df.ta.ema(length=21)
+            if ema8 is not None and ema21 is not None and not ema8.empty and not ema21.empty:
+                result['ema_8'] = float(ema8.iloc[-1] or 0)
+                result['ema_21'] = float(ema21.iloc[-1] or 0)
+                if result['ema_8'] > result['ema_21']:
+                    result['ema_cross'] = 'BULLISH'
+                elif result['ema_8'] < result['ema_21']:
+                    result['ema_cross'] = 'BEARISH'
+            
+            # VWAP (if volumes available)
+            if volumes and len(volumes) == len(closes):
+                try:
+                    vwap = df.ta.vwap()
+                    if vwap is not None and not vwap.empty:
+                        result['vwap_value'] = float(vwap.iloc[-1] or 0)
+                except Exception:
+                    pass
+        
+        else:
+            # Manual fallback calculations (basic versions)
+            closes_arr = np.array(closes)
+            
+            # Simple MACD manual
+            if len(closes_arr) >= 26:
+                ema12 = pd.Series(closes_arr).ewm(span=12).mean().iloc[-1]
+                ema26 = pd.Series(closes_arr).ewm(span=26).mean().iloc[-1]
+                result['macd_histogram'] = float(ema12 - ema26)
+            
+            # Simple Bollinger Bands manual
+            if len(closes_arr) >= 20:
+                sma20 = np.mean(closes_arr[-20:])
+                std20 = np.std(closes_arr[-20:])
+                upper = sma20 + 2 * std20
+                lower = sma20 - 2 * std20
+                band_range = upper - lower
+                if band_range > 0:
+                    result['bb_position'] = ((closes_arr[-1] - lower) / band_range) * 2 - 1
+                    result['bb_width'] = (band_range / sma20) * 100 if sma20 > 0 else 0
+            
+            # Simple EMA crossover manual
+            if len(closes_arr) >= 21:
+                ema8 = pd.Series(closes_arr).ewm(span=8).mean().iloc[-1]
+                ema21 = pd.Series(closes_arr).ewm(span=21).mean().iloc[-1]
+                result['ema_8'] = float(ema8)
+                result['ema_21'] = float(ema21)
+                result['ema_cross'] = 'BULLISH' if ema8 > ema21 else 'BEARISH'
+        
+    except Exception as e:
+        logger.warning(f"Enhanced indicator calculation error: {e}")
+    
+    return result
+
+
+# ============================================================================
 # HURST EXPONENT CALCULATION (R/S Analysis)
 # ============================================================================
 
@@ -4924,6 +5131,12 @@ class LightweightCoinAnalyzer:
         # Phase 137: Calculate ADX for regime detection - now returns tuple with trend direction
         adx, adx_trend, plus_di, minus_di = calculate_adx(highs_list, lows_list, closes_list)
         
+        # Phase 193: Calculate enhanced indicators (MACD, BB, StochRSI, EMA cross)
+        enhanced_ind = calculate_enhanced_indicators(
+            highs_list, lows_list, closes_list,
+            volumes=list(self.volumes) if len(self.volumes) >= 30 else None
+        )
+        
         self.opportunity.hurst = hurst
         self.opportunity.zscore = zscore
         self.opportunity.atr = atr
@@ -5012,6 +5225,7 @@ class LightweightCoinAnalyzer:
             funding_rate=funding_oi_tracker.funding_rates.get(self.symbol, 0.0),  # Phase 157
             coin_wr_penalty=trade_pattern_analyzer.get_coin_penalty(self.symbol),  # Phase 157
             side_wr_penalty=0,  # Phase 157: calculated inside generate_signal where signal_side is known
+            enhanced_indicators=enhanced_ind,  # Phase 193: MACD, BB, StochRSI, EMA cross
         )
         
         if signal:
@@ -9244,6 +9458,145 @@ balance_protector = BalanceProtector()
 
 
 # ============================================================================
+# PHASE 193: STOPLOSS FREQUENCY GUARD (Freqtrade-inspired)
+# Belirli sürede çok fazla SL tetiklenirse trading'i duraklat
+# Kill Switch'ten bağımsız, tamamlayıcı koruma katmanı
+# ============================================================================
+
+class StoplossFrequencyGuard:
+    """
+    Freqtrade'in StoplossGuard pattern'inden esinlenilmiş:
+    Son N dakikada X adet SL-triggered exit olmuşsa, tüm trading'i duraklat.
+    
+    Kill Switch = margin bazlı (büyük kayıp), StoplossGuard = frekans bazlı (art arda kayıp).
+    """
+    
+    def __init__(self):
+        self.lookback_minutes: int = 60       # Son 60 dakika
+        self.max_stoplosses: int = 3          # Max 3 SL
+        self.cooldown_minutes: int = 30       # 30 dk duraklat
+        self.only_per_pair: bool = False      # Global veya pair bazlı
+        self.enabled: bool = True
+        
+        # Internal tracking
+        self._stoploss_events: list = []  # [(timestamp, symbol, reason), ...]
+        self._lock_until: float = 0       # Global lock timestamp
+        self._pair_locks: Dict[str, float] = {}  # symbol -> lock_until
+        
+        logger.info("StoplossFrequencyGuard initialized (lookback=60min, max_sl=3, cooldown=30min)")
+    
+    def record_stoploss(self, symbol: str, reason: str = "SL"):
+        """Record a stoploss exit event."""
+        now = time.time()
+        self._stoploss_events.append((now, symbol, reason))
+        
+        # Cleanup old events (older than 2x lookback)
+        cutoff = now - (self.lookback_minutes * 60 * 2)
+        self._stoploss_events = [(t, s, r) for t, s, r in self._stoploss_events if t > cutoff]
+        
+        # Check if guard should trigger
+        self._check_guard(symbol)
+    
+    def _check_guard(self, triggered_symbol: str):
+        """Check if too many SLs, trigger cooldown if so."""
+        now = time.time()
+        lookback_start = now - (self.lookback_minutes * 60)
+        
+        if self.only_per_pair:
+            # Per-pair check
+            pair_events = [(t, s, r) for t, s, r in self._stoploss_events 
+                          if t > lookback_start and s == triggered_symbol]
+            if len(pair_events) >= self.max_stoplosses:
+                lock_until = now + (self.cooldown_minutes * 60)
+                self._pair_locks[triggered_symbol] = lock_until
+                logger.warning(
+                    f"🛑 STOPLOSS_GUARD: {triggered_symbol} locked for {self.cooldown_minutes}min "
+                    f"({len(pair_events)} SLs in {self.lookback_minutes}min)"
+                )
+        else:
+            # Global check
+            recent_events = [(t, s, r) for t, s, r in self._stoploss_events if t > lookback_start]
+            if len(recent_events) >= self.max_stoplosses:
+                lock_until = now + (self.cooldown_minutes * 60)
+                self._lock_until = lock_until
+                logger.warning(
+                    f"🛑 STOPLOSS_GUARD: ALL TRADING locked for {self.cooldown_minutes}min "
+                    f"({len(recent_events)} SLs in {self.lookback_minutes}min)"
+                )
+    
+    def is_locked(self, symbol: str = "") -> bool:
+        """Check if trading is locked (globally or per-pair)."""
+        if not self.enabled:
+            return False
+        
+        now = time.time()
+        
+        # Global lock check
+        if self._lock_until > now:
+            return True
+        
+        # Per-pair lock check
+        if symbol and self.only_per_pair:
+            pair_lock = self._pair_locks.get(symbol, 0)
+            if pair_lock > now:
+                return True
+        
+        return False
+    
+    def get_lock_reason(self, symbol: str = "") -> str:
+        """Get human-readable lock reason."""
+        now = time.time()
+        
+        if self._lock_until > now:
+            remaining = int((self._lock_until - now) / 60)
+            return f"Global SL guard: {remaining}min remaining"
+        
+        if symbol and self.only_per_pair:
+            pair_lock = self._pair_locks.get(symbol, 0)
+            if pair_lock > now:
+                remaining = int((pair_lock - now) / 60)
+                return f"{symbol} SL guard: {remaining}min remaining"
+        
+        return ""
+    
+    def get_status(self) -> dict:
+        """Get guard status for monitoring."""
+        now = time.time()
+        lookback_start = now - (self.lookback_minutes * 60)
+        recent = [(t, s, r) for t, s, r in self._stoploss_events if t > lookback_start]
+        
+        return {
+            'enabled': self.enabled,
+            'global_locked': self._lock_until > now,
+            'global_lock_remaining_min': max(0, int((self._lock_until - now) / 60)) if self._lock_until > now else 0,
+            'recent_stoplosses': len(recent),
+            'max_stoplosses': self.max_stoplosses,
+            'lookback_minutes': self.lookback_minutes,
+            'cooldown_minutes': self.cooldown_minutes,
+            'only_per_pair': self.only_per_pair,
+            'pair_locks': {s: int((t - now) / 60) for s, t in self._pair_locks.items() if t > now},
+        }
+    
+    def update_settings(self, settings: dict):
+        """Update guard settings from UI."""
+        if 'sl_guard_enabled' in settings:
+            self.enabled = settings['sl_guard_enabled']
+        if 'sl_guard_lookback' in settings:
+            self.lookback_minutes = max(5, min(240, settings['sl_guard_lookback']))
+        if 'sl_guard_max_sl' in settings:
+            self.max_stoplosses = max(1, min(20, settings['sl_guard_max_sl']))
+        if 'sl_guard_cooldown' in settings:
+            self.cooldown_minutes = max(5, min(120, settings['sl_guard_cooldown']))
+        if 'sl_guard_per_pair' in settings:
+            self.only_per_pair = settings['sl_guard_per_pair']
+        logger.info(f"StoplossFrequencyGuard settings updated: {self.get_status()}")
+
+
+# Global instance
+stoploss_frequency_guard = StoplossFrequencyGuard()
+
+
+# ============================================================================
 # PHASE 36: POSITION-BASED KILL SWITCH (IMPROVED)
 # ============================================================================
 
@@ -12244,6 +12597,7 @@ class SignalGenerator:
         funding_rate: float = 0.0,  # Phase 157: Funding rate for contrarian scoring
         coin_wr_penalty: int = 0,  # Phase 157: Coin WR penalty from trade pattern analysis
         side_wr_penalty: int = 0,  # Phase 157: Side WR penalty from trade pattern analysis
+        enhanced_indicators: Optional[Dict] = None,  # Phase 193: MACD, BB, StochRSI, EMA cross
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -12629,6 +12983,73 @@ class SignalGenerator:
                 reasons.append(f"POC_zone({poc_dist_pct:.1f}%)+5")
         
         # =====================================================================
+        # PHASE 193: ENHANCED INDICATOR SCORING LAYERS (pandas-ta powered)
+        # BONUS-ONLY — Sadece destekleyici skor, asla VETO veya penalty değil
+        # =====================================================================
+        if enhanced_indicators:
+            ei = enhanced_indicators
+            
+            # Layer 19: MACD Momentum Confirmation (+5/+8)
+            # MACD histogram sinyal yönünü onaylıyorsa bonus
+            macd_hist = ei.get('macd_histogram', 0)
+            macd_cross = ei.get('macd_signal_cross', 'NEUTRAL')
+            if signal_side == "LONG":
+                if macd_cross == 'BULLISH':
+                    score += 8
+                    reasons.append("MACD_CROSS_BULL+8")
+                elif macd_hist > 0:
+                    score += 5
+                    reasons.append(f"MACD_POS+5")
+            elif signal_side == "SHORT":
+                if macd_cross == 'BEARISH':
+                    score += 8
+                    reasons.append("MACD_CROSS_BEAR+8")
+                elif macd_hist < 0:
+                    score += 5
+                    reasons.append(f"MACD_NEG+5")
+            
+            # Layer 20: Bollinger Bands Position Confirmation (+5/+8)
+            # LONG + fiyat alt BB'de = düşük fiyat desteği, SHORT + fiyat üst BB'de
+            bb_pos = ei.get('bb_position', 0)
+            if signal_side == "LONG" and bb_pos < -0.5:
+                bb_bonus = 8 if bb_pos < -0.8 else 5
+                score += bb_bonus
+                reasons.append(f"BB_LOW({bb_pos:.2f})+{bb_bonus}")
+            elif signal_side == "SHORT" and bb_pos > 0.5:
+                bb_bonus = 8 if bb_pos > 0.8 else 5
+                score += bb_bonus
+                reasons.append(f"BB_HIGH({bb_pos:.2f})+{bb_bonus}")
+            
+            # Layer 21: Stochastic RSI Confirmation (+5/+8)
+            # StochRSI crossover + extreme zone = güçlü momentum sinyali
+            stoch_k = ei.get('stoch_rsi_k', 50)
+            stoch_cross = ei.get('stoch_rsi_cross', 'NEUTRAL')
+            if signal_side == "LONG":
+                if stoch_cross == 'BULLISH':
+                    score += 8
+                    reasons.append(f"SRSI_BULL({stoch_k:.0f})+8")
+                elif stoch_k < 20:
+                    score += 5
+                    reasons.append(f"SRSI_OS({stoch_k:.0f})+5")
+            elif signal_side == "SHORT":
+                if stoch_cross == 'BEARISH':
+                    score += 8
+                    reasons.append(f"SRSI_BEAR({stoch_k:.0f})+8")
+                elif stoch_k > 80:
+                    score += 5
+                    reasons.append(f"SRSI_OB({stoch_k:.0f})+5")
+            
+            # Layer 22: EMA Crossover Trend Confirmation (+5)
+            # EMA(8) x EMA(21) — kısa vadeli trend yönü
+            ema_cross = ei.get('ema_cross', 'NEUTRAL')
+            if signal_side == "LONG" and ema_cross == 'BULLISH':
+                score += 5
+                reasons.append("EMA_BULL+5")
+            elif signal_side == "SHORT" and ema_cross == 'BEARISH':
+                score += 5
+                reasons.append("EMA_BEAR+5")
+        
+        # =====================================================================
         # PHASE 137: ADX + HURST REGIME DETECTION
         # SADECE BONUS - VETO YOK (Phase 133/134/135'teki hatayı önlemek için)
         # =====================================================================
@@ -12672,6 +13093,14 @@ class SignalGenerator:
             if score < min_score_required:
                 logger.info(f"🚫 VOLATILE_VETO: {symbol} {signal_side} score={score} < volatile_min={min_score_required}")
                 return None
+        
+        # =====================================================================
+        # PHASE 193: STOPLOSS FREQUENCY GUARD CHECK
+        # =====================================================================
+        if stoploss_frequency_guard.is_locked(symbol):
+            lock_reason = stoploss_frequency_guard.get_lock_reason(symbol)
+            logger.info(f"🛑 SL_GUARD: {symbol} {signal_side} rejected — {lock_reason}")
+            return None
         
         # =====================================================================
         # PHASE 48: KILL SWITCH FAULT PENALTY + BLOCK
@@ -14882,6 +15311,47 @@ class PaperTradingEngine:
             "pullbackPct": pos.get('pullbackPct', 0),
         }
         
+        # =====================================================================
+        # PHASE 193: POST-CLOSE HOOKS (SL Guard, FreqAI, Hyperopt)
+        # =====================================================================
+        try:
+            # 1. StoplossFrequencyGuard: Record SL exits
+            if 'SL' in reason.upper() or 'STOP' in reason.upper():
+                stoploss_frequency_guard.record_stoploss(
+                    symbol=pos.get('symbol', 'UNKNOWN'),
+                    reason=reason
+                )
+            
+            # 2. FreqAI: Record trade features for ML training
+            if freqai_model and freqai_model.enabled:
+                ml_features = {
+                    'zscore': pos.get('zScore', 0),
+                    'hurst': pos.get('hurst', 0.5),
+                    'rsi': pos.get('rsi', 50),
+                    'adx': pos.get('adx', 25),
+                    'volume_ratio': pos.get('volumeRatio', 1.0),
+                    'bb_position': pos.get('bbPosition', 0),
+                    'macd_histogram': pos.get('macdHistogram', 0),
+                    'stoch_rsi_k': pos.get('stochRsiK', 50),
+                    'ema_cross_bullish': 1.0 if pos.get('emaCross') == 'BULLISH' else 0.0,
+                    'vwap_zscore': pos.get('vwapZscore', 0),
+                    'spread_pct': pos.get('spreadPct', 0),
+                    'funding_rate': pos.get('fundingRate', 0),
+                    'imbalance': pos.get('imbalance', 0),
+                    'signal_score': pos.get('signalScore', 0),
+                    'leverage': pos.get('leverage', 10),
+                    'atr_pct': (pos.get('atr', 0) / pos.get('entryPrice', 1)) * 100 if pos.get('entryPrice', 0) > 0 else 0,
+                }
+                freqai_model.record_trade(ml_features, pnl > 0)
+            
+            # 3. Hyperopt: Record trade data for parameter optimization
+            if hhq_hyperoptimizer and hhq_hyperoptimizer.enabled:
+                hhq_hyperoptimizer.record_trade(trade)
+                if hhq_hyperoptimizer.should_auto_optimize():
+                    asyncio.create_task(hhq_hyperoptimizer.optimize())
+        except Exception as e:
+            logger.warning(f"⚠️ Phase 193 post-close hook error: {e}")
+        
         # Phase 138: LIVE positions - store reason for Binance sync, DON'T write trade yet
         # Binance sync will detect the close and write trade with this reason
         symbol = pos.get('symbol', 'UNKNOWN')
@@ -16525,6 +16995,57 @@ async def paper_trading_update_settings(
 
 
 # Phase 36: Market Order from Signal Card
+
+# ============================================================================
+# PHASE 193: NEW API ENDPOINTS (FreqAI, Hyperopt, StoplossGuard, WS Manager)
+# ============================================================================
+
+@app.get("/phase193/status")
+async def phase193_status():
+    """Get status of all Phase 193 modules."""
+    return JSONResponse({
+        "stoploss_guard": stoploss_frequency_guard.get_status(),
+        "freqai": freqai_model.get_status() if freqai_model else {"enabled": False, "error": "not installed"},
+        "hyperopt": hhq_hyperoptimizer.get_status() if hhq_hyperoptimizer else {"enabled": False, "error": "not installed"},
+        "ws_manager": ccxt_ws_manager.get_status() if ccxt_ws_manager else {"enabled": False, "error": "not installed"},
+        "pandas_ta": PANDAS_TA_AVAILABLE,
+    })
+
+@app.post("/phase193/stoploss-guard/settings")
+async def phase193_sl_guard_settings(request: Request):
+    """Update StoplossFrequencyGuard settings."""
+    data = await request.json()
+    stoploss_frequency_guard.update_settings(data)
+    return JSONResponse(stoploss_frequency_guard.get_status())
+
+@app.post("/phase193/freqai/retrain")
+async def phase193_freqai_retrain():
+    """Force FreqAI model retrain."""
+    if not freqai_model:
+        return JSONResponse({"error": "FreqAI not available"}, status_code=400)
+    success = freqai_model.force_retrain()
+    return JSONResponse({
+        "success": success,
+        "status": freqai_model.get_status()
+    })
+
+@app.post("/phase193/hyperopt/run")
+async def phase193_hyperopt_run(request: Request):
+    """Run hyperparameter optimization."""
+    if not hhq_hyperoptimizer:
+        return JSONResponse({"error": "Hyperopt not available"}, status_code=400)
+    
+    data = await request.json() if request.headers.get('content-type') == 'application/json' else {}
+    n_trials = data.get('n_trials', 100)
+    
+    # Load trade data from paper trader if not already loaded
+    if not hhq_hyperoptimizer.trade_data and 'global_paper_trader' in globals():
+        hhq_hyperoptimizer.trade_data = list(global_paper_trader.trade_history)
+    
+    result = await hhq_hyperoptimizer.optimize(n_trials=n_trials)
+    return JSONResponse(result)
+
+
 @app.post("/paper-trading/market-order")
 async def paper_trading_market_order(request: Request):
     """Open a market order from a signal card (manual entry)."""
