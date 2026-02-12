@@ -7088,7 +7088,9 @@ async def background_scanner_loop():
                                     else:
                                         # Illiquid coin or regular SL → market close (execution certainty)
                                         logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
+                                        # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
+                                        pos_roi = pos.get('unrealizedPnlPercent', 0)
+                                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive', False) and pos_roi >= 0) else 'SL_HIT'
                                         global_paper_trader.close_position(pos, current_price, reason)
                                         continue
                             else:
@@ -14607,13 +14609,18 @@ class PaperTradingEngine:
         if atr is None:
             atr = current_price * 0.01
         
-        # After max_position_age_hours, start gradual liquidation
-        if age_hours > self.max_position_age_hours:
+        # exit_tightness ile ölçeklendir: yüksek = daha uzun tutma süresi
+        adjusted_max_age = self.max_position_age_hours * self.exit_tightness
+        adjusted_hard_limit = 48 * self.exit_tightness
+        bounce_mult = 0.3 * self.exit_tightness  # Bounce threshold: yüksek = daha geniş
+        
+        # After adjusted max age, start gradual liquidation
+        if age_hours > adjusted_max_age:
             # Mark position for gradual exit if not already
             if not pos.get('gradual_exit_mode', False):
                 pos['gradual_exit_mode'] = True
                 pos['gradual_exit_start'] = current_price
-                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f} saat - Aşamalı tasfiye başladı")
+                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f}h > {adjusted_max_age:.1f}h (x{self.exit_tightness}) - Aşamalı tasfiye")
             
             # For LONG: Close on bounces (price goes up then comes back)
             if pos['side'] == 'LONG':
@@ -14622,8 +14629,8 @@ class PaperTradingEngine:
                 elif current_price > pos['gradual_high']:
                     pos['gradual_high'] = current_price
                 
-                # If price dropped from high by 0.3 ATR, close position
-                if pos['gradual_high'] - current_price >= atr * 0.3:
+                # If price dropped from high by bounce_mult * ATR, close position
+                if pos['gradual_high'] - current_price >= atr * bounce_mult:
                     self.add_log(f"📉 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
                     self.close_position(pos, current_price, 'TIME_GRADUAL')
                     return True
@@ -14635,15 +14642,15 @@ class PaperTradingEngine:
                 elif current_price < pos['gradual_low']:
                     pos['gradual_low'] = current_price
                 
-                # If price rose from low by 0.3 ATR, close position
-                if current_price - pos['gradual_low'] >= atr * 0.3:
+                # If price rose from low by bounce_mult * ATR, close position
+                if current_price - pos['gradual_low'] >= atr * bounce_mult:
                     self.add_log(f"📈 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
                     self.close_position(pos, current_price, 'TIME_GRADUAL')
                     return True
             
-            # Hard limit: After 48 hours, force close regardless
-            if age_hours > 48:
-                self.add_log(f"🆘 48+ SAAT: Zorunlu çıkış")
+            # Hard limit: force close regardless
+            if age_hours > adjusted_hard_limit:
+                self.add_log(f"🆘 {adjusted_hard_limit:.0f}h+ SAAT: Zorunlu çıkış (x{self.exit_tightness})")
                 self.close_position(pos, current_price, 'TIME_FORCE')
                 return True
                 
@@ -14652,8 +14659,9 @@ class PaperTradingEngine:
     def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
         """Hard limit for maximum loss per position.
         
-        Dynamic threshold: max(base_emergency_pct, actual_sl_distance * 1.5)
+        Dynamic threshold: max(base_emergency_pct, actual_sl_distance * 1.5) * exit_tightness
         This ensures Emergency SL never triggers BEFORE normal SL on high-vol coins.
+        exit_tightness scales the threshold: higher = more patient, lower = quicker exit.
         """
         entry = pos['entryPrice']
         
@@ -14670,11 +14678,14 @@ class PaperTradingEngine:
         else:
             effective_emergency_pct = self.emergency_sl_pct
         
-        # Cap at 10% to prevent runaway losses on extreme-vol coins
-        effective_emergency_pct = min(effective_emergency_pct, 10.0)
+        # Apply exit_tightness: higher = wider emergency threshold (more patient)
+        effective_emergency_pct = effective_emergency_pct * self.exit_tightness
+        
+        # Cap at 10% * exit_tightness to prevent runaway losses
+        effective_emergency_pct = min(effective_emergency_pct, 10.0 * self.exit_tightness)
             
         if loss_pct >= effective_emergency_pct:
-            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f})")
+            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f}, x{self.exit_tightness})")
             self.close_position(pos, current_price, 'EMERGENCY_SL')
             return True
         return False
@@ -14695,12 +14706,14 @@ class PaperTradingEngine:
         age_ms = int(datetime.now().timestamp() * 1000) - open_time
         age_hours = age_ms / (1000 * 60 * 60)
         
-        # 4 saatten önce kontrol etme
-        if age_hours < 4:
+        # exit_tightness ile ölçeklendir: yüksek = daha sabırlı (4h * 2.7 = 10.8h)
+        adverse_hours = 4 * self.exit_tightness
+        if age_hours < adverse_hours:
             return False
         
         entry = pos['entryPrice']
-        pullback_pct = pos.get('pullbackPct', 1.0)  # Varsayılan %1
+        # exit_tightness ile pullback genişlet: yüksek = daha geniş tolerans
+        pullback_pct = pos.get('pullbackPct', 1.0) * self.exit_tightness
         
         if pos['side'] == 'LONG':
             # Terste mi? (fiyat entry'nin altında)
@@ -15154,7 +15167,8 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] += 1
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
-                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive') else 'SL_HIT'
+                        # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
+                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
                         self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
@@ -15190,7 +15204,8 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] += 1
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
-                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive') else 'SL_HIT'
+                        # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
+                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
                         self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
