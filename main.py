@@ -15093,10 +15093,9 @@ class PaperTradingEngine:
             self.update_progressive_sl(pos, current_price, atr)
             
             # 4. Loss Recovery Mode
-            # Phase 151: Skip for live positions — handled by LossRecoveryTrailManager (more sophisticated)
-            if not pos.get('isLive', False):
-                if self.check_loss_recovery(pos, current_price, atr):
-                    continue
+            # DISABLED: Paper-only check_loss_recovery had a too-aggressive -1% threshold
+            # that bypassed normal SL. All positions (paper + live) now use 
+            # LossRecoveryTrailManager with spread-based thresholds (-3% to -7%)
             
             # ===== ORIGINAL TRAILING LOGIC (spread-aware + ROI-aware) =====
             
