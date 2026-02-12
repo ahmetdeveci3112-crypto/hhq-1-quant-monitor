@@ -14650,16 +14650,31 @@ class PaperTradingEngine:
         return False
     
     def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
-        """Hard limit for maximum loss per position."""
+        """Hard limit for maximum loss per position.
+        
+        Dynamic threshold: max(base_emergency_pct, actual_sl_distance * 1.5)
+        This ensures Emergency SL never triggers BEFORE normal SL on high-vol coins.
+        """
         entry = pos['entryPrice']
         
         if pos['side'] == 'LONG':
             loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
         else:
             loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
+        
+        # Dynamic emergency threshold: never tighter than the position's own SL
+        sl_price = pos.get('stopLoss', 0)
+        if sl_price > 0 and entry > 0:
+            actual_sl_distance_pct = abs(entry - sl_price) / entry * 100
+            effective_emergency_pct = max(self.emergency_sl_pct, actual_sl_distance_pct * 1.5)
+        else:
+            effective_emergency_pct = self.emergency_sl_pct
+        
+        # Cap at 10% to prevent runaway losses on extreme-vol coins
+        effective_emergency_pct = min(effective_emergency_pct, 10.0)
             
-        if loss_pct >= self.emergency_sl_pct:
-            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp limiti aşıldı")
+        if loss_pct >= effective_emergency_pct:
+            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f})")
             self.close_position(pos, current_price, 'EMERGENCY_SL')
             return True
         return False
