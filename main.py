@@ -7882,21 +7882,21 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # =====================================================
     try:
         # Calculate TF count from scores (positive score = aligned)
-        scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
+        scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0, '1d': 0})
         tf_count = sum(1 for s in scores.values() if s > 0)
         
         # Get existing leverage from SignalGenerator (unified calculation)
         current_leverage = signal.get('leverage', 25)
         
         # Apply MTF bonus/penalty (don't overwrite, just adjust)
-        if tf_count >= 3:
-            mtf_mult = 1.1   # Phase 184: +10% for all TFs aligned (was +20%)
+        if tf_count >= 4:
+            mtf_mult = 1.1   # +10% for all 4 TFs aligned
+        elif tf_count >= 3:
+            mtf_mult = 1.0   # No change for 3 TFs
         elif tf_count >= 2:
-            mtf_mult = 1.0   # No change for 2 TFs
-        elif tf_count >= 1:
-            mtf_mult = 0.8   # -20% for only 1 TF
+            mtf_mult = 0.8   # -20% for only 2 TFs
         else:
-            mtf_mult = 0.6   # -40% for no TF aligned
+            mtf_mult = 0.6   # -40% for 0-1 TF aligned
         
         adjusted_leverage = int(round(current_leverage * mtf_mult))
         adjusted_leverage = max(3, min(50, adjusted_leverage))  # Phase 184: cap 75→50
@@ -7907,7 +7907,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         
         # Log if MTF adjusted leverage
         if mtf_mult != 1.0:
-            logger.info(f"📊 MTF Adjustment: {current_leverage}x × {mtf_mult:.1f} (TF:{tf_count}/3) → {adjusted_leverage}x | {symbol}")
+            logger.info(f"📊 MTF Adjustment: {current_leverage}x × {mtf_mult:.1f} (TF:{tf_count}/4) → {adjusted_leverage}x | {symbol}")
     except Exception as lev_err:
         logger.warning(f"MTF leverage adjustment error: {lev_err}")
     
@@ -7978,7 +7978,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             symbol=symbol
         )
         trends = mtf_result.get('trends', {})
-        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
+        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
@@ -8119,15 +8119,16 @@ class MultiTimeframeConfirmation:
     
     # Timeframe weights
     WEIGHTS = {
-        '15m': 20,
-        '1h': 30,
-        '4h': 50
+        '15m': 10,
+        '1h': 20,
+        '4h': 30,
+        '1d': 40
     }
     
     def __init__(self):
-        self.coin_trends = {}  # symbol -> {trend_15m, trend_1h, trend_4h, last_update, mtf_score}
+        self.coin_trends = {}  # symbol -> {trend_15m, trend_1h, trend_4h, trend_1d, last_update, mtf_score}
         self.cache_ttl = 300  # 5 minutes cache per coin
-        logger.info("📊 MTF Scoring System initialized (15m:20, 1h:30, 4h:50)")
+        logger.info("📊 MTF Scoring System initialized (15m:10, 1h:20, 4h:30, 1d:40)")
     
     def get_trend_from_closes(self, closes: list) -> dict:
         """Calculate trend from close prices using EMA and price change."""
@@ -8227,7 +8228,7 @@ class MultiTimeframeConfirmation:
         return (0, 1.0)
     
     async def update_coin_trend(self, symbol: str, exchange) -> dict:
-        """Fetch 15m, 1h, 4h candles and calculate MTF data."""
+        """Fetch 15m, 1h, 4h, 1d candles and calculate MTF data."""
         now = datetime.now().timestamp()
         
         # Check cache
@@ -8241,16 +8242,18 @@ class MultiTimeframeConfirmation:
             'trend_15m': 'NEUTRAL',
             'trend_1h': 'NEUTRAL',
             'trend_4h': 'NEUTRAL',
+            'trend_1d': 'NEUTRAL',
             'last_update': now
         }
         
         try:
             ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
             
-            # Fetch all 3 timeframes (parallel would be faster but keeping simple)
+            # Fetch all 4 timeframes
             ohlcv_15m = await exchange.fetch_ohlcv(ccxt_symbol, '15m', limit=30)
             ohlcv_1h = await exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=30)
             ohlcv_4h = await exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=30)
+            ohlcv_1d = await exchange.fetch_ohlcv(ccxt_symbol, '1d', limit=30)
             
             # Calculate trends
             if ohlcv_15m and len(ohlcv_15m) >= 10:
@@ -8277,8 +8280,13 @@ class MultiTimeframeConfirmation:
                 else:
                     result['price_change_4h_20'] = 0.0
             
+            if ohlcv_1d and len(ohlcv_1d) >= 10:
+                closes_1d = [c[4] for c in ohlcv_1d]
+                trend_1d = self.get_trend_from_closes(closes_1d)
+                result['trend_1d'] = trend_1d['trend']
+            
             self.coin_trends[symbol] = result
-            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}, 4h_20_chg={result.get('price_change_4h_20', 0):.1f}%")
+            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}, 1d={result['trend_1d']}, 4h_20_chg={result.get('price_change_4h_20', 0):.1f}%")
             
         except Exception as e:
             logger.debug(f"MTF update failed for {symbol}: {e}")
@@ -8307,8 +8315,9 @@ class MultiTimeframeConfirmation:
         score_15m = self.calculate_trend_score(trend_data.get('trend_15m', 'NEUTRAL'), signal_action, self.WEIGHTS['15m'])
         score_1h = self.calculate_trend_score(trend_data.get('trend_1h', 'NEUTRAL'), signal_action, self.WEIGHTS['1h'])
         score_4h = self.calculate_trend_score(trend_data.get('trend_4h', 'NEUTRAL'), signal_action, self.WEIGHTS['4h'])
+        score_1d = self.calculate_trend_score(trend_data.get('trend_1d', 'NEUTRAL'), signal_action, self.WEIGHTS['1d'])
         
-        total_score = score_15m + score_1h + score_4h
+        total_score = score_15m + score_1h + score_4h + score_1d
         
         result = {
             'mtf_score': total_score,
@@ -8319,33 +8328,35 @@ class MultiTimeframeConfirmation:
             'trends': {
                 '15m': trend_data.get('trend_15m', 'NEUTRAL'),
                 '1h': trend_data.get('trend_1h', 'NEUTRAL'),
-                '4h': trend_data.get('trend_4h', 'NEUTRAL')
+                '4h': trend_data.get('trend_4h', 'NEUTRAL'),
+                '1d': trend_data.get('trend_1d', 'NEUTRAL')
             },
             'scores': {
                 '15m': score_15m,
                 '1h': score_1h,
-                '4h': score_4h
+                '4h': score_4h,
+                '1d': score_1d
             }
         }
         
         # Decision based on score
         if total_score > 50:
             # Strong alignment - BONUS
-            result['score_modifier'] = 1.1  # +10% bonus
-            result['reason'] = f"MTF uyumlu (+{total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}"
+            result['score_modifier'] = 1.15  # +15% bonus
+            result['reason'] = f"MTF uyumlu (+{total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}, 1d:{result['trends']['1d']}"
         
         elif total_score >= 0:
             # Neutral to slight positive - NORMAL
             result['score_modifier'] = 1.0
-            result['reason'] = f"MTF nötr ({total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}"
+            result['reason'] = f"MTF nötr ({total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}, 1d:{result['trends']['1d']}"
         
-        elif total_score > -50:
+        elif total_score > -25:
             # Against trend but not too strong - PENALTY
             result['score_modifier'] = 0.8  # -20% penalty
             result['reason'] = f"MTF karşıt ({total_score}): pozisyon açılacak ama %20 düşük skor"
         
         else:
-            # Strongly against trend - BLOCK
+            # Strongly against trend - BLOCK (< -25)
             result['confirmed'] = False
             result['score_modifier'] = 0.0
             result['reason'] = f"MTF RED ({total_score}): çok güçlü karşı trend"
@@ -17535,18 +17546,18 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     import math
                                     
                                     # Calculate TF count from scores (positive score = aligned)
-                                    scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0})
+                                    scores = mtf_result.get('scores', {'15m': 0, '1h': 0, '4h': 0, '1d': 0})
                                     tf_count = sum(1 for s in scores.values() if s > 0)
                                     
                                     # Base leverage from MTF agreement
-                                    if tf_count >= 3:
-                                        base_leverage = 100  # All TFs aligned
+                                    if tf_count >= 4:
+                                        base_leverage = 100  # All 4 TFs aligned
+                                    elif tf_count >= 3:
+                                        base_leverage = 75   # 3 TFs aligned
                                     elif tf_count >= 2:
-                                        base_leverage = 75   # 2 TFs aligned
-                                    elif tf_count >= 1:
-                                        base_leverage = 50   # 1 TF aligned
+                                        base_leverage = 50   # 2 TFs aligned
                                     else:
-                                        base_leverage = 25   # No TF aligned
+                                        base_leverage = 25   # 0-1 TF aligned
                                     
                                     # PRICE FACTOR: Logarithmic reduction for low-price coins
                                     if price > 0:
