@@ -7741,6 +7741,29 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Don't open new position if we already have one in this symbol
     if existing_position:
+        existing_side = existing_position.get('side', '')
+        
+        # Phase 200: Counter-signal detection — ters sinyal varsa exit_tightness modifier uygula
+        if existing_side != action:
+            # Ters sinyal! Skor bazlı modifier hesapla
+            signal_score = signal.get('score', 0)
+            if signal_score >= 90:
+                modifier = 0.4
+            elif signal_score >= 80:
+                modifier = 0.55
+            elif signal_score >= 65:
+                modifier = 0.7
+            elif signal_score >= 50:
+                modifier = 0.85
+            else:
+                modifier = 1.0  # Zayıf sinyal, etki yok
+            
+            if modifier < 1.0:
+                existing_position['counter_signal_modifier'] = modifier
+                existing_position['counter_signal_time'] = datetime.now().timestamp()
+                effective_et = global_paper_trader.exit_tightness * modifier
+                logger.info(f"⚡ COUNTER SIGNAL: {symbol} {action} (skor:{signal_score}) vs açık {existing_side} → exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f} (x{modifier})")
+        
         signal_log_data['reject_reason'] = 'EXISTING_POSITION'
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
         logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
@@ -13502,6 +13525,8 @@ class PaperTradingEngine:
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.8  # 0.5-2.0: Pullback multiplier (Gevşek/Loose mode)
         self.exit_tightness = 1.2   # 0.5-2.0: SL/TP multiplier
+        # Phase 200: Counter-signal adaptive exit tightness cache TTL
+        self.counter_signal_ttl = 900  # 15 minutes
         # Phase 19: Server-side persistent logs
         self.logs = []
         # Phase 20: Advanced Risk Management Config
@@ -13742,6 +13767,31 @@ class PaperTradingEngine:
             'details': self.coin_blacklist
         }
 
+    # =========================================================================
+    # PHASE 200: ADAPTIVE EXIT TIGHTNESS (Counter-Signal)
+    # Per-position exit_tightness based on opposing signals
+    # =========================================================================
+    
+    def get_effective_exit_tightness(self, pos: dict) -> float:
+        """Get per-position exit_tightness with counter-signal modifier.
+        
+        If an opposing signal was recently received for this coin,
+        the modifier reduces exit_tightness → tighter exits.
+        If no opposing signal or modifier expired, returns global exit_tightness.
+        """
+        modifier = pos.get('counter_signal_modifier', 1.0)
+        cs_time = pos.get('counter_signal_time', 0)
+        
+        # Expire modifier after TTL (15 minutes)
+        if modifier < 1.0 and cs_time > 0:
+            now_ts = datetime.now().timestamp()
+            if now_ts - cs_time > self.counter_signal_ttl:
+                # Expired — reset to global
+                pos['counter_signal_modifier'] = 1.0
+                modifier = 1.0
+        
+        return self.exit_tightness * modifier
+    
     # =========================================================================
     # DYNAMIC ATR MULTIPLIER
     # Adjusts SL/TP based on current volatility conditions
@@ -14504,7 +14554,7 @@ class PaperTradingEngine:
         entry = pos['entryPrice']
         
         # Apply exit_tightness to thresholds - lower = earlier activation
-        t = self.exit_tightness
+        t = self.get_effective_exit_tightness(pos)
         
         if pos['side'] == 'LONG':
             profit_atr = (current_price - entry) / atr if atr > 0 else 0
@@ -14621,9 +14671,10 @@ class PaperTradingEngine:
             atr = current_price * 0.01
         
         # exit_tightness ile ölçeklendir: yüksek = daha uzun tutma süresi
-        adjusted_max_age = self.max_position_age_hours * self.exit_tightness
-        adjusted_hard_limit = 48 * self.exit_tightness
-        bounce_mult = 0.3 * self.exit_tightness  # Bounce threshold: yüksek = daha geniş
+        et = self.get_effective_exit_tightness(pos)
+        adjusted_max_age = self.max_position_age_hours * et
+        adjusted_hard_limit = 48 * et
+        bounce_mult = 0.3 * et  # Bounce threshold: yüksek = daha geniş
         
         # After adjusted max age, start gradual liquidation
         if age_hours > adjusted_max_age:
@@ -14631,7 +14682,7 @@ class PaperTradingEngine:
             if not pos.get('gradual_exit_mode', False):
                 pos['gradual_exit_mode'] = True
                 pos['gradual_exit_start'] = current_price
-                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f}h > {adjusted_max_age:.1f}h (x{self.exit_tightness}) - Aşamalı tasfiye")
+                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f}h > {adjusted_max_age:.1f}h (x{et:.1f}) - Aşamalı tasfiye")
             
             # For LONG: Close on bounces (price goes up then comes back)
             if pos['side'] == 'LONG':
@@ -14661,7 +14712,7 @@ class PaperTradingEngine:
             
             # Hard limit: force close regardless
             if age_hours > adjusted_hard_limit:
-                self.add_log(f"🆘 {adjusted_hard_limit:.0f}h+ SAAT: Zorunlu çıkış (x{self.exit_tightness})")
+                self.add_log(f"🆘 {adjusted_hard_limit:.0f}h+ SAAT: Zorunlu çıkış (x{et:.1f})")
                 self.close_position(pos, current_price, 'TIME_FORCE')
                 return True
                 
@@ -14690,13 +14741,14 @@ class PaperTradingEngine:
             effective_emergency_pct = self.emergency_sl_pct
         
         # Apply exit_tightness: higher = wider emergency threshold (more patient)
-        effective_emergency_pct = effective_emergency_pct * self.exit_tightness
+        et = self.get_effective_exit_tightness(pos)
+        effective_emergency_pct = effective_emergency_pct * et
         
         # Cap at 10% * exit_tightness to prevent runaway losses
-        effective_emergency_pct = min(effective_emergency_pct, 10.0 * self.exit_tightness)
+        effective_emergency_pct = min(effective_emergency_pct, 10.0 * et)
             
         if loss_pct >= effective_emergency_pct:
-            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f}, x{self.exit_tightness})")
+            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f}, x{et:.1f})")
             self.close_position(pos, current_price, 'EMERGENCY_SL')
             return True
         return False
@@ -14718,13 +14770,14 @@ class PaperTradingEngine:
         age_hours = age_ms / (1000 * 60 * 60)
         
         # exit_tightness ile ölçeklendir: yüksek = daha sabırlı (4h * 2.7 = 10.8h)
-        adverse_hours = 4 * self.exit_tightness
+        et = self.get_effective_exit_tightness(pos)
+        adverse_hours = 4 * et
         if age_hours < adverse_hours:
             return False
         
         entry = pos['entryPrice']
         # exit_tightness ile pullback genişlet: yüksek = daha geniş tolerans
-        pullback_pct = pos.get('pullbackPct', 1.0) * self.exit_tightness
+        pullback_pct = pos.get('pullbackPct', 1.0) * et
         
         if pos['side'] == 'LONG':
             # Terste mi? (fiyat entry'nin altında)
@@ -15150,7 +15203,7 @@ class PaperTradingEngine:
                 'Very High': 8.0   # Meme — very volatile, late trail
             }
             base_activation_roi = spread_activation_map.get(pos.get('spread_level', 'Normal'), 4.0)
-            activation_threshold = base_activation_roi * self.exit_tightness
+            activation_threshold = base_activation_roi * self.get_effective_exit_tightness(pos)
             
             if pos['side'] == 'LONG':
                 # LONG: ROI must be >= threshold (positive ROI)
