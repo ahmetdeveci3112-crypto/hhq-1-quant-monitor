@@ -1415,7 +1415,7 @@ class LiveBinanceTrader:
                     # ================================================================
                     # Use same formulas as paper trading
                     sl_atr_mult = 1.5  # Default SL ATR multiplier
-                    tp_atr_mult = 2.5  # Default TP ATR multiplier
+                    tp_atr_mult = 3.0  # Default TP ATR multiplier (wider for better R:R)
                     trail_activation_atr = 1.5
                     trail_distance_atr = 1.0
                     exit_tightness = global_paper_trader.exit_tightness if global_paper_trader else 1.0
@@ -1500,12 +1500,12 @@ class LiveBinanceTrader:
                             # LONG: price drops below trailing stop
                             if mark_price <= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_STOP_HIT: mark ${mark_price:.6f} <= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: mark ${mark_price:.6f} <= trail ${trailing_stop:.6f}"
                         else:  # SHORT
                             # SHORT: price rises above trailing stop
                             if mark_price >= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_STOP_HIT: mark ${mark_price:.6f} >= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: mark ${mark_price:.6f} >= trail ${trailing_stop:.6f}"
                         
                         if should_close:
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
@@ -7030,7 +7030,7 @@ async def background_scanner_loop():
                             # of sustained breach. Protects against 1-min wick spikes.
                             # =========================================================
                             SL_CONFIRMATION_TICKS = 5  # Ticks required
-                            SL_CONFIRMATION_SECONDS = 30  # Minimum seconds in SL zone
+                            SL_CONFIRMATION_SECONDS = 15  # Minimum seconds in SL zone
                             
                             # Initialize confirmation state
                             if 'slConfirmCount' not in pos:
@@ -7072,23 +7072,24 @@ async def background_scanner_loop():
                                                     'order_id': limit_result['id'],
                                                     'placed_at': datetime.now().timestamp(),
                                                     'limit_price': trailing_stop,
-                                                    'reason': 'TRAIL_SL_HIT',
+                                                    'reason': 'TRAIL_EXIT',
                                                     'timeout_seconds': 45,
                                                 }
                                                 logger.warning(f"📙 TRAIL_LIMIT: {pos_symbol} {pos['side']} limit @ ${trailing_stop:.6f} (liquid coin, saves slippage)")
                                                 continue
                                             else:
                                                 logger.warning(f"📙 TRAIL_LIMIT_FAIL: {pos_symbol} limit failed, market close")
-                                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                                global_paper_trader.close_position(pos, current_price, 'TRAIL_EXIT')
                                                 continue
                                         except Exception as e:
                                             logger.error(f"Trail limit error {pos_symbol}: {e}")
-                                            global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                            global_paper_trader.close_position(pos, current_price, 'TRAIL_EXIT')
                                             continue
                                     else:
                                         # Illiquid coin or regular SL → market close (execution certainty)
                                         logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                        global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
+                                        global_paper_trader.close_position(pos, current_price, reason)
                                         continue
                             else:
                                 # Price recovered - reset counter (spike bypassed!)
@@ -7391,7 +7392,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
         trailing_stop = pos.get('trailingStop', sl)
         
         SL_CONFIRMATION_TICKS = 5
-        SL_CONFIRMATION_SECONDS = 30
+        SL_CONFIRMATION_SECONDS = 15
         
         if 'slConfirmCount' not in pos:
             pos['slConfirmCount'] = 0
@@ -7411,8 +7412,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
             pos['slConfirmCount'] += 1
             breach_duration = now_ts - pos['slBreachStartTime']
             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
+                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
                 logger.info(f"🔴 SL CONFIRMED (WS): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                global_paper_trader.close_position(pos, current_price, reason)
                 continue
         else:
             if pos['slConfirmCount'] > 0:
@@ -7593,7 +7595,7 @@ async def position_price_update_loop():
                         
                         # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation
                         SL_CONFIRMATION_TICKS = 5
-                        SL_CONFIRMATION_SECONDS = 30
+                        SL_CONFIRMATION_SECONDS = 15
                         
                         if 'slConfirmCount' not in pos:
                             pos['slConfirmCount'] = 0
@@ -7613,8 +7615,9 @@ async def position_price_update_loop():
                             pos['slConfirmCount'] += 1
                             breach_duration = now_ts - pos['slBreachStartTime']
                             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
+                                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
                                 logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                global_paper_trader.close_position(pos, current_price, 'SL_HIT')
+                                global_paper_trader.close_position(pos, current_price, reason)
                                 continue
                         else:
                             if pos['slConfirmCount'] > 0:
@@ -9606,23 +9609,23 @@ class PositionBasedKillSwitch:
     Dynamic Kill Switch - thresholds calculated per-position based on leverage.
     
     Base thresholds (at 10x leverage):
-    - First Reduction: -70% of invested margin → close 50% of position
-    - Full Close: -150% of invested margin → close entire position
+    - First Reduction: -30% of invested margin → close 50% of position
+    - Full Close: -60% of invested margin → close entire position
     
     Leverage adjustment:
-    - Higher leverage (>10x): Tighter thresholds (more sensitive)
-    - Lower leverage (<10x): Looser thresholds (more room)
+    - Higher leverage (>10x): Looser thresholds (more room)
+    - Lower leverage (<10x): Tighter thresholds (less room)
     
-    Formula: threshold = base_threshold * (10 / leverage)
-    - 25x leverage: -70% * (10/25) = -28% first, -60% full
-    - 10x leverage: -70% * (10/10) = -70% first, -150% full  
-    - 5x leverage: -70% * (10/5) = -140% first, -300% full
+    Formula: threshold = base_threshold * sqrt(leverage / 10)
+    - 25x leverage: -30% * sqrt(2.5) = -47% first, -95% full
+    - 10x leverage: -30% * 1.0 = -30% first, -60% full  
+    - 5x leverage: -30% * sqrt(0.5) = -21% first, -42% full
     """
     
     def __init__(self, reduction_size: float = 0.5):
         # Base thresholds at 10x leverage (reference point)
-        self.base_first_reduction = -70.0  # -70% of invested margin
-        self.base_full_close = -150.0      # -150% of invested margin
+        self.base_first_reduction = -30.0  # -30% of invested margin
+        self.base_full_close = -60.0       # -60% of invested margin
         self.reduction_size = reduction_size  # 50% reduction at first level
         
         # Track which positions have been partially closed
@@ -9962,11 +9965,11 @@ class TimeBasedPositionManager:
                     # Dynamic base for TP levels: ATR_pct * multiplier
                     base_tp_pct = atr_pct * mult
                     
-                    # TP levels: 50%, 100%, 200% of base
+                    # TP levels: 100%, 150%, 250% of base
                     tp_levels = [
-                        {'pct': base_tp_pct * 0.5, 'close_pct': 0.25, 'key': 'tp1'},
-                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.25, 'key': 'tp2'},
-                        {'pct': base_tp_pct * 2.0, 'close_pct': 0.25, 'key': 'tp3'},
+                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.25, 'key': 'tp1'},
+                        {'pct': base_tp_pct * 1.5, 'close_pct': 0.25, 'key': 'tp2'},
+                        {'pct': base_tp_pct * 2.5, 'close_pct': 0.25, 'key': 'tp3'},
                     ]
                     
                     # Current profit percentage
@@ -13468,8 +13471,8 @@ class PaperTradingEngine:
         self.leverage = 10
         self.risk_per_trade = 0.02  # 2%
         # Phase 18: Full Trading Parameters
-        self.sl_atr = 30  # High value - position risk management handles actual exits
-        self.tp_atr = 20
+        self.sl_atr = 15  # 1.5x ATR — tighter SL for better R:R
+        self.tp_atr = 30  # 3.0x ATR — wider TP for better R:R
         self.trail_activation_atr = 1.5
         self.trail_distance_atr = 1.0
         self.sl_multiplier = 2.0  # ATR multiplier for SL (used in sync loop)
@@ -13491,7 +13494,7 @@ class PaperTradingEngine:
         # Phase 20: Advanced Risk Management Config
         self.max_position_age_hours = 24
         self.daily_drawdown_limit = 5.0  # %5 günlük kayıp limiti
-        self.emergency_sl_pct = 10.0  # %10 pozisyon başına max kayıp
+        self.emergency_sl_pct = 5.0   # %5 pozisyon başına max kayıp (10x lev = %50 margin)
         self.current_spread_pct = 0.05  # Will be updated from WebSocket
         self.daily_start_balance = 10000.0
         # Phase 34: Pending Orders System
@@ -14755,8 +14758,8 @@ class PaperTradingEngine:
                     self.leverage = data.get('leverage', 10)
                     self.risk_per_trade = data.get('risk_per_trade', 0.02)
                     # Phase 18: Load full trading parameters
-                    self.sl_atr = data.get('sl_atr', 30)  # Default: 30 ATR
-                    self.tp_atr = data.get('tp_atr', 20)  # Default: 20 ATR
+                    self.sl_atr = data.get('sl_atr', 15)  # Default: 15 (1.5x ATR)
+                    self.tp_atr = data.get('tp_atr', 30)  # Default: 30 (3.0x ATR)
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
                     self.max_positions = data.get('max_positions', 50)  # Default: 50
@@ -15136,15 +15139,16 @@ class PaperTradingEngine:
                         pos['slBreachStartTime'] = now_ts
                     pos['slConfirmCount'] += 1
                     breach_duration = now_ts - pos['slBreachStartTime']
-                    if pos['slConfirmCount'] >= 5 and breach_duration >= 30:
-                        self.close_position(pos, current_price, 'SL')
+                    if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
+                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive') else 'SL_HIT'
+                        self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} LONG | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price >= pos['takeProfit']:
-                        self.close_position(pos, current_price, 'TP')
+                        self.close_position(pos, current_price, 'TP_HIT')
                     
             elif pos['side'] == 'SHORT':
                 # SHORT: ROI must be >= threshold (positive ROI means price went down)
@@ -15171,15 +15175,16 @@ class PaperTradingEngine:
                         pos['slBreachStartTime'] = now_ts
                     pos['slConfirmCount'] += 1
                     breach_duration = now_ts - pos['slBreachStartTime']
-                    if pos['slConfirmCount'] >= 5 and breach_duration >= 30:
-                        self.close_position(pos, current_price, 'SL')
+                    if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
+                        reason = 'TRAIL_EXIT' if pos.get('isTrailingActive') else 'SL_HIT'
+                        self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} SHORT | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price <= pos['takeProfit']:
-                        self.close_position(pos, current_price, 'TP')
+                        self.close_position(pos, current_price, 'TP_HIT')
 
     def _format_detailed_reason(self, reason: str, pos: Dict, exit_price: float, pnl_percent: float) -> str:
         """
@@ -15317,7 +15322,7 @@ class PaperTradingEngine:
         # =====================================================================
         try:
             # 1. StoplossFrequencyGuard: Record SL exits
-            if 'SL' in reason.upper() or 'STOP' in reason.upper():
+            if reason in ('SL_HIT', 'EMERGENCY_SL'):
                 stoploss_frequency_guard.record_stoploss(
                     symbol=pos.get('symbol', 'UNKNOWN'),
                     reason=reason
