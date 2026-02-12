@@ -2733,10 +2733,12 @@ async def binance_position_sync_loop():
                     eth_atr_pct = _get_coin_atr_percent('ETHUSDT')
                     
                     # Update recovery manager
+                    wallet_bal = global_paper_trader.balance if global_paper_trader else 100.0
                     recovery_status = portfolio_recovery_manager.update(
                         total_unrealized_pnl=total_upnl,
                         btc_atr_pct=btc_atr_pct,
-                        eth_atr_pct=eth_atr_pct
+                        eth_atr_pct=eth_atr_pct,
+                        wallet_balance=wallet_bal
                     )
                     
                     # Check if we should close all positions
@@ -2827,14 +2829,10 @@ async def binance_position_sync_loop():
                         if breakeven_actions.get('breakeven_activated') or breakeven_actions.get('breakeven_closed'):
                             logger.info(f"🔒 Breakeven: activated={breakeven_actions['breakeven_activated']}, closed={breakeven_actions['breakeven_closed']}")
                         
-                        # Phase 200: LossRecoveryTrailManager DEAKTIF
-                        # Sebep: Fiyat bazlı eşikler (leverage dikkate almıyor) pozisyonları
-                        # kâra dönme şansı vermeden erken kapatıyordu. Emergency SL, Adverse Exit,
-                        # Time-based Exit ve Adaptive Exit Tightness aynı korumayı daha akıllıca sağlıyor.
-                        # Sınıf kodu korundu — ileride yeniden aktif edilebilir.
-                        # recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
-                        # if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
-                        #     logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
+                        # Check loss recovery trail conditions
+                        recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
+                        if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
+                            logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
                 except Exception as mgr_err:
                     logger.warning(f"Position manager error: {mgr_err}")
                 
@@ -10282,14 +10280,14 @@ class PortfolioRecoveryManager:
         # Configuration
         # Phase 190: Removed 12h wait — recovery candidate activates immediately
         self.underwater_threshold_hours = 0    # Immediate — artıya geçince trail başlar
-        self.min_positive_threshold = 0.50     # Min $0.50 to activate trailing
-        self.min_trailing_pct = 1.5           # 1.5% minimum trailing distance
-        self.max_trailing_pct = 5.0           # 5.0% maximum trailing distance
+        self.min_positive_pct = 0.03           # Phase 200: Portföy bakiyesinin %3'ü (dinamik)
+        self.min_trailing_pct = 5.0            # Phase 200: 5.0% minimum trailing distance (was 1.5%)
+        self.max_trailing_pct = 10.0           # 10.0% maximum trailing distance
         self.cooldown_hours = 6               # Hours to wait after recovery close
         
-        logger.info(f"🔄 PortfolioRecoveryManager initialized: immediate trail on positive uPnL → close all")
+        logger.info(f"🔄 PortfolioRecoveryManager initialized: min_positive=%3 of balance, trail=5-10%")
     
-    def update(self, total_unrealized_pnl: float, btc_atr_pct: float, eth_atr_pct: float) -> str:
+    def update(self, total_unrealized_pnl: float, btc_atr_pct: float, eth_atr_pct: float, wallet_balance: float = 100.0) -> str:
         """
         Main update method - called every sync cycle.
         
@@ -10297,6 +10295,7 @@ class PortfolioRecoveryManager:
             total_unrealized_pnl: Total unrealized PnL across all positions
             btc_atr_pct: BTC ATR as percentage of price
             eth_atr_pct: ETH ATR as percentage of price
+            wallet_balance: Current wallet balance for dynamic threshold
             
         Returns:
             Status string for logging
@@ -10332,7 +10331,9 @@ class PortfolioRecoveryManager:
             return f"UNDERWATER_{hours_underwater:.1f}h"
         
         # ===== PHASE 2: POSITIVE PNL CHECK =====
-        if total_unrealized_pnl >= self.min_positive_threshold:
+        # Dynamic threshold: 3% of wallet balance
+        dynamic_threshold = max(wallet_balance * self.min_positive_pct, 0.50)  # Min $0.50 floor
+        if total_unrealized_pnl >= dynamic_threshold:
             
             # If we're a recovery candidate and PnL turned positive, activate trailing
             if self.is_recovery_candidate and not self.recovery_trailing_active:
