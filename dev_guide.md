@@ -1433,3 +1433,60 @@ Market order ile giriş yaparken oluşan slippage (fiyat kayması) kayıpların�
 | Spread Filter | 186 | Spread > %0.3 → emri erteleme |
 | Limit + Market Fallback | 186 | 3s limit → market fallback |
 | EXEC_QUALITY Log | 186 | Slippage loglama |
+
+## Phase 202: Hybrid Trend Mode (Momentum Strategy)
+
+**Referans:** Freqtrade `custom_stoploss`, pandas-ta ADX+Supertrend, Jesse KAMA Trend Following
+
+### 3 Katmanlı Hibrit Trend Sistemi
+
+#### Katman 1: Trend Tespiti (pandas-ta)
+- **ADX > 40** (4H timeframe, `calculate_adx` kullanılır)
+- **Supertrend aynı yönde** (4H, `pandas_ta.supertrend(length=10, multiplier=3.0)`)
+- **Sinyal trend yönünde** (LONG + BULLISH veya SHORT + BEARISH)
+- Her 3 koşul sağlanırsa → `trend_mode = True`
+
+#### Katman 2: Pro-Trend Giriş Bonusu (Jesse pattern)
+`calculate_strong_trend_penalty` genişletildi → 3-tuple döner: `(score, size_mult, is_trend_mode)`
+
+| 4H Değişim | ADX | Counter-Trend (Phase 143) | Pro-Trend (Phase 202) |
+|-----------|-----|---------------------------|------------------------|
+| %5-10 | >40 | -10 pts, %75 size | **+5 pts, %110 size** |
+| %10-20 | >40 | -20 pts, %50 size | **+10 pts, %120 size** |
+| %20+ | >50 | -30 pts, %25 size | **+15 pts, %130 size** |
+
+#### Katman 3: Stepped SL Lock (Freqtrade pattern)
+Trend Mode pozisyonlarda kâr seviyesine göre SL kilitlenir:
+
+| Kâr % | SL Konumu | Açıklama |
+|-------|-----------|----------|
+| ≥ %0.5 | Breakeven | Zararda kapatmayı engelle |
+| ≥ %2 | Entry + %1 | Minimum %1 kâr kilitle |
+| ≥ %5 | Entry + %3 | %3 kâr kilitle |
+| ≥ %10 | Entry + %7 | %7 kâr kilitle |
+
+#### Trend Mode Pozisyon Parametreleri
+| Parametre | Normal | Trend Mode | Multiplier |
+|-----------|--------|------------|------------|
+| TP ATR | 3.0x | ~5.0x | ×1.67 |
+| Trail Activation | 1.5x | ~2.5x | ×1.67 |
+| Trail Distance | 1.0x | ~1.5x | ×1.50 |
+| SL ATR | 1.5x | ~2.0x | ×1.33 |
+
+### Log Formatları
+```
+🚀 TREND_MODE: +15.2% ADX=52 → LONG BOOST (+15pts, 130% size)
+🚀 TREND_MODE SIGNAL: LONG BTCUSDT | ADX_4H=52 ST=1 Size×130%
+🚀 TREND_MODE PARAMS: LONG BTCUSDT | TP×1.67 Trail×1.67 SL×1.33
+🔒 STEPPED_SL: BTCUSDT LONG ROI=5.2% | SL $42000 → $43260
+```
+
+### Entegrasyon Noktaları
+| Değişiklik | Fonksiyon | Dosya |
+|-----------|-----------|-------|
+| Supertrend hesaplama | `update_coin_trend` | main.py |
+| Pro-trend bonus | `calculate_strong_trend_penalty` | main.py |
+| Trend mode flag | `confirm_signal` | main.py |
+| Signal'e aktarma | `process_cloud_signal` | main.py |
+| Wider params | `open_position`, `execute_pending_order` | main.py |
+| Stepped SL lock | Exit loop (Cloud + WS) | main.py |

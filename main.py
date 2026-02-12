@@ -7043,6 +7043,54 @@ async def background_scanner_loop():
                             trailing_stop = pos.get('trailingStop', sl)
                             
                             # =========================================================
+                            # Phase 202: STEPPED SL LOCK for Trend Mode positions
+                            # Freqtrade custom_stoploss pattern — lock profits as they grow
+                            # =========================================================
+                            if pos.get('trend_mode', False) and entry_price > 0:
+                                if pos['side'] == 'LONG':
+                                    current_roi = (current_price - entry_price) / entry_price * 100
+                                else:
+                                    current_roi = (entry_price - current_price) / entry_price * 100
+                                
+                                stepped_sl = None
+                                if current_roi >= 10:
+                                    # Lock %7 profit
+                                    if pos['side'] == 'LONG':
+                                        stepped_sl = entry_price * 1.07
+                                    else:
+                                        stepped_sl = entry_price * 0.93
+                                elif current_roi >= 5:
+                                    # Lock %3 profit
+                                    if pos['side'] == 'LONG':
+                                        stepped_sl = entry_price * 1.03
+                                    else:
+                                        stepped_sl = entry_price * 0.97
+                                elif current_roi >= 2:
+                                    # Lock %1 profit
+                                    if pos['side'] == 'LONG':
+                                        stepped_sl = entry_price * 1.01
+                                    else:
+                                        stepped_sl = entry_price * 0.99
+                                elif current_roi >= 0.5:
+                                    # Breakeven lock
+                                    stepped_sl = entry_price
+                                
+                                if stepped_sl is not None:
+                                    # Only ratchet UP (LONG) or DOWN (SHORT) — never weaken
+                                    if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
+                                        old_sl = trailing_stop
+                                        trailing_stop = stepped_sl
+                                        pos['trailingStop'] = stepped_sl
+                                        if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
+                                            logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
+                                    elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
+                                        old_sl = trailing_stop
+                                        trailing_stop = stepped_sl
+                                        pos['trailingStop'] = stepped_sl
+                                        if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
+                                            logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
+                            
+                            # =========================================================
                             # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                             # SL triggers ONLY after 5 consecutive ticks AND 30 seconds
                             # of sustained breach. Protects against 1-min wick spikes.
@@ -7410,6 +7458,48 @@ async def on_position_price_update(symbol: str, ticker: dict):
         sl = pos.get('stopLoss', 0)
         tp = pos.get('takeProfit', 0)
         trailing_stop = pos.get('trailingStop', sl)
+        
+        # =========================================================
+        # Phase 202: STEPPED SL LOCK for Trend Mode positions (WS)
+        # =========================================================
+        if pos.get('trend_mode', False) and entry_price > 0:
+            if pos['side'] == 'LONG':
+                current_roi = (current_price - entry_price) / entry_price * 100
+            else:
+                current_roi = (entry_price - current_price) / entry_price * 100
+            
+            stepped_sl = None
+            if current_roi >= 10:
+                if pos['side'] == 'LONG':
+                    stepped_sl = entry_price * 1.07
+                else:
+                    stepped_sl = entry_price * 0.93
+            elif current_roi >= 5:
+                if pos['side'] == 'LONG':
+                    stepped_sl = entry_price * 1.03
+                else:
+                    stepped_sl = entry_price * 0.97
+            elif current_roi >= 2:
+                if pos['side'] == 'LONG':
+                    stepped_sl = entry_price * 1.01
+                else:
+                    stepped_sl = entry_price * 0.99
+            elif current_roi >= 0.5:
+                stepped_sl = entry_price
+            
+            if stepped_sl is not None:
+                if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
+                    old_sl = trailing_stop
+                    trailing_stop = stepped_sl
+                    pos['trailingStop'] = stepped_sl
+                    if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
+                        logger.info(f"🔒 STEPPED_SL(WS): {symbol} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
+                elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
+                    old_sl = trailing_stop
+                    trailing_stop = stepped_sl
+                    pos['trailingStop'] = stepped_sl
+                    if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
+                        logger.info(f"🔒 STEPPED_SL(WS): {symbol} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
         
         SL_CONFIRMATION_TICKS = 5
         SL_CONFIRMATION_SECONDS = 15
@@ -7916,6 +8006,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Add MTF size modifier to signal for position sizing
     signal['mtf_size_modifier'] = score_modifier
     
+    # Phase 202: Pass trend_mode and strong_trend data to signal
+    signal['trend_mode'] = mtf_result.get('trend_mode', False)
+    signal['strong_trend_size_mult'] = mtf_result.get('strong_trend_size_mult', 1.0)
+    signal['adx_4h'] = mtf_result.get('adx_4h', 0)
+    signal['supertrend_dir'] = mtf_result.get('supertrend_dir', 0)
+    if signal['trend_mode']:
+        logger.warning(f"🚀 TREND_MODE SIGNAL: {action} {symbol} | ADX_4H={signal['adx_4h']:.0f} ST={signal['supertrend_dir']} Size×{signal['strong_trend_size_mult']:.0%}")
+    
     # =====================================================
     # PHASE 99: MTF LEVERAGE ADJUSTMENT (Bonus/Penalty Only)
     # SignalGenerator already calculated unified leverage
@@ -8227,19 +8325,15 @@ class MultiTimeframeConfirmation:
         
         return 0
     
-    def calculate_strong_trend_penalty(self, price_change_pct: float, signal_action: str) -> tuple:
+    def calculate_strong_trend_penalty(self, price_change_pct: float, signal_action: str, adx: float = 0) -> tuple:
         """
-        Phase 143: Strong Trend Filter
+        Phase 143 + Phase 202: Strong Trend Filter + Pro-Trend Bonus
         
-        Son 20 4H mumdan hesaplanan fiyat değişimi > threshold ve
-        sinyal counter-trend ise penalty + size reduction uygula.
+        Counter-trend: penalty + size reduction (Phase 143)
+        Pro-trend: bonus + size increase + trend_mode flag (Phase 202)
         
-        Args:
-            price_change_pct: 20 4H mum boyunca fiyat değişimi (%)
-            signal_action: 'LONG' or 'SHORT'
-            
         Returns:
-            (penalty_score: int, size_multiplier: float)
+            (score_modifier: int, size_multiplier: float, is_trend_mode: bool)
         """
         abs_change = abs(price_change_pct)
         
@@ -8247,26 +8341,36 @@ class MultiTimeframeConfirmation:
         is_bullish = price_change_pct > 0
         is_counter_trend = (is_bullish and signal_action == "SHORT") or \
                            (not is_bullish and signal_action == "LONG")
+        is_pro_trend = (is_bullish and signal_action == "LONG") or \
+                       (not is_bullish and signal_action == "SHORT")
         
-        # Counter-trend değilse veya değişim < 5% ise penalty yok
+        # ========== Phase 202: Pro-Trend Bonus ==========
+        if is_pro_trend and abs_change >= 5 and adx >= 40:
+            if abs_change >= 20:
+                logger.warning(f"🚀 TREND_MODE: {price_change_pct:+.1f}% ADX={adx:.0f} → {signal_action} BOOST (+15pts, 130% size)")
+                return (+15, 1.30, True)
+            elif abs_change >= 10:
+                logger.warning(f"🚀 TREND_MODE: {price_change_pct:+.1f}% ADX={adx:.0f} → {signal_action} BOOST (+10pts, 120% size)")
+                return (+10, 1.20, True)
+            elif abs_change >= 5:
+                logger.info(f"🚀 TREND_MODE: {price_change_pct:+.1f}% ADX={adx:.0f} → {signal_action} BOOST (+5pts, 110% size)")
+                return (+5, 1.10, True)
+        
+        # ========== Phase 143: Counter-Trend Penalty ==========
         if not is_counter_trend or abs_change < 5:
-            return (0, 1.0)
+            return (0, 1.0, False)
         
-        # Tiered penalty sistemi
         if abs_change >= 20:
-            # Very strong trend: -30 pts, 25% size
             logger.warning(f"⚠️ STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-30, 25% size)")
-            return (-30, 0.25)
+            return (-30, 0.25, False)
         elif abs_change >= 10:
-            # Strong trend: -20 pts, 50% size
             logger.warning(f"⚠️ STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-20, 50% size)")
-            return (-20, 0.50)
+            return (-20, 0.50, False)
         elif abs_change >= 5:
-            # Moderate trend: -10 pts, 75% size
             logger.info(f"📊 STRONG_TREND: {price_change_pct:+.1f}% → {signal_action} penalized (-10, 75% size)")
-            return (-10, 0.75)
+            return (-10, 0.75, False)
         
-        return (0, 1.0)
+        return (0, 1.0, False)
     
     async def update_coin_trend(self, symbol: str, exchange) -> dict:
         """Fetch 15m, 1h, 4h, 1d candles and calculate MTF data."""
@@ -8320,6 +8424,36 @@ class MultiTimeframeConfirmation:
                     result['price_change_4h_20'] = round(price_change_pct, 2)
                 else:
                     result['price_change_4h_20'] = 0.0
+                
+                # Phase 202: Supertrend calculation for trend mode
+                try:
+                    if PANDAS_TA_AVAILABLE and len(ohlcv_4h) >= 14:
+                        import pandas as pd
+                        df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        st = pta.supertrend(df_4h['high'], df_4h['low'], df_4h['close'], length=10, multiplier=3.0)
+                        if st is not None and len(st) > 0:
+                            st_dir = st.iloc[-1][f'SUPERTd_10_3.0']
+                            result['supertrend_dir'] = int(st_dir)  # 1=bullish, -1=bearish
+                        else:
+                            result['supertrend_dir'] = 0
+                    else:
+                        result['supertrend_dir'] = 0
+                except Exception as st_err:
+                    logger.debug(f"Supertrend calc error {symbol}: {st_err}")
+                    result['supertrend_dir'] = 0
+                
+                # Phase 202: ADX from 4H data for trend mode
+                try:
+                    highs_4h = [c[2] for c in ohlcv_4h]
+                    lows_4h = [c[3] for c in ohlcv_4h]
+                    closes_4h_list = [c[4] for c in ohlcv_4h]
+                    adx_4h, adx_trend_4h, _, _ = calculate_adx(highs_4h, lows_4h, closes_4h_list)
+                    result['adx_4h'] = adx_4h
+                    result['adx_trend_4h'] = adx_trend_4h
+                except Exception as adx_err:
+                    logger.debug(f"ADX 4H calc error {symbol}: {adx_err}")
+                    result['adx_4h'] = 0
+                    result['adx_trend_4h'] = 'NEUTRAL'
             
             if ohlcv_1d and len(ohlcv_1d) >= 10:
                 closes_1d = [c[4] for c in ohlcv_1d]
@@ -8403,21 +8537,39 @@ class MultiTimeframeConfirmation:
             result['reason'] = f"MTF RED ({total_score}): çok güçlü karşı trend"
         
         # ================================================================
-        # Phase 143: Strong Trend Filter - Apply additional penalty
+        # Phase 143 + 202: Strong Trend Filter + Pro-Trend Bonus
         # ================================================================
         price_change_4h_20 = trend_data.get('price_change_4h_20', 0.0)
-        strong_trend_penalty, strong_trend_size_mult = self.calculate_strong_trend_penalty(
-            price_change_4h_20, signal_action
+        adx_4h = trend_data.get('adx_4h', 0)
+        supertrend_dir = trend_data.get('supertrend_dir', 0)
+        
+        strong_trend_penalty, strong_trend_size_mult, is_trend_mode = self.calculate_strong_trend_penalty(
+            price_change_4h_20, signal_action, adx=adx_4h
         )
         
-        # Apply penalty to mtf_score
+        # Phase 202: Validate trend_mode with Supertrend confirmation
+        if is_trend_mode:
+            # Supertrend must agree: LONG needs bullish(1), SHORT needs bearish(-1)
+            st_confirms = (signal_action == 'LONG' and supertrend_dir == 1) or \
+                          (signal_action == 'SHORT' and supertrend_dir == -1)
+            if not st_confirms:
+                logger.info(f"📊 TREND_MODE downgrade: {signal_action} but Supertrend={supertrend_dir} — disabling trend mode")
+                is_trend_mode = False
+                # Keep the score bonus but don't apply wider params
+        
+        # Apply modifier to mtf_score
         result['mtf_score'] += strong_trend_penalty
         result['strong_trend_penalty'] = strong_trend_penalty
         result['strong_trend_size_mult'] = strong_trend_size_mult
         result['price_change_4h_20'] = price_change_4h_20
+        result['trend_mode'] = is_trend_mode
+        result['adx_4h'] = adx_4h
+        result['supertrend_dir'] = supertrend_dir
         
-        # If strong trend penalty applied, adjust reason
-        if strong_trend_penalty < 0:
+        # Adjust reason
+        if is_trend_mode:
+            result['reason'] += f" | 🚀 TREND_MODE(4h:{price_change_4h_20:+.1f}% ADX:{adx_4h:.0f} ST:{supertrend_dir}): +{strong_trend_penalty}pts, {int(strong_trend_size_mult*100)}% size"
+        elif strong_trend_penalty < 0:
             result['reason'] += f" | STRONG_TREND({price_change_4h_20:+.1f}%): {strong_trend_penalty}pts, {int(strong_trend_size_mult*100)}% size"
         
         return result
@@ -14044,14 +14196,31 @@ class PaperTradingEngine:
         size_mult = size_mult * strong_trend_size_mult
         if strong_trend_size_mult < 1.0:
             logger.info(f"📉 STRONG_TREND SIZE: {strong_trend_size_mult:.0%} multiplier applied → size_mult={size_mult:.2f}")
+        elif strong_trend_size_mult > 1.0:
+            logger.info(f"🚀 TREND_MODE SIZE: {strong_trend_size_mult:.0%} multiplier applied → size_mult={size_mult:.2f}")
         
         # Calculate SL/TP based on pullback entry price
         # Apply exit_tightness: lower = quicker exit (smaller SL/TP), higher = hold longer (bigger SL/TP)
         # DYNAMIC ATR MULTIPLIER: Adjust based on current volatility
         dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, price)
         
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
+        # Phase 202: Trend Mode — wider params for strong trend pro-trend signals
+        is_trend_mode = signal.get('trend_mode', False) if signal else False
+        if is_trend_mode:
+            # Trend Mode: let winners run with wider params
+            tm_sl_mult = 1.33    # SL 33% wider (1.5x → 2.0x ATR effective)
+            tm_tp_mult = 1.67    # TP 67% wider (3.0x → 5.0x ATR effective)
+            tm_trail_act_mult = 1.67  # Trail activation 67% wider (1.5x → 2.5x effective)
+            tm_trail_dist_mult = 1.50  # Trail distance 50% wider (1.0x → 1.5x effective)
+            logger.warning(f"🚀 TREND_MODE PARAMS: {side} {trade_symbol} | TP×{tm_tp_mult:.2f} Trail×{tm_trail_act_mult:.2f} SL×{tm_sl_mult:.2f}")
+        else:
+            tm_sl_mult = 1.0
+            tm_tp_mult = 1.0
+            tm_trail_act_mult = 1.0
+            tm_trail_dist_mult = 1.0
+        
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
         if signal and 'dynamic_trail_activation' in signal:
@@ -14063,8 +14232,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
         if side == 'LONG':
             sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
@@ -14135,6 +14304,8 @@ class PaperTradingEngine:
             # Dynamic trail params (per-coin)
             "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
             "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr,
+            # Phase 202: Trend Mode flag
+            "trend_mode": is_trend_mode,
             # Phase 155: AI Optimizer settings snapshot
             "settingsSnapshot": settings_snapshot,
         }
@@ -14379,8 +14550,22 @@ class PaperTradingEngine:
         # FIX #2: Dynamic ATR Multiplier (parity with open_position)
         dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, fill_price)
         
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult
+        # Phase 202: Trend Mode wider params
+        is_trend_mode = order.get('trend_mode', False)
+        if is_trend_mode:
+            tm_sl_mult = 1.33
+            tm_tp_mult = 1.67
+            tm_trail_act_mult = 1.67
+            tm_trail_dist_mult = 1.50
+            logger.warning(f"🚀 TREND_MODE EXEC: {side} {symbol} | wider TP/Trail/SL")
+        else:
+            tm_sl_mult = 1.0
+            tm_tp_mult = 1.0
+            tm_trail_act_mult = 1.0
+            tm_trail_dist_mult = 1.0
+        
+        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
         if 'dynamic_trail_activation' in order:
@@ -14390,8 +14575,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
         if side == 'LONG':
             sl = max(fill_price * 0.01, fill_price - (atr * adjusted_sl_atr))
@@ -14427,7 +14612,9 @@ class PaperTradingEngine:
             # Phase 49: Carry forward analysis data from pending order
             "signalScore": order.get('signalScore', 0),
             "mtfScore": order.get('mtfScore', 0),
-            "zScore": order.get('zScore', 0)
+            "zScore": order.get('zScore', 0),
+            # Phase 202: Trend Mode flag for stepped SL
+            "trend_mode": is_trend_mode
         }
         
         # =====================================================================
