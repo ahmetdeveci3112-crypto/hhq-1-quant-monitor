@@ -2827,10 +2827,14 @@ async def binance_position_sync_loop():
                         if breakeven_actions.get('breakeven_activated') or breakeven_actions.get('breakeven_closed'):
                             logger.info(f"🔒 Breakeven: activated={breakeven_actions['breakeven_activated']}, closed={breakeven_actions['breakeven_closed']}")
                         
-                        # Check loss recovery trail conditions
-                        recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
-                        if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
-                            logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
+                        # Phase 200: LossRecoveryTrailManager DEAKTIF
+                        # Sebep: Fiyat bazlı eşikler (leverage dikkate almıyor) pozisyonları
+                        # kâra dönme şansı vermeden erken kapatıyordu. Emergency SL, Adverse Exit,
+                        # Time-based Exit ve Adaptive Exit Tightness aynı korumayı daha akıllıca sağlıyor.
+                        # Sınıf kodu korundu — ileride yeniden aktif edilebilir.
+                        # recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
+                        # if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
+                        #     logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
                 except Exception as mgr_err:
                     logger.warning(f"Position manager error: {mgr_err}")
                 

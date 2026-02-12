@@ -1358,3 +1358,47 @@ FreqAI: Trade recorded (profitable=True, total=51, until_retrain=49)
 - [ ] UI'da Phase 193 modül durumlarını göster (Settings panel)
 - [ ] StoplossGuard per-pair mode'u test et ve UI toggle ekle
 
+---
+
+## Phase 200: Adaptive Exit Tightness + LossRecoveryTrailManager Deaktivasyonu
+
+### Adaptive Exit Tightness (Counter-Signal Modifier)
+
+**Amaç:** Açık pozisyon varken ters sinyal geldiğinde, o pozisyonun `exit_tightness`'ını dinamik olarak düşürmek → daha sıkı çıkış kriterleri.
+
+**Modifier Tablosu:**
+| Ters Sinyal Skoru | Modifier | Efektif (2.7× global ile) |
+|-------------------|----------|---------------------------|
+| < 50 | 1.0 | 2.7 (etki yok) |
+| 50-65 | 0.85 | 2.3 |
+| 65-80 | 0.70 | 1.9 |
+| 80-90 | 0.55 | 1.5 |
+| 90+ | 0.40 | 1.1 |
+
+**TTL:** 15 dakika. Expire olunca global değere döner.
+
+**Etkilenen:** Emergency SL, Progressive SL, Time-based Exit, Adverse Exit, Trail Activation ROI
+**Etkilenmeyen:** `open_position` SL/TP, Settings API toplu güncelleme, Kill Switch
+
+**Log:** `⚡ COUNTER SIGNAL: BTCUSDT SHORT (skor:85) vs açık LONG → exit_tightness 2.7→1.5 (x0.55)`
+
+---
+
+### LossRecoveryTrailManager — DEAKTIF (2026-02-12)
+
+> [!WARNING]
+> Bu mekanizma deaktif edildi. Sınıf kodu korundu (line ~10750), sadece çağrı noktası kapatıldı (line ~2830).
+
+**Neden deaktif edildi:**
+
+1. **Fiyat bazlı eşikler, leverage dikkate almıyor:** Normal spread'de -%5 fiyat düşüşünde trail tracking başlıyor → 7x leverage ile bu -%35 ROI demek
+2. **Erken kapatma:** Pozisyon kâra dönme şansı varken, toparlanmanın %50'sini geri verdiğinde kapatıyor
+3. **Toplu kapanma:** Piyasa toplu düşüş + toparlanma yapınca tüm pozisyonlarda aynı anda tetikleniyor
+4. **Redundant:** Emergency SL, Adverse Exit, Time-based Exit ve Adaptive Exit Tightness aynı korumayı daha akıllıca sağlıyor
+
+**Orijinal parametreler (referans):**
+```python
+loss_thresholds = {'Very Low': -3.0, 'Low': -4.0, 'Normal': -5.0, 'High': -7.0, 'Very High': -10.0}
+recovery_activation_pct = 0.30  # Kaybın %30'u toparlanınca trail aktif
+trail_giveback_pct = 0.50       # Toparlanmanın %50'si geri verilince kapat
+```
