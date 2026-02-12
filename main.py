@@ -2732,13 +2732,13 @@ async def binance_position_sync_loop():
                     btc_atr_pct = _get_coin_atr_percent('BTCUSDT')
                     eth_atr_pct = _get_coin_atr_percent('ETHUSDT')
                     
-                    # Update recovery manager
-                    wallet_bal = global_paper_trader.balance if global_paper_trader else 100.0
+                    # Update recovery manager — use Binance Margin Balance
+                    margin_bal = balance.get('marginBalance', balance.get('total', 100.0))
                     recovery_status = portfolio_recovery_manager.update(
                         total_unrealized_pnl=total_upnl,
                         btc_atr_pct=btc_atr_pct,
                         eth_atr_pct=eth_atr_pct,
-                        wallet_balance=wallet_bal
+                        wallet_balance=margin_bal
                     )
                     
                     # Check if we should close all positions
@@ -10280,7 +10280,7 @@ class PortfolioRecoveryManager:
         # Configuration
         # Phase 190: Removed 12h wait — recovery candidate activates immediately
         self.underwater_threshold_hours = 0    # Immediate — artıya geçince trail başlar
-        self.min_positive_pct = 0.03           # Phase 200: Portföy bakiyesinin %3'ü (dinamik)
+        self.min_positive_pct = 0.03           # Phase 200: Margin Balance'ın %3'ü (dinamik, min $5)
         self.min_trailing_pct = 5.0            # Phase 200: 5.0% minimum trailing distance (was 1.5%)
         self.max_trailing_pct = 10.0           # 10.0% maximum trailing distance
         self.cooldown_hours = 6               # Hours to wait after recovery close
@@ -10331,8 +10331,8 @@ class PortfolioRecoveryManager:
             return f"UNDERWATER_{hours_underwater:.1f}h"
         
         # ===== PHASE 2: POSITIVE PNL CHECK =====
-        # Dynamic threshold: 3% of wallet balance
-        dynamic_threshold = max(wallet_balance * self.min_positive_pct, 0.50)  # Min $0.50 floor
+        # Dynamic threshold: 3% of margin balance, min $5
+        dynamic_threshold = max(wallet_balance * self.min_positive_pct, 5.0)  # Min $5 floor
         if total_unrealized_pnl >= dynamic_threshold:
             
             # If we're a recovery candidate and PnL turned positive, activate trailing
