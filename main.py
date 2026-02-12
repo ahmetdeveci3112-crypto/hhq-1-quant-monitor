@@ -1686,6 +1686,22 @@ class LiveBinanceTrader:
             mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
             spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
             
+            # ===== Phase 201: Order Book Depth Check =====
+            try:
+                orderbook = await self.exchange.fetch_order_book(ccxt_symbol, 10)
+                relevant_levels = orderbook['asks'][:10] if side == 'LONG' else orderbook['bids'][:10]
+                available_liquidity_usd = sum(level[0] * level[1] for level in relevant_levels)
+                
+                MAX_BOOK_IMPACT_PCT = 0.20  # Max 20% of visible liquidity
+                if available_liquidity_usd > 0 and size_usd > available_liquidity_usd * MAX_BOOK_IMPACT_PCT:
+                    adjusted_size = available_liquidity_usd * 0.10  # Reduce to 10% of book
+                    logger.warning(f"🚫 LIQUIDITY_GUARD: {symbol} size ${size_usd:.2f} > {MAX_BOOK_IMPACT_PCT*100:.0f}% of book (${available_liquidity_usd:.0f}) → adjusted to ${adjusted_size:.2f}")
+                    size_usd = max(adjusted_size, 5.0)  # Min $5 notional floor
+                elif available_liquidity_usd > 0:
+                    logger.debug(f"📊 BOOK_DEPTH: {symbol} size=${size_usd:.2f} vs book=${available_liquidity_usd:.0f} ({size_usd/available_liquidity_usd*100:.1f}%)")
+            except Exception as ob_err:
+                logger.debug(f"Order book depth check error: {ob_err}")
+            
             amount = size_usd / price
             
             # Minimum lot size
@@ -14441,6 +14457,24 @@ class PaperTradingEngine:
                     logger.debug(f"Spread filter check error: {sf_err}")
                     # Continue with entry if spread check fails
                 
+                # ===== Phase 201: Pre-Entry Price Drift Check =====
+                # Compare signal price vs current price — reject if drifted too much
+                try:
+                    signal_price = order.get('signalPrice', 0)
+                    current_price = pre_ticker.get('last', fill_price) if 'pre_ticker' in dir() else fill_price
+                    if signal_price > 0 and current_price > 0:
+                        MAX_PRICE_DRIFT_PCT = 1.5  # Max 1.5% drift since signal
+                        price_drift_pct = abs(current_price - signal_price) / signal_price * 100
+                        if price_drift_pct > MAX_PRICE_DRIFT_PCT:
+                            logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} REJECTED — price drifted {price_drift_pct:.2f}% since signal (signal=${signal_price:.6f} → now=${current_price:.6f})")
+                            self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} price drifted {price_drift_pct:.1f}% since signal")
+                            # Don't retry — signal is stale
+                            return
+                        else:
+                            logger.debug(f"✅ DRIFT_CHECK: {symbol} drift={price_drift_pct:.2f}% OK (max {MAX_PRICE_DRIFT_PCT}%)")
+                except Exception as drift_err:
+                    logger.debug(f"Price drift check error: {drift_err}")
+                
                 logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance (LIMIT entry)...")
                 
                 # Phase 186 Feature B: Use limit entry with market fallback
@@ -14452,6 +14486,22 @@ class PaperTradingEngine:
                 )
                 
                 if result:
+                    # ===== Phase 201: Post-Fill Max Slippage Rejection =====
+                    fill_slippage = abs(result.get('slippage_pct', 0))
+                    MAX_FILL_SLIPPAGE_PCT = 0.5  # Max 0.5% fill slippage
+                    if fill_slippage > MAX_FILL_SLIPPAGE_PCT:
+                        logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} fill slippage {fill_slippage:.3f}% > max {MAX_FILL_SLIPPAGE_PCT}% — CLOSING immediately")
+                        self.add_log(f"🚫 SLIPPAGE REJECT: {symbol} closed (fill slip {fill_slippage:.2f}%)")
+                        try:
+                            await live_binance_trader.close_position(
+                                symbol=symbol,
+                                side=side,
+                                amount=result.get('amount', order['size'])
+                            )
+                        except Exception as close_err:
+                            logger.error(f"❌ Slippage rejection close failed: {close_err}")
+                        return  # Don't create local position
+                    
                     new_position['binance_order_id'] = result.get('id')
                     actual_fill = result.get('price', fill_price)
                     new_position['binance_fill_price'] = actual_fill
@@ -14459,7 +14509,7 @@ class PaperTradingEngine:
                     new_position['entry_method'] = result.get('entry_method', 'MARKET')
                     new_position['entry_slippage'] = result.get('slippage_pct', 0)
                     new_position['entry_spread'] = result.get('spread_pct', 0)
-                    logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')} | method={result.get('entry_method', 'MARKET')}")
+                    logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')} | method={result.get('entry_method', 'MARKET')} | slippage={fill_slippage:.3f}%")
                     
                     # Phase 186: Update entryPrice + SL/TP if actual fill differs
                     if abs(actual_fill - fill_price) / fill_price > 0.001:

@@ -1397,8 +1397,39 @@ FreqAI: Trade recorded (profitable=True, total=51, until_retrain=49)
 4. **Redundant:** Emergency SL, Adverse Exit, Time-based Exit ve Adaptive Exit Tightness aynı korumayı daha akıllıca sağlıyor
 
 **Orijinal parametreler (referans):**
-```python
-loss_thresholds = {'Very Low': -3.0, 'Low': -4.0, 'Normal': -5.0, 'High': -7.0, 'Very High': -10.0}
-recovery_activation_pct = 0.30  # Kaybın %30'u toparlanınca trail aktif
-trail_giveback_pct = 0.50       # Toparlanmanın %50'si geri verilince kapat
 ```
+
+---
+
+## Phase 201: 3-Layer Slippage Protection System
+
+### Amaç
+Market order ile giriş yaparken oluşan slippage (fiyat kayması) kayıplarını minimize etmek. Freqtrade `confirm_trade_entry` pattern'ından ilham alındı.
+
+### Katman 1: Pre-Entry Price Drift Check
+**Konum:** `execute_pending_orders()` → spread filter'dan sonra
+- Sinyal fiyatı (`signalPrice`) ile mevcut fiyat karşılaştırılır
+- **Eşik:** %1.5 max drift
+- Aşılırsa emir **tamamen reddedilir** (retry yok — sinyal bayat)
+- Log: `🚫 SLIPPAGE_GUARD: ... price drifted X%`
+
+### Katman 2: Post-Fill Max Slippage Rejection
+**Konum:** `execute_pending_orders()` → Binance fill'den sonra
+- Fill slippage (`result.slippage_pct`) kontrol edilir
+- **Eşik:** %0.5 max fill slippage
+- Aşılırsa pozisyon **anında kapatılır** (`close_position`)
+- Log: `🚫 SLIPPAGE_GUARD: ... fill slippage X% > max`
+
+### Katman 3: Order Book Depth Check
+**Konum:** `place_limit_entry_order()` → amount hesabından önce
+- `fetch_order_book(symbol, 10)` ile ilk 10 seviyenin likiditesi ölçülür
+- Emir boyutu > likiditenin %20'si → boyut likiditenin %10'una küçültülür
+- Minimum $5 notional floor
+- Log: `🚫 LIQUIDITY_GUARD: ... adjusted to $X`
+
+### Mevcut Korumalar (Korundu)
+| Koruma | Phase | Açıklama |
+|--------|-------|----------|
+| Spread Filter | 186 | Spread > %0.3 → emri erteleme |
+| Limit + Market Fallback | 186 | 3s limit → market fallback |
+| EXEC_QUALITY Log | 186 | Slippage loglama |
