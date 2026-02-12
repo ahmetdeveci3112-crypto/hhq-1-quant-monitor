@@ -14461,7 +14461,11 @@ class PaperTradingEngine:
                 # Compare signal price vs current price — reject if drifted too much
                 try:
                     signal_price = order.get('signalPrice', 0)
-                    current_price = pre_ticker.get('last', fill_price) if 'pre_ticker' in dir() else fill_price
+                    # Use pre_ticker from spread filter if available, otherwise fetch fresh
+                    try:
+                        current_price = pre_ticker.get('last', fill_price)
+                    except NameError:
+                        current_price = fill_price
                     if signal_price > 0 and current_price > 0:
                         MAX_PRICE_DRIFT_PCT = 1.5  # Max 1.5% drift since signal
                         price_drift_pct = abs(current_price - signal_price) / signal_price * 100
