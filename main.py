@@ -1522,6 +1522,19 @@ class LiveBinanceTrader:
                                 should_close = True
                                 close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} >= trail ${trailing_stop:.6f}"
                         
+                        # Phase 205b: EMERGENCY SL — tick price WAY past trail stop
+                        if not should_close:
+                            EMERGENCY_SL_MARGIN_PCT = 1.5
+                            emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
+                            if side == 'LONG' and current_price <= (trailing_stop - emergency_margin):
+                                should_close = True
+                                excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+                                close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
+                            elif side == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
+                                should_close = True
+                                excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+                                close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
+                        
                         if should_close:
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
                             logger.warning(f"   📊 ROI: {pnl_percent:.1f}% | PnL: ${unrealized_pnl:.2f}")
@@ -7163,12 +7176,33 @@ async def background_scanner_loop():
                             if 'slBreachStartTime' not in pos:
                                 pos['slBreachStartTime'] = 0
                             
-                            # Check if price is in SL zone
+                            # Check if price is in SL zone (candle close based)
                             sl_breached = False
                             if pos['side'] == 'LONG' and candle_close_price <= trailing_stop:
                                 sl_breached = True
                             elif pos['side'] == 'SHORT' and candle_close_price >= trailing_stop:
                                 sl_breached = True
+                            
+                            # =========================================================
+                            # Phase 205b: EMERGENCY SL — tick price WAY past SL
+                            # If current_price exceeds SL by >1.5% of entry, close
+                            # immediately. Bypasses both candle close AND spike confirm.
+                            # Protects against major crashes mid-candle.
+                            # =========================================================
+                            EMERGENCY_SL_MARGIN_PCT = 1.5
+                            emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
+                            emergency_breached = False
+                            if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
+                                emergency_breached = True
+                            elif pos['side'] == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
+                                emergency_breached = True
+                            
+                            if emergency_breached:
+                                excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+                                reason = 'EMERGENCY_SL'
+                                logger.warning(f"🚨 EMERGENCY SL: {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}% | Candle close: ${candle_close_price:.6f}")
+                                global_paper_trader.close_position(pos, current_price, reason)
+                                continue
                             
                             now_ts = datetime.now().timestamp()
                             if sl_breached:
@@ -7576,6 +7610,21 @@ async def on_position_price_update(symbol: str, ticker: dict):
             sl_breached = True
         elif pos['side'] == 'SHORT' and candle_close_price >= trailing_stop:
             sl_breached = True
+        
+        # Phase 205b: EMERGENCY SL — tick price WAY past SL
+        EMERGENCY_SL_MARGIN_PCT = 1.5
+        emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
+        emergency_breached = False
+        if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
+            emergency_breached = True
+        elif pos['side'] == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
+            emergency_breached = True
+        
+        if emergency_breached:
+            excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+            logger.warning(f"🚨 EMERGENCY SL (WS): {symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}%")
+            global_paper_trader.close_position(pos, current_price, 'EMERGENCY_SL')
+            continue
         
         now_ts = datetime.now().timestamp()
         if sl_breached:
