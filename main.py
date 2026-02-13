@@ -3096,37 +3096,68 @@ async def binance_position_sync_loop():
                         engine_triggered = True
                         logger.info(f"📋 REASON MATCHED: {symbol} = {reason_data.get('reason')}")
                     else:
-                        # No pending reason - truly external close (manual from Binance)
+                        # No pending reason — infer from position data
                         exit_price = pos.get('markPrice', pos.get('entryPrice', 0))
                         pnl = pos.get('unrealizedPnl', 0)
                         pnl_percent = pos.get('unrealizedPnlPercent', 0)
+                        entry_price = pos.get('entryPrice', 0)
+                        side = pos.get('side', 'LONG')
+                        tp = pos.get('takeProfit', 0)
+                        sl = pos.get('stopLoss', 0)
+                        is_trailing = pos.get('isTrailingActive', False)
+                        leverage_val = pos.get('leverage', 10)
+                        margin_val = pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(leverage_val, 1))
+                        roi_val = (pnl / margin_val * 100) if margin_val > 0 else 0
+                        
+                        # Phase 203: Smart reason inference from position state
+                        inferred_reason = 'External Close (Binance)'
+                        if tp > 0 and entry_price > 0:
+                            if side == 'LONG' and exit_price >= tp * 0.998:
+                                inferred_reason = f"🟢 TP: Take Profit Tetiklendi ({roi_val:+.1f}%)"
+                            elif side == 'SHORT' and exit_price <= tp * 1.002:
+                                inferred_reason = f"🟢 TP: Take Profit Tetiklendi ({roi_val:+.1f}%)"
+                        if inferred_reason.startswith('External'):
+                            if is_trailing and pnl >= 0:
+                                inferred_reason = f"📈 TRAIL: Trailing Stop Tetiklendi ({roi_val:+.1f}%)"
+                            elif is_trailing and pnl < 0:
+                                inferred_reason = f"🔴 SL: Trailing Stop Tetiklendi ({roi_val:+.1f}%)"
+                            elif sl > 0:
+                                if side == 'LONG' and exit_price <= sl * 1.002:
+                                    inferred_reason = f"🔴 SL: Stop Loss Tetiklendi ({roi_val:+.1f}%)"
+                                elif side == 'SHORT' and exit_price >= sl * 0.998:
+                                    inferred_reason = f"🔴 SL: Stop Loss Tetiklendi ({roi_val:+.1f}%)"
+                        
+                        if inferred_reason != 'External Close (Binance)':
+                            logger.info(f"🔍 REASON INFERRED: {symbol} = {inferred_reason}")
+                        else:
+                            logger.info(f"🔗 EXTERNAL CLOSE: {symbol} — no engine reason, no inference match")
                         
                         trade = {
                             "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
                             "symbol": symbol,
-                            "side": pos.get('side', 'LONG'),
-                            "entryPrice": pos.get('entryPrice', 0),
+                            "side": side,
+                            "entryPrice": entry_price,
                             "exitPrice": exit_price,
                             "size": pos.get('size', 0),
                             "sizeUsd": pos.get('sizeUsd', 0),
                             "pnl": pnl,
                             "pnlPercent": pnl_percent,
-                            "margin": pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(pos.get('leverage', 10), 1)),
-                            "roi": (pnl / max(pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(pos.get('leverage', 10), 1)), 0.01)) * 100 if (pos.get('initialMargin', 0) > 0 or pos.get('sizeUsd', 0) > 0) else 0,
+                            "margin": margin_val,
+                            "roi": roi_val,
                             "openTime": pos.get('openTime', 0),
                             "closeTime": int(datetime.now().timestamp() * 1000),
-                            "reason": "External Close (Binance)",
-                            "leverage": pos.get('leverage', 10),
+                            "reason": inferred_reason,
+                            "leverage": leverage_val,
                             "isLive": True,
                             "signalScore": pos.get('signalScore', 0),
                             "mtfScore": pos.get('mtfScore', 0),
                             "zScore": pos.get('zScore', 0),
                             "spreadLevel": pos.get('spreadLevel', 'unknown'),
-                            "stopLoss": pos.get('stopLoss', 0),
-                            "takeProfit": pos.get('takeProfit', 0),
+                            "stopLoss": sl,
+                            "takeProfit": tp,
                             "trailActivation": pos.get('trailActivation', 0),
                             "trailingStop": pos.get('trailingStop', 0),
-                            "isTrailingActive": pos.get('isTrailingActive', False),
+                            "isTrailingActive": is_trailing,
                             "atr": pos.get('atr', 0),
                         }
                     
@@ -15558,6 +15589,7 @@ class PaperTradingEngine:
             
             # Trailing Stop
             'TRAIL': f"📈 TRAIL: Trailing Stop ({pnl_percent:+.1f}%, peak'ten çekilme)",
+            'TRAIL_EXIT': f"📈 TRAIL: Trailing Stop Çıkışı ({pnl_percent:+.1f}%)",
             'TRAILING_STOP': f"📈 TRAIL: Trailing Stop Tetiklendi ({pnl_percent:+.1f}%)",
             
             # Kill Switch
