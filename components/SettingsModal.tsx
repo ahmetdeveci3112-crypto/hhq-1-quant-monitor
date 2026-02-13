@@ -53,9 +53,10 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     const t = localSettings.entryTightness;
     if (t <= 0.7) return { label: 'Dar', color: 'text-emerald-400', desc: 'Küçük pullback, hızlı giriş (×0.71-0.84)' };
     if (t <= 1.2) return { label: 'Normal', color: 'text-blue-400', desc: 'Standart pullback beklentisi (×1.0)' };
-    if (t <= 2.0) return { label: 'Geniş', color: 'text-amber-400', desc: 'Daha derin pullback, seçici giriş (×1.3-1.4)' };
-    if (t <= 3.0) return { label: 'Çok Geniş', color: 'text-orange-400', desc: 'Derin pullback, konservatif (×1.4-1.7)' };
-    return { label: 'Maksimum', color: 'text-rose-400', desc: 'En derin pullback, sadece güçlü fırsatlar (×1.7-2.0)' };
+    if (t <= 2.5) return { label: 'Geniş', color: 'text-amber-400', desc: 'Daha derin pullback, seçici giriş (×1.3-1.6)' };
+    if (t <= 5.0) return { label: 'Çok Geniş', color: 'text-orange-400', desc: 'Derin pullback, konservatif (×1.7-2.2)' };
+    if (t <= 10.0) return { label: 'Ekstrem', color: 'text-rose-400', desc: 'Çok derin pullback, sadece güçlü fırsatlar (×2.2-3.2)' };
+    return { label: 'Maksimum', color: 'text-fuchsia-400', desc: 'En derin pullback, ultra konservatif (×3.2-3.9)' };
   };
 
   // Exit tightness level helper
@@ -64,9 +65,10 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     if (t <= 0.5) return { label: 'Çok Hızlı', color: 'text-rose-400', desc: 'Erken çıkış, küçük SL/TP (×0.55-0.71)' };
     if (t <= 0.9) return { label: 'Hızlı', color: 'text-orange-400', desc: 'Sıkı SL/TP aralığı (×0.71-0.95)' };
     if (t <= 1.5) return { label: 'Normal', color: 'text-emerald-400', desc: 'Standart SL/TP (×1.0-1.2)' };
-    if (t <= 2.5) return { label: 'Sabırlı', color: 'text-blue-400', desc: 'Geniş SL/TP, daha uzun tutma (×1.2-1.6)' };
-    if (t <= 3.5) return { label: 'Çok Sabırlı', color: 'text-indigo-400', desc: 'Geniş alan, trend takibi (×1.6-1.9)' };
-    return { label: 'Maksimum', color: 'text-fuchsia-400', desc: 'En geniş SL/TP, uzun vade (×1.9-2.0)' };
+    if (t <= 3.0) return { label: 'Sabrılı', color: 'text-blue-400', desc: 'Geniş SL/TP, daha uzun tutma (×1.2-1.7)' };
+    if (t <= 6.0) return { label: 'Çok Sabrılı', color: 'text-indigo-400', desc: 'Geniş alan, trend takibi (×1.7-2.4)' };
+    if (t <= 10.0) return { label: 'Ekstrem', color: 'text-purple-400', desc: 'Çok geniş SL/TP, uzun vade (×2.4-3.2)' };
+    return { label: 'Maksimum', color: 'text-fuchsia-400', desc: 'En geniş SL/TP, ultra uzun vade (×3.2-3.9)' };
   };
 
   const sensitivity = getSensitivityLevel();
@@ -238,7 +240,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.5"
-                max="4.0"
+                max="15.0"
                 step="0.1"
                 value={localSettings.entryTightness}
                 onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
@@ -246,7 +248,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.5x (Dar = Hızlı Giriş)</span>
-                <span>4.0x (Geniş = Seçici Giriş)</span>
+                <span>15.0x (Geniş = Seçici Giriş)</span>
               </div>
             </div>
           </div>
@@ -275,7 +277,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.3"
-                max="4.0"
+                max="15.0"
                 step="0.1"
                 value={localSettings.exitTightness}
                 onChange={e => setLocalSettings({ ...localSettings, exitTightness: parseFloat(e.target.value) })}
@@ -283,7 +285,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.3x (Hızlı Çıkış = Sıkı SL/TP)</span>
-                <span>4.0x (Sabırlı = Geniş SL/TP)</span>
+                <span>15.0x (Sabrılı = Geniş SL/TP)</span>
               </div>
             </div>
           </div>

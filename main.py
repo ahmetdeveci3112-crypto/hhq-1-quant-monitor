@@ -1410,6 +1410,18 @@ class LiveBinanceTrader:
                     entry_price = float(p.get('entryPrice') or 0)
                     mark_price = float(p.get('markPrice') or 0)
                     
+                    # Phase 204: Use currentPrice from engine position (scanner/WS close price)
+                    # instead of markPrice for exit decisions — markPrice can spike with wicks
+                    engine_pos = None
+                    if global_paper_trader:
+                        for ep in global_paper_trader.positions:
+                            if ep.get('symbol') == symbol:
+                                engine_pos = ep
+                                break
+                    current_price = float(engine_pos.get('currentPrice', 0)) if engine_pos else 0
+                    if current_price <= 0:
+                        current_price = mark_price  # Fallback to markPrice if no engine price
+                    
                     # ================================================================
                     # Phase 145: Calculate dynamic TP/SL/Trail for live positions
                     # ================================================================
@@ -1450,7 +1462,7 @@ class LiveBinanceTrader:
                         self.trailing_state[symbol] = {
                             'isActive': False,
                             'trailingStop': sl,
-                            'peakPrice': mark_price,
+                            'peakPrice': current_price,
                             'activatedAt': None
                         }
                     
@@ -1462,7 +1474,7 @@ class LiveBinanceTrader:
                     if not trail_state['isActive'] and roi_pct >= activation_threshold:
                         trail_state['isActive'] = True
                         trail_state['activatedAt'] = datetime.now().isoformat()
-                        trail_state['peakPrice'] = mark_price
+                        trail_state['peakPrice'] = current_price
                         logger.info(f"🔄 TRAIL ACTIVATED: {symbol} ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     
                     is_trailing_active = trail_state['isActive']
@@ -1471,8 +1483,8 @@ class LiveBinanceTrader:
                     if is_trailing_active:
                         if side == 'LONG':
                             # Track peak price and adjust trailing stop
-                            if mark_price > trail_state['peakPrice']:
-                                trail_state['peakPrice'] = mark_price
+                            if current_price > trail_state['peakPrice']:
+                                trail_state['peakPrice'] = current_price
                             trailing_stop = trail_state['peakPrice'] - trail_distance
                             # Keep the highest trailing stop
                             if trailing_stop > trail_state['trailingStop']:
@@ -1480,8 +1492,8 @@ class LiveBinanceTrader:
                                 logger.debug(f"  📈 {symbol} LONG trailing stop raised to ${trailing_stop:.6f}")
                         else:  # SHORT
                             # Track lowest price (peak for short) and adjust trailing stop
-                            if mark_price < trail_state['peakPrice']:
-                                trail_state['peakPrice'] = mark_price
+                            if current_price < trail_state['peakPrice']:
+                                trail_state['peakPrice'] = current_price
                             trailing_stop = trail_state['peakPrice'] + trail_distance
                             # Keep the lowest trailing stop for shorts
                             if trailing_stop < trail_state['trailingStop'] or trail_state['trailingStop'] == sl:
@@ -1498,14 +1510,14 @@ class LiveBinanceTrader:
                         
                         if side == 'LONG':
                             # LONG: price drops below trailing stop
-                            if mark_price <= trailing_stop:
+                            if current_price <= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: mark ${mark_price:.6f} <= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: price ${current_price:.6f} <= trail ${trailing_stop:.6f}"
                         else:  # SHORT
                             # SHORT: price rises above trailing stop
-                            if mark_price >= trailing_stop:
+                            if current_price >= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: mark ${mark_price:.6f} >= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: price ${current_price:.6f} >= trail ${trailing_stop:.6f}"
                         
                         if should_close:
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
@@ -2766,7 +2778,7 @@ async def binance_position_sync_loop():
                         
                         for pos in positions_to_close:
                             try:
-                                current_price = pos.get('markPrice', pos.get('entryPrice', 0))
+                                current_price = pos.get('currentPrice', pos.get('markPrice', pos.get('entryPrice', 0)))
                                 pnl_before = pos.get('unrealizedPnl', 0)
                                 global_paper_trader.close_position(pos, current_price, "RECOVERY_CLOSE_ALL")
                                 closed_count += 1
@@ -2994,6 +3006,8 @@ async def binance_position_sync_loop():
                                 logger.debug(f"📊 Sync update: {symbol} SL={pos.get('stopLoss', 'NONE')} TP={pos.get('takeProfit', 'NONE')} Trail={pos.get('isTrailingActive', 'NONE')}")
                                 
                                 mark_price = bp.get('markPrice', pos.get('markPrice', 0))
+                                # Phase 204: Prefer currentPrice (close/last price) over markPrice
+                                current_price_sync = pos.get('currentPrice', mark_price)
                                 entry_price = pos.get('entryPrice', 0)
                                 
                                 # Phase 154: Initialize ALL exit params if missing
@@ -3050,19 +3064,19 @@ async def binance_position_sync_loop():
                                     pos['trailingStop'] = pos.get('stopLoss', 0)
                                 
                                 # Phase 154: Force trail activation for profitable positions
-                                if mark_price > 0 and entry_price > 0:
-                                    if pos['side'] == 'LONG' and mark_price > entry_price:
+                                if current_price_sync > 0 and entry_price > 0:
+                                    if pos['side'] == 'LONG' and current_price_sync > entry_price:
                                         # Profitable LONG - ALWAYS activate trail
                                         pos['trailActivation'] = entry_price  # Set at entry
                                         if not pos.get('isTrailingActive', False):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} LONG +{((mark_price/entry_price)-1)*100:.1f}% - trail activated!")
-                                    elif pos['side'] == 'SHORT' and mark_price < entry_price:
+                                            logger.info(f"📊 Trail fix: {symbol} LONG +{((current_price_sync/entry_price)-1)*100:.1f}% - trail activated!")
+                                    elif pos['side'] == 'SHORT' and current_price_sync < entry_price:
                                         # Profitable SHORT - ALWAYS activate trail
                                         pos['trailActivation'] = entry_price  # Set at entry
                                         if not pos.get('isTrailingActive', False):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} SHORT +{((entry_price/mark_price)-1)*100:.1f}% - trail activated!")
+                                            logger.info(f"📊 Trail fix: {symbol} SHORT +{((entry_price/current_price_sync)-1)*100:.1f}% - trail activated!")
                                 break
                 
                 # ================================================================
@@ -6679,17 +6693,18 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['atr'] = paper_pos.get('atr', 0)
                         
                         # Phase 156: isTrailingActive must be based on CURRENT profitability from Binance
-                        mark_price = bp.get('markPrice', 0)
+                        # Phase 204: Use currentPrice (close/last) instead of markPrice (can spike with wicks)
+                        close_price = bp.get('currentPrice', bp.get('markPrice', 0))
                         entry_price = bp.get('entryPrice', 0)
                         side = bp.get('side', 'LONG')
                         
-                        if mark_price > 0 and entry_price > 0:
+                        if close_price > 0 and entry_price > 0:
                             if side == 'LONG':
-                                # Trail active only if currently profitable (mark > entry)
-                                merged['isTrailingActive'] = mark_price > entry_price
+                                # Trail active only if currently profitable (price > entry)
+                                merged['isTrailingActive'] = close_price > entry_price
                             else:
-                                # SHORT: Trail active only if mark < entry
-                                merged['isTrailingActive'] = mark_price < entry_price
+                                # SHORT: Trail active only if price < entry
+                                merged['isTrailingActive'] = close_price < entry_price
                         else:
                             merged['isTrailingActive'] = False
                     else:
@@ -10729,7 +10744,7 @@ class BreakevenStopManager:
                     
                 side = pos.get('side', '')
                 entry_price = float(pos.get('entryPrice', 0))
-                current_price = float(pos.get('markPrice', pos.get('currentPrice', 0)))
+                current_price = float(pos.get('currentPrice', pos.get('markPrice', 0)))
                 contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
                 spread_level = pos.get('spread_level', 'Normal')
                 
@@ -11011,7 +11026,7 @@ class LossRecoveryTrailManager:
                     
                 side = pos.get('side', '')
                 entry_price = float(pos.get('entryPrice', 0))
-                current_price = float(pos.get('markPrice', pos.get('currentPrice', 0)))
+                current_price = float(pos.get('currentPrice', pos.get('markPrice', 0)))
                 contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
                 spread_level = pos.get('spread_level', 'Normal')
                 
@@ -13727,8 +13742,8 @@ class PaperTradingEngine:
         self.min_score_high = 90  # Maximum possible score (defensive mode)
         self.min_confidence_score = 68  # Current effective min score (dynamically calculated)
         # Phase 36: Entry/Exit tightness settings
-        self.entry_tightness = 1.8  # 0.5-2.0: Pullback multiplier (Gevşek/Loose mode)
-        self.exit_tightness = 1.2   # 0.5-2.0: SL/TP multiplier
+        self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
+        self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
         # Phase 200: Counter-signal adaptive exit tightness cache TTL
         self.counter_signal_ttl = 900  # 15 minutes
         # Phase 19: Server-side persistent logs

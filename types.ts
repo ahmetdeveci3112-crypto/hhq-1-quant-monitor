@@ -160,8 +160,8 @@ export interface SystemSettings {
   minScoreLow?: number;         // Min score when winning (aggressive: 30-60)
   minScoreHigh?: number;        // Min score when losing (defensive: 60-95)
   // Entry/Exit control settings
-  entryTightness: number;       // 0.5-2.0: Pullback multiplier (lower = tighter entry, higher = looser)
-  exitTightness: number;        // 0.5-2.0: SL/TP multiplier (lower = quick exit, higher = hold longer)
+  entryTightness: number;       // 0.5-15.0: Pullback multiplier (lower = tighter entry, higher = looser)
+  exitTightness: number;        // 0.5-15.0: SL/TP multiplier (lower = quick exit, higher = hold longer)
   // Kill Switch settings
   killSwitchFirstReduction: number;  // -5 to -30: First reduction threshold (default -15)
   killSwitchFullClose: number;       // -10 to -50: Full close threshold (default -20)
