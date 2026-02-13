@@ -1524,7 +1524,7 @@ class LiveBinanceTrader:
                         
                         # Phase 205b: EMERGENCY SL — tick price WAY past trail stop
                         if not should_close:
-                            EMERGENCY_SL_MARGIN_PCT = 1.5
+                            EMERGENCY_SL_MARGIN_PCT = 2.5
                             emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
                             if side == 'LONG' and current_price <= (trailing_stop - emergency_margin):
                                 should_close = True
@@ -7189,7 +7189,7 @@ async def background_scanner_loop():
                             # immediately. Bypasses both candle close AND spike confirm.
                             # Protects against major crashes mid-candle.
                             # =========================================================
-                            EMERGENCY_SL_MARGIN_PCT = 1.5
+                            EMERGENCY_SL_MARGIN_PCT = 2.5
                             emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
                             emergency_breached = False
                             if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
@@ -7612,7 +7612,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             sl_breached = True
         
         # Phase 205b: EMERGENCY SL — tick price WAY past SL
-        EMERGENCY_SL_MARGIN_PCT = 1.5
+        EMERGENCY_SL_MARGIN_PCT = 2.5
         emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
         emergency_breached = False
         if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
