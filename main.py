@@ -1466,6 +1466,9 @@ class LiveBinanceTrader:
                             'activatedAt': None
                         }
                     
+                    # Phase 205: Use candle close price for trail decisions
+                    candle_close_price = last_candle_close.get(symbol, current_price)
+                    
                     trail_state = self.trailing_state[symbol]
                     roi_pct = pnl_percent
                     activation_threshold = 3.0 * exit_tightness  # Phase 144: ROI-based
@@ -1482,18 +1485,18 @@ class LiveBinanceTrader:
                     # Update trailing stop if active
                     if is_trailing_active:
                         if side == 'LONG':
-                            # Track peak price and adjust trailing stop
-                            if current_price > trail_state['peakPrice']:
-                                trail_state['peakPrice'] = current_price
+                            # Track peak price using candle close (Phase 205)
+                            if candle_close_price > trail_state['peakPrice']:
+                                trail_state['peakPrice'] = candle_close_price
                             trailing_stop = trail_state['peakPrice'] - trail_distance
                             # Keep the highest trailing stop
                             if trailing_stop > trail_state['trailingStop']:
                                 trail_state['trailingStop'] = trailing_stop
                                 logger.debug(f"  📈 {symbol} LONG trailing stop raised to ${trailing_stop:.6f}")
                         else:  # SHORT
-                            # Track lowest price (peak for short) and adjust trailing stop
-                            if current_price < trail_state['peakPrice']:
-                                trail_state['peakPrice'] = current_price
+                            # Track lowest price using candle close (Phase 205)
+                            if candle_close_price < trail_state['peakPrice']:
+                                trail_state['peakPrice'] = candle_close_price
                             trailing_stop = trail_state['peakPrice'] + trail_distance
                             # Keep the lowest trailing stop for shorts
                             if trailing_stop < trail_state['trailingStop'] or trail_state['trailingStop'] == sl:
@@ -1509,15 +1512,15 @@ class LiveBinanceTrader:
                         close_reason = ""
                         
                         if side == 'LONG':
-                            # LONG: price drops below trailing stop
-                            if current_price <= trailing_stop:
+                            # LONG: candle close drops below trailing stop
+                            if candle_close_price <= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: price ${current_price:.6f} <= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} <= trail ${trailing_stop:.6f}"
                         else:  # SHORT
-                            # SHORT: price rises above trailing stop
-                            if current_price >= trailing_stop:
+                            # SHORT: candle close rises above trailing stop
+                            if candle_close_price >= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: price ${current_price:.6f} >= trail ${trailing_stop:.6f}"
+                                close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} >= trail ${trailing_stop:.6f}"
                         
                         if should_close:
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
@@ -5051,6 +5054,8 @@ class LightweightCoinAnalyzer:
             self.opportunity.price = self.prices[-1]
             self.opportunity.last_update = datetime.now().timestamp()
             self.is_preloaded = True
+            # Phase 205: Set initial candle close from preloaded data
+            last_candle_close[self.symbol] = self.prices[-1]
             
             # Preload VWAP from historical data
             self.vwap_numerator = 0.0
@@ -5104,6 +5109,9 @@ class LightweightCoinAnalyzer:
             self.highs.append(self._tick_high)
             self.lows.append(self._tick_low)
             self.volumes.append(self._tick_volume)
+            
+            # Phase 205: Update global candle close price for exit decisions
+            last_candle_close[self.symbol] = price
             
             # Update VWAP with proper candle data (Typical Price = (H+L+C)/3)
             typical_price = (self._tick_high + self._tick_low + price) / 3
@@ -7084,6 +7092,11 @@ async def background_scanner_loop():
                             # Phase 190: Skip if limit close is pending (breakeven or TP)
                             if pos.get('pending_limit_close'):
                                 continue
+                            
+                            # Phase 205: Use candle close price for exit DECISIONS (SL/TP/trail)
+                            # Prevents false triggers from intra-candle wicks/spikes
+                            candle_close_price = last_candle_close.get(pos_symbol, current_price)
+                            
                             sl = pos.get('stopLoss', 0)
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
@@ -7094,9 +7107,9 @@ async def background_scanner_loop():
                             # =========================================================
                             if pos.get('trend_mode', False) and entry_price > 0:
                                 if pos['side'] == 'LONG':
-                                    current_roi = (current_price - entry_price) / entry_price * 100
+                                    current_roi = (candle_close_price - entry_price) / entry_price * 100
                                 else:
-                                    current_roi = (entry_price - current_price) / entry_price * 100
+                                    current_roi = (entry_price - candle_close_price) / entry_price * 100
                                 
                                 stepped_sl = None
                                 if current_roi >= 10:
@@ -7152,9 +7165,9 @@ async def background_scanner_loop():
                             
                             # Check if price is in SL zone
                             sl_breached = False
-                            if pos['side'] == 'LONG' and current_price <= trailing_stop:
+                            if pos['side'] == 'LONG' and candle_close_price <= trailing_stop:
                                 sl_breached = True
-                            elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+                            elif pos['side'] == 'SHORT' and candle_close_price >= trailing_stop:
                                 sl_breached = True
                             
                             now_ts = datetime.now().timestamp()
@@ -7219,9 +7232,9 @@ async def background_scanner_loop():
                             # Market fallback after 60 seconds.
                             # =========================================================
                             tp_hit = False
-                            if pos['side'] == 'LONG' and current_price >= tp:
+                            if pos['side'] == 'LONG' and candle_close_price >= tp:
                                 tp_hit = True
-                            elif pos['side'] == 'SHORT' and current_price <= tp:
+                            elif pos['side'] == 'SHORT' and candle_close_price <= tp:
                                 tp_hit = True
                             
                             if tp_hit and not pos.get('pending_limit_close'):
@@ -7300,16 +7313,16 @@ async def background_scanner_loop():
                             
                             if pos['side'] == 'LONG':
                                 # Phase 153: For LONG, activate trail when price > entry (profitable)
-                                # or when price > trail_activation (whichever comes first)
-                                if current_price > entry_price or current_price > trail_activation:
-                                    new_trailing = current_price - dynamic_trail_distance
+                                # Phase 205: Use candle close for trail activation decision
+                                if candle_close_price > entry_price or candle_close_price > trail_activation:
+                                    new_trailing = candle_close_price - dynamic_trail_distance
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT':
                                 # Phase 153: For SHORT, activate trail when price < entry (profitable)
-                                if current_price < entry_price or current_price < trail_activation:
-                                    new_trailing = current_price + dynamic_trail_distance
+                                if candle_close_price < entry_price or candle_close_price < trail_activation:
+                                    new_trailing = candle_close_price + dynamic_trail_distance
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
@@ -7501,6 +7514,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
             continue
         
         # ---- SL/TP Kontrolü (Spike Bypass ile) ----
+        # Phase 205: Use candle close price for exit DECISIONS
+        candle_close_price = last_candle_close.get(symbol, current_price)
+        
         sl = pos.get('stopLoss', 0)
         tp = pos.get('takeProfit', 0)
         trailing_stop = pos.get('trailingStop', sl)
@@ -7510,9 +7526,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
         # =========================================================
         if pos.get('trend_mode', False) and entry_price > 0:
             if pos['side'] == 'LONG':
-                current_roi = (current_price - entry_price) / entry_price * 100
+                current_roi = (candle_close_price - entry_price) / entry_price * 100
             else:
-                current_roi = (entry_price - current_price) / entry_price * 100
+                current_roi = (entry_price - candle_close_price) / entry_price * 100
             
             stepped_sl = None
             if current_roi >= 10:
@@ -7556,9 +7572,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
             pos['slBreachStartTime'] = 0
         
         sl_breached = False
-        if pos['side'] == 'LONG' and current_price <= trailing_stop:
+        if pos['side'] == 'LONG' and candle_close_price <= trailing_stop:
             sl_breached = True
-        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
+        elif pos['side'] == 'SHORT' and candle_close_price >= trailing_stop:
             sl_breached = True
         
         now_ts = datetime.now().timestamp()
@@ -7580,13 +7596,14 @@ async def on_position_price_update(symbol: str, ticker: dict):
             pos['slBreachStartTime'] = 0
         
         # TP Hit Check (anında — kar için onay gerekmez)
-        if pos['side'] == 'LONG' and current_price >= tp:
+        # Phase 205: Use candle close for TP decision
+        if pos['side'] == 'LONG' and candle_close_price >= tp:
             global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-            logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${current_price:.6f}")
+            logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
             continue
-        elif pos['side'] == 'SHORT' and current_price <= tp:
+        elif pos['side'] == 'SHORT' and candle_close_price <= tp:
             global_paper_trader.close_position(pos, current_price, 'TP_HIT')
-            logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f}")
+            logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
             continue
         
         # ---- Trailing Stop Güncelle ----
@@ -7611,13 +7628,14 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         dynamic_trail_distance = trail_distance * volatility_mult
         
-        if pos['side'] == 'LONG' and current_price > trail_activation:
-            new_trailing = current_price - dynamic_trail_distance
+        # Phase 205: Use candle close for trail activation & ratchet
+        if pos['side'] == 'LONG' and candle_close_price > trail_activation:
+            new_trailing = candle_close_price - dynamic_trail_distance
             if new_trailing > trailing_stop:
                 pos['trailingStop'] = new_trailing
                 pos['isTrailingActive'] = True
-        elif pos['side'] == 'SHORT' and current_price < trail_activation:
-            new_trailing = current_price + dynamic_trail_distance
+        elif pos['side'] == 'SHORT' and candle_close_price < trail_activation:
+            new_trailing = candle_close_price + dynamic_trail_distance
             if new_trailing < trailing_stop:
                 pos['trailingStop'] = new_trailing
                 pos['isTrailingActive'] = True
@@ -16632,6 +16650,11 @@ global_paper_trader = PaperTradingEngine()
 # When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
 # Binance sync will use this to set proper reason when detecting closed position
 pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timestamp": int}}
+
+# Phase 205: Last closed candle's close price per symbol
+# Updated by scanner candle builder (5m) — used for exit decisions instead of tick price
+# This prevents false exits caused by intra-candle wicks/spikes
+last_candle_close = {}  # {symbol: float}
 
 @app.get("/paper-trading/status")
 async def paper_trading_status():
