@@ -364,6 +364,21 @@ class SQLiteManager:
                     await db.execute(f'ALTER TABLE position_closes ADD COLUMN {col_name} {col_type}')
                 except:
                     pass
+            
+            # Phase 211: OBI depth filter columns
+            obi_migration_columns = [
+                ('obi_value', 'REAL DEFAULT 0'),  # signals table
+            ]
+            for col_name, col_type in obi_migration_columns:
+                try:
+                    await db.execute(f'ALTER TABLE signals ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+            # OBI value for trades table (saved in settings_snapshot JSON, but also as direct column)
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN obi_value REAL DEFAULT 0')
+            except:
+                pass
             await db.commit()
             
             self._initialized = True
@@ -597,8 +612,8 @@ class SQLiteManager:
                     symbol, action, price, zscore, hurst, atr, signal_score,
                     htf_trend, mtf_confirmed, mtf_reason, blacklisted, accepted,
                     reject_reason, z_threshold, min_confidence, entry_tightness,
-                    exit_tightness, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_tightness, timestamp, obi_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 signal_data.get('symbol'),
                 signal_data.get('action'),
@@ -617,7 +632,8 @@ class SQLiteManager:
                 signal_data.get('min_confidence', 0),
                 signal_data.get('entry_tightness', 1.0),
                 signal_data.get('exit_tightness', 1.0),
-                signal_data.get('timestamp', int(datetime.now().timestamp() * 1000))
+                signal_data.get('timestamp', int(datetime.now().timestamp() * 1000)),
+                signal_data.get('obi_value', 0),  # Phase 211: OBI depth value
             ))
             await db.commit()
     
@@ -1508,6 +1524,46 @@ class LiveBinanceTrader:
                         # ================================================================
                         # Phase 147: Check if trailing stop is HIT and close position
                         # ================================================================
+                        # Phase 212: Emergency SL runs BEFORE Flash Trade Guard
+                        # Flash crash koruması ilk 60 saniyede de aktif olmalı
+                        EMERGENCY_SL_MARGIN_PCT_PRE = 1.0  # Phase 212: 2.5→1.0 (10x'le %10 margin kaybı)
+                        emergency_margin_pre = entry_price * (EMERGENCY_SL_MARGIN_PCT_PRE / 100)
+                        if side == 'LONG' and current_price <= (trailing_stop - emergency_margin_pre):
+                            excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+                            close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
+                            logger.warning(f"🚨 EMERGENCY SL (pre-guard): {symbol} {side} | {close_reason}")
+                            should_close = True
+                        elif side == 'SHORT' and current_price >= (trailing_stop + emergency_margin_pre):
+                            excess_pct = abs(current_price - trailing_stop) / entry_price * 100
+                            close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
+                            logger.warning(f"🚨 EMERGENCY SL (pre-guard): {symbol} {side} | {close_reason}")
+                            should_close = True
+                        else:
+                            should_close = False
+                            close_reason = ""
+                        
+                        if should_close:
+                            # Emergency — skip Flash Trade Guard, close immediately
+                            logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
+                            if not hasattr(self, 'pending_closes'):
+                                self.pending_closes = []
+                            self.pending_closes.append({
+                                'symbol': symbol,
+                                'side': side,
+                                'reason': close_reason,
+                                'contracts': position_amount,
+                                'pnl_percent': pnl_percent,
+                            })
+                            continue
+                        
+                        # Phase 210: Flash Trade Guard — minimum 60s hold time
+                        MIN_HOLD_SECONDS = 60
+                        open_time_ms = pos.get('openTime', 0) if pos else trail_state.get('openTime', 0)
+                        if open_time_ms > 0:
+                            hold_duration = datetime.now().timestamp() - (open_time_ms / 1000)
+                            if hold_duration < MIN_HOLD_SECONDS:
+                                continue  # Skip trail exit check — too early
+                        
                         should_close = False
                         close_reason = ""
                         
@@ -1522,19 +1578,8 @@ class LiveBinanceTrader:
                                 should_close = True
                                 close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} >= trail ${trailing_stop:.6f}"
                         
-                        # Phase 205b: EMERGENCY SL — tick price WAY past trail stop
-                        if not should_close:
-                            EMERGENCY_SL_MARGIN_PCT = 2.5
-                            emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
-                            if side == 'LONG' and current_price <= (trailing_stop - emergency_margin):
-                                should_close = True
-                                excess_pct = abs(current_price - trailing_stop) / entry_price * 100
-                                close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
-                            elif side == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
-                                should_close = True
-                                excess_pct = abs(current_price - trailing_stop) / entry_price * 100
-                                close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
-                        
+                        # Phase 212: Duplicate Emergency SL removed — pre-guard version handles this
+                        # (See L1527-1557 above)
                         if should_close:
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
                             logger.warning(f"   📊 ROI: {pnl_percent:.1f}% | PnL: ${unrealized_pnl:.2f}")
@@ -2932,13 +2977,16 @@ async def binance_position_sync_loop():
                         # Calculate default exit parameters
                         # IMPORTANT: If position is already profitable, set TP beyond CURRENT price
                         # to avoid instant TP trigger on sync
+                        # Phase 210: Minimum trail activation distance = 0.5 ATR
+                        min_trail_distance = atr * 0.5
+                        
                         if bp['side'] == 'LONG':
                             # For LONG: if mark > entry, position is profitable
                             if mark_price > entry_price:
                                 # TP beyond current price, SL at breakeven or below entry
                                 stop_loss = entry_price  # Breakeven
                                 take_profit = mark_price + (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = entry_price  # Phase 150: Start trail at entry for profitable positions
+                                trail_activation = entry_price + min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
                                 stop_loss = entry_price - (atr * global_paper_trader.sl_atr / 10)
                                 take_profit = entry_price + (atr * global_paper_trader.tp_atr / 10)
@@ -2949,7 +2997,7 @@ async def binance_position_sync_loop():
                                 # TP beyond current price, SL at breakeven or above entry
                                 stop_loss = entry_price  # Breakeven
                                 take_profit = mark_price - (atr * global_paper_trader.tp_atr / 10)
-                                trail_activation = entry_price  # Phase 150: Start trail at entry for profitable positions
+                                trail_activation = entry_price - min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
                                 stop_loss = entry_price + (atr * global_paper_trader.sl_atr / 10)
                                 take_profit = entry_price - (atr * global_paper_trader.tp_atr / 10)
@@ -2973,7 +3021,7 @@ async def binance_position_sync_loop():
                             'trailActivation': trail_activation,
                             'trailDistance': atr * trail_distance_atr,  # Phase 151: Dynamic trail distance
                             'trailingStop': stop_loss,
-                            'isTrailingActive': (bp['side'] == 'LONG' and mark_price > entry_price) or (bp['side'] == 'SHORT' and mark_price < entry_price),  # Phase 150: Auto-activate for profitable
+                            'isTrailingActive': False,  # Phase 213: Don't auto-activate — wait for ROI >= 1.5%
                             'slConfirmCount': 0,
                             'atr': atr,
                             'volatilityPct': volatility_pct,  # Phase 151: Store for reference
@@ -3079,20 +3127,24 @@ async def binance_position_sync_loop():
                                 if not pos.get('trailingStop'):
                                     pos['trailingStop'] = pos.get('stopLoss', 0)
                                 
-                                # Phase 154: Force trail activation for profitable positions
+                                # Phase 213: Trail activation requires minimum ROI of 1.5%
+                                # (replaces Phase 154/210 forced activation)
                                 if current_price_sync > 0 and entry_price > 0:
-                                    if pos['side'] == 'LONG' and current_price_sync > entry_price:
-                                        # Profitable LONG - ALWAYS activate trail
-                                        pos['trailActivation'] = entry_price  # Set at entry
-                                        if not pos.get('isTrailingActive', False):
+                                    sync_leverage = pos.get('leverage', 10)
+                                    
+                                    if pos['side'] == 'LONG':
+                                        sync_price_move = ((current_price_sync - entry_price) / entry_price) * 100
+                                    else:
+                                        sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
+                                    sync_roi = sync_price_move * sync_leverage
+                                    
+                                    if sync_roi >= 1.5 and not pos.get('isTrailingActive', False):
+                                        if pos['side'] == 'LONG' and current_price_sync > pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} LONG +{((current_price_sync/entry_price)-1)*100:.1f}% - trail activated!")
-                                    elif pos['side'] == 'SHORT' and current_price_sync < entry_price:
-                                        # Profitable SHORT - ALWAYS activate trail
-                                        pos['trailActivation'] = entry_price  # Set at entry
-                                        if not pos.get('isTrailingActive', False):
+                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG ROI={sync_roi:.1f}% >= 1.5%")
+                                        elif pos['side'] == 'SHORT' and current_price_sync < pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail fix: {symbol} SHORT +{((entry_price/current_price_sync)-1)*100:.1f}% - trail activated!")
+                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT ROI={sync_roi:.1f}% >= 1.5%")
                                 break
                 
                 # ================================================================
@@ -3139,13 +3191,17 @@ async def binance_position_sync_loop():
                         margin_val = pos.get('initialMargin', 0) or (pos.get('sizeUsd', 0) / max(leverage_val, 1))
                         roi_val = (pnl / margin_val * 100) if margin_val > 0 else 0
                         
-                        # Phase 203: Smart reason inference from position state
+                        # Phase 203 + Phase 210: Smart reason inference from position state
                         inferred_reason = 'External Close (Binance)'
+                        
+                        # Step 1: Try TP/SL price match
                         if tp > 0 and entry_price > 0:
                             if side == 'LONG' and exit_price >= tp * 0.998:
                                 inferred_reason = f"🟢 TP: Take Profit Tetiklendi ({roi_val:+.1f}%)"
                             elif side == 'SHORT' and exit_price <= tp * 1.002:
                                 inferred_reason = f"🟢 TP: Take Profit Tetiklendi ({roi_val:+.1f}%)"
+                        
+                        # Step 2: Try trailing stop inference
                         if inferred_reason.startswith('External'):
                             if is_trailing and pnl >= 0:
                                 inferred_reason = f"📈 TRAIL: Trailing Stop Tetiklendi ({roi_val:+.1f}%)"
@@ -3157,7 +3213,20 @@ async def binance_position_sync_loop():
                                 elif side == 'SHORT' and exit_price >= sl * 0.998:
                                     inferred_reason = f"🔴 SL: Stop Loss Tetiklendi ({roi_val:+.1f}%)"
                         
-                        if inferred_reason != 'External Close (Binance)':
+                        # Step 3: Phase 210 — PnL-based fallback inference
+                        if inferred_reason.startswith('External'):
+                            if roi_val >= 10:
+                                inferred_reason = f"🟢 TP_INFERRED: Karlı Çıkış ({roi_val:+.1f}%)"
+                            elif roi_val <= -5:
+                                inferred_reason = f"🔴 SL_INFERRED: Zararlı Çıkış ({roi_val:+.1f}%)"
+                            elif abs(roi_val) <= 2:
+                                inferred_reason = f"📊 BREAKEVEN_INFERRED: Başabaş ({roi_val:+.1f}%)"
+                            else:
+                                inferred_reason = f"📋 CLOSE_INFERRED: Pozisyon Kapandı ({roi_val:+.1f}%)"
+                        
+                        if 'INFERRED' in inferred_reason:
+                            logger.info(f"🔍 REASON INFERRED (Phase 210): {symbol} = {inferred_reason}")
+                        elif inferred_reason != 'External Close (Binance)':
                             logger.info(f"🔍 REASON INFERRED: {symbol} = {inferred_reason}")
                         else:
                             logger.info(f"🔗 EXTERNAL CLOSE: {symbol} — no engine reason, no inference match")
@@ -4025,10 +4094,11 @@ def get_dynamic_trail_params(
     # 2. HURST ADJUSTMENT
     # Trending (>0.5) → wider trails to capture bigger moves
     # Mean-reverting (<0.5) → tighter trails, exit quickly
+    # Phase 213: Trending coins get significantly wider trails (min 2x)
     if hurst >= 0.65:
-        hurst_mult = 1.4   # Strong trend → let it run
+        hurst_mult = 2.0   # Strong trend → let it run (was 1.4)
     elif hurst >= 0.55:
-        hurst_mult = 1.2   # Mild trend
+        hurst_mult = 1.6   # Mild trend → still wide (was 1.2)
     elif hurst >= 0.45:
         hurst_mult = 1.0   # Random walk
     elif hurst >= 0.35:
@@ -4060,7 +4130,11 @@ def get_dynamic_trail_params(
     
     # Clamp to reasonable ranges
     final_activation = max(0.5, min(3.0, final_activation))  # 0.5-3.0 range
-    final_distance = max(0.3, min(2.0, final_distance))      # 0.3-2.0 range
+    final_distance = max(0.3, min(2.5, final_distance))      # 0.3-2.5 range (Phase 213: was 2.0)
+    
+    # Phase 213: Enforce minimum 2x distance for trending coins
+    if hurst >= 0.55:
+        final_distance = max(final_distance, base_distance * 1.5)  # At least 1.5x base for trending
     
     return round(final_activation, 2), round(final_distance, 2)
 
@@ -7106,6 +7180,33 @@ async def background_scanner_loop():
                             if pos.get('pending_limit_close'):
                                 continue
                             
+                            # Phase 212: Emergency SL runs BEFORE Flash Trade Guard
+                            # Flash crash koruması ilk 60 saniyede de aktif olmalı
+                            sl_ws = pos.get('stopLoss', 0)
+                            trailing_stop_ws = pos.get('trailingStop', sl_ws)
+                            EMERGENCY_SL_MARGIN_PCT_PRE_WS = 1.0  # Phase 212: 2.5→1.0
+                            emergency_margin_pre_ws = entry_price * (EMERGENCY_SL_MARGIN_PCT_PRE_WS / 100)
+                            if pos['side'] == 'LONG' and current_price <= (trailing_stop_ws - emergency_margin_pre_ws):
+                                excess_pct = abs(current_price - trailing_stop_ws) / entry_price * 100
+                                reason = 'EMERGENCY_SL'
+                                logger.warning(f"🚨 EMERGENCY SL (pre-guard): {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop_ws:.6f} | Aşım: {excess_pct:.2f}%")
+                                global_paper_trader.close_position(pos, current_price, reason)
+                                continue
+                            elif pos['side'] == 'SHORT' and current_price >= (trailing_stop_ws + emergency_margin_pre_ws):
+                                excess_pct = abs(current_price - trailing_stop_ws) / entry_price * 100
+                                reason = 'EMERGENCY_SL'
+                                logger.warning(f"🚨 EMERGENCY SL (pre-guard): {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop_ws:.6f} | Aşım: {excess_pct:.2f}%")
+                                global_paper_trader.close_position(pos, current_price, reason)
+                                continue
+                            
+                            # Phase 210: Flash Trade Guard — minimum 60s hold time
+                            MIN_HOLD_SECONDS_WS = 60
+                            open_time_ms_ws = pos.get('openTime', 0)
+                            if open_time_ms_ws > 0:
+                                hold_duration_ws = datetime.now().timestamp() - (open_time_ms_ws / 1000)
+                                if hold_duration_ws < MIN_HOLD_SECONDS_WS:
+                                    continue  # Skip all exit checks — too early
+                            
                             # Phase 205: Use candle close price for exit DECISIONS (SL/TP/trail)
                             # Prevents false triggers from intra-candle wicks/spikes
                             candle_close_price = last_candle_close.get(pos_symbol, current_price)
@@ -7189,7 +7290,7 @@ async def background_scanner_loop():
                             # immediately. Bypasses both candle close AND spike confirm.
                             # Protects against major crashes mid-candle.
                             # =========================================================
-                            EMERGENCY_SL_MARGIN_PCT = 2.5
+                            EMERGENCY_SL_MARGIN_PCT = 1.0  # Phase 212: 2.5→1.0
                             emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
                             emergency_breached = False
                             if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
@@ -7332,30 +7433,38 @@ async def background_scanner_loop():
                             
                             # ===================================================================
                             # PROFIT-BASED TRAIL: Kâr arttıkça trail mesafesi sıkılaşır
-                            # %2-5 kâr: standart, %5-10: sıkı, %10+: çok sıkı
+                            # Phase 213: Yumuşatıldı — trending coinlerde erken çıkış engellendi
                             # ===================================================================
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                            if pnl_pct >= 10.0:
-                                # Çok yüksek kâr: trail mesafesini %50'ye küçült
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.5
-                            elif pnl_pct >= 5.0:
-                                # Yüksek kâr: trail mesafesini %75'e küçült
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.75
+                            if pnl_pct >= 15.0:
+                                # Çok yüksek kâr: trail mesafesini %70'e küçült (was 0.5)
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.7
+                            elif pnl_pct >= 8.0:
+                                # Yüksek kâr: trail mesafesini %85'e küçült (was 0.75)
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.85
                             else:
                                 # Normal: volatilite ayarlı mesafe
                                 dynamic_trail_distance = volatility_adjusted_distance
                             
+                            # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+                            leverage = pos.get('leverage', 10)
                             if pos['side'] == 'LONG':
-                                # Phase 153: For LONG, activate trail when price > entry (profitable)
-                                # Phase 205: Use candle close for trail activation decision
-                                if candle_close_price > entry_price or candle_close_price > trail_activation:
+                                price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                            else:
+                                price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
+                            roi_pct = price_move_pct * leverage
+                            min_roi_for_trail = 1.5  # %1.5 ROI minimum
+                            
+                            if pos['side'] == 'LONG':
+                                # Phase 213: Trail only activates when ROI >= 1.5% AND price > trail_activation
+                                if candle_close_price > trail_activation and roi_pct >= min_roi_for_trail:
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT':
-                                # Phase 153: For SHORT, activate trail when price < entry (profitable)
-                                if candle_close_price < entry_price or candle_close_price < trail_activation:
+                                # Phase 213: Trail only activates when ROI >= 1.5% AND price < trail_activation
+                                if candle_close_price < trail_activation and roi_pct >= min_roi_for_trail:
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
@@ -7612,7 +7721,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             sl_breached = True
         
         # Phase 205b: EMERGENCY SL — tick price WAY past SL
-        EMERGENCY_SL_MARGIN_PCT = 2.5
+        EMERGENCY_SL_MARGIN_PCT = 1.0  # Phase 212: 2.5→1.0
         emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
         emergency_breached = False
         if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
@@ -7677,13 +7786,29 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         dynamic_trail_distance = trail_distance * volatility_mult
         
-        # Phase 205: Use candle close for trail activation & ratchet
-        if pos['side'] == 'LONG' and candle_close_price > trail_activation:
+        # Phase 213: Profit-based softened tightening (WS parity with scanner)
+        ws_pnl_pct = pos.get('unrealizedPnlPercent', 0)
+        if ws_pnl_pct >= 15.0:
+            dynamic_trail_distance = dynamic_trail_distance * 0.7
+        elif ws_pnl_pct >= 8.0:
+            dynamic_trail_distance = dynamic_trail_distance * 0.85
+        
+        # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+        ws_leverage = pos.get('leverage', 10)
+        if pos['side'] == 'LONG':
+            ws_price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+        else:
+            ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
+        ws_roi_pct = ws_price_move_pct * ws_leverage
+        ws_min_roi_for_trail = 1.5  # %1.5 ROI minimum
+        
+        # Phase 205 + Phase 213: Use candle close for trail activation & ratchet with ROI gate
+        if pos['side'] == 'LONG' and candle_close_price > trail_activation and ws_roi_pct >= ws_min_roi_for_trail:
             new_trailing = candle_close_price - dynamic_trail_distance
             if new_trailing > trailing_stop:
                 pos['trailingStop'] = new_trailing
                 pos['isTrailingActive'] = True
-        elif pos['side'] == 'SHORT' and candle_close_price < trail_activation:
+        elif pos['side'] == 'SHORT' and candle_close_price < trail_activation and ws_roi_pct >= ws_min_roi_for_trail:
             new_trailing = candle_close_price + dynamic_trail_distance
             if new_trailing < trailing_stop:
                 pos['trailingStop'] = new_trailing
@@ -7882,12 +8007,28 @@ async def position_price_update_loop():
                         
                         dynamic_trail_distance = trail_distance * volatility_mult
                         
-                        if pos['side'] == 'LONG' and current_price > trail_activation:
+                        # Phase 213: Profit-based softened tightening (parity with scanner/WS)
+                        fast_pnl_pct = pos.get('unrealizedPnlPercent', 0)
+                        if fast_pnl_pct >= 15.0:
+                            dynamic_trail_distance = dynamic_trail_distance * 0.7
+                        elif fast_pnl_pct >= 8.0:
+                            dynamic_trail_distance = dynamic_trail_distance * 0.85
+                        
+                        # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+                        fast_leverage = pos.get('leverage', 10)
+                        if pos['side'] == 'LONG':
+                            fast_price_move = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                        else:
+                            fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
+                        fast_roi = fast_price_move * fast_leverage
+                        fast_min_roi = 1.5  # %1.5 ROI minimum
+                        
+                        if pos['side'] == 'LONG' and current_price > trail_activation and fast_roi >= fast_min_roi:
                             new_trailing = current_price - dynamic_trail_distance
                             if new_trailing > trailing_stop:
                                 pos['trailingStop'] = new_trailing
                                 pos['isTrailingActive'] = True
-                        elif pos['side'] == 'SHORT' and current_price < trail_activation:
+                        elif pos['side'] == 'SHORT' and current_price < trail_activation and fast_roi >= fast_min_roi:
                             new_trailing = current_price + dynamic_trail_distance
                             if new_trailing < trailing_stop:
                                 pos['trailingStop'] = new_trailing
@@ -7950,7 +8091,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'mtf_confirmed': True,
         'mtf_reason': '',
         'htf_trend': 'NEUTRAL',
-        'blacklisted': False
+        'blacklisted': False,
+        'obi_value': 0.0,  # Phase 211: OBI depth value (updated before save)
     }
     
     # Check if we already have a position in this symbol
@@ -8038,6 +8180,67 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             
     except Exception as btc_err:
         logger.warning(f"BTC Filter error: {btc_err}")
+    
+    # =====================================================
+    # Phase 211: OBI DEPTH FILTER — L2 Order Book Pressure
+    # Sadece sinyal üretilmiş coinler için depth çekilir (rate limit safe)
+    # Tiered: |OBI| > 0.6 = VETO, 0.3-0.6 = -15 penalty, < 0.3 = neutral
+    # =====================================================
+    try:
+        obi_value = await obi_detector.get_obi(symbol)
+        
+        # Phase 212: Thin Order Book Guard — min bid+ask depth $50K
+        try:
+            depth_data = obi_detector.obi_cache.get(symbol, {})
+            total_depth = depth_data.get('total_bid_usd', 0) + depth_data.get('total_ask_usd', 0)
+            if 0 < total_depth < 50000:  # Only if data exists and is too thin
+                signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
+                signal_log_data['obi_value'] = round(obi_value, 4)
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                logger.info(f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < $50K → BLOCKED")
+                return
+        except Exception:
+            pass  # depth data may not always be available
+        
+        # Determine if OBI opposes or aligns with signal direction
+        is_opposing = False
+        is_aligned = False
+        
+        if obi_value > 0.3:  # Buying pressure (bid heavy)
+            if action == "SHORT":
+                is_opposing = True
+            elif action == "LONG":
+                is_aligned = True
+        elif obi_value < -0.3:  # Selling pressure (ask heavy)
+            if action == "LONG":
+                is_opposing = True
+            elif action == "SHORT":
+                is_aligned = True
+        
+        if is_opposing:
+            if abs(obi_value) > 0.6:
+                # Strong opposing pressure → VETO
+                signal_log_data['reject_reason'] = f'OBI_VETO:opposing_{obi_value:.3f}'
+                signal_log_data['obi_value'] = round(obi_value, 4)
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} | Strong opposing pressure → BLOCKED")
+                return
+            else:
+                # Moderate opposing pressure → Soft penalty (-15)
+                original_score = signal.get('confidenceScore', 60)
+                signal['confidenceScore'] = max(40, original_score - 15)
+                signal_log_data['obi_value'] = round(obi_value, 4)
+                logger.info(f"📊 OBI_PENALTY: {action} {symbol} | OBI={obi_value:+.3f} | Score: {original_score} → {signal['confidenceScore']} (-15)")
+        elif is_aligned:
+            signal_log_data['obi_value'] = round(obi_value, 4)
+            logger.info(f"📊 OBI_CONFIRM: {action} {symbol} | OBI={obi_value:+.3f} | Order book aligned ✅")
+        else:
+            # Phase 212: Neutral OBI değerini de kaydet (0.0 ile "hesaplanmadı" ayrımı için)
+            signal_log_data['obi_value'] = round(obi_value, 4)
+            logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
+        
+    except Exception as obi_err:
+        logger.debug(f"OBI filter error for {symbol}: {obi_err}")
     
     # =====================================================
     # Phase 60: MARKET REGIME FILTER
@@ -12695,7 +12898,10 @@ class OrderBookImbalanceDetector:
             'obi': obi,
             'timestamp': now,
             'bid_qty': sum(float(b[1]) for b in bids[:self.depth_levels]) if bids else 0,
-            'ask_qty': sum(float(a[1]) for a in asks[:self.depth_levels]) if asks else 0
+            'ask_qty': sum(float(a[1]) for a in asks[:self.depth_levels]) if asks else 0,
+            # Phase 212: USD depth for Thin Book Guard
+            'total_bid_usd': sum(float(b[0]) * float(b[1]) for b in bids[:self.depth_levels]) if bids else 0,
+            'total_ask_usd': sum(float(a[0]) * float(a[1]) for a in asks[:self.depth_levels]) if asks else 0,
         }
         
         return obi
@@ -13020,22 +13226,15 @@ class SignalGenerator:
             return None
         
         # =====================================================================
-        # STRONG TREND PROTECTION (ADX-based filter)
-        # When ADX > 30, it indicates a strong trend - reject counter-trend signals
-        # This prevents losses like LYNUSDT SHORT during strong bullish rallies
+        # Phase 212: STRONG_TREND_FILTER kaldırıldı (ADX>40)
+        # REGIME_VETO (ADX>30 + Hurst>0.55) aynı işi daha hassas yapıyor.
+        # ADX>40 filtresi hiç tetiklenmiyordu çünkü REGIME_VETO daha önce yakalıyordu.
+        # ADX trend alignment bonusu korundu.
         # =====================================================================
-        ADX_STRONG_TREND_THRESHOLD = 40  # Phase 184: Raised from 30 to reject fewer signals
-        
-        if adx > ADX_STRONG_TREND_THRESHOLD:
-            # Strong trend detected - reject signals against the trend
-            if adx_trend == "BULLISH" and signal_side == "SHORT":
-                logger.warning(f"⚠️ STRONG_TREND_FILTER: Rejecting {symbol} SHORT - ADX={adx:.1f} trend={adx_trend}")
-                return None
-            elif adx_trend == "BEARISH" and signal_side == "LONG":
-                logger.warning(f"⚠️ STRONG_TREND_FILTER: Rejecting {symbol} LONG - ADX={adx:.1f} trend={adx_trend}")
-                return None
-            else:
-                # Signal aligns with trend - this is good, add bonus
+        if adx > 30 and adx_trend != "NEUTRAL":
+            # ADX trend alignment bonus (sadece yön uyumlu sinyallere)
+            if (adx_trend == "BULLISH" and signal_side == "LONG") or \
+               (adx_trend == "BEARISH" and signal_side == "SHORT"):
                 score += 5
                 reasons.append(f"ADX_ALIGN({adx:.0f})")
         
@@ -13051,6 +13250,20 @@ class SignalGenerator:
         
         # Phase 128: TRACE LOG - every signal that passes Z-Score threshold
         logger.info(f"🎯 Z_PASS: {symbol} {signal_side} Z={zscore:.2f} H={hurst:.2f} score={score}")
+        
+        # =====================================================================
+        # Phase 212: SPIKE PROTECTION (Pump-Dump Guard)
+        # Fiyat ATR'nin 10x'i kadar hareket ettiyse pump-dump riski yüksek.
+        # Z-Score geçmişe baktığı için spike sonrası "ucuz" görebilir.
+        # ATR normalden 10x+ fark = aşırı hareket, sinyal verme.
+        # =====================================================================
+        if atr > 0:
+            # Z-Score excess + ATR combination: if zscore is extreme AND volatility spike
+            spike_ratio = abs(zscore) * (price * 0.01 / atr) if atr > 0 else 0
+            # If the price move is so extreme that ATR-normalized Z is >15, it's a pump-dump
+            if abs(zscore) > 4.0 and volume_ratio > 3.0:
+                logger.info(f"🚨 SPIKE_GUARD: {symbol} {signal_side} BLOCKED | Z={zscore:.2f} Vol={volume_ratio:.1f}x | Pump-dump risk")
+                return None
         
         # Bonus based on Z-Score strength (0-10 pts extra)
         zscore_excess = abs(zscore) - effective_threshold
@@ -13419,6 +13632,13 @@ class SignalGenerator:
             if score < min_score_required:
                 logger.info(f"🚫 VOLATILE_VETO: {symbol} {signal_side} score={score} < volatile_min={min_score_required}")
                 return None
+        
+        # =====================================================================
+        # Phase 212: BTC TREND GUARD kaldırıldı
+        # BTC kontrolü sadece process_signal_for_paper_trading() içinde
+        # btc_filter.should_allow_signal() üzerinden yapılıyor.
+        # Çift penalty sorununu giderir.
+        # =====================================================================
         
         # =====================================================================
         # PHASE 193: STOPLOSS FREQUENCY GUARD CHECK
@@ -13818,7 +14038,7 @@ class PaperTradingEngine:
         # Phase 20: Advanced Risk Management Config
         self.max_position_age_hours = 24
         self.daily_drawdown_limit = 5.0  # %5 günlük kayıp limiti
-        self.emergency_sl_pct = 5.0   # %5 pozisyon başına max kayıp (10x lev = %50 margin)
+        self.emergency_sl_pct = 3.5   # Phase 212: %5→%3.5 (10x lev = %35 margin max kayıp)
         self.current_spread_pct = 0.05  # Will be updated from WebSocket
         self.daily_start_balance = 10000.0
         # Phase 34: Pending Orders System
@@ -14386,6 +14606,15 @@ class PaperTradingEngine:
             settings_snapshot['market_regime'] = market_regime_detector.current_regime
         except:
             settings_snapshot['market_regime'] = 'UNKNOWN'
+        # Phase 211: OBI depth settings
+        settings_snapshot['obi_threshold_veto'] = 0.6
+        settings_snapshot['obi_threshold_penalty'] = 0.3
+        settings_snapshot['obi_penalty_points'] = 15
+        try:
+            obi_cached = obi_detector.obi_cache.get(trade_symbol, {})
+            settings_snapshot['obi_value_at_entry'] = round(obi_cached.get('obi', 0), 4)
+        except:
+            settings_snapshot['obi_value_at_entry'] = 0
         
         pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
@@ -15499,6 +15728,21 @@ class PaperTradingEngine:
             # Phase 190: Use per-position price (from fast loop WebSocket / Binance sync updates)
             current_price = pos.get('currentPrice', pos.get('markPrice', current_price))
             atr = pos.get('atr', current_price * 0.01)
+            
+            # Phase 212: Entry-based Emergency SL DEVRE DIŞI
+            # Trail-based Emergency SL (pre-guard, %1) zaten flash crash koruyor.
+            # Entry-based versiyon volatile coin'lerde erken kapanmaya neden oluyordu.
+            # Kalan korumalar: Trail Emergency SL, Normal SL, Adverse Exit, Time Exit, Daily Drawdown
+            # if self.check_emergency_sl(pos, current_price):
+            #     continue
+            
+            # Phase 210: Flash Trade Guard — minimum 60s hold time
+            MIN_HOLD_SECONDS_PT = 60
+            open_time_ms_pt = pos.get('openTime', 0)
+            if open_time_ms_pt > 0:
+                hold_duration_pt = datetime.now().timestamp() - (open_time_ms_pt / 1000)
+                if hold_duration_pt < MIN_HOLD_SECONDS_PT:
+                    continue  # Skip remaining exit checks — too early
                 
             # Calc PnL
             if pos['side'] == 'LONG':
@@ -15512,10 +15756,6 @@ class PaperTradingEngine:
             pos['unrealizedPnlPercent'] = pnl_percent
             
             # ===== PHASE 20: RISK MANAGEMENT PRIORITY ===== 
-            
-            # 1. Emergency SL (highest priority)
-            if self.check_emergency_sl(pos, current_price):
-                continue
             
             # 1.5. Adverse Position Exit (4h terste kalan pozisyonlar)
             if self.check_adverse_position_exit(pos, current_price, atr):
