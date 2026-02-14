@@ -1526,14 +1526,7 @@ class LiveBinanceTrader:
                         # ================================================================
                         # Phase 212: Emergency SL runs BEFORE Flash Trade Guard
                         # Flash crash koruması ilk 60 saniyede de aktif olmalı
-                        EMERGENCY_SL_MARGIN_PCT_PRE = 1.0  # Phase 212: 2.5→1.0 (10x'le %10 margin kaybı)
-                        emergency_margin_pre = entry_price * (EMERGENCY_SL_MARGIN_PCT_PRE / 100)
-                        if side == 'LONG' and current_price <= (trailing_stop - emergency_margin_pre):
-                            excess_pct = abs(current_price - trailing_stop) / entry_price * 100
-                            close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
-                            logger.warning(f"🚨 EMERGENCY SL (pre-guard): {symbol} {side} | {close_reason}")
-                            should_close = True
-                        elif side == 'SHORT' and current_price >= (trailing_stop + emergency_margin_pre):
+                        if engine_pos and check_emergency_sl_static(engine_pos, current_price, trailing_stop):
                             excess_pct = abs(current_price - trailing_stop) / entry_price * 100
                             close_reason = f"EMERGENCY_SL: price ${current_price:.6f} exceeded trail ${trailing_stop:.6f} by {excess_pct:.2f}%"
                             logger.warning(f"🚨 EMERGENCY SL (pre-guard): {symbol} {side} | {close_reason}")
@@ -1975,6 +1968,29 @@ class LiveBinanceTrader:
             
         except Exception as e:
             logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} | Error: {e}")
+            # Phase 217: Retry with exponential backoff to prevent ghost positions
+            for retry in range(3):
+                try:
+                    await asyncio.sleep(1 * (retry + 1))
+                    logger.warning(f"🔄 CLOSE RETRY {retry+1}/3: {side} {symbol}")
+                    order = await self.exchange.create_market_order(
+                        ccxt_symbol, close_side, amount,
+                        params={'reduceOnly': True}
+                    )
+                    logger.info(f"✅ CLOSE RETRY SUCCESS: {side} {symbol} | Order: {order.get('id', 'N/A')}")
+                    return {
+                        'id': order.get('id'),
+                        'symbol': symbol,
+                        'side': side,
+                        'amount': amount,
+                        'status': order.get('status', 'filled'),
+                        'timestamp': int(datetime.now().timestamp() * 1000),
+                    }
+                except Exception as retry_err:
+                    logger.error(f"❌ CLOSE RETRY {retry+1} FAILED: {retry_err}")
+            
+            # All retries failed — mark as ghost position risk
+            logger.critical(f"🚨 GHOST POSITION RISK: {side} {symbol} close FAILED after 3 retries — manual intervention needed")
             return None
     
     async def close_position_limit(self, symbol: str, side: str, amount: float, price: float) -> dict:
@@ -4141,6 +4157,26 @@ def get_dynamic_trail_params(
         final_distance = max(final_distance, base_distance * 1.5)  # At least 1.5x base for trending
     
     return round(final_activation, 2), round(final_distance, 2)
+
+def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: float) -> bool:
+    """
+    Phase 217: Unified trail-based Emergency SL check — single source of truth.
+    Checks if current price exceeds the trailing stop by >1% of entry price.
+    Returns True if emergency breach detected.
+    """
+    entry_price = pos.get('entryPrice', 0)
+    if entry_price <= 0 or trailing_stop <= 0:
+        return False
+    
+    EMERGENCY_MARGIN_PCT = 1.0  # %1 of entry price
+    emergency_margin = entry_price * (EMERGENCY_MARGIN_PCT / 100)
+    side = pos.get('side', 'LONG')
+    
+    if side == 'LONG' and current_price <= (trailing_stop - emergency_margin):
+        return True
+    elif side == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
+        return True
+    return False
 
 def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
     """
@@ -7491,15 +7527,7 @@ async def background_scanner_loop():
                             # Flash crash koruması ilk 60 saniyede de aktif olmalı
                             sl_ws = pos.get('stopLoss', 0)
                             trailing_stop_ws = pos.get('trailingStop', sl_ws)
-                            EMERGENCY_SL_MARGIN_PCT_PRE_WS = 1.0  # Phase 212: 2.5→1.0
-                            emergency_margin_pre_ws = entry_price * (EMERGENCY_SL_MARGIN_PCT_PRE_WS / 100)
-                            if pos['side'] == 'LONG' and current_price <= (trailing_stop_ws - emergency_margin_pre_ws):
-                                excess_pct = abs(current_price - trailing_stop_ws) / entry_price * 100
-                                reason = 'EMERGENCY_SL'
-                                logger.warning(f"🚨 EMERGENCY SL (pre-guard): {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop_ws:.6f} | Aşım: {excess_pct:.2f}%")
-                                global_paper_trader.close_position(pos, current_price, reason)
-                                continue
-                            elif pos['side'] == 'SHORT' and current_price >= (trailing_stop_ws + emergency_margin_pre_ws):
+                            if check_emergency_sl_static(pos, current_price, trailing_stop_ws):
                                 excess_pct = abs(current_price - trailing_stop_ws) / entry_price * 100
                                 reason = 'EMERGENCY_SL'
                                 logger.warning(f"🚨 EMERGENCY SL (pre-guard): {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop_ws:.6f} | Aşım: {excess_pct:.2f}%")
@@ -7597,15 +7625,7 @@ async def background_scanner_loop():
                             # immediately. Bypasses both candle close AND spike confirm.
                             # Protects against major crashes mid-candle.
                             # =========================================================
-                            EMERGENCY_SL_MARGIN_PCT = 1.0  # Phase 212: 2.5→1.0
-                            emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
-                            emergency_breached = False
-                            if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
-                                emergency_breached = True
-                            elif pos['side'] == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
-                                emergency_breached = True
-                            
-                            if emergency_breached:
+                            if check_emergency_sl_static(pos, current_price, trailing_stop):
                                 excess_pct = abs(current_price - trailing_stop) / entry_price * 100
                                 reason = 'EMERGENCY_SL'
                                 logger.warning(f"🚨 EMERGENCY SL: {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}% | Candle close: ${candle_close_price:.6f}")
@@ -8026,8 +8046,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
                         logger.info(f"🔒 STEPPED_SL(WS): {symbol} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
         
-        SL_CONFIRMATION_TICKS = 5
+        SL_CONFIRMATION_TICKS = 3
         SL_CONFIRMATION_SECONDS = 15
+        SL_MAX_WAIT_SECONDS = 60  # Phase 217: Sakin piyasada max bekleme
         
         if 'slConfirmCount' not in pos:
             pos['slConfirmCount'] = 0
@@ -8041,15 +8062,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             sl_breached = True
         
         # Phase 205b: EMERGENCY SL — tick price WAY past SL
-        EMERGENCY_SL_MARGIN_PCT = 1.0  # Phase 212: 2.5→1.0
-        emergency_margin = entry_price * (EMERGENCY_SL_MARGIN_PCT / 100)
-        emergency_breached = False
-        if pos['side'] == 'LONG' and current_price <= (trailing_stop - emergency_margin):
-            emergency_breached = True
-        elif pos['side'] == 'SHORT' and current_price >= (trailing_stop + emergency_margin):
-            emergency_breached = True
-        
-        if emergency_breached:
+        if check_emergency_sl_static(pos, current_price, trailing_stop):
             excess_pct = abs(current_price - trailing_stop) / entry_price * 100
             logger.warning(f"🚨 EMERGENCY SL (WS): {symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}%")
             global_paper_trader.close_position(pos, current_price, 'EMERGENCY_SL')
@@ -8064,6 +8077,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
                 reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
                 logger.info(f"🔴 SL CONFIRMED (WS): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
+                global_paper_trader.close_position(pos, current_price, reason)
+                continue
+            elif breach_duration >= SL_MAX_WAIT_SECONDS:
+                # Phase 217: Sakin piyasada tick gelmese bile süre doldu
+                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
+                logger.info(f"🔴 SL TIMEOUT (WS): {symbol} @ ${current_price:.6f} | {breach_duration:.0f}s timeout")
                 global_paper_trader.close_position(pos, current_price, reason)
                 continue
         else:
@@ -10559,7 +10578,15 @@ class PositionBasedKillSwitch:
         if self.last_reset_date != today:
             self.day_start_balance = current_balance
             self.last_reset_date = today
-            self.partially_closed.clear()
+            # Phase 217: Sadece biten pozisyonları temizle, açık pozisyonların durumunu koru
+            try:
+                active_position_ids = {p.get('id', '') for p in global_paper_trader.positions} if 'global_paper_trader' in globals() else set()
+                self.partially_closed = {
+                    pid: count for pid, count in self.partially_closed.items()
+                    if pid in active_position_ids
+                }
+            except Exception:
+                self.partially_closed.clear()
             logger.info(f"📅 New trading day (Turkey): Starting balance ${current_balance:.2f}")
     
     async def check_positions(self, paper_trader) -> dict:
@@ -14394,6 +14421,11 @@ class PaperTradingEngine:
         self.emergency_sl_pct = 3.5   # Phase 212: %5→%3.5 (10x lev = %35 margin max kayıp)
         self.current_spread_pct = 0.05  # Will be updated from WebSocket
         self.daily_start_balance = 10000.0
+        # Phase 217: Portfolio-level drawdown protection
+        self.portfolio_max_unrealized_loss_pct = 15.0  # Toplam açık pozisyon max kayıp %
+        # Phase 217: Save state throttle
+        self._last_save_time = 0
+        self.leverage_multiplier = 1.0  # Phase 217: User-adjustable leverage multiplier (0.3-3.0)
         # Phase 34: Pending Orders System
         self.pending_orders = []  # List of pending limit orders waiting for pullback
         self.pending_order_timeout_seconds = 1800  # 30 minutes to fill or cancel
@@ -14806,6 +14838,17 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
             return None  # Silently skip to avoid log spam
         
+        # Phase 217: Direction exposure limit — max %70 aynı yönde
+        long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
+        short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
+        max_same_direction = max(3, self.max_positions * 70 // 100)
+        if side == 'LONG' and long_count >= max_same_direction:
+            logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık (max {max_same_direction})")
+            return None
+        if side == 'SHORT' and short_count >= max_same_direction:
+            logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
+            return None
+        
         # =========================================================================
         # PHASE 33: POSITION SCALING LOGIC
         # =========================================================================
@@ -14819,13 +14862,11 @@ class PaperTradingEngine:
         
         # Check for existing pending order for same symbol (avoid duplicate pending)
         existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
-        existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
         if existing_pending:
             logger.info(f"🚫 OPEN_POS SKIP: Pending order already exists for {trade_symbol}")
             return None  # Already have pending order for this symbol
         
         # Check if we already have opposite position in same coin (hedging check)
-        same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
             logger.info(f"🚫 OPEN_POS SKIP: Hedging disabled, opposite pos exists for {trade_symbol}")
@@ -15699,6 +15740,39 @@ class PaperTradingEngine:
             return True
         return False
     
+    def check_portfolio_drawdown(self) -> bool:
+        """Phase 217: Tüm açık pozisyonların toplam unrealized kaybını kontrol et."""
+        if not self.positions:
+            return False
+        
+        total_unrealized = sum(p.get('unrealizedPnl', 0) for p in self.positions)
+        
+        if self.balance <= 0:
+            return False
+        
+        loss_pct = (total_unrealized / self.balance) * 100
+        
+        if loss_pct < -self.portfolio_max_unrealized_loss_pct:
+            # En kötü pozisyondan başlayarak kapat
+            sorted_positions = sorted(
+                self.positions,
+                key=lambda p: p.get('unrealizedPnl', 0)
+            )
+            
+            # En kötü %50'sini kapat
+            close_count = max(1, len(sorted_positions) // 2)
+            for pos in sorted_positions[:close_count]:
+                current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
+                self.close_position(pos, current_price, 'PORTFOLIO_DRAWDOWN')
+            
+            self.add_log(
+                f"🚨 PORTFÖY KORUMA: Toplam kayıp %{abs(loss_pct):.1f} "
+                f"(limit: %{self.portfolio_max_unrealized_loss_pct}), "
+                f"{close_count} pozisyon kapatıldı"
+            )
+            return True
+        return False
+    
     def check_adverse_position_exit(self, pos: dict, current_price: float, atr: float = None) -> bool:
         """
         4 saat boyunca terste kalan pozisyonları kontrol et.
@@ -15769,7 +15843,7 @@ class PaperTradingEngine:
         
         today_trades = [t for t in self.trades if t.get('closeTime', 0) >= today_start_ms]
         daily_pnl = sum(t.get('pnl', 0) for t in today_trades)
-        daily_pnl_pct = (daily_pnl / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+        daily_pnl_pct = (daily_pnl / self.balance) * 100 if self.balance > 0 else 0
         
         if daily_pnl_pct < -self.daily_drawdown_limit:
             if self.enabled:
@@ -15817,6 +15891,9 @@ class PaperTradingEngine:
                         daily_kill_switch.full_close_pct = data.get('kill_switch_full_close', -150)
                     # Phase 60: Load AI Optimizer state
                     self.ai_optimizer_enabled = data.get('ai_optimizer_enabled', False)
+                    # Phase 217: Load leverage multiplier + daily_start_balance
+                    self.leverage_multiplier = data.get('leverage_multiplier', 1.0)
+                    self.daily_start_balance = data.get('daily_start_balance', self.balance)
                     # Sync with parameter_optimizer
                     try:
                         parameter_optimizer.enabled = self.ai_optimizer_enabled
@@ -15833,7 +15910,12 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
-    def save_state(self):
+    def save_state(self, force: bool = False):
+        # Phase 217: Save state throttle — max 1 save per 2 seconds (unless force=True)
+        now = datetime.now().timestamp()
+        if not force and now - self._last_save_time < 2.0:
+            return
+        self._last_save_time = now
         try:
             data = {
                 "balance": self.balance,
@@ -15866,6 +15948,9 @@ class PaperTradingEngine:
                 "kill_switch_full_close": daily_kill_switch.full_close_pct,
                 # Phase 60: AI Optimizer state
                 "ai_optimizer_enabled": self.ai_optimizer_enabled,
+                # Phase 217: Leverage multiplier + daily_start_balance
+                "leverage_multiplier": getattr(self, 'leverage_multiplier', 1.0),
+                "daily_start_balance": self.daily_start_balance,
                 # Phase 19: Save logs
                 "logs": self.logs[-100:]
             }
@@ -16078,6 +16163,9 @@ class PaperTradingEngine:
         # Phase 20: Check daily drawdown first
         if self.check_daily_drawdown():
             return
+        # Phase 217: Check portfolio-level drawdown
+        if self.check_portfolio_drawdown():
+            return
         
         # Calculate ATR-like value from position if not provided
         if atr is None:
@@ -16117,6 +16205,17 @@ class PaperTradingEngine:
             
             pos['unrealizedPnl'] = pnl
             pos['unrealizedPnlPercent'] = pnl_percent
+            
+            # Phase 217: Estimate funding fee cost
+            open_time_ms = pos.get('openTime', 0)
+            if open_time_ms > 0:
+                age_hours = (datetime.now().timestamp() * 1000 - open_time_ms) / (1000 * 60 * 60)
+                funding_periods = int(age_hours / 8)  # Her 8 saatte bir funding
+                if funding_periods > 0:
+                    symbol = pos.get('symbol', '')
+                    rate = funding_oi_tracker.funding_rates.get(symbol, 0.0001) if 'funding_oi_tracker' in globals() else 0.0001
+                    size_usd = pos.get('sizeUsd', 0)
+                    pos['estimatedFundingCost'] = round(size_usd * abs(rate) * funding_periods, 4)
             
             # ===== PHASE 20: RISK MANAGEMENT PRIORITY ===== 
             
@@ -16299,6 +16398,9 @@ class PaperTradingEngine:
             
             # Phase 214: Failed Continuation
             'FAILED_CONTINUATION': f"🔄 FAILED_CONT: Kalıcılık Sağlanamadı — {pos.get('fc_failed_count', 0)} başarısız deneme ({pnl_percent:+.1f}%)",
+            
+            # Phase 217: Portfolio Drawdown
+            'PORTFOLIO_DRAWDOWN': f"🚨 PORTFÖY: Toplam kayıp limiti aşıldı ({pnl_percent:+.1f}%)",
         }
         
         return reason_map.get(reason, f"📋 {reason} ({pnl_percent:+.1f}%)")
@@ -16513,7 +16615,7 @@ class PaperTradingEngine:
         live_tag = "🔴 LIVE" if pos.get('isLive', False) else "📄 PAPER"
         emoji = "✅" if pnl > 0 else "❌"
         self.add_log(f"{emoji} {live_tag} KAPANDI [{reason}]: {pos.get('side', 'UNKNOWN')} @ ${exit_price:.4f} | PnL: ${pnl:.2f}")
-        self.save_state()
+        self.save_state(force=True)  # Critical: position close MUST be persisted
         logger.info(f"✅ {live_tag} CLOSE: {reason} PnL: {pnl:.2f}")
         
         # =====================================================================
