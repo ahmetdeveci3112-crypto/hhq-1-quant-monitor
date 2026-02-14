@@ -15217,39 +15217,29 @@ class PaperTradingEngine:
                     # Initialize extreme price (bottom for LONG, peak for SHORT)
                     order['extremePrice'] = current_price
                     
-                    # Calculate trail_entry_distance (same as trail TP's trail_distance)
-                    order_adx = order.get('adx', 0)
+                    # Calculate trail_entry_distance using COIN-SPECIFIC dynamic trail params
+                    # The order already carries dynamic_trail_distance from get_dynamic_trail_params()
+                    # which accounts for volatility, hurst, price, and spread.
+                    # Trail entry = 30-60% of exit trail distance (trend-adjusted)
                     order_hurst = order.get('hurst', 0.5)
-                    adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
-                    hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
-                    trend_s = adx_s * 0.6 + hurst_s * 0.4
+                    dynamic_trail_dist = order.get('dynamic_trail_distance', None)
                     
-                    # Trail entry distance: 0.05-0.10 × ATR (trend-adjusted)
-                    trail_factor = 0.10 - trend_s * 0.05
-                    trail_entry_dist = atr * trail_factor
-                    
-                    # Apply entry_tightness: mirrors exit_tightness in Trail TP
-                    # Higher entry_tightness = require bigger reversal = more conservative
-                    import math
-                    et_mult = math.sqrt(max(0.5, self.entry_tightness))  # 1.0→1.0x, 1.8→1.34x
-                    trail_entry_dist *= et_mult
-                    
-                    # Phase 176: Coin-specific spread multiplier
-                    # Higher spread = noisier price action = need larger reversal to confirm
-                    order_spread = order.get('spreadLevel', 'normal').lower()
-                    spread_trail_mult = {
-                        'very low': 0.7,   # BTC/ETH — clean price action, tight reversal
-                        'low': 0.85,       # Large caps
-                        'normal': 1.0,     # Standard
-                        'high': 1.3,       # Mid/small caps — more noise
-                        'very high': 1.6,  # Meme coins — heavy noise filtering
-                    }.get(order_spread, 1.0)
-                    trail_entry_dist *= spread_trail_mult
-                    
-                    # Cap at 25% of pullback distance
-                    pb_dist = abs(entry_price - order.get('signalPrice', entry_price))
-                    if pb_dist > 0:
-                        trail_entry_dist = min(trail_entry_dist, pb_dist * 0.25)
+                    if dynamic_trail_dist is not None and dynamic_trail_dist > 0:
+                        # Use coin-specific trail distance from dynamic params
+                        # Trending coins: tighter entry trail (30%) → enter quickly on small bounce
+                        # Mean-reverting: wider entry trail (60%) → wait for clear reversal
+                        hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
+                        entry_trail_ratio = 0.60 - hurst_s * 0.30  # 0.30 (trending) to 0.60 (mean-reverting)
+                        trail_entry_dist = atr * dynamic_trail_dist * entry_trail_ratio
+                    else:
+                        # Fallback: use ATR-based calculation with wider factor
+                        order_adx = order.get('adx', 0)
+                        adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
+                        hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
+                        trend_s = adx_s * 0.6 + hurst_s * 0.4
+                        # 0.30 - 0.50 ATR (was 0.05-0.10 — 6x increase)
+                        trail_factor = 0.50 - trend_s * 0.20
+                        trail_entry_dist = atr * trail_factor
                     
                     order['trailEntryDistance'] = trail_entry_dist
                     

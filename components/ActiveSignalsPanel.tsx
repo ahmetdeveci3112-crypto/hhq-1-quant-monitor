@@ -237,23 +237,26 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 // PB%: Actual pullback = distance from price to entry
                                 const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Phase 175: Trail Entry — mirrors Trail TP logic
+                                // Phase 218: Trail Entry — coin-specific using dynamic trail params
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const hurstStr = Math.min(1.0, Math.max(0, ((signal.hurst || 0.5) - 0.35) / 0.4));
-                                const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
-                                const trendStr = hurstStr * 0.6 + zStr * 0.4;
-                                const trailFactor = 0.10 - trendStr * 0.05;
-                                let rawTrail = atrPct * trailFactor;
-                                // Apply entry_tightness (sqrt smoothing)
-                                const etMult = Math.sqrt(Math.max(0.5, entryTightness));
-                                rawTrail *= etMult;
-                                // Phase 176: Coin-specific spread multiplier
-                                const spreadTrailMult: Record<string, number> = {
-                                    'Very Low': 0.7, 'Low': 0.85, 'Normal': 1.0, 'High': 1.3, 'Very High': 1.6
-                                };
-                                rawTrail *= spreadTrailMult[spreadInfo.level] ?? 1.0;
-                                // Cap at 25% of pullback
-                                const trailPct = pbPct > 0 ? Math.min(rawTrail, pbPct * 0.25) : rawTrail;
+                                const hurstVal = signal.hurst || 0.5;
+                                const hurstStr = Math.min(1.0, Math.max(0, (hurstVal - 0.35) / 0.4));
+
+                                // Use dynamic_trail_distance from backend if available
+                                const dynTrailDist = (signal as any).dynamic_trail_distance;
+                                let trailPct: number;
+
+                                if (dynTrailDist && dynTrailDist > 0 && atrPct > 0) {
+                                    // Trending → tighter entry trail (30%), Mean-reverting → wider (60%)
+                                    const entryTrailRatio = 0.60 - hurstStr * 0.30;
+                                    trailPct = atrPct * dynTrailDist * entryTrailRatio;
+                                } else {
+                                    // Fallback: 0.30-0.50 ATR (was 0.05-0.10)
+                                    const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
+                                    const trendStr = hurstStr * 0.6 + zStr * 0.4;
+                                    const trailFactor = 0.50 - trendStr * 0.20;
+                                    trailPct = atrPct * trailFactor;
+                                }
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
