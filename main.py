@@ -4277,12 +4277,13 @@ def _apply_tightening(pos: dict, factor: float):
     entry = pos['entryPrice']
     side = pos['side']
     
-    # Orijinal değerleri sakla (ilk seferde)
-    if 'original_sl' not in pos:
+    # Orijinal değerleri sakla (ilk seferde — tek sefer)
+    if not pos.get('_mtf_originals_saved', False):
         pos['original_sl'] = pos.get('stopLoss', 0)
         pos['original_trail_distance'] = pos.get('trailDistance', 0)
         pos['original_trail_activation'] = pos.get('trailActivation', entry)
         pos['original_tp'] = pos.get('takeProfit', 0)
+        pos['_mtf_originals_saved'] = True
     
     orig_sl = pos['original_sl']
     
@@ -4291,13 +4292,12 @@ def _apply_tightening(pos: dict, factor: float):
         if side == 'LONG':
             sl_distance = entry - orig_sl
             new_sl = entry - (sl_distance * factor)
-            # Sadece yukarı taşı (daha sıkı = daha yüksek SL)
-            pos['stopLoss'] = max(new_sl, pos.get('stopLoss', 0))
+            # Orijinal SL'den hesapla — factor değiştikçe SL de ayarlansın
+            pos['stopLoss'] = new_sl
         else:  # SHORT
             sl_distance = orig_sl - entry
             new_sl = entry + (sl_distance * factor)
-            # Sadece aşağı taşı (daha sıkı = daha düşük SL)
-            pos['stopLoss'] = min(new_sl, pos.get('stopLoss', float('inf')))
+            pos['stopLoss'] = new_sl
     
     # Trail distance sıkılaştır
     orig_td = pos.get('original_trail_distance', 0)
@@ -4322,9 +4322,12 @@ def _apply_widening(pos: dict, expand: float):
     entry = pos['entryPrice']
     side = pos['side']
     
-    if 'original_tp' not in pos:
+    if not pos.get('_mtf_originals_saved', False):
         pos['original_tp'] = pos.get('takeProfit', 0)
         pos['original_trail_distance'] = pos.get('trailDistance', 0)
+        pos['original_sl'] = pos.get('stopLoss', 0)
+        pos['original_trail_activation'] = pos.get('trailActivation', entry)
+        pos['_mtf_originals_saved'] = True
     
     orig_tp = pos.get('original_tp', 0)
     orig_td = pos.get('original_trail_distance', 0)
@@ -4416,14 +4419,17 @@ async def apply_mtf_position_guard(positions: list, exchange):
                 )
             
             else:
-                # Nötr — orijinal değerlere dön (varsa)
-                if 'original_sl' in pos:
+                # Nötr — orijinal değerlere dön ve flag temizle
+                if pos.get('_mtf_originals_saved', False):
                     if not pos.get('isTrailingActive', False):
-                        pos['stopLoss'] = pos['original_sl']
+                        pos['stopLoss'] = pos.get('original_sl', pos['stopLoss'])
                     pos['trailDistance'] = pos.get('original_trail_distance', pos.get('trailDistance', 0))
                     pos['trailActivation'] = pos.get('original_trail_activation', pos.get('trailActivation', entry))
-                if 'original_tp' in pos:
-                    pos['takeProfit'] = pos['original_tp']
+                    pos['takeProfit'] = pos.get('original_tp', pos.get('takeProfit', 0))
+                    # Temizle — yeni cycle'da taze kayıt yapılsın
+                    for key in ['original_sl', 'original_tp', 'original_trail_distance', 
+                                'original_trail_activation', '_mtf_originals_saved']:
+                        pos.pop(key, None)
                 pos.pop('mtf_guard_factor', None)
                 logger.debug(f"📊 MTF_GUARD NEUTRAL: {symbol} {side} | MTF={mtf_score} | restored originals")
         
