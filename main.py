@@ -14947,8 +14947,8 @@ class PaperTradingEngine:
             tm_trail_act_mult = 1.0
             tm_trail_dist_mult = 1.0
         
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
+        adjusted_sl_atr = (self.sl_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = (self.tp_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
         if signal and 'dynamic_trail_activation' in signal:
@@ -15301,8 +15301,8 @@ class PaperTradingEngine:
             tm_trail_act_mult = 1.0
             tm_trail_dist_mult = 1.0
         
-        adjusted_sl_atr = self.sl_atr * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = self.tp_atr * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
+        adjusted_sl_atr = (self.sl_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = (self.tp_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
         if 'dynamic_trail_activation' in order:
@@ -16264,7 +16264,10 @@ class PaperTradingEngine:
                 'Very High': 8.0   # Meme — very volatile, late trail
             }
             base_activation_roi = spread_activation_map.get(pos.get('spread_level', 'Normal'), 4.0)
-            activation_threshold = base_activation_roi * self.get_effective_exit_tightness(pos)
+            # Phase 218: Trail threshold must account for leverage — otherwise tiny price moves
+            # on high leverage (e.g. 0.42% on 20x = 8.5% ROI) falsely trigger trail
+            pos_leverage = pos.get('leverage', 10)
+            activation_threshold = base_activation_roi * self.get_effective_exit_tightness(pos) * pos_leverage
             
             if pos['side'] == 'LONG':
                 # LONG: ROI must be >= threshold (positive ROI)
@@ -18120,8 +18123,8 @@ async def paper_trading_update_settings(
             side = pos.get('side', '')
             
             # Recalculate TP/SL with new exit_tightness
-            adjusted_sl_atr = global_paper_trader.sl_atr * global_paper_trader.exit_tightness
-            adjusted_tp_atr = global_paper_trader.tp_atr * global_paper_trader.exit_tightness
+            adjusted_sl_atr = (global_paper_trader.sl_atr / 10) * global_paper_trader.exit_tightness
+            adjusted_tp_atr = (global_paper_trader.tp_atr / 10) * global_paper_trader.exit_tightness
             adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
             adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
             
@@ -18260,8 +18263,8 @@ async def paper_trading_market_order(request: Request):
         leverage = global_paper_trader.leverage
         
         # SL/TP based on ATR
-        sl_distance = atr * global_paper_trader.sl_atr
-        tp_distance = atr * global_paper_trader.tp_atr
+        sl_distance = atr * (global_paper_trader.sl_atr / 10)
+        tp_distance = atr * (global_paper_trader.tp_atr / 10)
         
         if side == 'LONG':
             sl = price - sl_distance
