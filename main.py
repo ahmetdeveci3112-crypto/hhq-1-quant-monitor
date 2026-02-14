@@ -2788,9 +2788,77 @@ async def binance_position_sync_loop():
     logger.info("🔄 Binance Position Sync Loop started")
     reconnect_interval = 30  # seconds between reconnect attempts
     last_reconnect_attempt = 0
+    _phase218_recalc_done = False  # One-time flag
     
     while True:
         try:
+            # ================================================================
+            # Phase 218: ONE-TIME RECALC — fix SL/TP for existing positions
+            # sl_atr=15 was used as raw multiplier instead of 1.5 (=15/10)
+            # This runs ONCE per server lifetime to fix all positions
+            # ================================================================
+            if not _phase218_recalc_done and len(global_paper_trader.positions) > 0:
+                _phase218_recalc_done = True
+                fixed_count = 0
+                sl_atr_corrected = global_paper_trader.sl_atr / 10  # 15 → 1.5
+                tp_atr_corrected = global_paper_trader.tp_atr / 10  # 30 → 3.0
+                et = global_paper_trader.exit_tightness  # 1.2
+                
+                for pos in global_paper_trader.positions:
+                    try:
+                        entry = pos.get('entryPrice', 0)
+                        if entry <= 0:
+                            continue
+                        
+                        atr = pos.get('atr', entry * 0.02)
+                        side = pos.get('side', '')
+                        
+                        # Calculate dynamic ATR multiplier
+                        dyn_mult = global_paper_trader.calculate_dynamic_atr_multiplier(atr, entry)
+                        
+                        adjusted_sl = sl_atr_corrected * et * dyn_mult
+                        adjusted_tp = tp_atr_corrected * et * dyn_mult
+                        
+                        old_sl = pos.get('stopLoss', 0)
+                        old_tp = pos.get('takeProfit', 0)
+                        
+                        if side == 'LONG':
+                            new_sl = max(entry * 0.01, entry - (atr * adjusted_sl))
+                            new_tp = entry + (atr * adjusted_tp)
+                        else:
+                            new_sl = entry + (atr * adjusted_sl)
+                            new_tp = max(entry * 0.01, entry - (atr * adjusted_tp))
+                        
+                        # Only fix if the values are suspiciously far (>50% from entry)
+                        sl_dist_pct = abs(entry - old_sl) / entry * 100 if entry > 0 else 0
+                        if sl_dist_pct > 50:  # SL is more than 50% away — clearly wrong
+                            pos['stopLoss'] = new_sl
+                            pos['trailingStop'] = new_sl
+                            pos['takeProfit'] = new_tp
+                            
+                            # Recalc trail activation/distance
+                            trail_act_atr = global_paper_trader.trail_activation_atr * et * dyn_mult
+                            trail_dist_atr = global_paper_trader.trail_distance_atr * et * dyn_mult
+                            if side == 'LONG':
+                                pos['trailActivation'] = entry + (atr * trail_act_atr)
+                            else:
+                                pos['trailActivation'] = entry - (atr * trail_act_atr)
+                            pos['trailDistance'] = atr * trail_dist_atr
+                            
+                            # Reset trailing state since SL changed
+                            pos['isTrailingActive'] = False
+                            
+                            fixed_count += 1
+                            logger.warning(f"🔧 Phase 218 RECALC: {pos.get('symbol')} {side} | SL: {old_sl:.6f} → {new_sl:.6f} | TP: {old_tp:.6f} → {new_tp:.6f}")
+                    except Exception as e:
+                        logger.error(f"Phase 218 recalc error for {pos.get('symbol', '?')}: {e}")
+                
+                if fixed_count > 0:
+                    global_paper_trader.save_state()
+                    logger.warning(f"🔧 Phase 218: Fixed {fixed_count}/{len(global_paper_trader.positions)} positions with wrong SL/TP")
+                else:
+                    logger.info("✅ Phase 218: All positions have correct SL/TP — no fix needed")
+            
             # Phase 189: Auto-reconnect if Binance connection lost or failed on startup
             if not live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
                 now = datetime.now().timestamp()
