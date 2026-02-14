@@ -4234,6 +4234,202 @@ def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
     
     return ''
 
+# ===================================================================
+# Phase 215: LIVE MTF POSITION GUARD
+# Giriş filtresi + açık pozisyon sıkılaştırma/genişletme
+# ===================================================================
+
+# Son MTF guard güncelleme zamanı (global)
+_last_mtf_guard_update = 0
+
+def check_ma_alignment_veto(symbol: str, action: str) -> tuple:
+    """
+    Phase 215 Katman 1: MA Alignment Hard Veto
+    4H + 1D trend + Supertrend üçü de aynı yönde ise ters sinyali HARD REJECT et.
+    Returns: (vetoed: bool, reason: str)
+    """
+    trend_data = mtf_confirmation.coin_trends.get(symbol, {})
+    
+    trend_4h = trend_data.get('trend_4h', 'NEUTRAL')
+    trend_1d = trend_data.get('trend_1d', 'NEUTRAL')
+    supertrend_dir = trend_data.get('supertrend_dir', 0)  # 1=bull, -1=bear
+    
+    bullish_alignment = (
+        trend_4h in ('BULLISH', 'STRONG_BULLISH') and
+        trend_1d in ('BULLISH', 'STRONG_BULLISH') and
+        supertrend_dir == 1
+    )
+    bearish_alignment = (
+        trend_4h in ('BEARISH', 'STRONG_BEARISH') and
+        trend_1d in ('BEARISH', 'STRONG_BEARISH') and
+        supertrend_dir == -1
+    )
+    
+    if action == 'SHORT' and bullish_alignment:
+        return True, f"MA_VETO: 4H={trend_4h}, 1D={trend_1d}, ST=BULL → SHORT blocked"
+    if action == 'LONG' and bearish_alignment:
+        return True, f"MA_VETO: 4H={trend_4h}, 1D={trend_1d}, ST=BEAR → LONG blocked"
+    
+    return False, ""
+
+def _apply_tightening(pos: dict, factor: float):
+    """Phase 215: SL mesafesini, trail distance'ı ve trail activation'ı sıkılaştır."""
+    entry = pos['entryPrice']
+    side = pos['side']
+    
+    # Orijinal değerleri sakla (ilk seferde)
+    if 'original_sl' not in pos:
+        pos['original_sl'] = pos.get('stopLoss', 0)
+        pos['original_trail_distance'] = pos.get('trailDistance', 0)
+        pos['original_trail_activation'] = pos.get('trailActivation', entry)
+        pos['original_tp'] = pos.get('takeProfit', 0)
+    
+    orig_sl = pos['original_sl']
+    
+    # SL sıkılaştır (sadece trail aktif DEĞİLSE)
+    if not pos.get('isTrailingActive', False) and orig_sl > 0:
+        if side == 'LONG':
+            sl_distance = entry - orig_sl
+            new_sl = entry - (sl_distance * factor)
+            # Sadece yukarı taşı (daha sıkı = daha yüksek SL)
+            pos['stopLoss'] = max(new_sl, pos.get('stopLoss', 0))
+        else:  # SHORT
+            sl_distance = orig_sl - entry
+            new_sl = entry + (sl_distance * factor)
+            # Sadece aşağı taşı (daha sıkı = daha düşük SL)
+            pos['stopLoss'] = min(new_sl, pos.get('stopLoss', float('inf')))
+    
+    # Trail distance sıkılaştır
+    orig_td = pos.get('original_trail_distance', 0)
+    if orig_td > 0:
+        pos['trailDistance'] = orig_td * factor
+    
+    # Trail activation düşür (daha erken trail başlasın)
+    orig_ta = pos.get('original_trail_activation', entry)
+    if side == 'LONG':
+        ta_diff = orig_ta - entry
+        if ta_diff > 0:
+            pos['trailActivation'] = entry + (ta_diff * factor)
+    else:
+        ta_diff = entry - orig_ta
+        if ta_diff > 0:
+            pos['trailActivation'] = entry - (ta_diff * factor)
+    
+    pos['mtf_guard_factor'] = factor
+
+def _apply_widening(pos: dict, expand: float):
+    """Phase 215: TP ve trail distance genişlet (pro-trend + kârda)."""
+    entry = pos['entryPrice']
+    side = pos['side']
+    
+    if 'original_tp' not in pos:
+        pos['original_tp'] = pos.get('takeProfit', 0)
+        pos['original_trail_distance'] = pos.get('trailDistance', 0)
+    
+    orig_tp = pos.get('original_tp', 0)
+    orig_td = pos.get('original_trail_distance', 0)
+    
+    # TP genişlet
+    if orig_tp > 0:
+        if side == 'LONG':
+            tp_distance = orig_tp - entry
+            if tp_distance > 0:
+                pos['takeProfit'] = entry + (tp_distance * expand)
+        else:
+            tp_distance = entry - orig_tp
+            if tp_distance > 0:
+                pos['takeProfit'] = entry - (tp_distance * expand)
+    
+    # Trail distance genişlet (daha geniş trail = daha geç çıkış)
+    if orig_td > 0:
+        pos['trailDistance'] = orig_td * expand
+    
+    pos['mtf_guard_factor'] = expand
+
+async def apply_mtf_position_guard(positions: list, exchange):
+    """
+    Phase 215 Katman 2: Her 30 dakikada bir açık pozisyonlar için MTF re-evaluation.
+    Contra-trend → SL/Trail sıkılaştır
+    Pro-trend + kârda → TP/Trail genişlet
+    """
+    global _last_mtf_guard_update
+    now = datetime.now().timestamp()
+    
+    if now - _last_mtf_guard_update < 1800:  # 30 dakika
+        return
+    _last_mtf_guard_update = now
+    
+    if not positions or not exchange:
+        return
+    
+    logger.info(f"📊 MTF_GUARD: {len(positions)} pozisyon için trend re-evaluation başlıyor")
+    
+    for pos in positions:
+        try:
+            symbol = pos.get('symbol', '')
+            side = pos.get('side', 'LONG')
+            entry = pos.get('entryPrice', 0)
+            if entry <= 0 or not symbol:
+                continue
+            
+            # MTF trend güncelle (API call)
+            await mtf_confirmation.update_coin_trend(symbol, exchange)
+            mtf_result = mtf_confirmation.confirm_signal(symbol, side)
+            mtf_score = mtf_result.get('mtf_score', 0)
+            
+            # Mevcut PnL hesapla
+            current_price = pos.get('currentPrice', entry)
+            if side == 'LONG':
+                pnl_pct = ((current_price - entry) / entry) * 100
+            else:
+                pnl_pct = ((entry - current_price) / entry) * 100
+            
+            trends = mtf_result.get('trends', {})
+            trend_info = f"15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}"
+            
+            # ---- CONTRA-TREND SIKILAŞTIRMAa ----
+            if mtf_score < 0:
+                if mtf_score < -25:
+                    factor = 0.30   # çok agresif
+                elif mtf_score < -10:
+                    factor = 0.50
+                else:
+                    factor = 0.70
+                
+                _apply_tightening(pos, factor)
+                logger.warning(
+                    f"⚠️ MTF_GUARD TIGHTEN: {symbol} {side} | "
+                    f"MTF={mtf_score} | factor={factor:.0%} | PnL={pnl_pct:+.1f}% | {trend_info}"
+                )
+            
+            # ---- PRO-TREND GENİŞLETME (sadece kârda) ----
+            elif mtf_score > 25 and pnl_pct > 0:
+                if mtf_score > 50:
+                    expand = 1.40
+                else:
+                    expand = 1.20
+                
+                _apply_widening(pos, expand)
+                logger.info(
+                    f"📈 MTF_GUARD WIDEN: {symbol} {side} | "
+                    f"MTF={mtf_score} | expand={expand:.0%} | PnL={pnl_pct:+.1f}% | {trend_info}"
+                )
+            
+            else:
+                # Nötr — orijinal değerlere dön (varsa)
+                if 'original_sl' in pos:
+                    if not pos.get('isTrailingActive', False):
+                        pos['stopLoss'] = pos['original_sl']
+                    pos['trailDistance'] = pos.get('original_trail_distance', pos.get('trailDistance', 0))
+                    pos['trailActivation'] = pos.get('original_trail_activation', pos.get('trailActivation', entry))
+                if 'original_tp' in pos:
+                    pos['takeProfit'] = pos['original_tp']
+                pos.pop('mtf_guard_factor', None)
+                logger.debug(f"📊 MTF_GUARD NEUTRAL: {symbol} {side} | MTF={mtf_score} | restored originals")
+        
+        except Exception as guard_err:
+            logger.debug(f"MTF Guard error for {pos.get('symbol', '?')}: {guard_err}")
+
 def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: float = 0.0, spread_pct: float = 0.0) -> dict:
     """
     Get SL/TP/Trail/Leverage based on volatility (ATR as % of price).
@@ -7141,6 +7337,15 @@ async def background_scanner_loop():
                         time_actions = await time_based_position_manager.check_positions(global_paper_trader)
                         if time_actions.get('trail_activated') or time_actions.get('time_reduced'):
                             logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}")
+                        
+                        # Phase 215: Live MTF Position Guard (her 30 dakikada)
+                        try:
+                            await apply_mtf_position_guard(
+                                global_paper_trader.positions,
+                                multi_coin_scanner.exchange
+                            )
+                        except Exception as mtf_guard_err:
+                            logger.debug(f"MTF Guard error: {mtf_guard_err}")
                     
                     # UPDATE MTF TRENDS for coins with active signals (before processing)
                     for signal in multi_coin_scanner.active_signals:
@@ -8419,6 +8624,17 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.info(f"✅ REGIME BONUS: {action} {symbol} | Size: +{int(short_bonus*100)}%")
     except Exception as regime_err:
         logger.debug(f"Market Regime Filter error: {regime_err}")
+    
+    # ================================================================
+    # Phase 215: MA ALIGNMENT HARD VETO
+    # 4H + 1D + Supertrend üçü aynı yönde → ters sinyal HARD REJECT
+    # ================================================================
+    ma_vetoed, ma_veto_reason = check_ma_alignment_veto(symbol, action)
+    if ma_vetoed:
+        signal_log_data['reject_reason'] = f"MA_ALIGNMENT_VETO:{ma_veto_reason}"
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        logger.warning(f"🚫 MA_VETO: {action} {symbol} — {ma_veto_reason}")
+        return
     
     # MULTI-TIMEFRAME CONFIRMATION CHECK
     # Verify signal aligns with higher timeframe (1h) trend
