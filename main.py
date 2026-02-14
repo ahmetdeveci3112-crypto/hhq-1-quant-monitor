@@ -4225,10 +4225,8 @@ def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
             f"📊 FAILED_BREAK #{failed_count}/{max_attempts}: {pos.get('symbol','?')} {side} "
             f"(depth={min_profit_depth:.6f}, atr%={atr_pct:.1f}%)"
         )
-    elif not in_profit and not at_breakeven:
-        # Still in loss territory, not at breakeven
-        if was_in_profit:
-            pos['fc_was_in_profit'] = False
+    # Note: If price is in shallow profit (above entry but < 0.3 ATR), we keep
+    # was_in_profit=True so we correctly count the failed break when price returns to BE
     
     # ---- Check if max attempts reached ----
     if failed_count >= max_attempts:
@@ -8105,7 +8103,9 @@ async def position_price_update_loop():
                             continue
                         
                         # ---- Phase 214: FAILED CONTINUATION DETECTOR (backup) ----
-                        fc_result_bu = check_failed_continuation(pos, current_price)
+                        # Phase 214 fix: Use candle close price, not tick price
+                        fc_candle_close_bu = last_candle_close.get(symbol, current_price)
+                        fc_result_bu = check_failed_continuation(pos, fc_candle_close_bu)
                         if fc_result_bu == 'FAILED_CONTINUATION':
                             fc_count_bu = pos.get('fc_failed_count', 0)
                             logger.warning(f"📊 FAILED_CONTINUATION (backup): {symbol} {pos['side']} — {fc_count_bu} başarısız deneme")
