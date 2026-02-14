@@ -165,6 +165,8 @@ export interface SystemSettings {
   // Kill Switch settings
   killSwitchFirstReduction: number;  // -5 to -30: First reduction threshold (default -15)
   killSwitchFullClose: number;       // -10 to -50: Full close threshold (default -20)
+  // Phase 216: Leverage multiplier
+  leverageMultiplier: number;        // 0.3-3.0: User-controlled leverage multiplier (default 1.0)
 }
 
 // =============================================================================

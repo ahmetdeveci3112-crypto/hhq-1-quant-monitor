@@ -368,6 +368,42 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               4. Risk Yönetimi
             </h3>
 
+            {/* Phase 216: Leverage Multiplier Slider */}
+            <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 mb-4">
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-sm text-slate-300">Kaldıraç Çarpanı</label>
+                <span className={`text-sm font-mono font-bold ${(localSettings.leverageMultiplier ?? 1.0) < 0.7 ? 'text-emerald-400' :
+                    (localSettings.leverageMultiplier ?? 1.0) <= 1.3 ? 'text-blue-400' :
+                      (localSettings.leverageMultiplier ?? 1.0) <= 2.0 ? 'text-amber-400' :
+                        'text-rose-400'
+                  }`}>
+                  {(localSettings.leverageMultiplier ?? 1.0).toFixed(1)}x
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-500 mb-3">
+                ⚡ Hesaplanan kaldıracı bu çarpanla çarpar. 1.0x = değişiklik yok. Düşük = daha güvenli, yüksek = daha agresif.
+              </p>
+              <input
+                type="range"
+                min="0.3"
+                max="3.0"
+                step="0.1"
+                value={localSettings.leverageMultiplier ?? 1.0}
+                onChange={e => setLocalSettings({ ...localSettings, leverageMultiplier: parseFloat(e.target.value) })}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                <span>0.3x (Güvenli)</span>
+                <span>1.0x</span>
+                <span>3.0x (Agresif)</span>
+              </div>
+              <div className="mt-2 bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
+                {(localSettings.leverageMultiplier ?? 1.0) < 0.7 && '🛡️ Düşük kaldıraç — Sermaye koruma öncelikli'}
+                {(localSettings.leverageMultiplier ?? 1.0) >= 0.7 && (localSettings.leverageMultiplier ?? 1.0) <= 1.3 && '⚖️ Normal kaldıraç — Standart risk/ödül dengesi'}
+                {(localSettings.leverageMultiplier ?? 1.0) > 1.3 && (localSettings.leverageMultiplier ?? 1.0) <= 2.0 && '⚡ Yüksek kaldıraç — Artırılmış risk, dikkatli olun'}
+                {(localSettings.leverageMultiplier ?? 1.0) > 2.0 && '🔥 Çok yüksek kaldıraç — Maksimum risk, tasfiye tehlikesi!'}
+              </div>
+            </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs text-slate-300 mb-1">Stop Loss (ATR)</label>

@@ -14159,16 +14159,18 @@ class SignalGenerator:
             balance_protector.peak_balance
         )
         
-        # COMBINED LEVERAGE: base × volatility × balance_protection
+        # COMBINED LEVERAGE: base × volatility × balance_protection × user_multiplier
         # Phase 152: price_factor kaldırıldı — get_volatility_adjusted_params zaten uyguluyor
-        final_leverage = int(round(base_leverage * volatility_factor * leverage_mult))
+        # Phase 216: User-controlled leverage multiplier from settings
+        user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+        final_leverage = int(round(base_leverage * volatility_factor * leverage_mult * user_lev_mult))
         
         # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
         
         # Log if any factor reduced leverage significantly
-        if volatility_factor < 0.9 or leverage_mult < 0.9:
-            logger.info(f"📊 Unified Leverage: base={base_leverage}x × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
+        if volatility_factor < 0.9 or leverage_mult < 0.9 or user_lev_mult != 1.0:
+            logger.info(f"📊 Unified Leverage: base={base_leverage}x × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} × user={user_lev_mult:.1f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
         
         # Use spread-based SL/TP multipliers (override regime-based)
         atr_sl = spread_params['sl_multiplier']
@@ -14867,7 +14869,8 @@ class PaperTradingEngine:
         else:
             session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
             leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
-            adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
+            user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+            adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
             adjusted_leverage = max(3, min(75, adjusted_leverage))
         
         # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
@@ -16001,7 +16004,8 @@ class PaperTradingEngine:
         
         # Apply BalanceProtector leverage multiplier
         leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
-        adjusted_leverage = int(session_adjusted_leverage * leverage_mult)
+        user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+        adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
         adjusted_leverage = max(3, min(75, adjusted_leverage))
         
         # Get size multiplier from signal and BalanceProtector
@@ -17916,7 +17920,9 @@ async def paper_trading_get_settings():
         },
         # Phase 57: Kill Switch settings
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
-        "killSwitchFullClose": daily_kill_switch.full_close_pct
+        "killSwitchFullClose": daily_kill_switch.full_close_pct,
+        # Phase 216: Leverage multiplier
+        "leverageMultiplier": getattr(global_paper_trader, 'leverage_multiplier', 1.0)
     })
 
 @app.post("/paper-trading/settings")
@@ -17936,7 +17942,8 @@ async def paper_trading_update_settings(
     entryTightness: float = None,
     exitTightness: float = None,
     killSwitchFirstReduction: float = None,
-    killSwitchFullClose: float = None
+    killSwitchFullClose: float = None,
+    leverageMultiplier: float = None
 ):
     """Update cloud trading settings."""
     if symbol:
@@ -17986,6 +17993,12 @@ async def paper_trading_update_settings(
     if killSwitchFullClose is not None:
         daily_kill_switch.full_close_pct = killSwitchFullClose
         logger.info(f"🚨 Kill Switch Full Close updated: {killSwitchFullClose}%")
+    
+    # Phase 216: Leverage multiplier
+    if leverageMultiplier is not None:
+        clamped = max(0.3, min(3.0, leverageMultiplier))
+        global_paper_trader.leverage_multiplier = clamped
+        logger.info(f"⚡ Leverage Multiplier updated: {clamped:.1f}x")
     
     # Log settings change (simplified)
     global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")

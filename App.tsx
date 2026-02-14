@@ -300,7 +300,8 @@ export default function App() {
     entryTightness: 1.8,
     exitTightness: 1.2,
     killSwitchFirstReduction: -100,
-    killSwitchFullClose: -150
+    killSwitchFullClose: -150,
+    leverageMultiplier: 1.0
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -591,7 +592,8 @@ export default function App() {
           entryTightness: data.entryTightness ?? 1.8,
           exitTightness: data.exitTightness ?? 1.2,
           killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
-          killSwitchFullClose: data.killSwitchFullClose ?? -150
+          killSwitchFullClose: data.killSwitchFullClose ?? -150,
+          leverageMultiplier: data.leverageMultiplier ?? 1.0
         });
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
@@ -658,7 +660,8 @@ export default function App() {
           entryTightness: String(settings.entryTightness),
           exitTightness: String(settings.exitTightness),
           killSwitchFirstReduction: String(settings.killSwitchFirstReduction),
-          killSwitchFullClose: String(settings.killSwitchFullClose)
+          killSwitchFullClose: String(settings.killSwitchFullClose),
+          leverageMultiplier: String(settings.leverageMultiplier ?? 1.0)
         });
         const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
         if (res.ok) {
@@ -1687,10 +1690,10 @@ export default function App() {
                         SL Guard
                       </h4>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.stoploss_guard.global_locked
-                          ? 'bg-rose-500/20 text-rose-400 animate-pulse'
-                          : phase193Status.stoploss_guard.enabled
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : 'bg-slate-500/20 text-slate-400'
+                        ? 'bg-rose-500/20 text-rose-400 animate-pulse'
+                        : phase193Status.stoploss_guard.enabled
+                          ? 'bg-emerald-500/20 text-emerald-400'
+                          : 'bg-slate-500/20 text-slate-400'
                         }`}>
                         {phase193Status.stoploss_guard.global_locked ? '🔒 LOCKED' : phase193Status.stoploss_guard.enabled ? '🟢 Aktif' : '⚫ Pasif'}
                       </span>
@@ -1722,10 +1725,10 @@ export default function App() {
                         FreqAI ML
                       </h4>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.freqai.is_trained
-                          ? 'bg-emerald-500/20 text-emerald-400'
-                          : phase193Status.freqai.enabled
-                            ? 'bg-amber-500/20 text-amber-400'
-                            : 'bg-slate-500/20 text-slate-400'
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : phase193Status.freqai.enabled
+                          ? 'bg-amber-500/20 text-amber-400'
+                          : 'bg-slate-500/20 text-slate-400'
                         }`}>
                         {phase193Status.freqai.is_trained ? '✅ Trained' : phase193Status.freqai.enabled ? '⏳ Waiting' : '⚫ Pasif'}
                       </span>
@@ -1760,10 +1763,10 @@ export default function App() {
                         Hyperopt
                       </h4>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.hyperopt.is_optimized
-                          ? 'bg-emerald-500/20 text-emerald-400'
-                          : phase193Status.hyperopt.enabled
-                            ? 'bg-amber-500/20 text-amber-400'
-                            : 'bg-slate-500/20 text-slate-400'
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : phase193Status.hyperopt.enabled
+                          ? 'bg-amber-500/20 text-amber-400'
+                          : 'bg-slate-500/20 text-slate-400'
                         }`}>
                         {phase193Status.hyperopt.is_optimized ? '✅ Optimized' : phase193Status.hyperopt.enabled ? '⏳ Ready' : '⚫ Pasif'}
                       </span>
