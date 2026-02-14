@@ -3029,6 +3029,10 @@ async def binance_position_sync_loop():
                             'dynamicTrailDistance': trail_distance_atr,  # Phase 151: Store multiplier
                             'isLive': True,
                             'isSynced': True,  # Mark as synced from Binance
+                            # Phase 214: Failed Continuation Detector
+                            'fc_was_in_profit': False,
+                            'fc_failed_count': 0,
+                            'fc_max_profit_pct': 0.0,
                         }
                         
                         global_paper_trader.positions.append(new_pos)
@@ -4137,6 +4141,100 @@ def get_dynamic_trail_params(
         final_distance = max(final_distance, base_distance * 1.5)  # At least 1.5x base for trending
     
     return round(final_activation, 2), round(final_distance, 2)
+
+def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
+    """
+    Phase 214: Failed Continuation Detector
+    Kalıcılık sağlayamayan pozisyonları tespit eder.
+    
+    Mantık: Fiyat N kez meaningful profit zone'a girip entry'ye geri dönüyorsa,
+    giriş noktası yanlıştır → breakeven'da kapat.
+    
+    Returns: 'FAILED_CONTINUATION' if position should be closed, else ''
+    """
+    entry_price = pos.get('entryPrice', 0)
+    if entry_price <= 0:
+        return ''
+    
+    side = pos.get('side', 'LONG')
+    pos_atr = pos.get('atr', entry_price * 0.02)
+    atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
+    
+    # Skip if position already reached 5%+ profit (trail handles it)
+    fc_max_profit = pos.get('fc_max_profit_pct', 0.0)
+    if fc_max_profit >= 5.0:
+        return ''
+    
+    # ---- Dynamic max attempts based on ATR% ----
+    if atr_pct < 2.0:
+        max_attempts = 4   # BTC/ETH — low noise
+    elif atr_pct < 4.0:
+        max_attempts = 3   # Medium volatility
+    elif atr_pct < 8.0:
+        max_attempts = 3   # High volatility
+    else:
+        max_attempts = 2   # Meme coin — fast exit
+    
+    # Trend mode: +1 tolerance
+    if pos.get('trend_mode', False):
+        max_attempts += 1
+    
+    # Clamp to 2-4 range (5 with trend mode)
+    max_attempts = max(2, min(5, max_attempts))
+    
+    # Time-based reduction: after 8 hours, -1 attempt (min 2)
+    open_time = pos.get('openTime', 0)
+    if open_time > 0:
+        elapsed_hours = (datetime.now().timestamp() * 1000 - open_time) / (1000 * 3600)
+        if elapsed_hours >= 8:
+            max_attempts = max(2, max_attempts - 1)
+    
+    # ---- Calculate current profit state ----
+    # Minimum profit depth: 0.3× ATR for meaningful move
+    min_profit_depth = pos_atr * 0.3
+    # Breakeven zone: entry ± 0.05%
+    be_tolerance = entry_price * 0.0005
+    
+    if side == 'LONG':
+        price_vs_entry = candle_close_price - entry_price
+        in_profit = price_vs_entry >= min_profit_depth
+        at_breakeven = abs(candle_close_price - entry_price) <= be_tolerance
+    else:  # SHORT
+        price_vs_entry = entry_price - candle_close_price
+        in_profit = price_vs_entry >= min_profit_depth
+        at_breakeven = abs(candle_close_price - entry_price) <= be_tolerance
+    
+    # Track max profit % seen
+    current_pnl_pct = abs(pos.get('unrealizedPnlPercent', 0))
+    if current_pnl_pct > fc_max_profit:
+        pos['fc_max_profit_pct'] = current_pnl_pct
+    
+    was_in_profit = pos.get('fc_was_in_profit', False)
+    failed_count = pos.get('fc_failed_count', 0)
+    
+    # ---- State machine ----
+    if in_profit and not was_in_profit:
+        # Entered meaningful profit zone
+        pos['fc_was_in_profit'] = True
+    elif (at_breakeven or price_vs_entry < 0) and was_in_profit:
+        # Was profitable, now back at breakeven or losing → failed break
+        pos['fc_failed_count'] = failed_count + 1
+        pos['fc_was_in_profit'] = False
+        failed_count = pos['fc_failed_count']
+        logger.info(
+            f"📊 FAILED_BREAK #{failed_count}/{max_attempts}: {pos.get('symbol','?')} {side} "
+            f"(depth={min_profit_depth:.6f}, atr%={atr_pct:.1f}%)"
+        )
+    elif not in_profit and not at_breakeven:
+        # Still in loss territory, not at breakeven
+        if was_in_profit:
+            pos['fc_was_in_profit'] = False
+    
+    # ---- Check if max attempts reached ----
+    if failed_count >= max_attempts:
+        return 'FAILED_CONTINUATION'
+    
+    return ''
 
 def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: float = 0.0, spread_pct: float = 0.0) -> dict:
     """
@@ -7403,6 +7501,19 @@ async def background_scanner_loop():
                                     global_paper_trader.close_position(pos, current_price, 'TP_HIT')
                                     continue
                             
+                            # ===================================================================
+                            # Phase 214: FAILED CONTINUATION DETECTOR
+                            # N kez kâra geçip entry'ye geri dönen pozisyonları breakeven'da kapat
+                            # ===================================================================
+                            fc_result = check_failed_continuation(pos, candle_close_price)
+                            if fc_result == 'FAILED_CONTINUATION':
+                                fc_count = pos.get('fc_failed_count', 0)
+                                logger.warning(f"📊 FAILED_CONTINUATION: {pos_symbol} {pos['side']} — {fc_count} başarısız deneme, breakeven kapatılıyor")
+                                # Breakeven close: entry + spread buffer
+                                be_exit_price = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+                                global_paper_trader.close_position(pos, be_exit_price, 'FAILED_CONTINUATION')
+                                continue
+                            
                             # Update trailing stop if in profit
                             trail_activation = pos.get('trailActivation', entry_price)
                             trail_distance = pos.get('trailDistance', 0)
@@ -7764,6 +7875,15 @@ async def on_position_price_update(symbol: str, ticker: dict):
             logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
             continue
         
+        # ---- Phase 214: FAILED CONTINUATION DETECTOR (WS) ----
+        fc_result_ws = check_failed_continuation(pos, candle_close_price)
+        if fc_result_ws == 'FAILED_CONTINUATION':
+            fc_count_ws = pos.get('fc_failed_count', 0)
+            logger.warning(f"📊 FAILED_CONTINUATION (WS): {symbol} {pos['side']} — {fc_count_ws} başarısız deneme")
+            be_exit_ws = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+            global_paper_trader.close_position(pos, be_exit_ws, 'FAILED_CONTINUATION')
+            continue
+        
         # ---- Trailing Stop Güncelle ----
         trail_activation = pos.get('trailActivation', entry_price)
         trail_distance = pos.get('trailDistance', 0)
@@ -7982,6 +8102,15 @@ async def position_price_update_loop():
                         elif pos['side'] == 'SHORT' and current_price <= tp:
                             global_paper_trader.close_position(pos, current_price, 'TP_HIT')
                             logger.info(f"✅ TP triggered: SHORT {symbol} @ ${current_price:.6f}")
+                            continue
+                        
+                        # ---- Phase 214: FAILED CONTINUATION DETECTOR (backup) ----
+                        fc_result_bu = check_failed_continuation(pos, current_price)
+                        if fc_result_bu == 'FAILED_CONTINUATION':
+                            fc_count_bu = pos.get('fc_failed_count', 0)
+                            logger.warning(f"📊 FAILED_CONTINUATION (backup): {symbol} {pos['side']} — {fc_count_bu} başarısız deneme")
+                            be_exit_bu = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+                            global_paper_trader.close_position(pos, be_exit_bu, 'FAILED_CONTINUATION')
                             continue
                         
                         # Update trailing stop if in profit
@@ -14956,7 +15085,11 @@ class PaperTradingEngine:
             "mtfScore": order.get('mtfScore', 0),
             "zScore": order.get('zScore', 0),
             # Phase 202: Trend Mode flag for stepped SL
-            "trend_mode": is_trend_mode
+            "trend_mode": is_trend_mode,
+            # Phase 214: Failed Continuation Detector
+            "fc_was_in_profit": False,
+            "fc_failed_count": 0,
+            "fc_max_profit_pct": 0.0,
         }
         
         # =====================================================================
@@ -15689,7 +15822,11 @@ class PaperTradingEngine:
             "unrealizedPnlPercent": 0.0,
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": adjusted_leverage,  # Phase 29: Store leverage
-            "spreadLevel": signal.get('spreadLevel', 'normal')  # Phase 29: Store spread level
+            "spreadLevel": signal.get('spreadLevel', 'normal'),  # Phase 29: Store spread level
+            # Phase 214: Failed Continuation Detector
+            "fc_was_in_profit": False,
+            "fc_failed_count": 0,
+            "fc_max_profit_pct": 0.0,
         }
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -15933,6 +16070,9 @@ class PaperTradingEngine:
             
             # Signal Reversal
             'SIGNAL_REVERSAL_PROFIT': f"🔄 REVERSAL: Sinyal Değişimi Karlı Çıkış ({pnl_percent:+.1f}%)",
+            
+            # Phase 214: Failed Continuation
+            'FAILED_CONTINUATION': f"🔄 FAILED_CONT: Kalıcılık Sağlanamadı — {pos.get('fc_failed_count', 0)} başarısız deneme ({pnl_percent:+.1f}%)",
         }
         
         return reason_map.get(reason, f"📋 {reason} ({pnl_percent:+.1f}%)")
@@ -17819,7 +17959,11 @@ async def paper_trading_market_order(request: Request):
             "unrealizedPnl": 0,
             "unrealizedPnlPercent": 0,
             "openTime": int(datetime.now().timestamp() * 1000),
-            "leverage": leverage
+            "leverage": leverage,
+            # Phase 214: Failed Continuation Detector
+            "fc_was_in_profit": False,
+            "fc_failed_count": 0,
+            "fc_max_profit_pct": 0.0,
         }
         
         global_paper_trader.positions.append(position)
