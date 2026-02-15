@@ -7852,18 +7852,19 @@ async def background_scanner_loop():
                             
                             # ===================================================================
                             # PROFIT-BASED TRAIL: Kâr arttıkça trail mesafesi sıkılaşır
-                            # Phase 213: Yumuşatıldı — trending coinlerde erken çıkış engellendi
+                            # Phase 222: Granüler ROI bazlı trail daraltma
                             # ===================================================================
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                            if pnl_pct >= 15.0:
-                                # Çok yüksek kâr: trail mesafesini %70'e küçült (was 0.5)
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.7
+                            if pnl_pct >= 25.0:
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.4   # Çok yüksek kâr: çok sıkı
+                            elif pnl_pct >= 15.0:
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.55  # Yüksek kâr
                             elif pnl_pct >= 8.0:
-                                # Yüksek kâr: trail mesafesini %85'e küçült (was 0.75)
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.85
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.70  # Orta kâr
+                            elif pnl_pct >= 4.0:
+                                dynamic_trail_distance = volatility_adjusted_distance * 0.85  # Düşük kâr
                             else:
-                                # Normal: volatilite ayarlı mesafe
-                                dynamic_trail_distance = volatility_adjusted_distance
+                                dynamic_trail_distance = volatility_adjusted_distance          # Normal
                             
                             # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
                             leverage = pos.get('leverage', 10)
@@ -7872,7 +7873,7 @@ async def background_scanner_loop():
                             else:
                                 price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
                             roi_pct = price_move_pct * leverage
-                            min_roi_for_trail = 1.5  # %1.5 ROI minimum
+                            min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
                             
                             if pos['side'] == 'LONG':
                                 # Phase 213: Trail only activates when ROI >= 1.5% AND price > trail_activation
@@ -8227,7 +8228,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
         else:
             ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
         ws_roi_pct = ws_price_move_pct * ws_leverage
-        ws_min_roi_for_trail = 1.5  # %1.5 ROI minimum
+        ws_min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
         
         # Phase 205 + Phase 213: Use candle close for trail activation & ratchet with ROI gate
         if pos['side'] == 'LONG' and candle_close_price > trail_activation and ws_roi_pct >= ws_min_roi_for_trail:
@@ -8547,7 +8548,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         # Phase 200: Counter-signal detection — ters sinyal varsa exit_tightness modifier uygula
         if existing_side != action:
             # Ters sinyal! Skor bazlı modifier hesapla
-            signal_score = signal.get('score', 0)
+            signal_score = signal.get('confidenceScore', 0)  # Phase 223: was 'score' (field didn't exist)
             if signal_score >= 90:
                 modifier = 0.4
             elif signal_score >= 80:
@@ -10739,6 +10740,17 @@ class PositionBasedKillSwitch:
                 # Get DYNAMIC thresholds based on this position's leverage
                 first_threshold, full_threshold = self.get_dynamic_thresholds(leverage)
                 
+                # Phase 222: Kill Switch must not trigger before SL
+                sl_price = pos.get('stopLoss', 0)
+                if sl_price > 0 and entry_price > 0:
+                    if side == 'LONG':
+                        sl_roi = ((sl_price - entry_price) / entry_price) * 100 * leverage
+                    else:
+                        sl_roi = ((entry_price - sl_price) / entry_price) * 100 * leverage
+                    # SL ROI is negative for losses — if SL would close at a tighter loss than kill switch, let SL handle it
+                    if -sl_roi > -full_threshold:
+                        continue
+                
                 # Log for debugging with dynamic thresholds
                 logger.info(f"🎯 Kill switch check {symbol} [{leverage}x]: ROI={position_loss_pct:.1f}% | Thresholds: {first_threshold:.0f}%/{full_threshold:.0f}%")
                 
@@ -10946,7 +10958,7 @@ class TimeBasedPositionManager:
                 # ===============================================
                 if unrealized_pnl > 0 and contracts > 0:
                     # Get spread level and ATR for dynamic TP calculation
-                    spread_level = pos.get('spread_level', 'Normal')
+                    spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223: was only 'spread_level'
                     atr = pos.get('atr', current_price * 0.02)
                     
                     # ATR as percentage of price
@@ -10966,10 +10978,11 @@ class TimeBasedPositionManager:
                     base_tp_pct = atr_pct * mult
                     
                     # TP levels: 100%, 150%, 250% of base
+                    # Phase 222: TP1 %40 kapatma, TP2/3 daha geniş aralık
                     tp_levels = [
-                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.25, 'key': 'tp1'},
-                        {'pct': base_tp_pct * 1.5, 'close_pct': 0.25, 'key': 'tp2'},
-                        {'pct': base_tp_pct * 2.5, 'close_pct': 0.25, 'key': 'tp3'},
+                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.40, 'key': 'tp1'},
+                        {'pct': base_tp_pct * 2.0, 'close_pct': 0.30, 'key': 'tp2'},
+                        {'pct': base_tp_pct * 3.5, 'close_pct': 0.30, 'key': 'tp3'},
                     ]
                     
                     # Current profit percentage
@@ -11214,7 +11227,7 @@ class TimeBasedPositionManager:
                                 paper_trader.trades.append(trade_record)
                                 paper_trader.stats['totalTrades'] += 1
                                 if partial_pnl > 0:
-                                    paper_trader.stats['winTrades'] += 1
+                                    paper_trader.stats['winningTrades'] += 1  # Phase 223: was 'winTrades' (KeyError)
                                 
                                 # Phase 56: If 100% reduction, mark position for removal
                                 if reduction_pct >= 1.0 or pos.get('size', 0) <= 0 or pos.get('sizeUsd', 0) <= 0.01:
@@ -14480,7 +14493,7 @@ class SignalGenerator:
         reasons.append(f"Lev({final_leverage}x)")
         
         # Debug: Log the actual ATR% value and what level it maps to
-        logger.info(f"📊 Signal {signal_side}: ATR%={spread_pct:.2f}% PB%={pullback_pct*100:.2f}% (ATR:{atr_pct*100:.1f}%+Spread:{spread_pct:.2f}%) → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")
+        logger.info(f"📊 Signal {signal_side}: Spread%={spread_pct:.2f}% PB%={pullback_pct*100:.2f}% (ATR:{atr_pct*100:.1f}%+Spread:{spread_pct:.2f}%) → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")  # Phase 223: label was ATR% but value was spread_pct
         
         # Phase 127: Log successful signal generation for tracing
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
@@ -14550,7 +14563,7 @@ class PaperTradingEngine:
         self.sl_atr = 15  # 1.5x ATR — tighter SL for better R:R
         self.tp_atr = 30  # 3.0x ATR — wider TP for better R:R
         self.trail_activation_atr = 1.5
-        self.trail_distance_atr = 1.0
+        self.trail_distance_atr = 1.5  # Phase 222: 1.0→1.5 (trail %80 loss rate fix)
         self.sl_multiplier = 2.0  # ATR multiplier for SL (used in sync loop)
         self.tp_multiplier = 3.0  # ATR multiplier for TP (used in sync loop)
         # Phase 22: Multi-position config
@@ -15347,8 +15360,9 @@ class PaperTradingEngine:
                     order['trailEntryDistance'] = trail_entry_dist
                     
                     trail_pct = (trail_entry_dist / entry_price * 100) if entry_price > 0 else 0
-                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}% (ATR×{trail_factor:.2f}×ET{et_mult:.2f}×SP{spread_trail_mult:.1f})")
-                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness} spread={order_spread}×{spread_trail_mult}")
+                    # Phase 223: Fixed NameError — et_mult, spread_trail_mult, order_spread were undefined in this scope
+                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}%")
+                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness}")
             else:
                 # Step 2: Trailing entry active — track extreme and check reversal
                 # This mirrors Trail TP: track peakPrice, trigger when price drops by trail_distance
