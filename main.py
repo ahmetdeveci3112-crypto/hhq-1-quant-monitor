@@ -2989,8 +2989,12 @@ async def binance_position_sync_loop():
                                 bp['spread_level'] = 'Normal'
                             elif real_spread < 0.40:
                                 bp['spread_level'] = 'High'
-                            else:
+                            elif real_spread < 0.80:
                                 bp['spread_level'] = 'Very High'
+                            elif real_spread < 1.50:
+                                bp['spread_level'] = 'Extreme'
+                            else:
+                                bp['spread_level'] = 'Ultra'
                             bp['atr_pct'] = real_spread  # Store real spread as atr_pct for compatibility
                         elif analyzer and hasattr(analyzer, 'highs') and hasattr(analyzer, 'lows') and hasattr(analyzer, 'closes'):
                             # ATR fallback when no bookTicker data
@@ -3885,14 +3889,16 @@ def calculate_spread_level(atr_pct: float = None, highs: list = None, lows: list
         highs, lows, closes: Raw price data to calculate volatility (optional)
         
     Returns:
-        Spread level: 'Very Low', 'Low', 'Normal', 'High', 'Very High'
+        Spread level: 'Very Low', 'Low', 'Normal', 'High', 'Very High', 'Extreme', 'Ultra'
         
     Thresholds (based on typical crypto volatility):
     - Very Low: ATR < 1% (BTC, ETH)
     - Low: ATR 1-2%
     - Normal: ATR 2-4%
     - High: ATR 4-7%  
-    - Very High: ATR > 7% (meme coins)
+    - Very High: ATR 7-12% (meme coins)
+    - Extreme: ATR 12-20% (hyper-volatile)
+    - Ultra: ATR > 20% (extreme edge cases)
     """
     
     # Calculate volatility from candle data if not provided
@@ -3930,8 +3936,12 @@ def calculate_spread_level(atr_pct: float = None, highs: list = None, lows: list
         return 'Normal'     # Mid caps
     elif atr_pct < 7.0:
         return 'High'       # Small caps, volatile
-    else:
+    elif atr_pct < 12.0:
         return 'Very High'  # Meme coins, very volatile
+    elif atr_pct < 20.0:
+        return 'Extreme'    # Hyper-volatile, new launches
+    else:
+        return 'Ultra'      # Extreme edge cases
 
 
 def calculate_atr_percentage(symbol: str, highs: list, lows: list, closes: list, period: int = 14) -> float:
@@ -4150,7 +4160,9 @@ VOLATILITY_LEVELS = {
     "low":       {"max_atr_pct": 20.0,  "trail": 1.0, "sl": 2.0, "tp": 3.0, "leverage": 10, "pullback": 0.006},  # <20% = 10x (was 25x)
     "normal":    {"max_atr_pct": 30.0,  "trail": 1.5, "sl": 2.5, "tp": 4.0, "leverage": 7,  "pullback": 0.012},  # <30% = 7x (was 10x)
     "high":      {"max_atr_pct": 50.0,  "trail": 2.0, "sl": 3.0, "tp": 5.0, "leverage": 5,  "pullback": 0.018},  # <50% = 5x
-    "very_high": {"max_atr_pct": 100,   "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024}   # 50%+ = 3x
+    "very_high": {"max_atr_pct": 70.0,  "trail": 3.0, "sl": 4.0, "tp": 6.0, "leverage": 3,  "pullback": 0.024},  # <70% = 3x
+    "extreme":   {"max_atr_pct": 90.0,  "trail": 4.0, "sl": 5.0, "tp": 8.0, "leverage": 3,  "pullback": 0.030},  # <90% = 3x, hyper-volatile
+    "ultra":     {"max_atr_pct": 999,   "trail": 5.0, "sl": 6.0, "tp": 10.0,"leverage": 3,  "pullback": 0.036}   # 90%+ = 3x, extreme
 }
 
 # =====================================================
@@ -4627,8 +4639,8 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
                 "level": level.replace('_', ' ').title()
             }
     
-    # Default to very_high
-    params = VOLATILITY_LEVELS["very_high"]
+    # Default to ultra
+    params = VOLATILITY_LEVELS["ultra"]
     base_leverage = params["leverage"]
     
     # Apply logarithmic Combined Formula for default case too
@@ -4652,7 +4664,7 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
         "sl_multiplier": params["sl"],
         "tp_multiplier": params["tp"],
         "trail_multiplier": params["trail"],
-        "level": "Very High"  # Phase 223c: Title Case
+        "level": "Ultra"  # Phase 228: New top level
     }
 
 
@@ -11135,7 +11147,9 @@ class TimeBasedPositionManager:
                         'Low': 0.75,
                         'Normal': 1.0,
                         'High': 1.5,
-                        'Very High': 2.5   # Meme coins - wider TPs
+                        'Very High': 2.5,  # Meme coins - wider TPs
+                        'Extreme': 3.5,    # Hyper-volatile
+                        'Ultra': 5.0       # Extreme edge cases
                     }
                     mult = spread_mults.get(spread_level, 1.0)
                     
@@ -11215,7 +11229,8 @@ class TimeBasedPositionManager:
                                     # 2) Move SL to breakeven (entry + fee buffer)
                                     fee_buffers = {
                                         'Very Low': 0.005, 'Low': 0.005, 'Normal': 0.006,
-                                        'High': 0.008, 'Very High': 0.010
+                                        'High': 0.008, 'Very High': 0.010,
+                                        'Extreme': 0.015, 'Ultra': 0.020
                                     }
                                     fee_buffer = fee_buffers.get(spread_level, 0.006)
                                     if side == 'LONG':
@@ -11272,7 +11287,9 @@ class TimeBasedPositionManager:
                             'Low': 0.75,
                             'Normal': 1.0,
                             'High': 1.5,
-                            'Very High': 2.0   # Meme coins - wait for larger pullback
+                            'Very High': 2.0,  # Meme coins - wait for larger pullback
+                            'Extreme': 3.0,    # Hyper-volatile
+                            'Ultra': 4.0       # Extreme edge cases
                         }
                         multiplier = spread_multipliers.get(spread_level, 1.0)
                         pullback_threshold = atr * multiplier
@@ -11672,6 +11689,8 @@ class BreakevenStopManager:
             'Normal':    {'floor': 1.0, 'atr_mult': 1.5},   # Mid-cap
             'High':      {'floor': 1.5, 'atr_mult': 2.0},   # Low liquidity
             'Very High': {'floor': 2.0, 'atr_mult': 2.5},   # Meme coins
+            'Extreme':   {'floor': 3.0, 'atr_mult': 3.0},   # Hyper-volatile
+            'Ultra':     {'floor': 4.0, 'atr_mult': 4.0},   # Extreme edge cases
         }
         
         # Phase 185: Fee buffer increased — minimum 0.5% for all levels
@@ -11683,6 +11702,8 @@ class BreakevenStopManager:
             'Normal':    0.006,   # 0.60% (was 0.15%)
             'High':      0.008,   # 0.80% (was 0.20%)
             'Very High': 0.010,   # 1.00% (was 0.30%)
+            'Extreme':   0.015,   # 1.50%
+            'Ultra':     0.020,   # 2.00%
         }
         
         # Phase 190: Reduced min age from 30 to 5 minutes
@@ -11975,7 +11996,9 @@ class LossRecoveryTrailManager:
             'Low': -4.0,
             'Normal': -5.0,
             'High': -7.0,
-            'Very High': -10.0  # Meme coins - need more room
+            'Very High': -10.0, # Meme coins - need more room
+            'Extreme': -15.0,   # Hyper-volatile
+            'Ultra': -20.0      # Extreme edge cases
         }
         
         # Recovery percentages
@@ -13698,7 +13721,9 @@ class ScoreComponentAnalyzer:
             'Low': 0.7,
             'Normal': 0.5,
             'High': 0.3,
-            'Very High': 0.1
+            'Very High': 0.1,
+            'Extreme': 0.05,
+            'Ultra': 0.02
         }
         return mapping.get(spread_level, 0.5)
     
@@ -16110,6 +16135,8 @@ class PaperTradingEngine:
         # Spread adjustment: yüksek spread → daha uzun bekle
         if spread_level in ('High', 'Very High'):
             base_wait_min += 2
+        elif spread_level in ('Extreme', 'Ultra'):
+            base_wait_min += 4
         
         signal_confirmation_delay_seconds = base_wait_min * 60
         
@@ -17461,7 +17488,9 @@ class PaperTradingEngine:
                 'Low':      3.0,
                 'Normal':   4.0,
                 'High':     6.0,   # High spread = later trail
-                'Very High': 8.0   # Meme — very volatile, late trail
+                'Very High': 8.0,  # Meme — very volatile, late trail
+                'Extreme':  12.0,  # Hyper-volatile
+                'Ultra':    16.0   # Extreme edge cases
             }
             base_activation_roi = spread_activation_map.get(pos.get('spreadLevel', pos.get('spread_level', 'Normal')), 4.0)  # Phase 223c
             # Phase 218: Trail threshold must account for leverage — otherwise tiny price moves
