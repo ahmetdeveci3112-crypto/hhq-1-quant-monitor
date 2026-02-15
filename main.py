@@ -6994,10 +6994,13 @@ class MultiCoinScanner:
                     bid_ask_spread = ((ask - bid) / mid) * 100  # Midpoint-based percentage
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                     analyzer.opportunity.has_real_spread = True
+                    # Diagnostic: log first coin's spread each scan
+                    if coin_count <= 1:
+                        logger.info(f"📊 SPREAD_OK: {symbol} bid={bid} ask={ask} spread={bid_ask_spread:.4f}% hasReal=True")
                 else:
-                    # Debug: log when bid/ask is missing or invalid
-                    if coin_count <= 3:  # Only first 3 to avoid spam
-                        logger.debug(f"📊 SPREAD_DEBUG: {symbol} bid={bid} ask={ask} — no valid spread")
+                    # Diagnostic: log when bid/ask is missing or invalid
+                    if coin_count <= 1:
+                        logger.info(f"📊 SPREAD_MISS: {symbol} bid={bid} ask={ask} — no valid spread, hasReal stays False")
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
