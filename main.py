@@ -5904,13 +5904,13 @@ class BinanceWebSocketManager:
             if not symbol.endswith('USDT'):
                 continue
                 
-            # Calculate simple imbalance from bid/ask quantities
+            # Calculate simple imbalance from bid/ask quantities (may be 0 for futures ticker)
             bid_qty = float(ticker.get('B', 0))  # Best bid quantity
             ask_qty = float(ticker.get('A', 0))  # Best ask quantity
-            imbalance = 0.0
-            if bid_qty + ask_qty > 0:
-                imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100  # -100 to +100
-                
+            
+            # Preserve existing bid/ask from bookTicker (futures ticker@arr doesn't have b/a)
+            existing = self.tickers.get(symbol, {})
+            
             self.tickers[symbol] = {
                 'last': float(ticker.get('c', 0)),  # Close price
                 'percentage': float(ticker.get('P', 0)),  # Price change percent
@@ -5918,11 +5918,11 @@ class BinanceWebSocketManager:
                 'baseVolume': float(ticker.get('v', 0)),  # Base asset volume (Phase 178)
                 'high': float(ticker.get('h', 0)),  # High
                 'low': float(ticker.get('l', 0)),  # Low
-                'bid': float(ticker.get('b', 0)),  # Best bid price
-                'ask': float(ticker.get('a', 0)),  # Best ask price
-                'bidQty': bid_qty,  # Best bid quantity
-                'askQty': ask_qty,  # Best ask quantity
-                'imbalance': imbalance,  # Simple L1 imbalance
+                'bid': existing.get('bid', 0),  # Preserved from bookTicker
+                'ask': existing.get('ask', 0),  # Preserved from bookTicker
+                'bidQty': existing.get('bidQty', bid_qty),  # Preserved from bookTicker
+                'askQty': existing.get('askQty', ask_qty),  # Preserved from bookTicker
+                'imbalance': existing.get('imbalance', 0),  # Preserved from bookTicker
                 'timestamp': int(ticker.get('E', 0))  # Event time
             }
         
