@@ -7723,7 +7723,7 @@ async def background_scanner_loop():
                                 # Close only if BOTH conditions met: enough ticks AND enough time
                                 if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
                                     # Phase 183: Hybrid — limit for liquid, market for illiquid
-                                    spread_level = pos.get('spread_level', 'Normal')
+                                    spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
                                     is_trailing_hit = pos.get('isTrailingActive', False)
                                     
                                     if is_trailing_hit and spread_level in ('Very Low', 'Low') and pos.get('isLive', False) and live_binance_trader.enabled and not pos.get('pending_limit_close'):
@@ -11092,7 +11092,7 @@ class TimeBasedPositionManager:
                     if age_minutes >= self.early_trail_minutes:
                         # Get ATR and spread level from position
                         atr = pos.get('atr', current_price * 0.02)  # Default 2% if no ATR
-                        spread_level = pos.get('spread_level', 'Normal')
+                        spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
                         
                         # Dynamic pullback multiplier based on spread
                         spread_multipliers = {
@@ -11558,7 +11558,7 @@ class BreakevenStopManager:
                 entry_price = float(pos.get('entryPrice', 0))
                 current_price = float(pos.get('currentPrice', pos.get('markPrice', 0)))
                 contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
-                spread_level = pos.get('spread_level', 'Normal')
+                spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
                 
                 if entry_price <= 0 or current_price <= 0 or contracts == 0:
                     continue
@@ -11843,7 +11843,7 @@ class LossRecoveryTrailManager:
                 entry_price = float(pos.get('entryPrice', 0))
                 current_price = float(pos.get('currentPrice', pos.get('markPrice', 0)))
                 contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
-                spread_level = pos.get('spread_level', 'Normal')
+                spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
                 
                 if entry_price <= 0 or current_price <= 0 or contracts == 0:
                     continue
@@ -15509,6 +15509,7 @@ class PaperTradingEngine:
             "entryPrice": fill_price,
             "size": order['size'],
             "sizeUsd": order['sizeUsd'],
+            "contracts": order['size'],  # Phase 223b: needed for partial TP
             "stopLoss": sl,
             "takeProfit": tp,
             "trailingStop": sl,
@@ -16298,6 +16299,7 @@ class PaperTradingEngine:
             "entryPrice": current_price,
             "size": position_size,
             "sizeUsd": position_size_usd,
+            "contracts": position_size,  # Phase 223b: needed for partial TP
             "stopLoss": signal['sl'],
             "takeProfit": signal['tp'],
             "trailingStop": signal['sl'],
