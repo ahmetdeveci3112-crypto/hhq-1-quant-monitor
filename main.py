@@ -7121,6 +7121,10 @@ class MultiCoinScanner:
                 
                 if signal:
                     signal['symbol'] = symbol
+                    # Phase 230B: Propagate coin data for BTC filter multi-factor override
+                    signal['priceChange24h'] = analyzer.opportunity.price_change_24h
+                    signal['volume24h'] = analyzer.opportunity.volume_24h
+                    signal['zscore'] = analyzer.opportunity.zscore
                     signals.append(signal)
                 
                 opportunities.append(analyzer.opportunity.to_dict())
@@ -8806,7 +8810,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
             symbol, action,
             coin_change_pct=signal.get('priceChange24h', 0),
-            volume_24h=signal.get('volume_24h', 0),
+            volume_24h=signal.get('volume24h', 0),
             zscore=signal.get('zscore', 0),
             spread_pct=signal.get('spreadPct', 0)
         )
@@ -20109,6 +20113,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             hurst = metrics['hurst']
                             spread_pct = metrics.get('spreadPct', 0.05)
                             
+                            # Phase 230B: Add coin data for BTC filter multi-factor override
+                            ws_opp = getattr(streamer.signal_generator, 'opportunity', None)
+                            if ws_opp:
+                                signal['priceChange24h'] = getattr(ws_opp, 'price_change_24h', 0)
+                                signal['volume24h'] = getattr(ws_opp, 'volume_24h', 0)
+                            
                             # Update MTF trends using real OHLCV data (Cloud Scanner parity)
                             try:
                                 await mtf_confirmation.update_coin_trend(active_symbol, streamer.exchange)
@@ -20263,6 +20273,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
                                         active_symbol, signal['action'],
                                         coin_change_pct=signal.get('priceChange24h', 0),
+                                        volume_24h=signal.get('volume24h', 0),
                                         zscore=signal.get('zscore', 0),
                                         spread_pct=signal.get('spreadPct', 0)
                                     )
