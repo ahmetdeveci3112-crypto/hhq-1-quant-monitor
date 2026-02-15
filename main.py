@@ -7270,7 +7270,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     filtered_opportunities.append(opp)
                     continue
                 
-                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
+                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action, coin_change_pct=opp.get('priceChange24h', 0))
                 if btc_allowed:
                     if btc_penalty > 0:
                         original_score = opp.get('signalScore', 0)
@@ -9994,9 +9994,10 @@ class BTCCorrelationFilter:
         
         return self.get_state()
     
-    def should_allow_signal(self, symbol: str, signal_action: str) -> tuple:
+    def should_allow_signal(self, symbol: str, signal_action: str, coin_change_pct: float = 0.0) -> tuple:
         """
         Sinyal izin verilmeli mi?
+        Phase 230: coin_change_pct = coin's own 24H price change %
         Returns: (allowed: bool, penalty: float, reason: str)
         """
         # BTC kendisi ise filtreleme yok
@@ -10153,13 +10154,42 @@ class BTCCorrelationFilter:
         full_bullish = (self.btc_trend_daily in ["BULLISH", "STRONG_BULLISH"] and 
                         self.btc_trend in ["BULLISH", "STRONG_BULLISH"])
         
+        # Phase 230: Coin Strength Exception
+        # Coins with strong independent momentum bypass full veto → penalty instead
+        abs_coin_change = abs(coin_change_pct)
+        coin_is_strong = (
+            (signal_action == "LONG" and coin_change_pct > 5.0) or
+            (signal_action == "SHORT" and coin_change_pct < -5.0)
+        )
+        
         if full_bearish and signal_action == "LONG":
-            logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} LONG blocked (Daily+ShortTerm BEARISH)")
-            return (False, 1.0, "🚫 Full Bearish Alignment - LONG VETOED")
+            if coin_is_strong:
+                # Coin pumping hard despite BTC dip → allow with penalty
+                if abs_coin_change > 15:
+                    penalty_val = 0.15
+                elif abs_coin_change > 10:
+                    penalty_val = 0.20
+                else:
+                    penalty_val = 0.30
+                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} LONG allowed (coin:{coin_change_pct:+.1f}%) despite Full Bearish | penalty={penalty_val}")
+                return (True, penalty_val, f"💪 Coin Strength Override ({coin_change_pct:+.1f}%) - Full Bearish bypassed")
+            else:
+                logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} LONG blocked (Daily+ShortTerm BEARISH, coin:{coin_change_pct:+.1f}%)")
+                return (False, 1.0, "🚫 Full Bearish Alignment - LONG VETOED")
         
         if full_bullish and signal_action == "SHORT":
-            logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} SHORT blocked (Daily+ShortTerm BULLISH)")
-            return (False, 1.0, "🚫 Full Bullish Alignment - SHORT VETOED")
+            if coin_is_strong:
+                if abs_coin_change > 15:
+                    penalty_val = 0.15
+                elif abs_coin_change > 10:
+                    penalty_val = 0.20
+                else:
+                    penalty_val = 0.30
+                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} SHORT allowed (coin:{coin_change_pct:+.1f}%) despite Full Bullish | penalty={penalty_val}")
+                return (True, penalty_val, f"💪 Coin Strength Override ({coin_change_pct:+.1f}%) - Full Bullish bypassed")
+            else:
+                logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} SHORT blocked (Daily+ShortTerm BULLISH, coin:{coin_change_pct:+.1f}%)")
+                return (False, 1.0, "🚫 Full Bullish Alignment - SHORT VETOED")
         
         # ===================================================================
         # GÜNLÜK TREND FİLTRESİ (EN GÜÇLÜ)
