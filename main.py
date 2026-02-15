@@ -6995,8 +6995,9 @@ class MultiCoinScanner:
         
         # Phase 228: Fetch book tickers (bid/ask) via REST API
         book_cache = await self.fetch_book_tickers()
-        if book_cache:
-            logger.info(f"📊 BookTicker: {len(book_cache)} coins with bid/ask data")
+        # P3 fix: Log intersection with scanned coins, not total cache
+        matched = len(set(book_cache.keys()) & set(tickers.keys())) if book_cache else 0
+        logger.info(f"📊 BookTicker: {matched}/{len(tickers)} scanned coins have bid/ask data")
         
         # Update BTC basis (Spot-Futures spread) - once per minute
         await self.update_btc_basis()
@@ -7027,6 +7028,12 @@ class MultiCoinScanner:
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
                 
+                # P2 fix: Reset spread flag each scan — prevents stale data on REST fail
+                analyzer.opportunity.has_real_spread = False
+                
+                # P1 fix: Set WS imbalance as default, then let bookTicker override
+                analyzer.opportunity.imbalance = imbalance
+                
                 # Phase 228: Calculate real bid-ask spread from REST bookTicker
                 book = book_cache.get(symbol, {})
                 bid = book.get('bid', 0)
@@ -7036,17 +7043,17 @@ class MultiCoinScanner:
                     bid_ask_spread = ((ask - bid) / mid) * 100
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                     analyzer.opportunity.has_real_spread = True
-                    # Also update ticker for imbalance from book quantities
+                    # P1 fix: Override imbalance with real L1 data from bookTicker
                     bid_qty = book.get('bidQty', 0)
                     ask_qty = book.get('askQty', 0)
                     if bid_qty + ask_qty > 0:
-                        analyzer.opportunity.imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100
+                        imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100
+                        analyzer.opportunity.imbalance = imbalance
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
-                analyzer.opportunity.imbalance = imbalance  # Store for opportunity display
                 
-                # Analyze for signal with BTC basis and L1 imbalance
+                # Analyze for signal with BTC basis and L1 imbalance (uses bookTicker imbalance if available)
                 signal = analyzer.analyze(imbalance=imbalance, basis_pct=self.btc_basis_pct)
                 
                 if signal:
