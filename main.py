@@ -8556,6 +8556,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if action == 'NONE':
         return
     
+    # Phase 225: Block signals during price shock (trade execution level gate)
+    try:
+        shock_blocked, shock_reason = price_shock_manager.should_block_signal(action, signal.get('symbol', ''))
+        if shock_blocked:
+            logger.info(f"⚡ SHOCK_BLOCK: {signal.get('symbol', '?')} {action} blocked at execution — {shock_reason}")
+            return None
+    except Exception:
+        pass
+    
     symbol = signal.get('symbol', global_paper_trader.symbol)
     atr = signal.get('atr', 0)
     
@@ -12728,18 +12737,28 @@ class PriceShockManager:
             # Fake alarm check: recovery within 3 minutes
             if elapsed > self.recovery_check_delay and self.shock_trigger_price > 0:
                 if self.shock_mode == 'BEAR_SHOCK':
-                    recovery = ((btc_price - self.shock_trigger_price) / self.shock_trigger_price) * 100 if self.shock_trigger_price > 0 else 0
-                    btc_5m = self._get_btc_5m_change()
-                    # If price recovered >60% of the drop
-                    if recovery > 0 and abs(btc_5m) < self._get_dynamic_threshold(btc_filter) * self.recovery_cancel_pct:
-                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC recovered {recovery:.2f}% — cancelling BEAR_SHOCK early")
+                    # Calculate actual % recovery from trigger price
+                    drop_pct = abs(((self.shock_trigger_price - btc_price) / self.shock_trigger_price) * 100) if self.shock_trigger_price > 0 else 0
+                    # Price has recovered above trigger = fake alarm
+                    if btc_price > self.shock_trigger_price:
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC recovered above trigger ${self.shock_trigger_price:.0f} → ${btc_price:.0f} — cancelling BEAR_SHOCK")
+                        self._deactivate_shock('FAKE_RECOVERY')
+                        return
+                    # Original drop was X%, now only Y% → if recovered >60% of drop
+                    original_5m_drop = abs(self.current_shock_event.get('btc_change_5m', 0)) if self.current_shock_event else 1
+                    if original_5m_drop > 0 and drop_pct < original_5m_drop * (1 - self.recovery_cancel_pct):
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: Drop shrunk {original_5m_drop:.2f}%→{drop_pct:.2f}% (>60% recovered) — cancelling BEAR_SHOCK")
                         self._deactivate_shock('FAKE_RECOVERY')
                         return
                 elif self.shock_mode == 'BULL_SHOCK':
-                    recovery = ((self.shock_trigger_price - btc_price) / self.shock_trigger_price) * 100 if self.shock_trigger_price > 0 else 0
-                    btc_5m = self._get_btc_5m_change()
-                    if recovery > 0 and abs(btc_5m) < self._get_dynamic_threshold(btc_filter) * self.recovery_cancel_pct:
-                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC reversed {recovery:.2f}% — cancelling BULL_SHOCK early")
+                    pump_pct = abs(((btc_price - self.shock_trigger_price) / self.shock_trigger_price) * 100) if self.shock_trigger_price > 0 else 0
+                    if btc_price < self.shock_trigger_price:
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC reversed below trigger ${self.shock_trigger_price:.0f} → ${btc_price:.0f} — cancelling BULL_SHOCK")
+                        self._deactivate_shock('FAKE_RECOVERY')
+                        return
+                    original_5m_pump = abs(self.current_shock_event.get('btc_change_5m', 0)) if self.current_shock_event else 1
+                    if original_5m_pump > 0 and pump_pct < original_5m_pump * (1 - self.recovery_cancel_pct):
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: Pump shrunk {original_5m_pump:.2f}%→{pump_pct:.2f}% (>60% recovered) — cancelling BULL_SHOCK")
                         self._deactivate_shock('FAKE_RECOVERY')
                         return
             
@@ -12897,14 +12916,24 @@ class PriceShockManager:
             
             # Tighten: entry-SL distance × 0.7
             if exposed_side == 'LONG':
-                sl_distance = entry - current_sl  # positive for valid SL
-                new_sl = entry - (sl_distance * self.sl_tighten_factor)
+                sl_distance = entry - current_sl  # positive for valid SL below entry
                 trail_distance = entry - current_trailing
+                # Guard: skip if SL/trail already above entry (profitable position with moved stops)
+                if sl_distance <= 0 or trail_distance <= 0:
+                    del self.sl_snapshots[pos_id]  # Remove snapshot since we're skipping
+                    logger.debug(f"⚡ SHOCK_SKIP: {pos.get('symbol')} LONG — SL already above entry (profitable), no tightening needed")
+                    continue
+                new_sl = entry - (sl_distance * self.sl_tighten_factor)
                 new_trailing = entry - (trail_distance * self.sl_tighten_factor)
             else:
-                sl_distance = current_sl - entry  # positive for valid SL
-                new_sl = entry + (sl_distance * self.sl_tighten_factor)
+                sl_distance = current_sl - entry  # positive for valid SL above entry
                 trail_distance = current_trailing - entry
+                # Guard: skip if SL/trail already below entry (profitable position with moved stops)
+                if sl_distance <= 0 or trail_distance <= 0:
+                    del self.sl_snapshots[pos_id]
+                    logger.debug(f"⚡ SHOCK_SKIP: {pos.get('symbol')} SHORT — SL already below entry (profitable), no tightening needed")
+                    continue
+                new_sl = entry + (sl_distance * self.sl_tighten_factor)
                 new_trailing = entry + (trail_distance * self.sl_tighten_factor)
             
             pos['stopLoss'] = new_sl
@@ -12921,17 +12950,30 @@ class PriceShockManager:
         now = datetime.now().timestamp()
         duration = now - (self.shock_start_time or now)
         
-        # Restore SL snapshots (Guardrail 2)
+        # Restore SL snapshots (Guardrail 2 — smart restore: don't overwrite improved trailing)
         restored_count = 0
         for pos_id, snapshot in self.sl_snapshots.items():
-            # Try to find position in global_paper_trader
             try:
                 for pos in global_paper_trader.positions:
                     if pos.get('id') == pos_id:
-                        pos['stopLoss'] = snapshot['sl']
-                        pos['trailingStop'] = snapshot['trailing']
+                        current_sl = pos.get('stopLoss', 0)
+                        current_trailing = pos.get('trailingStop', 0)
+                        side = pos.get('side', 'LONG')
+                        
+                        # Smart restore: only restore if snapshot SL is more protective than current
+                        # For LONG: higher SL = more protective
+                        # For SHORT: lower SL = more protective
+                        if side == 'LONG':
+                            restore_sl = max(snapshot['sl'], current_sl)  # Keep the higher (more protective)
+                            restore_trail = max(snapshot['trailing'], current_trailing)
+                        else:
+                            restore_sl = min(snapshot['sl'], current_sl)  # Keep the lower (more protective)
+                            restore_trail = min(snapshot['trailing'], current_trailing)
+                        
+                        pos['stopLoss'] = restore_sl
+                        pos['trailingStop'] = restore_trail
                         restored_count += 1
-                        logger.info(f"✅ SHOCK_RESTORE: {pos.get('symbol')} SL restored to {snapshot['sl']:.4f}")
+                        logger.info(f"✅ SHOCK_RESTORE: {pos.get('symbol')} SL→{restore_sl:.4f} trail→{restore_trail:.4f} (smart restore)")
                         break
             except:
                 pass
