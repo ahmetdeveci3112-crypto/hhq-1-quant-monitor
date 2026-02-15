@@ -3056,16 +3056,16 @@ async def binance_position_sync_loop():
                             low_24h = float(ticker.get('low', entry_price * 0.98))
                             estimated_atr = (high_24h - low_24h) / 3  # ~3 ATR in 24h range
                             volatility_pct = (estimated_atr / entry_price) * 100 if entry_price > 0 else 2.0
-                            # Phase 228: Real bid-ask spread from REST bookTicker
-                            book = sync_book_cache.get(symbol, {}) if sync_book_cache else {}
-                            bid = book.get('bid', 0)
-                            ask = book.get('ask', 0)
-                            sync_spread_pct = ((ask - bid) / ((ask + bid) / 2) * 100) if bid > 0 and ask > 0 and ask > bid else 0.05
                         else:
                             # Fallback to 2% estimate
-                            estimated_atr = entry_price * 0.02
+                            estimated_atr = entry_price * 0.02 if entry_price > 0 else 0.02
                             volatility_pct = 2.0
-                            sync_spread_pct = 0.05
+                        
+                        # Phase 228: Always use REST bookTicker for spread (independent of WS ticker)
+                        book = sync_book_cache.get(symbol, {}) if sync_book_cache else {}
+                        bid = book.get('bid', 0)
+                        ask = book.get('ask', 0)
+                        sync_spread_pct = ((ask - bid) / ((ask + bid) / 2) * 100) if bid > 0 and ask > 0 and ask > bid else 0.05
                         
                         atr = estimated_atr
                         
@@ -15352,7 +15352,9 @@ class SignalGenerator:
             'trendSizeReduction': trend_size_reduction,  # Phase 110: Applied reduction
             # Phase 153: ADX and Hurst for dynamic bounce confirmation
             'adx': adx,
-            'hurst': hurst
+            'hurst': hurst,
+            'spreadPct': spread_pct,  # Phase 228: Real bid-ask spread for dynamic trail
+            'volatility_pct': atr_pct * 100  # Phase 228: Volatility for dynamic trail
         }
 
 
