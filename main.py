@@ -5291,7 +5291,7 @@ class CoinOpportunity:
         self.zscore: float = 0.0
         self.hurst: float = 0.5
         self.spread_pct: float = 0.0  # ATR-based volatility % (legacy)
-        self.bid_ask_spread_pct: float = 0.05  # Real bid-ask spread %
+        self.bid_ask_spread_pct: float = 0.0  # Real bid-ask spread % (0 = not yet received)
         self.has_real_spread: bool = False
         self.imbalance: float = 0.0
         self.volume_24h: float = 0.0
@@ -6985,8 +6985,9 @@ class MultiCoinScanner:
                 # Phase 177: Calculate real bid-ask spread from WebSocket ticker
                 bid = ticker.get('bid', 0)
                 ask = ticker.get('ask', 0)
-                if bid > 0 and ask > 0:
-                    bid_ask_spread = ((ask - bid) / bid) * 100  # Percentage
+                if bid > 0 and ask > 0 and ask > bid:
+                    mid = (ask + bid) / 2
+                    bid_ask_spread = ((ask - bid) / mid) * 100  # Midpoint-based percentage
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                     analyzer.opportunity.has_real_spread = True
                 
