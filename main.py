@@ -5310,7 +5310,7 @@ class CoinOpportunity:
             "signalAction": self.signal_action,
             "zscore": round(self.zscore, 2),
             "hurst": round(self.hurst, 2),
-            "spreadPct": round(self.bid_ask_spread_pct, 4) if self.has_real_spread else None,  # Real bid-ask spread
+            "spreadPct": round(self.bid_ask_spread_pct, 4) if self.has_real_spread else round(self.spread_pct, 4),  # Real bid-ask spread, fallback to ATR-based
             "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
