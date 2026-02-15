@@ -10994,6 +10994,54 @@ class TimeBasedPositionManager:
                                 pos['contracts'] = contracts - close_contracts
                                 pos['original_contracts'] = pos.get('original_contracts', contracts)
                                 
+                                # =====================================================
+                                # Phase 220: TP1 → Force Trail + Breakeven SL
+                                # Kalan pozisyonu trail ile koru, SL'i entry+fee'ye taşı
+                                # =====================================================
+                                if level['key'] == 'tp1':
+                                    # 1) Force-activate trailing stop for remaining position
+                                    trail_dist = pos.get('trailDistance', atr * 1.5)
+                                    if side == 'LONG':
+                                        new_trail_stop = current_price - trail_dist
+                                        # Trail stop should be at least at entry
+                                        new_trail_stop = max(new_trail_stop, entry_price)
+                                        pos['trailingStop'] = new_trail_stop
+                                    else:  # SHORT
+                                        new_trail_stop = current_price + trail_dist
+                                        new_trail_stop = min(new_trail_stop, entry_price)
+                                        pos['trailingStop'] = new_trail_stop
+                                    pos['isTrailingActive'] = True
+                                    logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
+                                    
+                                    # 2) Move SL to breakeven (entry + fee buffer)
+                                    fee_buffers = {
+                                        'Very Low': 0.005, 'Low': 0.005, 'Normal': 0.006,
+                                        'High': 0.008, 'Very High': 0.010
+                                    }
+                                    fee_buffer = fee_buffers.get(spread_level, 0.006)
+                                    if side == 'LONG':
+                                        breakeven_sl = entry_price * (1 + fee_buffer)
+                                        if breakeven_sl > pos.get('stopLoss', 0):
+                                            pos['stopLoss'] = breakeven_sl
+                                    else:  # SHORT
+                                        breakeven_sl = entry_price * (1 - fee_buffer)
+                                        if breakeven_sl < pos.get('stopLoss', float('inf')):
+                                            pos['stopLoss'] = breakeven_sl
+                                    pos['breakeven_activated'] = True
+                                    logger.warning(f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → breakeven ${breakeven_sl:.6f} (entry+{fee_buffer*100:.1f}%)")
+                                    
+                                    # 3) For LIVE positions: Update SL on Binance
+                                    if pos.get('isLive', False):
+                                        try:
+                                            remaining_contracts = pos['contracts']
+                                            sl_result = await live_binance_trader.set_stop_loss(symbol, side, remaining_contracts, breakeven_sl)
+                                            if sl_result:
+                                                logger.warning(f"🔒 TP1_BREAKEVEN LIVE ✅: {symbol} SL set to ${breakeven_sl:.6f} on Binance")
+                                            else:
+                                                logger.error(f"❌ TP1_BREAKEVEN LIVE FAILED: {symbol} - set_stop_loss returned None")
+                                        except Exception as be_err:
+                                            logger.warning(f"⚠️ TP1_BREAKEVEN LIVE SKIP: {symbol} - {be_err} (will use internal SL)")
+                                
                                 # Log partial TP
                                 logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at {profit_pct:.2f}% profit (level: {level['key']}, base: {base_tp_pct:.2f}%)")
                                 actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
