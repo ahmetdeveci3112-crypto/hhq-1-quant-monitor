@@ -7270,12 +7270,23 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     filtered_opportunities.append(opp)
                     continue
                 
-                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action, coin_change_pct=opp.get('priceChange24h', 0))
+                btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
+                    symbol, signal_action,
+                    coin_change_pct=opp.get('priceChange24h', 0),
+                    volume_24h=opp.get('volume24h', 0),
+                    zscore=opp.get('zscore', 0),
+                    spread_pct=opp.get('spreadPct', 0)
+                )
                 if btc_allowed:
                     if btc_penalty > 0:
                         original_score = opp.get('signalScore', 0)
                         opp['signalScore'] = int(original_score * (1 - btc_penalty))
                         opp['btcFilterNote'] = btc_reason
+                    # Phase 230B: Apply override risk caps
+                    if btc_filter.last_override:
+                        opp['overrideLeverageCap'] = 3
+                        opp['overrideSizeMult'] = 0.5
+                        opp['btcOverride'] = True
                     filtered_opportunities.append(opp)
                 else:
                     opp['signalAction'] = 'NONE'
@@ -8787,13 +8798,25 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # BTC TREND FILTER (Cloud Scanner)
     # =====================================================
     try:
-        btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, action)
+        btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
+            symbol, action,
+            coin_change_pct=signal.get('priceChange24h', 0),
+            volume_24h=signal.get('volume_24h', 0),
+            zscore=signal.get('zscore', 0),
+            spread_pct=signal.get('spreadPct', 0)
+        )
         
         if not btc_allowed:
             signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
             logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason}")
             return
+        
+        # Phase 230B: Override risk caps (leverage 3x, size 50%)
+        if btc_filter.last_override:
+            signal['overrideLeverageCap'] = 3
+            signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), 0.5)
+            logger.info(f"💪 OVERRIDE CAPS: {symbol} | leverage≤3x, size≤0.5x")
         
         # Apply penalty to signal score and size
         if btc_penalty > 0:
@@ -9646,7 +9669,10 @@ class BTCCorrelationFilter:
         self.prev_btc_change_1h = 0.0       # Önceki 1H değişim
         self.prev_btc_change_4h = 0.0       # Önceki 4H değişim
         
-        logger.info("📊 BTCCorrelationFilter initialized with MTF Recovery Detection")
+        # Phase 230B: Coin Strength Override tracking
+        self.last_override = False          # Set per should_allow_signal call
+        
+        logger.info("📊 BTCCorrelationFilter initialized with MTF Recovery + Coin Strength Override")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -9994,12 +10020,15 @@ class BTCCorrelationFilter:
         
         return self.get_state()
     
-    def should_allow_signal(self, symbol: str, signal_action: str, coin_change_pct: float = 0.0) -> tuple:
+    def should_allow_signal(self, symbol: str, signal_action: str, 
+                            coin_change_pct: float = 0.0, volume_24h: float = 0.0,
+                            zscore: float = 0.0, spread_pct: float = 0.0) -> tuple:
         """
-        Sinyal izin verilmeli mi?
-        Phase 230: coin_change_pct = coin's own 24H price change %
+        Phase 230B (Codex): Multi-factor coin strength override.
         Returns: (allowed: bool, penalty: float, reason: str)
+        Sets self.last_override = True when coin strength exception fires.
         """
+        self.last_override = False  # Reset per call
         # BTC kendisi ise filtreleme yok
         if 'BTC' in symbol:
             return (True, 0.0, "BTC no filter")
@@ -10154,42 +10183,31 @@ class BTCCorrelationFilter:
         full_bullish = (self.btc_trend_daily in ["BULLISH", "STRONG_BULLISH"] and 
                         self.btc_trend in ["BULLISH", "STRONG_BULLISH"])
         
-        # Phase 230: Coin Strength Exception
-        # Coins with strong independent momentum bypass full veto → penalty instead
-        abs_coin_change = abs(coin_change_pct)
-        coin_is_strong = (
-            (signal_action == "LONG" and coin_change_pct > 5.0) or
-            (signal_action == "SHORT" and coin_change_pct < -5.0)
-        )
-        
         if full_bearish and signal_action == "LONG":
-            if coin_is_strong:
-                # Coin pumping hard despite BTC dip → allow with penalty
-                if abs_coin_change > 15:
-                    penalty_val = 0.15
-                elif abs_coin_change > 10:
-                    penalty_val = 0.20
-                else:
-                    penalty_val = 0.30
-                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} LONG allowed (coin:{coin_change_pct:+.1f}%) despite Full Bearish | penalty={penalty_val}")
-                return (True, penalty_val, f"💪 Coin Strength Override ({coin_change_pct:+.1f}%) - Full Bearish bypassed")
+            # Phase 230B: Multi-factor coin strength check
+            override_allowed, factors_detail = self._check_coin_strength_override(
+                symbol, signal_action, coin_change_pct, volume_24h, zscore, spread_pct
+            )
+            if override_allowed:
+                self.last_override = True
+                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} LONG (coin:{coin_change_pct:+.1f}%) despite Full Bearish | {factors_detail}")
+                return (True, 0.30, f"💪 Override ({coin_change_pct:+.1f}%) [{factors_detail}] - Full Bearish bypassed")
             else:
-                logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} LONG blocked (Daily+ShortTerm BEARISH, coin:{coin_change_pct:+.1f}%)")
-                return (False, 1.0, "🚫 Full Bearish Alignment - LONG VETOED")
+                # Phase 230B: Soft veto — 75% penalty instead of hard block
+                logger.info(f"🚫 FULL ALIGNMENT PENALTY: {symbol} LONG (coin:{coin_change_pct:+.1f}%, {factors_detail}) | penalty=0.75")
+                return (True, 0.75, f"🚫 Full Bearish Alignment - 75% penalty ({factors_detail})")
         
         if full_bullish and signal_action == "SHORT":
-            if coin_is_strong:
-                if abs_coin_change > 15:
-                    penalty_val = 0.15
-                elif abs_coin_change > 10:
-                    penalty_val = 0.20
-                else:
-                    penalty_val = 0.30
-                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} SHORT allowed (coin:{coin_change_pct:+.1f}%) despite Full Bullish | penalty={penalty_val}")
-                return (True, penalty_val, f"💪 Coin Strength Override ({coin_change_pct:+.1f}%) - Full Bullish bypassed")
+            override_allowed, factors_detail = self._check_coin_strength_override(
+                symbol, signal_action, coin_change_pct, volume_24h, zscore, spread_pct
+            )
+            if override_allowed:
+                self.last_override = True
+                logger.warning(f"💪 COIN STRENGTH OVERRIDE: {symbol} SHORT (coin:{coin_change_pct:+.1f}%) despite Full Bullish | {factors_detail}")
+                return (True, 0.30, f"💪 Override ({coin_change_pct:+.1f}%) [{factors_detail}] - Full Bullish bypassed")
             else:
-                logger.info(f"🚫 FULL ALIGNMENT VETO: {symbol} SHORT blocked (Daily+ShortTerm BULLISH, coin:{coin_change_pct:+.1f}%)")
-                return (False, 1.0, "🚫 Full Bullish Alignment - SHORT VETOED")
+                logger.info(f"🚫 FULL ALIGNMENT PENALTY: {symbol} SHORT (coin:{coin_change_pct:+.1f}%, {factors_detail}) | penalty=0.75")
+                return (True, 0.75, f"🚫 Full Bullish Alignment - 75% penalty ({factors_detail})")
         
         # ===================================================================
         # GÜNLÜK TREND FİLTRESİ (EN GÜÇLÜ)
@@ -10240,6 +10258,60 @@ class BTCCorrelationFilter:
         allowed = penalty < 0.35  # was 0.30
         
         return (allowed, penalty, reason)
+    
+    def _check_coin_strength_override(self, symbol: str, signal_action: str,
+                                       coin_change_pct: float, volume_24h: float,
+                                       zscore: float, spread_pct: float) -> tuple:
+        """
+        Phase 230B (Codex): Multi-factor coin strength validation.
+        Requires at least 3 of 4 factors to pass for override.
+        Returns: (override_allowed: bool, factors_detail: str)
+        """
+        factors_passed = 0
+        factors_labels = []
+        
+        # Factor 1: Price Momentum — coin moving strongly in signal direction
+        if signal_action == "LONG":
+            momentum_ok = coin_change_pct > 5.0
+        else:
+            momentum_ok = coin_change_pct < -5.0
+        if momentum_ok:
+            factors_passed += 1
+            factors_labels.append(f"✅MOM({coin_change_pct:+.1f}%)")
+        else:
+            factors_labels.append(f"❌MOM({coin_change_pct:+.1f}%)")
+        
+        # Factor 2: Volume — healthy liquidity (>$500K daily volume)
+        volume_ok = volume_24h > 500_000
+        if volume_ok:
+            factors_passed += 1
+            factors_labels.append(f"✅VOL(${volume_24h/1e6:.1f}M)")
+        else:
+            factors_labels.append(f"❌VOL(${volume_24h/1e6:.1f}M)")
+        
+        # Factor 3: Z-score not extreme — avoid buying tops or selling bottoms
+        if signal_action == "LONG":
+            zscore_ok = zscore < 2.5  # Not overbought
+        else:
+            zscore_ok = zscore > -2.5  # Not oversold
+        if zscore_ok:
+            factors_passed += 1
+            factors_labels.append(f"✅Z({zscore:.1f})")
+        else:
+            factors_labels.append(f"❌Z({zscore:.1f})")
+        
+        # Factor 4: Spread acceptable — entry cost reasonable
+        spread_ok = spread_pct < 0.5  # Less than 0.5% spread
+        if spread_ok:
+            factors_passed += 1
+            factors_labels.append(f"✅SPR({spread_pct:.2f}%)")
+        else:
+            factors_labels.append(f"❌SPR({spread_pct:.2f}%)")
+        
+        detail = f"{factors_passed}/4 [{' '.join(factors_labels)}]"
+        override_allowed = factors_passed >= 3
+        
+        return (override_allowed, detail)
     
     def calculate_mtf_momentum_score(self, direction: str = "LONG") -> int:
         """
@@ -16085,6 +16157,13 @@ class PaperTradingEngine:
             adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
             adjusted_leverage = max(3, min(75, adjusted_leverage))
         
+        # Phase 230B: Override leverage cap (BTC counter-trend protection)
+        if signal and signal.get('overrideLeverageCap'):
+            cap = signal['overrideLeverageCap']
+            if adjusted_leverage > cap:
+                logger.info(f"💪 OVERRIDE LEV CAP: {self.symbol} {adjusted_leverage}x → {cap}x")
+                adjusted_leverage = cap
+        
         # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
         dynamic_risk = self.get_dynamic_risk_per_trade()
         session_risk = session_manager.adjust_risk(dynamic_risk)
@@ -17372,6 +17451,13 @@ class PaperTradingEngine:
         user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
         adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
         adjusted_leverage = max(3, min(75, adjusted_leverage))
+        
+        # Phase 230B: Override leverage cap (BTC counter-trend protection)
+        if signal.get('overrideLeverageCap'):
+            cap = signal['overrideLeverageCap']
+            if adjusted_leverage > cap:
+                logger.info(f"💪 OVERRIDE LEV CAP: {symbol} {adjusted_leverage}x → {cap}x")
+                adjusted_leverage = cap
         
         # Get size multiplier from signal and BalanceProtector
         signal_size_mult = signal.get('sizeMultiplier', 1.0)
@@ -20150,7 +20236,10 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                 try:
                                     await btc_filter.update_btc_state(streamer.exchange)
                                     btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
-                                        active_symbol, signal['action']
+                                        active_symbol, signal['action'],
+                                        coin_change_pct=signal.get('priceChange24h', 0),
+                                        zscore=signal.get('zscore', 0),
+                                        spread_pct=signal.get('spreadPct', 0)
                                     )
                                     
                                     if not btc_allowed:
@@ -20160,6 +20249,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                         signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 - btc_penalty)
                                         signal['btc_adjustment'] = btc_reason
                                         logger.info(f"BTC ADJUSTMENT: {btc_reason} | Size: {signal.get('sizeMultiplier', 1.0):.2f}x")
+                                        # Phase 230B: Override risk caps
+                                        if btc_filter.last_override:
+                                            signal['overrideLeverageCap'] = 3
+                                            signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), 0.5)
+                                            logger.info(f"💪 WS OVERRIDE CAPS: {active_symbol} | leverage≤3x, size≤0.5x")
                                 except Exception as btc_err:
                                     logger.warning(f"BTC Filter error: {btc_err}")
                                 
