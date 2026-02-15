@@ -5774,6 +5774,9 @@ class LightweightCoinAnalyzer:
         # Get coin's own daily trend (not BTC's)
         coin_daily_trend, coin_daily_change = self.get_daily_trend()
         
+        # Phase 177: Use real bid-ask spread, conservative fallback (0.10%) if not yet received
+        effective_spread = self.opportunity.bid_ask_spread_pct if self.opportunity.has_real_spread else 0.10
+        
         # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
@@ -5781,7 +5784,7 @@ class LightweightCoinAnalyzer:
             imbalance=imbalance,
             price=self.opportunity.price,
             atr=atr,
-            spread_pct=self.opportunity.bid_ask_spread_pct,  # Phase 177: Real bid-ask spread
+            spread_pct=effective_spread,
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             basis_pct=basis_pct,
