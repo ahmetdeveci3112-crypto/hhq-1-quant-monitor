@@ -275,7 +275,7 @@ export interface CoinOpportunity {
   signalAction: 'LONG' | 'SHORT' | 'NONE';
   zscore: number;
   hurst: number;
-  spreadPct: number;
+  spreadPct: number | null;
   imbalance: number;
   volume24h: number;
   priceChange24h: number;

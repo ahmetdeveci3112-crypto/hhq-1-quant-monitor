@@ -41,6 +41,20 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
 
 type SortKey = 'score' | 'symbol' | 'price' | 'zScore' | 'hurst' | 'side';
 
+const getSpreadInfoFromSignal = (
+    signal: CoinOpportunity,
+    entryTightness: number = 1.0
+): { level: string; pullback: number; leverage: number } => {
+    if (typeof signal.spreadPct !== 'number' || signal.spreadPct <= 0) {
+        return {
+            level: 'Unknown',
+            pullback: 0.6 * entryTightness,
+            leverage: signal.leverage || 10
+        };
+    }
+    return getSpreadInfo(signal.spreadPct, entryTightness);
+};
+
 export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40 }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
@@ -93,7 +107,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     // Mobile Card Component
     const SignalCard = ({ signal, key: _key }: { signal: CoinOpportunity; key?: string }) => {
         const isLong = signal.signalAction === 'LONG';
-        const spreadInfo = getSpreadInfo(signal.spreadPct || 0.05, entryTightness);
+        const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
         // Use backend leverage if available, fallback to local calculation
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = isLong
@@ -230,7 +244,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         ) : (
                             activeSignals.map((signal) => {
                                 const isLong = signal.signalAction === 'LONG';
-                                const spreadInfo = getSpreadInfo(signal.spreadPct || 0.05, entryTightness);
+                                const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
                                 const entryPrice = isLong
                                     ? signal.price * (1 - spreadInfo.pullback / 100)
                                     : signal.price * (1 + spreadInfo.pullback / 100);

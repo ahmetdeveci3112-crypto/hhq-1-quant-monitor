@@ -5292,6 +5292,7 @@ class CoinOpportunity:
         self.hurst: float = 0.5
         self.spread_pct: float = 0.0  # ATR-based volatility % (legacy)
         self.bid_ask_spread_pct: float = 0.05  # Real bid-ask spread %
+        self.has_real_spread: bool = False
         self.imbalance: float = 0.0
         self.volume_24h: float = 0.0
         self.price_change_24h: float = 0.0
@@ -5309,7 +5310,7 @@ class CoinOpportunity:
             "signalAction": self.signal_action,
             "zscore": round(self.zscore, 2),
             "hurst": round(self.hurst, 2),
-            "spreadPct": round(self.bid_ask_spread_pct, 4),  # Real bid-ask spread
+            "spreadPct": round(self.bid_ask_spread_pct, 4) if self.has_real_spread else None,  # Real bid-ask spread
             "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
@@ -6987,6 +6988,7 @@ class MultiCoinScanner:
                 if bid > 0 and ask > 0:
                     bid_ask_spread = ((ask - bid) / bid) * 100  # Percentage
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
+                    analyzer.opportunity.has_real_spread = True
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
@@ -20646,4 +20648,3 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
-
