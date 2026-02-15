@@ -2960,21 +2960,43 @@ async def binance_position_sync_loop():
                 live_binance_trader.last_positions = binance_positions
                 
                 # ================================================================
-                # PHASE XXX: ENRICH POSITIONS WITH DYNAMIC SPREAD LEVEL
-                # Calculate spread_level from coin volatility (ATR %)
+                # PHASE 228: Fetch bookTicker for real bid-ask spread
+                # Used by both position enrichment and sync trail params
                 # ================================================================
+                sync_book_cache = await multi_coin_scanner.fetch_book_tickers()
+                
+                # ================================================================
+                # PHASE XXX: ENRICH POSITIONS WITH DYNAMIC SPREAD LEVEL
+                # Phase 228: Use real bid-ask spread when available, ATR fallback
                 for bp in binance_positions:
                     try:
                         symbol = bp.get('symbol', '')
                         # Try to get analyzer for this coin to calculate volatility
                         analyzer = multi_coin_scanner.analyzers.get(symbol) if hasattr(multi_coin_scanner, 'analyzers') else None
                         
-                        if analyzer and hasattr(analyzer, 'highs') and hasattr(analyzer, 'lows') and hasattr(analyzer, 'closes'):
-                            # Calculate spread level from actual candle data
+                        # Phase 228: Use real bid-ask spread from REST bookTicker
+                        book = sync_book_cache.get(symbol, {}) if sync_book_cache else {}
+                        book_bid = book.get('bid', 0)
+                        book_ask = book.get('ask', 0)
+                        if book_bid > 0 and book_ask > 0 and book_ask > book_bid:
+                            real_spread = ((book_ask - book_bid) / ((book_ask + book_bid) / 2)) * 100
+                            # Classify bid-ask spread level
+                            if real_spread < 0.02:
+                                bp['spread_level'] = 'Very Low'
+                            elif real_spread < 0.05:
+                                bp['spread_level'] = 'Low'
+                            elif real_spread < 0.15:
+                                bp['spread_level'] = 'Normal'
+                            elif real_spread < 0.40:
+                                bp['spread_level'] = 'High'
+                            else:
+                                bp['spread_level'] = 'Very High'
+                            bp['atr_pct'] = real_spread  # Store real spread as atr_pct for compatibility
+                        elif analyzer and hasattr(analyzer, 'highs') and hasattr(analyzer, 'lows') and hasattr(analyzer, 'closes'):
+                            # ATR fallback when no bookTicker data
                             highs = list(analyzer.highs)
                             lows = list(analyzer.lows)
                             closes = list(analyzer.closes)
-                            
                             if len(closes) >= 14:
                                 atr_pct = calculate_atr_percentage(symbol, highs, lows, closes)
                                 bp['spread_level'] = calculate_spread_level(atr_pct=atr_pct)
@@ -2983,23 +3005,8 @@ async def binance_position_sync_loop():
                                 bp['spread_level'] = 'Normal'
                                 bp['atr_pct'] = 2.0
                         else:
-                            # No analyzer - estimate from entry price (meme coins often have low prices)
-                            entry_price = float(bp.get('entryPrice', 1))
-                            if entry_price > 1000:  # BTC, ETH
-                                bp['spread_level'] = 'Very Low'
-                                bp['atr_pct'] = 0.8
-                            elif entry_price > 10:
-                                bp['spread_level'] = 'Low'
-                                bp['atr_pct'] = 1.5
-                            elif entry_price > 0.1:
-                                bp['spread_level'] = 'Normal'
-                                bp['atr_pct'] = 3.0
-                            elif entry_price > 0.001:
-                                bp['spread_level'] = 'High'
-                                bp['atr_pct'] = 5.0
-                            else:
-                                bp['spread_level'] = 'Very High'
-                                bp['atr_pct'] = 10.0
+                            bp['spread_level'] = 'Normal'
+                            bp['atr_pct'] = 2.0
                     except Exception as enrich_err:
                         bp['spread_level'] = 'Normal'
                         bp['atr_pct'] = 2.0
@@ -3049,10 +3056,11 @@ async def binance_position_sync_loop():
                             low_24h = float(ticker.get('low', entry_price * 0.98))
                             estimated_atr = (high_24h - low_24h) / 3  # ~3 ATR in 24h range
                             volatility_pct = (estimated_atr / entry_price) * 100 if entry_price > 0 else 2.0
-                            # Phase 178: Real bid-ask spread from WS ticker
-                            bid = float(ticker.get('bid', 0))
-                            ask = float(ticker.get('ask', 0))
-                            sync_spread_pct = ((ask - bid) / bid * 100) if bid > 0 and ask > 0 else 0.05
+                            # Phase 228: Real bid-ask spread from REST bookTicker
+                            book = sync_book_cache.get(symbol, {}) if sync_book_cache else {}
+                            bid = book.get('bid', 0)
+                            ask = book.get('ask', 0)
+                            sync_spread_pct = ((ask - bid) / ((ask + bid) / 2) * 100) if bid > 0 and ask > 0 and ask > bid else 0.05
                         else:
                             # Fallback to 2% estimate
                             estimated_atr = entry_price * 0.02
