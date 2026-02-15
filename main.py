@@ -794,12 +794,13 @@ class SQLiteManager:
             db.row_factory = aiosqlite.Row
             
             # Step 0: Exact match by close_order_id (Phase 229)
+            # Phase 229b: Added symbol filter to prevent cross-symbol mismatches
             if close_order_id:
                 async with db.execute('''
                     SELECT * FROM position_closes 
-                    WHERE close_order_id = ? AND close_order_id != ''
+                    WHERE symbol = ? AND close_order_id = ? AND close_order_id != ''
                     LIMIT 1
-                ''', (close_order_id,)) as cursor:
+                ''', (symbol, close_order_id)) as cursor:
                     row = await cursor.fetchone()
                     if row:
                         logger.info(f"🆔 ORDER ID MATCH: {symbol} close_oid={close_order_id[:12]}")
@@ -839,14 +840,18 @@ class SQLiteManager:
             await db.commit()
     
     async def update_close_order_id(self, symbol: str, close_order_id: str):
-        """Phase 229: Update the most recent position_close with Binance close order ID."""
+        """Phase 229b: Update the most recent position_close with Binance close order ID.
+        Uses timestamp window (last 5 min) to prevent wrong-row updates on rapid consecutive closes."""
         try:
+            now_ms = int(datetime.now().timestamp() * 1000)
+            window_ms = 5 * 60 * 1000  # 5 minutes
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute('''
                     UPDATE position_closes SET close_order_id = ?
                     WHERE symbol = ? AND (close_order_id IS NULL OR close_order_id = '')
+                    AND timestamp > ? - ?
                     ORDER BY timestamp DESC LIMIT 1
-                ''', (close_order_id, symbol))
+                ''', (close_order_id, symbol, now_ms, window_ms))
                 await db.commit()
                 logger.info(f"🆔 Close order ID saved: {symbol} = {close_order_id[:12]}")
         except Exception as e:
@@ -11133,7 +11138,11 @@ class PositionBasedKillSwitch:
                 if result:
                     # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                     pos['_partial_close_ts'] = datetime.now().timestamp()
-                    logger.warning(f"📊 KILL_SWITCH LIVE ✅: {symbol} reduced {reduction_pct*100:.0f}% on Binance ({reduction_size:.4f} contracts) | Order: {result.get('id')}")
+                    close_oid = str(result.get('id', ''))
+                    logger.warning(f"📊 KILL_SWITCH LIVE ✅: {symbol} reduced {reduction_pct*100:.0f}% on Binance ({reduction_size:.4f} contracts) | Order: {close_oid[:12]}")
+                    # Phase 229b: Persist close order ID
+                    if close_oid:
+                        safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                 else:
                     logger.error(f"❌ KILL_SWITCH LIVE FAILED: {symbol} - close_position returned None")
             except Exception as e:
@@ -11337,7 +11346,11 @@ class TimeBasedPositionManager:
                                         if result:
                                             # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                                             pos['_partial_close_ts'] = datetime.now().timestamp()
-                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at {profit_pct:.2f}% profit | Order: {result.get('id')}")
+                                            close_oid = str(result.get('id', ''))
+                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at {profit_pct:.2f}% profit | Order: {close_oid[:12]}")
+                                            # Phase 229b: Persist close order ID
+                                            if close_oid:
+                                                safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                                         else:
                                             logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
                                     except Exception as e:
@@ -11526,7 +11539,11 @@ class TimeBasedPositionManager:
                                     try:
                                         result = await live_binance_trader.close_position(symbol, side, reduction_amount)
                                         if result:
-                                            logger.warning(f"📊 TIME REDUCE LIVE ✅: {symbol} closed {reduction_pct*100:.0f}% on Binance ({reduction_amount:.4f} contracts) | Order: {result.get('id')}")
+                                            close_oid = str(result.get('id', ''))
+                                            logger.warning(f"📊 TIME REDUCE LIVE ✅: {symbol} closed {reduction_pct*100:.0f}% on Binance ({reduction_amount:.4f} contracts) | Order: {close_oid[:12]}")
+                                            # Phase 229b: Persist close order ID
+                                            if close_oid:
+                                                safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                                         else:
                                             logger.error(f"❌ TIME REDUCE LIVE FAILED: {symbol} - close_position returned None")
                                     except Exception as e:
@@ -11990,7 +12007,11 @@ class BreakevenStopManager:
                                 try:
                                     market_result = await live_trader.close_position(symbol, side, remaining_amount)
                                     if market_result:
-                                        logger.warning(f"✅ BREAKEVEN REMAINDER CLOSED: {symbol} {remaining_amount:.4f} contracts via market")
+                                        close_oid = str(market_result.get('id', ''))
+                                        logger.warning(f"✅ BREAKEVEN REMAINDER CLOSED: {symbol} {remaining_amount:.4f} contracts via market | Order: {close_oid[:12]}")
+                                        # Phase 229b: Persist close order ID
+                                        if close_oid:
+                                            safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                                     else:
                                         logger.error(f"❌ BREAKEVEN REMAINDER FAILED: {symbol} — orphaned {remaining_amount:.4f} contracts!")
                                 except Exception as mkt_err:
@@ -12296,10 +12317,14 @@ class LossRecoveryTrailManager:
                                 }), name=f"persist_recovery_{symbol}")
                                 result = await live_trader.close_position(symbol, side, abs(contracts))
                                 if result:
+                                    close_oid = str(result.get('id', ''))
                                     actions["recovery_closed"].append(symbol)
                                     # Clear state
                                     del self.recovery_state[state_key]
-                                    logger.warning(f"✅ RECOVERY CLOSE SUCCESS: {symbol}")
+                                    logger.warning(f"✅ RECOVERY CLOSE SUCCESS: {symbol} | Order: {close_oid[:12]}")
+                                    # Phase 229b: Persist close order ID
+                                    if close_oid:
+                                        safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                                 else:
                                     logger.error(f"❌ RECOVERY CLOSE FAILED: {symbol}")
                             except Exception as e:
