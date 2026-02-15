@@ -8892,6 +8892,42 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     except Exception as trail_err:
         logger.debug(f"Dynamic trail params error: {trail_err}")
     
+    # =====================================================
+    # Phase 224B: SIGNAL FLIP PENALTY
+    # Same coin opposite signal within 5min → score penalty
+    # =====================================================
+    try:
+        now_ts = datetime.now().timestamp()
+        last_sig = global_paper_trader.last_signal_per_coin.get(symbol, {})
+        if last_sig:
+            time_since_last = now_ts - last_sig.get('time', 0)
+            was_opposite = last_sig.get('side') != action
+            if was_opposite and time_since_last < 300:  # 5dk içinde flip
+                penalty = max(5, int(15 - (time_since_last / 20)))
+                original_score = signal.get('confidenceScore', 60)
+                signal['confidenceScore'] = max(40, original_score - penalty)
+                logger.info(f"🔄 FLIP_PENALTY: {symbol} {action} -{penalty}pt (flip {time_since_last:.0f}s ago, score {original_score}→{signal['confidenceScore']})")
+        global_paper_trader.last_signal_per_coin[symbol] = {'side': action, 'time': now_ts}
+    except Exception as flip_err:
+        logger.debug(f"Flip penalty error: {flip_err}")
+    
+    # =====================================================
+    # Phase 224B: EV-BASED SIGNAL FILTER
+    # Reject signals with negative expected value
+    # =====================================================
+    try:
+        ev = global_paper_trader.calculate_signal_ev(signal)
+        signal['ev'] = round(ev, 4)
+        if ev <= -0.5:
+            signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV={ev:.4f} <= -0.5 | score={signal.get('confidenceScore', 0)}")
+            return
+        elif ev < 0:
+            logger.info(f"⚠️ EV_WARNING: {action} {symbol} | EV={ev:.4f} (weak but passing)")
+    except Exception as ev_err:
+        logger.debug(f"EV filter error: {ev_err}")
+    
     # Execute trade
     try:
         await global_paper_trader.open_position(
@@ -10978,12 +11014,19 @@ class TimeBasedPositionManager:
                     # Dynamic base for TP levels: ATR_pct * multiplier
                     base_tp_pct = atr_pct * mult
                     
-                    # TP levels: 100%, 150%, 250% of base
-                    # Phase 222: TP1 %40 kapatma, TP2/3 daha geniş aralık
+                    # Phase 224C2: Leverage-normalized TP levels
+                    # TP hedefleri margin-based ROI olarak tanımlanır
+                    leverage = pos.get('leverage', 10)
+                    
+                    # ROI-based TP targets (margin üzerinden)
+                    tp1_price_pct = max(base_tp_pct * 1.0, 8.0 / leverage)   # ~8% ROI
+                    tp2_price_pct = max(base_tp_pct * 2.0, 20.0 / leverage)  # ~20% ROI
+                    tp3_price_pct = max(base_tp_pct * 3.5, 40.0 / leverage)  # ~40% ROI
+                    
                     tp_levels = [
-                        {'pct': base_tp_pct * 1.0, 'close_pct': 0.40, 'key': 'tp1'},
-                        {'pct': base_tp_pct * 2.0, 'close_pct': 0.30, 'key': 'tp2'},
-                        {'pct': base_tp_pct * 3.5, 'close_pct': 0.30, 'key': 'tp3'},
+                        {'pct': tp1_price_pct, 'close_pct': 0.40, 'key': 'tp1'},
+                        {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
+                        {'pct': tp3_price_pct, 'close_pct': 0.30, 'key': 'tp3'},
                     ]
                     
                     # Current profit percentage
@@ -12260,6 +12303,266 @@ class PostTradeTracker:
             'avg_avoided_loss': sum(r.get('avoided_loss_pct', 0) for r in recent) / len(recent) if recent else 0,
         }
 
+    # Phase 224C3: Exit parameter tuning recommendations
+    def get_tuning_recommendations(self) -> dict:
+        """Son 50 analiz sonucundan exit parametre önerileri üret."""
+        recent = self.analysis_results[-50:]
+        if len(recent) < 20:
+            return {}
+        
+        early_exits = [r for r in recent if r.get('was_early_exit', False)]
+        correct_exits = [r for r in recent if r.get('was_correct_exit', False)]
+        
+        recommendations = {}
+        
+        early_pct = len(early_exits) / len(recent)
+        correct_pct = len(correct_exits) / len(recent)
+        
+        # %60+ erken çıkış → trail distance artır
+        if early_pct > 0.6:
+            recommendations['trail_distance_mult'] = 1.1
+            recommendations['reason_trail'] = f'Erken çıkış oranı yüksek: %{early_pct*100:.0f}'
+        elif early_pct < 0.2:
+            recommendations['trail_distance_mult'] = 0.95
+            recommendations['reason_trail'] = f'Erken çıkış oranı düşük: %{early_pct*100:.0f}'
+        
+        # %40+ doğru çıkış → TP'leri sıkılaştır (iyi çalışıyor)
+        # %20- doğru çıkış → TP'leri gevşet (çok erken kapanıyor)
+        if correct_pct < 0.20:
+            recommendations['tp_mult'] = 1.1
+            recommendations['reason_tp'] = f'Doğru çıkış oranı düşük: %{correct_pct*100:.0f}'
+        elif correct_pct > 0.5:
+            recommendations['tp_mult'] = 0.9
+            recommendations['reason_tp'] = f'Doğru çıkış oranı yüksek: %{correct_pct*100:.0f}'
+        
+        if recommendations:
+            logger.info(f"📊 TUNING_REC: {recommendations}")
+        
+        return recommendations
+
+
+# ============================================================================
+# PHASE 224C: EXIT ARBITRATOR
+# Central coordinator for exit decisions — logs, prioritizes, recommends
+# ============================================================================
+
+class ExitArbitrator:
+    """
+    Phase 224C: Tüm exit kararlarını merkezi bir yerde koordine eder.
+    
+    Mevcut update() loop'undaki exit sırasını DEĞİŞTİRMEZ,
+    ancak her çıkış kararını loglar ve analiz sağlar.
+    Priority: EMERGENCY > KILL_SWITCH > ADVERSE > TIME > SL > TRAIL > TP > BREAKEVEN
+    """
+    
+    PRIORITY = {
+        'EMERGENCY_SL': 1,
+        'KILL_SWITCH': 2,
+        'ADVERSE': 3,
+        'TIME': 4,
+        'SL_HIT': 5,
+        'TRAIL_EXIT': 6,
+        'TP_HIT': 7,
+        'BREAKEVEN': 8,
+        'LOSS_RECOVERY': 9,
+        'PARTIAL_TP': 10,
+    }
+    
+    def __init__(self):
+        self.exit_stats = {}  # {reason: {count, total_pnl, avg_roi}}
+        self.recent_exits = deque(maxlen=200)  # Son 200 çıkış
+        logger.info("⚖️ ExitArbitrator initialized")
+    
+    def record_exit(self, symbol: str, reason: str, roi: float, pnl: float, decision_trace: list = None):
+        """Çıkış kararını kaydet ve analiz et."""
+        if reason not in self.exit_stats:
+            self.exit_stats[reason] = {'count': 0, 'total_pnl': 0.0, 'total_roi': 0.0}
+        
+        self.exit_stats[reason]['count'] += 1
+        self.exit_stats[reason]['total_pnl'] += pnl
+        self.exit_stats[reason]['total_roi'] += roi
+        
+        exit_record = {
+            'symbol': symbol,
+            'reason': reason,
+            'roi': round(roi, 2),
+            'pnl': round(pnl, 4),
+            'time': datetime.now().isoformat(),
+            'trace_len': len(decision_trace) if decision_trace else 0,
+            'priority': self.PRIORITY.get(reason, 99),
+        }
+        self.recent_exits.append(exit_record)
+    
+    def get_stats(self) -> dict:
+        """Çıkış istatistikleri — hangi manager en çok/en az kârlı."""
+        result = {}
+        for reason, stats in self.exit_stats.items():
+            count = stats['count']
+            result[reason] = {
+                'count': count,
+                'avg_pnl': round(stats['total_pnl'] / max(1, count), 4),
+                'avg_roi': round(stats['total_roi'] / max(1, count), 2),
+                'total_pnl': round(stats['total_pnl'], 4),
+            }
+        return result
+    
+    def get_worst_exit_reasons(self, n: int = 3) -> list:
+        """En kötü performans gösteren exit reason'lar."""
+        stats = self.get_stats()
+        sorted_reasons = sorted(stats.items(), key=lambda x: x[1]['avg_pnl'])
+        return sorted_reasons[:n]
+
+# Global instance
+exit_arbitrator = ExitArbitrator()
+
+
+# ============================================================================
+# PHASE 224D: MARKET REGIME MANAGER
+# VOLATILE / QUIET / TRENDING regime detection + parameter profiles
+# ============================================================================
+
+# Regime-based parameter profiles
+REGIME_PROFILES = {
+    'VOLATILE': {
+        'min_score_offset': 10,      # Daha seçici
+        'trail_distance_mult': 1.3,  # Daha geniş trail
+        'tp_mult': 1.2,              # Daha geniş TP
+        'sl_mult': 1.2,              # Daha geniş SL
+        'confirmation_mult': 0.5,    # Daha kısa bekleme (hızlı hareket)
+    },
+    'QUIET': {
+        'min_score_offset': -5,      # Daha agresif
+        'trail_distance_mult': 0.8,  # Daha sıkı trail
+        'tp_mult': 0.8,
+        'sl_mult': 0.9,
+        'confirmation_mult': 1.5,    # Daha uzun bekleme
+    },
+    'TRENDING': {
+        'min_score_offset': -10,     # Trend'e güven
+        'trail_distance_mult': 1.0,
+        'tp_mult': 1.5,              # Trend'de TP uzak
+        'sl_mult': 0.8,              # Trend'de SL sıkı
+        'confirmation_mult': 0.7,    # Trend'de hızlı entry
+    }
+}
+
+class MarketRegimeManager:
+    """
+    Phase 224D: BTC volatilite ve trend'den rejim tespit et.
+    Rejime göre parametreleri ayarla.
+    """
+    
+    def __init__(self):
+        self.current_regime = 'QUIET'
+        self.regime_history = deque(maxlen=100)
+        self._last_update = 0
+        logger.info("🎭 MarketRegimeManager initialized")
+    
+    def detect_regime(self) -> str:
+        """BTC volatilite ve trend'den rejim tespit et."""
+        try:
+            btc_atr_pct = 2.0
+            btc_trend = 'neutral'
+            
+            if 'global_btc_state' in globals() and global_btc_state:
+                btc_atr_pct = global_btc_state.get('atr_pct', 2.0)
+                btc_trend = global_btc_state.get('trend', 'neutral')
+            
+            if btc_atr_pct > 4.0:
+                regime = 'VOLATILE'
+            elif btc_trend in ('bullish', 'bearish') and btc_atr_pct < 3.0:
+                regime = 'TRENDING'
+            else:
+                regime = 'QUIET'
+            
+            if regime != self.current_regime:
+                logger.info(f"🎭 REGIME_CHANGE: {self.current_regime} → {regime} (BTC ATR={btc_atr_pct:.1f}%, trend={btc_trend})")
+                self.current_regime = regime
+            
+            self.regime_history.append({
+                'regime': regime,
+                'time': datetime.now().isoformat(),
+                'btc_atr_pct': btc_atr_pct,
+                'btc_trend': btc_trend,
+            })
+            
+            return regime
+        except Exception as e:
+            logger.debug(f"Regime detection error: {e}")
+            return self.current_regime
+    
+    def get_profile(self) -> dict:
+        """Mevcut rejime ait parametre profili."""
+        return REGIME_PROFILES.get(self.current_regime, REGIME_PROFILES['QUIET'])
+    
+    def get_adjusted_min_score(self, base_score: int) -> int:
+        """Rejime göre ayarlanmış minimum skor."""
+        profile = self.get_profile()
+        return base_score + profile.get('min_score_offset', 0)
+
+# Global instance
+market_regime_manager = MarketRegimeManager()
+
+
+# ============================================================================
+# PHASE 224D3: CANARY MODE - A/B Test Infrastructure
+# Test new parameters on ~10% of positions
+# ============================================================================
+
+class CanaryMode:
+    """
+    Yeni parametre setini rastgele %10 pozisyonda dene.
+    Deterministik: pozisyon ID hash'ine göre.
+    """
+    
+    def __init__(self, canary_pct: float = 0.10):
+        self.canary_pct = canary_pct
+        self.canary_params = {}      # Deneysel parametreler {key: value}
+        self.canary_results = []     # Canary pozisyon PnL'leri
+        self.control_results = []    # Normal pozisyon PnL'leri
+        self.enabled = False         # Başlangıçta kapalı
+        logger.info(f"🐤 CanaryMode initialized (pct={canary_pct*100:.0f}%)")
+    
+    def should_use_canary(self, pos_id: str) -> bool:
+        """Deterministik: pos_id hash'inin son 2 hanesi < canary_pct * 100."""
+        if not self.enabled or not self.canary_params:
+            return False
+        return (hash(pos_id) % 100) < int(self.canary_pct * 100)
+    
+    def get_params(self, pos_id: str, base_params: dict) -> dict:
+        """Base params + canary overrides."""
+        if not self.should_use_canary(pos_id):
+            return base_params
+        merged = {**base_params, **self.canary_params}
+        return merged
+    
+    def record_result(self, pos_id: str, pnl: float):
+        """Trade kapanınca sonucu kaydet."""
+        if self.should_use_canary(pos_id):
+            self.canary_results.append(pnl)
+        else:
+            self.control_results.append(pnl)
+    
+    def get_report(self) -> dict:
+        """A/B test sonuçları."""
+        canary_n = len(self.canary_results)
+        control_n = len(self.control_results)
+        
+        canary_wr = sum(1 for r in self.canary_results if r > 0) / max(1, canary_n)
+        control_wr = sum(1 for r in self.control_results if r > 0) / max(1, control_n)
+        
+        canary_avg = sum(self.canary_results) / max(1, canary_n)
+        control_avg = sum(self.control_results) / max(1, control_n)
+        
+        return {
+            'canary': {'n': canary_n, 'win_rate': round(canary_wr * 100, 1), 'avg_pnl': round(canary_avg, 4)},
+            'control': {'n': control_n, 'win_rate': round(control_wr * 100, 1), 'avg_pnl': round(control_avg, 4)},
+            'canary_params': self.canary_params,
+            'is_better': canary_avg > control_avg if canary_n >= 10 and control_n >= 10 else None,
+        }
+
+# Global instance
+canary_mode = CanaryMode()
 
 # ============================================================================
 # PHASE 155: AI OPTIMIZER - PnL-CORRELATED PERFORMANCE ANALYZER
@@ -14606,6 +14909,10 @@ class PaperTradingEngine:
         self.blacklist_threshold = 2  # Consecutive losses to trigger blacklist
         self.blacklist_duration_hours = 2  # Hours to keep coin blacklisted
         
+        # Phase 224A: MAE/MFE Diagnostics + Signal EV
+        self.score_band_stats = {}  # {"60-70": {wins, losses, total_win, total_loss, avg_win, avg_loss}}
+        self.last_signal_per_coin = {}  # {symbol: {side, time}} for flip detection
+        
         # Phase 60: AI Optimizer Toggle - kapalıyken dinamik hesaplamalar yapılmaz
         self.ai_optimizer_enabled = False  # Default: OFF - manuel ayarlar geçerli
         
@@ -14702,6 +15009,59 @@ class PaperTradingEngine:
             self.add_log(f"📊 Min Skor: {dynamic_score} ({mode}, WR:{win_rate*100:.0f}%)")
         
         return dynamic_score
+    
+    # =========================================================================
+    # Phase 224B: EV-Based Signal Filter
+    # =========================================================================
+    def calculate_signal_ev(self, signal: dict) -> float:
+        """
+        Phase 224B: Expected Value hesaplama.
+        EV = p(win) * avg_win - (1-p) * |avg_loss|
+        Skor bandına göre historik win rate kullanır.
+        Returns: EV value (positive = profitable, negative = avoid)
+        """
+        score = signal.get('confidenceScore', 0)
+        
+        # Skor bandı: 50-60, 60-70, 70-80, 80-90, 90-100
+        band = min(90, max(50, (score // 10) * 10))
+        band_key = f"{band}-{band + 10}"
+        
+        hist = self.score_band_stats.get(band_key, {})
+        total = hist.get('wins', 0) + hist.get('losses', 0)
+        
+        if total < 5:
+            # Yetersiz veri → ham skoru normalize et (0-1 arası)
+            return (score - 50) / 50.0  # 50=0, 100=1
+        
+        p_win = hist['wins'] / total
+        avg_win = hist.get('avg_win', 0)
+        avg_loss = abs(hist.get('avg_loss', 0))
+        
+        ev = p_win * avg_win - (1 - p_win) * avg_loss
+        return ev
+    
+    def update_score_band_stats(self, signal_score: int, pnl: float):
+        """Phase 224B: Trade kapanınca skor bandı istatistiğini güncelle."""
+        band = min(90, max(50, (signal_score // 10) * 10))
+        band_key = f"{band}-{band + 10}"
+        
+        if band_key not in self.score_band_stats:
+            self.score_band_stats[band_key] = {
+                'wins': 0, 'losses': 0,
+                'total_win': 0.0, 'total_loss': 0.0,
+                'avg_win': 0.0, 'avg_loss': 0.0
+            }
+        
+        stats = self.score_band_stats[band_key]
+        if pnl > 0:
+            stats['wins'] += 1
+            stats['total_win'] += pnl
+        else:
+            stats['losses'] += 1
+            stats['total_loss'] += pnl
+        
+        stats['avg_win'] = stats['total_win'] / max(1, stats['wins'])
+        stats['avg_loss'] = stats['total_loss'] / max(1, stats['losses'])
     
     def get_dynamic_risk_per_trade(self) -> float:
         """
@@ -15169,8 +15529,38 @@ class PaperTradingEngine:
         position_size = position_size_usd / entry_price
         
         # Create pending order
-        # Signal Confirmation: 5 dakika bekleme süresi - trend değişikliğini filtreler
-        signal_confirmation_delay_seconds = 300  # 5 dakika
+        # Signal Confirmation: Phase 224B adaptive delay — ATR/spread/skora göre 1-8dk
+        atr_pct_confirm = (atr / price * 100) if price > 0 else 2.0
+        conf_score = signal.get('confidenceScore', 0) if signal else 0
+        
+        # Base wait: ATR-based
+        if atr_pct_confirm > 5.0:
+            base_wait_min = 2       # Yüksek volatilite → kısa bekle
+        elif atr_pct_confirm > 2.0:
+            base_wait_min = 4       # Normal
+        else:
+            base_wait_min = 6       # Düşük volatilite → uzun bekle
+        
+        # Score adjustment: yüksek skor → daha az bekleme
+        if conf_score >= 85:
+            base_wait_min = max(1, base_wait_min - 2)
+        elif conf_score >= 70:
+            base_wait_min = max(2, base_wait_min - 1)
+        
+        # Spread adjustment: yüksek spread → daha uzun bekle
+        if spread_level in ('High', 'Very High'):
+            base_wait_min += 2
+        
+        signal_confirmation_delay_seconds = base_wait_min * 60
+        
+        # Phase 224D: Regime-based confirmation multiplier
+        try:
+            regime_profile = market_regime_manager.get_profile()
+            confirm_mult = regime_profile.get('confirmation_mult', 1.0)
+            signal_confirmation_delay_seconds = int(signal_confirmation_delay_seconds * confirm_mult)
+            signal_confirmation_delay_seconds = max(60, min(600, signal_confirmation_delay_seconds))  # 1-10dk cap
+        except Exception:
+            pass
         
         # Phase 155: AI Optimizer — snapshot settings at trade open time
         settings_snapshot = {
@@ -15253,6 +15643,19 @@ class PaperTradingEngine:
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 continue
+            
+            # Phase 224B: Stale Signal Penalty — skor zamanla düşer
+            created_at = order.get('createdAt', current_time)
+            pending_age_min = (current_time - created_at) / 60000
+            if pending_age_min > 10:
+                stale_penalty = min(20, int((pending_age_min - 10) * 2))
+                original_score = order.get('signalScore', 70)
+                adjusted_score = max(40, original_score - stale_penalty)
+                if adjusted_score < self.min_confidence_score:
+                    self.pending_orders.remove(order)
+                    self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score})")
+                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, score {original_score}→{adjusted_score})")
+                    continue
             
             # Find current price for this symbol
             current_price = None
@@ -15532,6 +15935,12 @@ class PaperTradingEngine:
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
             "fc_max_profit_pct": 0.0,
+            # Phase 224A: MAE/MFE + Decision Trace
+            "mae_pct": 0.0,
+            "mfe_pct": 0.0,
+            "mae_price": fill_price,
+            "mfe_price": fill_price,
+            "decision_trace": [],
         }
         
         # =====================================================================
@@ -16315,6 +16724,12 @@ class PaperTradingEngine:
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
             "fc_max_profit_pct": 0.0,
+            # Phase 224A: MAE/MFE + Decision Trace
+            "mae_pct": 0.0,
+            "mfe_pct": 0.0,
+            "mae_price": current_price,
+            "mfe_price": current_price,
+            "decision_trace": [],
         }
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -16383,6 +16798,14 @@ class PaperTradingEngine:
             pos['unrealizedPnl'] = pnl
             pos['unrealizedPnlPercent'] = pnl_percent
             
+            # Phase 224A: MAE/MFE update
+            if pnl_percent < pos.get('mae_pct', 0):
+                pos['mae_pct'] = pnl_percent
+                pos['mae_price'] = current_price
+            if pnl_percent > pos.get('mfe_pct', 0):
+                pos['mfe_pct'] = pnl_percent
+                pos['mfe_price'] = current_price
+            
             # Phase 217: Estimate funding fee cost
             open_time_ms = pos.get('openTime', 0)
             if open_time_ms > 0:
@@ -16398,10 +16821,12 @@ class PaperTradingEngine:
             
             # 1.5. Adverse Position Exit (4h terste kalan pozisyonlar)
             if self.check_adverse_position_exit(pos, current_price, atr):
+                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE', 'roi': round(pnl_percent, 1)})
                 continue
             
             # 2. Time-based exit (gradual liquidation)
             if self.check_time_based_exit(pos, current_price, atr):
+                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME', 'roi': round(pnl_percent, 1)})
                 continue
             
             # 3. Progressive SL (move SL to lock profits)
@@ -16474,6 +16899,7 @@ class PaperTradingEngine:
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                         reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
+                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
                         self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
@@ -16481,6 +16907,7 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price >= pos['takeProfit']:
+                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
                         self.close_position(pos, current_price, 'TP_HIT')
                     
             elif pos['side'] == 'SHORT':
@@ -16511,6 +16938,7 @@ class PaperTradingEngine:
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                         reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
+                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
                         self.close_position(pos, current_price, reason)
                 else:
                     if pos['slConfirmCount'] > 0:
@@ -16518,6 +16946,7 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price <= pos['takeProfit']:
+                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
                         self.close_position(pos, current_price, 'TP_HIT')
 
     def _format_detailed_reason(self, reason: str, pos: Dict, exit_price: float, pnl_percent: float) -> str:
@@ -16656,6 +17085,10 @@ class PaperTradingEngine:
             "hurst": pos.get('hurst', 0.5),
             "adx": pos.get('adx', 0),
             "pullbackPct": pos.get('pullbackPct', 0),
+            # Phase 224A: MAE/MFE + Decision Trace
+            "mae_pct": round(pos.get('mae_pct', 0), 2),
+            "mfe_pct": round(pos.get('mfe_pct', 0), 2),
+            "decision_trace": pos.get('decision_trace', [])[-5:],  # Son 5 karar
         }
         
         # =====================================================================
@@ -16753,6 +17186,9 @@ class PaperTradingEngine:
                     'binance_fill_price': pos.get('binance_fill_price', 0),
                     'hurst': pos.get('hurst', 0.5),
                     'trade_id': trade.get('id', ''),
+                    # Phase 224A
+                    'mae_pct': round(pos.get('mae_pct', 0), 2),
+                    'mfe_pct': round(pos.get('mfe_pct', 0), 2),
                 }
                 safe_create_task(sqlite_manager.save_position_close(close_data))
             except Exception as e:
@@ -16790,6 +17226,30 @@ class PaperTradingEngine:
         symbol = pos.get('symbol', 'UNKNOWN')
         is_win = pnl > 0
         self.update_coin_stats(symbol, is_win, pnl)
+        
+        # Phase 224B: Update score band statistics for EV calculation
+        signal_score = pos.get('signalScore', 0)
+        if signal_score > 0:
+            self.update_score_band_stats(signal_score, pnl)
+        
+        # Phase 224C: Record exit in ExitArbitrator
+        try:
+            roi_arb = (pnl / max(0.01, pos.get('initialMargin', 1))) * 100
+            exit_arbitrator.record_exit(
+                symbol=symbol,
+                reason=reason,
+                roi=roi_arb,
+                pnl=pnl,
+                decision_trace=pos.get('decision_trace', [])
+            )
+        except Exception as ea_err:
+            logger.debug(f"ExitArbitrator error: {ea_err}")
+        
+        # Phase 224D3: Record result in CanaryMode
+        try:
+            canary_mode.record_result(pos.get('id', ''), pnl)
+        except Exception as cm_err:
+            logger.debug(f"CanaryMode error: {cm_err}")
         
         # Log position close
         live_tag = "🔴 LIVE" if pos.get('isLive', False) else "📄 PAPER"
