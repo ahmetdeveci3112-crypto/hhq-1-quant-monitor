@@ -12915,26 +12915,29 @@ class PriceShockManager:
             }
             
             # Tighten: entry-SL distance × 0.7
+            # If trailingStop is 0 (not set), fall back to SL value
+            effective_trailing = current_trailing if current_trailing > 0 else current_sl
+            
             if exposed_side == 'LONG':
                 sl_distance = entry - current_sl  # positive for valid SL below entry
-                trail_distance = entry - current_trailing
-                # Guard: skip if SL/trail already above entry (profitable position with moved stops)
-                if sl_distance <= 0 or trail_distance <= 0:
+                trail_distance = entry - effective_trailing
+                # Guard: skip if SL already above entry (profitable position with moved stops)
+                if sl_distance <= 0:
                     del self.sl_snapshots[pos_id]  # Remove snapshot since we're skipping
                     logger.debug(f"⚡ SHOCK_SKIP: {pos.get('symbol')} LONG — SL already above entry (profitable), no tightening needed")
                     continue
                 new_sl = entry - (sl_distance * self.sl_tighten_factor)
-                new_trailing = entry - (trail_distance * self.sl_tighten_factor)
+                new_trailing = entry - (trail_distance * self.sl_tighten_factor) if trail_distance > 0 else new_sl
             else:
                 sl_distance = current_sl - entry  # positive for valid SL above entry
-                trail_distance = current_trailing - entry
-                # Guard: skip if SL/trail already below entry (profitable position with moved stops)
-                if sl_distance <= 0 or trail_distance <= 0:
+                trail_distance = effective_trailing - entry
+                # Guard: skip if SL already below entry (profitable position with moved stops)
+                if sl_distance <= 0:
                     del self.sl_snapshots[pos_id]
                     logger.debug(f"⚡ SHOCK_SKIP: {pos.get('symbol')} SHORT — SL already below entry (profitable), no tightening needed")
                     continue
                 new_sl = entry + (sl_distance * self.sl_tighten_factor)
-                new_trailing = entry + (trail_distance * self.sl_tighten_factor)
+                new_trailing = entry + (trail_distance * self.sl_tighten_factor) if trail_distance > 0 else new_sl
             
             pos['stopLoss'] = new_sl
             pos['trailingStop'] = new_trailing
