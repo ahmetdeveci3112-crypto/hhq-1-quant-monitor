@@ -1442,8 +1442,9 @@ class LiveBinanceTrader:
                     # Phase 145: Calculate dynamic TP/SL/Trail for live positions
                     # ================================================================
                     # Use same formulas as paper trading
-                    sl_atr_mult = 1.5  # Default SL ATR multiplier
-                    tp_atr_mult = 3.0  # Default TP ATR multiplier (wider for better R:R)
+                    # Phase 221: Use same formula as open_position for consistency
+                    sl_atr_mult = (global_paper_trader.sl_atr / 10) if global_paper_trader else 1.5
+                    tp_atr_mult = (global_paper_trader.tp_atr / 10) if global_paper_trader else 3.0
                     trail_activation_atr = 1.5
                     trail_distance_atr = 1.0
                     exit_tightness = global_paper_trader.exit_tightness if global_paper_trader else 1.0
@@ -1451,11 +1452,12 @@ class LiveBinanceTrader:
                     # Estimate ATR as ~1.5% of price (typical for crypto)
                     estimated_atr = entry_price * 0.015
                     
-                    # Apply exit_tightness multiplier
-                    adjusted_sl_atr = sl_atr_mult * exit_tightness
-                    adjusted_tp_atr = tp_atr_mult * exit_tightness
-                    adjusted_trail_activation = trail_activation_atr * exit_tightness
-                    adjusted_trail_distance = trail_distance_atr * exit_tightness
+                    # Phase 221: Apply exit_tightness + dynamic_atr_mult (was missing)
+                    dyn_mult = global_paper_trader.calculate_dynamic_atr_multiplier(estimated_atr, entry_price) if global_paper_trader else 1.0
+                    adjusted_sl_atr = sl_atr_mult * exit_tightness * dyn_mult
+                    adjusted_tp_atr = tp_atr_mult * exit_tightness * dyn_mult
+                    adjusted_trail_activation = trail_activation_atr * exit_tightness * dyn_mult
+                    adjusted_trail_distance = trail_distance_atr * exit_tightness * dyn_mult
                     
                     # Calculate TP/SL based on side
                     if side == 'LONG':
@@ -7618,11 +7620,20 @@ async def background_scanner_loop():
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
                             
+                            # Phase 221: Breakeven SL varsa, trailing_stop'u breakeven seviyesinde tut
+                            if pos.get('breakeven_activated', False) and sl > 0:
+                                if pos['side'] == 'LONG':
+                                    trailing_stop = max(trailing_stop, sl)
+                                else:
+                                    trailing_stop = min(trailing_stop, sl)
+                                pos['trailingStop'] = trailing_stop
+                            
                             # =========================================================
                             # Phase 202: STEPPED SL LOCK for Trend Mode positions
                             # Freqtrade custom_stoploss pattern — lock profits as they grow
                             # =========================================================
-                            if pos.get('trend_mode', False) and entry_price > 0:
+                            # Phase 221: Stepped SL tüm trail-aktif pozisyonlara uygulanır (was trend_mode only)
+                            if pos.get('isTrailingActive', False) and entry_price > 0:
                                 if pos['side'] == 'LONG':
                                     current_roi = (candle_close_price - entry_price) / entry_price * 100
                                 else:
@@ -10721,6 +10732,9 @@ class PositionBasedKillSwitch:
                 # Phase 152: Use LEVERAGED ROI instead of unleveraged margin loss
                 # unrealizedPnlPercent is already leveraged (pnl / sizeUsd * 100 * leverage)
                 position_loss_pct = pos.get('unrealizedPnlPercent', 0)
+                # Phase 221: Fallback calculation for paper positions where unrealizedPnlPercent=0
+                if position_loss_pct == 0 and unrealized_pnl < 0 and initial_margin > 0:
+                    position_loss_pct = (unrealized_pnl / initial_margin) * 100
                 
                 # Get DYNAMIC thresholds based on this position's leverage
                 first_threshold, full_threshold = self.get_dynamic_thresholds(leverage)
@@ -11564,6 +11578,9 @@ class BreakevenStopManager:
                 state = self.breakeven_state.get(state_key, {})
                 
                 if not state.get('active', False):
+                    # Phase 221: Phase 220 zaten breakeven set ettiyse atla
+                    if pos.get('breakeven_activated', False):
+                        continue
                     # Not yet activated - check if we should activate
                     if age_minutes < self.min_breakeven_age_minutes:
                         # Too young — skip breakeven (let trade develop)
