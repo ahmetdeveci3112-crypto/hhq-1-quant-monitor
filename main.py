@@ -15983,6 +15983,31 @@ class PaperTradingEngine:
         
         trail_distance = atr * adjusted_trail_distance_atr
         
+        # Phase 224D3: Apply CanaryMode parameter overrides for canary positions
+        try:
+            if order.get('is_canary', False) and canary_mode.enabled:
+                base_params = {'sl': sl, 'tp': tp, 'trail_activation': trail_activation, 'trail_distance': trail_distance}
+                canary_result = canary_mode.get_params(order.get('id', ''), base_params)
+                # Apply canary multipliers if present
+                if 'tp_mult' in canary_mode.canary_params:
+                    tp_m = canary_mode.canary_params['tp_mult']
+                    if side == 'LONG':
+                        tp = fill_price + (tp - fill_price) * tp_m
+                    else:
+                        tp = fill_price - (fill_price - tp) * tp_m
+                if 'sl_mult' in canary_mode.canary_params:
+                    sl_m = canary_mode.canary_params['sl_mult']
+                    if side == 'LONG':
+                        sl = fill_price - (fill_price - sl) * sl_m
+                    else:
+                        sl = fill_price + (sl - fill_price) * sl_m
+                if 'trail_mult' in canary_mode.canary_params:
+                    tr_m = canary_mode.canary_params['trail_mult']
+                    trail_distance *= tr_m
+                logger.info(f"🐤 CANARY: {symbol} {side} | overrides applied: {canary_mode.canary_params}")
+        except Exception as canary_err:
+            logger.debug(f"CanaryMode params error: {canary_err}")
+        
         # Create actual position
         new_position = {
             "id": order['id'].replace('PO_', 'POS_'),
