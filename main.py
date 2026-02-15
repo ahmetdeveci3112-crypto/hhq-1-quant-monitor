@@ -7925,6 +7925,24 @@ async def background_scanner_loop():
                 except Exception as pt_error:
                     logger.debug(f"Post-trade update error: {pt_error}")
                 
+                # Phase 224D: Detect market regime periodically (every scan cycle)
+                try:
+                    market_regime_manager.detect_regime()
+                except Exception as mr_err:
+                    logger.debug(f"Regime detection error: {mr_err}")
+                
+                # Phase 224C3: Apply PostTradeTracker tuning recommendations every 15 min
+                if int(datetime.now().timestamp()) % 900 < scan_interval:
+                    try:
+                        tuning = post_trade_tracker.get_tuning_recommendations()
+                        if tuning:
+                            regime_profile = market_regime_manager.get_profile()
+                            # Store tuning for use in update loop
+                            global_paper_trader._tuning_recs = tuning
+                            logger.info(f"📊 Applied tuning: {tuning} regime={market_regime_manager.current_regime}")
+                    except Exception as tune_err:
+                        logger.debug(f"Tuning recommendations error: {tune_err}")
+                
                 # Phase 52: Run optimizer every 15 minutes (900 seconds)
                 if int(datetime.now().timestamp()) % 900 < scan_interval:
                     logger.info("🤖 AI Optimizer check triggered (15-min interval)")
@@ -12527,7 +12545,9 @@ class CanaryMode:
         """Deterministik: pos_id hash'inin son 2 hanesi < canary_pct * 100."""
         if not self.enabled or not self.canary_params:
             return False
-        return (hash(pos_id) % 100) < int(self.canary_pct * 100)
+        import hashlib
+        h = int(hashlib.md5(pos_id.encode()).hexdigest(), 16)
+        return (h % 100) < int(self.canary_pct * 100)
     
     def get_params(self, pos_id: str, base_params: dict) -> dict:
         """Base params + canary overrides."""
@@ -14005,6 +14025,12 @@ class SignalGenerator:
         # Phase 28: Dynamic threshold from coin profile
         # Phase 152 FIX: User's min_confidence_score is always the floor
         user_min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 65
+        # Phase 224D: Apply regime offset to min_score
+        try:
+            user_min_score = market_regime_manager.get_adjusted_min_score(user_min_score)
+            user_min_score = max(40, min(95, user_min_score))  # Clamp to sane range
+        except Exception:
+            pass
         
         if coin_profile:
             base_threshold = coin_profile.get('optimal_threshold', 1.6)
@@ -15030,8 +15056,9 @@ class PaperTradingEngine:
         total = hist.get('wins', 0) + hist.get('losses', 0)
         
         if total < 5:
-            # Yetersiz veri → ham skoru normalize et (0-1 arası)
-            return (score - 50) / 50.0  # 50=0, 100=1
+            # Yetersiz veri → EV tahmini: score'u PnL ölçeğine dönüştür
+            # avg_win/avg_loss tipik ~0.01-0.05 USDT/margin aralığında
+            return (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
         
         p_win = hist['wins'] / total
         avg_win = hist.get('avg_win', 0)
@@ -15507,6 +15534,32 @@ class PaperTradingEngine:
         adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
+        # Phase 224D G5: Apply regime profile multipliers
+        try:
+            regime_profile = market_regime_manager.get_profile()
+            tuning_recs = getattr(self, '_tuning_recs', {})
+            
+            # Regime multipliers
+            r_tp_mult = regime_profile.get('tp_mult', 1.0)
+            r_sl_mult = regime_profile.get('sl_mult', 1.0)
+            r_trail_mult = regime_profile.get('trail_distance_mult', 1.0)
+            
+            # PostTradeTracker tuning overrides (if available)
+            if tuning_recs.get('tp_mult'):
+                r_tp_mult *= tuning_recs['tp_mult']
+            if tuning_recs.get('trail_distance_mult'):
+                r_trail_mult *= tuning_recs['trail_distance_mult']
+            
+            adjusted_sl_atr *= r_sl_mult
+            adjusted_tp_atr *= r_tp_mult
+            adjusted_trail_activation_atr *= r_trail_mult
+            adjusted_trail_distance_atr *= r_trail_mult
+            
+            if r_tp_mult != 1.0 or r_sl_mult != 1.0 or r_trail_mult != 1.0:
+                logger.info(f"🎭 REGIME_PARAMS: {trade_symbol} | TP×{r_tp_mult:.2f} SL×{r_sl_mult:.2f} Trail×{r_trail_mult:.2f} regime={market_regime_manager.current_regime}")
+        except Exception as rp_err:
+            logger.debug(f"Regime profile params error: {rp_err}")
+        
         if side == 'LONG':
             sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
             tp = entry_price + (atr * adjusted_tp_atr)
@@ -15619,6 +15672,8 @@ class PaperTradingEngine:
             "trend_mode": is_trend_mode,
             # Phase 155: AI Optimizer settings snapshot
             "settingsSnapshot": settings_snapshot,
+            # Phase 224D3: CanaryMode A/B test flag
+            "is_canary": canary_mode.should_use_canary(f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}"),
         }
         
         self.pending_orders.append(pending_order)
@@ -16396,6 +16451,7 @@ class PaperTradingEngine:
             if current_price >= pullback_threshold:
                 loss_pct = ((entry - current_price) / entry) * 100
                 self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
+                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
                 self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
                 return True
                 
@@ -16411,6 +16467,7 @@ class PaperTradingEngine:
             if current_price <= pullback_threshold:
                 loss_pct = ((current_price - entry) / entry) * 100
                 self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
+                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
                 self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
                 return True
         
@@ -16492,6 +16549,9 @@ class PaperTradingEngine:
                     kill_switch_fault_tracker.load_from_trade_history(self.trades)
                     # Phase 59: Load coin performance stats from trade history
                     coin_performance_tracker.load_from_trade_history(self.trades)
+                    # Phase 224B: Load EV signal filter state
+                    self.score_band_stats = data.get('score_band_stats', {})
+                    self.last_signal_per_coin = data.get('last_signal_per_coin', {})
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
@@ -16537,7 +16597,10 @@ class PaperTradingEngine:
                 "leverage_multiplier": getattr(self, 'leverage_multiplier', 1.0),
                 "daily_start_balance": self.daily_start_balance,
                 # Phase 19: Save logs
-                "logs": self.logs[-100:]
+                "logs": self.logs[-100:],
+                # Phase 224B: EV signal filter state
+                "score_band_stats": self.score_band_stats,
+                "last_signal_per_coin": self.last_signal_per_coin,
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
@@ -17189,6 +17252,8 @@ class PaperTradingEngine:
                     # Phase 224A
                     'mae_pct': round(pos.get('mae_pct', 0), 2),
                     'mfe_pct': round(pos.get('mfe_pct', 0), 2),
+                    # Phase 224A: Decision trace
+                    'decision_trace': json.dumps(pos.get('decision_trace', [])[-10:]),
                 }
                 safe_create_task(sqlite_manager.save_position_close(close_data))
             except Exception as e:
