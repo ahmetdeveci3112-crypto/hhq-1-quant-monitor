@@ -11045,6 +11045,9 @@ class TimeBasedPositionManager:
                                 # Log partial TP
                                 logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at {profit_pct:.2f}% profit (level: {level['key']}, base: {base_tp_pct:.2f}%)")
                                 actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
+                                
+                                # Phase 220b: Update local contracts for next TP level calculation
+                                contracts = pos['contracts']
                 
                 # Phase 190: REMOVED duplicate breakeven (Phase 137)
                 # BreakevenStopManager handles this better with limit orders + fee buffer
