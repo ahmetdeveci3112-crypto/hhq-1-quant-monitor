@@ -4604,7 +4604,8 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
                 "sl_multiplier": params["sl"],
                 "tp_multiplier": params["tp"],
                 "trail_multiplier": params["trail"],
-                "level": level
+                # Phase 223c: Normalize to Title Case for consumer compatibility
+                "level": level.replace('_', ' ').title()
             }
     
     # Default to very_high
@@ -4632,7 +4633,7 @@ def get_volatility_adjusted_params(volatility_pct: float, atr: float, price: flo
         "sl_multiplier": params["sl"],
         "tp_multiplier": params["tp"],
         "trail_multiplier": params["trail"],
-        "level": "very_high"
+        "level": "Very High"  # Phase 223c: Title Case
     }
 
 
@@ -16440,7 +16441,7 @@ class PaperTradingEngine:
                 'High':     6.0,   # High spread = later trail
                 'Very High': 8.0   # Meme — very volatile, late trail
             }
-            base_activation_roi = spread_activation_map.get(pos.get('spread_level', 'Normal'), 4.0)
+            base_activation_roi = spread_activation_map.get(pos.get('spreadLevel', pos.get('spread_level', 'Normal')), 4.0)  # Phase 223c
             # Phase 218: Trail threshold must account for leverage — otherwise tiny price moves
             # on high leverage (e.g. 0.42% on 20x = 8.5% ROI) falsely trigger trail
             pos_leverage = pos.get('leverage', 10)
