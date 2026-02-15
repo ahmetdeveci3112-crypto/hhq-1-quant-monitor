@@ -20120,10 +20120,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             spread_pct = metrics.get('spreadPct', 0.05)
                             
                             # Phase 230B: Add coin data for BTC filter multi-factor override
-                            ws_opp = getattr(streamer.signal_generator, 'opportunity', None)
-                            if ws_opp:
-                                signal['priceChange24h'] = getattr(ws_opp, 'price_change_24h', 0)
-                                signal['volume24h'] = getattr(ws_opp, 'volume_24h', 0)
+                            # Source: ws_ticker has 'percentage' (24h change) and 'quoteVolume' (24h USD volume)
+                            signal['priceChange24h'] = ticker.get('percentage', 0)
+                            signal['volume24h'] = ticker.get('quoteVolume', 0)
                             
                             # Update MTF trends using real OHLCV data (Cloud Scanner parity)
                             try:
