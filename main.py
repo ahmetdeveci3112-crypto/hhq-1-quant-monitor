@@ -365,6 +365,9 @@ class SQLiteManager:
                 ('mae_pct', 'REAL DEFAULT 0'),
                 ('mfe_pct', 'REAL DEFAULT 0'),
                 ('decision_trace', 'TEXT DEFAULT \"[]\"'),
+                # Phase 229: Order ID-based trade matching
+                ('entry_order_id', 'TEXT'),
+                ('close_order_id', 'TEXT'),
             ]
             for col_name, col_type in pc_migration_columns:
                 try:
@@ -744,8 +747,9 @@ class SQLiteManager:
                     stop_loss, take_profit, atr, trailing_stop, trail_activation,
                     settings_snapshot, entry_method, entry_slippage, entry_spread,
                     signal_score, spread_level, binance_fill_price, hurst, trade_id,
-                    mae_pct, mfe_pct, decision_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mae_pct, mfe_pct, decision_trace,
+                    entry_order_id, close_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 close_data.get('symbol'),
                 close_data.get('side'),
@@ -777,16 +781,31 @@ class SQLiteManager:
                 close_data.get('mae_pct', 0),
                 close_data.get('mfe_pct', 0),
                 close_data.get('decision_trace', '[]'),
+                close_data.get('entry_order_id', ''),
+                close_data.get('close_order_id', ''),
             ))
             await db.commit()
-            logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')}")
+            logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')} | entry_oid={close_data.get('entry_order_id', '')[:12]} close_oid={close_data.get('close_order_id', '')[:12]}")
     
-    async def get_pending_close_reason(self, symbol: str, close_time: int, window_minutes: int = 30) -> dict:
-        """Get pending close reason from SQLite for a symbol within time window."""
+    async def get_pending_close_reason(self, symbol: str, close_time: int, window_minutes: int = 30, close_order_id: str = None) -> dict:
+        """Phase 229: Get pending close reason — order ID match first, timestamp fallback."""
         window_ms = window_minutes * 60 * 1000
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            # Step 1: Try unmatched records first
+            
+            # Step 0: Exact match by close_order_id (Phase 229)
+            if close_order_id:
+                async with db.execute('''
+                    SELECT * FROM position_closes 
+                    WHERE close_order_id = ? AND close_order_id != ''
+                    LIMIT 1
+                ''', (close_order_id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        logger.info(f"🆔 ORDER ID MATCH: {symbol} close_oid={close_order_id[:12]}")
+                        return dict(row)
+            
+            # Step 1: Try unmatched records by timestamp
             async with db.execute('''
                 SELECT * FROM position_closes 
                 WHERE symbol = ? AND matched_to_income = 0
@@ -799,7 +818,6 @@ class SQLiteManager:
                     return dict(row)
             
             # Step 2: Fallback — check ALL records (even matched ones)
-            # This handles cases where funding/fee incomes matched the record first
             async with db.execute('''
                 SELECT * FROM position_closes 
                 WHERE symbol = ? AND ABS(timestamp - ?) < ?
@@ -819,6 +837,20 @@ class SQLiteManager:
                 UPDATE position_closes SET matched_to_income = 1 WHERE id = ?
             ''', (close_id,))
             await db.commit()
+    
+    async def update_close_order_id(self, symbol: str, close_order_id: str):
+        """Phase 229: Update the most recent position_close with Binance close order ID."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    UPDATE position_closes SET close_order_id = ?
+                    WHERE symbol = ? AND (close_order_id IS NULL OR close_order_id = '')
+                    ORDER BY timestamp DESC LIMIT 1
+                ''', (close_order_id, symbol))
+                await db.commit()
+                logger.info(f"🆔 Close order ID saved: {symbol} = {close_order_id[:12]}")
+        except Exception as e:
+            logger.warning(f"⚠️ update_close_order_id error: {e}")
     
     async def save_binance_trade(self, trade_data: dict):
         """
@@ -2307,6 +2339,7 @@ class LiveBinanceTrader:
                 leverage = 1
                 size_usd = 0.0
                 qty = 0.0
+                close_order_id = ''  # Phase 229: Binance close order ID
                 
                 # Fetch trades for this symbol around the close time
                 try:
@@ -2330,11 +2363,13 @@ class LiveBinanceTrader:
                             t_price = float(t.get('price', 0))
                             t_qty = float(t.get('qty', 0))
                             realized = float(t.get('realizedPnl', 0))
+                            t_order_id = str(t.get('orderId', ''))  # Phase 229
                             
                             # If this trade has realized PnL matching our close, it's the exit
                             if abs(realized - pnl) < 0.01 and t_price > 0:
                                 exit_price = t_price
                                 qty = t_qty
+                                close_order_id = t_order_id  # Phase 229
                                 # If selling, was LONG. If buying, was SHORT
                                 side = 'LONG' if t_side == 'SELL' else 'SHORT'
                                 break
@@ -2395,9 +2430,12 @@ class LiveBinanceTrader:
                                 pnl = trade_data.get('pnl')
                 
                 # If not found in memory, try SQLite (for persistence after restart)
+                # Phase 229: Pass close_order_id from in-memory or UserTrades
+                mem_close_oid = pending_close_reasons.get(symbol, {}).get('close_order_id', '') if symbol in pending_close_reasons else ''
+                effective_close_oid = mem_close_oid or close_order_id
                 if reason_detail == 'Position closed on Binance':
                     try:
-                        sqlite_close = await sqlite_manager.get_pending_close_reason(symbol, timestamp, window_minutes=60)
+                        sqlite_close = await sqlite_manager.get_pending_close_reason(symbol, timestamp, window_minutes=60, close_order_id=effective_close_oid)
                         if sqlite_close:
                             close_reason = sqlite_close.get('reason', close_reason)
                             reason_detail = sqlite_close.get('original_reason', reason_detail)
@@ -17779,7 +17817,8 @@ class PaperTradingEngine:
                 "pnl": pnl,
                 "exitPrice": exit_price,
                 "timestamp": int(datetime.now().timestamp() * 1000),
-                "trade_data": trade  # Full trade data for Binance sync to use
+                "trade_data": trade,  # Full trade data for Binance sync to use
+                "entry_order_id": pos.get('binance_order_id', ''),  # Phase 229
             }
             logger.info(f"📋 PENDING REASON SET: {symbol} = {detailed_reason}")
             
@@ -17818,6 +17857,8 @@ class PaperTradingEngine:
                     'mfe_pct': round(pos.get('mfe_pct', 0), 2),
                     # Phase 224A: Decision trace
                     'decision_trace': json.dumps(pos.get('decision_trace', [])[-10:]),
+                    # Phase 229: Order ID-based matching
+                    'entry_order_id': pos.get('binance_order_id', ''),
                 }
                 safe_create_task(sqlite_manager.save_position_close(close_data))
             except Exception as e:
@@ -17955,7 +17996,14 @@ class PaperTradingEngine:
             
             result = await live_binance_trader.close_position(symbol, side, actual_amount)
             if result:
-                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f}")
+                close_order_id = str(result.get('id', ''))
+                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f} | OrderID: {close_order_id[:12]}")
+                
+                # Phase 229: Save close_order_id to pending_close_reasons + SQLite
+                if close_order_id and symbol in pending_close_reasons:
+                    pending_close_reasons[symbol]['close_order_id'] = close_order_id
+                if close_order_id:
+                    safe_create_task(sqlite_manager.update_close_order_id(symbol, close_order_id))
             else:
                 logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
         except Exception as e:
