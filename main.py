@@ -12864,14 +12864,13 @@ class ScoreComponentAnalyzer:
         logger.debug(f"📊 SCORE RECORD: {trade.get('symbol')} PnL:{trade.get('pnl', 0):.2f} ZS:{components.get('zScore', 0):.2f}")
     
     def _spread_to_numeric(self, spread_level: str) -> float:
-        """Spread seviyesini sayıya çevir."""
+        """Spread seviyesini sayıya çevir. Phase 223d: Title Case uyumlu."""
         mapping = {
-            'extreme': 1.0,
-            'very_low': 0.9,
-            'low': 0.7,
-            'medium': 0.5,
-            'high': 0.3,
-            'very_high': 0.1
+            'Very Low': 0.9,
+            'Low': 0.7,
+            'Normal': 0.5,
+            'High': 0.3,
+            'Very High': 0.1
         }
         return mapping.get(spread_level, 0.5)
     
