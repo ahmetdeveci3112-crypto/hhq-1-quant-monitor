@@ -5838,7 +5838,7 @@ class BinanceWebSocketManager:
         self.running = False
         self.connected = False
         self.last_update = 0
-        self.ws_url = "wss://fstream.binance.com/stream?streams=!ticker@arr/!bookTicker"  # Phase 228: Combined stream
+        self.ws_url = "wss://fstream.binance.com/ws/!ticker@arr"  # Phase 228: bookTicker via REST instead
         self._reconnect_task = None
         # Phase 191: Callback pattern for real-time position updates
         self.position_symbols: set = set()  # Aktif pozisyonlu semboller
@@ -5864,16 +5864,7 @@ class BinanceWebSocketManager:
                         
                         try:
                             data = json.loads(message)
-                            # Combined stream wraps in {stream, data}
-                            if isinstance(data, dict) and 'stream' in data:
-                                stream_name = data['stream']
-                                payload = data['data']
-                                if stream_name == '!ticker@arr':
-                                    self._process_ticker_message(payload)
-                                elif stream_name == '!bookTicker':
-                                    self._process_book_ticker(payload)
-                            elif isinstance(data, list):
-                                # Fallback: direct ticker array
+                            if isinstance(data, list):
                                 self._process_ticker_message(data)
                             
                             # Phase 191: Process pending position price updates
@@ -5938,38 +5929,7 @@ class BinanceWebSocketManager:
                 if sym in self.position_symbols:
                     self._pending_updates.append((sym, self.tickers[sym]))
 
-    def _process_book_ticker(self, data: dict):
-        """Process bookTicker message — updates bid/ask in existing ticker cache."""
-        if not isinstance(data, dict):
-            return
-        
-        symbol = data.get('s', '')
-        if not symbol.endswith('USDT'):
-            return
-        
-        bid = float(data.get('b', 0))
-        ask = float(data.get('a', 0))
-        bid_qty = float(data.get('B', 0))
-        ask_qty = float(data.get('A', 0))
-        
-        if symbol in self.tickers:
-            # Update existing ticker with real bid/ask
-            self.tickers[symbol]['bid'] = bid
-            self.tickers[symbol]['ask'] = ask
-            self.tickers[symbol]['bidQty'] = bid_qty
-            self.tickers[symbol]['askQty'] = ask_qty
-            # Recalculate imbalance from real quantities
-            if bid_qty + ask_qty > 0:
-                self.tickers[symbol]['imbalance'] = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100
-        else:
-            # Create minimal ticker entry (will be enriched by !ticker@arr)
-            self.tickers[symbol] = {
-                'last': 0, 'percentage': 0, 'quoteVolume': 0, 'baseVolume': 0,
-                'high': 0, 'low': 0,
-                'bid': bid, 'ask': ask, 'bidQty': bid_qty, 'askQty': ask_qty,
-                'imbalance': ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100 if bid_qty + ask_qty > 0 else 0,
-                'timestamp': int(data.get('E', 0))
-            }
+    # Phase 228: _process_book_ticker removed — using REST API instead (see CloudScanner.fetch_book_tickers)
     
     def get_tickers(self, symbols: list = None) -> dict:
         """Get current ticker data for specified symbols."""
@@ -6992,6 +6952,39 @@ class MultiCoinScanner:
         except Exception as e:
             logger.debug(f"BTC basis update error: {e}")
     
+    async def fetch_book_tickers(self) -> dict:
+        """Phase 228: Fetch book tickers (bid/ask) via REST API.
+        
+        Binance Futures !ticker@arr WS does NOT include bid/ask fields.
+        This REST call gets all book tickers in one request.
+        """
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    'https://fapi.binance.com/fapi/v1/ticker/bookTicker',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        cache = {}
+                        for item in data:
+                            symbol = item.get('symbol', '')
+                            if symbol.endswith('USDT'):
+                                cache[symbol] = {
+                                    'bid': float(item.get('bidPrice', 0)),
+                                    'ask': float(item.get('askPrice', 0)),
+                                    'bidQty': float(item.get('bidQty', 0)),
+                                    'askQty': float(item.get('askQty', 0)),
+                                }
+                        return cache
+                    else:
+                        logger.warning(f"BookTicker REST failed: status={resp.status}")
+                        return {}
+        except Exception as e:
+            logger.warning(f"BookTicker REST error: {e}")
+            return {}
+    
     async def scan_all_coins(self) -> list:
         """Scan all coins and return opportunities."""
         if not self.coins:
@@ -6999,6 +6992,11 @@ class MultiCoinScanner:
         
         # Fetch all ticker data at once
         tickers = await self.fetch_ticker_data(self.coins)
+        
+        # Phase 228: Fetch book tickers (bid/ask) via REST API
+        book_cache = await self.fetch_book_tickers()
+        if book_cache:
+            logger.info(f"📊 BookTicker: {len(book_cache)} coins with bid/ask data")
         
         # Update BTC basis (Spot-Futures spread) - once per minute
         await self.update_btc_basis()
@@ -7029,21 +7027,20 @@ class MultiCoinScanner:
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
                 
-                # Phase 177: Calculate real bid-ask spread from WebSocket ticker
-                bid = ticker.get('bid', 0)
-                ask = ticker.get('ask', 0)
+                # Phase 228: Calculate real bid-ask spread from REST bookTicker
+                book = book_cache.get(symbol, {})
+                bid = book.get('bid', 0)
+                ask = book.get('ask', 0)
                 if bid > 0 and ask > 0 and ask > bid:
                     mid = (ask + bid) / 2
-                    bid_ask_spread = ((ask - bid) / mid) * 100  # Midpoint-based percentage
+                    bid_ask_spread = ((ask - bid) / mid) * 100
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                     analyzer.opportunity.has_real_spread = True
-                    # Diagnostic: log first coin's spread each scan
-                    if coin_count <= 1:
-                        logger.info(f"📊 SPREAD_OK: {symbol} bid={bid} ask={ask} spread={bid_ask_spread:.4f}% hasReal=True")
-                else:
-                    # Diagnostic: log when bid/ask is missing or invalid
-                    if coin_count <= 1:
-                        logger.info(f"📊 SPREAD_MISS: {symbol} bid={bid} ask={ask} — no valid spread, hasReal stays False")
+                    # Also update ticker for imbalance from book quantities
+                    bid_qty = book.get('bidQty', 0)
+                    ask_qty = book.get('askQty', 0)
+                    if bid_qty + ask_qty > 0:
+                        analyzer.opportunity.imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
