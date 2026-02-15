@@ -29,12 +29,12 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
     let leverage: number;
     let level: string;
 
-    if (spreadPct <= 0.02) { level = 'Very Low'; basePullback = 0.3; leverage = 15; }
-    else if (spreadPct <= 0.05) { level = 'Low'; basePullback = 0.6; leverage = 10; }
-    else if (spreadPct <= 0.15) { level = 'Normal'; basePullback = 1.0; leverage = 7; }
-    else if (spreadPct <= 0.40) { level = 'High'; basePullback = 1.5; leverage = 5; }
-    else if (spreadPct <= 0.80) { level = 'Very High'; basePullback = 2.0; leverage = 3; }
-    else if (spreadPct <= 1.50) { level = 'Extreme'; basePullback = 3.0; leverage = 3; }
+    if (spreadPct < 0.02) { level = 'Very Low'; basePullback = 0.3; leverage = 15; }
+    else if (spreadPct < 0.05) { level = 'Low'; basePullback = 0.6; leverage = 10; }
+    else if (spreadPct < 0.15) { level = 'Normal'; basePullback = 1.0; leverage = 7; }
+    else if (spreadPct < 0.40) { level = 'High'; basePullback = 1.5; leverage = 5; }
+    else if (spreadPct < 0.80) { level = 'Very High'; basePullback = 2.0; leverage = 3; }
+    else if (spreadPct < 1.50) { level = 'Extreme'; basePullback = 3.0; leverage = 3; }
     else { level = 'Ultra'; basePullback = 4.0; leverage = 3; }
 
     const adjustedPullback = basePullback * entryTightness;
@@ -48,7 +48,7 @@ const getSpreadInfoFromSignal = (
     entryTightness: number = 1.0
 ): { level: string; pullback: number; leverage: number } => {
     // Check if real spread data has been received from WebSocket
-    const hasReal = (signal as any).hasRealSpread === true;
+    const hasReal = signal.hasRealSpread === true;
     if (!hasReal || typeof signal.spreadPct !== 'number') {
         return {
             level: 'Pending',
@@ -261,7 +261,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const hurstStr = Math.min(1.0, Math.max(0, (hurstVal - 0.35) / 0.4));
 
                                 // Use dynamic_trail_distance from backend if available
-                                const dynTrailDist = (signal as any).dynamic_trail_distance;
+                                const dynTrailDist = signal.dynamic_trail_distance;
                                 let trailPct: number;
 
                                 if (dynTrailDist && dynTrailDist > 0 && atrPct > 0) {
