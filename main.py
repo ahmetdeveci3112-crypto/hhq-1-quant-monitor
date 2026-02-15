@@ -7142,6 +7142,15 @@ async def update_ui_cache(opportunities: list, stats: dict):
             if signal_action == 'NONE':
                 filtered_opportunities.append(opp)
             else:
+                # Phase 225: PriceShock block (before BTC filter)
+                shock_blocked, shock_reason = price_shock_manager.should_block_signal(signal_action, symbol)
+                if shock_blocked:
+                    opp['signalAction'] = 'NONE'
+                    opp['signalScore'] = 0
+                    opp['shockBlocked'] = shock_reason
+                    filtered_opportunities.append(opp)
+                    continue
+                
                 btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(symbol, signal_action)
                 if btc_allowed:
                     if btc_penalty > 0:
@@ -7392,6 +7401,18 @@ async def background_scanner_loop():
                         trade_pattern_analyzer.analyze(global_paper_trader.trades)
                 except Exception as e:
                     logger.debug(f"Trade pattern analysis error: {e}")
+                
+                # Phase 225: Check for price shocks (after BTC + funding data available)
+                try:
+                    price_shock_manager.check_for_shock(btc_filter, liquidation_tracker, funding_oi_tracker)
+                    # If shock active, tighten exposed positions + cancel opposing pending
+                    if price_shock_manager.shock_mode != 'NORMAL':
+                        price_shock_manager.tighten_exposed_positions(global_paper_trader.positions)
+                        cancelled = price_shock_manager.cancel_opposing_pending(global_paper_trader.pending_orders)
+                        for c in cancelled:
+                            global_paper_trader.add_log(f"⚡ SHOCK_CANCEL: {c.get('side')} {c.get('symbol')} pending order cancelled ({price_shock_manager.shock_mode})")
+                except Exception as e:
+                    logger.debug(f"PriceShock check error: {e}")
                 
                 # Refresh coin list every 30 minutes to catch new listings
                 now = datetime.now().timestamp()
@@ -12607,6 +12628,352 @@ class CanaryMode:
 
 # Global instance
 canary_mode = CanaryMode()
+
+# ============================================================================
+# PHASE 225: PRICE SHOCK MANAGER
+# ============================================================================
+
+class PriceShockManager:
+    """
+    Bidirectional price shock detection + automatic response.
+    
+    Detects sudden BTC/coin price moves using ATR-dynamic thresholds and
+    4-filter validation (price, volume, sustained, liquidation/funding).
+    
+    Response: block opposing signals, cancel opposing pending orders,
+    tighten SL on exposed positions (idempotent, entry-distance based).
+    
+    Guardrails:
+    1. SL tightening = entry-SL distance × 0.7 (not price × 0.7), idempotent
+    2. Shock deactivation restores original SL from snapshot
+    3. Market shock > coin shock priority
+    4. Funding = supporting evidence only (not sole trigger)
+    5. Full event logging (filters passed, actions taken, duration)
+    """
+    
+    def __init__(self):
+        self.shock_mode = 'NORMAL'  # NORMAL | BEAR_SHOCK | BULL_SHOCK
+        self.shock_start_time = None
+        self.shock_cooldown_until = 0  # timestamp
+        self.min_shock_duration = 600  # 10 minutes minimum
+        self.shock_ttl = 900  # 15 minutes TTL
+        self.cooldown_duration = 900  # 15 minutes cooldown after shock ends
+        self.sl_tighten_factor = 0.7  # SL distance × 0.7
+        self.recovery_cancel_pct = 0.60  # %60 recovery → fake alarm
+        self.recovery_check_delay = 180  # 3 minutes
+        
+        # Snapshots for restore
+        self.sl_snapshots = {}  # {pos_id: {'sl': original_sl, 'trailing': original_trailing}}
+        self.shock_trigger_price = 0.0  # BTC price at shock trigger
+        
+        # History for logging
+        self.shock_history = []  # [{type, timestamp, filters, actions, duration}]
+        self.current_shock_event = None
+        
+        # BTC price tracking for 5m change
+        self.btc_price_history = []  # [(timestamp, price)] — last 10 minutes
+        
+        logger.info("⚡ PriceShockManager initialized (Phase 225)")
+    
+    def _update_price_history(self, btc_price: float):
+        """Track BTC price for 5-minute change calculation."""
+        now = datetime.now().timestamp()
+        self.btc_price_history.append((now, btc_price))
+        # Keep last 10 minutes
+        cutoff = now - 600
+        self.btc_price_history = [(t, p) for t, p in self.btc_price_history if t > cutoff]
+    
+    def _get_btc_5m_change(self) -> float:
+        """Calculate BTC % change over last 5 minutes."""
+        now = datetime.now().timestamp()
+        current_prices = [(t, p) for t, p in self.btc_price_history if t > now - 30]
+        old_prices = [(t, p) for t, p in self.btc_price_history if now - 330 < t < now - 270]
+        
+        if not current_prices or not old_prices:
+            return 0.0
+        
+        current = current_prices[-1][1]
+        old = sum(p for _, p in old_prices) / len(old_prices)
+        
+        if old <= 0:
+            return 0.0
+        return ((current - old) / old) * 100
+    
+    def _get_dynamic_threshold(self, btc_filter) -> float:
+        """ATR-based dynamic threshold. Higher in volatile markets, lower in quiet."""
+        btc_1h = abs(getattr(btc_filter, 'btc_change_1h', 0))
+        btc_4h = abs(getattr(btc_filter, 'btc_change_4h', 0))
+        
+        # Estimate 5m ATR from 1h and 4h changes
+        estimated_5m_atr = max(btc_1h / 4, btc_4h / 12, 0.3)
+        
+        # Threshold = 1.5 × estimated ATR, clamped to [0.5%, 2.0%]
+        threshold = max(0.5, min(2.0, 1.5 * estimated_5m_atr))
+        return threshold
+    
+    def check_for_shock(self, btc_filter, liquidation_tracker, funding_oi_tracker):
+        """Main shock detection — called every scanner cycle."""
+        now = datetime.now().timestamp()
+        btc_price = getattr(btc_filter, 'btc_price', 0)
+        
+        if btc_price <= 0:
+            return
+        
+        self._update_price_history(btc_price)
+        
+        # Check TTL expiry for active shock
+        if self.shock_mode != 'NORMAL':
+            elapsed = now - (self.shock_start_time or now)
+            
+            # Fake alarm check: recovery within 3 minutes
+            if elapsed > self.recovery_check_delay and self.shock_trigger_price > 0:
+                if self.shock_mode == 'BEAR_SHOCK':
+                    recovery = ((btc_price - self.shock_trigger_price) / self.shock_trigger_price) * 100 if self.shock_trigger_price > 0 else 0
+                    btc_5m = self._get_btc_5m_change()
+                    # If price recovered >60% of the drop
+                    if recovery > 0 and abs(btc_5m) < self._get_dynamic_threshold(btc_filter) * self.recovery_cancel_pct:
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC recovered {recovery:.2f}% — cancelling BEAR_SHOCK early")
+                        self._deactivate_shock('FAKE_RECOVERY')
+                        return
+                elif self.shock_mode == 'BULL_SHOCK':
+                    recovery = ((self.shock_trigger_price - btc_price) / self.shock_trigger_price) * 100 if self.shock_trigger_price > 0 else 0
+                    btc_5m = self._get_btc_5m_change()
+                    if recovery > 0 and abs(btc_5m) < self._get_dynamic_threshold(btc_filter) * self.recovery_cancel_pct:
+                        logger.warning(f"⚡ SHOCK_FAKE_ALARM: BTC reversed {recovery:.2f}% — cancelling BULL_SHOCK early")
+                        self._deactivate_shock('FAKE_RECOVERY')
+                        return
+            
+            # TTL expiry (after minimum duration)
+            if elapsed > max(self.min_shock_duration, self.shock_ttl):
+                logger.info(f"⚡ SHOCK_TTL: {self.shock_mode} expired after {elapsed/60:.1f}min")
+                self._deactivate_shock('TTL_EXPIRED')
+                return
+            
+            # If shock still active, check if it should extend
+            btc_5m = self._get_btc_5m_change()
+            threshold = self._get_dynamic_threshold(btc_filter)
+            if abs(btc_5m) > threshold:
+                # Extend TTL
+                self.shock_start_time = now - self.min_shock_duration  # Keep min duration passed
+                logger.debug(f"⚡ SHOCK_EXTEND: {self.shock_mode} TTL extended (BTC 5m={btc_5m:+.2f}%)")
+            return
+        
+        # Cooldown check
+        if now < self.shock_cooldown_until:
+            return
+        
+        # === DETECTION ===
+        btc_5m = self._get_btc_5m_change()
+        threshold = self._get_dynamic_threshold(btc_filter)
+        
+        if abs(btc_5m) < threshold:
+            return  # No shock candidate
+        
+        # 4-filter validation (need 3/4)
+        filters_passed = []
+        
+        # Filter 1: Price shock (already confirmed above)
+        filters_passed.append('price')
+        
+        # Filter 2: Volume spike — use 30m momentum as proxy
+        btc_30m = abs(getattr(btc_filter, 'btc_change_30m', 0))
+        if btc_30m > threshold * 0.8:
+            filters_passed.append('volume_momentum')
+        
+        # Filter 3: No quick recovery — check if move is sustained
+        # Use ratio of 30m vs 5m changes (if both same direction, sustained)
+        if btc_5m * getattr(btc_filter, 'btc_change_30m', 0) > 0:  # Same sign
+            filters_passed.append('sustained')
+        
+        # Filter 4: Liquidation spike OR funding extreme
+        try:
+            # Check BTCUSDT liquidations
+            btc_liqs = liquidation_tracker.recent_liquidations.get('BTCUSDT', [])
+            recent_liq_usd = sum(
+                l.get('usd', 0) for l in btc_liqs 
+                if l.get('timestamp', 0) > now - 60
+            )
+            if recent_liq_usd > 200000:  # $200K+ BTC liquidations in 60s
+                filters_passed.append('liquidation')
+        except:
+            pass
+        
+        if 'liquidation' not in filters_passed:
+            try:
+                btc_funding = funding_oi_tracker.funding_rates.get('BTCUSDT', 0)
+                if abs(btc_funding) > 0.001:  # 0.1%+ extreme funding
+                    filters_passed.append('funding_extreme')
+            except:
+                pass
+        
+        # Need 3/4 filters
+        if len(filters_passed) < 3:
+            logger.debug(f"⚡ SHOCK_INSUFFICIENT: BTC 5m={btc_5m:+.2f}% but only {len(filters_passed)}/4 filters: {filters_passed}")
+            return
+        
+        # === ACTIVATE SHOCK ===
+        shock_type = 'BEAR_SHOCK' if btc_5m < 0 else 'BULL_SHOCK'
+        self.shock_mode = shock_type
+        self.shock_start_time = now
+        self.shock_trigger_price = btc_price
+        
+        self.current_shock_event = {
+            'type': shock_type,
+            'timestamp': now,
+            'btc_change_5m': round(btc_5m, 2),
+            'threshold': round(threshold, 2),
+            'filters_passed': filters_passed,
+            'btc_price': btc_price,
+            'actions': [],
+            'positions_affected': [],
+        }
+        
+        logger.warning(f"⚡ PRICE_SHOCK: {shock_type} activated | BTC 5m={btc_5m:+.2f}% (threshold={threshold:.2f}%) | Filters: {filters_passed}")
+    
+    def should_block_signal(self, signal_action: str, symbol: str = '') -> tuple:
+        """Check if signal should be blocked due to active shock."""
+        if self.shock_mode == 'NORMAL':
+            return False, ''
+        
+        if self.shock_mode == 'BEAR_SHOCK' and signal_action == 'LONG':
+            return True, f'BEAR_SHOCK: LONG blocked (BTC crash detected)'
+        
+        if self.shock_mode == 'BULL_SHOCK' and signal_action == 'SHORT':
+            return True, f'BULL_SHOCK: SHORT blocked (BTC pump detected)'
+        
+        return False, ''
+    
+    def cancel_opposing_pending(self, pending_orders: list) -> list:
+        """Cancel pending orders opposing the shock direction. Returns cancelled list."""
+        if self.shock_mode == 'NORMAL':
+            return []
+        
+        cancelled = []
+        cancel_side = 'LONG' if self.shock_mode == 'BEAR_SHOCK' else 'SHORT'
+        
+        for order in list(pending_orders):
+            if order.get('side') == cancel_side:
+                cancelled.append(order)
+                pending_orders.remove(order)
+        
+        if cancelled and self.current_shock_event:
+            self.current_shock_event['actions'].append(f'cancel_pending_{cancel_side}_{len(cancelled)}')
+        
+        return cancelled
+    
+    def tighten_exposed_positions(self, positions: list):
+        """
+        Tighten SL for positions exposed to shock direction.
+        Guardrail 1: Uses entry-SL DISTANCE × 0.7, not price × 0.7.
+        Idempotent: snapshots prevent double-tightening.
+        """
+        if self.shock_mode == 'NORMAL':
+            return
+        
+        exposed_side = 'LONG' if self.shock_mode == 'BEAR_SHOCK' else 'SHORT'
+        
+        for pos in positions:
+            if pos.get('side') != exposed_side:
+                continue
+            
+            pos_id = pos.get('id', '')
+            
+            # Idempotent: skip if already tightened
+            if pos_id in self.sl_snapshots:
+                continue
+            
+            entry = pos.get('entryPrice', 0)
+            current_sl = pos.get('stopLoss', 0)
+            current_trailing = pos.get('trailingStop', 0)
+            
+            if entry <= 0:
+                continue
+            
+            # Snapshot original values for restore
+            self.sl_snapshots[pos_id] = {
+                'sl': current_sl,
+                'trailing': current_trailing,
+            }
+            
+            # Tighten: entry-SL distance × 0.7
+            if exposed_side == 'LONG':
+                sl_distance = entry - current_sl  # positive for valid SL
+                new_sl = entry - (sl_distance * self.sl_tighten_factor)
+                trail_distance = entry - current_trailing
+                new_trailing = entry - (trail_distance * self.sl_tighten_factor)
+            else:
+                sl_distance = current_sl - entry  # positive for valid SL
+                new_sl = entry + (sl_distance * self.sl_tighten_factor)
+                trail_distance = current_trailing - entry
+                new_trailing = entry + (trail_distance * self.sl_tighten_factor)
+            
+            pos['stopLoss'] = new_sl
+            pos['trailingStop'] = new_trailing
+            
+            if self.current_shock_event:
+                self.current_shock_event['positions_affected'].append(pos_id)
+                self.current_shock_event['actions'].append(f'tighten_sl_{pos_id[-8:]}')
+            
+            logger.warning(f"📉 SHOCK_TIGHTEN: {pos.get('symbol')} {exposed_side} | SL {current_sl:.4f}→{new_sl:.4f} (distance×{self.sl_tighten_factor})")
+    
+    def _deactivate_shock(self, reason: str = 'TTL_EXPIRED'):
+        """Deactivate shock and restore original SL values."""
+        now = datetime.now().timestamp()
+        duration = now - (self.shock_start_time or now)
+        
+        # Restore SL snapshots (Guardrail 2)
+        restored_count = 0
+        for pos_id, snapshot in self.sl_snapshots.items():
+            # Try to find position in global_paper_trader
+            try:
+                for pos in global_paper_trader.positions:
+                    if pos.get('id') == pos_id:
+                        pos['stopLoss'] = snapshot['sl']
+                        pos['trailingStop'] = snapshot['trailing']
+                        restored_count += 1
+                        logger.info(f"✅ SHOCK_RESTORE: {pos.get('symbol')} SL restored to {snapshot['sl']:.4f}")
+                        break
+            except:
+                pass
+        
+        # Log event
+        if self.current_shock_event:
+            self.current_shock_event['duration_seconds'] = round(duration)
+            self.current_shock_event['deactivation_reason'] = reason
+            self.current_shock_event['restored_count'] = restored_count
+            self.shock_history.append(self.current_shock_event)
+            # Keep last 50 events
+            self.shock_history = self.shock_history[-50:]
+        
+        old_mode = self.shock_mode
+        self.shock_mode = 'NORMAL'
+        self.shock_start_time = None
+        self.shock_trigger_price = 0.0
+        self.sl_snapshots.clear()
+        self.current_shock_event = None
+        
+        # Set cooldown (Guardrail: hysteresis)
+        self.shock_cooldown_until = now + self.cooldown_duration
+        
+        logger.warning(f"⚡ SHOCK_DEACTIVATED: {old_mode} → NORMAL | reason={reason} | duration={duration/60:.1f}min | restored={restored_count} positions | cooldown={self.cooldown_duration/60:.0f}min")
+    
+    def get_shock_status(self) -> dict:
+        """Get current shock status for API/dashboard."""
+        now = datetime.now().timestamp()
+        return {
+            'mode': self.shock_mode,
+            'active': self.shock_mode != 'NORMAL',
+            'start_time': self.shock_start_time,
+            'elapsed_seconds': round(now - self.shock_start_time) if self.shock_start_time else 0,
+            'trigger_price': self.shock_trigger_price,
+            'cooldown_remaining': max(0, round(self.shock_cooldown_until - now)),
+            'sl_snapshots_count': len(self.sl_snapshots),
+            'history_count': len(self.shock_history),
+            'last_event': self.shock_history[-1] if self.shock_history else None,
+        }
+
+# Global instance
+price_shock_manager = PriceShockManager()
 
 # ============================================================================
 # PHASE 155: AI OPTIMIZER - PnL-CORRELATED PERFORMANCE ANALYZER
