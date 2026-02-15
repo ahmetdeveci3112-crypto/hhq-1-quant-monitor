@@ -264,6 +264,9 @@ class SQLiteManager:
                     roi REAL,
                     timestamp INTEGER NOT NULL,
                     matched_to_income INTEGER DEFAULT 0,
+                    mae_pct REAL DEFAULT 0,
+                    mfe_pct REAL DEFAULT 0,
+                    decision_trace TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -358,6 +361,10 @@ class SQLiteManager:
                 ('binance_fill_price', 'REAL DEFAULT 0'),
                 ('hurst', 'REAL DEFAULT 0.5'),
                 ('trade_id', 'TEXT'),
+                # Phase 224A: Diagnostics columns
+                ('mae_pct', 'REAL DEFAULT 0'),
+                ('mfe_pct', 'REAL DEFAULT 0'),
+                ('decision_trace', 'TEXT DEFAULT \"[]\"'),
             ]
             for col_name, col_type in pc_migration_columns:
                 try:
@@ -736,8 +743,9 @@ class SQLiteManager:
                     pnl, leverage, size_usd, margin, roi, timestamp,
                     stop_loss, take_profit, atr, trailing_stop, trail_activation,
                     settings_snapshot, entry_method, entry_slippage, entry_spread,
-                    signal_score, spread_level, binance_fill_price, hurst, trade_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_score, spread_level, binance_fill_price, hurst, trade_id,
+                    mae_pct, mfe_pct, decision_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 close_data.get('symbol'),
                 close_data.get('side'),
@@ -766,6 +774,9 @@ class SQLiteManager:
                 close_data.get('binance_fill_price', 0),
                 close_data.get('hurst', 0.5),
                 close_data.get('trade_id', ''),
+                close_data.get('mae_pct', 0),
+                close_data.get('mfe_pct', 0),
+                close_data.get('decision_trace', '[]'),
             ))
             await db.commit()
             logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')}")
@@ -12482,9 +12493,20 @@ class MarketRegimeManager:
             btc_atr_pct = 2.0
             btc_trend = 'neutral'
             
-            if 'global_btc_state' in globals() and global_btc_state:
-                btc_atr_pct = global_btc_state.get('atr_pct', 2.0)
-                btc_trend = global_btc_state.get('trend', 'neutral')
+            # Read from btc_filter (BTCCorrelationFilter global instance)
+            if 'btc_filter' in globals() and btc_filter:
+                btc_trend_raw = getattr(btc_filter, 'btc_trend', 'NEUTRAL')
+                # Map BTCCorrelationFilter trend strings to regime format
+                if btc_trend_raw in ('BULLISH', 'STRONG_BULLISH'):
+                    btc_trend = 'bullish'
+                elif btc_trend_raw in ('BEARISH', 'STRONG_BEARISH'):
+                    btc_trend = 'bearish'
+                else:
+                    btc_trend = 'neutral'
+                # ATR estimate from 30m + 1h momentum
+                btc_1h_change = abs(getattr(btc_filter, 'btc_change_1h', 0))
+                btc_4h_change = abs(getattr(btc_filter, 'btc_change_4h', 0))
+                btc_atr_pct = max(btc_1h_change, btc_4h_change / 2, 1.0)
             
             if btc_atr_pct > 4.0:
                 regime = 'VOLATILE'
@@ -12556,9 +12578,11 @@ class CanaryMode:
         merged = {**base_params, **self.canary_params}
         return merged
     
-    def record_result(self, pos_id: str, pnl: float):
-        """Trade kapanınca sonucu kaydet."""
-        if self.should_use_canary(pos_id):
+    def record_result(self, pos_id: str, pnl: float, is_canary: bool = None):
+        """Trade kapanınca sonucu kaydet. Use stored is_canary flag if available."""
+        if is_canary is None:
+            is_canary = self.should_use_canary(pos_id)
+        if is_canary:
             self.canary_results.append(pnl)
         else:
             self.control_results.append(pnl)
@@ -15996,6 +16020,8 @@ class PaperTradingEngine:
             "mae_price": fill_price,
             "mfe_price": fill_price,
             "decision_trace": [],
+            # Phase 224D3: CanaryMode flag propagated from pending order
+            "is_canary": order.get('is_canary', False),
         }
         
         # =====================================================================
@@ -16321,6 +16347,7 @@ class PaperTradingEngine:
                 # If price dropped from high by bounce_mult * ATR, close position
                 if pos['gradual_high'] - current_price >= atr * bounce_mult:
                     self.add_log(f"📉 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
+                    pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_GRADUAL', 'roi': round(((current_price - pos['entryPrice']) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
                     self.close_position(pos, current_price, 'TIME_GRADUAL')
                     return True
                     
@@ -16334,12 +16361,14 @@ class PaperTradingEngine:
                 # If price rose from low by bounce_mult * ATR, close position
                 if current_price - pos['gradual_low'] >= atr * bounce_mult:
                     self.add_log(f"📈 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
+                    pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_GRADUAL', 'roi': round(((pos['entryPrice'] - current_price) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
                     self.close_position(pos, current_price, 'TIME_GRADUAL')
                     return True
             
             # Hard limit: force close regardless
             if age_hours > adjusted_hard_limit:
                 self.add_log(f"🆘 {adjusted_hard_limit:.0f}h+ SAAT: Zorunlu çıkış (x{et:.1f})")
+                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_FORCE', 'roi': round(((current_price - pos['entryPrice']) / pos['entryPrice'] * 100) if pos.get('side') == 'LONG' and pos['entryPrice'] > 0 else ((pos['entryPrice'] - current_price) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
                 self.close_position(pos, current_price, 'TIME_FORCE')
                 return True
                 
@@ -16884,12 +16913,10 @@ class PaperTradingEngine:
             
             # 1.5. Adverse Position Exit (4h terste kalan pozisyonlar)
             if self.check_adverse_position_exit(pos, current_price, atr):
-                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE', 'roi': round(pnl_percent, 1)})
                 continue
             
             # 2. Time-based exit (gradual liquidation)
             if self.check_time_based_exit(pos, current_price, atr):
-                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME', 'roi': round(pnl_percent, 1)})
                 continue
             
             # 3. Progressive SL (move SL to lock profits)
@@ -17310,9 +17337,9 @@ class PaperTradingEngine:
         except Exception as ea_err:
             logger.debug(f"ExitArbitrator error: {ea_err}")
         
-        # Phase 224D3: Record result in CanaryMode
+        # Phase 224D3: Record result in CanaryMode (use stored flag)
         try:
-            canary_mode.record_result(pos.get('id', ''), pnl)
+            canary_mode.record_result(pos.get('id', ''), pnl, is_canary=pos.get('is_canary', False))
         except Exception as cm_err:
             logger.debug(f"CanaryMode error: {cm_err}")
         
