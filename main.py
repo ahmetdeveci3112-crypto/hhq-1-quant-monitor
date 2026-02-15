@@ -5311,6 +5311,7 @@ class CoinOpportunity:
             "zscore": round(self.zscore, 2),
             "hurst": round(self.hurst, 2),
             "spreadPct": round(self.bid_ask_spread_pct, 4),  # Real bid-ask spread from WebSocket
+            "hasRealSpread": self.has_real_spread,  # True when real bid/ask data received
             "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
@@ -6993,6 +6994,10 @@ class MultiCoinScanner:
                     bid_ask_spread = ((ask - bid) / mid) * 100  # Midpoint-based percentage
                     analyzer.opportunity.bid_ask_spread_pct = round(bid_ask_spread, 4)
                     analyzer.opportunity.has_real_spread = True
+                else:
+                    # Debug: log when bid/ask is missing or invalid
+                    if coin_count <= 3:  # Only first 3 to avoid spam
+                        logger.debug(f"📊 SPREAD_DEBUG: {symbol} bid={bid} ask={ask} — no valid spread")
                 
                 # Update whale tracker with volume and price change
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))

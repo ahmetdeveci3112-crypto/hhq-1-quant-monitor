@@ -45,9 +45,11 @@ const getSpreadInfoFromSignal = (
     signal: CoinOpportunity,
     entryTightness: number = 1.0
 ): { level: string; pullback: number; leverage: number } => {
-    if (typeof signal.spreadPct !== 'number' || signal.spreadPct <= 0) {
+    // Check if real spread data has been received from WebSocket
+    const hasReal = (signal as any).hasRealSpread === true;
+    if (!hasReal || typeof signal.spreadPct !== 'number') {
         return {
-            level: 'Unknown',
+            level: 'Pending',
             pullback: 0.6 * entryTightness,
             leverage: signal.leverage || 10
         };
