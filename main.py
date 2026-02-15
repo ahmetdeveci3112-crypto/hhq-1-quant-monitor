@@ -846,14 +846,17 @@ class SQLiteManager:
             now_ms = int(datetime.now().timestamp() * 1000)
             window_ms = 5 * 60 * 1000  # 5 minutes
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute('''
+                cursor = await db.execute('''
                     UPDATE position_closes SET close_order_id = ?
                     WHERE symbol = ? AND (close_order_id IS NULL OR close_order_id = '')
                     AND timestamp > ? - ?
                     ORDER BY timestamp DESC LIMIT 1
                 ''', (close_order_id, symbol, now_ms, window_ms))
                 await db.commit()
-                logger.info(f"🆔 Close order ID saved: {symbol} = {close_order_id[:12]}")
+                if cursor.rowcount > 0:
+                    logger.info(f"🆔 Close order ID saved: {symbol} = {close_order_id[:12]}")
+                else:
+                    logger.debug(f"🆔 Close order ID no matching row: {symbol} = {close_order_id[:12]}")
         except Exception as e:
             logger.warning(f"⚠️ update_close_order_id error: {e}")
     
@@ -12022,6 +12025,9 @@ class BreakevenStopManager:
                                     logger.error(f"❌ BREAKEVEN MARKET FALLBACK ERROR: {symbol} — {mkt_err}")
                             
                             # Limit order filled (fully or partially)! Record breakeven
+                            # Phase 229b: Persist limit order ID for trade matching
+                            if order_id:
+                                safe_create_task(sqlite_manager.update_close_order_id(symbol, str(order_id)))
                             
                             # Calculate real PnL
                             if side == 'LONG':
