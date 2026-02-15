@@ -8566,6 +8566,24 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.info(f"🚫 SKIPPING {symbol}: Max positions reached ({len(global_paper_trader.positions)})")
         return
     
+    # Phase 219: USDT-based directional exposure limit — early reject
+    MAX_DIRECTION_EXPOSURE_PCT = 0.40
+    signal_side = 'LONG' if action in ('BUY', 'LONG') else 'SHORT'
+    same_dir_margin = sum(
+        p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+        for p in global_paper_trader.positions if p.get('side') == signal_side
+    )
+    same_dir_margin += sum(
+        p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+        for p in global_paper_trader.pending_orders if p.get('side') == signal_side
+    )
+    max_dir_exposure = global_paper_trader.balance * MAX_DIRECTION_EXPOSURE_PCT
+    if same_dir_margin >= max_dir_exposure:
+        signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
+        return
+    
     # Check blacklist
     if global_paper_trader.is_coin_blacklisted(symbol):
         signal_log_data['reject_reason'] = 'BLACKLISTED'
@@ -14906,7 +14924,7 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
             return None  # Silently skip to avoid log spam
         
-        # Phase 217: Direction exposure limit — max %70 aynı yönde
+        # Phase 217: Direction exposure limit — max %70 aynı yönde (count-based)
         long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
         short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
         max_same_direction = max(3, self.max_positions * 70 // 100)
@@ -14915,6 +14933,23 @@ class PaperTradingEngine:
             return None
         if side == 'SHORT' and short_count >= max_same_direction:
             logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
+            return None
+        
+        # Phase 219: USDT-based directional exposure limit — max %40 of balance per direction
+        # Prevents overexposure to one direction. Uses margin (sizeUsd/leverage) as actual capital at risk.
+        MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
+        same_dir_margin = sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in self.positions if p.get('side') == side
+        )
+        # Also count pending orders for same direction
+        same_dir_margin += sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in self.pending_orders if p.get('side') == side
+        )
+        max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
+        if same_dir_margin >= max_dir_exposure:
+            logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
             return None
         
         # =========================================================================
