@@ -284,6 +284,9 @@ export interface CoinOpportunity {
   lastUpdate: number;
   leverage?: number;  // Phase 73: Backend-calculated leverage based on volatility
   pullbackPct?: number;  // Pullback percentage for entry
+  hasRealSpread?: boolean;  // Phase 228: Whether real bid-ask spread data is available
+  spreadLevel?: string;  // Phase 228: 'Very Low' | 'Low' | 'Normal' | 'High' | 'Very High' | 'Extreme' | 'Ultra'
+  dynamic_trail_distance?: number;  // Phase 228: Dynamic trail distance from backend
 }
 
 export interface ScannerStats {

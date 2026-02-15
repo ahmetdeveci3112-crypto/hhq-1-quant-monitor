@@ -29,11 +29,13 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
     let leverage: number;
     let level: string;
 
-    if (spreadPct <= 0.015) { level = 'Very Low'; basePullback = 0.3; leverage = 50; }
-    else if (spreadPct <= 0.05) { level = 'Low'; basePullback = 0.6; leverage = 25; }
-    else if (spreadPct <= 0.12) { level = 'Normal'; basePullback = 1.0; leverage = 10; }
-    else if (spreadPct <= 0.25) { level = 'High'; basePullback = 1.5; leverage = 5; }
-    else { level = 'Very High'; basePullback = 2.0; leverage = 3; }
+    if (spreadPct <= 0.02) { level = 'Very Low'; basePullback = 0.3; leverage = 15; }
+    else if (spreadPct <= 0.05) { level = 'Low'; basePullback = 0.6; leverage = 10; }
+    else if (spreadPct <= 0.15) { level = 'Normal'; basePullback = 1.0; leverage = 7; }
+    else if (spreadPct <= 0.40) { level = 'High'; basePullback = 1.5; leverage = 5; }
+    else if (spreadPct <= 0.80) { level = 'Very High'; basePullback = 2.0; leverage = 3; }
+    else if (spreadPct <= 1.50) { level = 'Extreme'; basePullback = 3.0; leverage = 3; }
+    else { level = 'Ultra'; basePullback = 4.0; leverage = 3; }
 
     const adjustedPullback = basePullback * entryTightness;
     return { level, pullback: adjustedPullback, leverage };

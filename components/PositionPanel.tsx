@@ -111,10 +111,14 @@ export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClose
                         <span className="text-indigo-400 font-bold">{(position as any).leverage}x</span>
                     )}
                     {(position as any).spreadLevel && (
-                        <span className={`px-1 rounded text-[8px] ${(position as any).spreadLevel === 'very_low' ? 'bg-emerald-500/20 text-emerald-400' :
-                            (position as any).spreadLevel === 'low' ? 'bg-emerald-500/10 text-emerald-300' :
-                                (position as any).spreadLevel === 'normal' ? 'bg-amber-500/10 text-amber-400' :
-                                    'bg-red-500/10 text-red-400'
+                        <span className={`px-1 rounded text-[8px] ${(position as any).spreadLevel === 'Very Low' ? 'bg-emerald-500/20 text-emerald-400' :
+                                (position as any).spreadLevel === 'Low' ? 'bg-emerald-500/10 text-emerald-300' :
+                                    (position as any).spreadLevel === 'Normal' ? 'bg-amber-500/10 text-amber-400' :
+                                        (position as any).spreadLevel === 'High' ? 'bg-orange-500/10 text-orange-400' :
+                                            (position as any).spreadLevel === 'Very High' ? 'bg-red-500/10 text-red-400' :
+                                                (position as any).spreadLevel === 'Extreme' ? 'bg-red-500/20 text-red-500' :
+                                                    (position as any).spreadLevel === 'Ultra' ? 'bg-fuchsia-500/20 text-fuchsia-400' :
+                                                        'bg-slate-500/10 text-slate-400'
                             }`}>{(position as any).spreadLevel}</span>
                     )}
                 </div>
