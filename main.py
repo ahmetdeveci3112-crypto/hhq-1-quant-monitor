@@ -5838,7 +5838,7 @@ class BinanceWebSocketManager:
         self.running = False
         self.connected = False
         self.last_update = 0
-        self.ws_url = "wss://fstream.binance.com/ws/!ticker@arr"
+        self.ws_url = "wss://fstream.binance.com/stream?streams=!ticker@arr/!bookTicker"  # Phase 228: Combined stream
         self._reconnect_task = None
         # Phase 191: Callback pattern for real-time position updates
         self.position_symbols: set = set()  # Aktif pozisyonlu semboller
@@ -5864,7 +5864,17 @@ class BinanceWebSocketManager:
                         
                         try:
                             data = json.loads(message)
-                            self._process_ticker_message(data)
+                            # Combined stream wraps in {stream, data}
+                            if isinstance(data, dict) and 'stream' in data:
+                                stream_name = data['stream']
+                                payload = data['data']
+                                if stream_name == '!ticker@arr':
+                                    self._process_ticker_message(payload)
+                                elif stream_name == '!bookTicker':
+                                    self._process_book_ticker(payload)
+                            elif isinstance(data, list):
+                                # Fallback: direct ticker array
+                                self._process_ticker_message(data)
                             
                             # Phase 191: Process pending position price updates
                             if self._pending_updates:
@@ -5927,6 +5937,39 @@ class BinanceWebSocketManager:
                 sym = ticker.get('s', '')
                 if sym in self.position_symbols:
                     self._pending_updates.append((sym, self.tickers[sym]))
+
+    def _process_book_ticker(self, data: dict):
+        """Process bookTicker message — updates bid/ask in existing ticker cache."""
+        if not isinstance(data, dict):
+            return
+        
+        symbol = data.get('s', '')
+        if not symbol.endswith('USDT'):
+            return
+        
+        bid = float(data.get('b', 0))
+        ask = float(data.get('a', 0))
+        bid_qty = float(data.get('B', 0))
+        ask_qty = float(data.get('A', 0))
+        
+        if symbol in self.tickers:
+            # Update existing ticker with real bid/ask
+            self.tickers[symbol]['bid'] = bid
+            self.tickers[symbol]['ask'] = ask
+            self.tickers[symbol]['bidQty'] = bid_qty
+            self.tickers[symbol]['askQty'] = ask_qty
+            # Recalculate imbalance from real quantities
+            if bid_qty + ask_qty > 0:
+                self.tickers[symbol]['imbalance'] = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100
+        else:
+            # Create minimal ticker entry (will be enriched by !ticker@arr)
+            self.tickers[symbol] = {
+                'last': 0, 'percentage': 0, 'quoteVolume': 0, 'baseVolume': 0,
+                'high': 0, 'low': 0,
+                'bid': bid, 'ask': ask, 'bidQty': bid_qty, 'askQty': ask_qty,
+                'imbalance': ((bid_qty - ask_qty) / (bid_qty + ask_qty)) * 100 if bid_qty + ask_qty > 0 else 0,
+                'timestamp': int(data.get('E', 0))
+            }
     
     def get_tickers(self, symbols: list = None) -> dict:
         """Get current ticker data for specified symbols."""
