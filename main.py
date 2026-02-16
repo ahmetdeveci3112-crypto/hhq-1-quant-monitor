@@ -8064,14 +8064,15 @@ async def background_scanner_loop():
                             
                             if pos['side'] == 'LONG':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                if (trail_already_active and price_move_pct >= min_price_move_for_trail) or (candle_close_price > trail_activation and price_move_pct >= min_price_move_for_trail):
+                                # Phase 231e: Only price_move check — no trailActivation price threshold
+                                if price_move_pct >= min_price_move_for_trail or trail_already_active:
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                if (trail_already_active and price_move_pct >= min_price_move_for_trail) or (candle_close_price < trail_activation and price_move_pct >= min_price_move_for_trail):
+                                if price_move_pct >= min_price_move_for_trail or trail_already_active:
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
@@ -8454,13 +8455,14 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
-            if (ws_trail_already_active and ws_price_move_pct >= ws_min_price_move) or (candle_close_price > trail_activation and ws_price_move_pct >= ws_min_price_move):
+            # Phase 231e: Only price_move check — no trailActivation price threshold
+            if ws_price_move_pct >= ws_min_price_move or ws_trail_already_active:
                 new_trailing = candle_close_price - dynamic_trail_distance
                 if new_trailing > trailing_stop:
                     pos['trailingStop'] = new_trailing
                     pos['isTrailingActive'] = True
         elif pos['side'] == 'SHORT':
-            if (ws_trail_already_active and ws_price_move_pct >= ws_min_price_move) or (candle_close_price < trail_activation and ws_price_move_pct >= ws_min_price_move):
+            if ws_price_move_pct >= ws_min_price_move or ws_trail_already_active:
                 new_trailing = candle_close_price + dynamic_trail_distance
                 if new_trailing < trailing_stop:
                     pos['trailingStop'] = new_trailing
@@ -8686,16 +8688,16 @@ async def position_price_update_loop():
                         fast_roi = fast_price_move * fast_leverage
                         fast_min_price_move = 0.75  # Phase 231d: %0.75 price move (not ROI)
                         
-                        # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
-                            if (fast_trail_already_active and fast_price_move >= fast_min_price_move) or (current_price > trail_activation and fast_price_move >= fast_min_price_move):
+                            # Phase 231e: Only price_move check — no trailActivation price threshold
+                            if fast_price_move >= fast_min_price_move or fast_trail_already_active:
                                 new_trailing = current_price - dynamic_trail_distance
                                 if new_trailing > trailing_stop:
                                     pos['trailingStop'] = new_trailing
                                     pos['isTrailingActive'] = True
                         elif pos['side'] == 'SHORT':
-                            if (fast_trail_already_active and fast_price_move >= fast_min_price_move) or (current_price < trail_activation and fast_price_move >= fast_min_price_move):
+                            if fast_price_move >= fast_min_price_move or fast_trail_already_active:
                                 new_trailing = current_price + dynamic_trail_distance
                                 if new_trailing < trailing_stop:
                                     pos['trailingStop'] = new_trailing
@@ -11380,8 +11382,12 @@ class TimeBasedPositionManager:
                                 partial_tp_state[level['key']] = True
                                 pos['partial_tp_state'] = partial_tp_state
                                 
-                                # Calculate contracts to close (25%)
-                                close_contracts = contracts * level['close_pct']
+                                # Phase 231e: Use ORIGINAL contracts for percentage calc
+                                # Prevents compounding: 40/18/12.6 → correct 40/30/30
+                                original_contracts = pos.get('original_contracts', contracts)
+                                if original_contracts == 0:
+                                    original_contracts = contracts
+                                close_contracts = original_contracts * level['close_pct']
                                 
                                 # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False) and close_contracts > 0:
@@ -11410,9 +11416,13 @@ class TimeBasedPositionManager:
                                         logger.warning(f"⚠️ PARTIAL_TP REVERTED: {symbol} {level['key']} — Binance close failed, state rolled back")
                                         continue  # Skip contract update and trail activation
                                 
-                                # Update position contracts (reduce by close_pct)
-                                pos['contracts'] = contracts - close_contracts
-                                pos['original_contracts'] = pos.get('original_contracts', contracts)
+                                # Phase 231e: Save original_contracts BEFORE first reduction
+                                if not pos.get('original_contracts'):
+                                    pos['original_contracts'] = contracts
+                                
+                                # Update position contracts AND size (keep in sync)
+                                pos['contracts'] = pos.get('contracts', contracts) - close_contracts
+                                pos['size'] = pos.get('contracts', contracts)  # Sync size = contracts
                                 
                                 # =====================================================
                                 # Phase 220: TP1 → Force Trail + Breakeven SL
