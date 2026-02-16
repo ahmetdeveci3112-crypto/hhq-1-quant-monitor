@@ -1540,14 +1540,19 @@ class LiveBinanceTrader:
                     
                     trail_state = self.trailing_state[symbol]
                     roi_pct = pnl_percent
-                    activation_threshold = 3.0 * exit_tightness  # Phase 144: ROI-based
+                    # Phase 231j: Dual-condition — aligned with scanner/WS/backup/sync
+                    fb_price_move = abs((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                     
-                    # Once activated, stays active until position closes
-                    if not trail_state['isActive'] and roi_pct >= activation_threshold:
+                    # Phase 231h: Breakeven prices
+                    be_long = entry_price * 1.001
+                    be_short = entry_price * 0.999
+                    
+                    # Phase 231j: price_move >= 0.75 OR roi >= 5.0
+                    if not trail_state['isActive'] and (fb_price_move >= 0.75 or roi_pct >= 5.0):
                         trail_state['isActive'] = True
                         trail_state['activatedAt'] = datetime.now().isoformat()
                         trail_state['peakPrice'] = current_price
-                        logger.info(f"🔄 TRAIL ACTIVATED: {symbol} ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                        logger.info(f"🔄 TRAIL+BE(fallback): {symbol} pm={fb_price_move:.2f}% roi={roi_pct:.1f}%")
                     
                     is_trailing_active = trail_state['isActive']
                     
@@ -1558,6 +1563,8 @@ class LiveBinanceTrader:
                             if candle_close_price > trail_state['peakPrice']:
                                 trail_state['peakPrice'] = candle_close_price
                             trailing_stop = trail_state['peakPrice'] - trail_distance
+                            # Phase 231h: Clamp — never below breakeven
+                            trailing_stop = max(trailing_stop, be_long)
                             # Keep the highest trailing stop
                             if trailing_stop > trail_state['trailingStop']:
                                 trail_state['trailingStop'] = trailing_stop
@@ -1567,6 +1574,8 @@ class LiveBinanceTrader:
                             if candle_close_price < trail_state['peakPrice']:
                                 trail_state['peakPrice'] = candle_close_price
                             trailing_stop = trail_state['peakPrice'] + trail_distance
+                            # Phase 231h: Clamp — never above breakeven
+                            trailing_stop = min(trailing_stop, be_short)
                             # Keep the lowest trailing stop for shorts
                             if trailing_stop < trail_state['trailingStop'] or trail_state['trailingStop'] == sl:
                                 trail_state['trailingStop'] = trailing_stop
