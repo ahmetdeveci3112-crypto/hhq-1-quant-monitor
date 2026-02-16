@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, BarChart3, Trophy, AlertTriangle, Bot, RefreshCw } from 'lucide-react';
+import { translateReason } from '../utils/reasonUtils';
 
 interface DailyPnL {
     date: string;
@@ -23,86 +24,7 @@ interface Props {
     apiUrl: string;
 }
 
-// Phase 58: Translate close reasons to detailed Turkish descriptions with algorithm criteria
-const translateReason = (reason: string): string => {
-    const mapping: Record<string, string> = {
-        // ===== STOP LOSS / TAKE PROFIT =====
-        'SL': '🛑 Stop Loss Tetiklendi',
-        'TP': '✅ Take Profit Ulaşıldı',
-        'SL_HIT': '🛑 Stop Loss: 3 Tick Onayı ile Kapatıldı',
-        'TP_HIT': '✅ Take Profit: Hedef Fiyata Ulaşıldı',
-
-        // ===== BREAKEVEN STOP =====
-        'BREAKEVEN_CLOSE': '🔒 Breakeven: Fiyat Giriş Noktasına Döndü',
-
-        // ===== LOSS RECOVERY TRAIL =====
-        'RECOVERY_TRAIL_CLOSE': '🔄 Zarar Toparlanması: Kazancın %50\'sini Geri Verdi',
-
-        // ===== KILL SWITCH - MARGIN ZARAR LİMİTİ =====
-        'KILL_SWITCH_FULL': '🚨 Kill Switch: Margin Kaybı ≥%50 → Tam Kapatma',
-        'KILL_SWITCH_PARTIAL': '⚠️ Kill Switch: Margin Kaybı ≥%30 → %50 Küçültme',
-
-        // ===== TIME-BASED - ZAMAN BAZLI =====
-        'TIME_REDUCE_4H': '⏰ Zaman: 4 Saat Zararda → %10 Küçültme',
-        'TIME_REDUCE_8H': '⏰ Zaman: 8 Saat Zararda → %10 Küçültme',
-        'TIME_GRADUAL': '⏳ Zaman: 12h Aşımı + ATR Geri Çekilme',
-        'TIME_FORCE': '⌛ Zaman: 48+ Saat → Zorunlu Çıkış',
-        'EARLY_TRAIL': '📊 Erken Trail: Kârda Stagnasyon Tespiti',
-
-        // ===== PORTFOLIO RECOVERY =====
-        'RECOVERY_CLOSE_ALL': '🔴 Portfolio Recovery: 12h Underwater → Pozitife Dönüş',
-        'RECOVERY_EXIT': '🔄 Toparlanma: Kayıptan Başabaşa Dönüş',
-
-        // ===== ADVERSE & EMERGENCY =====
-        'ADVERSE_TIME_EXIT': '📉 Olumsuz Zaman: 8+ Saat Zararda Kaldı',
-        'EMERGENCY_SL': '🚨 Acil SL: -%15 Pozisyon Kaybı Limiti',
-
-        // ===== SIGNAL-BASED =====
-        'SIGNAL_REVERSAL_PROFIT': '↩️ Sinyal Tersi: Kârda İken Trend Döndü',
-        'SIGNAL_REVERSAL': '↩️ Sinyal Tersi: Trend Yönü Değişti',
-
-        // ===== MANUEL =====
-        'MANUAL': '👤 Manuel: Kullanıcı Tarafından Kapatıldı',
-        'MANUAL_CLOSE': '👤 Manuel Kapatma',
-    };
-
-    if (!reason) return '-';
-
-    // Partial match for dynamic reasons - order matters (most specific first)
-    // TIME_REDUCE patterns
-    if (reason.includes('TIME_REDUCE_4H')) return mapping['TIME_REDUCE_4H'];
-    if (reason.includes('TIME_REDUCE_8H')) return mapping['TIME_REDUCE_8H'];
-    if (reason.includes('TIME_REDUCE')) return '⏰ Zaman Bazlı Küçültme';
-
-    // BREAKEVEN patterns
-    if (reason.includes('BREAKEVEN_CLOSE')) return mapping['BREAKEVEN_CLOSE'];
-    if (reason.includes('BREAKEVEN')) return '🔒 Breakeven Stop Tetiklendi';
-
-    // RECOVERY patterns
-    if (reason.includes('RECOVERY_TRAIL_CLOSE')) return mapping['RECOVERY_TRAIL_CLOSE'];
-    if (reason.includes('RECOVERY_TRAIL')) return '🔄 Zarar Toparlanma Trail Aktif';
-    if (reason.includes('RECOVERY_CLOSE_ALL')) return mapping['RECOVERY_CLOSE_ALL'];
-    if (reason.includes('RECOVERY')) return mapping['RECOVERY_EXIT'];
-
-    // KILL SWITCH patterns
-    if (reason.includes('KILL_SWITCH_FULL')) return mapping['KILL_SWITCH_FULL'];
-    if (reason.includes('KILL_SWITCH_PARTIAL')) return mapping['KILL_SWITCH_PARTIAL'];
-    if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
-    if (reason.includes('KILL')) return '🚨 Kill Switch Tetiklendi';
-
-    // TIME patterns
-    if (reason.includes('TIME_GRADUAL')) return mapping['TIME_GRADUAL'];
-    if (reason.includes('TIME_FORCE')) return mapping['TIME_FORCE'];
-    if (reason.includes('EARLY_TRAIL')) return mapping['EARLY_TRAIL'];
-
-    // Other patterns
-    if (reason.includes('ADVERSE')) return mapping['ADVERSE_TIME_EXIT'];
-    if (reason.includes('EMERGENCY')) return mapping['EMERGENCY_SL'];
-    if (reason.includes('MANUAL')) return mapping['MANUAL'];
-    if (reason.includes('SIGNAL_REVERSAL')) return mapping['SIGNAL_REVERSAL'];
-
-    return mapping[reason] || reason;
-};
+// Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
 
 export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {

@@ -1473,7 +1473,8 @@ class LiveBinanceTrader:
                     except Exception as e:
                         logger.warning(f"Could not get openTime from SQLite for {symbol}: {e}")
                     
-                    position_amount = abs(contracts)
+                    # Phase 232: Use raw_position_amt when contracts==0
+                    position_amount = abs(contracts) if abs(contracts) > 0 else abs(raw_position_amt)
                     entry_price = float(p.get('entryPrice') or 0)
                     mark_price = float(p.get('markPrice') or 0)
                     
@@ -1532,7 +1533,8 @@ class LiveBinanceTrader:
                             'isActive': False,
                             'trailingStop': sl,
                             'peakPrice': current_price,
-                            'activatedAt': None
+                            'activatedAt': None,
+                            'openTime': open_time  # Phase 232: for hold-time guard
                         }
                     
                     # Phase 205: Use candle close price for trail decisions
@@ -2158,6 +2160,14 @@ class LiveBinanceTrader:
             
             if result:
                 logger.info(f"✅ TRAIL CLOSE SUCCESS: {symbol} | Order ID: {result.get('id')}")
+                # Phase 232: Persist reason for sync
+                if not hasattr(self, 'pending_close_reasons'):
+                    self.pending_close_reasons = {}
+                self.pending_close_reasons[symbol] = reason
+                try:
+                    await db_manager.save_position_close(symbol, reason)
+                except Exception:
+                    pass
             else:
                 logger.error(f"❌ TRAIL CLOSE FAILED: {symbol}")
                 
@@ -7444,6 +7454,12 @@ async def update_ui_cache(opportunities: list, stats: dict):
             ui_state_cache.positions = global_paper_trader.positions
             ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
             ui_state_cache.trading_mode = "paper"
+            # Phase 232: Sync trades on every cycle (fix stale cache)
+            ui_state_cache.trades = sorted(
+                global_paper_trader.trades,
+                key=lambda t: t.get('closeTime', t.get('close_time', 0)),
+                reverse=True
+            )
         
         # Phase 150: Trade history — SQLite first, then Binance delta
         now = datetime.now().timestamp()
@@ -7749,29 +7765,39 @@ async def background_scanner_loop():
                                         filled_amt = order_status.get('filled', 0)
                                         
                                         if remaining_amt > 0:
-                                            # Partial fill → market close remainder
+                                            # Phase 232: Partial fill → weighted avg exit price
                                             logger.warning(f"⚠️ LIMIT_PARTIAL: {pos_symbol} filled={filled_amt:.4f} remaining={remaining_amt:.4f} → market closing rest")
+                                            limit_avg = fill_price
+                                            market_avg = current_price
                                             try:
-                                                await live_binance_trader.close_position(pos_symbol, pos['side'], remaining_amt)
+                                                mkt_result = await live_binance_trader.close_position(pos_symbol, pos['side'], remaining_amt)
+                                                if mkt_result and mkt_result.get('average'):
+                                                    market_avg = float(mkt_result['average'])
                                             except Exception as pf_err:
                                                 logger.error(f"❌ Partial fill market close error: {pf_err}")
+                                            # Weighted average exit
+                                            exit_avg = (filled_amt * limit_avg + remaining_amt * market_avg) / (filled_amt + remaining_amt) if (filled_amt + remaining_amt) > 0 else fill_price
+                                        else:
+                                            exit_avg = fill_price
                                         
-                                        logger.warning(f"✅ LIMIT_FILLED: {pos_symbol} {pos['side']} @ ${fill_price:.6f} | Reason: {reason} | Elapsed: {elapsed:.0f}s")
+                                        logger.warning(f"✅ LIMIT_FILLED: {pos_symbol} {pos['side']} @ ${exit_avg:.6f} | Reason: {reason} | Elapsed: {elapsed:.0f}s")
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, fill_price, reason)
+                                        global_paper_trader.close_position(pos, exit_avg, reason)
                                         continue
                                     elif status == 'canceled' or status == 'expired':
-                                        # Order was externally cancelled
+                                        # Phase 232: Distinct reason for cancelled orders
+                                        cancel_reason = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                                         logger.warning(f"⚠️ LIMIT_CANCELLED: {pos_symbol} order {order_id} — market close")
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        global_paper_trader.close_position(pos, current_price, cancel_reason)
                                         continue
                                     elif elapsed >= timeout:
-                                        # TIMEOUT → cancel limit + market close
+                                        # Phase 232: Distinct reason for timeout
+                                        timeout_reason = f"{'TP_TIMEOUT' if 'TP' in reason else 'TRAIL_TIMEOUT'}_MARKET_FALLBACK({reason})"
                                         logger.warning(f"⏰ LIMIT_TIMEOUT: {pos_symbol} {reason} not filled in {elapsed:.0f}s → cancel + market")
                                         await live_binance_trader.cancel_order(pos_symbol, order_id)
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        global_paper_trader.close_position(pos, current_price, timeout_reason)
                                         continue
                                     else:
                                         # Still open — skip this position's SL/TP checks
@@ -8294,24 +8320,34 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 if chk_status == 'closed':
                     fill_price = order_check.get('average', pending.get('limit_price', current_price))
                     remaining_amt = order_check.get('remaining', 0)
+                    filled_amt_ws = order_check.get('filled', 0)
                     if remaining_amt > 0:
+                        limit_avg_ws = fill_price
+                        market_avg_ws = current_price
                         try:
-                            await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                            mkt_r = await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                            if mkt_r and mkt_r.get('average'):
+                                market_avg_ws = float(mkt_r['average'])
                         except:
                             pass
-                    logger.warning(f"✅ WS_LIMIT_FILLED: {symbol} @ ${fill_price:.6f} | {reason} | {elapsed:.0f}s")
+                        exit_avg_ws = (filled_amt_ws * limit_avg_ws + remaining_amt * market_avg_ws) / (filled_amt_ws + remaining_amt) if (filled_amt_ws + remaining_amt) > 0 else fill_price
+                    else:
+                        exit_avg_ws = fill_price
+                    logger.warning(f"✅ WS_LIMIT_FILLED: {symbol} @ ${exit_avg_ws:.6f} | {reason} | {elapsed:.0f}s")
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, fill_price, reason)
+                    global_paper_trader.close_position(pos, exit_avg_ws, reason)
                     continue
                 elif chk_status in ('canceled', 'expired'):
+                    cancel_reason_ws = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, reason)
+                    global_paper_trader.close_position(pos, current_price, cancel_reason_ws)
                     continue
                 elif elapsed >= timeout:
+                    timeout_reason_ws = f"{'TP_TIMEOUT' if 'TP' in reason else 'TRAIL_TIMEOUT'}_MARKET_FALLBACK({reason})"
                     logger.warning(f"⏰ WS_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
                     await live_binance_trader.cancel_order(symbol, order_id)
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, reason)
+                    global_paper_trader.close_position(pos, current_price, timeout_reason_ws)
                     continue
                 else:
                     continue  # Still pending — skip SL/TP
@@ -8604,25 +8640,35 @@ async def position_price_update_loop():
                                 if chk_status == 'closed':
                                     fill_price = order_check.get('average', pending.get('limit_price', current_price))
                                     remaining_amt = order_check.get('remaining', 0)
+                                    filled_amt_fast = order_check.get('filled', 0)
                                     if remaining_amt > 0:
                                         logger.warning(f"⚠️ FAST_PARTIAL: {symbol} remaining={remaining_amt:.4f} → market close")
+                                        limit_avg_fast = fill_price
+                                        market_avg_fast = current_price
                                         try:
-                                            await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                                            mkt_rf = await live_binance_trader.close_position(symbol, pos['side'], remaining_amt)
+                                            if mkt_rf and mkt_rf.get('average'):
+                                                market_avg_fast = float(mkt_rf['average'])
                                         except:
                                             pass
-                                    logger.warning(f"✅ FAST_LIMIT_FILLED: {symbol} @ ${fill_price:.6f} | {reason} | {elapsed:.0f}s")
+                                        exit_avg_fast = (filled_amt_fast * limit_avg_fast + remaining_amt * market_avg_fast) / (filled_amt_fast + remaining_amt) if (filled_amt_fast + remaining_amt) > 0 else fill_price
+                                    else:
+                                        exit_avg_fast = fill_price
+                                    logger.warning(f"✅ FAST_LIMIT_FILLED: {symbol} @ ${exit_avg_fast:.6f} | {reason} | {elapsed:.0f}s")
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, fill_price, reason)
+                                    global_paper_trader.close_position(pos, exit_avg_fast, reason)
                                     continue
                                 elif chk_status in ('canceled', 'expired'):
+                                    cancel_reason_fast = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    global_paper_trader.close_position(pos, current_price, cancel_reason_fast)
                                     continue
                                 elif elapsed >= timeout:
+                                    timeout_reason_fast = f"{'TP_TIMEOUT' if 'TP' in reason else 'TRAIL_TIMEOUT'}_MARKET_FALLBACK({reason})"
                                     logger.warning(f"⏰ FAST_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
                                     await live_binance_trader.cancel_order(symbol, order_id)
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    global_paper_trader.close_position(pos, current_price, timeout_reason_fast)
                                     continue
                                 else:
                                     continue  # Still pending — skip SL/TP checks
@@ -17961,6 +18007,15 @@ class PaperTradingEngine:
         Close a position and record it in trade history.
         For live trading, also schedules async Binance close.
         """
+        # Phase 232: Idempotent guard — prevent double close
+        if pos not in self.positions:
+            logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already removed from positions, skipping close")
+            return None
+        if pos.get('_closing'):
+            logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already closing, skipping")
+            return None
+        pos['_closing'] = True
+        
         # Calculate PnL
         if pos['side'] == 'LONG':
             pnl = (exit_price - pos['entryPrice']) * pos['size']
@@ -18030,7 +18085,23 @@ class PaperTradingEngine:
             # Phase 224A: MAE/MFE + Decision Trace
             "mae_pct": round(pos.get('mae_pct', 0), 2),
             "mfe_pct": round(pos.get('mfe_pct', 0), 2),
-            "decision_trace": pos.get('decision_trace', [])[-5:],  # Son 5 karar
+            "decision_trace": pos.get('decision_trace', [])[-5:],
+            # Phase 232: Canonical reason + legacy closeReason
+            "closeReason": reason,
+            # Phase 232: Close metrics snapshot
+            "close_metrics_json": json.dumps({
+                'entry': pos.get('entryPrice', 0),
+                'exit': exit_price,
+                'stopLoss': pos.get('stopLoss', 0),
+                'takeProfit': pos.get('takeProfit', 0),
+                'trailingStop': pos.get('trailingStop', 0),
+                'atr': pos.get('atr', 0),
+                'leverage': pos.get('leverage', 10),
+                'price_move_pct': round(abs(exit_price - pos.get('entryPrice', 0)) / pos.get('entryPrice', 1) * 100, 4) if pos.get('entryPrice', 0) > 0 else 0,
+                'roi_pct': round((pnl / initial_margin * 100), 2) if initial_margin > 0 else 0,
+                'spreadLevel': pos.get('spreadLevel', 'unknown'),
+                'isTrailingActive': pos.get('isTrailingActive', False),
+            }),
         }
         
         # =====================================================================
@@ -19466,7 +19537,7 @@ async def get_performance_summary():
     # Close reason breakdown
     reason_stats = {}
     for t in trades:
-        reason = t.get('closeReason', t.get('reason', 'UNKNOWN'))
+        reason = t.get('reason', t.get('closeReason', 'UNKNOWN'))
         # Normalize reason
         if 'SL' in str(reason).upper() or 'STOP' in str(reason).upper():
             reason = 'SL_HIT'

@@ -75,14 +75,14 @@ export interface Position {
   sl1Hit?: boolean;
 }
 
-// Phase 139: Comprehensive close reason type matching all backend reasons
+// Phase 139+232: Comprehensive close reason type matching all backend reasons
 export type CloseReason =
   // Stop Loss variants
   | 'SL' | 'SL_HIT' | 'EMERGENCY_SL'
   // Take Profit variants  
   | 'TP' | 'TP_HIT' | 'TP1'
   // Trailing Stop
-  | 'TRAILING' | 'TRAILING_STOP'
+  | 'TRAILING' | 'TRAILING_STOP' | 'TRAIL_EXIT'
   // Kill Switch
   | 'KILL_SWITCH_FULL' | 'KILL_SWITCH_PARTIAL'
   // Time-based position management
@@ -91,14 +91,23 @@ export type CloseReason =
   | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
   // Phase 142: Portfolio Recovery Close
   | 'RECOVERY_CLOSE_ALL'
+  // Phase 232: New reasons
+  | 'FAILED_CONTINUATION' | 'PORTFOLIO_DRAWDOWN'
+  | 'BREAKEVEN_CLOSE' | 'RECOVERY_TRAIL_CLOSE'
   // Manual & Signal-based
-  | 'MANUAL' | 'SIGNAL' | 'SIGNAL_REVERSAL_PROFIT'
+  | 'MANUAL' | 'MANUAL_CLOSE' | 'SIGNAL' | 'SIGNAL_REVERSAL_PROFIT' | 'SIGNAL_REVERSAL'
   // External & System
   | 'EXTERNAL' | 'External Close (Binance)'
   // Backtest specific
-  | 'RESCUE' | 'SL1' | 'END'
+  | 'RESCUE' | 'SL1' | 'END' | 'EARLY_TRAIL' | 'BREAKEVEN'
   // Binance PnL
-  | 'Binance PnL';
+  | 'Binance PnL'
+  // Phase 232: Fallback patterns (cancel/timeout)
+  | 'LIMIT_CANCELLED_MARKET_FALLBACK'
+  | 'TP_TIMEOUT_MARKET_FALLBACK'
+  | 'TRAIL_TIMEOUT_MARKET_FALLBACK'
+  // Forward-compat: allow any string
+  | (string & {});
 
 export interface Trade {
   id: string;
