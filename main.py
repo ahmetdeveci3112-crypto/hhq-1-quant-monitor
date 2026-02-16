@@ -3299,14 +3299,10 @@ async def binance_position_sync_loop():
                                         sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
                                     sync_roi = sync_price_move * sync_leverage
                                     
-                                    # Phase 231d: Price move based activation (was ROI based)
+                                    # Phase 231g: Only price_move check — aligned with scanner/WS/backup
                                     if sync_price_move >= 0.75 and not pos.get('isTrailingActive', False):
-                                        if pos['side'] == 'LONG' and current_price_sync > pos.get('trailActivation', entry_price):
-                                            pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG price_move={sync_price_move:.2f}% >= 0.75%")
-                                        elif pos['side'] == 'SHORT' and current_price_sync < pos.get('trailActivation', entry_price):
-                                            pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT price_move={sync_price_move:.2f}% >= 0.75%")
+                                        pos['isTrailingActive'] = True
+                                        logger.info(f"📊 Trail activated (sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}% >= 0.75%")
                                 break
                 
                 # ================================================================
@@ -11423,8 +11419,8 @@ class TimeBasedPositionManager:
                                     pos['original_sizeUsd'] = pos.get('sizeUsd', 0)
                                     pos['original_initialMargin'] = pos.get('initialMargin', 0)
                                 
-                                # Phase 231f: Update ALL position size fields (contracts + size + sizeUsd + initialMargin)
-                                new_contracts = pos.get('contracts', contracts) - close_contracts
+                                # Phase 231g: Clamp to prevent negative contracts
+                                new_contracts = max(0, pos.get('contracts', contracts) - close_contracts)
                                 pos['contracts'] = new_contracts
                                 
                                 # Ratio-based sync: all fields scale proportionally
