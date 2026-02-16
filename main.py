@@ -7375,14 +7375,11 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         side = bp.get('side', 'LONG')
                         
                         if close_price > 0 and entry_price > 0:
-                            if side == 'LONG':
-                                # Trail active only if currently profitable (price > entry)
-                                merged['isTrailingActive'] = close_price > entry_price
-                            else:
-                                # SHORT: Trail active only if price < entry
-                                merged['isTrailingActive'] = close_price < entry_price
+                            # Phase 231: Use paper_pos's REAL trail state, don't infer from profitability
+                            # Old bug: was setting isTrailingActive = (profitable?) which was wrong
+                            merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
                         else:
-                            merged['isTrailingActive'] = False
+                            merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
                     else:
                         # No paper position - calculate default exit params
                         entry = bp.get('entryPrice', 0)
@@ -8675,18 +8672,22 @@ async def position_price_update_loop():
                         else:
                             fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                         fast_roi = fast_price_move * fast_leverage
-                        fast_min_roi = 1.5  # %1.5 ROI minimum
+                        fast_min_roi = 0.75  # Phase 231: Aligned with scanner/WS (was 1.5)
                         
-                        if pos['side'] == 'LONG' and current_price > trail_activation and fast_roi >= fast_min_roi:
-                            new_trailing = current_price - dynamic_trail_distance
-                            if new_trailing > trailing_stop:
-                                pos['trailingStop'] = new_trailing
-                                pos['isTrailingActive'] = True
-                        elif pos['side'] == 'SHORT' and current_price < trail_activation and fast_roi >= fast_min_roi:
-                            new_trailing = current_price + dynamic_trail_distance
-                            if new_trailing < trailing_stop:
-                                pos['trailingStop'] = new_trailing
-                                pos['isTrailingActive'] = True
+                        # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
+                        fast_trail_already_active = pos.get('isTrailingActive', False)
+                        if pos['side'] == 'LONG':
+                            if (fast_trail_already_active and fast_roi >= fast_min_roi) or (current_price > trail_activation and fast_roi >= fast_min_roi):
+                                new_trailing = current_price - dynamic_trail_distance
+                                if new_trailing > trailing_stop:
+                                    pos['trailingStop'] = new_trailing
+                                    pos['isTrailingActive'] = True
+                        elif pos['side'] == 'SHORT':
+                            if (fast_trail_already_active and fast_roi >= fast_min_roi) or (current_price < trail_activation and fast_roi >= fast_min_roi):
+                                new_trailing = current_price + dynamic_trail_distance
+                                if new_trailing < trailing_stop:
+                                    pos['trailingStop'] = new_trailing
+                                    pos['isTrailingActive'] = True
                                 
                     except Exception as pos_error:
                         logger.debug(f"Position update error for {symbol}: {pos_error}")
@@ -11372,9 +11373,11 @@ class TimeBasedPositionManager:
                                 
                                 # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False) and close_contracts > 0:
+                                    live_success = False
                                     try:
                                         result = await live_binance_trader.close_position(symbol, side, close_contracts)
                                         if result:
+                                            live_success = True
                                             # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                                             pos['_partial_close_ts'] = datetime.now().timestamp()
                                             close_oid = str(result.get('id', ''))
@@ -11386,8 +11389,16 @@ class TimeBasedPositionManager:
                                             logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
                                     except Exception as e:
                                         logger.error(f"❌ PARTIAL_TP LIVE ERROR: {symbol} - {e}")
+                                    
+                                    # Phase 231: Only update local state if Binance close succeeded
+                                    if not live_success:
+                                        # Revert TP state — Binance failed, don't mark as closed
+                                        partial_tp_state[level['key']] = False
+                                        pos['partial_tp_state'] = partial_tp_state
+                                        logger.warning(f"⚠️ PARTIAL_TP REVERTED: {symbol} {level['key']} — Binance close failed, state rolled back")
+                                        continue  # Skip contract update and trail activation
                                 
-                                # Update position contracts (reduce by 25%)
+                                # Update position contracts (reduce by close_pct)
                                 pos['contracts'] = contracts - close_contracts
                                 pos['original_contracts'] = pos.get('original_contracts', contracts)
                                 
