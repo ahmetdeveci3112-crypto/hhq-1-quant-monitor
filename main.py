@@ -11416,13 +11416,22 @@ class TimeBasedPositionManager:
                                         logger.warning(f"⚠️ PARTIAL_TP REVERTED: {symbol} {level['key']} — Binance close failed, state rolled back")
                                         continue  # Skip contract update and trail activation
                                 
-                                # Phase 231e: Save original_contracts BEFORE first reduction
+                                # Phase 231e: Save original values BEFORE first reduction
                                 if not pos.get('original_contracts'):
                                     pos['original_contracts'] = contracts
+                                    pos['original_size'] = pos.get('size', contracts)
+                                    pos['original_sizeUsd'] = pos.get('sizeUsd', 0)
+                                    pos['original_initialMargin'] = pos.get('initialMargin', 0)
                                 
-                                # Update position contracts AND size (keep in sync)
-                                pos['contracts'] = pos.get('contracts', contracts) - close_contracts
-                                pos['size'] = pos.get('contracts', contracts)  # Sync size = contracts
+                                # Phase 231f: Update ALL position size fields (contracts + size + sizeUsd + initialMargin)
+                                new_contracts = pos.get('contracts', contracts) - close_contracts
+                                pos['contracts'] = new_contracts
+                                
+                                # Ratio-based sync: all fields scale proportionally
+                                ratio = new_contracts / contracts if contracts > 0 else 1.0
+                                pos['size'] = new_contracts  # size = contracts (same unit)
+                                pos['sizeUsd'] = pos.get('sizeUsd', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
+                                pos['initialMargin'] = pos.get('initialMargin', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
                                 
                                 # =====================================================
                                 # Phase 220: TP1 → Force Trail + Breakeven SL
