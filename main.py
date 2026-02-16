@@ -3299,14 +3299,14 @@ async def binance_position_sync_loop():
                                         sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
                                     sync_roi = sync_price_move * sync_leverage
                                     
-                                    # Phase 231c: Aligned ROI threshold with scanner/WS/backup (was 1.5)
-                                    if sync_roi >= 0.75 and not pos.get('isTrailingActive', False):
+                                    # Phase 231d: Price move based activation (was ROI based)
+                                    if sync_price_move >= 0.75 and not pos.get('isTrailingActive', False):
                                         if pos['side'] == 'LONG' and current_price_sync > pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG ROI={sync_roi:.1f}% >= 0.75%")
+                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG price_move={sync_price_move:.2f}% >= 0.75%")
                                         elif pos['side'] == 'SHORT' and current_price_sync < pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT ROI={sync_roi:.1f}% >= 0.75%")
+                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT price_move={sync_price_move:.2f}% >= 0.75%")
                                 break
                 
                 # ================================================================
@@ -8053,27 +8053,25 @@ async def background_scanner_loop():
                             else:
                                 dynamic_trail_distance = volatility_adjusted_distance          # Normal
                             
-                            # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+                            # Phase 231d: Price move based trail activation (0.75% of entry price)
                             leverage = pos.get('leverage', 10)
                             if pos['side'] == 'LONG':
                                 price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                             else:
                                 price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
                             roi_pct = price_move_pct * leverage
-                            min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
+                            min_price_move_for_trail = 0.75  # Phase 231d: %0.75 price move (not ROI)
                             
                             if pos['side'] == 'LONG':
-                                # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                if (trail_already_active and roi_pct >= min_roi_for_trail) or (candle_close_price > trail_activation and roi_pct >= min_roi_for_trail):
+                                if (trail_already_active and price_move_pct >= min_price_move_for_trail) or (candle_close_price > trail_activation and price_move_pct >= min_price_move_for_trail):
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT':
-                                # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                if (trail_already_active and roi_pct >= min_roi_for_trail) or (candle_close_price < trail_activation and roi_pct >= min_roi_for_trail):
+                                if (trail_already_active and price_move_pct >= min_price_move_for_trail) or (candle_close_price < trail_activation and price_move_pct >= min_price_move_for_trail):
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
@@ -8445,26 +8443,24 @@ async def on_position_price_update(symbol: str, ticker: dict):
         elif ws_pnl_pct >= 8.0:
             dynamic_trail_distance = dynamic_trail_distance * 0.85
         
-        # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+        # Phase 231d: Price move based trail activation (0.75% of entry price)
         ws_leverage = pos.get('leverage', 10)
         if pos['side'] == 'LONG':
             ws_price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
         else:
             ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
         ws_roi_pct = ws_price_move_pct * ws_leverage
-        ws_min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
+        ws_min_price_move = 0.75  # Phase 231d: %0.75 price move (not ROI)
         
-        # Phase 231: Use candle close for trail activation & ratchet with ROI gate
-        # If trail already active (e.g. early trail, partial TP), bypass trail_activation check
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
-            if (ws_trail_already_active and ws_roi_pct >= ws_min_roi_for_trail) or (candle_close_price > trail_activation and ws_roi_pct >= ws_min_roi_for_trail):
+            if (ws_trail_already_active and ws_price_move_pct >= ws_min_price_move) or (candle_close_price > trail_activation and ws_price_move_pct >= ws_min_price_move):
                 new_trailing = candle_close_price - dynamic_trail_distance
                 if new_trailing > trailing_stop:
                     pos['trailingStop'] = new_trailing
                     pos['isTrailingActive'] = True
         elif pos['side'] == 'SHORT':
-            if (ws_trail_already_active and ws_roi_pct >= ws_min_roi_for_trail) or (candle_close_price < trail_activation and ws_roi_pct >= ws_min_roi_for_trail):
+            if (ws_trail_already_active and ws_price_move_pct >= ws_min_price_move) or (candle_close_price < trail_activation and ws_price_move_pct >= ws_min_price_move):
                 new_trailing = candle_close_price + dynamic_trail_distance
                 if new_trailing < trailing_stop:
                     pos['trailingStop'] = new_trailing
@@ -8688,18 +8684,18 @@ async def position_price_update_loop():
                         else:
                             fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                         fast_roi = fast_price_move * fast_leverage
-                        fast_min_roi = 0.75  # Phase 231: Aligned with scanner/WS (was 1.5)
+                        fast_min_price_move = 0.75  # Phase 231d: %0.75 price move (not ROI)
                         
                         # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
-                            if (fast_trail_already_active and fast_roi >= fast_min_roi) or (current_price > trail_activation and fast_roi >= fast_min_roi):
+                            if (fast_trail_already_active and fast_price_move >= fast_min_price_move) or (current_price > trail_activation and fast_price_move >= fast_min_price_move):
                                 new_trailing = current_price - dynamic_trail_distance
                                 if new_trailing > trailing_stop:
                                     pos['trailingStop'] = new_trailing
                                     pos['isTrailingActive'] = True
                         elif pos['side'] == 'SHORT':
-                            if (fast_trail_already_active and fast_roi >= fast_min_roi) or (current_price < trail_activation and fast_roi >= fast_min_roi):
+                            if (fast_trail_already_active and fast_price_move >= fast_min_price_move) or (current_price < trail_activation and fast_price_move >= fast_min_price_move):
                                 new_trailing = current_price + dynamic_trail_distance
                                 if new_trailing < trailing_stop:
                                     pos['trailingStop'] = new_trailing
