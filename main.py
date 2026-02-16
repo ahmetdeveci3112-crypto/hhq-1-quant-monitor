@@ -3302,12 +3302,16 @@ async def binance_position_sync_loop():
                                     # Phase 231h: Only price_move check + breakeven on activation
                                     if sync_price_move >= 0.75 and not pos.get('isTrailingActive', False):
                                         pos['isTrailingActive'] = True
-                                        # Breakeven SL on trail activation
+                                        # Breakeven on BOTH stopLoss AND trailingStop
                                         if pos['side'] == 'LONG':
-                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), entry_price * 1.001)
+                                            be_price = entry_price * 1.001
+                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), be_price)
+                                            pos['trailingStop'] = max(pos.get('trailingStop', 0), be_price)
                                         else:
-                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), entry_price * 0.999)
-                                        logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL→breakeven")
+                                            be_price = entry_price * 0.999
+                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_price)
+                                            pos['trailingStop'] = min(pos.get('trailingStop', float('inf')), be_price)
+                                        logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL+Trail→breakeven")
                                 break
                 
                 # ================================================================
@@ -8315,10 +8319,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
         tp = pos.get('takeProfit', 0)
         trailing_stop = pos.get('trailingStop', sl)
         
-        # =========================================================
-        # Phase 202: STEPPED SL LOCK for Trend Mode positions (WS)
-        # =========================================================
-        if pos.get('trend_mode', False) and entry_price > 0:
+        # Phase 231i: Stepped SL for ALL trail-active positions (was trend_mode only)
+        # Aligned with scanner path (L7816) which already uses isTrailingActive
+        if pos.get('isTrailingActive', False) and entry_price > 0:
             if pos['side'] == 'LONG':
                 current_roi = (candle_close_price - entry_price) / entry_price * 100
             else:
