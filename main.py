@@ -3299,10 +3299,15 @@ async def binance_position_sync_loop():
                                         sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
                                     sync_roi = sync_price_move * sync_leverage
                                     
-                                    # Phase 231g: Only price_move check — aligned with scanner/WS/backup
+                                    # Phase 231h: Only price_move check + breakeven on activation
                                     if sync_price_move >= 0.75 and not pos.get('isTrailingActive', False):
                                         pos['isTrailingActive'] = True
-                                        logger.info(f"📊 Trail activated (sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}% >= 0.75%")
+                                        # Breakeven SL on trail activation
+                                        if pos['side'] == 'LONG':
+                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), entry_price * 1.001)
+                                        else:
+                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), entry_price * 0.999)
+                                        logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL→breakeven")
                                 break
                 
                 # ================================================================
@@ -8058,21 +8063,35 @@ async def background_scanner_loop():
                             roi_pct = price_move_pct * leverage
                             min_price_move_for_trail = 0.75  # Phase 231d: %0.75 price move (not ROI)
                             
+                            # Phase 231h: Fee buffer for breakeven (0.1% = taker fee both sides)
+                            be_long = entry_price * 1.001
+                            be_short = entry_price * 0.999
+                            
                             if pos['side'] == 'LONG':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                # Phase 231e: Only price_move check — no trailActivation price threshold
                                 if price_move_pct >= min_price_move_for_trail or trail_already_active:
                                     new_trailing = candle_close_price - dynamic_trail_distance
+                                    # Phase 231h: Clamp — trail stop never below breakeven
+                                    new_trailing = max(new_trailing, be_long)
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
-                                        pos['isTrailingActive'] = True
+                                        if not trail_already_active:
+                                            pos['isTrailingActive'] = True
+                                            # Breakeven SL on first activation
+                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
+                                            logger.info(f"📊 TRAIL+BE: {pos_symbol} LONG trail ON, SL→breakeven ${be_long:.6f}")
                             elif pos['side'] == 'SHORT':
                                 trail_already_active = pos.get('isTrailingActive', False)
                                 if price_move_pct >= min_price_move_for_trail or trail_already_active:
                                     new_trailing = candle_close_price + dynamic_trail_distance
+                                    # Phase 231h: Clamp — trail stop never above breakeven
+                                    new_trailing = min(new_trailing, be_short)
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
-                                        pos['isTrailingActive'] = True
+                                        if not trail_already_active:
+                                            pos['isTrailingActive'] = True
+                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
+                                            logger.info(f"📊 TRAIL+BE: {pos_symbol} SHORT trail ON, SL→breakeven ${be_short:.6f}")
                                     
                     except Exception as pos_error:
                         logger.debug(f"Position update error: {pos_error}")
@@ -8449,20 +8468,32 @@ async def on_position_price_update(symbol: str, ticker: dict):
         ws_roi_pct = ws_price_move_pct * ws_leverage
         ws_min_price_move = 0.75  # Phase 231d: %0.75 price move (not ROI)
         
+        # Phase 231h: Fee buffer for breakeven
+        be_long = entry_price * 1.001
+        be_short = entry_price * 0.999
+        
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
-            # Phase 231e: Only price_move check — no trailActivation price threshold
             if ws_price_move_pct >= ws_min_price_move or ws_trail_already_active:
                 new_trailing = candle_close_price - dynamic_trail_distance
+                # Phase 231h: Clamp — trail stop never below breakeven
+                new_trailing = max(new_trailing, be_long)
                 if new_trailing > trailing_stop:
                     pos['trailingStop'] = new_trailing
-                    pos['isTrailingActive'] = True
+                    if not ws_trail_already_active:
+                        pos['isTrailingActive'] = True
+                        pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
+                        logger.info(f"📊 TRAIL+BE(WS): {pos.get('symbol')} LONG trail ON, SL→breakeven")
         elif pos['side'] == 'SHORT':
             if ws_price_move_pct >= ws_min_price_move or ws_trail_already_active:
                 new_trailing = candle_close_price + dynamic_trail_distance
+                new_trailing = min(new_trailing, be_short)
                 if new_trailing < trailing_stop:
                     pos['trailingStop'] = new_trailing
-                    pos['isTrailingActive'] = True
+                    if not ws_trail_already_active:
+                        pos['isTrailingActive'] = True
+                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
+                        logger.info(f"📊 TRAIL+BE(WS): {pos.get('symbol')} SHORT trail ON, SL→breakeven")
 
 
 # ============================================================================
@@ -8684,20 +8715,30 @@ async def position_price_update_loop():
                         fast_roi = fast_price_move * fast_leverage
                         fast_min_price_move = 0.75  # Phase 231d: %0.75 price move (not ROI)
                         
+                        # Phase 231h: Fee buffer for breakeven
+                        be_long = entry_price * 1.001
+                        be_short = entry_price * 0.999
+                        
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
-                            # Phase 231e: Only price_move check — no trailActivation price threshold
                             if fast_price_move >= fast_min_price_move or fast_trail_already_active:
                                 new_trailing = current_price - dynamic_trail_distance
+                                # Phase 231h: Clamp — trail stop never below breakeven
+                                new_trailing = max(new_trailing, be_long)
                                 if new_trailing > trailing_stop:
                                     pos['trailingStop'] = new_trailing
-                                    pos['isTrailingActive'] = True
+                                    if not fast_trail_already_active:
+                                        pos['isTrailingActive'] = True
+                                        pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
                         elif pos['side'] == 'SHORT':
                             if fast_price_move >= fast_min_price_move or fast_trail_already_active:
                                 new_trailing = current_price + dynamic_trail_distance
+                                new_trailing = min(new_trailing, be_short)
                                 if new_trailing < trailing_stop:
                                     pos['trailingStop'] = new_trailing
-                                    pos['isTrailingActive'] = True
+                                    if not fast_trail_already_active:
+                                        pos['isTrailingActive'] = True
+                                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
                                 
                     except Exception as pos_error:
                         logger.debug(f"Position update error for {symbol}: {pos_error}")
