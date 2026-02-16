@@ -338,6 +338,8 @@ class SQLiteManager:
                 ('hurst', 'REAL DEFAULT 0.5'),
                 ('adx', 'REAL DEFAULT 0'),
                 ('pullback_pct', 'REAL DEFAULT 0'),
+                # Phase 232: Close metrics snapshot
+                ('close_metrics_json', 'TEXT DEFAULT "{}"'),
             ]
             for col_name, col_type in migration_columns:
                 try:
@@ -422,8 +424,8 @@ class SQLiteManager:
                  spread_level, settings_snapshot,
                  stop_loss, take_profit, atr, trailing_stop, trail_activation, is_trailing_active,
                  margin, roi, is_live, entry_method, entry_slippage, entry_spread, 
-                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade.get('id'),
                 trade.get('symbol'),
@@ -461,6 +463,7 @@ class SQLiteManager:
                 trade.get('hurst', 0.5),
                 trade.get('adx', 0),
                 trade.get('pullbackPct', 0),
+                trade.get('close_metrics_json', '{}'),
             ))
             await db.commit()
     
@@ -557,6 +560,8 @@ class SQLiteManager:
                             'isLive': bool(d.get('is_live', 0)),
                             'hurst': d.get('hurst', 0.5) or 0.5,
                             'settingsSnapshot': d.get('settings_snapshot', {}),
+                            # Phase 232: Close metrics snapshot
+                            'close_metrics_json': d.get('close_metrics_json', '{}'),
                         }
                         trades.append(trade)
                     
@@ -2160,14 +2165,13 @@ class LiveBinanceTrader:
             
             if result:
                 logger.info(f"✅ TRAIL CLOSE SUCCESS: {symbol} | Order ID: {result.get('id')}")
-                # Phase 232: Persist reason for sync
-                if not hasattr(self, 'pending_close_reasons'):
-                    self.pending_close_reasons = {}
-                self.pending_close_reasons[symbol] = reason
-                try:
-                    await db_manager.save_position_close(symbol, reason)
-                except Exception:
-                    pass
+                # Phase 232: Persist reason to GLOBAL pending_close_reasons
+                # (consumers at L2439, L3361, L18162 read from global dict)
+                pending_close_reasons[symbol] = {
+                    "reason": reason,
+                    "original_reason": reason,
+                    "timestamp": int(datetime.now().timestamp() * 1000),
+                }
             else:
                 logger.error(f"❌ TRAIL CLOSE FAILED: {symbol}")
                 
@@ -2605,6 +2609,7 @@ class LiveBinanceTrader:
                     'openTime': timestamp - 3600000,  # Estimate: 1 hour before close
                     'closeTime': timestamp,
                     'reason': 'Synced from Binance',
+                    'closeReason': 'Synced from Binance',
                     'leverage': 0,
                     'isLive': True,
                     'signalScore': 0,
@@ -3436,6 +3441,7 @@ async def binance_position_sync_loop():
                             "openTime": pos.get('openTime', 0),
                             "closeTime": int(datetime.now().timestamp() * 1000),
                             "reason": inferred_reason,
+                            "closeReason": inferred_reason,
                             "leverage": leverage_val,
                             "isLive": True,
                             "signalScore": pos.get('signalScore', 0),
@@ -7811,7 +7817,7 @@ async def background_scanner_loop():
                                         except:
                                             pass
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                                         continue
                             
                             # Check SL/TP
@@ -8358,7 +8364,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     except:
                         pass
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, reason)
+                    global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                     continue
             continue  # pending_limit_close aktif, SL/TP atla
         
@@ -8679,7 +8685,7 @@ async def position_price_update_loop():
                                     except:
                                         pass
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                                     continue
                         
                         # Check SL/TP exits with SPIKE BYPASS
