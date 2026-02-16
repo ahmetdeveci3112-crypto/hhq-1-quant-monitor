@@ -3124,7 +3124,9 @@ async def binance_position_sync_loop():
                             volatility_pct=volatility_pct,
                             hurst=0.5,  # Default neutral
                             price=entry_price,
-                            spread_pct=sync_spread_pct  # Phase 178: Real spread
+                            spread_pct=sync_spread_pct,  # Phase 178: Real spread
+                            settings_activation=global_paper_trader.trail_activation_atr,  # Phase 231: Cap
+                            settings_distance=global_paper_trader.trail_distance_atr  # Phase 231: Cap
                         )
                         
                         logger.info(f"📊 Volatility calc: {symbol} ATR%={volatility_pct:.2f}% → trail_act={trail_activation_atr}x, trail_dist={trail_distance_atr}x")
@@ -4223,16 +4225,22 @@ def get_dynamic_trail_params(
     volatility_pct: float,
     hurst: float = 0.5,
     price: float = 0.0,
-    spread_pct: float = 0.0
+    spread_pct: float = 0.0,
+    settings_activation: float = 0.0,
+    settings_distance: float = 0.0
 ) -> tuple:
     """
     Calculate dynamic trail_activation_atr and trail_distance_atr.
+    
+    Phase 231: Now respects settings values as upper caps.
     
     Args:
         volatility_pct: ATR as percentage of price (e.g., 5.0 for 5%)
         hurst: Hurst exponent (0-1, >0.5 = trending, <0.5 = mean reverting)
         price: Current price for price factor calculation
         spread_pct: Current spread percentage
+        settings_activation: Settings trail_activation_atr (used as cap, 0=no cap)
+        settings_distance: Settings trail_distance_atr (used as cap, 0=no cap)
         
     Returns:
         tuple: (trail_activation_atr, trail_distance_atr)
@@ -4302,6 +4310,12 @@ def get_dynamic_trail_params(
     # Phase 213: Enforce minimum 2x distance for trending coins
     if hurst >= 0.55:
         final_distance = max(final_distance, base_distance * 1.5)  # At least 1.5x base for trending
+    
+    # Phase 231: Cap at settings values — user settings always respected
+    if settings_activation > 0:
+        final_activation = min(final_activation, settings_activation)
+    if settings_distance > 0:
+        final_distance = min(final_distance, settings_distance)
     
     return round(final_activation, 2), round(final_distance, 2)
 
@@ -7614,16 +7628,8 @@ async def background_scanner_loop():
                             # Broadcast kill switch event to UI
                             await ui_ws_manager.broadcast_kill_switch(kill_switch_actions)
                         
-                        # Phase 49: Time-based position management
-                        # Activates trailing early for profitable stagnant positions
-                        # Gradually reduces losing stagnant positions
-                        
-                        # Phase 137 DEBUG: Trace log to verify check_positions is called
-                        logger.info(f"📊 TIME_MANAGER_CALL: positions={len(global_paper_trader.positions)}")
-                        
-                        time_actions = await time_based_position_manager.check_positions(global_paper_trader)
-                        if time_actions.get('trail_activated') or time_actions.get('time_reduced'):
-                            logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}")
+                        # Phase 231: check_positions moved AFTER position price update (below)
+                        # Was here previously — caused partial TP to use stale PnL
                         
                         # Phase 215: Live MTF Position Guard (her 30 dakikada)
                         try:
@@ -8051,15 +8057,17 @@ async def background_scanner_loop():
                             min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
                             
                             if pos['side'] == 'LONG':
-                                # Phase 213: Trail only activates when ROI >= 1.5% AND price > trail_activation
-                                if candle_close_price > trail_activation and roi_pct >= min_roi_for_trail:
+                                # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
+                                trail_already_active = pos.get('isTrailingActive', False)
+                                if (trail_already_active and roi_pct >= min_roi_for_trail) or (candle_close_price > trail_activation and roi_pct >= min_roi_for_trail):
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     if new_trailing > trailing_stop:
                                         pos['trailingStop'] = new_trailing
                                         pos['isTrailingActive'] = True
                             elif pos['side'] == 'SHORT':
-                                # Phase 213: Trail only activates when ROI >= 1.5% AND price < trail_activation
-                                if candle_close_price < trail_activation and roi_pct >= min_roi_for_trail:
+                                # Phase 231: If trail already active (e.g. early trail), bypass trail_activation check
+                                trail_already_active = pos.get('isTrailingActive', False)
+                                if (trail_already_active and roi_pct >= min_roi_for_trail) or (candle_close_price < trail_activation and roi_pct >= min_roi_for_trail):
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     if new_trailing < trailing_stop:
                                         pos['trailingStop'] = new_trailing
@@ -8068,6 +8076,16 @@ async def background_scanner_loop():
                     except Exception as pos_error:
                         logger.debug(f"Position update error: {pos_error}")
                         continue
+                
+                # =====================================================================
+                # Phase 231: TIME-BASED POSITION MANAGEMENT (moved here from before price update)
+                # Now runs AFTER position prices/PnL are updated — fixes stale partial TP check
+                # =====================================================================
+                if global_paper_trader.enabled and global_paper_trader.positions:
+                    logger.info(f"📊 TIME_MANAGER_CALL: positions={len(global_paper_trader.positions)}")
+                    time_actions = await time_based_position_manager.check_positions(global_paper_trader)
+                    if time_actions.get('trail_activated') or time_actions.get('time_reduced') or time_actions.get('partial_tp'):
+                        logger.info(f"📊 Time Manager Actions: Trail={time_actions['trail_activated']}, Reduced={time_actions['time_reduced']}, TP={time_actions.get('partial_tp', [])}")
                 
                 # =====================================================================
                 # PHASE 34: CHECK PENDING ORDERS FOR EXECUTION
@@ -8423,17 +8441,21 @@ async def on_position_price_update(symbol: str, ticker: dict):
         ws_roi_pct = ws_price_move_pct * ws_leverage
         ws_min_roi_for_trail = 0.75  # Phase 222: %0.75 ROI — trail daha erken aktifleşsin
         
-        # Phase 205 + Phase 213: Use candle close for trail activation & ratchet with ROI gate
-        if pos['side'] == 'LONG' and candle_close_price > trail_activation and ws_roi_pct >= ws_min_roi_for_trail:
-            new_trailing = candle_close_price - dynamic_trail_distance
-            if new_trailing > trailing_stop:
-                pos['trailingStop'] = new_trailing
-                pos['isTrailingActive'] = True
-        elif pos['side'] == 'SHORT' and candle_close_price < trail_activation and ws_roi_pct >= ws_min_roi_for_trail:
-            new_trailing = candle_close_price + dynamic_trail_distance
-            if new_trailing < trailing_stop:
-                pos['trailingStop'] = new_trailing
-                pos['isTrailingActive'] = True
+        # Phase 231: Use candle close for trail activation & ratchet with ROI gate
+        # If trail already active (e.g. early trail, partial TP), bypass trail_activation check
+        ws_trail_already_active = pos.get('isTrailingActive', False)
+        if pos['side'] == 'LONG':
+            if (ws_trail_already_active and ws_roi_pct >= ws_min_roi_for_trail) or (candle_close_price > trail_activation and ws_roi_pct >= ws_min_roi_for_trail):
+                new_trailing = candle_close_price - dynamic_trail_distance
+                if new_trailing > trailing_stop:
+                    pos['trailingStop'] = new_trailing
+                    pos['isTrailingActive'] = True
+        elif pos['side'] == 'SHORT':
+            if (ws_trail_already_active and ws_roi_pct >= ws_min_roi_for_trail) or (candle_close_price < trail_activation and ws_roi_pct >= ws_min_roi_for_trail):
+                new_trailing = candle_close_price + dynamic_trail_distance
+                if new_trailing < trailing_stop:
+                    pos['trailingStop'] = new_trailing
+                    pos['isTrailingActive'] = True
 
 
 # ============================================================================
@@ -9093,7 +9115,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             volatility_pct=volatility_pct,
             hurst=hurst,
             price=price,
-            spread_pct=spread_pct
+            spread_pct=spread_pct,
+            settings_activation=global_paper_trader.trail_activation_atr,  # Phase 231: Cap
+            settings_distance=global_paper_trader.trail_distance_atr  # Phase 231: Cap
         )
         
         signal['dynamic_trail_activation'] = trail_activation_atr
@@ -20256,7 +20280,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                         volatility_pct=volatility_pct,
                                         hurst=hurst,
                                         price=price,
-                                        spread_pct=spread_pct
+                                        spread_pct=spread_pct,
+                                        settings_activation=global_paper_trader.trail_activation_atr,  # Phase 231: Cap
+                                        settings_distance=global_paper_trader.trail_distance_atr  # Phase 231: Cap
                                     )
                                     
                                     signal['dynamic_trail_activation'] = trail_activation_atr
