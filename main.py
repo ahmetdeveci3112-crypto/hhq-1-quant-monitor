@@ -1541,7 +1541,11 @@ class LiveBinanceTrader:
                     trail_state = self.trailing_state[symbol]
                     roi_pct = pnl_percent
                     # Phase 231j: Dual-condition — aligned with scanner/WS/backup/sync
-                    fb_price_move = abs((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                    # Phase 231l: Side-aware (not abs) — same as other paths
+                    if side == 'LONG':
+                        fb_price_move = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                    else:
+                        fb_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                     
                     # Phase 231h: Breakeven prices
                     be_long = entry_price * 1.001
@@ -1606,14 +1610,14 @@ class LiveBinanceTrader:
                                 'symbol': symbol,
                                 'side': side,
                                 'reason': close_reason,
-                                'contracts': position_amount,
+                                'amount': position_amount,
                                 'pnl_percent': pnl_percent,
                             })
                             continue
                         
                         # Phase 210: Flash Trade Guard — minimum 60s hold time
                         MIN_HOLD_SECONDS = 60
-                        open_time_ms = pos.get('openTime', 0) if pos else trail_state.get('openTime', 0)
+                        open_time_ms = trail_state.get('openTime', 0)
                         if open_time_ms > 0:
                             hold_duration = datetime.now().timestamp() - (open_time_ms / 1000)
                             if hold_duration < MIN_HOLD_SECONDS:
