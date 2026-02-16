@@ -3482,6 +3482,7 @@ async def binance_position_sync_loop():
                         # Update with actual Binance close data if available
                         trade['closeTime'] = int(datetime.now().timestamp() * 1000)
                         trade['reason'] = reason_data.get('reason', 'External Close (Binance)')
+                        trade['closeReason'] = trade['reason']  # Phase 232c: dual field
                         engine_triggered = True
                         logger.info(f"📋 REASON MATCHED: {symbol} = {reason_data.get('reason')}")
                     else:
@@ -12355,6 +12356,7 @@ class BreakevenStopManager:
                                     "openTime": pos.get('openTime', 0),
                                     "leverage": leverage_val,
                                     "isLive": True,
+                                    "closeReason": "BREAKEVEN_CLOSE",  # Phase 232c: dual field
                                 }
                             }
                             safe_create_task(sqlite_manager.save_position_close({
@@ -12598,6 +12600,7 @@ class LossRecoveryTrailManager:
                                         "openTime": pos.get('openTime', 0),
                                         "leverage": leverage_val,
                                         "isLive": True,
+                                        "closeReason": "RECOVERY_TRAIL_CLOSE",  # Phase 232c: dual field
                                     }
                                 }
                                 # Persist to SQLite so data survives restart
