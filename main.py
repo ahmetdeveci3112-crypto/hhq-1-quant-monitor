@@ -1619,6 +1619,26 @@ class LiveBinanceTrader:
                                 'reason': close_reason,
                                 'amount': position_amount,
                                 'pnl_percent': pnl_percent,
+                                # Phase 232b: Position snapshot for trade_data + DB persist
+                                'pos_snapshot': {
+                                    'entryPrice': entry_price,
+                                    'exitPrice': current_price,
+                                    'unrealizedPnl': unrealized_pnl,
+                                    'leverage': calculated_leverage,
+                                    'sizeUsd': notional,
+                                    'margin': position_margin,
+                                    'stopLoss': sl,
+                                    'takeProfit': tp,
+                                    'trailActivation': trail_activation,
+                                    'trailingStop': trailing_stop,
+                                    'isTrailingActive': is_trailing_active,
+                                    'atr': estimated_atr,
+                                    'spreadLevel': engine_pos.get('spreadLevel', 'unknown') if engine_pos else 'unknown',
+                                    'signalScore': engine_pos.get('signalScore', 0) if engine_pos else 0,
+                                    'openTime': engine_pos.get('openTime', 0) if engine_pos else 0,
+                                    'binance_order_id': engine_pos.get('binance_order_id', '') if engine_pos else '',
+                                    'hurst': engine_pos.get('hurst', 0.5) if engine_pos else 0.5,
+                                },
                             })
                             continue
                         
@@ -1659,7 +1679,27 @@ class LiveBinanceTrader:
                                 'side': side,
                                 'amount': position_amount,
                                 'reason': close_reason,
-                                'timestamp': datetime.now().isoformat()
+                                'timestamp': datetime.now().isoformat(),
+                                # Phase 232b: Position snapshot for trade_data + DB persist
+                                'pos_snapshot': {
+                                    'entryPrice': entry_price,
+                                    'exitPrice': candle_close_price,
+                                    'unrealizedPnl': unrealized_pnl,
+                                    'leverage': calculated_leverage,
+                                    'sizeUsd': notional,
+                                    'margin': position_margin,
+                                    'stopLoss': sl,
+                                    'takeProfit': tp,
+                                    'trailActivation': trail_activation,
+                                    'trailingStop': trailing_stop,
+                                    'isTrailingActive': is_trailing_active,
+                                    'atr': estimated_atr,
+                                    'spreadLevel': engine_pos.get('spreadLevel', 'unknown') if engine_pos else 'unknown',
+                                    'signalScore': engine_pos.get('signalScore', 0) if engine_pos else 0,
+                                    'openTime': engine_pos.get('openTime', 0) if engine_pos else 0,
+                                    'binance_order_id': engine_pos.get('binance_order_id', '') if engine_pos else '',
+                                    'hurst': engine_pos.get('hurst', 0.5) if engine_pos else 0.5,
+                                },
                             })
                             
                             # Clear trailing state after close triggered
@@ -2157,6 +2197,7 @@ class LiveBinanceTrader:
             side = close_order['side']
             amount = close_order['amount']
             reason = close_order['reason']
+            pos_snapshot = close_order.get('pos_snapshot', {})
             
             logger.info(f"🔴 EXECUTING TRAIL CLOSE: {symbol} {side}")
             logger.info(f"   📋 Reason: {reason}")
@@ -2165,13 +2206,84 @@ class LiveBinanceTrader:
             
             if result:
                 logger.info(f"✅ TRAIL CLOSE SUCCESS: {symbol} | Order ID: {result.get('id')}")
-                # Phase 232: Persist reason to GLOBAL pending_close_reasons
-                # (consumers at L2439, L3361, L18162 read from global dict)
+                
+                now_ms = int(datetime.now().timestamp() * 1000)
+                entry_price = pos_snapshot.get('entryPrice', 0)
+                exit_price = pos_snapshot.get('exitPrice', 0)
+                pnl = pos_snapshot.get('unrealizedPnl', 0)
+                leverage = pos_snapshot.get('leverage', 10)
+                size_usd = pos_snapshot.get('sizeUsd', 0)
+                margin = pos_snapshot.get('margin', 0) or (size_usd / max(leverage, 1))
+                roi = (pnl / margin * 100) if margin > 0 else 0
+                
+                # Build trade_data for sync loop
+                trade_data = {
+                    'id': f"TRAIL_{symbol}_{now_ms}",
+                    'symbol': symbol,
+                    'side': side,
+                    'entryPrice': entry_price,
+                    'exitPrice': exit_price,
+                    'size': amount,
+                    'sizeUsd': size_usd,
+                    'pnl': round(pnl, 4),
+                    'pnlPercent': close_order.get('pnl_percent', 0),
+                    'margin': round(margin, 4),
+                    'roi': round(roi, 2),
+                    'openTime': pos_snapshot.get('openTime', 0),
+                    'closeTime': now_ms,
+                    'reason': reason,
+                    'closeReason': reason,
+                    'leverage': leverage,
+                    'isLive': True,
+                    'stopLoss': pos_snapshot.get('stopLoss', 0),
+                    'takeProfit': pos_snapshot.get('takeProfit', 0),
+                    'trailActivation': pos_snapshot.get('trailActivation', 0),
+                    'trailingStop': pos_snapshot.get('trailingStop', 0),
+                    'isTrailingActive': pos_snapshot.get('isTrailingActive', False),
+                    'atr': pos_snapshot.get('atr', 0),
+                    'spreadLevel': pos_snapshot.get('spreadLevel', 'unknown'),
+                    'signalScore': pos_snapshot.get('signalScore', 0),
+                    'hurst': pos_snapshot.get('hurst', 0.5),
+                }
+                
+                # Phase 232b-P1: Write to GLOBAL pending_close_reasons WITH trade_data
                 pending_close_reasons[symbol] = {
                     "reason": reason,
                     "original_reason": reason,
-                    "timestamp": int(datetime.now().timestamp() * 1000),
+                    "timestamp": now_ms,
+                    "trade_data": trade_data,
+                    "entry_order_id": pos_snapshot.get('binance_order_id', ''),
                 }
+                
+                # Phase 232b-P2: Persist to position_closes for restart safety
+                try:
+                    close_data = {
+                        'symbol': symbol,
+                        'side': side,
+                        'reason': reason,
+                        'original_reason': reason,
+                        'entryPrice': entry_price,
+                        'exitPrice': exit_price,
+                        'pnl': pnl,
+                        'leverage': leverage,
+                        'sizeUsd': size_usd,
+                        'margin': margin,
+                        'roi': roi,
+                        'timestamp': now_ms,
+                        'stopLoss': pos_snapshot.get('stopLoss', 0),
+                        'takeProfit': pos_snapshot.get('takeProfit', 0),
+                        'atr': pos_snapshot.get('atr', 0),
+                        'trailingStop': pos_snapshot.get('trailingStop', 0),
+                        'trailActivation': pos_snapshot.get('trailActivation', 0),
+                        'signalScore': pos_snapshot.get('signalScore', 0),
+                        'spreadLevel': pos_snapshot.get('spreadLevel', 'unknown'),
+                        'hurst': pos_snapshot.get('hurst', 0.5),
+                        'entry_order_id': pos_snapshot.get('binance_order_id', ''),
+                    }
+                    safe_create_task(sqlite_manager.save_position_close(close_data))
+                    logger.info(f"💾 TRAIL CLOSE persisted to position_closes: {symbol}")
+                except Exception as db_err:
+                    logger.debug(f"SQLite position_close save error: {db_err}")
             else:
                 logger.error(f"❌ TRAIL CLOSE FAILED: {symbol}")
                 
