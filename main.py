@@ -3299,13 +3299,14 @@ async def binance_position_sync_loop():
                                         sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
                                     sync_roi = sync_price_move * sync_leverage
                                     
-                                    if sync_roi >= 1.5 and not pos.get('isTrailingActive', False):
+                                    # Phase 231c: Aligned ROI threshold with scanner/WS/backup (was 1.5)
+                                    if sync_roi >= 0.75 and not pos.get('isTrailingActive', False):
                                         if pos['side'] == 'LONG' and current_price_sync > pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG ROI={sync_roi:.1f}% >= 1.5%")
+                                            logger.info(f"📊 Trail activated (sync): {symbol} LONG ROI={sync_roi:.1f}% >= 0.75%")
                                         elif pos['side'] == 'SHORT' and current_price_sync < pos.get('trailActivation', entry_price):
                                             pos['isTrailingActive'] = True
-                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT ROI={sync_roi:.1f}% >= 1.5%")
+                                            logger.info(f"📊 Trail activated (sync): {symbol} SHORT ROI={sync_roi:.1f}% >= 0.75%")
                                 break
                 
                 # ================================================================
@@ -7891,7 +7892,15 @@ async def background_scanner_loop():
                             
                             now_ts = datetime.now().timestamp()
                             if sl_breached:
-                                # Start timer on first breach
+                                # Phase 231c: Trail hit → immediate close (no confirmation delay)
+                                # Trail is profit protection — delay loses money
+                                if pos.get('isTrailingActive', False):
+                                    reason = 'TRAIL_EXIT'
+                                    logger.info(f"🔴 TRAIL EXIT (immediate): {pos_symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
+                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    continue
+                                
+                                # Start timer on first breach (SL only, not trail)
                                 if pos['slConfirmCount'] == 0:
                                     pos['slBreachStartTime'] = now_ts
                                 pos['slConfirmCount'] += 1
@@ -8358,12 +8367,19 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         now_ts = datetime.now().timestamp()
         if sl_breached:
+            # Phase 231c: Trail hit → immediate close (no confirmation delay)
+            if pos.get('isTrailingActive', False):
+                reason = 'TRAIL_EXIT'
+                logger.info(f"🔴 TRAIL EXIT (immediate, WS): {symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
+                global_paper_trader.close_position(pos, current_price, reason)
+                continue
+            
             if pos['slConfirmCount'] == 0:
                 pos['slBreachStartTime'] = now_ts
             pos['slConfirmCount'] += 1
             breach_duration = now_ts - pos['slBreachStartTime']
             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
-                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
+                reason = 'SL_HIT'
                 logger.info(f"🔴 SL CONFIRMED (WS): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
                 global_paper_trader.close_position(pos, current_price, reason)
                 continue
