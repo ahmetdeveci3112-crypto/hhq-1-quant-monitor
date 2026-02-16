@@ -7382,6 +7382,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
                         merged['trailActivation'] = paper_pos.get('trailActivation', 0)
                         merged['atr'] = paper_pos.get('atr', 0)
+                        # Phase 231k: Use paper_pos openTime (original entry) — not Binance updateTime
+                        if paper_pos.get('openTime', 0) > 0:
+                            merged['openTime'] = paper_pos['openTime']
                         
                         # Phase 156: isTrailingActive must be based on CURRENT profitability from Binance
                         # Phase 204: Use currentPrice (close/last) instead of markPrice (can spike with wicks)
