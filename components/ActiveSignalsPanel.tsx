@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown } from 'lucide-react';
+import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter } from 'lucide-react';
 import { CoinOpportunity } from '../types';
 
 interface ActiveSignalsPanelProps {
@@ -23,8 +23,6 @@ const formatTime = (timestamp: number | null): string => {
 };
 
 const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level: string; pullback: number; leverage: number } => {
-    // spreadPct from backend = real bid-ask spread % from Binance WebSocket
-    // BTC ~0.005%, ETH ~0.01%, mid caps ~0.03-0.08%, small caps ~0.1-0.2%, meme ~0.3%+
     let basePullback: number;
     let leverage: number;
     let level: string;
@@ -42,12 +40,12 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
 };
 
 type SortKey = 'score' | 'symbol' | 'price' | 'zScore' | 'hurst' | 'side';
+type QualityFilter = 'all' | 'eq_pass' | 'fib_active' | 'vol_spike';
 
 const getSpreadInfoFromSignal = (
     signal: CoinOpportunity,
     entryTightness: number = 1.0
 ): { level: string; pullback: number; leverage: number } => {
-    // Check if real spread data has been received from WebSocket
     const hasReal = signal.hasRealSpread === true;
     if (!hasReal || typeof signal.spreadPct !== 'number') {
         return {
@@ -59,13 +57,82 @@ const getSpreadInfoFromSignal = (
     return getSpreadInfo(signal.spreadPct, entryTightness);
 };
 
+// Get backend entry price or fallback to local calculation
+const getEntryPrice = (signal: CoinOpportunity, entryTightness: number): number => {
+    if (signal.entryPriceBackend && signal.entryPriceBackend > 0) {
+        return signal.entryPriceBackend;
+    }
+    // Fallback: local calculation
+    const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
+    const isLong = signal.signalAction === 'LONG';
+    return isLong
+        ? signal.price * (1 - spreadInfo.pullback / 100)
+        : signal.price * (1 + spreadInfo.pullback / 100);
+};
+
+// Quality badge component
+const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
+    const badges: React.ReactNode[] = [];
+
+    // EQ badge
+    if (signal.entryQualityPass) {
+        const count = signal.entryQualityReasons?.length || 0;
+        const isStrong = count >= 3;
+        badges.push(
+            <span key="eq" className={`text-[9px] px-1 py-0.5 rounded font-bold ${isStrong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
+                title={`Entry Quality: ${signal.entryQualityReasons?.join(', ') || 'passed'}`}>
+                EQ{isStrong ? '★' : ''}{count}/3
+            </span>
+        );
+    }
+
+    // Fib badge
+    if (signal.fibActive) {
+        badges.push(
+            <span key="fib" className="text-[9px] px-1 py-0.5 rounded font-bold bg-purple-500/20 text-purple-400"
+                title={`Fib Level: ${signal.fibLevel || '?'} | Bonus: +${signal.fibBonus || 0} | Alpha: ${signal.fibBlendAlpha || 0}`}>
+                FIB{signal.fibBonus ? `+${signal.fibBonus}` : ''}
+            </span>
+        );
+    }
+
+    // Volume spike badge
+    if (signal.isVolumeSpike) {
+        badges.push(
+            <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
+                title={`Volume Ratio: ${signal.volumeRatio || 0}x`}>
+                🔥VOL
+            </span>
+        );
+    } else if ((signal.volumeRatio || 0) >= 1.25) {
+        badges.push(
+            <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/10 text-amber-500/60"
+                title={`Volume Ratio: ${signal.volumeRatio}x`}>
+                Vol{signal.volumeRatio}x
+            </span>
+        );
+    }
+
+    if (badges.length === 0) return null;
+    return <div className="flex items-center gap-0.5 flex-wrap">{badges}</div>;
+};
+
 export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40 }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
+    const [qualityFilter, setQualityFilter] = useState<QualityFilter>('all');
 
     const activeSignals = signals
         .filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore)
+        .filter(s => {
+            switch (qualityFilter) {
+                case 'eq_pass': return s.entryQualityPass === true;
+                case 'fib_active': return s.fibActive === true;
+                case 'vol_spike': return s.isVolumeSpike === true;
+                default: return true;
+            }
+        })
         .sort((a, b) => {
             let compare = 0;
             switch (sortKey) {
@@ -108,15 +175,18 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         </th>
     );
 
+    // Count for filter badges
+    const allSignals = signals.filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore);
+    const eqCount = allSignals.filter(s => s.entryQualityPass).length;
+    const fibCount = allSignals.filter(s => s.fibActive).length;
+    const volCount = allSignals.filter(s => s.isVolumeSpike).length;
+
     // Mobile Card Component
     const SignalCard = ({ signal, key: _key }: { signal: CoinOpportunity; key?: string }) => {
         const isLong = signal.signalAction === 'LONG';
         const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
-        // Use backend leverage if available, fallback to local calculation
         const leverage = signal.leverage || spreadInfo.leverage;
-        const entryPrice = isLong
-            ? signal.price * (1 - spreadInfo.pullback / 100)
-            : signal.price * (1 + spreadInfo.pullback / 100);
+        const entryPrice = getEntryPrice(signal, entryTightness);
         const isLoading = loadingSymbol === signal.symbol;
 
         return (
@@ -143,6 +213,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     </span>
                 </div>
 
+                {/* Quality Badges */}
+                <div className="mb-2">
+                    <QualityBadges signal={signal} />
+                </div>
+
                 {/* Middle: Price Info */}
                 <div className="grid grid-cols-2 gap-2 mb-2">
                     <div>
@@ -150,7 +225,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <div className="text-xs font-mono text-white">${formatPrice(signal.price)}</div>
                     </div>
                     <div>
-                        <div className="text-[9px] text-slate-500 uppercase">Giriş</div>
+                        <div className="text-[9px] text-slate-500 uppercase">
+                            Giriş {signal.entryPriceBackend ? '(BE)' : ''}
+                        </div>
                         <div className={`text-xs font-mono font-semibold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
                             ${formatPrice(entryPrice)}
                         </div>
@@ -163,7 +240,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
-                        <span className="text-amber-400">PB:{Math.abs((entryPrice - signal.price) / signal.price * 100).toFixed(1)}%</span>
+                        <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(1)}%</span>
                         <span className="flex items-center gap-1 text-slate-500">
                             <Clock className="w-2.5 h-2.5" />{formatTime(signal.lastSignalTime)}
                         </span>
@@ -206,6 +283,28 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 </div>
             </div>
 
+            {/* Quality Filters */}
+            <div className="px-4 py-2 border-b border-slate-800/30 flex items-center gap-2 overflow-x-auto">
+                <Filter className="w-3 h-3 text-slate-500 flex-shrink-0" />
+                {([
+                    { key: 'all' as QualityFilter, label: 'Tüm', count: allSignals.length },
+                    { key: 'eq_pass' as QualityFilter, label: 'EQ Pass', count: eqCount },
+                    { key: 'fib_active' as QualityFilter, label: 'Fib Aktif', count: fibCount },
+                    { key: 'vol_spike' as QualityFilter, label: 'Vol Spike', count: volCount },
+                ]).map(f => (
+                    <button
+                        key={f.key}
+                        onClick={() => setQualityFilter(f.key)}
+                        className={`text-[10px] px-2 py-1 rounded-full font-medium transition-colors whitespace-nowrap ${qualityFilter === f.key
+                            ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/40'
+                            : 'bg-slate-800/50 text-slate-500 border border-slate-700/30 hover:text-slate-300'
+                            }`}
+                    >
+                        {f.label} {f.count > 0 && <span className="ml-0.5 text-[9px] opacity-70">({f.count})</span>}
+                    </button>
+                ))}
+            </div>
+
             {/* MOBILE: Card Layout */}
             <div className="lg:hidden p-3 space-y-2 max-h-[60vh] overflow-y-auto">
                 {activeSignals.length === 0 ? (
@@ -228,6 +327,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <th className="py-3 px-3 font-medium text-right">Price</th>
                             <th className="py-3 px-3 font-medium text-right">Entry</th>
                             <SortHeader label="Score" sortKeyName="score" align="right" />
+                            <th className="py-3 px-2 font-medium text-center">Quality</th>
                             <SortHeader label="Z-Score" sortKeyName="zScore" align="right" />
                             <SortHeader label="Hurst" sortKeyName="hurst" align="right" />
                             <th className="py-3 px-3 font-medium text-center">Lev</th>
@@ -249,27 +349,21 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             activeSignals.map((signal) => {
                                 const isLong = signal.signalAction === 'LONG';
                                 const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
-                                const entryPrice = isLong
-                                    ? signal.price * (1 - spreadInfo.pullback / 100)
-                                    : signal.price * (1 + spreadInfo.pullback / 100);
+                                const entryPrice = getEntryPrice(signal, entryTightness);
                                 const isLoading = loadingSymbol === signal.symbol;
-                                // PB%: Actual pullback = distance from price to entry
-                                const pbPct = Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Phase 218: Trail Entry — coin-specific using dynamic trail params
+                                const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
+                                // Phase 218: Trail Entry
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const hurstVal = signal.hurst || 0.5;
                                 const hurstStr = Math.min(1.0, Math.max(0, (hurstVal - 0.35) / 0.4));
 
-                                // Use dynamic_trail_distance from backend if available
                                 const dynTrailDist = signal.dynamic_trail_distance;
                                 let trailPct: number;
 
                                 if (dynTrailDist && dynTrailDist > 0 && atrPct > 0) {
-                                    // Trending → tighter entry trail (30%), Mean-reverting → wider (60%)
                                     const entryTrailRatio = 0.60 - hurstStr * 0.30;
                                     trailPct = atrPct * dynTrailDist * entryTrailRatio;
                                 } else {
-                                    // Fallback: 0.30-0.50 ATR (was 0.05-0.10)
                                     const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
                                     const trendStr = hurstStr * 0.6 + zStr * 0.4;
                                     const trailFactor = 0.50 - trendStr * 0.20;
@@ -298,11 +392,17 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                         <td className="py-2.5 px-3 text-right font-mono text-xs text-slate-300">${formatPrice(signal.price)}</td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs font-semibold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
                                             ${formatPrice(entryPrice)}
+                                            {signal.entryPriceBackend ? (
+                                                <span className="text-[8px] text-slate-600 ml-0.5">BE</span>
+                                            ) : null}
                                         </td>
                                         <td className="py-2.5 px-3 text-right">
                                             <span className={`text-xs font-bold ${signal.signalScore >= 80 ? 'text-emerald-400' : signal.signalScore >= 60 ? 'text-amber-400' : 'text-slate-400'
                                                 }`}>{signal.signalScore}</span>
                                             <span className="text-[10px] text-slate-600">/100</span>
+                                        </td>
+                                        <td className="py-2.5 px-2 text-center">
+                                            <QualityBadges signal={signal} />
                                         </td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs ${Math.abs(signal.zscore || 0) >= 2 ? 'text-amber-400' : 'text-slate-400'}`}>
                                             {(signal.zscore || 0).toFixed(2)}

@@ -296,6 +296,20 @@ export interface CoinOpportunity {
   hasRealSpread?: boolean;  // Phase 228: Whether real bid-ask spread data is available
   spreadLevel?: string;  // Phase 228: 'Very Low' | 'Low' | 'Normal' | 'High' | 'Very High' | 'Extreme' | 'Ultra'
   dynamic_trail_distance?: number;  // Phase 228: Dynamic trail distance from backend
+  // Phase EQG: Entry Quality Gate observability
+  volumeRatio?: number;
+  isVolumeSpike?: boolean;
+  obImbalanceTrend?: number;
+  entryQualityPass?: boolean;
+  entryQualityReasons?: string[];
+  // Phase FIB: Fibonacci observability
+  fibActive?: boolean;
+  fibLevel?: string | null;
+  fibBonus?: number;
+  fibEntry?: number;
+  fibBlendAlpha?: number;
+  // Backend ideal entry price
+  entryPriceBackend?: number;
 }
 
 export interface ScannerStats {

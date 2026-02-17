@@ -126,6 +126,38 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             )}
 
+            {/* Quality Badges — Phase EQG+FIB */}
+            {hasSignal && (
+                <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {coin.entryQualityPass && (
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.entryQualityReasons?.length || 0) >= 3
+                            ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
+                            title={`EQ: ${coin.entryQualityReasons?.join(', ') || 'pass'}`}>
+                            EQ{(coin.entryQualityReasons?.length || 0)}/3
+                        </span>
+                    )}
+                    {coin.fibActive && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-purple-500/20 text-purple-400"
+                            title={`Fib: ${coin.fibLevel} +${coin.fibBonus}`}>
+                            FIB{coin.fibBonus ? `+${coin.fibBonus}` : ''}
+                        </span>
+                    )}
+                    {coin.isVolumeSpike && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
+                            title={`Volume: ${coin.volumeRatio}x`}>
+                            🔥{coin.volumeRatio}x
+                        </span>
+                    )}
+                    {(coin.obImbalanceTrend || 0) !== 0 && (
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.obImbalanceTrend || 0) > 0
+                            ? 'bg-emerald-500/10 text-emerald-500/70' : 'bg-rose-500/10 text-rose-500/70'}`}
+                            title={`OB Trend: ${coin.obImbalanceTrend}`}>
+                            OB{(coin.obImbalanceTrend || 0) > 0 ? '↑' : '↓'}
+                        </span>
+                    )}
+                </div>
+            )}
+
             {/* Volume */}
             <div className="mt-2 text-xs text-slate-500 flex items-center gap-1">
                 <Activity className="w-3 h-3" />

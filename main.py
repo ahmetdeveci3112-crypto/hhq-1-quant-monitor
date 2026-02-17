@@ -5841,6 +5841,18 @@ class CoinOpportunity:
         self.last_update: float = 0.0
         self.leverage: int = 10  # Default leverage, updated by SignalGenerator
         self.pullback_pct: float = 0.0  # Pullback percentage for signal
+        # Phase EQG + FIB: UI observability fields
+        self.volume_ratio: float = 0.0
+        self.is_volume_spike: bool = False
+        self.ob_imbalance_trend: float = 0.0
+        self.entry_quality_pass: bool = False
+        self.entry_quality_reasons: list = []
+        self.fib_active: bool = False
+        self.fib_level: Optional[str] = None
+        self.fib_bonus: int = 0
+        self.fib_entry: float = 0.0
+        self.fib_blend_alpha: float = 0.0
+        self.entry_price: float = 0.0  # Backend ideal_entry price
     
     def to_dict(self) -> dict:
         return {
@@ -5859,8 +5871,20 @@ class CoinOpportunity:
             "lastSignalTime": self.last_signal_time,
             "atr": self.atr,
             "lastUpdate": self.last_update,
-            "leverage": self.leverage,  # Phase 73: Include leverage in UI data
-            "pullbackPct": round(self.pullback_pct, 2)
+            "leverage": self.leverage,
+            "pullbackPct": round(self.pullback_pct, 2),
+            # Phase EQG + FIB: UI observability
+            "volumeRatio": round(self.volume_ratio, 2),
+            "isVolumeSpike": self.is_volume_spike,
+            "obImbalanceTrend": round(self.ob_imbalance_trend, 1),
+            "entryQualityPass": self.entry_quality_pass,
+            "entryQualityReasons": self.entry_quality_reasons,
+            "fibActive": self.fib_active,
+            "fibLevel": self.fib_level,
+            "fibBonus": self.fib_bonus,
+            "fibEntry": round(self.fib_entry, 8) if self.fib_entry else 0,
+            "fibBlendAlpha": self.fib_blend_alpha,
+            "entryPriceBackend": round(self.entry_price, 8) if self.entry_price else 0,
         }
 
 
@@ -6374,9 +6398,21 @@ class LightweightCoinAnalyzer:
         if signal:
             self.opportunity.signal_score = signal.get('confidenceScore', 0)
             self.opportunity.signal_action = signal.get('action', 'NONE')
-            self.opportunity.leverage = signal.get('leverage', 10)  # Phase 73: Pass leverage to UI
-            self.opportunity.pullback_pct = signal.get('pullbackPct', 0)  # Pullback % for UI
+            self.opportunity.leverage = signal.get('leverage', 10)
+            self.opportunity.pullback_pct = signal.get('pullbackPct', 0)
             self.opportunity.last_signal_time = datetime.now().timestamp()
+            # Phase EQG + FIB: Store observability fields
+            self.opportunity.volume_ratio = signal.get('volumeRatio', 0)
+            self.opportunity.is_volume_spike = signal.get('isVolumeSpike', False)
+            self.opportunity.ob_imbalance_trend = signal.get('obImbalanceTrend', 0)
+            self.opportunity.entry_quality_pass = signal.get('entryQualityPass', False)
+            self.opportunity.entry_quality_reasons = signal.get('entryQualityReasons', [])
+            self.opportunity.fib_active = signal.get('fibActive', False)
+            self.opportunity.fib_level = signal.get('fibLevel')
+            self.opportunity.fib_bonus = signal.get('fibBonus', 0)
+            self.opportunity.fib_entry = signal.get('fibEntry', 0)
+            self.opportunity.fib_blend_alpha = signal.get('fibBlendAlpha', 0)
+            self.opportunity.entry_price = signal.get('entryPrice', 0) or signal.get('entry', 0)
             return signal
         else:
             # Decay signal score over time if no new signal
