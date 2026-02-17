@@ -5874,7 +5874,7 @@ class CoinOpportunity:
             "zscore": round(self.zscore, 2),
             "hurst": round(self.hurst, 2),
             "spreadPct": round(self.bid_ask_spread_pct, 4),  # Real bid-ask spread from WebSocket
-            "hasRealSpread": self.has_real_spread,  # True when real bid/ask data received
+            "hasRealSpread": bool(self.has_real_spread),  # True when real bid/ask data received
             "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
@@ -5885,17 +5885,17 @@ class CoinOpportunity:
             "leverage": self.leverage,
             "pullbackPct": round(self.pullback_pct, 2),
             # Phase EQG + FIB: UI observability
-            "volumeRatio": round(self.volume_ratio, 2),
-            "isVolumeSpike": self.is_volume_spike,
-            "obImbalanceTrend": round(self.ob_imbalance_trend, 1),
-            "entryQualityPass": self.entry_quality_pass,
-            "entryQualityReasons": self.entry_quality_reasons,
-            "fibActive": self.fib_active,
+            "volumeRatio": round(float(self.volume_ratio), 2),
+            "isVolumeSpike": bool(self.is_volume_spike),
+            "obImbalanceTrend": round(float(self.ob_imbalance_trend), 1),
+            "entryQualityPass": bool(self.entry_quality_pass),
+            "entryQualityReasons": list(self.entry_quality_reasons) if self.entry_quality_reasons else [],
+            "fibActive": bool(self.fib_active),
             "fibLevel": self.fib_level,
-            "fibBonus": self.fib_bonus,
-            "fibEntry": round(self.fib_entry, 8) if self.fib_entry else 0,
-            "fibBlendAlpha": self.fib_blend_alpha,
-            "entryPriceBackend": round(self.entry_price, 8) if self.entry_price else 0,
+            "fibBonus": int(self.fib_bonus),
+            "fibEntry": round(float(self.fib_entry), 8) if self.fib_entry else 0,
+            "fibBlendAlpha": float(self.fib_blend_alpha),
+            "entryPriceBackend": round(float(self.entry_price), 8) if self.entry_price else 0,
         }
 
 
@@ -20693,6 +20693,19 @@ async def paper_trading_close(position_id: str):
 # PHASE 31: MULTI-COIN SCANNER WEBSOCKET ENDPOINT
 # ============================================================================
 
+
+def _safe_json_default(obj):
+    """Fallback serializer for numpy/pandas types that json.dumps can't handle."""
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 @app.websocket("/ws/scanner")
 async def scanner_websocket_endpoint(websocket: WebSocket):
     """
@@ -20714,7 +20727,8 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     try:
         # INSTANT: Send cached state immediately (no API calls!)
         if ui_state_cache.is_ready():
-            await websocket.send_json(ui_state_cache.get_state())
+            state = ui_state_cache.get_state()
+            await websocket.send_text(json.dumps(state, default=_safe_json_default))
             logger.info(f"📦 Phase 98: Sent cached state instantly ({len(ui_state_cache.opportunities)} opportunities)")
         else:
             # Cache not ready yet - send empty state with loading message
@@ -20734,7 +20748,8 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             await asyncio.sleep(stream_interval)
             
             # Simply send the current cache state
-            await websocket.send_json(ui_state_cache.get_state())
+            state = ui_state_cache.get_state()
+            await websocket.send_text(json.dumps(state, default=_safe_json_default))
             
     except WebSocketDisconnect:
         logger.info("Scanner WebSocket client disconnected")
