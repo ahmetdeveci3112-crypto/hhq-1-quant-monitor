@@ -461,17 +461,17 @@ export default function App() {
   }, [addLog, isRunning]);
 
   // Phase 36: Market Order from Signal Card
-  const handleMarketOrder = useCallback(async (symbol: string, side: 'LONG' | 'SHORT', price: number) => {
+  const handleMarketOrder = useCallback(async (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number = 10) => {
     try {
-      addLog(`🛒 Market Order: ${side} ${symbol} @ $${price.toFixed(4)}`);
+      addLog(`🛒 Market Order: ${side} ${symbol} @ $${price.toFixed(4)} (${signalLeverage}x)`);
       const res = await fetch(`${BACKEND_API_URL}/paper-trading/market-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, side, price })
+        body: JSON.stringify({ symbol, side, price, signalLeverage })
       });
       const data = await res.json();
       if (data.success) {
-        addLog(`✅ Market Order Başarılı: ${side} ${symbol}`);
+        addLog(`✅ Market Order Başarılı: ${side} ${symbol} @ ${signalLeverage}x`);
       } else {
         addLog(`❌ Market Order Hata: ${data.error || 'Bilinmeyen hata'}`);
       }

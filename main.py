@@ -1759,8 +1759,13 @@ class LiveBinanceTrader:
             logger.info(f"⚙️ Leverage set: {symbol} -> {leverage}x")
             return True
         except Exception as e:
-            logger.warning(f"Leverage set warning (may already be set): {e}")
-            return True  # Often fails if already set, which is OK
+            err_str = str(e).lower()
+            # "already set" / "No need to change" is benign — Binance returns error if same leverage
+            if 'already' in err_str or 'no need' in err_str or 'not modified' in err_str:
+                logger.info(f"⚙️ Leverage already {leverage}x for {symbol} (OK)")
+                return True
+            logger.error(f"❌ Leverage set FAILED for {symbol} -> {leverage}x: {e}")
+            return False  # Real error — caller should abort order
     
     async def place_market_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
         """Market emir gönder — Phase 186: with execution quality logging."""
@@ -1771,8 +1776,11 @@ class LiveBinanceTrader:
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         
         try:
-            # Kaldıraç ayarla
-            await self.set_leverage(symbol, leverage)
+            # Kaldıraç ayarla — abort if real failure
+            set_ok = await self.set_leverage(symbol, leverage)
+            if not set_ok:
+                logger.error(f"❌ Aborting market order {symbol}: leverage set to {leverage}x failed")
+                return None
             
             # Phase 186: Capture pre-order book state
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
@@ -1855,7 +1863,10 @@ class LiveBinanceTrader:
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         
         try:
-            await self.set_leverage(symbol, leverage)
+            set_ok = await self.set_leverage(symbol, leverage)
+            if not set_ok:
+                logger.error(f"❌ Aborting limit entry {symbol}: leverage set to {leverage}x failed")
+                return None
             
             # Fetch ticker for pricing
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
@@ -20395,8 +20406,15 @@ async def paper_trading_update_settings(
     # Phase 216: Leverage multiplier
     if leverageMultiplier is not None:
         clamped = max(0.3, min(3.0, leverageMultiplier))
+        old_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
         global_paper_trader.leverage_multiplier = clamped
-        logger.info(f"⚡ Leverage Multiplier updated: {clamped:.1f}x")
+        logger.info(f"⚡ Leverage Multiplier updated: {old_mult:.1f}x → {clamped:.1f}x")
+        # Fix P1: Clear pending orders with stale leverage when multiplier changes
+        if abs(old_mult - clamped) > 0.01 and global_paper_trader.pending_orders:
+            stale_count = len(global_paper_trader.pending_orders)
+            global_paper_trader.pending_orders.clear()
+            global_paper_trader.add_log(f"⚠️ SETTINGS_CHANGED_LEVERAGE_MULTIPLIER: {stale_count} pending orders cleared (lev {old_mult:.1f}x→{clamped:.1f}x)")
+            logger.info(f"🗑️ Cleared {stale_count} pending orders due to leverage multiplier change")
     
     # Log settings change (simplified)
     global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
@@ -20531,6 +20549,8 @@ async def paper_trading_market_order(request: Request):
         symbol = data.get('symbol')
         side = data.get('side')  # LONG or SHORT
         price = float(data.get('price', 0))
+        # Fix P0: Use signal leverage from UI (already includes multiplier)
+        requested_lev = data.get('signalLeverage')
         
         if not symbol or not side or price <= 0:
             return JSONResponse({"success": False, "error": "Missing symbol, side, or price"}, status_code=400)
@@ -20553,7 +20573,23 @@ async def paper_trading_market_order(request: Request):
         # Calculate position sizing
         balance = global_paper_trader.balance
         risk_amount = balance * global_paper_trader.risk_per_trade
-        leverage = global_paper_trader.leverage
+        
+        # Fix P0: Leverage pipeline — priority: signalLeverage > base * multiplier
+        base_lev = global_paper_trader.leverage
+        user_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+        if requested_lev and requested_lev > 0:
+            leverage = max(3, min(75, int(requested_lev)))
+        else:
+            leverage = max(3, min(75, int(base_lev * user_mult)))
+        
+        # LEV_PIPE log for full traceability
+        logger.info(f"🔧 LEV_PIPE: signalLev={requested_lev} userMult={user_mult:.1f} baseLev={base_lev} → orderLev={leverage}x | {side} {symbol}")
+        
+        # Fix P1: Set leverage on Binance — abort if real failure
+        if live_binance_trader.enabled:
+            set_ok = await live_binance_trader.set_leverage(symbol, leverage)
+            if not set_ok:
+                return JSONResponse({"success": False, "error": f"Binance leverage set failed for {symbol} → {leverage}x"}, status_code=500)
         
         # SL/TP based on ATR
         sl_distance = atr * (global_paper_trader.sl_atr / 10)
@@ -20600,10 +20636,10 @@ async def paper_trading_market_order(request: Request):
         }
         
         global_paper_trader.positions.append(position)
-        global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${price:.4f} | SL: ${sl:.4f} | TP: ${tp:.4f}")
+        global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${price:.4f} | {leverage}x | SL: ${sl:.4f} | TP: ${tp:.4f}")
         global_paper_trader.save_state()
         
-        logger.info(f"✅ Market Order: {side} {symbol} @ {price}")
+        logger.info(f"✅ Market Order: {side} {symbol} @ {price} | finalLev={leverage}x")
         return JSONResponse({"success": True, "position": position})
         
     except Exception as e:

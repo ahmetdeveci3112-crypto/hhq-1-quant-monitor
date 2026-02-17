@@ -4,7 +4,7 @@ import { CoinOpportunity } from '../types';
 
 interface ActiveSignalsPanelProps {
     signals: CoinOpportunity[];
-    onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number) => Promise<void>;
+    onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number) => Promise<void>;
     entryTightness?: number;
     minConfidenceScore?: number;
 }
@@ -155,7 +155,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         if (!onMarketOrder) return;
         setLoadingSymbol(signal.symbol);
         try {
-            await onMarketOrder(signal.symbol, signal.signalAction as 'LONG' | 'SHORT', signal.price);
+            await onMarketOrder(signal.symbol, signal.signalAction as 'LONG' | 'SHORT', signal.price, signal.leverage || 10);
         } finally {
             setLoadingSymbol(null);
         }
