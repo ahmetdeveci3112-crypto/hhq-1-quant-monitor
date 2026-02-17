@@ -4361,6 +4361,303 @@ VOLATILITY_LEVELS = {
     "ultra":     {"max_atr_pct": 999,   "trail": 5.0, "sl": 6.0, "tp": 10.0,"leverage": 3,  "pullback": 0.036}   # 90%+ = 3x, extreme
 }
 
+# ============================================================================
+# FIBONACCI RETRACEMENT ENGINE — Feature Flags & Helpers
+# Phase FIB: Dual-role Fibonacci (score bonus + entry refinement)
+# ============================================================================
+
+FIB_ENABLED = True               # Master switch — ACTIVE (Canary Aşama 1)
+FIB_SCORE_ENABLED = True         # Score bonus layer (Layer 23)
+FIB_ENTRY_ENABLED = True         # Entry blend layer — ACTIVE
+FIB_MAX_ENTRY_DEV_PCT = 1.0      # Max deviation between fib_entry and atr_entry (%)
+FIB_BLEND_ALPHA = 0.35           # Blend weight (0=pure ATR, 1=pure fib)
+
+# Fibonacci ratios
+FIB_RATIOS = {
+    '0.236': 0.236,
+    '0.382': 0.382,
+    '0.500': 0.500,
+    '0.618': 0.618,
+    '0.786': 0.786,
+}
+
+# Score bonus per Fibonacci level (capped at 12 total)
+FIB_SCORE_MAP = {
+    '0.618': 8,
+    '0.500': 6,
+    '0.382': 4,
+    '0.236': 2,
+    '0.786': 3,
+}
+FIB_SCORE_CAP = 12
+FIB_CONFLUENCE_BONUS = 2  # Extra bonus when VP/Sweep aligns
+
+
+def detect_swings_atr(highs: list, lows: list, closes: list, atr: float,
+                      lookback: int = 30, k: float = 1.5) -> dict:
+    """
+    ATR-filtered swing high/low detection (Method 2 from Fibonacci guide).
+    
+    A swing is valid only if the price move from the last swing exceeds k × ATR,
+    filtering out small fake moves and noise.
+    
+    Args:
+        highs: List of high prices
+        lows: List of low prices
+        closes: List of close prices
+        atr: Current ATR value
+        lookback: How many bars to look back
+        k: ATR multiplier threshold (1.5 = need 1.5× ATR move for valid swing)
+    
+    Returns:
+        {
+            'swing_high': float or None,
+            'swing_low': float or None,
+            'swing_high_idx': int or -1,
+            'swing_low_idx': int or -1,
+            'valid': bool
+        }
+    """
+    result = {
+        'swing_high': None, 'swing_low': None,
+        'swing_high_idx': -1, 'swing_low_idx': -1,
+        'valid': False
+    }
+    
+    if len(highs) < lookback or len(lows) < lookback or atr <= 0:
+        return result
+    
+    min_move = k * atr  # Minimum price move for a valid swing
+    
+    # Use the last `lookback` bars
+    h = highs[-lookback:]
+    l = lows[-lookback:]
+    c = closes[-lookback:]
+    
+    # Find highest high and lowest low
+    max_h = max(h)
+    min_l = min(l)
+    max_h_idx = len(h) - 1 - h[::-1].index(max_h)  # Last occurrence
+    min_l_idx = len(l) - 1 - l[::-1].index(min_l)
+    
+    # Check if the range is significant (> k * ATR)
+    swing_range = max_h - min_l
+    if swing_range < min_move:
+        return result  # Range too small — no meaningful swing
+    
+    # Validate: use fractal confirmation (2-bar lookback)
+    # Swing High: bar[i] high > bar[i-1] high AND bar[i] high > bar[i-2] high
+    valid_sh = False
+    for i in range(len(h) - 1, 1, -1):
+        if h[i] == max_h and h[i] > h[i-1] and h[i] > h[i-2]:
+            max_h_idx = i
+            valid_sh = True
+            break
+    
+    valid_sl = False
+    for i in range(len(l) - 1, 1, -1):
+        if l[i] == min_l and l[i] < l[i-1] and l[i] < l[i-2]:
+            min_l_idx = i
+            valid_sl = True
+            break
+    
+    if not valid_sh:
+        # Fallback: just use the max high
+        valid_sh = True
+    if not valid_sl:
+        valid_sl = True
+    
+    # Ensure swing high happened after swing low (for uptrend) or vice versa
+    # We return both and let the caller decide based on trend
+    result['swing_high'] = max_h
+    result['swing_low'] = min_l
+    result['swing_high_idx'] = max_h_idx
+    result['swing_low_idx'] = min_l_idx
+    result['valid'] = valid_sh and valid_sl
+    
+    return result
+
+
+def calculate_fib_levels(swing_high: float, swing_low: float, trend: str = 'UP') -> dict:
+    """
+    Calculate Fibonacci retracement levels from swing high/low.
+    
+    Uptrend: levels measured down from swing_high (retracement of upward move)
+    Downtrend: levels measured up from swing_low (retracement of downward move)
+    
+    Args:
+        swing_high: The swing high price
+        swing_low: The swing low price
+        trend: 'UP' or 'DOWN'
+    
+    Returns:
+        {
+            '0.236': price_level,
+            '0.382': price_level,
+            '0.500': price_level,
+            '0.618': price_level,
+            '0.786': price_level,
+            'range': swing_high - swing_low
+        }
+    """
+    price_range = swing_high - swing_low
+    if price_range <= 0:
+        return {}
+    
+    levels = {'range': price_range}
+    
+    for name, ratio in FIB_RATIOS.items():
+        if trend == 'UP':
+            # Uptrend retracement: price pulls back down from high
+            levels[name] = swing_high - (price_range * ratio)
+        else:
+            # Downtrend retracement: price bounces up from low
+            levels[name] = swing_low + (price_range * ratio)
+    
+    return levels
+
+
+def build_fib_context(signal_side: str, price: float, atr: float,
+                      adx: float, hurst: float, trend_data: dict,
+                      sweep_result: dict = None, volume_profile_poc: float = 0) -> dict:
+    """
+    Build Fibonacci context for signal scoring and entry refinement.
+    
+    Uses cached OHLCV data from MTF trend updates to detect swings
+    and calculate Fibonacci levels. Produces score bonus (capped at 12)
+    and optimal entry price.
+    
+    Args:
+        signal_side: 'LONG' or 'SHORT'
+        price: Current price
+        atr: Current ATR
+        adx: Current ADX
+        hurst: Current Hurst exponent
+        trend_data: From mtf_confirmation.coin_trends[symbol]
+        sweep_result: LiquiditySweep detection result (optional)
+        volume_profile_poc: Volume profile POC price (optional)
+    
+    Returns:
+        {
+            'fib_active': bool,
+            'fib_score_bonus': int (0-12),
+            'fib_entry': float (0 if inactive),
+            'fib_level': str or None ('0.618', '0.5', etc.),
+            'fib_zone_upper': float,
+            'fib_zone_lower': float,
+            'confluence': list,
+            'skip_reason': str (if inactive)
+        }
+    """
+    result = {
+        'fib_active': False,
+        'fib_score_bonus': 0,
+        'fib_entry': 0,
+        'fib_level': None,
+        'fib_zone_upper': 0,
+        'fib_zone_lower': 0,
+        'confluence': [],
+        'skip_reason': ''
+    }
+    
+    # Need OHLCV data from MTF cache
+    ohlcv_4h = trend_data.get('ohlcv_4h', [])
+    
+    if not ohlcv_4h or len(ohlcv_4h) < 20:
+        result['skip_reason'] = 'no_data'
+        return result
+    
+    # Check: Fibonacci works best in trending markets
+    # If Hurst < 0.45 (mean-reverting) AND ADX < 20 (no trend), skip
+    if hurst < 0.40 and adx < 15:
+        result['skip_reason'] = 'chop_market'
+        return result
+    
+    # Extract OHLCV arrays
+    highs_4h = [c[2] for c in ohlcv_4h]
+    lows_4h = [c[3] for c in ohlcv_4h]
+    closes_4h = [c[4] for c in ohlcv_4h]
+    
+    # Detect swings on 4H data
+    swings = detect_swings_atr(highs_4h, lows_4h, closes_4h, atr, lookback=min(30, len(ohlcv_4h)), k=1.5)
+    
+    if not swings['valid'] or swings['swing_high'] is None or swings['swing_low'] is None:
+        result['skip_reason'] = 'no_swing'
+        return result
+    
+    # Determine trend from signal side
+    trend = 'UP' if signal_side == 'LONG' else 'DOWN'
+    
+    # Calculate Fibonacci levels
+    fib_levels = calculate_fib_levels(swings['swing_high'], swings['swing_low'], trend)
+    
+    if not fib_levels:
+        result['skip_reason'] = 'no_range'
+        return result
+    
+    # Zone width: ATR × 0.5 on each side of the fib level
+    zone_width = atr * 0.5
+    
+    # Find which zone (if any) the current price is in
+    best_level = None
+    best_bonus = 0
+    best_fib_price = 0
+    
+    for level_name in ['0.618', '0.500', '0.382', '0.786', '0.236']:
+        fib_price = fib_levels.get(level_name, 0)
+        if fib_price <= 0:
+            continue
+        
+        zone_upper = fib_price + zone_width
+        zone_lower = fib_price - zone_width
+        
+        if zone_lower <= price <= zone_upper:
+            bonus = FIB_SCORE_MAP.get(level_name, 0)
+            if bonus > best_bonus:
+                best_bonus = bonus
+                best_level = level_name
+                best_fib_price = fib_price
+                result['fib_zone_upper'] = zone_upper
+                result['fib_zone_lower'] = zone_lower
+    
+    if best_level is None:
+        result['skip_reason'] = 'not_in_zone'
+        return result
+    
+    # Confluence checks
+    confluence = []
+    confluence_bonus = 0
+    
+    # Check LiquiditySweep confluence
+    if sweep_result and sweep_result.get('sweep_type'):
+        sweep_type = sweep_result['sweep_type']
+        if (sweep_type == 'BULLISH' and signal_side == 'LONG') or \
+           (sweep_type == 'BEARISH' and signal_side == 'SHORT'):
+            confluence.append('LiqSweep')
+            confluence_bonus += 1
+    
+    # Check VolumeProfile POC confluence
+    if volume_profile_poc and volume_profile_poc > 0:
+        poc_distance = abs(best_fib_price - volume_profile_poc)
+        if poc_distance < zone_width:
+            confluence.append('VP_POC')
+            confluence_bonus += 1
+    
+    # Cap confluence bonus
+    confluence_bonus = min(confluence_bonus, FIB_CONFLUENCE_BONUS)
+    
+    # Total score bonus (capped at FIB_SCORE_CAP)
+    total_bonus = min(best_bonus + confluence_bonus, FIB_SCORE_CAP)
+    
+    result['fib_active'] = True
+    result['fib_score_bonus'] = total_bonus
+    result['fib_entry'] = best_fib_price
+    result['fib_level'] = best_level
+    result['confluence'] = confluence
+    
+    return result
+
+
 # =====================================================
 # DYNAMIC TRAIL PARAMETERS (Hybrid Approach)
 # Calculates trail_activation and trail_distance based on:
@@ -6006,6 +6303,28 @@ class LightweightCoinAnalyzer:
         # Phase 177: Use real bid-ask spread, conservative fallback (0.10%) if not yet received
         effective_spread = self.opportunity.bid_ask_spread_pct if self.opportunity.has_real_spread else 0.10
         
+        # Phase FIB: Build Fibonacci context for Cloud Scanner (OHLCV already cached by update_coin_trend)
+        cs_fib_context = None
+        if FIB_ENABLED:
+            try:
+                trend_data = mtf_confirmation.coin_trends.get(self.symbol, {}) if 'mtf_confirmation' in globals() else {}
+                if trend_data:
+                    # Pre-determine signal side from z-score direction (not threshold)
+                    # P2 fix: actual threshold is dynamic (effective_threshold), so just use direction
+                    pre_side = 'LONG' if zscore < 0 else ('SHORT' if zscore > 0 else None)
+                    if pre_side:
+                        cs_fib_context = build_fib_context(
+                            signal_side=pre_side,
+                            price=self.opportunity.price,
+                            atr=atr,
+                            adx=adx,
+                            hurst=hurst,
+                            trend_data=trend_data,
+                            sweep_result=sweep_result,
+                        )
+            except Exception as fib_err:
+                logger.debug(f"FIB context error in scanner: {fib_err}")
+        
         # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
@@ -6034,6 +6353,7 @@ class LightweightCoinAnalyzer:
             coin_wr_penalty=trade_pattern_analyzer.get_coin_penalty(self.symbol),  # Phase 157
             side_wr_penalty=0,  # Phase 157: calculated inside generate_signal where signal_side is known
             enhanced_indicators=enhanced_ind,  # Phase 193: MACD, BB, StochRSI, EMA cross
+            fib_context=cs_fib_context,  # Phase FIB: Fibonacci context
         )
         
         if signal:
@@ -7795,13 +8115,24 @@ async def background_scanner_loop():
                             logger.debug(f"MTF Guard error: {mtf_guard_err}")
                     
                     # UPDATE MTF TRENDS for coins with active signals (before processing)
+                    # Phase FIB: Also update for ALL scanned opportunities (cache TTL prevents re-fetch)
+                    # This ensures OHLCV cache is warm for Fibonacci context on new signals
+                    mtf_update_symbols = set()
                     for signal in multi_coin_scanner.active_signals:
+                        s = signal.get('symbol', '')
+                        if s:
+                            mtf_update_symbols.add(s)
+                    if FIB_ENABLED:
+                        for opp in opportunities:
+                            s = opp.get('symbol', '')
+                            if s and opp.get('signalScore', 0) > 0:
+                                mtf_update_symbols.add(s)
+                    for sym in mtf_update_symbols:
                         try:
-                            symbol = signal.get('symbol', '')
-                            if symbol and multi_coin_scanner.exchange:
-                                await mtf_confirmation.update_coin_trend(symbol, multi_coin_scanner.exchange)
+                            if multi_coin_scanner.exchange:
+                                await mtf_confirmation.update_coin_trend(sym, multi_coin_scanner.exchange)
                         except Exception as mtf_err:
-                            logger.debug(f"MTF update error for {symbol}: {mtf_err}")
+                            logger.debug(f"MTF update error for {sym}: {mtf_err}")
                     
                     for signal in multi_coin_scanner.active_signals:
                         try:
@@ -9758,6 +10089,12 @@ class MultiTimeframeConfirmation:
                 trend_1d = self.get_trend_from_closes(closes_1d)
                 result['trend_1d'] = trend_1d['trend']
             
+            # Phase FIB: Cache OHLCV snapshots for Fibonacci swing detection
+            if ohlcv_1h:
+                result['ohlcv_1h'] = ohlcv_1h[-30:]
+            if ohlcv_4h:
+                result['ohlcv_4h'] = ohlcv_4h[-30:]
+            
             self.coin_trends[symbol] = result
             logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}, 1d={result['trend_1d']}, 4h_20_chg={result.get('price_change_4h_20', 0):.1f}%")
             
@@ -11446,6 +11783,7 @@ class PositionBasedKillSwitch:
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": "KILL_SWITCH_PARTIAL",
+            "closeReason": "KILL_SWITCH_PARTIAL",
             "leverage": pos.get('leverage', 10)
         }
         paper_trader.trades.append(partial_trade)
@@ -14996,6 +15334,7 @@ class SignalGenerator:
         coin_wr_penalty: int = 0,  # Phase 157: Coin WR penalty from trade pattern analysis
         side_wr_penalty: int = 0,  # Phase 157: Side WR penalty from trade pattern analysis
         enhanced_indicators: Optional[Dict] = None,  # Phase 193: MACD, BB, StochRSI, EMA cross
+        fib_context: Optional[Dict] = None,  # Phase FIB: Fibonacci retracement context
     ) -> Optional[Dict[str, Any]]:
         """
         Generate signal based on 13 Layers of confluence (SMC + Breakouts + RSI + Volume + Sweep).
@@ -15461,6 +15800,21 @@ class SignalGenerator:
                 reasons.append("EMA_BEAR+5")
         
         # =====================================================================
+        # PHASE FIB: FIBONACCI ZONE CONFLUENCE (Layer 23, max +12)
+        # Price in Fibonacci retracement zone → score bonus
+        # =====================================================================
+        if FIB_ENABLED and FIB_SCORE_ENABLED and fib_context:
+            fib_bonus = fib_context.get('fib_score_bonus', 0)
+            if fib_bonus > 0:
+                score += fib_bonus
+                fib_level = fib_context.get('fib_level', '?')
+                fib_conf = fib_context.get('confluence', [])
+                conf_str = '+' + '+'.join(fib_conf) if fib_conf else ''
+                reasons.append(f"Fib({fib_level},+{fib_bonus}{conf_str})")
+            elif fib_context.get('skip_reason'):
+                reasons.append(f"FibSkip({fib_context['skip_reason']})")
+        
+        # =====================================================================
         # PHASE 137: ADX + HURST REGIME DETECTION
         # SADECE BONUS - VETO YOK (Phase 133/134/135'teki hatayı önlemek için)
         # =====================================================================
@@ -15766,13 +16120,38 @@ class SignalGenerator:
             logger.info(f"⚡ MOMENTUM ENTRY: {symbol} {signal_side} — pullback {original_pullback*100:.1f}%→0% | ADX={adx:.1f} H={hurst:.2f} trend={coin_daily_trend}")
         
         if signal_side == "LONG":
-            ideal_entry = price * (1 - pullback_pct)
+            atr_entry = price * (1 - pullback_pct)
+        else:
+            atr_entry = price * (1 + pullback_pct)
+        
+        # =====================================================================
+        # PHASE FIB: FIBONACCI ENTRY BLEND
+        # Blend ATR-based entry with Fibonacci entry (alpha=0.35)
+        # strong_momentum → bypass (market entry), fib kapalı
+        # deviation > 1% → fallback to ATR entry
+        # =====================================================================
+        ideal_entry = atr_entry  # Default: ATR-based entry
+        fib_blend_applied = False
+        
+        if not strong_momentum and FIB_ENABLED and FIB_ENTRY_ENABLED and fib_context:
+            fib_entry = fib_context.get('fib_entry', 0)
+            if fib_entry > 0 and fib_context.get('fib_active'):
+                dev_pct = abs(fib_entry - atr_entry) / price * 100 if price > 0 else 999
+                if dev_pct <= FIB_MAX_ENTRY_DEV_PCT:
+                    alpha = FIB_BLEND_ALPHA
+                    ideal_entry = atr_entry * (1 - alpha) + fib_entry * alpha
+                    fib_blend_applied = True
+                    reasons.append(f"FibBlend(a={alpha})")
+                    logger.info(f"📐 FIB ENTRY: {symbol} {signal_side} atr_entry={atr_entry:.6f} fib_entry={fib_entry:.6f} → blend={ideal_entry:.6f} (dev={dev_pct:.2f}%)")
+                else:
+                    reasons.append(f"FibSkip(too_far,{dev_pct:.1f}%)")
+        
+        if signal_side == "LONG":
             sl = ideal_entry - (atr * atr_sl) - spread_buffer
             tp = ideal_entry + (atr * atr_tp)
             trail_activation = ideal_entry + trail_act
             trail_dist = atr * trail_mult
         else:
-            ideal_entry = price * (1 + pullback_pct)
             sl = ideal_entry + (atr * atr_sl) + spread_buffer
             tp = ideal_entry - (atr * atr_tp)
             trail_activation = ideal_entry - trail_act
@@ -15847,7 +16226,14 @@ class SignalGenerator:
             'adx': adx,
             'hurst': hurst,
             'spreadPct': spread_pct,  # Phase 228: Real bid-ask spread for dynamic trail
-            'volatility_pct': atr_pct * 100  # Phase 228: Volatility for dynamic trail
+            'volatility_pct': atr_pct * 100,  # Phase 228: Volatility for dynamic trail
+            # Phase FIB: Fibonacci telemetry
+            'fibActive': fib_context.get('fib_active', False) if fib_context else False,
+            'fibLevel': fib_context.get('fib_level') if fib_context else None,
+            'fibBonus': fib_context.get('fib_score_bonus', 0) if fib_context else 0,
+            'fibEntry': fib_context.get('fib_entry', 0) if fib_context else 0,
+            'atrEntry': atr_entry,
+            'fibBlendAlpha': FIB_BLEND_ALPHA if fib_blend_applied else 0,
         }
 
 
@@ -20409,6 +20795,32 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                         vol_osc = metrics.get('vol_osc', 0)
                         breakout = streamer.pivot_analyzer.check_breakout(price, open_price, vol_osc)
                         
+                        # Phase FIB: Update MTF BEFORE generate_signal (so OHLCV cache is fresh)
+                        ws_fib_context = None
+                        if FIB_ENABLED:
+                            try:
+                                await mtf_confirmation.update_coin_trend(active_symbol, streamer.exchange)
+                                # Build fib_context from cached MTF data
+                                trend_data = mtf_confirmation.coin_trends.get(active_symbol, {})
+                                if trend_data:
+                                    # Determine signal_side from z-score direction
+                                    # P2 fix: use direction, not hardcoded ±1.0 threshold
+                                    z = metrics.get('zScore', 0)
+                                    pre_side = 'LONG' if z < 0 else ('SHORT' if z > 0 else None)
+                                    if pre_side:
+                                        # P3 fix: get adx from trend_data (adx_4h), not metrics (has no adx)
+                                        ws_adx = trend_data.get('adx_4h', 25)
+                                        ws_fib_context = build_fib_context(
+                                            signal_side=pre_side,
+                                            price=price,
+                                            atr=metrics['atr'],
+                                            adx=ws_adx,
+                                            hurst=metrics['hurst'],
+                                            trend_data=trend_data
+                                        )
+                            except Exception as fib_err:
+                                logger.debug(f"FIB context error: {fib_err}")
+                        
                         signal = streamer.signal_generator.generate_signal(
                             hurst=metrics['hurst'],
                             zscore=metrics['zScore'],
@@ -20424,7 +20836,8 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             breakout=breakout, # NEW: Phase 11 Breakout
                             spread_pct=metrics.get('spreadPct', 0.05), # Phase 13
                             volatility_ratio=metrics.get('volatilityRatio', 1.0), # Phase 13
-                            coin_profile=streamer.coin_profile  # Phase 28: Dynamic optimization
+                            coin_profile=streamer.coin_profile,  # Phase 28: Dynamic optimization
+                            fib_context=ws_fib_context  # Phase FIB: Fibonacci context
                         )
                         
                         # =====================================================
@@ -20443,6 +20856,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             signal['volume24h'] = ticker.get('quoteVolume', 0)
                             
                             # Update MTF trends using real OHLCV data (Cloud Scanner parity)
+                            # NOTE: If FIB_ENABLED, this was already called above — cache TTL prevents re-fetch
                             try:
                                 await mtf_confirmation.update_coin_trend(active_symbol, streamer.exchange)
                             except Exception as mtf_update_err:
