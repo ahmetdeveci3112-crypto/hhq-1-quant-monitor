@@ -340,7 +340,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     <tbody>
                         {activeSignals.length === 0 ? (
                             <tr>
-                                <td colSpan={14} className="py-16 text-center text-slate-600">
+                                <td colSpan={13} className="py-16 text-center text-slate-600">
                                     <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
                                     <p>No active signals</p>
                                 </td>
