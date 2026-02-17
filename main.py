@@ -21,7 +21,7 @@ import os
 import time
 import websockets
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 import ccxt.async_support as ccxt_async
