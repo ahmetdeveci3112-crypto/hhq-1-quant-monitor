@@ -4372,6 +4372,21 @@ FIB_ENTRY_ENABLED = True         # Entry blend layer — ACTIVE
 FIB_MAX_ENTRY_DEV_PCT = 1.0      # Max deviation between fib_entry and atr_entry (%)
 FIB_BLEND_ALPHA = 0.35           # Blend weight (0=pure ATR, 1=pure fib)
 
+# ============================================================================
+# ENTRY QUALITY GATE — Feature Flags
+# Phase EQG: Filter out low-volume, weak-momentum entries
+# ============================================================================
+
+ENTRY_QUALITY_GATE_ENABLED = True
+ENTRY_QUALITY_MODE = 'hard'      # 'soft' = score -15 | 'hard' = reject
+EQ_MIN_VOLUME_RATIO = 1.25      # Koşul A: min volume ratio
+EQ_MIN_IMBALANCE = 4.0          # Koşul B: min OB imbalance
+EQ_MIN_OB_TREND = 2.0           # Koşul B: min ob_imbalance_trend
+EQ_MIN_VOLUME_24H = 1_500_000   # Koşul C: min 24h volume ($)
+EQ_MAX_SPREAD = 0.20            # Koşul C: max spread (%)
+EQ_MIN_DEPTH_USD = 120_000      # Execution: min total depth ($)
+EQ_OBI_OPPOSE_VETO = 0.35       # Execution: OBI opposing veto threshold
+
 # Fibonacci ratios
 FIB_RATIOS = {
     '0.236': 0.236,
@@ -9453,15 +9468,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     try:
         obi_value = await obi_detector.get_obi(symbol)
         
-        # Phase 212: Thin Order Book Guard — min bid+ask depth $50K
+        # Phase 212: Thin Order Book Guard — min bid+ask depth (Phase EQG: $50K → $120K)
         try:
             depth_data = obi_detector.obi_cache.get(symbol, {})
             total_depth = depth_data.get('total_bid_usd', 0) + depth_data.get('total_ask_usd', 0)
-            if 0 < total_depth < 50000:  # Only if data exists and is too thin
+            if 0 < total_depth < EQ_MIN_DEPTH_USD:  # Phase EQG: Dynamic threshold
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                logger.info(f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < $50K → BLOCKED")
+                logger.info(f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${EQ_MIN_DEPTH_USD/1000:.0f}K → BLOCKED")
                 return
         except Exception:
             pass  # depth data may not always be available
@@ -9482,12 +9497,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 is_aligned = True
         
         if is_opposing:
-            if abs(obi_value) > 0.6:
+            if abs(obi_value) > EQ_OBI_OPPOSE_VETO:  # Phase EQG: 0.6 → 0.35
                 # Strong opposing pressure → VETO
                 signal_log_data['reject_reason'] = f'OBI_VETO:opposing_{obi_value:.3f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} | Strong opposing pressure → BLOCKED")
+                logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} > {EQ_OBI_OPPOSE_VETO} | Opposing pressure → BLOCKED")
                 return
             else:
                 # Moderate opposing pressure → Soft penalty (-15)
@@ -9499,8 +9514,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal_log_data['obi_value'] = round(obi_value, 4)
             logger.info(f"📊 OBI_CONFIRM: {action} {symbol} | OBI={obi_value:+.3f} | Order book aligned ✅")
         else:
-            # Phase 212: Neutral OBI değerini de kaydet (0.0 ile "hesaplanmadı" ayrımı için)
+            # Phase EQG: Neutral OBI + düşük hacim ise reject
             signal_log_data['obi_value'] = round(obi_value, 4)
+            vol_ratio_val = signal.get('volumeRatio', 1.0)
+            if abs(obi_value) < 0.12 and vol_ratio_val < 1.2:
+                signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
+                return
             logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
         
     except Exception as obi_err:
@@ -15912,6 +15933,57 @@ class SignalGenerator:
         logger.info(f"✅ SCORE_PASS: {symbol} {signal_side} score={score} >= min={min_score_required}")
         
         # =====================================================================
+        # PHASE EQG: ENTRY QUALITY GATE
+        # 3 koşuldan en az 2'si geçmeli, yoksa low-quality entry
+        # A: Volume (volume_ratio >= 1.25 VEYA is_volume_spike)
+        # B: OB Direction (imbalance/ob_trend sinyalle uyumlu)
+        # C: Liquidity (24h vol >= $1.5M VE spread <= 0.20%)
+        # =====================================================================
+        eq_pass_count = 0
+        eq_reasons = []
+        entry_quality_pass = True  # Default: pass
+        
+        if ENTRY_QUALITY_GATE_ENABLED:
+            # Koşul A: Volume başlangıcı
+            cond_a = volume_ratio >= EQ_MIN_VOLUME_RATIO or is_volume_spike
+            if cond_a:
+                eq_pass_count += 1
+                eq_reasons.append(f"A:Vol({volume_ratio:.1f}x)")
+            
+            # Koşul B: OB yön baskısı
+            cond_b = False
+            if signal_side == "LONG":
+                cond_b = imbalance >= EQ_MIN_IMBALANCE or ob_imbalance_trend >= EQ_MIN_OB_TREND
+            elif signal_side == "SHORT":
+                cond_b = imbalance <= -EQ_MIN_IMBALANCE or ob_imbalance_trend <= -EQ_MIN_OB_TREND
+            if cond_b:
+                eq_pass_count += 1
+                eq_reasons.append(f"B:OB(imb={imbalance:.0f},tr={ob_imbalance_trend:.1f})")
+            
+            # Koşul C: Likidite yeterli
+            cond_c = volume_24h >= EQ_MIN_VOLUME_24H and spread_pct <= EQ_MAX_SPREAD
+            if cond_c:
+                eq_pass_count += 1
+                eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
+            
+            # Gate kararı: en az 2/3 geçmeli
+            if eq_pass_count < 2:
+                entry_quality_pass = False
+                fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
+                
+                if ENTRY_QUALITY_MODE == 'hard':
+                    logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.1f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
+                    return None
+                else:  # soft mode
+                    score -= 15
+                    reasons.append(fail_detail)
+                    logger.info(f"⚠️ {fail_detail}: {symbol} {signal_side} score-=15 → {score}")
+            else:
+                reasons.append(f"EQ_PASS({eq_pass_count}/3)")
+                if eq_pass_count == 3:
+                    reasons.append("EQ_STRONG")
+        
+        # =====================================================================
         # AŞAMA 2: KONFİRMASYON FİLTRELERİ (Skor Vermez, Sadece Kontrol Eder)
         # Coin istatistiklerine göre dinamik eşikler kullanılır
         # =====================================================================
@@ -15940,18 +16012,19 @@ class SignalGenerator:
         # Z-Score zaten fiyat sapmasını ölçüyor - RSI gereksiz.
         # ===================================================================
         
-        # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123)
-        # Phase 128: Lowered from $1M to $500K to allow more mid-cap signals
-        min_volume = 500_000  # $500K min 24h volume
+        # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123 + Phase EQG)
+        # Phase EQG: 24h volume threshold artık EQ_MIN_VOLUME_24H ile kontrol ediliyor
+        # Ama ek güvenlik olarak çok düşük hacim kontrolü kalıyor
+        min_volume = 500_000  # $500K min 24h volume (hard floor)
         
         if volume_24h < min_volume:
             confirmation_passed = False
             confirmation_fails.append(f"LOW_LIQ(24h_Vol=${volume_24h/1_000_000:.1f}M < $0.5M)")
-            
-        # Eski kod:
-        # if volume_ratio < vol_threshold:
-        #     confirmation_passed = False
-        #     confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
+        
+        # Phase EQG: Volume ratio kontrolü tekrar aktif
+        if volume_ratio < vol_threshold:
+            confirmation_passed = False
+            confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
         
         # Konfirmasyon 3: Hurst Regime Kontrolü (SADECE UYARI - VETO DEĞİL)
         if hurst > 0.65:
@@ -16100,6 +16173,16 @@ class SignalGenerator:
         pullback_pct = min(0.10, pullback_pct)
         
         # =====================================================================
+        # PHASE EQG: STRONG QUALITY PULLBACK REDUCTION
+        # 3/3 kalite koşulu geçtiyse → daha erken giriş (trend başlangıcını yakala)
+        # strong_momentum zaten pullback=0 yapıyor, onu override etme
+        # =====================================================================
+        if ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3 and not strong_momentum:
+            original_pb = pullback_pct
+            pullback_pct *= 0.75
+            reasons.append(f"EQ_EARLY(pb {original_pb*100:.1f}%→{pullback_pct*100:.1f}%)")
+        
+        # =====================================================================
         # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
         # ADX > 30 (güçlü trend) + Hurst > 0.55 (trending rejim) + 
         # Coin daily trend aligned → Direkt market entry, pullback yok
@@ -16234,6 +16317,13 @@ class SignalGenerator:
             'fibEntry': fib_context.get('fib_entry', 0) if fib_context else 0,
             'atrEntry': atr_entry,
             'fibBlendAlpha': FIB_BLEND_ALPHA if fib_blend_applied else 0,
+            # Phase EQG: Entry Quality telemetry
+            'volumeRatio': round(volume_ratio, 2),
+            'isVolumeSpike': is_volume_spike,
+            'imbalancePct': round(imbalance, 1),
+            'obImbalanceTrend': round(ob_imbalance_trend, 1),
+            'entryQualityPass': entry_quality_pass,
+            'entryQualityReasons': eq_reasons,
         }
 
 
