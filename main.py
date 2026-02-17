@@ -16173,16 +16173,6 @@ class SignalGenerator:
         pullback_pct = min(0.10, pullback_pct)
         
         # =====================================================================
-        # PHASE EQG: STRONG QUALITY PULLBACK REDUCTION
-        # 3/3 kalite koşulu geçtiyse → daha erken giriş (trend başlangıcını yakala)
-        # strong_momentum zaten pullback=0 yapıyor, onu override etme
-        # =====================================================================
-        if ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3 and not strong_momentum:
-            original_pb = pullback_pct
-            pullback_pct *= 0.75
-            reasons.append(f"EQ_EARLY(pb {original_pb*100:.1f}%→{pullback_pct*100:.1f}%)")
-        
-        # =====================================================================
         # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
         # ADX > 30 (güçlü trend) + Hurst > 0.55 (trending rejim) + 
         # Coin daily trend aligned → Direkt market entry, pullback yok
@@ -16201,6 +16191,12 @@ class SignalGenerator:
             pullback_pct = 0.0  # Market entry — no pullback
             reasons.append(f"⚡ MOMENTUM_ENTRY(ADX={adx:.0f},H={hurst:.2f})")
             logger.info(f"⚡ MOMENTUM ENTRY: {symbol} {signal_side} — pullback {original_pullback*100:.1f}%→0% | ADX={adx:.1f} H={hurst:.2f} trend={coin_daily_trend}")
+        elif ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3:
+            # PHASE EQG: STRONG QUALITY PULLBACK REDUCTION
+            # 3/3 kalite koşulu geçtiyse → daha erken giriş (trend başlangıcını yakala)
+            original_pb = pullback_pct
+            pullback_pct *= 0.75
+            reasons.append(f"EQ_EARLY(pb {original_pb*100:.1f}%→{pullback_pct*100:.1f}%)")
         
         if signal_side == "LONG":
             atr_entry = price * (1 - pullback_pct)
@@ -16211,21 +16207,23 @@ class SignalGenerator:
         # PHASE FIB: FIBONACCI ENTRY BLEND
         # Blend ATR-based entry with Fibonacci entry (alpha=0.35)
         # strong_momentum → bypass (market entry), fib kapalı
-        # deviation > 1% → fallback to ATR entry
+        # deviation > max_dev → fallback to ATR entry
+        # Phase EQG: EQ_STRONG durumunda Fib deviation limiti genişletilir (1.0% → 1.5%)
         # =====================================================================
         ideal_entry = atr_entry  # Default: ATR-based entry
         fib_blend_applied = False
+        max_dev = 1.5 if (ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3) else FIB_MAX_ENTRY_DEV_PCT
         
         if not strong_momentum and FIB_ENABLED and FIB_ENTRY_ENABLED and fib_context:
             fib_entry = fib_context.get('fib_entry', 0)
             if fib_entry > 0 and fib_context.get('fib_active'):
                 dev_pct = abs(fib_entry - atr_entry) / price * 100 if price > 0 else 999
-                if dev_pct <= FIB_MAX_ENTRY_DEV_PCT:
+                if dev_pct <= max_dev:
                     alpha = FIB_BLEND_ALPHA
                     ideal_entry = atr_entry * (1 - alpha) + fib_entry * alpha
                     fib_blend_applied = True
                     reasons.append(f"FibBlend(a={alpha})")
-                    logger.info(f"📐 FIB ENTRY: {symbol} {signal_side} atr_entry={atr_entry:.6f} fib_entry={fib_entry:.6f} → blend={ideal_entry:.6f} (dev={dev_pct:.2f}%)")
+                    logger.info(f"📐 FIB ENTRY: {symbol} {signal_side} atr_entry={atr_entry:.6f} fib_entry={fib_entry:.6f} → blend={ideal_entry:.6f} (dev={dev_pct:.2f}% max={max_dev:.1f}%)")
                 else:
                     reasons.append(f"FibSkip(too_far,{dev_pct:.1f}%)")
         
