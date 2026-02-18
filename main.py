@@ -20499,17 +20499,18 @@ async def get_performance_summary():
 async def scanner_start():
     """Start the background scanner."""
     global background_scanner_task
-    
-    if multi_coin_scanner.running:
+
+    task_alive = background_scanner_task is not None and not background_scanner_task.done()
+
+    # Heal stale state: running flag true but task is dead
+    if multi_coin_scanner.running and task_alive:
         return JSONResponse({"success": True, "running": True, "message": "Scanner already running"})
-    
-    # Start scanner
+
     multi_coin_scanner.running = True
-    
-    # Restart background task if needed
-    if background_scanner_task is None or background_scanner_task.done():
+    if not task_alive:
         background_scanner_task = asyncio.create_task(background_scanner_loop())
-    
+        logger.warning("🔁 Scanner task auto-restarted via /scanner/start (stale running state healed)")
+
     logger.info("🚀 Scanner started via API")
     return JSONResponse({"success": True, "running": True, "message": "Scanner started"})
 
@@ -20523,10 +20524,29 @@ async def scanner_stop():
 @app.get("/scanner/status")
 async def scanner_status():
     """Get scanner running status."""
+    global background_scanner_task
+    task_alive = background_scanner_task is not None and not background_scanner_task.done()
+
+    # Self-heal: if scanner marked running but task died, restart automatically.
+    auto_restarted = False
+    if multi_coin_scanner.running and not task_alive:
+        background_scanner_task = asyncio.create_task(background_scanner_loop())
+        task_alive = True
+        auto_restarted = True
+        logger.warning("🔁 Scanner task auto-restarted via /scanner/status (detected dead task)")
+
+    cache_age = 0
+    if ui_state_cache.last_update > 0:
+        cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update))
+
     return JSONResponse({
         "running": multi_coin_scanner.running,
         "totalCoins": len(multi_coin_scanner.coins),
-        "analyzedCoins": len(multi_coin_scanner.analyzers)
+        "analyzedCoins": len(multi_coin_scanner.analyzers),
+        "taskAlive": task_alive,
+        "cacheInitialized": ui_state_cache._initialized,
+        "cacheAgeSec": cache_age,
+        "autoRestarted": auto_restarted
     })
 
 # Phase 17: Settings endpoints
@@ -20958,8 +20978,15 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     - No Binance API rate limit impact from UI connections
     - All clients see consistent data
     """
+    global background_scanner_task
     await websocket.accept()
     logger.info("🚀 Phase 98: Scanner WebSocket connected - using cache")
+
+    # Auto-heal on client connect: running=true but scanner task is dead.
+    task_alive = background_scanner_task is not None and not background_scanner_task.done()
+    if multi_coin_scanner.running and not task_alive:
+        background_scanner_task = asyncio.create_task(background_scanner_loop())
+        logger.warning("🔁 Scanner task auto-restarted via /ws/scanner connect")
     
     full_state_interval = 2.0  # Full payload (opportunities + portfolio) cadence
     fast_tick_interval = 0.35  # Fast price ticks for active signals/positions
