@@ -8665,7 +8665,10 @@ async def background_scanner_loop():
                             roi_pct = price_move_pct * leverage
                             
                             # Dynamic thresholds from market conditions
-                            pos_atr_pct = pos.get('volatility_pct', 2.0)
+                            pos_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+                            if not pos_atr_pct and entry_price > 0:
+                                pos_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
+                            pos_atr_pct = pos_atr_pct or 2.0
                             pos_spread = pos.get('spreadPct', 0.05)
                             pos_vol_ratio = pos.get('volumeRatio', 1.0)
                             min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
@@ -9094,7 +9097,10 @@ async def on_position_price_update(symbol: str, ticker: dict):
             ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
         ws_roi_pct = ws_price_move_pct * ws_leverage
         
-        ws_atr_pct = pos.get('volatility_pct', 2.0)
+        ws_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+        if not ws_atr_pct and entry_price > 0:
+            ws_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
+        ws_atr_pct = ws_atr_pct or 2.0
         ws_spread = pos.get('spreadPct', 0.05)
         ws_vol_ratio = pos.get('volumeRatio', 1.0)
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
@@ -9366,7 +9372,10 @@ async def position_price_update_loop():
                             fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                         fast_roi = fast_price_move * fast_leverage
                         
-                        fast_atr_pct = pos.get('volatility_pct', 2.0)
+                        fast_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+                        if not fast_atr_pct and entry_price > 0:
+                            fast_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
+                        fast_atr_pct = fast_atr_pct or 2.0
                         fast_spread = pos.get('spreadPct', 0.05)
                         fast_vol_ratio = pos.get('volumeRatio', 1.0)
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
@@ -17290,6 +17299,10 @@ class PaperTradingEngine:
             # Dynamic trail params (per-coin)
             "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
             "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr,
+            # Dynamic trail activation threshold data
+            "volatility_pct": (atr / price * 100) if price > 0 else 2.0,
+            "spreadPct": signal.get('spreadPct', 0.05) if signal else 0.05,
+            "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
             # Phase 202: Trend Mode flag
             "trend_mode": is_trend_mode,
             # Phase 155: AI Optimizer settings snapshot
@@ -17671,6 +17684,10 @@ class PaperTradingEngine:
             "decision_trace": [],
             # Phase 224D3: CanaryMode flag propagated from pending order
             "is_canary": order.get('is_canary', False),
+            # Dynamic trail activation threshold data (propagated from pending order)
+            "volatility_pct": order.get('volatility_pct', (order.get('atr', fill_price * 0.02) / fill_price * 100) if fill_price > 0 else 2.0),
+            "spreadPct": order.get('spreadPct', 0.05),
+            "volumeRatio": order.get('volumeRatio', 1.0),
         }
         
         # =====================================================================
