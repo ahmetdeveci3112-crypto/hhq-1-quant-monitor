@@ -17703,8 +17703,8 @@ class PaperTradingEngine:
         elif force_market and live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
             # Force market: bypass spread/drift guards, send direct market order
             try:
-                logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (no spread/drift check)...")
-                result = await live_binance_trader.place_limit_entry_order(
+                logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (MARKET, no spread/drift check)...")
+                result = await live_binance_trader.place_market_order(
                     symbol=symbol,
                     side=side,
                     size_usd=order['sizeUsd'],
@@ -18270,6 +18270,8 @@ class PaperTradingEngine:
         }
         # Phase 32: Clear old logs on reset
         self.logs = []
+        # Clear pending orders
+        self.pending_orders = []
         # Reset pipeline metrics
         for key in self.pipeline_metrics:
             self.pipeline_metrics[key] = 0
