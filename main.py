@@ -5168,6 +5168,33 @@ def get_dynamic_trail_activation_threshold(
     return min_price_move, min_roi
 
 
+def update_runtime_trail_telemetry(
+    pos: dict,
+    dynamic_trail_distance: float,
+    effective_exit_tightness: float,
+    min_price_move_pct: float,
+    min_roi_pct: float,
+    threshold_mult: float,
+    entry_price: float
+):
+    """
+    Persist runtime trail/exit telemetry on the position for UI observability.
+    """
+    try:
+        safe_entry = float(entry_price or 0)
+        safe_distance = float(dynamic_trail_distance or 0)
+        distance_pct = (safe_distance / safe_entry * 100.0) if safe_entry > 0 else 0.0
+        pos['effectiveExitTightness'] = round(float(effective_exit_tightness or 1.0), 3)
+        pos['runtimeTrailDistance'] = round(safe_distance, 8)
+        pos['runtimeTrailDistancePct'] = round(distance_pct, 4)
+        pos['runtimeTrailActivationMovePct'] = round(float(min_price_move_pct or 0), 3)
+        pos['runtimeTrailActivationRoiPct'] = round(float(min_roi_pct or 0), 2)
+        pos['runtimeTrailThresholdMult'] = round(float(threshold_mult or 1.0), 3)
+        pos['runtimeTrailLastUpdateTs'] = int(datetime.now().timestamp() * 1000)
+    except Exception:
+        pass
+
+
 def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: float) -> bool:
     """
     Phase 217: Unified trail-based Emergency SL check — single source of truth.
@@ -8313,6 +8340,13 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
                         merged['trailActivation'] = paper_pos.get('trailActivation', 0)
                         merged['atr'] = paper_pos.get('atr', 0)
+                        merged['effectiveExitTightness'] = paper_pos.get('effectiveExitTightness', global_paper_trader.exit_tightness)
+                        merged['runtimeTrailDistance'] = paper_pos.get('runtimeTrailDistance', paper_pos.get('trailDistance', 0))
+                        merged['runtimeTrailDistancePct'] = paper_pos.get('runtimeTrailDistancePct', 0.0)
+                        merged['runtimeTrailActivationMovePct'] = paper_pos.get('runtimeTrailActivationMovePct', 0.0)
+                        merged['runtimeTrailActivationRoiPct'] = paper_pos.get('runtimeTrailActivationRoiPct', 0.0)
+                        merged['runtimeTrailThresholdMult'] = paper_pos.get('runtimeTrailThresholdMult', 1.0)
+                        merged['runtimeTrailLastUpdateTs'] = paper_pos.get('runtimeTrailLastUpdateTs', 0)
                         # Phase 231k: Use paper_pos openTime (original entry) — not Binance updateTime
                         if paper_pos.get('openTime', 0) > 0:
                             merged['openTime'] = paper_pos['openTime']
@@ -8346,6 +8380,13 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['trailingStop'] = merged['stopLoss']
                         merged['isTrailingActive'] = False
                         merged['atr'] = atr
+                        merged['effectiveExitTightness'] = getattr(global_paper_trader, 'exit_tightness', 1.0)
+                        merged['runtimeTrailDistance'] = merged.get('trailDistance', 0)
+                        merged['runtimeTrailDistancePct'] = round((merged.get('trailDistance', 0) / entry * 100), 4) if entry > 0 else 0.0
+                        merged['runtimeTrailActivationMovePct'] = 0.0
+                        merged['runtimeTrailActivationRoiPct'] = 0.0
+                        merged['runtimeTrailThresholdMult'] = 1.0
+                        merged['runtimeTrailLastUpdateTs'] = int(datetime.now().timestamp() * 1000)
                     
                     merged_positions.append(merged)
                 
@@ -9022,6 +9063,15 @@ async def background_scanner_loop():
                             min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
                                 pos_atr_pct, pos_spread, pos_vol_ratio, leverage, threshold_mult=threshold_mult
                             )
+                            update_runtime_trail_telemetry(
+                                pos=pos,
+                                dynamic_trail_distance=dynamic_trail_distance,
+                                effective_exit_tightness=effective_et,
+                                min_price_move_pct=min_price_move_for_trail,
+                                min_roi_pct=min_roi_for_trail,
+                                threshold_mult=threshold_mult,
+                                entry_price=entry_price,
+                            )
                             
                             # Phase 231h: Fee buffer for breakeven (0.1% = taker fee both sides)
                             be_long = entry_price * 1.001
@@ -9456,6 +9506,15 @@ async def on_position_price_update(symbol: str, ticker: dict):
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
             ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage, threshold_mult=threshold_mult
         )
+        update_runtime_trail_telemetry(
+            pos=pos,
+            dynamic_trail_distance=dynamic_trail_distance,
+            effective_exit_tightness=effective_et,
+            min_price_move_pct=ws_min_price_move,
+            min_roi_pct=ws_min_roi,
+            threshold_mult=threshold_mult,
+            entry_price=entry_price,
+        )
         
         # Phase 231h: Fee buffer for breakeven
         be_long = entry_price * 1.001
@@ -9719,6 +9778,15 @@ async def position_price_update_loop():
                         threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
                             fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage, threshold_mult=threshold_mult
+                        )
+                        update_runtime_trail_telemetry(
+                            pos=pos,
+                            dynamic_trail_distance=dynamic_trail_distance,
+                            effective_exit_tightness=effective_et,
+                            min_price_move_pct=fast_min_price_move,
+                            min_roi_pct=fast_min_roi,
+                            threshold_mult=threshold_mult,
+                            entry_price=entry_price,
                         )
                         
                         # Phase 231h: Fee buffer for breakeven
@@ -18254,6 +18322,14 @@ class PaperTradingEngine:
             "volatility_pct": order.get('volatility_pct', (order.get('atr', fill_price * 0.02) / fill_price * 100) if fill_price > 0 else 2.0),
             "spreadPct": order.get('spreadPct', 0.05),
             "volumeRatio": order.get('volumeRatio', 1.0),
+            # Runtime trail telemetry (updated every tick)
+            "effectiveExitTightness": self.exit_tightness,
+            "runtimeTrailDistance": trail_distance,
+            "runtimeTrailDistancePct": round((trail_distance / fill_price * 100), 4) if fill_price > 0 else 0.0,
+            "runtimeTrailActivationMovePct": 0.0,
+            "runtimeTrailActivationRoiPct": 0.0,
+            "runtimeTrailThresholdMult": 1.0,
+            "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
         }
         
         # =====================================================================
@@ -19122,6 +19198,14 @@ class PaperTradingEngine:
             "mae_price": current_price,
             "mfe_price": current_price,
             "decision_trace": [],
+            # Runtime trail telemetry (updated every tick)
+            "effectiveExitTightness": self.exit_tightness,
+            "runtimeTrailDistance": signal.get('trailDistance', 0),
+            "runtimeTrailDistancePct": round((signal.get('trailDistance', 0) / current_price * 100), 4) if current_price > 0 else 0.0,
+            "runtimeTrailActivationMovePct": 0.0,
+            "runtimeTrailActivationRoiPct": 0.0,
+            "runtimeTrailThresholdMult": 1.0,
+            "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
         }
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -21424,6 +21508,14 @@ async def paper_trading_market_order(request: Request):
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
             "fc_max_profit_pct": 0.0,
+            # Runtime trail telemetry (updated every tick)
+            "effectiveExitTightness": global_paper_trader.exit_tightness,
+            "runtimeTrailDistance": atr * global_paper_trader.trail_distance_atr,
+            "runtimeTrailDistancePct": round((atr * global_paper_trader.trail_distance_atr / price * 100), 4) if price > 0 else 0.0,
+            "runtimeTrailActivationMovePct": 0.0,
+            "runtimeTrailActivationRoiPct": 0.0,
+            "runtimeTrailThresholdMult": 1.0,
+            "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
         }
         
         global_paper_trader.positions.append(position)

@@ -73,6 +73,14 @@ export interface Position {
   openTime: number;
   tp1Hit?: boolean;
   sl1Hit?: boolean;
+  // Runtime trail telemetry from backend (updated on each price loop)
+  effectiveExitTightness?: number;
+  runtimeTrailDistance?: number;
+  runtimeTrailDistancePct?: number;
+  runtimeTrailActivationMovePct?: number;
+  runtimeTrailActivationRoiPct?: number;
+  runtimeTrailThresholdMult?: number;
+  runtimeTrailLastUpdateTs?: number;
 }
 
 // Phase 139+232: Comprehensive close reason type matching all backend reasons

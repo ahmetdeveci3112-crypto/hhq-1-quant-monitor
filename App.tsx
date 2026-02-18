@@ -1393,6 +1393,17 @@ export default function App() {
                     const sl = (pos as any).stopLoss || 0;
                     const trailingStop = (pos as any).trailingStop || sl;
                     const isTrailingActive = (pos as any).isTrailingActive || false;
+                    const runtimeTrailDistancePctRaw = Number(
+                      (pos as any).runtimeTrailDistancePct ??
+                      (((pos as any).trailDistance || 0) / (pos.entryPrice || 1)) * 100
+                    );
+                    const runtimeTrailDistancePct = Number.isFinite(runtimeTrailDistancePctRaw) ? runtimeTrailDistancePctRaw : 0;
+                    const runtimeTrailMovePctRaw = Number((pos as any).runtimeTrailActivationMovePct ?? 0);
+                    const runtimeTrailMovePct = Number.isFinite(runtimeTrailMovePctRaw) ? runtimeTrailMovePctRaw : 0;
+                    const runtimeTrailRoiPctRaw = Number((pos as any).runtimeTrailActivationRoiPct ?? 0);
+                    const runtimeTrailRoiPct = Number.isFinite(runtimeTrailRoiPctRaw) ? runtimeTrailRoiPctRaw : 0;
+                    const effectiveExitTightnessRaw = Number((pos as any).effectiveExitTightness ?? settings.exitTightness ?? 1.0);
+                    const effectiveExitTightness = Number.isFinite(effectiveExitTightnessRaw) ? effectiveExitTightnessRaw : 1.0;
                     const tpRoi = tp > 0 && pos.entryPrice > 0
                       ? isLong
                         ? ((tp - pos.entryPrice) / pos.entryPrice) * 100 * (pos.leverage || 10)
@@ -1419,6 +1430,13 @@ export default function App() {
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
                           <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
                           <div><span className="text-rose-400">SL: ${formatPrice(isTrailingActive ? trailingStop : sl)}</span></div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
+                          <div className="text-cyan-400">Takip Mesafe: {runtimeTrailDistancePct.toFixed(2)}%</div>
+                          <div className="text-slate-400">Çıkış Çarpanı: x{effectiveExitTightness.toFixed(2)}</div>
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-1">
+                          Aktivasyon: {runtimeTrailMovePct.toFixed(2)}% / ROI {runtimeTrailRoiPct.toFixed(1)}%
                         </div>
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -1486,6 +1504,17 @@ export default function App() {
                         const sl = (pos as any).stopLoss || 0;
                         const trailingStop = (pos as any).trailingStop || sl;
                         const isTrailingActive = (pos as any).isTrailingActive || false;
+                        const runtimeTrailDistancePctRaw = Number(
+                          (pos as any).runtimeTrailDistancePct ??
+                          (((pos as any).trailDistance || 0) / (pos.entryPrice || 1)) * 100
+                        );
+                        const runtimeTrailDistancePct = Number.isFinite(runtimeTrailDistancePctRaw) ? runtimeTrailDistancePctRaw : 0;
+                        const runtimeTrailMovePctRaw = Number((pos as any).runtimeTrailActivationMovePct ?? 0);
+                        const runtimeTrailMovePct = Number.isFinite(runtimeTrailMovePctRaw) ? runtimeTrailMovePctRaw : 0;
+                        const runtimeTrailRoiPctRaw = Number((pos as any).runtimeTrailActivationRoiPct ?? 0);
+                        const runtimeTrailRoiPct = Number.isFinite(runtimeTrailRoiPctRaw) ? runtimeTrailRoiPctRaw : 0;
+                        const effectiveExitTightnessRaw = Number((pos as any).effectiveExitTightness ?? settings.exitTightness ?? 1.0);
+                        const effectiveExitTightness = Number.isFinite(effectiveExitTightnessRaw) ? effectiveExitTightnessRaw : 1.0;
 
                         // TP'ye ulaşınca elde edilecek ROI (kaldıraç dahil)
                         const leverage = pos.leverage || 10;
@@ -1527,11 +1556,16 @@ export default function App() {
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
-                              {isTrailingActive ? (
-                                <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">AÇIK</span>
-                              ) : (
-                                <span className="text-[10px] bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">KAPALI</span>
-                              )}
+                              <div className="text-[10px] space-y-0.5">
+                                {isTrailingActive ? (
+                                  <span className="inline-block bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">AÇIK</span>
+                                ) : (
+                                  <span className="inline-block bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">KAPALI</span>
+                                )}
+                                <div className="font-mono text-cyan-400">Mesafe {runtimeTrailDistancePct.toFixed(2)}%</div>
+                                <div className="font-mono text-slate-400">Akt: {runtimeTrailMovePct.toFixed(2)}% / {runtimeTrailRoiPct.toFixed(1)}%</div>
+                                <div className="font-mono text-slate-500">Çıkış x{effectiveExitTightness.toFixed(2)}</div>
+                              </div>
                             </td>
                             <td className="py-3 px-2 text-center">
                               {(() => {

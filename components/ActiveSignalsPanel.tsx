@@ -103,6 +103,21 @@ const getDynamicTrailEntryThreshold = (
     return { minMove, minRoi };
 };
 
+const getLiveEntryThresholdMult = (
+    entryTightness: number,
+    spreadPct: number,
+    volumeRatio: number
+): number => {
+    const tightness = Math.max(0.5, Math.min(15.0, Number.isFinite(entryTightness) ? entryTightness : 1.0));
+    const tightnessMult = Math.sqrt(tightness);
+    const safeSpread = Number.isFinite(spreadPct) ? spreadPct : 0.05;
+    const safeVolumeRatio = Number.isFinite(volumeRatio) ? volumeRatio : 1.0;
+    const spreadAdj = 1.0 + Math.max(0, safeSpread - 0.08) * 2.0;
+    const volAdj = safeVolumeRatio < 1.0 ? 1.12 : safeVolumeRatio > 2.0 ? 0.92 : 1.0;
+    const liveMult = tightnessMult * spreadAdj * volAdj;
+    return Math.max(0.7, Math.min(2.6, liveMult));
+};
+
 // Quality badge component
 const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     const badges: React.ReactNode[] = [];
@@ -234,6 +249,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = getEntryPrice(signal, entryTightness);
+        const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
+        const spreadPct = typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05;
+        const volumeRatio = signal.volumeRatio || 1.0;
+        const liveThresholdMult = getLiveEntryThresholdMult(entryTightness, spreadPct, volumeRatio);
+        const liveTrail = getDynamicTrailEntryThreshold(atrPct, spreadPct, volumeRatio, leverage, liveThresholdMult);
         const isLoading = loadingSymbol === signal.symbol;
         const priceFlash = priceFlashMap[signal.symbol];
 
@@ -289,6 +309,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
                         <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(2)}%</span>
+                        <span
+                            className="text-cyan-400"
+                            title={`Anlık trail giriş eşiği: hareket ${liveTrail.minMove.toFixed(2)}% | ROI ${liveTrail.minRoi.toFixed(1)}% | giriş çarpanı ${entryTightness.toFixed(1)}x`}
+                        >
+                            Trail:{liveTrail.minMove.toFixed(2)}%
+                        </span>
                         <span className="flex items-center gap-1 text-slate-500">
                             <Clock className="w-2.5 h-2.5" />{formatTime(signal.lastSignalTime)}
                         </span>
@@ -403,19 +429,25 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const leverage = signal.leverage || spreadInfo.leverage;
                                 const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const fallbackTrail = getDynamicTrailEntryThreshold(
+                                const spreadPct = typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05;
+                                const volumeRatio = signal.volumeRatio || 1.0;
+                                const liveThresholdMult = getLiveEntryThresholdMult(entryTightness, spreadPct, volumeRatio);
+                                const liveTrail = getDynamicTrailEntryThreshold(
                                     atrPct,
-                                    typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05,
-                                    signal.volumeRatio || 1.0,
+                                    spreadPct,
+                                    volumeRatio,
                                     leverage,
-                                    signal.entryThresholdMult || 1.0
+                                    liveThresholdMult
                                 );
-                                const trailEntryPct = (signal.trailEntryMinMovePct && signal.trailEntryMinMovePct > 0)
-                                    ? signal.trailEntryMinMovePct
-                                    : fallbackTrail.minMove;
-                                const trailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0)
-                                    ? signal.trailEntryMinRoiPct
-                                    : fallbackTrail.minRoi;
+                                const trailEntryPct = liveTrail.minMove;
+                                const trailEntryRoi = liveTrail.minRoi;
+                                const snapshotTrailEntryPct = (signal.trailEntryMinMovePct && signal.trailEntryMinMovePct > 0) ? signal.trailEntryMinMovePct : 0;
+                                const snapshotTrailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0) ? signal.trailEntryMinRoiPct : 0;
+                                const snapshotThresholdMult = signal.entryThresholdMult || 1.0;
+                                const hasSnapshotTrail = snapshotTrailEntryPct > 0;
+                                const trailTitle = hasSnapshotTrail
+                                    ? `Anlık trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}% | canlı çarpan ${liveThresholdMult.toFixed(2)}x | Sinyal anı: ${snapshotTrailEntryPct.toFixed(2)}% / ${snapshotTrailEntryRoi.toFixed(1)}% (çarpan ${snapshotThresholdMult.toFixed(2)}x)`
+                                    : `Anlık trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}% | canlı çarpan ${liveThresholdMult.toFixed(2)}x`;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -468,10 +500,18 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     </span>
                                                     <span
                                                         className="text-[10px] font-mono font-semibold text-cyan-400"
-                                                        title={`Dinamik trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}%`}
+                                                        title={trailTitle}
                                                     >
                                                         {isLong ? '↑' : '↓'}{trailEntryPct.toFixed(2)}%
                                                     </span>
+                                                    <span className="text-[9px] font-mono text-slate-500">
+                                                        x{liveThresholdMult.toFixed(2)}
+                                                    </span>
+                                                    {hasSnapshotTrail ? (
+                                                        <span className="text-[9px] font-mono text-slate-600">
+                                                            an:{snapshotTrailEntryPct.toFixed(2)}%
+                                                        </span>
+                                                    ) : null}
                                                 </div>
                                             ) : (
                                                 <span className="text-[10px] font-mono text-slate-500">Piyasa</span>
