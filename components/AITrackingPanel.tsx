@@ -67,12 +67,12 @@ interface Props {
 
 const getRegimeStyle = (regime: string) => {
     switch (regime) {
-        case 'TRENDING_UP': return { color: 'text-emerald-400', bg: 'bg-emerald-500/20', icon: '🐂', label: 'BULL' };
-        case 'TRENDING_DOWN': return { color: 'text-rose-400', bg: 'bg-rose-500/20', icon: '🐻', label: 'BEAR' };
-        case 'TRENDING': return { color: 'text-blue-400', bg: 'bg-blue-500/20', icon: '📊', label: 'TRENDING' };
-        case 'VOLATILE': return { color: 'text-orange-400', bg: 'bg-orange-500/20', icon: '🔥', label: 'VOLATILE' };
-        case 'QUIET': return { color: 'text-sky-400', bg: 'bg-sky-500/20', icon: '😴', label: 'QUIET' };
-        default: return { color: 'text-amber-400', bg: 'bg-amber-500/20', icon: '↔️', label: 'RANGING' };
+        case 'TRENDING_UP': return { color: 'text-emerald-400', bg: 'bg-emerald-500/20', icon: '🐂', label: 'YÜKSELİŞ' };
+        case 'TRENDING_DOWN': return { color: 'text-rose-400', bg: 'bg-rose-500/20', icon: '🐻', label: 'DÜŞÜŞ' };
+        case 'TRENDING': return { color: 'text-blue-400', bg: 'bg-blue-500/20', icon: '📊', label: 'TREND' };
+        case 'VOLATILE': return { color: 'text-orange-400', bg: 'bg-orange-500/20', icon: '🔥', label: 'VOLATİL' };
+        case 'QUIET': return { color: 'text-sky-400', bg: 'bg-sky-500/20', icon: '😴', label: 'SAKİN' };
+        default: return { color: 'text-amber-400', bg: 'bg-amber-500/20', icon: '↔️', label: 'YATAY' };
     }
 };
 
@@ -147,25 +147,25 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             {/* BTC Trend Direction */}
                             {marketRegime.trendDirection && (
                                 <div className="text-center">
-                                    <div className="text-[10px] text-slate-500 uppercase">BTC Trend</div>
+                                    <div className="text-[10px] text-slate-500 uppercase">BTC Yönü</div>
                                     <div className={`text-sm font-bold ${marketRegime.trendDirection === 'UP' ? 'text-emerald-400' :
                                             marketRegime.trendDirection === 'DOWN' ? 'text-rose-400' : 'text-slate-400'
                                         }`}>
-                                        {marketRegime.trendDirection === 'UP' ? '▲ UP' :
-                                            marketRegime.trendDirection === 'DOWN' ? '▼ DOWN' : '— NEUTRAL'}
+                                        {marketRegime.trendDirection === 'UP' ? '▲ YUKARI' :
+                                            marketRegime.trendDirection === 'DOWN' ? '▼ AŞAĞI' : '— NÖTR'}
                                     </div>
                                 </div>
                             )}
                             {/* Regime Params */}
                             <div className="flex gap-3">
                                 <div className="text-center">
-                                    <div className="text-[10px] text-slate-500">Score</div>
+                                    <div className="text-[10px] text-slate-500">Skor</div>
                                     <div className={`text-sm font-bold ${(marketRegime.params?.min_score_adjustment || 0) > 0 ? 'text-rose-400' : (marketRegime.params?.min_score_adjustment || 0) < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
                                         {(marketRegime.params?.min_score_adjustment || 0) > 0 ? '+' : ''}{marketRegime.params?.min_score_adjustment || 0}
                                     </div>
                                 </div>
                                 <div className="text-center">
-                                    <div className="text-[10px] text-slate-500">Trail</div>
+                                    <div className="text-[10px] text-slate-500">Takip</div>
                                     <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.trail_distance_mult?.toFixed(1) || '1.0'}</div>
                                 </div>
                                 <div className="text-center">
@@ -203,14 +203,14 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                 </h3>
                 {safeTracking.length === 0 ? (
                     <div className="text-center py-6 text-slate-500">
-                        Takipte trade yok
+                        Takipte işlem yok
                     </div>
                 ) : (
                     <div className="overflow-x-auto">
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="text-slate-400 text-xs">
-                                    <th className="text-left py-2">Coin</th>
+                                    <th className="text-left py-2">Varlık</th>
                                     <th className="text-left py-2">Yön</th>
                                     <th className="text-right py-2">Çıkış</th>
                                     <th className="text-right py-2">Max/Min</th>
@@ -256,7 +256,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="text-slate-400 text-xs">
-                                    <th className="text-left py-2">Coin</th>
+                                    <th className="text-left py-2">Varlık</th>
                                     <th className="text-left py-2">Yön</th>
                                     <th className="text-right py-2">PnL</th>
                                     <th className="text-right py-2">Kaçırılan</th>

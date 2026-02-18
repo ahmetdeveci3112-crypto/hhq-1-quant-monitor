@@ -9,6 +9,45 @@ interface Props {
     onClosePosition: (id: string, reason?: string) => void;
 }
 
+const normalizeSpreadLevel = (level: string): string => {
+    switch (level) {
+        case 'Very Low':
+        case 'Çok Düşük':
+            return 'VERY_LOW';
+        case 'Low':
+        case 'Düşük':
+            return 'LOW';
+        case 'Normal':
+            return 'NORMAL';
+        case 'High':
+        case 'Yüksek':
+            return 'HIGH';
+        case 'Very High':
+        case 'Çok Yüksek':
+            return 'VERY_HIGH';
+        case 'Extreme':
+        case 'Aşırı':
+            return 'EXTREME';
+        case 'Ultra':
+            return 'ULTRA';
+        default:
+            return 'UNKNOWN';
+    }
+};
+
+const getSpreadLevelLabel = (level: string): string => {
+    switch (normalizeSpreadLevel(level)) {
+        case 'VERY_LOW': return 'Çok Düşük';
+        case 'LOW': return 'Düşük';
+        case 'NORMAL': return 'Orta';
+        case 'HIGH': return 'Yüksek';
+        case 'VERY_HIGH': return 'Çok Yüksek';
+        case 'EXTREME': return 'Aşırı';
+        case 'ULTRA': return 'Aşırı+';
+        default: return level || 'Bilinmiyor';
+    }
+};
+
 export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClosePosition }) => {
     if (!position) return null;
 
@@ -110,17 +149,22 @@ export const PositionPanel: React.FC<Props> = ({ position, currentPrice, onClose
                     {(position as any).leverage && (
                         <span className="text-indigo-400 font-bold">{(position as any).leverage}x</span>
                     )}
-                    {(position as any).spreadLevel && (
-                        <span className={`px-1 rounded text-[8px] ${(position as any).spreadLevel === 'Very Low' ? 'bg-emerald-500/20 text-emerald-400' :
-                                (position as any).spreadLevel === 'Low' ? 'bg-emerald-500/10 text-emerald-300' :
-                                    (position as any).spreadLevel === 'Normal' ? 'bg-amber-500/10 text-amber-400' :
-                                        (position as any).spreadLevel === 'High' ? 'bg-orange-500/10 text-orange-400' :
-                                            (position as any).spreadLevel === 'Very High' ? 'bg-red-500/10 text-red-400' :
-                                                (position as any).spreadLevel === 'Extreme' ? 'bg-red-500/20 text-red-500' :
-                                                    (position as any).spreadLevel === 'Ultra' ? 'bg-fuchsia-500/20 text-fuchsia-400' :
-                                                        'bg-slate-500/10 text-slate-400'
-                            }`}>{(position as any).spreadLevel}</span>
-                    )}
+                    {(position as any).spreadLevel && (() => {
+                        const level = normalizeSpreadLevel((position as any).spreadLevel);
+                        const cls = level === 'VERY_LOW' ? 'bg-emerald-500/20 text-emerald-400' :
+                            level === 'LOW' ? 'bg-emerald-500/10 text-emerald-300' :
+                                level === 'NORMAL' ? 'bg-amber-500/10 text-amber-400' :
+                                    level === 'HIGH' ? 'bg-orange-500/10 text-orange-400' :
+                                        level === 'VERY_HIGH' ? 'bg-red-500/10 text-red-400' :
+                                            level === 'EXTREME' ? 'bg-red-500/20 text-red-500' :
+                                                level === 'ULTRA' ? 'bg-fuchsia-500/20 text-fuchsia-400' :
+                                                    'bg-slate-500/10 text-slate-400';
+                        return (
+                            <span className={`px-1 rounded text-[8px] ${cls}`}>
+                                {getSpreadLevelLabel((position as any).spreadLevel)}
+                            </span>
+                        );
+                    })()}
                 </div>
             </div>
         </div>

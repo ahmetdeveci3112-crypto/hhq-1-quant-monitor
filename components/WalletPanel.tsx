@@ -13,7 +13,7 @@ interface WalletPanelProps {
 }
 
 const formatCurrency = (value: number): string => {
-    return new Intl.NumberFormat('en-US', {
+    return new Intl.NumberFormat('tr-TR', {
         style: 'decimal',
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
@@ -55,7 +55,7 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
             {/* Header */}
             <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                    <h3 className="text-sm font-medium text-slate-400">Margin Balance</h3>
+                    <h3 className="text-sm font-medium text-slate-400">Marjin Bakiye</h3>
                     <Eye className="w-4 h-4 text-slate-600 cursor-pointer hover:text-slate-400" />
                 </div>
                 <div className="flex items-center gap-2 text-slate-500">
@@ -76,10 +76,10 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
                 </div>
             </div>
 
-            {/* Today's Realized PnL */}
+            {/* Bugünkü Gerçekleşen K/Z */}
             <div className="mb-4">
                 <div className="flex items-center gap-2">
-                    <span className="text-sm text-slate-400">Today's Realized PNL</span>
+                    <span className="text-sm text-slate-400">Bugünkü Gerçekleşen K/Z</span>
                     <span className={`text-sm font-medium ${realizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {realizedPnl >= 0 ? '+' : ''}{formatCurrency(realizedPnl)} ({realizedPnlPercent >= 0 ? '+' : ''}{realizedPnlPercent.toFixed(2)}%)
                     </span>
@@ -89,12 +89,12 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
             {/* Wallet Balance & Unrealized PnL Row */}
             <div className="grid grid-cols-2 gap-4 mb-4">
                 <div>
-                    <div className="text-xs text-slate-500 mb-1">Wallet Balance (USDT)</div>
+                    <div className="text-xs text-slate-500 mb-1">Cüzdan Bakiye (USDT)</div>
                     <div className="text-base font-bold text-white font-mono">{formatCurrency(walletBalanceCalc)}</div>
                     <div className="text-[10px] text-slate-600">≈ ${formatCurrency(walletBalanceCalc)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-slate-500 mb-1">Unrealized PNL (USDT)</div>
+                    <div className="text-xs text-slate-500 mb-1">Gerçekleşmemiş K/Z (USDT)</div>
                     <div className={`text-base font-bold font-mono ${unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {unrealizedPnl >= 0 ? '+' : ''}{formatCurrency(unrealizedPnl)}
                     </div>
@@ -105,11 +105,11 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
             {/* Available & Used Margin */}
             <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-800">
                 <div>
-                    <div className="text-xs text-slate-500 mb-1">Available Balance</div>
+                    <div className="text-xs text-slate-500 mb-1">Kullanılabilir Bakiye</div>
                     <div className="text-sm font-bold text-cyan-400 font-mono">{formatCurrency(availableBalance)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-slate-500 mb-1">Used Margin</div>
+                    <div className="text-xs text-slate-500 mb-1">Kullanılan Marjin</div>
                     <div className="text-sm font-bold text-amber-400 font-mono">{formatCurrency(usedMargin)}</div>
                 </div>
             </div>
@@ -151,9 +151,9 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
                         }}
                     />
                     <span className="font-bold text-white">{position.symbol}</span>
-                    <span className="text-xs text-slate-500">Perp</span>
+                        <span className="text-xs text-slate-500">Vadeli</span>
                     <span className={`text-xs px-1.5 py-0.5 rounded ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
-                        Cross {position.leverage || 10}X
+                        Çapraz {position.leverage || 10}X
                     </span>
                 </div>
                 <button
@@ -183,15 +183,15 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
             {/* Size, Margin, Margin Ratio */}
             <div className="grid grid-cols-3 gap-3 mb-3">
                 <div>
-                    <div className="text-[10px] text-slate-500">Size ({symbol})</div>
+                    <div className="text-[10px] text-slate-500">Miktar ({symbol})</div>
                     <div className="text-xs font-mono text-white">{sizeCoins.toFixed(4)}</div>
                 </div>
                 <div>
-                    <div className="text-[10px] text-slate-500">Margin (USDT)</div>
+                    <div className="text-[10px] text-slate-500">Marjin (USDT)</div>
                     <div className="text-xs font-mono text-white">{margin.toFixed(2)}</div>
                 </div>
                 <div className="text-right">
-                    <div className="text-[10px] text-slate-500">Margin Ratio</div>
+                    <div className="text-[10px] text-slate-500">Marjin Oranı</div>
                     <div className="text-xs font-mono text-white">
                         {((margin / (position.sizeUsd || 1)) * 100).toFixed(2)}%
                     </div>
@@ -201,11 +201,11 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
             {/* Entry, Mark, Liq Price */}
             <div className="grid grid-cols-3 gap-3 pt-3 border-t border-slate-800">
                 <div>
-                    <div className="text-[10px] text-slate-500">Entry Price</div>
+                    <div className="text-[10px] text-slate-500">Giriş Fiyatı</div>
                     <div className="text-xs font-mono text-white">{position.entryPrice.toFixed(6)}</div>
                 </div>
                 <div>
-                    <div className="text-[10px] text-slate-500">Mark Price</div>
+                    <div className="text-[10px] text-slate-500">Anlık Fiyat</div>
                     <div className="text-xs font-mono text-white">{currentPrice.toFixed(6)}</div>
                 </div>
                 <div className="text-right">

@@ -39,7 +39,7 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
             <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                     <DollarSign className="w-4 h-4 text-slate-400" />
-                    <h3 className="font-semibold text-slate-300 text-sm">Paper Trading P&L</h3>
+                    <h3 className="font-semibold text-slate-300 text-sm">Sanal İşlem K/Z</h3>
                 </div>
                 <div className={`flex items-center gap-1 text-sm font-mono font-bold ${isProfit ? 'text-emerald-400' : 'text-red-400'}`}>
                     {isProfit ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
@@ -51,7 +51,7 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
             <div className="grid grid-cols-4 gap-2 p-3 border-b border-slate-800/50">
                 <div className="text-center">
                     <div className="text-[10px] text-slate-500 uppercase">Bakiye</div>
-                    <div className="text-sm font-mono font-bold text-white">${currentBalance.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}</div>
+                    <div className="text-sm font-mono font-bold text-white">${currentBalance.toLocaleString('tr-TR', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}</div>
                 </div>
                 <div className="text-center">
                     <div className="text-[10px] text-slate-500 uppercase">P&L</div>
@@ -60,13 +60,13 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
                     </div>
                 </div>
                 <div className="text-center">
-                    <div className="text-[10px] text-slate-500 uppercase">Win Rate</div>
+                    <div className="text-[10px] text-slate-500 uppercase">Kazanma Oranı</div>
                     <div className={`text-sm font-mono font-bold ${safeStats.winRate >= 50 ? 'text-emerald-400' : 'text-amber-400'}`}>
                         {safeStats.winRate.toFixed(1)}%
                     </div>
                 </div>
                 <div className="text-center">
-                    <div className="text-[10px] text-slate-500 uppercase">Trades</div>
+                    <div className="text-[10px] text-slate-500 uppercase">İşlem</div>
                     <div className="text-sm font-mono font-bold text-white">{safeStats.totalTrades}</div>
                 </div>
             </div>
@@ -125,7 +125,7 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
             {/* Extended Stats */}
             <div className="grid grid-cols-3 gap-2 p-3 border-t border-slate-800/50 bg-slate-900/50">
                 <div className="text-center">
-                    <div className="text-[9px] text-slate-500 uppercase">Profit Factor</div>
+                    <div className="text-[9px] text-slate-500 uppercase">Kâr Faktörü</div>
                     <div className={`text-xs font-mono font-bold ${safeStats.profitFactor >= 1.5 ? 'text-emerald-400' : safeStats.profitFactor >= 1 ? 'text-amber-400' : 'text-red-400'}`}>
                         {safeStats.profitFactor.toFixed(2)}
                     </div>
@@ -137,7 +137,7 @@ export const PnLPanel: React.FC<Props> = ({ equityCurve, stats, currentBalance, 
                     </div>
                 </div>
                 <div className="text-center">
-                    <div className="text-[9px] text-slate-500 uppercase">Avg Win/Loss</div>
+                    <div className="text-[9px] text-slate-500 uppercase">Ort. Kâr/Zarar</div>
                     <div className="text-xs font-mono font-bold text-white">
                         ${safeStats.avgWin.toFixed(0)} / ${safeStats.avgLoss.toFixed(0)}
                     </div>

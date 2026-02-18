@@ -94,8 +94,8 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             <div className="bg-fuchsia-900/30 border border-fuchsia-500/50 rounded-lg p-3 flex items-center gap-2">
               <Bot className="w-5 h-5 text-fuchsia-400" />
               <div>
-                <div className="text-sm font-medium text-fuchsia-300">AI Optimizer Aktif</div>
-                <p className="text-xs text-fuchsia-400/80">Ayarlar AI tarafından yönetiliyor. Değiştirmek için önce AI'ı kapatın.</p>
+                <div className="text-sm font-medium text-fuchsia-300">YZ Optimize Edici Aktif</div>
+                <p className="text-xs text-fuchsia-400/80">Ayarlar yapay zeka tarafından yönetiliyor. Değiştirmek için önce optimize ediciyi kapatın.</p>
               </div>
             </div>
           )}
@@ -147,7 +147,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-500 mb-3">
-                  🎯 Sinyal üretimi için gerekli minimum skor. AI Optimizer kapalıyken bu değer sabit kalır.
+                  🎯 Sinyal üretimi için gerekli minimum skor. YZ optimize edici kapalıyken bu değer sabit kalır.
                 </p>
                 <input
                   type="range"
@@ -173,7 +173,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-500 mb-3">
-                  🤖 AI Optimizer AÇIK iken: Sistem son 10 trade performansına göre bu aralıkta otomatik skor belirler
+                  🤖 YZ optimize edici AÇIK iken: Sistem son 10 işlem performansına göre bu aralıkta otomatik skor belirler
                 </p>
                 <div className="space-y-3">
                   <div>
@@ -209,7 +209,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </div>
                 <div className="flex justify-between text-[10px] text-slate-400 mt-2 bg-slate-900/50 p-2 rounded">
                   <span>⚔️ Kazanırken: {localSettings.minScoreLow || 50}</span>
-                  <span>⚖️ Normal: orta</span>
+                  <span>⚖️ Dengeli: orta</span>
                   <span>🛡️ Kaybederken: {localSettings.minScoreHigh || 70}</span>
                 </div>
               </div>
@@ -294,7 +294,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
           <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <ShieldAlert className="w-4 h-4" />
-              Kill Switch (Pozisyon Koruma)
+              Acil Durdurma (Pozisyon Koruma)
             </h3>
 
             <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 space-y-4">
@@ -406,7 +406,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-slate-300 mb-1">Stop Loss (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Zarar Durdur (ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -422,7 +422,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               </div>
 
               <div>
-                <label className="block text-xs text-slate-300 mb-1">Take Profit (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Kâr Al (ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
@@ -475,7 +475,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             <div>
               <h3 className="text-sm font-semibold text-fuchsia-400 uppercase tracking-wider mb-4 flex items-center gap-2">
                 <Bot className="w-4 h-4" />
-                5. AI Optimizer
+                5. Yapay Zeka Optimizatörü
               </h3>
 
               <div className="space-y-4">
@@ -483,7 +483,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
                   <div className="flex items-center justify-between">
                     <div>
-                      <div className="text-sm font-medium text-white">Auto-Optimize</div>
+                      <div className="text-sm font-medium text-white">Otomatik Optimize</div>
                       <p className="text-xs text-slate-400 mt-1">Sistem ayarlarını otomatik optimize et</p>
                     </div>
                     <button
@@ -502,7 +502,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-center">
                     <div className="text-xs text-slate-400">Takip Edilen</div>
                     <div className="text-xl font-bold text-fuchsia-400">{optimizerStats.trackingCount}</div>
-                    <div className="text-[10px] text-slate-500">trade</div>
+                    <div className="text-[10px] text-slate-500">işlem</div>
                   </div>
                   <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-center">
                     <div className="text-xs text-slate-400">Erken Çıkış</div>
@@ -598,7 +598,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                     <div>
                       <div className="flex justify-between text-[10px] mb-1">
-                        <span className="text-slate-400">⏸️ Bekleme Süresi (Cooldown)</span>
+                        <span className="text-slate-400">⏸️ Bekleme Süresi</span>
                         <span className="font-mono text-orange-400 font-bold">{phase193Status.stoploss_guard.cooldown_minutes || 30} dakika</span>
                       </div>
                       <p className="text-[9px] text-slate-600 mb-1">Kilitlenmeden sonra piyasanın sakinleşmesi için beklenen süre. Süre sonunda otomatik açılır.</p>
@@ -634,7 +634,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-500 mb-3">
-                    🧠 Geçmiş trade verilerinden öğrenerek her sinyale güven skoru verir. Düşük kaliteli sinyalleri filtreler.
+                    🧠 Geçmiş işlem verilerinden öğrenerek her sinyale güven skoru verir. Düşük kaliteli sinyalleri filtreler.
                   </p>
                   <div className="grid grid-cols-3 gap-2 mb-3">
                     <div className="bg-slate-900/50 rounded p-2 text-center">
@@ -654,7 +654,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     <div className="bg-slate-900/50 rounded p-2 text-center">
                       <div className="text-[10px] text-slate-500">Eğitim Verisi</div>
                       <div className="text-sm font-bold text-slate-300">{phase193Status.freqai.training_samples || 0}</div>
-                      <div className="text-[8px] text-slate-600">trade sayısı</div>
+                      <div className="text-[8px] text-slate-600">işlem sayısı</div>
                     </div>
                   </div>
                   <button
@@ -663,7 +663,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   >
                     🧠 Modeli Yeniden Eğit
                   </button>
-                  <p className="text-[9px] text-slate-600 mt-1 text-center">Son trade verilerini kullanarak ML modelini günceller (min. 50 trade gerekli)</p>
+                  <p className="text-[9px] text-slate-600 mt-1 text-center">Son işlem verilerini kullanarak ML modelini günceller (en az 50 işlem gerekli)</p>
                 </div>
 
                 {/* Hyperopt */}
@@ -679,7 +679,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-500 mb-3">
-                    🔬 Optuna ile Z-Score, SL/TP, entry/exit gibi parametreleri otomatik optimize eder. En iyi kombinasyonu bulur.
+                    🔬 Optuna ile Z-Skoru, SL/TP, giriş/çıkış gibi parametreleri otomatik optimize eder. En iyi kombinasyonu bulur.
                   </p>
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div className="bg-slate-900/50 rounded p-2 text-center">

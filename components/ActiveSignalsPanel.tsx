@@ -11,7 +11,7 @@ interface ActiveSignalsPanelProps {
 }
 
 const formatPrice = (price: number): string => {
-    if (price >= 1000) return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (price >= 1000) return price.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (price >= 1) return price.toFixed(4);
     if (price >= 0.0001) return price.toFixed(6);
     return price.toFixed(8);
@@ -28,13 +28,13 @@ const getSpreadInfo = (spreadPct: number, entryTightness: number = 1.0): { level
     let leverage: number;
     let level: string;
 
-    if (spreadPct < 0.02) { level = 'Very Low'; basePullback = 0.3; leverage = 15; }
-    else if (spreadPct < 0.05) { level = 'Low'; basePullback = 0.6; leverage = 10; }
-    else if (spreadPct < 0.15) { level = 'Normal'; basePullback = 1.0; leverage = 7; }
-    else if (spreadPct < 0.40) { level = 'High'; basePullback = 1.5; leverage = 5; }
-    else if (spreadPct < 0.80) { level = 'Very High'; basePullback = 2.0; leverage = 3; }
-    else if (spreadPct < 1.50) { level = 'Extreme'; basePullback = 3.0; leverage = 3; }
-    else { level = 'Ultra'; basePullback = 4.0; leverage = 3; }
+    if (spreadPct < 0.02) { level = 'Çok Düşük'; basePullback = 0.3; leverage = 15; }
+    else if (spreadPct < 0.05) { level = 'Düşük'; basePullback = 0.6; leverage = 10; }
+    else if (spreadPct < 0.15) { level = 'Orta'; basePullback = 1.0; leverage = 7; }
+    else if (spreadPct < 0.40) { level = 'Yüksek'; basePullback = 1.5; leverage = 5; }
+    else if (spreadPct < 0.80) { level = 'Çok Yüksek'; basePullback = 2.0; leverage = 3; }
+    else if (spreadPct < 1.50) { level = 'Aşırı'; basePullback = 3.0; leverage = 3; }
+    else { level = 'Aşırı+'; basePullback = 4.0; leverage = 3; }
 
     const adjustedPullback = basePullback * entryTightness;
     return { level, pullback: adjustedPullback, leverage };
@@ -50,7 +50,7 @@ const getSpreadInfoFromSignal = (
     const hasReal = signal.hasRealSpread === true;
     if (!hasReal || typeof signal.spreadPct !== 'number') {
         return {
-            level: 'Pending',
+            level: 'Bekliyor',
             pullback: 0.6 * entryTightness,
             leverage: signal.leverage || 10
         };
@@ -81,9 +81,11 @@ const getDynamicTrailEntryThreshold = (
     atrPct: number,
     spreadPct: number,
     volumeRatio: number,
-    leverage: number
+    leverage: number,
+    thresholdMult: number = 1.0
 ): { minMove: number; minRoi: number } => {
     // Keep UI formula aligned with backend get_dynamic_trail_activation_threshold()
+    const safeThresholdMult = Math.max(0.6, Math.min(3.0, thresholdMult || 1.0));
     const baseMove = Math.max(0.5, Math.min(2.0, atrPct * 0.40));
     const safeSpread = Number.isFinite(spreadPct) ? spreadPct : 0.05;
     const spreadFactor = 1.0 + Math.max(0, safeSpread - 0.05) * 3.0;
@@ -92,11 +94,11 @@ const getDynamicTrailEntryThreshold = (
     if (volumeRatio >= 2.0) volFactor = 0.85;
     else if (volumeRatio < 1.0) volFactor = 1.25;
 
-    let minMove = baseMove * spreadFactor * volFactor;
-    minMove = Math.max(0.4, Math.min(2.5, minMove));
+    let minMove = baseMove * spreadFactor * volFactor * safeThresholdMult;
+    minMove = Math.max(0.4, Math.min(3.5, minMove));
 
     let minRoi = minMove * Math.max(1, leverage);
-    minRoi = Math.max(4.0, Math.min(20.0, minRoi));
+    minRoi = Math.max(4.0, Math.min(28.0, minRoi));
 
     return { minMove, minRoi };
 };
@@ -111,7 +113,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
         const isStrong = count >= 3;
         badges.push(
             <span key="eq" className={`text-[9px] px-1 py-0.5 rounded font-bold ${isStrong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
-                title={`Entry Quality: ${signal.entryQualityReasons?.join(', ') || 'passed'}`}>
+                title={`Giriş Kalitesi: ${signal.entryQualityReasons?.join(', ') || 'geçti'}`}>
                 EQ{isStrong ? '★' : ''}{count}/3
             </span>
         );
@@ -131,14 +133,14 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     if (signal.isVolumeSpike) {
         badges.push(
             <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
-                title={`Volume Ratio: ${signal.volumeRatio || 0}x`}>
+                title={`Hacim Oranı: ${signal.volumeRatio || 0}x`}>
                 🔥VOL
             </span>
         );
     } else if ((signal.volumeRatio || 0) >= 1.25) {
         badges.push(
             <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/10 text-amber-500/60"
-                title={`Volume Ratio: ${signal.volumeRatio}x`}>
+                title={`Hacim Oranı: ${signal.volumeRatio}x`}>
                 Vol{signal.volumeRatio}x
             </span>
         );
@@ -151,9 +153,9 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
             <span
                 key="rej"
                 className="text-[9px] px-1 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                title={`Execution Reject: ${signal.executionRejectReason}`}
+                title={`İşleme Alınmadı: ${signal.executionRejectReason}`}
             >
-                REJ:{rejectKey}
+                RET:{rejectKey}
             </span>
         );
     }
@@ -298,7 +300,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold ${isLong ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'
                                 } ${isLoading ? 'opacity-50' : ''}`}
                         >
-                            {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Market</>}
+                            {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
                         </button>
                     )}
                 </div>
@@ -313,7 +315,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <div className="flex items-center gap-3">
                     <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                         <Zap className="w-4 h-4 text-amber-500" />
-                        Active Signals
+                        Aktif Sinyaller
                     </h3>
                     <span className="text-xs text-slate-500">{activeSignals.length}</span>
                 </div>
@@ -334,9 +336,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <Filter className="w-3 h-3 text-slate-500 flex-shrink-0" />
                 {([
                     { key: 'all' as QualityFilter, label: 'Tüm', count: allSignals.length },
-                    { key: 'eq_pass' as QualityFilter, label: 'EQ Pass', count: eqCount },
+                    { key: 'eq_pass' as QualityFilter, label: 'EQ Geçti', count: eqCount },
                     { key: 'fib_active' as QualityFilter, label: 'Fib Aktif', count: fibCount },
-                    { key: 'vol_spike' as QualityFilter, label: 'Vol Spike', count: volCount },
+                    { key: 'vol_spike' as QualityFilter, label: 'Hacim Sıçraması', count: volCount },
                 ]).map(f => (
                     <button
                         key={f.key}
@@ -356,7 +358,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 {activeSignals.length === 0 ? (
                     <div className="text-center py-8 text-slate-600">
                         <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                        <p>No active signals</p>
+                        <p>Aktif sinyal yok</p>
                     </div>
                 ) : (
                     activeSignals.map(signal => <SignalCard key={signal.symbol} signal={signal} />)
@@ -368,19 +370,19 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <table className="w-full text-sm">
                     <thead>
                         <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
-                            <SortHeader label="Symbol" sortKeyName="symbol" />
-                            <SortHeader label="Side" sortKeyName="side" />
-                            <th className="py-3 px-3 font-medium text-right">Price</th>
-                            <th className="py-3 px-3 font-medium text-right">Entry</th>
-                            <SortHeader label="Score" sortKeyName="score" align="right" />
-                            <th className="py-3 px-2 font-medium text-center">Quality</th>
-                            <SortHeader label="Z-Score" sortKeyName="zScore" align="right" />
+                            <SortHeader label="Sembol" sortKeyName="symbol" />
+                            <SortHeader label="Yön" sortKeyName="side" />
+                            <th className="py-3 px-3 font-medium text-right">Fiyat</th>
+                            <th className="py-3 px-3 font-medium text-right">Giriş</th>
+                            <SortHeader label="Skor" sortKeyName="score" align="right" />
+                            <th className="py-3 px-2 font-medium text-center">Kalite</th>
+                            <SortHeader label="Z-Skor" sortKeyName="zScore" align="right" />
                             <SortHeader label="Hurst" sortKeyName="hurst" align="right" />
-                            <th className="py-3 px-3 font-medium text-center">Lev</th>
-                            <th className="py-3 px-3 font-medium text-center">Trail Entry</th>
-                            <th className="py-3 px-3 font-medium text-center">Spread</th>
-                            <th className="py-3 px-3 font-medium text-center">Time</th>
-                            <th className="py-3 px-3 font-medium text-right">Action</th>
+                            <th className="py-3 px-3 font-medium text-center">Kald.</th>
+                            <th className="py-3 px-3 font-medium text-center">Takip Girişi</th>
+                            <th className="py-3 px-3 font-medium text-center">Makas</th>
+                            <th className="py-3 px-3 font-medium text-center">Saat</th>
+                            <th className="py-3 px-3 font-medium text-right">İşlem</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -388,7 +390,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <tr>
                                 <td colSpan={13} className="py-16 text-center text-slate-600">
                                     <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                                    <p>No active signals</p>
+                                    <p>Aktif sinyal yok</p>
                                 </td>
                             </tr>
                         ) : (
@@ -401,12 +403,19 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const leverage = signal.leverage || spreadInfo.leverage;
                                 const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const { minMove: trailEntryPct, minRoi: trailEntryRoi } = getDynamicTrailEntryThreshold(
+                                const fallbackTrail = getDynamicTrailEntryThreshold(
                                     atrPct,
                                     typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05,
                                     signal.volumeRatio || 1.0,
-                                    leverage
+                                    leverage,
+                                    signal.entryThresholdMult || 1.0
                                 );
+                                const trailEntryPct = (signal.trailEntryMinMovePct && signal.trailEntryMinMovePct > 0)
+                                    ? signal.trailEntryMinMovePct
+                                    : fallbackTrail.minMove;
+                                const trailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0)
+                                    ? signal.trailEntryMinRoiPct
+                                    : fallbackTrail.minRoi;
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -459,13 +468,13 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     </span>
                                                     <span
                                                         className="text-[10px] font-mono font-semibold text-cyan-400"
-                                                        title={`Dynamic trail entry: min move ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}%`}
+                                                        title={`Dinamik trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}%`}
                                                     >
                                                         {isLong ? '↑' : '↓'}{trailEntryPct.toFixed(2)}%
                                                     </span>
                                                 </div>
                                             ) : (
-                                                <span className="text-[10px] font-mono text-slate-500">MKT</span>
+                                                <span className="text-[10px] font-mono text-slate-500">Piyasa</span>
                                             )}
                                         </td>
                                         <td className="py-2.5 px-3 text-center text-[10px] text-slate-500">{spreadInfo.level}</td>
@@ -482,7 +491,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold ${isLong ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'
                                                         } ${isLoading ? 'opacity-50' : ''}`}
                                                 >
-                                                    {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Market</>}
+                                                    {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
                                                 </button>
                                             )}
                                         </td>

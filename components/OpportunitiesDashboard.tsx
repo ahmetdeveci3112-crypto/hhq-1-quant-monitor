@@ -8,7 +8,7 @@ interface OpportunitiesDashboardProps {
 }
 
 const formatPrice = (price: number): string => {
-    if (price >= 1000) return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (price >= 1000) return price.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (price >= 1) return price.toFixed(4);
     if (price >= 0.0001) return price.toFixed(6);
     return price.toFixed(8);
@@ -88,14 +88,14 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                     ${formatPrice(coin.price)}
                 </div>
                 <div className={`text-xs font-medium ${coin.priceChange24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {coin.priceChange24h >= 0 ? '+' : ''}{coin.priceChange24h.toFixed(2)}% 24h
+                    {coin.priceChange24h >= 0 ? '+' : ''}{coin.priceChange24h.toFixed(2)}% 24s
                 </div>
             </div>
 
             {/* Metrics */}
             <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="flex items-center justify-between bg-slate-800/50 rounded px-2 py-1">
-                    <span className="text-slate-500">Z-Score</span>
+                    <span className="text-slate-500">Z-Skor</span>
                     <span className={`font-mono font-bold ${Math.abs(coin.zscore) > 1.5
                         ? coin.zscore > 0 ? 'text-rose-400' : 'text-emerald-400'
                         : 'text-slate-300'
@@ -138,7 +138,7 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                     {coin.entryQualityPass && (
                         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.entryQualityReasons?.length || 0) >= 3
                             ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
-                            title={`EQ: ${coin.entryQualityReasons?.join(', ') || 'pass'}`}>
+                            title={`EQ: ${coin.entryQualityReasons?.join(', ') || 'geçti'}`}>
                             EQ{(coin.entryQualityReasons?.length || 0)}/3
                         </span>
                     )}
@@ -150,23 +150,23 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                     )}
                     {coin.isVolumeSpike && (
                         <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
-                            title={`Volume: ${coin.volumeRatio}x`}>
+                            title={`Hacim: ${coin.volumeRatio}x`}>
                             🔥{coin.volumeRatio}x
                         </span>
                     )}
                     {(coin.obImbalanceTrend || 0) !== 0 && (
                         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.obImbalanceTrend || 0) > 0
                             ? 'bg-emerald-500/10 text-emerald-500/70' : 'bg-rose-500/10 text-rose-500/70'}`}
-                            title={`OB Trend: ${coin.obImbalanceTrend}`}>
+                            title={`Defter Trendi: ${coin.obImbalanceTrend}`}>
                             OB{(coin.obImbalanceTrend || 0) > 0 ? '↑' : '↓'}
                         </span>
                     )}
                     {coin.executionRejectReason && (
                         <span
                             className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                            title={`Execution Reject: ${coin.executionRejectReason}`}
+                            title={`İşleme Alınmadı: ${coin.executionRejectReason}`}
                         >
-                            REJ:{getRejectReasonKey(coin.executionRejectReason)}
+                            RET:{getRejectReasonKey(coin.executionRejectReason)}
                         </span>
                     )}
                 </div>
@@ -175,7 +175,7 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
             {/* Volume */}
             <div className="mt-2 text-xs text-slate-500 flex items-center gap-1">
                 <Activity className="w-3 h-3" />
-                Vol: ${formatVolume(coin.volume24h)}
+                Hacim: ${formatVolume(coin.volume24h)}
             </div>
         </div>
     );

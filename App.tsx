@@ -71,14 +71,14 @@ const getReasonTooltip = (trade: any): string => {
 
   // Common info
   lines.push(`📊 ${trade.side} @ ${leverage}x`);
-  lines.push(`Entry: $${entry.toFixed(6)}`);
-  lines.push(`Exit: $${exit.toFixed(6)}`);
-  lines.push(`Margin ROI: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
+  lines.push(`Giriş: $${entry.toFixed(6)}`);
+  lines.push(`Çıkış: $${exit.toFixed(6)}`);
+  lines.push(`Marjin ROI: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
 
   if (reason === 'SL' || reason === 'SL_HIT') {
     lines.push('');
     lines.push('━━━ STOP LOSS KRİTERİ ━━━');
-    lines.push(`Stop Level: $${sl.toFixed(6)}`);
+    lines.push(`Stop Seviyesi: $${sl.toFixed(6)}`);
     lines.push('Koşul: Fiyat SL seviyesini 3 kez üst üste geçti');
     if (isTrailing) {
       lines.push(`Trailing SL: $${trail.toFixed(6)}`);
@@ -92,7 +92,7 @@ const getReasonTooltip = (trade: any): string => {
   } else if (reason === 'TP' || reason === 'TP_HIT' || reason.includes('PROFIT')) {
     lines.push('');
     lines.push('━━━ TAKE PROFIT KRİTERİ ━━━');
-    lines.push(`TP Level: $${tp.toFixed(6)}`);
+    lines.push(`TP Seviyesi: $${tp.toFixed(6)}`);
     lines.push('Koşul: Fiyat TP hedefine ulaştı');
     if (atr > 0) {
       const tpDistance = Math.abs(tp - entry);
@@ -303,7 +303,7 @@ export default function App() {
   }, []);
 
   const handleKillSwitch = useCallback((actions: any) => {
-    addLog(`🚨 Kill Switch: Reduced=${actions.reduced?.length || 0}, Closed=${actions.closed?.length || 0}`);
+    addLog(`🚨 Acil Durdurma: Azaltılan=${actions.reduced?.length || 0}, Kapatılan=${actions.closed?.length || 0}`);
   }, [addLog]);
 
   const handleWsLog = useCallback((message: string) => {
@@ -470,7 +470,7 @@ export default function App() {
   // Phase 36: Market Order from Signal Card
   const handleMarketOrder = useCallback(async (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number = 10) => {
     try {
-      addLog(`🛒 Market Order: ${side} ${symbol} @ $${price.toFixed(4)} (${signalLeverage}x)`);
+      addLog(`🛒 Piyasa Emri: ${side} ${symbol} @ $${price.toFixed(4)} (${signalLeverage}x)`);
       const res = await fetch(`${BACKEND_API_URL}/paper-trading/market-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -478,12 +478,12 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        addLog(`✅ Market Order Başarılı: ${side} ${symbol} @ ${signalLeverage}x`);
+        addLog(`✅ Piyasa Emri Başarılı: ${side} ${symbol} @ ${signalLeverage}x`);
       } else {
-        addLog(`❌ Market Order Hata: ${data.error || 'Bilinmeyen hata'}`);
+        addLog(`❌ Piyasa Emri Hatası: ${data.error || 'Bilinmeyen hata'}`);
       }
     } catch (e) {
-      addLog('❌ API hatası: Market Order başarısız');
+      addLog('❌ API hatası: Piyasa emri başarısız');
     }
   }, [addLog]);
 
@@ -682,7 +682,7 @@ export default function App() {
           });
         }
 
-        const symbol = data.symbol || 'N/A';
+        const symbol = data.symbol || 'YOK';
         const leverage = data.leverage || 0;
         addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 30} TP:${data.tpAtr || 20} | $${(data.balance || 0).toFixed(0)} `);
         setIsSynced(true); // Phase 27: Allow auto-save only after sync
@@ -803,10 +803,10 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setPhase193Status(prev => prev ? { ...prev, stoploss_guard: data } : prev);
-        addLog(`🛡️ SL Guard ayarları güncellendi`);
+        addLog(`🛡️ SL Kalkanı ayarları güncellendi`);
       }
     } catch (err) {
-      addLog('❌ SL Guard ayar güncelleme hatası');
+      addLog('❌ SL Kalkanı ayar güncelleme hatası');
     }
   }, [addLog]);
 
@@ -855,7 +855,7 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setOptimizerStats(prev => ({ ...prev, enabled: data.enabled }));
-        addLog(`🤖 AI Optimizer ${data.enabled ? 'aktif' : 'pasif'}`);
+        addLog(`🤖 YZ Optimize Edici ${data.enabled ? 'aktif' : 'pasif'}`);
       }
     } catch (err) {
       console.error('Optimizer toggle error:', err);
@@ -911,7 +911,7 @@ export default function App() {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        wsHandlersRef.current.addLog("🟢 Multi-Coin Scanner Bağlandı (Phase 31)");
+        wsHandlersRef.current.addLog("🟢 Çoklu Varlık Tarayıcı Bağlandı");
         setConnectionError(null);
         setIsConnected(true);
       };
@@ -1122,7 +1122,7 @@ export default function App() {
               <h1 className="text-sm md:text-lg font-bold text-white leading-tight">QuantMonitor <span className="hidden sm:inline text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span></h1>
               <div className="flex items-center gap-1 md:gap-2 text-[10px] md:text-xs text-slate-500">
                 <span className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
-                {isRunning ? 'Active' : 'Paused'}
+                {isRunning ? 'Aktif' : 'Duraklatıldı'}
               </div>
             </div>
           </div>
@@ -1135,7 +1135,7 @@ export default function App() {
             </div>
             <div className="flex items-center gap-4 text-xs">
               <span className="text-slate-400">
-                <span className="font-bold text-white">{scannerStats.totalCoins}</span> Coin
+                <span className="font-bold text-white">{scannerStats.totalCoins}</span> Varlık
               </span>
               <span className="text-emerald-400">
                 🟢 <span className="font-bold">{scannerStats.longSignals}</span>
@@ -1151,7 +1151,7 @@ export default function App() {
               {lastFastTickMs > 0 && (
                 <span className={`border-l border-slate-700 pl-3 flex items-center gap-1.5 font-semibold ${fastTickFresh ? 'text-cyan-400' : 'text-slate-600'}`}>
                   <span className={`w-1.5 h-1.5 rounded-full ${fastTickFresh ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`}></span>
-                  FAST
+                  HIZLI
                 </span>
               )}
             </div>
@@ -1161,7 +1161,7 @@ export default function App() {
           {phase193Status?.stoploss_guard?.global_locked && (
             <div className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-rose-500/10 border border-rose-500/30 rounded-lg animate-pulse">
               <Lock className="w-3.5 h-3.5 text-rose-400" />
-              <span className="text-[10px] font-bold text-rose-400 uppercase">SL Guard</span>
+              <span className="text-[10px] font-bold text-rose-400 uppercase">SL Kalkanı</span>
             </div>
           )}
         </div>
@@ -1176,7 +1176,7 @@ export default function App() {
               }`}
           >
             <div className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
-            <span className="hidden sm:inline">{autoTradeEnabled ? 'AUTO ON' : 'AUTO OFF'}</span>
+            <span className="hidden sm:inline">{autoTradeEnabled ? 'OTOMATİK AÇIK' : 'OTOMATİK KAPALI'}</span>
           </button>
 
           <button
@@ -1193,7 +1193,7 @@ export default function App() {
             className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-bold transition-all shadow-lg text-xs md:text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
           >
             {isRunning ? <Square className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" /> : <Play className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" />}
-            {isRunning ? 'Stop' : 'Start'}
+            {isRunning ? 'Durdur' : 'Başlat'}
           </button>
 
           <button
@@ -1220,15 +1220,15 @@ export default function App() {
         {/* Scanner Stats - Always visible compact bar */}
         <div className="grid grid-cols-4 gap-2 mb-4">
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Coin</span>
+            <span className="text-[10px] text-slate-500 uppercase">Varlık</span>
             <span className="text-sm font-bold text-white">{scannerStats.totalCoins}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Long</span>
+            <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
             <span className="text-sm font-bold text-emerald-400">{scannerStats.longSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Short</span>
+            <span className="text-[10px] text-slate-500 uppercase">Kısa</span>
             <span className="text-sm font-bold text-rose-400">{scannerStats.shortSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
@@ -1261,36 +1261,36 @@ export default function App() {
                 ) : (
                   <>
                     <div className="col-span-2">
-                      <div className="text-xs text-slate-500 uppercase">Margin Balance</div>
+                      <div className="text-xs text-slate-500 uppercase">Marjin Bakiye</div>
                       <div className="text-2xl font-bold text-white font-mono">
                         {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                         <span className="text-sm text-slate-500 ml-1">USDT</span>
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Wallet</div>
+                      <div className="text-xs text-slate-500 uppercase">Cüzdan</div>
                       <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Unrealized</div>
+                      <div className="text-xs text-slate-500 uppercase">Gerçekleşmemiş</div>
                       <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Available</div>
+                      <div className="text-xs text-slate-500 uppercase">Kullanılabilir</div>
                       <div className="text-base font-semibold text-cyan-400 font-mono">
                         {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Used Margin</div>
+                      <div className="text-xs text-slate-500 uppercase">Kullanılan Marjin</div>
                       <div className="text-base font-semibold text-amber-400 font-mono">
                         {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Today's PnL</div>
+                      <div className="text-xs text-slate-500 uppercase">Bugünkü K/Z</div>
                       <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
                       </div>
@@ -1319,7 +1319,7 @@ export default function App() {
                   <>
                     <div className="flex items-center gap-8">
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Margin Balance</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Marjin Bakiye</div>
                         <div className="text-xl font-bold text-white font-mono">
                           {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
                           <span className="text-xs text-slate-500 ml-1">USDT</span>
@@ -1327,11 +1327,11 @@ export default function App() {
                       </div>
                       <div className="h-8 w-px bg-slate-800"></div>
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Wallet Balance</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Cüzdan Bakiye</div>
                         <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Unrealized PnL</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Gerçekleşmemiş K/Z</div>
                         <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                           {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                         </div>
@@ -1339,19 +1339,19 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-8">
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Available</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılabilir</div>
                         <div className="text-base font-semibold text-cyan-400 font-mono">
                           {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Used Margin</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılan Marjin</div>
                         <div className="text-base font-semibold text-amber-400 font-mono">
                           {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Today's PnL</div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Bugünkü K/Z</div>
                         <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                           {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
                         </div>
@@ -1371,14 +1371,14 @@ export default function App() {
             {/* Open Positions */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-slate-800/50 flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-white">Open Positions</h3>
-                <span className="text-xs text-slate-500">{portfolio.positions.length} active</span>
+                <h3 className="text-sm font-semibold text-white">Açık Pozisyonlar</h3>
+                <span className="text-xs text-slate-500">{portfolio.positions.length} aktif</span>
               </div>
 
               {/* Mobile: Card Layout */}
               <div className="lg:hidden p-3 space-y-2 max-h-[400px] overflow-y-auto">
                 {portfolio.positions.length === 0 ? (
-                  <div className="text-center py-8 text-slate-600 text-xs">No open positions</div>
+                  <div className="text-center py-8 text-slate-600 text-xs">Açık pozisyon yok</div>
                 ) : (
                   [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
@@ -1407,14 +1407,14 @@ export default function App() {
                             <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
                             <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
-                            {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TRAIL</span>}
+                            {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TAKİP</span>}
                           </div>
-                          <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Close</button>
+                          <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
-                          <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
-                          <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
-                          <div><span className="text-slate-500">Mark</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
+                          <div><span className="text-slate-500">Yatırılan</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
+                          <div><span className="text-slate-500">Giriş</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
+                          <div><span className="text-slate-500">Anlık</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
                           <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
@@ -1453,24 +1453,24 @@ export default function App() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
-                      <th className="text-left py-3 px-4 font-medium">Symbol</th>
-                      <th className="text-left py-3 px-2 font-medium">Side</th>
-                      <th className="text-right py-3 px-2 font-medium">Invested</th>
-                      <th className="text-right py-3 px-2 font-medium">Entry</th>
-                      <th className="text-right py-3 px-2 font-medium">Mark</th>
+                      <th className="text-left py-3 px-4 font-medium">Sembol</th>
+                      <th className="text-left py-3 px-2 font-medium">Yön</th>
+                      <th className="text-right py-3 px-2 font-medium">Yatırılan</th>
+                      <th className="text-right py-3 px-2 font-medium">Giriş</th>
+                      <th className="text-right py-3 px-2 font-medium">Anlık</th>
                       <th className="text-right py-3 px-2 font-medium">TP/SL</th>
-                      <th className="text-center py-3 px-2 font-medium">Trail</th>
-                      <th className="text-center py-3 px-2 font-medium">Age</th>
+                      <th className="text-center py-3 px-2 font-medium">Takip</th>
+                      <th className="text-center py-3 px-2 font-medium">Süre</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
                       <th className="text-right py-3 px-2 font-medium">ROI%</th>
                       <th className="text-center py-3 px-2 font-medium">KS</th>
-                      <th className="text-right py-3 px-4 font-medium">Action</th>
+                      <th className="text-right py-3 px-4 font-medium">İşlem</th>
                     </tr>
                   </thead>
                   <tbody>
                     {portfolio.positions.length === 0 ? (
                       <tr>
-                        <td colSpan={12} className="py-12 text-center text-slate-600">No open positions</td>
+                        <td colSpan={12} className="py-12 text-center text-slate-600">Açık pozisyon yok</td>
                       </tr>
                     ) : (
                       [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
@@ -1528,9 +1528,9 @@ export default function App() {
                             </td>
                             <td className="py-3 px-2 text-center">
                               {isTrailingActive ? (
-                                <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">ON</span>
+                                <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">AÇIK</span>
                               ) : (
-                                <span className="text-[10px] bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">OFF</span>
+                                <span className="text-[10px] bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">KAPALI</span>
                               )}
                             </td>
                             <td className="py-3 px-2 text-center">
@@ -1578,7 +1578,7 @@ export default function App() {
                                 onClick={() => handleManualClose(pos.id)}
                                 className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2 py-1 rounded transition-colors"
                               >
-                                Close
+                                Kapat
                               </button>
                             </td>
                           </tr>
@@ -1593,14 +1593,14 @@ export default function App() {
             {/* Trade History Table */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-slate-800/50 flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-white">Trade History</h3>
-                <span className="text-xs text-slate-500">{portfolio.trades.length} trades</span>
+                <h3 className="text-sm font-semibold text-white">İşlem Geçmişi</h3>
+                <span className="text-xs text-slate-500">{portfolio.trades.length} işlem</span>
               </div>
 
               {/* Mobile: Card Layout */}
               <div className="lg:hidden p-3 space-y-2 max-h-[400px] overflow-y-auto">
                 {portfolio.trades.length === 0 ? (
-                  <div className="text-center py-8 text-slate-600 text-xs">No trades yet</div>
+                  <div className="text-center py-8 text-slate-600 text-xs">Henüz işlem yok</div>
                 ) : (
                   portfolio.trades.slice(0, 50).map((trade, i) => {
                     // Use pre-calculated ROI from backend, or calculate if not available
@@ -1612,7 +1612,7 @@ export default function App() {
                       <div key={i} className={`p-3 rounded-lg border ${isWin ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center gap-2">
-                            <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'N/A'}</span>
+                            <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'YOK'}</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{trade.side}</span>
                           </div>
                           <span className="text-[10px] text-slate-500">
@@ -1620,9 +1620,9 @@ export default function App() {
                           </span>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
-                          <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(trade.entryPrice)}</div></div>
-                          <div><span className="text-slate-500">Exit</span><div className="font-mono text-white">${formatPrice(trade.exitPrice)}</div></div>
-                          <div><span className="text-slate-500">Reason</span><div className="text-slate-400 truncate">{translateReason((trade as any).reason || trade.closeReason)}</div></div>
+                          <div><span className="text-slate-500">Giriş</span><div className="font-mono text-white">${formatPrice(trade.entryPrice)}</div></div>
+                          <div><span className="text-slate-500">Çıkış</span><div className="font-mono text-white">${formatPrice(trade.exitPrice)}</div></div>
+                          <div><span className="text-slate-500">Neden</span><div className="text-slate-400 truncate">{translateReason((trade as any).reason || trade.closeReason)}</div></div>
                         </div>
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -1643,20 +1643,20 @@ export default function App() {
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-[#0d1117]">
                     <tr className="text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-800/30">
-                      <th className="text-left py-3 px-4 font-medium">Time</th>
-                      <th className="text-left py-3 px-2 font-medium">Symbol</th>
-                      <th className="text-left py-3 px-2 font-medium">Side</th>
-                      <th className="text-right py-3 px-2 font-medium">Entry</th>
-                      <th className="text-right py-3 px-2 font-medium">Exit</th>
+                      <th className="text-left py-3 px-4 font-medium">Zaman</th>
+                      <th className="text-left py-3 px-2 font-medium">Sembol</th>
+                      <th className="text-left py-3 px-2 font-medium">Yön</th>
+                      <th className="text-right py-3 px-2 font-medium">Giriş</th>
+                      <th className="text-right py-3 px-2 font-medium">Çıkış</th>
                       <th className="text-right py-3 px-2 font-medium">PnL</th>
                       <th className="text-right py-3 px-2 font-medium">ROI%</th>
-                      <th className="text-left py-3 px-4 font-medium">Reason</th>
+                      <th className="text-left py-3 px-4 font-medium">Neden</th>
                     </tr>
                   </thead>
                   <tbody>
                     {portfolio.trades.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-12 text-center text-slate-600">No trades yet</td>
+                        <td colSpan={8} className="py-12 text-center text-slate-600">Henüz işlem yok</td>
                       </tr>
                     ) : (
                       portfolio.trades.map((trade, i) => {
@@ -1668,7 +1668,7 @@ export default function App() {
                             <td className="py-3 px-4 text-slate-400 font-mono text-xs">
                               {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
                             </td>
-                            <td className="py-3 px-2 font-medium text-white">{trade.symbol?.replace('USDT', '') || 'N/A'}</td>
+                            <td className="py-3 px-2 font-medium text-white">{trade.symbol?.replace('USDT', '') || 'YOK'}</td>
                             <td className="py-3 px-2">
                               <span className={`text-xs px-2 py-0.5 rounded font-semibold ${trade.side === 'LONG' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
                                 {trade.side}
@@ -1765,7 +1765,7 @@ export default function App() {
                     <div className="flex items-center justify-between mb-3">
                       <h4 className="text-sm font-bold text-white flex items-center gap-2">
                         <ShieldAlert className="w-4 h-4 text-orange-400" />
-                        SL Guard
+                        SL Kalkanı
                       </h4>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.stoploss_guard.global_locked
                         ? 'bg-rose-500/20 text-rose-400 animate-pulse'
@@ -1773,7 +1773,7 @@ export default function App() {
                           ? 'bg-emerald-500/20 text-emerald-400'
                           : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.stoploss_guard.global_locked ? '🔒 LOCKED' : phase193Status.stoploss_guard.enabled ? '🟢 Aktif' : '⚫ Pasif'}
+                        {phase193Status.stoploss_guard.global_locked ? '🔒 KİLİTLİ' : phase193Status.stoploss_guard.enabled ? '🟢 Aktif' : '⚫ Pasif'}
                       </span>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -1782,7 +1782,7 @@ export default function App() {
                         <div className="text-lg font-bold text-orange-400">{phase193Status.stoploss_guard.recent_stoplosses}</div>
                       </div>
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
-                        <div className="text-[10px] text-slate-500">Cooldown</div>
+                        <div className="text-[10px] text-slate-500">Bekleme</div>
                         <div className="text-lg font-bold text-slate-300">
                           {phase193Status.stoploss_guard.cooldown_remaining
                             ? `${Math.ceil(phase193Status.stoploss_guard.cooldown_remaining / 60)}dk`
@@ -1808,18 +1808,18 @@ export default function App() {
                           ? 'bg-amber-500/20 text-amber-400'
                           : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.freqai.is_trained ? '✅ Trained' : phase193Status.freqai.enabled ? '⏳ Waiting' : '⚫ Pasif'}
+                        {phase193Status.freqai.is_trained ? '✅ Hazır' : phase193Status.freqai.enabled ? '⏳ Bekliyor' : '⚫ Pasif'}
                       </span>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
-                        <div className="text-[10px] text-slate-500">Accuracy</div>
+                        <div className="text-[10px] text-slate-500">Doğruluk</div>
                         <div className="text-lg font-bold text-purple-400">
                           {phase193Status.freqai.accuracy ? `${(phase193Status.freqai.accuracy * 100).toFixed(1)}%` : '—'}
                         </div>
                       </div>
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
-                        <div className="text-[10px] text-slate-500">Samples</div>
+                        <div className="text-[10px] text-slate-500">Örnek</div>
                         <div className="text-lg font-bold text-slate-300">
                           {phase193Status.freqai.training_samples || 0}
                         </div>
@@ -1846,12 +1846,12 @@ export default function App() {
                           ? 'bg-amber-500/20 text-amber-400'
                           : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.hyperopt.is_optimized ? '✅ Optimized' : phase193Status.hyperopt.enabled ? '⏳ Ready' : '⚫ Pasif'}
+                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize' : phase193Status.hyperopt.enabled ? '⏳ Hazır' : '⚫ Pasif'}
                       </span>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
-                        <div className="text-[10px] text-slate-500">Best Score</div>
+                        <div className="text-[10px] text-slate-500">En İyi Skor</div>
                         <div className="text-lg font-bold text-cyan-400">
                           {phase193Status.hyperopt.best_score?.toFixed(2) || '—'}
                         </div>
@@ -1895,10 +1895,10 @@ export default function App() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="font-bold text-white flex items-center gap-2 text-sm">
                   <Terminal className="w-4 h-4 text-indigo-500" />
-                  Live System Logs
+                  Canlı Sistem Logları
                 </h3>
                 <div className="flex items-center gap-2">
-                  <span className="text-xs text-emerald-500 animate-pulse">● LIVE</span>
+                  <span className="text-xs text-emerald-500 animate-pulse">● CANLI</span>
                 </div>
               </div>
               <div

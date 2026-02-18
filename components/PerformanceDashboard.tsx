@@ -49,7 +49,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
             }
             if (coinsRes.ok) setCoinStats(await coinsRes.json());
         } catch (error) {
-            console.error('Performance fetch error:', error);
+            console.error('Performans verisi alınamadı:', error);
         } finally {
             setLoading(false);
         }
@@ -57,7 +57,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
 
     useEffect(() => {
         fetchData();
-        const interval = setInterval(fetchData, 60000); // Refresh every minute
+        const interval = setInterval(fetchData, 60000); // Her dakika yenile
         return () => clearInterval(interval);
     }, [apiUrl]);
 
@@ -91,20 +91,20 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         ${summary?.totalPnl?.toFixed(2) || '0.00'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-emerald-400 mt-1">
-                        {summary?.totalTrades || 0} trade
+                        {summary?.totalTrades || 0} işlem
                     </div>
                 </div>
 
                 <div className="bg-gradient-to-br from-blue-900/50 to-blue-800/30 border border-blue-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <BarChart3 className="w-4 h-4 sm:w-5 sm:h-5 text-blue-400" />
-                        <span className="text-xs sm:text-sm text-blue-300">Win Rate</span>
+                        <span className="text-xs sm:text-sm text-blue-300">Kazanma Oranı</span>
                     </div>
                     <div className="text-lg sm:text-2xl font-bold text-white">
                         %{summary?.winRate?.toFixed(1) || '0'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-blue-400 mt-1 truncate">
-                        {summary?.winningTrades || 0}W / {summary?.losingTrades || 0}L
+                        {summary?.winningTrades || 0}K / {summary?.losingTrades || 0}Z
                     </div>
                 </div>
 
@@ -124,13 +124,13 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 <div className="bg-gradient-to-br from-amber-900/50 to-amber-800/30 border border-amber-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <Trophy className="w-4 h-4 sm:w-5 sm:h-5 text-amber-400" />
-                        <span className="text-xs sm:text-sm text-amber-300">Profit Factor</span>
+                        <span className="text-xs sm:text-sm text-amber-300">Kâr Faktörü</span>
                     </div>
                     <div className={`text-lg sm:text-2xl font-bold ${(summary?.profitFactor || 0) >= 1 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {summary?.profitFactor?.toFixed(2) || '0.00'}
                     </div>
                     <div className="text-[10px] sm:text-xs text-amber-400 mt-1 truncate">
-                        W ${summary?.avgWin?.toFixed(2) || '0'} / L ${summary?.avgLoss?.toFixed(2) || '0'}
+                        K ${summary?.avgWin?.toFixed(2) || '0'} / Z ${summary?.avgLoss?.toFixed(2) || '0'}
                     </div>
                 </div>
             </div>
@@ -224,11 +224,11 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                                                         </span>
                                                     </div>
                                                     <div className="flex items-center justify-between gap-4 mt-1">
-                                                        <span className="text-slate-400 text-xs">Trade</span>
+                                                        <span className="text-slate-400 text-xs">İşlem</span>
                                                         <span className="text-white text-sm">{day.trades}</span>
                                                     </div>
                                                     <div className="flex items-center justify-between gap-4 mt-1">
-                                                        <span className="text-slate-400 text-xs">Win Rate</span>
+                                                        <span className="text-slate-400 text-xs">Kazanma</span>
                                                         <span className="text-fuchsia-400 text-sm">{day.winRate?.toFixed(0) || 0}%</span>
                                                     </div>
                                                     {/* Arrow */}
@@ -273,7 +273,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                                 <div key={i} className="flex items-center justify-between py-1 border-b border-slate-700/50">
                                     <div className="flex items-center gap-2">
                                         <span className="text-white font-medium">{(coin.symbol || '').replace('USDT', '')}</span>
-                                        <span className="text-xs text-slate-400">{coin.trades} trade</span>
+                                        <span className="text-xs text-slate-400">{coin.trades} işlem</span>
                                     </div>
                                     <div className="flex items-center gap-3">
                                         <span className="text-xs text-emerald-400">%{coin.win_rate}</span>
@@ -299,7 +299,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                                 <div key={i} className="flex items-center justify-between py-1 border-b border-slate-700/50">
                                     <div className="flex items-center gap-2">
                                         <span className="text-white font-medium">{(coin.symbol || '').replace('USDT', '')}</span>
-                                        <span className="text-xs text-slate-400">{coin.trades} trade</span>
+                                        <span className="text-xs text-slate-400">{coin.trades} işlem</span>
                                     </div>
                                     <div className="flex items-center gap-3">
                                         <span className="text-xs text-rose-400">%{coin.win_rate}</span>
@@ -330,7 +330,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                                 <div className={`text-lg font-bold ${data.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                                     ${data.pnl.toFixed(0)}
                                 </div>
-                                <div className="text-xs text-slate-500">{data.count} trade</div>
+                                <div className="text-xs text-slate-500">{data.count} işlem</div>
                             </div>
                         ))}
                 </div>

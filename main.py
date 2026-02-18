@@ -4405,6 +4405,11 @@ MTF_SOFT_OVERRIDE_MIN_SCORE = 110
 MTF_SOFT_OVERRIDE_PENALTY = 12
 MTF_SOFT_OVERRIDE_MIN_EQ = 3
 
+# Hybrid execution quality gate (entry strictness)
+EXEC_QUALITY_GATE_ENABLED = True
+EXEC_QUALITY_MIN_SCORE = 58.0
+EXEC_QUALITY_STRICT_MIN_SCORE = 66.0
+
 
 def get_dynamic_depth_threshold(
     spread_pct: float,
@@ -4465,6 +4470,259 @@ def get_dynamic_depth_threshold(
 
     raw = base * spread_factor * vol_factor * score_factor * lev_factor
     return max(EQ_MIN_DEPTH_USD_BASE, min(float(EQ_MIN_DEPTH_USD), raw))
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def compute_execution_quality_score(
+    signal_side: str,
+    confidence_score: float,
+    volume_ratio: float,
+    spread_pct: float,
+    atr_pct: float,
+    imbalance: float,
+    ob_imbalance_trend: float,
+    eq_count: int,
+    fib_active: bool,
+    fib_bonus: float,
+    is_volume_spike: bool,
+    zscore: float,
+    adx: float,
+    hurst: float
+) -> dict:
+    """
+    Hybrid execution quality score.
+    Higher score => cleaner microstructure and stronger setup quality.
+    """
+    score = float(confidence_score)
+    notes = []
+
+    # Microstructure / liquidity quality
+    if volume_ratio >= 2.0:
+        score += 8
+        notes.append("VOL_STRONG")
+    elif volume_ratio >= 1.25:
+        score += 4
+        notes.append("VOL_OK")
+    elif volume_ratio < 0.9:
+        score -= 10
+        notes.append("VOL_WEAK")
+
+    if spread_pct <= 0.06:
+        score += 6
+        notes.append("SPREAD_TIGHT")
+    elif spread_pct <= 0.18:
+        score += 2
+    elif spread_pct >= 0.40:
+        score -= 12
+        notes.append("SPREAD_WIDE")
+    elif spread_pct >= 0.25:
+        score -= 6
+
+    # Order book alignment
+    side_sign = 1.0 if signal_side == "LONG" else -1.0
+    side_imbalance = side_sign * float(imbalance)
+    side_ob_trend = side_sign * float(ob_imbalance_trend)
+
+    if side_imbalance >= 8:
+        score += 8
+        notes.append("OB_ALIGN")
+    elif side_imbalance >= 3:
+        score += 4
+    elif side_imbalance <= -4:
+        score -= 12
+        notes.append("OB_CONTRA")
+
+    if side_ob_trend >= 4:
+        score += 6
+        notes.append("OB_FLOW")
+    elif side_ob_trend <= -3:
+        score -= 8
+        notes.append("OB_FLOW_CONTRA")
+
+    # Quality signals
+    if eq_count >= 3:
+        score += 7
+        notes.append("EQ3")
+    elif eq_count == 2:
+        score += 3
+
+    if fib_active:
+        score += min(8.0, max(0.0, float(fib_bonus)))
+        notes.append("FIB")
+
+    if is_volume_spike:
+        score += 3
+
+    # Context penalty/bonus
+    if atr_pct >= 6.0:
+        score -= 4
+    elif atr_pct <= 1.2:
+        score += 2
+
+    if abs(zscore) >= 2.5:
+        score += 3
+    elif abs(zscore) < 1.7:
+        score -= 2
+
+    trend_strength = _clamp((adx - 18.0) / 25.0, 0.0, 1.0) * 0.6 + _clamp((hurst - 0.45) / 0.2, 0.0, 1.0) * 0.4
+    if trend_strength >= 0.75:
+        score += 2
+
+    return {
+        "score": round(score, 2),
+        "passed": score >= EXEC_QUALITY_MIN_SCORE,
+        "strict_passed": score >= EXEC_QUALITY_STRICT_MIN_SCORE,
+        "notes": notes[:6],
+    }
+
+
+def get_hybrid_entry_profile(
+    atr_pct: float,
+    spread_pct: float,
+    volume_ratio: float,
+    leverage: int,
+    entry_tightness: float,
+    confidence_score: float,
+    eq_count: int,
+    fib_active: bool,
+    adx: float,
+    hurst: float,
+    is_volume_spike: bool
+) -> dict:
+    """
+    Returns dynamic entry pullback and trail-entry activation thresholds.
+    All output values already include settings multiplier (`entry_tightness`).
+    """
+    safe_atr_pct = max(0.3, float(atr_pct))
+    safe_spread_pct = max(0.01, float(spread_pct))
+    safe_vol_ratio = max(0.2, float(volume_ratio))
+    safe_lev = max(1, int(leverage or 1))
+    tightness = _clamp(entry_tightness, 0.5, 15.0)
+    tightness_mult = math.sqrt(tightness)
+
+    # Base pullback (percentage terms)
+    base_pullback_pct = (safe_atr_pct * 0.42) + (safe_spread_pct * 0.70)
+
+    # Quality factor: stronger setup => slightly shallower pullback
+    if confidence_score >= 120 and eq_count >= 3:
+        quality_mult = 0.80
+    elif confidence_score >= 110:
+        quality_mult = 0.88
+    elif confidence_score >= 95:
+        quality_mult = 0.96
+    elif confidence_score >= 80:
+        quality_mult = 1.05
+    else:
+        quality_mult = 1.15
+
+    # Market microstructure factor
+    micro_mult = 1.0
+    if safe_vol_ratio < 1.0:
+        micro_mult *= 1.15
+    elif safe_vol_ratio >= 2.0:
+        micro_mult *= 0.90
+    if safe_spread_pct >= 0.25:
+        micro_mult *= 1.20
+
+    # Trend factor: strong trend means slightly shallower entry
+    trend_strength = _clamp((adx - 18.0) / 25.0, 0.0, 1.0) * 0.6 + _clamp((hurst - 0.45) / 0.2, 0.0, 1.0) * 0.4
+    trend_mult = 1.0 - (trend_strength * 0.14)
+
+    # Fib/volume spike can allow earlier but still controlled entry
+    confluence_mult = 1.0
+    if fib_active:
+        confluence_mult *= 0.93
+    if is_volume_spike and trend_strength > 0.5:
+        confluence_mult *= 0.92
+
+    pullback_pct = base_pullback_pct * tightness_mult * quality_mult * micro_mult * trend_mult * confluence_mult
+    pullback_pct = _clamp(pullback_pct, 0.15, 12.0)
+
+    # Trail-entry activation thresholds (pct)
+    trail_threshold_mult = _clamp(
+        tightness_mult * (1.0 + max(0.0, safe_spread_pct - 0.08) * 2.0) * (1.12 if safe_vol_ratio < 1.0 else 0.92 if safe_vol_ratio > 2.0 else 1.0),
+        0.7,
+        2.6,
+    )
+    min_move_pct, min_roi_pct = get_dynamic_trail_activation_threshold(
+        atr_pct=safe_atr_pct,
+        spread_pct=safe_spread_pct,
+        volume_ratio=safe_vol_ratio,
+        leverage=safe_lev,
+        threshold_mult=trail_threshold_mult,
+    )
+
+    return {
+        "pullback_pct": round(pullback_pct, 4),
+        "trail_entry_min_move_pct": round(min_move_pct, 3),
+        "trail_entry_min_roi_pct": round(min_roi_pct, 2),
+        "entry_tightness_mult": round(tightness_mult, 3),
+        "entry_threshold_mult": round(trail_threshold_mult, 3),
+    }
+
+
+def get_hybrid_runtime_trail_distance(
+    base_trail_distance: float,
+    atr_pct: float,
+    spread_pct: float,
+    volume_ratio: float,
+    roi_pct: float,
+    exit_tightness: float,
+    hurst: float = 0.5,
+    adx: float = 20.0
+) -> float:
+    """
+    Dynamic trailing distance for open positions.
+    Uses volatility + liquidity + trend + ROI, and includes exit_tightness multiplier.
+    """
+    base = max(0.0, float(base_trail_distance))
+    if base <= 0:
+        return 0.0
+
+    safe_atr_pct = max(0.3, float(atr_pct))
+    safe_spread_pct = max(0.01, float(spread_pct))
+    safe_vol_ratio = max(0.2, float(volume_ratio))
+    tightness_mult = math.sqrt(_clamp(exit_tightness, 0.3, 15.0))
+
+    # Volatility expansion
+    if safe_atr_pct < 1.0:
+        volatility_mult = 0.70
+    elif safe_atr_pct < 1.8:
+        volatility_mult = 0.85
+    elif safe_atr_pct < 3.0:
+        volatility_mult = 1.00
+    elif safe_atr_pct < 4.5:
+        volatility_mult = 1.25
+    elif safe_atr_pct < 6.5:
+        volatility_mult = 1.55
+    else:
+        volatility_mult = 1.90
+
+    micro_mult = 1.0 + max(0.0, safe_spread_pct - 0.08) * 2.2
+    if safe_vol_ratio < 1.0:
+        micro_mult *= 1.15
+    elif safe_vol_ratio >= 2.0:
+        micro_mult *= 0.92
+
+    trend_strength = _clamp((adx - 18.0) / 25.0, 0.0, 1.0) * 0.6 + _clamp((hurst - 0.45) / 0.2, 0.0, 1.0) * 0.4
+    trend_mult = 1.0 + (trend_strength * 0.20)
+
+    dynamic_distance = base * volatility_mult * tightness_mult * micro_mult * trend_mult
+
+    # Profit-aware tightening (less aggressive to avoid premature exits)
+    if roi_pct >= 30:
+        dynamic_distance *= 0.68
+    elif roi_pct >= 20:
+        dynamic_distance *= 0.78
+    elif roi_pct >= 12:
+        dynamic_distance *= 0.88
+    elif roi_pct >= 6:
+        dynamic_distance *= 0.95
+
+    return _clamp(dynamic_distance, base * 0.6, base * 3.5)
 
 # Fibonacci ratios
 FIB_RATIOS = {
@@ -4864,7 +5122,13 @@ def get_dynamic_trail_params(
 # ATR + spread + volume bazlı dinamik eşik hesaplama
 # Sabit 0.75% / 5.0% yerine piyasa koşullarına göre ayarlanır
 # =====================================================
-def get_dynamic_trail_activation_threshold(atr_pct: float, spread_pct: float, volume_ratio: float, leverage: int) -> tuple:
+def get_dynamic_trail_activation_threshold(
+    atr_pct: float,
+    spread_pct: float,
+    volume_ratio: float,
+    leverage: int,
+    threshold_mult: float = 1.0
+) -> tuple:
     """
     Calculate dynamic trail activation thresholds based on market conditions.
     
@@ -4877,6 +5141,8 @@ def get_dynamic_trail_activation_threshold(atr_pct: float, spread_pct: float, vo
     Returns:
         tuple: (min_price_move_pct, min_roi_pct)
     """
+    th_mult = _clamp(threshold_mult, 0.60, 3.00)
+
     # Base: ATR'nin %40'ı (min 0.5%, max 2.0%)
     base_move = max(0.5, min(2.0, atr_pct * 0.40))
     
@@ -4892,12 +5158,12 @@ def get_dynamic_trail_activation_threshold(atr_pct: float, spread_pct: float, vo
     else:
         vol_factor = 1.25    # Düşük volume: daha geç trail
     
-    min_price_move = round(base_move * spread_factor * vol_factor, 3)
-    min_price_move = max(0.4, min(2.5, min_price_move))  # Hard clamp
+    min_price_move = round(base_move * spread_factor * vol_factor * th_mult, 3)
+    min_price_move = max(0.4, min(3.5, min_price_move))  # Hard clamp
     
     # ROI = min_price_move × leverage (ama min 4%, max 20%)
-    min_roi = round(min_price_move * leverage, 1)
-    min_roi = max(4.0, min(20.0, min_roi))
+    min_roi = round(min_price_move * max(1, leverage), 1)
+    min_roi = max(4.0, min(28.0, min_roi))
     
     return min_price_move, min_roi
 
@@ -5978,6 +6244,11 @@ class CoinOpportunity:
         self.fib_entry: float = 0.0
         self.fib_blend_alpha: float = 0.0
         self.entry_price: float = 0.0  # Backend ideal_entry price
+        self.trail_entry_min_move_pct: float = 0.0
+        self.trail_entry_min_roi_pct: float = 0.0
+        self.entry_threshold_mult: float = 1.0
+        self.entry_exec_score: float = 0.0
+        self.entry_exec_passed: bool = True
         self.execution_reject_reason: Optional[str] = None
         self.execution_reject_ts: int = 0
     
@@ -6012,11 +6283,16 @@ class CoinOpportunity:
             "fibLevel": self.fib_level,
             "fibBonus": int(self.fib_bonus),
             "fibEntry": round(float(self.fib_entry), 8) if self.fib_entry else 0,
-            "fibBlendAlpha": float(self.fib_blend_alpha),
-            "entryPriceBackend": round(float(self.entry_price), 8) if self.entry_price else 0,
-            "executionRejectReason": self.execution_reject_reason,
-            "executionRejectTs": int(self.execution_reject_ts or 0),
-        }
+                "fibBlendAlpha": float(self.fib_blend_alpha),
+                "entryPriceBackend": round(float(self.entry_price), 8) if self.entry_price else 0,
+                "trailEntryMinMovePct": round(float(self.trail_entry_min_move_pct), 3),
+                "trailEntryMinRoiPct": round(float(self.trail_entry_min_roi_pct), 2),
+                "entryThresholdMult": round(float(self.entry_threshold_mult), 3),
+                "entryExecScore": round(float(self.entry_exec_score), 2),
+                "entryExecPassed": bool(self.entry_exec_passed),
+                "executionRejectReason": self.execution_reject_reason,
+                "executionRejectTs": int(self.execution_reject_ts or 0),
+            }
 
 
 class LightweightCoinAnalyzer:
@@ -6546,6 +6822,11 @@ class LightweightCoinAnalyzer:
             self.opportunity.fib_entry = signal.get('fibEntry', 0)
             self.opportunity.fib_blend_alpha = signal.get('fibBlendAlpha', 0)
             self.opportunity.entry_price = signal.get('entryPrice', 0) or signal.get('entry', 0)
+            self.opportunity.trail_entry_min_move_pct = signal.get('trailEntryMinMovePct', 0)
+            self.opportunity.trail_entry_min_roi_pct = signal.get('trailEntryMinRoiPct', 0)
+            self.opportunity.entry_threshold_mult = signal.get('entryThresholdMult', 1.0)
+            self.opportunity.entry_exec_score = signal.get('entryExecScore', signal.get('confidenceScore', 0))
+            self.opportunity.entry_exec_passed = signal.get('entryExecPassed', True)
             # Execution-stage reject reason (if any) for UI observability
             try:
                 if 'global_paper_trader' in globals():
@@ -8707,45 +8988,26 @@ async def background_scanner_loop():
                             trail_activation = pos.get('trailActivation', entry_price)
                             trail_distance = pos.get('trailDistance', 0)
                             
-                            # ===================================================================
-                            # REAL-TIME VOLATILITY-BASED TRAIL
-                            # ATR yüzdesi üzerinden gerçek zamanlı volatilite hesaplama
-                            # ===================================================================
+                            # Hybrid dynamic trail distance (includes exit_tightness multiplier).
                             pos_atr = pos.get('atr', entry_price * 0.02)
-                            atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
-                            
-                            # Volatilite çarpanı: ATR % bazlı dinamik hesaplama
-                            # Düşük ATR% (<1.5) = sıkı trail, Yüksek ATR% (>6) = geniş trail
-                            if atr_pct < 1.0:
-                                volatility_mult = 0.6   # BTC/ETH - çok düşük volatilite
-                            elif atr_pct < 1.5:
-                                volatility_mult = 0.75  # Major altcoin
-                            elif atr_pct < 2.5:
-                                volatility_mult = 1.0   # Normal volatilite
-                            elif atr_pct < 4.0:
-                                volatility_mult = 1.3   # Volatil
-                            elif atr_pct < 6.0:
-                                volatility_mult = 1.6   # Yüksek volatilite
-                            else:
-                                volatility_mult = 2.0   # Meme coin - çok yüksek volatilite
-                            
-                            volatility_adjusted_distance = trail_distance * volatility_mult
-                            
-                            # ===================================================================
-                            # PROFIT-BASED TRAIL: Kâr arttıkça trail mesafesi sıkılaşır
-                            # Phase 222: Granüler ROI bazlı trail daraltma
-                            # ===================================================================
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                            if pnl_pct >= 25.0:
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.4   # Çok yüksek kâr: çok sıkı
-                            elif pnl_pct >= 15.0:
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.55  # Yüksek kâr
-                            elif pnl_pct >= 8.0:
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.70  # Orta kâr
-                            elif pnl_pct >= 4.0:
-                                dynamic_trail_distance = volatility_adjusted_distance * 0.85  # Düşük kâr
-                            else:
-                                dynamic_trail_distance = volatility_adjusted_distance          # Normal
+                            pos_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+                            if not pos_atr_pct and entry_price > 0:
+                                pos_atr_pct = (pos_atr / entry_price) * 100
+                            pos_atr_pct = pos_atr_pct or 2.0
+                            pos_spread = pos.get('spreadPct', 0.05)
+                            pos_vol_ratio = pos.get('volumeRatio', 1.0)
+                            effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
+                            dynamic_trail_distance = get_hybrid_runtime_trail_distance(
+                                base_trail_distance=trail_distance,
+                                atr_pct=pos_atr_pct,
+                                spread_pct=pos_spread,
+                                volume_ratio=pos_vol_ratio,
+                                roi_pct=pnl_pct,
+                                exit_tightness=effective_et,
+                                hurst=pos.get('hurst', 0.5),
+                                adx=pos.get('adx', 20.0),
+                            )
                             
                             # Phase 231d: Dynamic trail activation threshold (ATR + spread + volume)
                             leverage = pos.get('leverage', 10)
@@ -8756,14 +9018,9 @@ async def background_scanner_loop():
                             roi_pct = price_move_pct * leverage
                             
                             # Dynamic thresholds from market conditions
-                            pos_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
-                            if not pos_atr_pct and entry_price > 0:
-                                pos_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
-                            pos_atr_pct = pos_atr_pct or 2.0
-                            pos_spread = pos.get('spreadPct', 0.05)
-                            pos_vol_ratio = pos.get('volumeRatio', 1.0)
+                            threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
                             min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
-                                pos_atr_pct, pos_spread, pos_vol_ratio, leverage
+                                pos_atr_pct, pos_spread, pos_vol_ratio, leverage, threshold_mult=threshold_mult
                             )
                             
                             # Phase 231h: Fee buffer for breakeven (0.1% = taker fee both sides)
@@ -9168,29 +9425,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
         trail_distance = pos.get('trailDistance', 0)
         
         pos_atr = pos.get('atr', entry_price * 0.02)
-        atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
-        
-        if atr_pct < 1.0:
-            volatility_mult = 0.6
-        elif atr_pct < 1.5:
-            volatility_mult = 0.75
-        elif atr_pct < 2.5:
-            volatility_mult = 1.0
-        elif atr_pct < 4.0:
-            volatility_mult = 1.3
-        elif atr_pct < 6.0:
-            volatility_mult = 1.6
-        else:
-            volatility_mult = 2.0
-        
-        dynamic_trail_distance = trail_distance * volatility_mult
-        
-        # Phase 213: Profit-based softened tightening (WS parity with scanner)
         ws_pnl_pct = pos.get('unrealizedPnlPercent', 0)
-        if ws_pnl_pct >= 15.0:
-            dynamic_trail_distance = dynamic_trail_distance * 0.7
-        elif ws_pnl_pct >= 8.0:
-            dynamic_trail_distance = dynamic_trail_distance * 0.85
         
         # Dynamic trail activation threshold (ATR + spread + volume)
         ws_leverage = pos.get('leverage', 10)
@@ -9202,12 +9437,24 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         ws_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
         if not ws_atr_pct and entry_price > 0:
-            ws_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
+            ws_atr_pct = (pos_atr / entry_price) * 100
         ws_atr_pct = ws_atr_pct or 2.0
         ws_spread = pos.get('spreadPct', 0.05)
         ws_vol_ratio = pos.get('volumeRatio', 1.0)
+        effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
+        dynamic_trail_distance = get_hybrid_runtime_trail_distance(
+            base_trail_distance=trail_distance,
+            atr_pct=ws_atr_pct,
+            spread_pct=ws_spread,
+            volume_ratio=ws_vol_ratio,
+            roi_pct=ws_pnl_pct,
+            exit_tightness=effective_et,
+            hurst=pos.get('hurst', 0.5),
+            adx=pos.get('adx', 20.0),
+        )
+        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
-            ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage
+            ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage, threshold_mult=threshold_mult
         )
         
         # Phase 231h: Fee buffer for breakeven
@@ -9441,31 +9688,8 @@ async def position_price_update_loop():
                         trail_activation = pos.get('trailActivation', entry_price)
                         trail_distance = pos.get('trailDistance', 0)
                         
-                        # Real-time ATR% based volatility (same as main loop)
                         pos_atr = pos.get('atr', entry_price * 0.02)
-                        atr_pct = (pos_atr / entry_price) * 100 if entry_price > 0 else 2.0
-                        
-                        if atr_pct < 1.0:
-                            volatility_mult = 0.6
-                        elif atr_pct < 1.5:
-                            volatility_mult = 0.75
-                        elif atr_pct < 2.5:
-                            volatility_mult = 1.0
-                        elif atr_pct < 4.0:
-                            volatility_mult = 1.3
-                        elif atr_pct < 6.0:
-                            volatility_mult = 1.6
-                        else:
-                            volatility_mult = 2.0
-                        
-                        dynamic_trail_distance = trail_distance * volatility_mult
-                        
-                        # Phase 213: Profit-based softened tightening (parity with scanner/WS)
                         fast_pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                        if fast_pnl_pct >= 15.0:
-                            dynamic_trail_distance = dynamic_trail_distance * 0.7
-                        elif fast_pnl_pct >= 8.0:
-                            dynamic_trail_distance = dynamic_trail_distance * 0.85
                         
                         # Dynamic trail activation threshold (ATR + spread + volume)
                         fast_leverage = pos.get('leverage', 10)
@@ -9477,12 +9701,24 @@ async def position_price_update_loop():
                         
                         fast_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
                         if not fast_atr_pct and entry_price > 0:
-                            fast_atr_pct = (pos.get('atr', entry_price * 0.02) / entry_price) * 100
+                            fast_atr_pct = (pos_atr / entry_price) * 100
                         fast_atr_pct = fast_atr_pct or 2.0
                         fast_spread = pos.get('spreadPct', 0.05)
                         fast_vol_ratio = pos.get('volumeRatio', 1.0)
+                        effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
+                        dynamic_trail_distance = get_hybrid_runtime_trail_distance(
+                            base_trail_distance=trail_distance,
+                            atr_pct=fast_atr_pct,
+                            spread_pct=fast_spread,
+                            volume_ratio=fast_vol_ratio,
+                            roi_pct=fast_pnl_pct,
+                            exit_tightness=effective_et,
+                            hurst=pos.get('hurst', 0.5),
+                            adx=pos.get('adx', 20.0),
+                        )
+                        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
-                            fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage
+                            fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage, threshold_mult=threshold_mult
                         )
                         
                         # Phase 231h: Fee buffer for breakeven
@@ -16246,7 +16482,7 @@ class SignalGenerator:
             if cond_a:
                 eq_pass_count += 1
                 eq_reasons.append(f"A:Vol({volume_ratio:.1f}x)")
-            
+
             # Koşul B: OB yön baskısı
             cond_b = False
             if signal_side == "LONG":
@@ -16256,18 +16492,17 @@ class SignalGenerator:
             if cond_b:
                 eq_pass_count += 1
                 eq_reasons.append(f"B:OB(imb={imbalance:.0f},tr={ob_imbalance_trend:.1f})")
-            
+
             # Koşul C: Likidite yeterli
             cond_c = volume_24h >= EQ_MIN_VOLUME_24H and spread_pct <= EQ_MAX_SPREAD
             if cond_c:
                 eq_pass_count += 1
                 eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
-            
+
             # Gate kararı: en az 2/3 geçmeli
             if eq_pass_count < 2:
                 entry_quality_pass = False
                 fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
-                
                 if ENTRY_QUALITY_MODE == 'hard':
                     logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.1f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
                     return None
@@ -16279,7 +16514,50 @@ class SignalGenerator:
                 reasons.append(f"EQ_PASS({eq_pass_count}/3)")
                 if eq_pass_count == 3:
                     reasons.append("EQ_STRONG")
-        
+
+        # =====================================================================
+        # PHASE HYBRID: EXECUTION QUALITY SCORE (microstructure + confluence)
+        # =====================================================================
+        atr_pct_for_exec = (atr / price * 100) if price > 0 else 2.0
+        fib_active_for_exec = bool(fib_context.get('fib_active', False)) if fib_context else False
+        fib_bonus_for_exec = float(fib_context.get('fib_score_bonus', 0)) if fib_context else 0.0
+        exec_quality = compute_execution_quality_score(
+            signal_side=signal_side,
+            confidence_score=score,
+            volume_ratio=volume_ratio,
+            spread_pct=spread_pct,
+            atr_pct=atr_pct_for_exec,
+            imbalance=imbalance,
+            ob_imbalance_trend=ob_imbalance_trend,
+            eq_count=eq_pass_count,
+            fib_active=fib_active_for_exec,
+            fib_bonus=fib_bonus_for_exec,
+            is_volume_spike=is_volume_spike,
+            zscore=zscore,
+            adx=adx,
+            hurst=hurst,
+        )
+        exec_quality_score = float(exec_quality.get("score", score))
+        exec_quality_passed = bool(exec_quality.get("passed", True))
+        exec_quality_notes = list(exec_quality.get("notes", []))
+        if exec_quality.get("strict_passed"):
+            score += 4
+            reasons.append(f"EXEC_STRONG({exec_quality_score:.0f})")
+        elif exec_quality_passed:
+            score += 1
+            reasons.append(f"EXEC_OK({exec_quality_score:.0f})")
+        else:
+            score -= 10
+            reasons.append(f"EXEC_WEAK({exec_quality_score:.0f})")
+            # Very weak execution quality is now a hard reject.
+            if exec_quality_score < (EXEC_QUALITY_MIN_SCORE - 10):
+                logger.info(
+                    f"🚫 EXEC_QUALITY_VETO: {symbol} {signal_side} exec={exec_quality_score:.1f} "
+                    f"< {EXEC_QUALITY_MIN_SCORE - 10:.1f} | vol={volume_ratio:.1f}x sp={spread_pct:.3f}% "
+                    f"imb={imbalance:.1f} tr={ob_imbalance_trend:.1f}"
+                )
+                return None
+
         # =====================================================================
         # AŞAMA 2: KONFİRMASYON FİLTRELERİ (Skor Vermez, Sadece Kontrol Eder)
         # Coin istatistiklerine göre dinamik eşikler kullanılır
@@ -16448,26 +16726,26 @@ class SignalGenerator:
             reasons.append(f"SpreadProt({spread_pct:.2f}%)")
         
         # =====================================================================
-        # PHASE 160: ATR+SPREAD PULLBACK (replaces old spread-only pullback)
-        # Pullback = (ATR% × pullback_factor) + (Spread% × 0.5)
-        # ATR% = coin's natural volatility → scales pullback depth
-        # Spread% = liquidity buffer → slippage protection
+        # PHASE HYBRID ENTRY: ATR + spread + volume + quality + settings multiplier
         # =====================================================================
-        
-        # ATR as percentage of price
-        atr_pct = (atr / price) if price > 0 else 0  # e.g., 0.075 for 7.5%
-        
-        # Pullback = ATR component + Spread component
-        pullback_factor = 0.4  # Use 40% of ATR as pullback base
-        spread_factor = 0.5    # Use 50% of spread as slippage buffer
-        pullback_pct = (atr_pct * pullback_factor) + (spread_pct / 100 * spread_factor)
-        
-        # Additional pullback for extreme volatility
-        if volatility_ratio > 2.0:
-            pullback_pct += 0.005  # +0.5%
-        
-        # Limit pullback to max 10% (ATR-based can go higher than old spread-based)
-        pullback_pct = min(0.10, pullback_pct)
+        entry_tightness = global_paper_trader.entry_tightness if 'global_paper_trader' in globals() and global_paper_trader else 1.0
+        atr_pct_percent = (atr / price * 100) if price > 0 else 2.0
+        hybrid_entry = get_hybrid_entry_profile(
+            atr_pct=atr_pct_percent,
+            spread_pct=spread_pct,
+            volume_ratio=volume_ratio,
+            leverage=final_leverage,
+            entry_tightness=entry_tightness,
+            confidence_score=score,
+            eq_count=eq_pass_count,
+            fib_active=fib_active_for_exec,
+            adx=adx,
+            hurst=hurst,
+            is_volume_spike=is_volume_spike,
+        )
+        pullback_pct = float(hybrid_entry.get('pullback_pct', 0.8)) / 100.0  # percent -> fraction
+        pullback_pct = _clamp(pullback_pct, 0.0, 0.12)
+        atr_pct = atr_pct_percent / 100.0
         
         # =====================================================================
         # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
@@ -16492,7 +16770,7 @@ class SignalGenerator:
             # PHASE EQG: STRONG QUALITY PULLBACK REDUCTION
             # 3/3 kalite koşulu geçtiyse → daha erken giriş (trend başlangıcını yakala)
             original_pb = pullback_pct
-            pullback_pct *= 0.75
+            pullback_pct *= 0.82
             reasons.append(f"EQ_EARLY(pb {original_pb*100:.1f}%→{pullback_pct*100:.1f}%)")
         
         if signal_side == "LONG":
@@ -16617,9 +16895,17 @@ class SignalGenerator:
             'isVolumeSpike': is_volume_spike,
             'imbalancePct': round(imbalance, 1),
             'obImbalanceTrend': round(ob_imbalance_trend, 1),
-            'entryQualityPass': entry_quality_pass,
-            'entryQualityReasons': eq_reasons,
-        }
+                'entryQualityPass': entry_quality_pass,
+                'entryQualityReasons': eq_reasons,
+                # Hybrid entry observability
+                'trailEntryMinMovePct': hybrid_entry.get('trail_entry_min_move_pct', 0.8),
+                'trailEntryMinRoiPct': hybrid_entry.get('trail_entry_min_roi_pct', 8.0),
+                'entryThresholdMult': hybrid_entry.get('entry_threshold_mult', 1.0),
+                'entryTightnessMult': hybrid_entry.get('entry_tightness_mult', 1.0),
+                'entryExecScore': exec_quality_score,
+                'entryExecPassed': exec_quality_passed,
+                'entryExecNotes': exec_quality_notes,
+            }
 
 
 # ============================================================================
@@ -17273,25 +17559,15 @@ class PaperTradingEngine:
         # =========================================================================
         # Create a pending order that waits for price to reach pullback level
         
-        # Get pullback entry price from signal and apply entry_tightness
-        if signal and 'entryPrice' in signal:
-            base_pullback_pct = signal.get('pullbackPct', 0)
-            # Apply entry_tightness: HIGHER = WIDER pullback (more distance from signal price)
-            # Formula: multiply by sqrt(entry_tightness) for smooth scaling
-            import math
-            et_mult = math.sqrt(max(0.5, self.entry_tightness))  # sqrt smoothing: 2.6→1.6, 1.0→1.0
-            adjusted_pullback_pct = base_pullback_pct * et_mult
-            
-            # Recalculate entry price with adjusted pullback
-            if side == 'LONG':
-                entry_price = price * (1 - adjusted_pullback_pct / 100)
+            # Entry is already dynamically calculated in SignalGenerator (includes entry_tightness).
+            # Avoid double-scaling entry_tightness here.
+            if signal and 'entryPrice' in signal and signal.get('entryPrice', 0) > 0:
+                entry_price = float(signal.get('entryPrice'))
+                pullback_pct = float(signal.get('pullbackPct', 0))
             else:
-                entry_price = price * (1 + adjusted_pullback_pct / 100)
-            pullback_pct = adjusted_pullback_pct
-        else:
-            # No pullback, use current price
-            entry_price = price
-            pullback_pct = 0
+                # No pullback, use current price
+                entry_price = price
+                pullback_pct = 0
         
         # Get spread-adjusted parameters from signal
         spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
@@ -17468,7 +17744,7 @@ class PaperTradingEngine:
         except:
             settings_snapshot['obi_value_at_entry'] = 0
         
-        pending_order = {
+            pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
             "side": side,
@@ -17501,9 +17777,14 @@ class PaperTradingEngine:
             # Dynamic trail activation threshold data
             "volatility_pct": (atr / price * 100) if price > 0 else 2.0,
             "spreadPct": signal.get('spreadPct', 0.05) if signal else 0.05,
-            "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
-            # Phase 202: Trend Mode flag
-            "trend_mode": is_trend_mode,
+                "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
+                "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
+                "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
+                "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
+                "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
+                "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+                # Phase 202: Trend Mode flag
+                "trend_mode": is_trend_mode,
             # Phase 155: AI Optimizer settings snapshot
             "settingsSnapshot": settings_snapshot,
             # Phase 224D3: CanaryMode A/B test flag
@@ -17642,7 +17923,7 @@ class PaperTradingEngine:
             # =================================================================
             trailing_entry_active = order.get('trailingEntryActive', False)
             atr = order.get('atr', entry_price * 0.01)
-            
+
             if not trailing_entry_active:
                 # Step 1: Check if price reached pullback entry level
                 reached_entry = False
@@ -17650,7 +17931,7 @@ class PaperTradingEngine:
                     reached_entry = True
                 elif side == 'SHORT' and current_price >= entry_price:
                     reached_entry = True
-                
+
                 if reached_entry:
                     # Start trailing entry — track the extreme price
                     order['trailingEntryActive'] = True
@@ -17658,74 +17939,107 @@ class PaperTradingEngine:
                     order['trailEntryStartTime'] = current_time
                     # Initialize extreme price (bottom for LONG, peak for SHORT)
                     order['extremePrice'] = current_price
-                    
-                    # Calculate trail_entry_distance using COIN-SPECIFIC dynamic trail params
-                    # The order already carries dynamic_trail_distance from get_dynamic_trail_params()
-                    # which accounts for volatility, hurst, price, and spread.
-                    # Trail entry = 30-60% of exit trail distance (trend-adjusted)
+
                     order_hurst = order.get('hurst', 0.5)
+                    order_adx = order.get('adx', 20.0)
+                    order_spread = order.get('spreadPct', 0.05)
+                    order_vol_ratio = order.get('volumeRatio', 1.0)
+                    order_atr_pct = order.get('volatility_pct', 0) or order.get('volatilityPct', 0)
+                    if not order_atr_pct and entry_price > 0:
+                        order_atr_pct = (atr / entry_price) * 100
+                    order_atr_pct = order_atr_pct or 2.0
                     dynamic_trail_dist = order.get('dynamic_trail_distance', None)
-                    
+
                     if dynamic_trail_dist is not None and dynamic_trail_dist > 0:
-                        # Use coin-specific trail distance from dynamic params
-                        # Trending coins: tighter entry trail (30%) → enter quickly on small bounce
-                        # Mean-reverting: wider entry trail (60%) → wait for clear reversal
+                        # Entry trail starts from per-coin trail distance, then widened dynamically.
                         hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
-                        entry_trail_ratio = 0.60 - hurst_s * 0.30  # 0.30 (trending) to 0.60 (mean-reverting)
-                        trail_entry_dist = atr * dynamic_trail_dist * entry_trail_ratio
+                        entry_trail_ratio = 0.65 - hurst_s * 0.25  # 0.40 (trend) - 0.65 (range)
+                        base_trail_entry_dist = atr * dynamic_trail_dist * entry_trail_ratio
                     else:
-                        # Fallback: use ATR-based calculation with wider factor
-                        order_adx = order.get('adx', 0)
                         adx_s = min(1.0, max(0.0, (order_adx - 15) / 45))
                         hurst_s = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                         trend_s = adx_s * 0.6 + hurst_s * 0.4
-                        # 0.30 - 0.50 ATR (was 0.05-0.10 — 6x increase)
-                        trail_factor = 0.50 - trend_s * 0.20
-                        trail_entry_dist = atr * trail_factor
-                    
+                        trail_factor = 0.70 - trend_s * 0.25
+                        base_trail_entry_dist = atr * trail_factor
+
+                    trail_entry_dist = get_hybrid_runtime_trail_distance(
+                        base_trail_distance=base_trail_entry_dist,
+                        atr_pct=order_atr_pct,
+                        spread_pct=order_spread,
+                        volume_ratio=order_vol_ratio,
+                        roi_pct=0.0,
+                        exit_tightness=self.entry_tightness,
+                        hurst=order_hurst,
+                        adx=order_adx,
+                    )
+
                     order['trailEntryDistance'] = trail_entry_dist
-                    
+                    min_entry_move = float(order.get('trailEntryMinMovePct', 0.0) or 0.0)
+                    min_reversal_pct = max(0.08, min_entry_move * 0.45) if min_entry_move > 0 else 0.08
+                    order['trailEntryMinReversalPct'] = min_reversal_pct
+
                     trail_pct = (trail_entry_dist / entry_price * 100) if entry_price > 0 else 0
-                    # Phase 223: Fixed NameError — et_mult, spread_trail_mult, order_spread were undefined in this scope
-                    self.add_log(f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | Reversal≥{trail_pct:.2f}%")
-                    logger.info(f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} trail_dist={trail_pct:.2f}% et={self.entry_tightness}")
+                    self.add_log(
+                        f"📍 TRAIL ENTRY: {side} {symbol} @ ${current_price:.6f} | "
+                        f"Mesafe≥{trail_pct:.2f}% | Reversal≥{min_reversal_pct:.2f}%"
+                    )
+                    logger.info(
+                        f"📍 TRAIL ENTRY START: {side} {symbol} entry=${entry_price:.6f} extreme=${current_price:.6f} "
+                        f"trail_dist={trail_pct:.2f}% rev_min={min_reversal_pct:.2f}% et={self.entry_tightness}"
+                    )
             else:
                 # Step 2: Trailing entry active — track extreme and check reversal
                 # This mirrors Trail TP: track peakPrice, trigger when price drops by trail_distance
                 # Here: track bottomPrice (LONG) or peakPrice (SHORT), trigger on reversal
-                
                 trail_entry_distance = order.get('trailEntryDistance', atr * 0.08)
                 extreme_price = order.get('extremePrice', current_price)
                 trail_start = order.get('trailEntryStartTime', current_time)
                 trail_timeout_ms = 15 * 60 * 1000  # 15 minute timeout
-                
+
                 # Cancel distance: how far from entry before giving up
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
+                order_spread = order.get('spreadPct', 0.05)
+                order_vol_ratio = order.get('volumeRatio', 1.0)
                 adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))
                 hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
                 base_cancel = 0.7 + trend_strength * 0.8
                 cancel_distance = atr * base_cancel
-                
+                cancel_distance *= math.sqrt(_clamp(self.entry_tightness, 0.5, 15.0))
+                cancel_distance *= 1.0 + max(0.0, order_spread - 0.08) * 1.8
+                if order_vol_ratio < 1.0:
+                    cancel_distance *= 1.12
+                elif order_vol_ratio > 2.0:
+                    cancel_distance *= 0.95
+                cancel_distance = _clamp(cancel_distance, atr * 0.4, atr * 4.0)
+
                 elapsed_ms = current_time - trail_start
                 elapsed_secs = elapsed_ms / 1000
-                
+                min_reversal_pct = float(order.get('trailEntryMinReversalPct', 0.08) or 0.08)
+
                 if side == 'LONG':
                     # Track bottom price (like trail TP tracks peak)
                     if current_price < extreme_price:
                         order['extremePrice'] = current_price
                         extreme_price = current_price
-                    
+
                     # Reversal confirmed: price rose from bottom by trail_entry_distance
                     if current_price >= extreme_price + trail_entry_distance:
                         reversal_pct = ((current_price - extreme_price) / extreme_price * 100) if extreme_price > 0 else 0
-                        self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Bottom=${extreme_price:.6f} +{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
-                        logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} bottom=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
-                        self.pipeline_metrics['trail_entry_ok'] += 1
-                        await self.execute_pending_order(order, current_price)
-                        continue
-                    
+                        if reversal_pct >= min_reversal_pct:
+                            self.add_log(
+                                f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | "
+                                f"Bottom=${extreme_price:.6f} +{reversal_pct:.2f}% ({elapsed_secs:.0f}s)"
+                            )
+                            logger.info(
+                                f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} "
+                                f"bottom=${extreme_price:.6f} reversal={reversal_pct:.2f}% (min={min_reversal_pct:.2f}%)"
+                            )
+                            self.pipeline_metrics['trail_entry_ok'] += 1
+                            await self.execute_pending_order(order, current_price)
+                            continue
+
                     # Cancel: dropped too far below entry
                     if current_price < entry_price - cancel_distance:
                         signal_score = order.get('signalScore', 0)
@@ -17743,22 +18057,28 @@ class PaperTradingEngine:
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
                         continue
-                
                 else:  # SHORT
                     # Track peak price (like trail TP tracks peak for short)
                     if current_price > extreme_price:
                         order['extremePrice'] = current_price
                         extreme_price = current_price
-                    
+
                     # Reversal confirmed: price dropped from peak by trail_entry_distance
                     if current_price <= extreme_price - trail_entry_distance:
                         reversal_pct = ((extreme_price - current_price) / extreme_price * 100) if extreme_price > 0 else 0
-                        self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Peak=${extreme_price:.6f} -{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
-                        logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} peak=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
-                        self.pipeline_metrics['trail_entry_ok'] += 1
-                        await self.execute_pending_order(order, current_price)
-                        continue
-                    
+                        if reversal_pct >= min_reversal_pct:
+                            self.add_log(
+                                f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | "
+                                f"Peak=${extreme_price:.6f} -{reversal_pct:.2f}% ({elapsed_secs:.0f}s)"
+                            )
+                            logger.info(
+                                f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} "
+                                f"peak=${extreme_price:.6f} reversal={reversal_pct:.2f}% (min={min_reversal_pct:.2f}%)"
+                            )
+                            self.pipeline_metrics['trail_entry_ok'] += 1
+                            await self.execute_pending_order(order, current_price)
+                            continue
+
                     # Cancel: rose too far above entry
                     if current_price > entry_price + cancel_distance:
                         signal_score = order.get('signalScore', 0)
@@ -17776,7 +18096,7 @@ class PaperTradingEngine:
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
                         continue
-                
+
                 # Timeout check
                 if elapsed_ms > trail_timeout_ms:
                     # Fix 2: Strong signals get market fallback instead of timeout
@@ -17788,13 +18108,14 @@ class PaperTradingEngine:
                         await self.execute_pending_order(order, current_price, force_market=True)
                         continue
                     # Normal timeout
-                    self.pending_orders.remove(order)
+                    if order in self.pending_orders:
+                        self.pending_orders.remove(order)
                     self.pipeline_metrics['trail_entry_timeout'] += 1
                     self.set_execution_feedback(symbol, "TRAIL_ENTRY_TIMEOUT")
                     self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı, score={signal_score})")
                     logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s score={signal_score}")
                     continue
-                
+
                 # Periodic log (every ~30s)
                 trail_pct = (trail_entry_distance / entry_price * 100) if entry_price > 0 else 0
                 if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
