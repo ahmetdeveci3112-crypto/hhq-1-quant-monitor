@@ -21293,11 +21293,20 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     else:
                                         volatility_factor = 0.3
                                     
-                                    # COMBINED LEVERAGE
-                                    dynamic_leverage = int(round(base_leverage * price_factor * spread_factor * volatility_factor))
+                                    # COMBINED LEVERAGE:
+                                    # backend selector output (MTF+price+spread+volatility) × user multiplier (Settings modal)
+                                    base_dynamic_leverage = base_leverage * price_factor * spread_factor * volatility_factor
+                                    user_lev_mult = (
+                                        getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+                                        if 'global_paper_trader' in globals() else 1.0
+                                    )
+                                    dynamic_leverage = int(round(base_dynamic_leverage * user_lev_mult))
                                     dynamic_leverage = max(3, min(75, dynamic_leverage))
                                     
                                     signal['leverage'] = dynamic_leverage
+                                    signal['leverage_includes_user_mult'] = True
+                                    signal['leverage_user_mult'] = round(user_lev_mult, 2)
+                                    signal['baseLeverage'] = max(3, min(75, int(round(base_dynamic_leverage))))
                                     signal['tf_count'] = tf_count
                                     signal['price_factor'] = round(price_factor, 2)
                                     signal['spread_factor'] = round(spread_factor, 2)
@@ -21305,13 +21314,22 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     signal['volatility_pct'] = round(volatility_pct, 2)
                                     
                                     # Log if any factor reduced leverage
-                                    if price_factor < 0.9 or spread_factor < 0.9 or volatility_factor < 0.9:
-                                        logger.info(f"📊 Leverage: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} × vol={volatility_factor:.2f} → {dynamic_leverage}x | {active_symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
+                                    if price_factor < 0.9 or spread_factor < 0.9 or volatility_factor < 0.9 or user_lev_mult != 1.0:
+                                        logger.info(
+                                            f"📊 Leverage: base={base_leverage}x × price={price_factor:.2f} × spread={spread_factor:.2f} × vol={volatility_factor:.2f} × user={user_lev_mult:.1f} "
+                                            f"→ {dynamic_leverage}x | {active_symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)"
+                                        )
                                     else:
                                         logger.info(f"📊 Dynamic Leverage: {dynamic_leverage}x (TF:{tf_count}/3)")
                                 except Exception as lev_err:
                                     logger.warning(f"Dynamic leverage error: {lev_err}")
-                                    signal['leverage'] = 25
+                                    user_lev_mult = (
+                                        getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+                                        if 'global_paper_trader' in globals() else 1.0
+                                    )
+                                    signal['leverage'] = max(3, min(75, int(round(25 * user_lev_mult))))
+                                    signal['leverage_includes_user_mult'] = True
+                                    signal['leverage_user_mult'] = round(user_lev_mult, 2)
                                 
                                 # =====================================================
                                 # VOLUME PROFILE BOOST (Cloud Scanner Parity)
