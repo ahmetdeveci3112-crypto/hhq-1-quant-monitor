@@ -4790,6 +4790,50 @@ def get_dynamic_trail_params(
     
     return round(final_activation, 2), round(final_distance, 2)
 
+
+# =====================================================
+# DYNAMIC TRAIL ACTIVATION THRESHOLD
+# ATR + spread + volume bazlı dinamik eşik hesaplama
+# Sabit 0.75% / 5.0% yerine piyasa koşullarına göre ayarlanır
+# =====================================================
+def get_dynamic_trail_activation_threshold(atr_pct: float, spread_pct: float, volume_ratio: float, leverage: int) -> tuple:
+    """
+    Calculate dynamic trail activation thresholds based on market conditions.
+    
+    Args:
+        atr_pct: ATR as percentage of price (e.g., 2.0 for 2%)
+        spread_pct: Current bid-ask spread percentage
+        volume_ratio: Current volume / average volume ratio
+        leverage: Position leverage
+    
+    Returns:
+        tuple: (min_price_move_pct, min_roi_pct)
+    """
+    # Base: ATR'nin %40'ı (min 0.5%, max 2.0%)
+    base_move = max(0.5, min(2.0, atr_pct * 0.40))
+    
+    # Spread factor: yüksek spread → daha geniş eşik (noise filtresi)
+    # 0.05% normal spread, üstü = ek buffer
+    spread_factor = 1.0 + max(0, (spread_pct - 0.05)) * 3.0
+    
+    # Volume factor: düşük volume → daha geniş eşik (fake move filtresi)
+    if volume_ratio >= 2.0:
+        vol_factor = 0.85    # Yüksek volume: daha erken trail OK
+    elif volume_ratio >= 1.0:
+        vol_factor = 1.0     # Normal
+    else:
+        vol_factor = 1.25    # Düşük volume: daha geç trail
+    
+    min_price_move = round(base_move * spread_factor * vol_factor, 3)
+    min_price_move = max(0.4, min(2.5, min_price_move))  # Hard clamp
+    
+    # ROI = min_price_move × leverage (ama min 4%, max 20%)
+    min_roi = round(min_price_move * leverage, 1)
+    min_roi = max(4.0, min(20.0, min_roi))
+    
+    return min_price_move, min_roi
+
+
 def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: float) -> bool:
     """
     Phase 217: Unified trail-based Emergency SL check — single source of truth.
@@ -8612,15 +8656,21 @@ async def background_scanner_loop():
                             else:
                                 dynamic_trail_distance = volatility_adjusted_distance          # Normal
                             
-                            # Phase 231d: Price move based trail activation (0.75% of entry price)
+                            # Phase 231d: Dynamic trail activation threshold (ATR + spread + volume)
                             leverage = pos.get('leverage', 10)
                             if pos['side'] == 'LONG':
                                 price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                             else:
                                 price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
                             roi_pct = price_move_pct * leverage
-                            min_price_move_for_trail = 0.75  # Phase 231d: %0.75 price move
-                            min_roi_for_trail = 5.0  # Phase 231j: OR %5 ROI (for high leverage)
+                            
+                            # Dynamic thresholds from market conditions
+                            pos_atr_pct = pos.get('volatility_pct', 2.0)
+                            pos_spread = pos.get('spreadPct', 0.05)
+                            pos_vol_ratio = pos.get('volumeRatio', 1.0)
+                            min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
+                                pos_atr_pct, pos_spread, pos_vol_ratio, leverage
+                            )
                             
                             # Phase 231h: Fee buffer for breakeven (0.1% = taker fee both sides)
                             be_long = entry_price * 1.001
@@ -8628,8 +8678,12 @@ async def background_scanner_loop():
                             
                             if pos['side'] == 'LONG':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                # Phase 231j: price_move >= 0.75% OR roi >= 5%
-                                if price_move_pct >= min_price_move_for_trail or roi_pct >= min_roi_for_trail or trail_already_active:
+                                # Hybrid rule: price_move >= min OR (roi >= min_roi AND price_move >= min*0.6)
+                                trail_should_activate = (
+                                    price_move_pct >= min_price_move_for_trail or
+                                    (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
+                                )
+                                if trail_should_activate or trail_already_active:
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     # Phase 231h: Clamp — trail stop never below breakeven
                                     new_trailing = max(new_trailing, be_long)
@@ -8639,10 +8693,14 @@ async def background_scanner_loop():
                                             pos['isTrailingActive'] = True
                                             # Breakeven SL on first activation
                                             pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
-                                            logger.info(f"📊 TRAIL+BE: {pos_symbol} LONG trail ON, SL→breakeven ${be_long:.6f}")
+                                            logger.info(f"📊 TRAIL_DYN: {pos_symbol} LONG trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                             elif pos['side'] == 'SHORT':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                if price_move_pct >= min_price_move_for_trail or roi_pct >= min_roi_for_trail or trail_already_active:
+                                trail_should_activate = (
+                                    price_move_pct >= min_price_move_for_trail or
+                                    (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
+                                )
+                                if trail_should_activate or trail_already_active:
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     # Phase 231h: Clamp — trail stop never above breakeven
                                     new_trailing = min(new_trailing, be_short)
@@ -8651,7 +8709,7 @@ async def background_scanner_loop():
                                         if not trail_already_active:
                                             pos['isTrailingActive'] = True
                                             pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
-                                            logger.info(f"📊 TRAIL+BE: {pos_symbol} SHORT trail ON, SL→breakeven ${be_short:.6f}")
+                                            logger.info(f"📊 TRAIL_DYN: {pos_symbol} SHORT trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                                     
                     except Exception as pos_error:
                         logger.debug(f"Position update error: {pos_error}")
@@ -9028,15 +9086,20 @@ async def on_position_price_update(symbol: str, ticker: dict):
         elif ws_pnl_pct >= 8.0:
             dynamic_trail_distance = dynamic_trail_distance * 0.85
         
-        # Phase 231d: Price move based trail activation (0.75% of entry price)
+        # Dynamic trail activation threshold (ATR + spread + volume)
         ws_leverage = pos.get('leverage', 10)
         if pos['side'] == 'LONG':
             ws_price_move_pct = ((candle_close_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
         else:
             ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
         ws_roi_pct = ws_price_move_pct * ws_leverage
-        ws_min_price_move = 0.75
-        ws_min_roi = 5.0  # Phase 231j
+        
+        ws_atr_pct = pos.get('volatility_pct', 2.0)
+        ws_spread = pos.get('spreadPct', 0.05)
+        ws_vol_ratio = pos.get('volumeRatio', 1.0)
+        ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
+            ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage
+        )
         
         # Phase 231h: Fee buffer for breakeven
         be_long = entry_price * 1.001
@@ -9044,7 +9107,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
-            if ws_price_move_pct >= ws_min_price_move or ws_roi_pct >= ws_min_roi or ws_trail_already_active:
+            # Hybrid rule: price_move >= min OR (roi >= min_roi AND price_move >= min*0.6)
+            ws_should_activate = (
+                ws_price_move_pct >= ws_min_price_move or
+                (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
+            )
+            if ws_should_activate or ws_trail_already_active:
                 new_trailing = candle_close_price - dynamic_trail_distance
                 # Phase 231h: Clamp — trail stop never below breakeven
                 new_trailing = max(new_trailing, be_long)
@@ -9053,9 +9121,13 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
                         pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
-                        logger.info(f"📊 TRAIL+BE(WS): {pos.get('symbol')} LONG trail ON, SL→breakeven")
+                        logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} LONG trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
         elif pos['side'] == 'SHORT':
-            if ws_price_move_pct >= ws_min_price_move or ws_roi_pct >= ws_min_roi or ws_trail_already_active:
+            ws_should_activate = (
+                ws_price_move_pct >= ws_min_price_move or
+                (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
+            )
+            if ws_should_activate or ws_trail_already_active:
                 new_trailing = candle_close_price + dynamic_trail_distance
                 new_trailing = min(new_trailing, be_short)
                 if new_trailing < trailing_stop:
@@ -9063,7 +9135,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
                         pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
-                        logger.info(f"📊 TRAIL+BE(WS): {pos.get('symbol')} SHORT trail ON, SL→breakeven")
+                        logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} SHORT trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
 
 
 # ============================================================================
@@ -9286,15 +9358,20 @@ async def position_price_update_loop():
                         elif fast_pnl_pct >= 8.0:
                             dynamic_trail_distance = dynamic_trail_distance * 0.85
                         
-                        # Phase 213: Minimum ROI check — trail sadece %1.5 ROI sonrası aktive olur
+                        # Dynamic trail activation threshold (ATR + spread + volume)
                         fast_leverage = pos.get('leverage', 10)
                         if pos['side'] == 'LONG':
                             fast_price_move = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                         else:
                             fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                         fast_roi = fast_price_move * fast_leverage
-                        fast_min_price_move = 0.75
-                        fast_min_roi = 5.0  # Phase 231j
+                        
+                        fast_atr_pct = pos.get('volatility_pct', 2.0)
+                        fast_spread = pos.get('spreadPct', 0.05)
+                        fast_vol_ratio = pos.get('volumeRatio', 1.0)
+                        fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
+                            fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage
+                        )
                         
                         # Phase 231h: Fee buffer for breakeven
                         be_long = entry_price * 1.001
@@ -9302,7 +9379,11 @@ async def position_price_update_loop():
                         
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
-                            if fast_price_move >= fast_min_price_move or fast_roi >= fast_min_roi or fast_trail_already_active:
+                            fast_should_activate = (
+                                fast_price_move >= fast_min_price_move or
+                                (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
+                            )
+                            if fast_should_activate or fast_trail_already_active:
                                 new_trailing = current_price - dynamic_trail_distance
                                 # Phase 231h: Clamp — trail stop never below breakeven
                                 new_trailing = max(new_trailing, be_long)
@@ -9312,7 +9393,11 @@ async def position_price_update_loop():
                                         pos['isTrailingActive'] = True
                                         pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
                         elif pos['side'] == 'SHORT':
-                            if fast_price_move >= fast_min_price_move or fast_roi >= fast_min_roi or fast_trail_already_active:
+                            fast_should_activate = (
+                                fast_price_move >= fast_min_price_move or
+                                (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
+                            )
+                            if fast_should_activate or fast_trail_already_active:
                                 new_trailing = current_price + dynamic_trail_distance
                                 new_trailing = min(new_trailing, be_short)
                                 if new_trailing < trailing_stop:
