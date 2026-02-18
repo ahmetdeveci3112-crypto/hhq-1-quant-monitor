@@ -4395,8 +4395,76 @@ EQ_MIN_IMBALANCE = 4.0          # Koşul B: min OB imbalance
 EQ_MIN_OB_TREND = 2.0           # Koşul B: min ob_imbalance_trend
 EQ_MIN_VOLUME_24H = 1_500_000   # Koşul C: min 24h volume ($)
 EQ_MAX_SPREAD = 0.20            # Koşul C: max spread (%)
-EQ_MIN_DEPTH_USD = 120_000      # Execution: min total depth ($)
+EQ_MIN_DEPTH_USD = 120_000      # Legacy max cap for execution depth threshold
+EQ_MIN_DEPTH_USD_BASE = 20_000  # Dynamic min floor
 EQ_OBI_OPPOSE_VETO = 0.35       # Execution: OBI opposing veto threshold
+
+# MTF soft-override for high-quality setups
+MTF_SOFT_OVERRIDE_ENABLED = True
+MTF_SOFT_OVERRIDE_MIN_SCORE = 110
+MTF_SOFT_OVERRIDE_PENALTY = 12
+MTF_SOFT_OVERRIDE_MIN_EQ = 3
+
+
+def get_dynamic_depth_threshold(
+    spread_pct: float,
+    volume_24h: float,
+    signal_score: float,
+    leverage: int
+) -> float:
+    """
+    Compute dynamic thin-book threshold.
+    Lower threshold for high-quality/high-liquidity signals, higher for noisy setups.
+    Clamped to [EQ_MIN_DEPTH_USD_BASE, EQ_MIN_DEPTH_USD].
+    """
+    base = 60_000.0
+
+    # Wider spreads demand more depth.
+    if spread_pct <= 0.05:
+        spread_factor = 0.85
+    elif spread_pct <= 0.15:
+        spread_factor = 1.00
+    elif spread_pct <= 0.35:
+        spread_factor = 1.20
+    else:
+        spread_factor = 1.40
+
+    # Higher 24h volume lowers required top-of-book depth.
+    if volume_24h >= 80_000_000:
+        vol_factor = 0.60
+    elif volume_24h >= 20_000_000:
+        vol_factor = 0.75
+    elif volume_24h >= 5_000_000:
+        vol_factor = 0.90
+    elif volume_24h >= EQ_MIN_VOLUME_24H:
+        vol_factor = 1.00
+    else:
+        vol_factor = 1.15
+
+    # Stronger score can pass with thinner book.
+    if signal_score >= 120:
+        score_factor = 0.65
+    elif signal_score >= 110:
+        score_factor = 0.75
+    elif signal_score >= 100:
+        score_factor = 0.85
+    elif signal_score >= 90:
+        score_factor = 0.95
+    else:
+        score_factor = 1.00
+
+    # Higher leverage requires a bit more depth.
+    if leverage <= 8:
+        lev_factor = 0.90
+    elif leverage <= 15:
+        lev_factor = 1.00
+    elif leverage <= 25:
+        lev_factor = 1.10
+    else:
+        lev_factor = 1.20
+
+    raw = base * spread_factor * vol_factor * score_factor * lev_factor
+    return max(EQ_MIN_DEPTH_USD_BASE, min(float(EQ_MIN_DEPTH_USD), raw))
 
 # Fibonacci ratios
 FIB_RATIOS = {
@@ -5910,6 +5978,8 @@ class CoinOpportunity:
         self.fib_entry: float = 0.0
         self.fib_blend_alpha: float = 0.0
         self.entry_price: float = 0.0  # Backend ideal_entry price
+        self.execution_reject_reason: Optional[str] = None
+        self.execution_reject_ts: int = 0
     
     def to_dict(self) -> dict:
         return {
@@ -5944,6 +6014,8 @@ class CoinOpportunity:
             "fibEntry": round(float(self.fib_entry), 8) if self.fib_entry else 0,
             "fibBlendAlpha": float(self.fib_blend_alpha),
             "entryPriceBackend": round(float(self.entry_price), 8) if self.entry_price else 0,
+            "executionRejectReason": self.execution_reject_reason,
+            "executionRejectTs": int(self.execution_reject_ts or 0),
         }
 
 
@@ -6474,6 +6546,19 @@ class LightweightCoinAnalyzer:
             self.opportunity.fib_entry = signal.get('fibEntry', 0)
             self.opportunity.fib_blend_alpha = signal.get('fibBlendAlpha', 0)
             self.opportunity.entry_price = signal.get('entryPrice', 0) or signal.get('entry', 0)
+            # Execution-stage reject reason (if any) for UI observability
+            try:
+                if 'global_paper_trader' in globals():
+                    feedback = global_paper_trader.get_execution_feedback(self.symbol)
+                    if feedback:
+                        self.opportunity.execution_reject_reason = feedback.get('reason')
+                        self.opportunity.execution_reject_ts = int(feedback.get('ts', 0) or 0)
+                    else:
+                        self.opportunity.execution_reject_reason = None
+                        self.opportunity.execution_reject_ts = 0
+            except Exception:
+                self.opportunity.execution_reject_reason = None
+                self.opportunity.execution_reject_ts = 0
             return signal
         else:
             # Decay signal score over time if no new signal
@@ -9452,6 +9537,18 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     """Process a signal for paper trading execution."""
     if not global_paper_trader.enabled:
         return
+
+    action = signal.get('action', 'NONE')
+    if action == 'NONE':
+        return
+
+    symbol = signal.get('symbol', global_paper_trader.symbol)
+
+    def reject_feedback(reason: str):
+        try:
+            global_paper_trader.set_execution_feedback(symbol, reason)
+        except Exception:
+            pass
     
     # ================================================================
     # Phase 142: Block signals during recovery cooldown
@@ -9459,22 +9556,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if portfolio_recovery_manager.is_in_cooldown():
         cooldown_remaining = portfolio_recovery_manager.get_cooldown_remaining()
         logger.info(f"⏸️ RECOVERY COOLDOWN: Skipping signal {signal.get('symbol', '?')}, {cooldown_remaining:.1f}h remaining")
+        reject_feedback("RECOVERY_COOLDOWN")
         return None
-    
-    action = signal.get('action', 'NONE')
-    if action == 'NONE':
-        return
     
     # Phase 225: Block signals during price shock (trade execution level gate)
     try:
         shock_blocked, shock_reason = price_shock_manager.should_block_signal(action, signal.get('symbol', ''))
         if shock_blocked:
             logger.info(f"⚡ SHOCK_BLOCK: {signal.get('symbol', '?')} {action} blocked at execution — {shock_reason}")
+            reject_feedback(f"SHOCK_BLOCK:{shock_reason}")
             return None
     except Exception:
         pass
-    
-    symbol = signal.get('symbol', global_paper_trader.symbol)
+
     atr = signal.get('atr', 0)
     
     # Phase 127: Log signal processing entry for tracing
@@ -9537,6 +9631,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         
         signal_log_data['reject_reason'] = 'EXISTING_POSITION'
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        reject_feedback("EXISTING_POSITION")
         logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
         return
     
@@ -9544,6 +9639,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
         signal_log_data['reject_reason'] = 'MAX_POSITIONS'
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        reject_feedback("MAX_POSITIONS")
         logger.info(f"🚫 SKIPPING {symbol}: Max positions reached ({len(global_paper_trader.positions)})")
         return
     
@@ -9562,6 +9658,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if same_dir_margin >= max_dir_exposure:
         signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        reject_feedback("DIRECTION_EXPOSURE")
         logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
         return
     
@@ -9570,6 +9667,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         signal_log_data['reject_reason'] = 'BLACKLISTED'
         signal_log_data['blacklisted'] = True
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        reject_feedback("BLACKLISTED")
         logger.info(f"🚫 SKIPPING {symbol}: Blacklisted")
         return
     
@@ -9588,6 +9686,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         if not btc_allowed:
             signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback(f"BTC_FILTER:{btc_reason}")
             logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason}")
             return
         
@@ -9631,11 +9730,24 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         try:
             depth_data = obi_detector.obi_cache.get(symbol, {})
             total_depth = depth_data.get('total_bid_usd', 0) + depth_data.get('total_ask_usd', 0)
-            if 0 < total_depth < EQ_MIN_DEPTH_USD:  # Phase EQG: Dynamic threshold
+            signal_score = signal.get('confidenceScore', 0)
+            signal_leverage = int(signal.get('leverage', 10) or 10)
+            dynamic_depth_threshold = get_dynamic_depth_threshold(
+                spread_pct=float(signal.get('spreadPct', 0.05) or 0.05),
+                volume_24h=float(signal.get('volume24h', 0) or 0),
+                signal_score=float(signal_score),
+                leverage=signal_leverage
+            )
+            if 0 < total_depth < dynamic_depth_threshold:
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                logger.info(f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${EQ_MIN_DEPTH_USD/1000:.0f}K → BLOCKED")
+                global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
+                reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
+                logger.info(
+                    f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
+                    f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
+                )
                 return
         except Exception:
             pass  # depth data may not always be available
@@ -9661,6 +9773,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 signal_log_data['reject_reason'] = f'OBI_VETO:opposing_{obi_value:.3f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                reject_feedback(f"OBI_VETO:{obi_value:+.3f}")
                 logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} > {EQ_OBI_OPPOSE_VETO} | Opposing pressure → BLOCKED")
                 return
             else:
@@ -9679,6 +9792,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             if abs(obi_value) < 0.12 and vol_ratio_val < 1.2:
                 signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
                 logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
                 return
             logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
@@ -9702,6 +9816,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             if long_penalty >= 0.5:
                 signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                reject_feedback("REGIME_BLOCKED:TRENDING_DOWN")
                 logger.info(f"🚫 REGIME BLOCK: {action} {symbol} - TRENDING_DOWN blocks LONGs")
                 return
             else:
@@ -9743,6 +9858,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if ma_vetoed:
         signal_log_data['reject_reason'] = f"MA_ALIGNMENT_VETO:{ma_veto_reason}"
         safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        reject_feedback(f"MA_ALIGNMENT_VETO:{ma_veto_reason}")
         logger.warning(f"🚫 MA_VETO: {action} {symbol} — {ma_veto_reason}")
         return
     
@@ -9754,10 +9870,30 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     signal_log_data['mtf_reason'] = mtf_result.get('reason', '')
     
     if not mtf_result['confirmed']:
-        signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-        logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
-        return
+        signal_score = int(signal.get('confidenceScore', 0) or 0)
+        eq_count = len(signal.get('entryQualityReasons') or [])
+        soft_override_ok = (
+            MTF_SOFT_OVERRIDE_ENABLED
+            and signal_score >= MTF_SOFT_OVERRIDE_MIN_SCORE
+            and eq_count >= MTF_SOFT_OVERRIDE_MIN_EQ
+        )
+        if soft_override_ok:
+            old_score = signal_score
+            signal['confidenceScore'] = max(40, signal_score - MTF_SOFT_OVERRIDE_PENALTY)
+            signal['mtf_override'] = True
+            signal['mtf_override_reason'] = mtf_result.get('reason', '')
+            global_paper_trader.pipeline_metrics['mtf_soft_override'] += 1
+            logger.warning(
+                f"⚠️ MTF_SOFT_OVERRIDE: {action} {symbol} score {old_score}->{signal['confidenceScore']} "
+                f"(eq={eq_count}/3) | {mtf_result.get('reason', '')}"
+            )
+        else:
+            signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
+            reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
+            logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
+            return
     
     # Phase 127: Log MTF confirmation pass
     logger.info(f"✅ MTF_CONFIRMATION PASS: {symbol} {action} (score: {mtf_result.get('mtf_score', 0)})")
@@ -9765,6 +9901,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Signal is ACCEPTED
     signal_log_data['accepted'] = True
     safe_create_task(sqlite_manager.save_signal(signal_log_data))
+    global_paper_trader.clear_execution_feedback(symbol)
     
     # Log MTF score info
     mtf_score = mtf_result.get('mtf_score', 0)
@@ -9909,6 +10046,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         if ev <= -0.5:
             signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback(f"NEGATIVE_EV:{ev:.4f}")
             logger.info(f"📉 EV_REJECT: {action} {symbol} | EV={ev:.4f} <= -0.5 | score={signal.get('confidenceScore', 0)}")
             return
         elif ev < 0:
@@ -16564,8 +16702,11 @@ class PaperTradingEngine:
             'stale_dropped': 0, 'trail_entry_start': 0, 'trail_entry_ok': 0,
             'trail_entry_fail': 0, 'trail_entry_timeout': 0, 'market_fallback': 0,
             'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0,
-            'fallback_on_fail': 0, 'fallback_on_expire': 0
+            'fallback_on_fail': 0, 'fallback_on_expire': 0,
+            'thin_book_rejected': 0, 'mtf_rejected': 0, 'mtf_soft_override': 0
         }
+        # Symbol-level execution feedback for UI (latest rejection reason).
+        self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
         
         # =========================================================================
         # COIN BLACKLIST SYSTEM
@@ -16771,6 +16912,37 @@ class PaperTradingEngine:
             safe_create_task(sqlite_manager.add_log(timestamp, message, ts))
         except Exception:
             pass  # Ignore if event loop not running
+
+    def set_execution_feedback(self, symbol: str, reason: str):
+        """Store latest execution-stage rejection reason for a symbol."""
+        if not symbol:
+            return
+        now_ms = int(datetime.now().timestamp() * 1000)
+        self.execution_feedback[symbol] = {
+            "reason": str(reason),
+            "ts": now_ms,
+        }
+
+    def clear_execution_feedback(self, symbol: str):
+        """Clear execution feedback once symbol progresses to pending/filled."""
+        if symbol in self.execution_feedback:
+            self.execution_feedback.pop(symbol, None)
+
+    def get_execution_feedback(self, symbol: str, ttl_sec: int = 1800) -> Optional[dict]:
+        """Get recent execution feedback; auto-expire stale entries."""
+        if not symbol:
+            return None
+        item = self.execution_feedback.get(symbol)
+        if not item:
+            return None
+        ts = int(item.get("ts", 0) or 0)
+        if ts <= 0:
+            return None
+        age_ms = int(datetime.now().timestamp() * 1000) - ts
+        if age_ms > ttl_sec * 1000:
+            self.execution_feedback.pop(symbol, None)
+            return None
+        return item
     
     # =========================================================================
     # COIN BLACKLIST SYSTEM METHODS
@@ -17024,12 +17196,14 @@ class PaperTradingEngine:
         
         # BLACKLIST CHECK: Skip coins that consistently cause losses
         if self.is_coin_blacklisted(trade_symbol):
+            self.set_execution_feedback(trade_symbol, "BLACKLISTED")
             logger.debug(f"Skipping {trade_symbol} - blacklisted")
             return None
         
         # Check position + pending order limits
         total_exposure = len(self.positions) + len(self.pending_orders)
         if total_exposure >= self.max_positions:
+            self.set_execution_feedback(trade_symbol, "MAX_EXPOSURE")
             logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
             return None  # Silently skip to avoid log spam
         
@@ -17038,9 +17212,11 @@ class PaperTradingEngine:
         short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
         max_same_direction = max(3, self.max_positions * 70 // 100)
         if side == 'LONG' and long_count >= max_same_direction:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
             logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık (max {max_same_direction})")
             return None
         if side == 'SHORT' and short_count >= max_same_direction:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
             logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
             return None
         
@@ -17058,6 +17234,7 @@ class PaperTradingEngine:
         )
         max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
         if same_dir_margin >= max_dir_exposure:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
             logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
             return None
         
@@ -17069,18 +17246,21 @@ class PaperTradingEngine:
         same_coin_same_dir_pend = [p for p in self.pending_orders if p.get('symbol') == trade_symbol and p.get('side') == side]
         
         if len(same_coin_same_dir_pos) + len(same_coin_same_dir_pend) >= 3:
+            self.set_execution_feedback(trade_symbol, "SCALE_LIMIT")
             logger.info(f"🚫 OPEN_POS SKIP: Scale-in limit reached for {trade_symbol} {side}")
             return None  # Silently skip scale-in limit
         
         # Check for existing pending order for same symbol (avoid duplicate pending)
         existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
         if existing_pending:
+            self.set_execution_feedback(trade_symbol, "PENDING_EXISTS")
             logger.info(f"🚫 OPEN_POS SKIP: Pending order already exists for {trade_symbol}")
             return None  # Already have pending order for this symbol
         
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
+            self.set_execution_feedback(trade_symbol, "HEDGING_DISABLED")
             logger.info(f"🚫 OPEN_POS SKIP: Hedging disabled, opposite pos exists for {trade_symbol}")
             return None
         
@@ -17332,6 +17512,7 @@ class PaperTradingEngine:
         
         self.pending_orders.append(pending_order)
         self.pipeline_metrics['pending_created'] += 1
+        self.clear_execution_feedback(trade_symbol)
         self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         
@@ -17376,6 +17557,7 @@ class PaperTradingEngine:
                 if order in self.pending_orders:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics['pending_expired'] += 1
+                self.set_execution_feedback(symbol, "PENDING_EXPIRED")
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 continue
@@ -17393,6 +17575,7 @@ class PaperTradingEngine:
                 if pending_age_min > (stale_threshold_min + STALE_GRACE_MIN) and adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['stale_dropped'] += 1
+                    self.set_execution_feedback(symbol, "STALE_SIGNAL")
                     self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
                     logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, stale_thresh={stale_threshold_min}min+{STALE_GRACE_MIN}min, score {original_score}→{adjusted_score})")
                     continue
@@ -17423,6 +17606,7 @@ class PaperTradingEngine:
                         if price_drop_pct > 3.0:  # Fiyat %3'den fazla düştü - entry kaçırıldı
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
+                            self.set_execution_feedback(symbol, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
                             continue
@@ -17432,6 +17616,7 @@ class PaperTradingEngine:
                         if price_rise_pct > 3.0:  # Fiyat %3'den fazla yükseldi - entry kaçırıldı
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
+                            self.set_execution_feedback(symbol, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
                             continue
@@ -17445,6 +17630,7 @@ class PaperTradingEngine:
                     # Konfirmasyon süresi doldu - sinyali onayla
                     order['confirmed'] = True
                     self.pipeline_metrics['signal_confirmed'] += 1
+                    self.clear_execution_feedback(symbol)
                     self.add_log(f"✅ SIGNAL CONFIRMED: {side} {symbol} @ ${current_price:.4f} (5dk bekleme tamamlandı)")
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
             
@@ -17553,6 +17739,7 @@ class PaperTradingEngine:
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
+                        self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
                         continue
@@ -17585,6 +17772,7 @@ class PaperTradingEngine:
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
+                        self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
                         continue
@@ -17602,6 +17790,7 @@ class PaperTradingEngine:
                     # Normal timeout
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['trail_entry_timeout'] += 1
+                    self.set_execution_feedback(symbol, "TRAIL_ENTRY_TIMEOUT")
                     self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı, score={signal_score})")
                     logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s score={signal_score}")
                     continue
@@ -17766,6 +17955,7 @@ class PaperTradingEngine:
                         logger.warning(f"🚫 SPREAD_FILTER: Rejecting {side} {symbol} entry — spread={pre_spread:.3f}% > {ENTRY_SPREAD_LIMIT}% (bid=${pre_bid:.6f} ask=${pre_ask:.6f})")
                         self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped (spread {pre_spread:.2f}% too wide)")
                         self.pipeline_metrics['spread_rejected'] += 1
+                        self.set_execution_feedback(symbol, f"SPREAD_FILTER:{pre_spread:.2f}%")
                         # Return order to pending for retry
                         if order not in self.pending_orders:
                             self.pending_orders.append(order)
@@ -17790,6 +17980,7 @@ class PaperTradingEngine:
                             logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} REJECTED — price drifted {price_drift_pct:.2f}% since signal (signal=${signal_price:.6f} → now=${current_price:.6f})")
                             self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} price drifted {price_drift_pct:.1f}% since signal")
                             self.pipeline_metrics['drift_rejected'] += 1
+                            self.set_execution_feedback(symbol, f"SLIPPAGE_GUARD:{price_drift_pct:.2f}%")
                             # Don't retry — signal is stale
                             return
                         else:
@@ -17814,6 +18005,7 @@ class PaperTradingEngine:
                     if fill_slippage > MAX_FILL_SLIPPAGE_PCT:
                         logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} fill slippage {fill_slippage:.3f}% > max {MAX_FILL_SLIPPAGE_PCT}% — CLOSING immediately")
                         self.add_log(f"🚫 SLIPPAGE REJECT: {symbol} closed (fill slip {fill_slippage:.2f}%)")
+                        self.set_execution_feedback(symbol, f"SLIPPAGE_REJECT:{fill_slippage:.2f}%")
                         try:
                             await live_binance_trader.close_position(
                                 symbol=symbol,
@@ -17851,12 +18043,14 @@ class PaperTradingEngine:
                 else:
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
                     self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi (yetersiz bakiye veya symbol hatası)")
+                    self.set_execution_feedback(symbol, "BINANCE_ORDER_FAILED")
                     return  # Don't create position if Binance order failed
                     
             except Exception as e:
                 error_msg = str(e)[:80]  # Truncate long error messages
                 logger.error(f"❌ LIVE ORDER ERROR: {e}")
                 self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
+                self.set_execution_feedback(symbol, "BINANCE_ORDER_ERROR")
                 return  # Don't create position if there was an error
         elif force_market and live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
             # Force market: bypass spread/drift guards, send direct market order
@@ -17893,10 +18087,12 @@ class PaperTradingEngine:
                 else:
                     logger.error(f"❌ FORCE MARKET FAILED - skipping position creation")
                     self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi")
+                    self.set_execution_feedback(symbol, "MARKET_FALLBACK_FAILED")
                     return
             except Exception as e:
                 logger.error(f"❌ FORCE MARKET ERROR: {e}")
                 self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {str(e)[:80]}")
+                self.set_execution_feedback(symbol, "MARKET_FALLBACK_ERROR")
                 return
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -17911,6 +18107,7 @@ class PaperTradingEngine:
         
         self.positions.append(new_position)
         self.pipeline_metrics['filled'] += 1
+        self.clear_execution_feedback(symbol)
         
         # Save to SQLite for persistent openTime tracking
         try:

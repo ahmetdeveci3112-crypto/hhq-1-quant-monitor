@@ -26,6 +26,12 @@ const getCoinIcon = (symbol: string): string => {
     return `https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${base}.png`;
 };
 
+const getRejectReasonKey = (reason?: string | null): string => {
+    if (!reason) return '';
+    const key = String(reason).split(':')[0] || String(reason);
+    return key.toUpperCase();
+};
+
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const isLong = coin.signalAction === 'LONG';
     const isShort = coin.signalAction === 'SHORT';
@@ -153,6 +159,14 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                             ? 'bg-emerald-500/10 text-emerald-500/70' : 'bg-rose-500/10 text-rose-500/70'}`}
                             title={`OB Trend: ${coin.obImbalanceTrend}`}>
                             OB{(coin.obImbalanceTrend || 0) > 0 ? '↑' : '↓'}
+                        </span>
+                    )}
+                    {coin.executionRejectReason && (
+                        <span
+                            className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
+                            title={`Execution Reject: ${coin.executionRejectReason}`}
+                        >
+                            REJ:{getRejectReasonKey(coin.executionRejectReason)}
                         </span>
                     )}
                 </div>

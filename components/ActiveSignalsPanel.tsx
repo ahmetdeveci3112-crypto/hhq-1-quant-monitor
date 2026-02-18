@@ -71,6 +71,36 @@ const getEntryPrice = (signal: CoinOpportunity, entryTightness: number): number 
         : signal.price * (1 + spreadInfo.pullback / 100);
 };
 
+const getRejectReasonKey = (reason?: string | null): string => {
+    if (!reason) return '';
+    const key = String(reason).split(':')[0] || String(reason);
+    return key.toUpperCase();
+};
+
+const getDynamicTrailEntryThreshold = (
+    atrPct: number,
+    spreadPct: number,
+    volumeRatio: number,
+    leverage: number
+): { minMove: number; minRoi: number } => {
+    // Keep UI formula aligned with backend get_dynamic_trail_activation_threshold()
+    const baseMove = Math.max(0.5, Math.min(2.0, atrPct * 0.40));
+    const safeSpread = Number.isFinite(spreadPct) ? spreadPct : 0.05;
+    const spreadFactor = 1.0 + Math.max(0, safeSpread - 0.05) * 3.0;
+
+    let volFactor = 1.0;
+    if (volumeRatio >= 2.0) volFactor = 0.85;
+    else if (volumeRatio < 1.0) volFactor = 1.25;
+
+    let minMove = baseMove * spreadFactor * volFactor;
+    minMove = Math.max(0.4, Math.min(2.5, minMove));
+
+    let minRoi = minMove * Math.max(1, leverage);
+    minRoi = Math.max(4.0, Math.min(20.0, minRoi));
+
+    return { minMove, minRoi };
+};
+
 // Quality badge component
 const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     const badges: React.ReactNode[] = [];
@@ -110,6 +140,20 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
             <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/10 text-amber-500/60"
                 title={`Volume Ratio: ${signal.volumeRatio}x`}>
                 Vol{signal.volumeRatio}x
+            </span>
+        );
+    }
+
+    // Execution reject badge
+    if (signal.executionRejectReason) {
+        const rejectKey = getRejectReasonKey(signal.executionRejectReason);
+        badges.push(
+            <span
+                key="rej"
+                className="text-[9px] px-1 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
+                title={`Execution Reject: ${signal.executionRejectReason}`}
+            >
+                REJ:{rejectKey}
             </span>
         );
     }
@@ -354,24 +398,15 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const entryPrice = getEntryPrice(signal, entryTightness);
                                 const isLoading = loadingSymbol === signal.symbol;
                                 const priceFlash = priceFlashMap[signal.symbol];
+                                const leverage = signal.leverage || spreadInfo.leverage;
                                 const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
-                                // Phase 218: Trail Entry
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
-                                const hurstVal = signal.hurst || 0.5;
-                                const hurstStr = Math.min(1.0, Math.max(0, (hurstVal - 0.35) / 0.4));
-
-                                const dynTrailDist = signal.dynamic_trail_distance;
-                                let trailPct: number;
-
-                                if (dynTrailDist && dynTrailDist > 0 && atrPct > 0) {
-                                    const entryTrailRatio = 0.60 - hurstStr * 0.30;
-                                    trailPct = atrPct * dynTrailDist * entryTrailRatio;
-                                } else {
-                                    const zStr = Math.min(1.0, Math.max(0, (Math.abs(signal.zscore || 0) - 1) / 2));
-                                    const trendStr = hurstStr * 0.6 + zStr * 0.4;
-                                    const trailFactor = 0.50 - trendStr * 0.20;
-                                    trailPct = atrPct * trailFactor;
-                                }
+                                const { minMove: trailEntryPct, minRoi: trailEntryRoi } = getDynamicTrailEntryThreshold(
+                                    atrPct,
+                                    typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05,
+                                    signal.volumeRatio || 1.0,
+                                    leverage
+                                );
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -414,7 +449,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             {(signal.hurst || 0).toFixed(2)}
                                         </td>
                                         <td className="py-2.5 px-3 text-center">
-                                            <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{signal.leverage || spreadInfo.leverage}x</span>
+                                            <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                                         </td>
                                         <td className="py-2.5 px-3 text-center">
                                             {pbPct > 0 ? (
@@ -422,8 +457,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     <span className="text-[10px] font-mono font-semibold text-amber-400">
                                                         {isLong ? '↓' : '↑'}{pbPct.toFixed(2)}%
                                                     </span>
-                                                    <span className="text-[10px] font-mono font-semibold text-cyan-400">
-                                                        {isLong ? '↑' : '↓'}{trailPct.toFixed(2)}%
+                                                    <span
+                                                        className="text-[10px] font-mono font-semibold text-cyan-400"
+                                                        title={`Dynamic trail entry: min move ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}%`}
+                                                    >
+                                                        {isLong ? '↑' : '↓'}{trailEntryPct.toFixed(2)}%
                                                     </span>
                                                 </div>
                                             ) : (

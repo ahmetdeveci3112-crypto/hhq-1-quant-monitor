@@ -311,6 +311,9 @@ export interface CoinOpportunity {
   fibBlendAlpha?: number;
   // Backend ideal entry price
   entryPriceBackend?: number;
+  // Execution-stage reject reason from backend pipeline (if signal couldn't become an order)
+  executionRejectReason?: string | null;
+  executionRejectTs?: number;
 }
 
 export interface ScannerStats {
