@@ -16446,6 +16446,13 @@ class PaperTradingEngine:
         # Phase 34: Pending Orders System
         self.pending_orders = []  # List of pending limit orders waiting for pullback
         self.pending_order_timeout_seconds = 1800  # 30 minutes to fill or cancel
+        # Pipeline metrics for fill rate observability
+        self.pipeline_metrics = {
+            'pending_created': 0, 'signal_confirmed': 0, 'pending_expired': 0,
+            'stale_dropped': 0, 'trail_entry_start': 0, 'trail_entry_ok': 0,
+            'trail_entry_fail': 0, 'trail_entry_timeout': 0, 'market_fallback': 0,
+            'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0
+        }
         
         # =========================================================================
         # COIN BLACKLIST SYSTEM
@@ -17207,6 +17214,7 @@ class PaperTradingEngine:
         }
         
         self.pending_orders.append(pending_order)
+        self.pipeline_metrics['pending_created'] += 1
         self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         
@@ -17225,6 +17233,7 @@ class PaperTradingEngine:
             # Check expiration first
             if current_time > expires_at:
                 self.pending_orders.remove(order)
+                self.pipeline_metrics['pending_expired'] += 1
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 continue
@@ -17232,14 +17241,17 @@ class PaperTradingEngine:
             # Phase 224B: Stale Signal Penalty — skor zamanla düşer
             created_at = order.get('createdAt', current_time)
             pending_age_min = (current_time - created_at) / 60000
-            if pending_age_min > 10:
-                stale_penalty = min(20, int((pending_age_min - 10) * 2))
+            # Fix 3: Confirmed orders get 20min stale threshold (was 10min for all)
+            stale_threshold_min = 20 if order.get('confirmed', False) else 10
+            if pending_age_min > stale_threshold_min:
+                stale_penalty = min(20, int((pending_age_min - stale_threshold_min) * 2))
                 original_score = order.get('signalScore', 70)
                 adjusted_score = max(40, original_score - stale_penalty)
                 if adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
-                    self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score})")
-                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, score {original_score}→{adjusted_score})")
+                    self.pipeline_metrics['stale_dropped'] += 1
+                    self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
+                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, stale_thresh={stale_threshold_min}min, score {original_score}→{adjusted_score})")
                     continue
             
             # Find current price for this symbol
@@ -17274,6 +17286,7 @@ class PaperTradingEngine:
                         price_drop_pct = (signal_price - current_price) / signal_price * 100
                         if price_drop_pct > 3.0:  # Fiyat %3'den fazla düştü - entry kaçırıldı
                             self.pending_orders.remove(order)
+                            self.pipeline_metrics['signal_missed'] += 1
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
                             continue
@@ -17282,6 +17295,7 @@ class PaperTradingEngine:
                         price_rise_pct = (current_price - signal_price) / signal_price * 100
                         if price_rise_pct > 3.0:  # Fiyat %3'den fazla yükseldi - entry kaçırıldı
                             self.pending_orders.remove(order)
+                            self.pipeline_metrics['signal_missed'] += 1
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
                             continue
@@ -17294,6 +17308,7 @@ class PaperTradingEngine:
                 else:
                     # Konfirmasyon süresi doldu - sinyali onayla
                     order['confirmed'] = True
+                    self.pipeline_metrics['signal_confirmed'] += 1
                     self.add_log(f"✅ SIGNAL CONFIRMED: {side} {symbol} @ ${current_price:.4f} (5dk bekleme tamamlandı)")
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
             
@@ -17317,6 +17332,7 @@ class PaperTradingEngine:
                 if reached_entry:
                     # Start trailing entry — track the extreme price
                     order['trailingEntryActive'] = True
+                    self.pipeline_metrics['trail_entry_start'] += 1
                     order['trailEntryStartTime'] = current_time
                     # Initialize extreme price (bottom for LONG, peak for SHORT)
                     order['extremePrice'] = current_price
@@ -17384,12 +17400,14 @@ class PaperTradingEngine:
                         reversal_pct = ((current_price - extreme_price) / extreme_price * 100) if extreme_price > 0 else 0
                         self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Bottom=${extreme_price:.6f} +{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
                         logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} bottom=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
+                        self.pipeline_metrics['trail_entry_ok'] += 1
                         await self.execute_pending_order(order, current_price)
                         continue
                     
                     # Cancel: dropped too far below entry
                     if current_price < entry_price - cancel_distance:
                         self.pending_orders.remove(order)
+                        self.pipeline_metrics['trail_entry_fail'] += 1
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
                         continue
@@ -17405,21 +17423,33 @@ class PaperTradingEngine:
                         reversal_pct = ((extreme_price - current_price) / extreme_price * 100) if extreme_price > 0 else 0
                         self.add_log(f"✅ TRAIL ENTRY OK: {side} {symbol} @ ${current_price:.6f} | Peak=${extreme_price:.6f} -{reversal_pct:.2f}% ({elapsed_secs:.0f}s)")
                         logger.info(f"✅ TRAIL ENTRY CONFIRMED: {side} {symbol} price=${current_price:.6f} peak=${extreme_price:.6f} reversal={reversal_pct:.2f}%")
+                        self.pipeline_metrics['trail_entry_ok'] += 1
                         await self.execute_pending_order(order, current_price)
                         continue
                     
                     # Cancel: rose too far above entry
                     if current_price > entry_price + cancel_distance:
                         self.pending_orders.remove(order)
+                        self.pipeline_metrics['trail_entry_fail'] += 1
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
                         continue
                 
                 # Timeout check
                 if elapsed_ms > trail_timeout_ms:
+                    # Fix 2: Strong signals get market fallback instead of timeout
+                    signal_score = order.get('signalScore', 0)
+                    if signal_score >= 85:
+                        self.pipeline_metrics['market_fallback'] += 1
+                        self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
+                        logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
+                        await self.execute_pending_order(order, current_price)
+                        continue
+                    # Normal timeout
                     self.pending_orders.remove(order)
-                    self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı)")
-                    logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s")
+                    self.pipeline_metrics['trail_entry_timeout'] += 1
+                    self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı, score={signal_score})")
+                    logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s score={signal_score}")
                     continue
                 
                 # Periodic log (every ~30s)
@@ -17574,6 +17604,7 @@ class PaperTradingEngine:
                     if pre_spread > ENTRY_SPREAD_LIMIT:
                         logger.warning(f"🚫 SPREAD_FILTER: Rejecting {side} {symbol} entry — spread={pre_spread:.3f}% > {ENTRY_SPREAD_LIMIT}% (bid=${pre_bid:.6f} ask=${pre_ask:.6f})")
                         self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped (spread {pre_spread:.2f}% too wide)")
+                        self.pipeline_metrics['spread_rejected'] += 1
                         # Return order to pending for retry
                         if order not in self.pending_orders:
                             self.pending_orders.append(order)
@@ -17597,6 +17628,7 @@ class PaperTradingEngine:
                         if price_drift_pct > MAX_PRICE_DRIFT_PCT:
                             logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} REJECTED — price drifted {price_drift_pct:.2f}% since signal (signal=${signal_price:.6f} → now=${current_price:.6f})")
                             self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} price drifted {price_drift_pct:.1f}% since signal")
+                            self.pipeline_metrics['drift_rejected'] += 1
                             # Don't retry — signal is stale
                             return
                         else:
@@ -17677,6 +17709,7 @@ class PaperTradingEngine:
             self.balance -= initial_margin
         
         self.positions.append(new_position)
+        self.pipeline_metrics['filled'] += 1
         
         # Save to SQLite for persistent openTime tracking
         try:
@@ -19734,7 +19767,8 @@ async def paper_trading_status():
         "logs": global_paper_trader.logs[-100:],  # Last 100 logs
         "equityCurve": global_paper_trader.equity_curve[-200:],  # Last 200 points
         "tradingMode": live_binance_trader.trading_mode,  # paper or live
-        "liveEnabled": live_binance_trader.enabled
+        "liveEnabled": live_binance_trader.enabled,
+        "pipelineMetrics": global_paper_trader.pipeline_metrics
     })
 
 
