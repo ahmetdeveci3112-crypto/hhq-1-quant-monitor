@@ -5896,6 +5896,8 @@ class CoinOpportunity:
         self.last_update: float = 0.0
         self.leverage: int = 10  # Default leverage, updated by SignalGenerator
         self.pullback_pct: float = 0.0  # Pullback percentage for signal
+        self.dynamic_trail_activation: float = 1.5  # Per-coin dynamic trail activation (ATR multiple)
+        self.dynamic_trail_distance: float = 1.0  # Per-coin dynamic trail distance (ATR multiple)
         # Phase EQG + FIB: UI observability fields
         self.volume_ratio: float = 0.0
         self.is_volume_spike: bool = False
@@ -5928,6 +5930,8 @@ class CoinOpportunity:
             "lastUpdate": self.last_update,
             "leverage": self.leverage,
             "pullbackPct": round(self.pullback_pct, 2),
+            "dynamic_trail_activation": round(float(self.dynamic_trail_activation), 3),
+            "dynamic_trail_distance": round(float(self.dynamic_trail_distance), 3),
             # Phase EQG + FIB: UI observability
             "volumeRatio": round(float(self.volume_ratio), 2),
             "isVolumeSpike": bool(self.is_volume_spike),
@@ -6455,6 +6459,8 @@ class LightweightCoinAnalyzer:
             self.opportunity.signal_action = signal.get('action', 'NONE')
             self.opportunity.leverage = signal.get('leverage', 10)
             self.opportunity.pullback_pct = signal.get('pullbackPct', 0)
+            self.opportunity.dynamic_trail_activation = signal.get('dynamic_trail_activation', 1.5)
+            self.opportunity.dynamic_trail_distance = signal.get('dynamic_trail_distance', 1.0)
             self.opportunity.last_signal_time = datetime.now().timestamp()
             # Phase EQG + FIB: Store observability fields
             self.opportunity.volume_ratio = signal.get('volumeRatio', 0)

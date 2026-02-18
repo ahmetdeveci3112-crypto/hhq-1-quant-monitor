@@ -242,7 +242,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
-                        <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(1)}%</span>
+                        <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(2)}%</span>
                         <span className="flex items-center gap-1 text-slate-500">
                             <Clock className="w-2.5 h-2.5" />{formatTime(signal.lastSignalTime)}
                         </span>
@@ -420,7 +420,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             {pbPct > 0 ? (
                                                 <div className="flex flex-col items-center gap-0.5">
                                                     <span className="text-[10px] font-mono font-semibold text-amber-400">
-                                                        {isLong ? '↓' : '↑'}{pbPct.toFixed(1)}%
+                                                        {isLong ? '↓' : '↑'}{pbPct.toFixed(2)}%
                                                     </span>
                                                     <span className="text-[10px] font-mono font-semibold text-cyan-400">
                                                         {isLong ? '↑' : '↓'}{trailPct.toFixed(2)}%
