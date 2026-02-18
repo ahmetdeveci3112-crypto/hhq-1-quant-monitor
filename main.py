@@ -4476,6 +4476,150 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
+STRATEGY_MODE_LEGACY = "LEGACY"
+STRATEGY_MODE_SMART_V2 = "SMART_V2"
+
+
+def get_smart_v2_strategy_profile(
+    mode: str,
+    signal_side: str,
+    hurst: float,
+    adx: float,
+    spread_pct: float,
+    volume_ratio: float,
+    volatility_ratio: float,
+    market_regime: str,
+    is_volume_spike: bool,
+    imbalance: float,
+    ob_imbalance_trend: float
+) -> dict:
+    """
+    Select SMART_V2 strategy and return strategy-specific entry/exit tuning.
+    Falls back to LEGACY-neutral multipliers when mode != SMART_V2.
+    """
+    base_profile = {
+        "strategy_mode": STRATEGY_MODE_LEGACY,
+        "active_strategy": "legacy",
+        "strategy_label": "Legacy",
+        "threshold_mult": 1.0,
+        "min_score_offset": 0,
+        "score_bonus": 0,
+        "entry_mult": 1.0,
+        "exit_mult": 1.0,
+        "leverage_mult": 1.0,
+        "notes": [],
+    }
+
+    if str(mode or STRATEGY_MODE_LEGACY).upper() != STRATEGY_MODE_SMART_V2:
+        return base_profile
+
+    safe_side = "LONG" if signal_side == "LONG" else "SHORT"
+    side_sign = 1.0 if safe_side == "LONG" else -1.0
+    safe_hurst = float(hurst or 0.5)
+    safe_adx = float(adx or 20.0)
+    safe_spread = max(0.01, float(spread_pct or 0.05))
+    safe_vol_ratio = max(0.2, float(volume_ratio or 1.0))
+    safe_volatility_ratio = max(0.3, float(volatility_ratio or 1.0))
+    regime_upper = str(market_regime or "RANGING").upper()
+
+    ob_alignment = side_sign * (float(imbalance or 0.0) * 0.65 + float(ob_imbalance_trend or 0.0) * 0.35)
+
+    profile = {
+        "strategy_mode": STRATEGY_MODE_SMART_V2,
+        "active_strategy": "balanced_flow",
+        "strategy_label": "Dengeli Akış",
+        "threshold_mult": 1.0,
+        "min_score_offset": 3,
+        "score_bonus": 0,
+        "entry_mult": 1.0,
+        "exit_mult": 1.0,
+        "leverage_mult": 1.0,
+        "notes": ["BALANCED"],
+    }
+
+    # Strategy routing by coin behavior.
+    if safe_adx >= 32 and safe_hurst >= 0.58 and (safe_vol_ratio >= 1.25 or is_volume_spike):
+        profile.update({
+            "active_strategy": "momentum_breakout",
+            "strategy_label": "Momentum Kırılım",
+            "threshold_mult": 1.10,
+            "min_score_offset": 8,
+            "score_bonus": 4 if ob_alignment >= 2.5 else 2,
+            "entry_mult": 0.78,
+            "exit_mult": 1.22,
+            "leverage_mult": 1.05,
+            "notes": ["MOMENTUM", "BREAKOUT"],
+        })
+    elif safe_adx >= 28 and safe_hurst >= 0.55:
+        profile.update({
+            "active_strategy": "trend_follow",
+            "strategy_label": "Trend Takibi",
+            "threshold_mult": 1.06,
+            "min_score_offset": 6,
+            "score_bonus": 2,
+            "entry_mult": 0.86,
+            "exit_mult": 1.18,
+            "leverage_mult": 1.02,
+            "notes": ["TREND"],
+        })
+    elif safe_hurst <= 0.43 and safe_adx <= 26:
+        profile.update({
+            "active_strategy": "mean_reversion",
+            "strategy_label": "Ortalamaya Dönüş",
+            "threshold_mult": 0.96,
+            "min_score_offset": 2,
+            "score_bonus": 3 if abs(ob_alignment) < 2.0 else 1,
+            "entry_mult": 1.12,
+            "exit_mult": 0.92,
+            "leverage_mult": 0.94,
+            "notes": ["MEAN_REVERSION"],
+        })
+    elif regime_upper == "VOLATILE" or safe_volatility_ratio >= 1.35:
+        profile.update({
+            "active_strategy": "volatile_guard",
+            "strategy_label": "Volatilite Koruması",
+            "threshold_mult": 1.18,
+            "min_score_offset": 10,
+            "score_bonus": 0,
+            "entry_mult": 1.24,
+            "exit_mult": 1.35,
+            "leverage_mult": 0.86,
+            "notes": ["VOLATILE_GUARD"],
+        })
+    elif safe_spread <= 0.08 and safe_volatility_ratio <= 0.90 and safe_vol_ratio >= 0.9:
+        profile.update({
+            "active_strategy": "low_vol_scalp",
+            "strategy_label": "Düşük Volatilite",
+            "threshold_mult": 0.93,
+            "min_score_offset": 3,
+            "score_bonus": 2,
+            "entry_mult": 0.88,
+            "exit_mult": 0.88,
+            "leverage_mult": 1.00,
+            "notes": ["LOW_VOL"],
+        })
+
+    # Microstructure refinement.
+    if ob_alignment <= -3.5:
+        profile["min_score_offset"] += 4
+        profile["threshold_mult"] *= 1.03
+        profile["leverage_mult"] *= 0.92
+        profile["notes"].append("OB_CONTRA_HARD")
+    elif ob_alignment >= 3.5:
+        profile["score_bonus"] += 2
+        profile["notes"].append("OB_ALIGN_STRONG")
+
+    # Clamp outputs to safe bounds.
+    profile["threshold_mult"] = _clamp(profile["threshold_mult"], 0.85, 1.30)
+    profile["entry_mult"] = _clamp(profile["entry_mult"], 0.65, 1.45)
+    profile["exit_mult"] = _clamp(profile["exit_mult"], 0.70, 1.60)
+    profile["leverage_mult"] = _clamp(profile["leverage_mult"], 0.75, 1.15)
+    profile["min_score_offset"] = int(_clamp(profile["min_score_offset"], 0, 20))
+    profile["score_bonus"] = int(_clamp(profile["score_bonus"], -5, 10))
+
+    return profile
+
+
 def compute_execution_quality_score(
     signal_side: str,
     confidence_score: float,
@@ -6276,6 +6420,9 @@ class CoinOpportunity:
         self.entry_threshold_mult: float = 1.0
         self.entry_exec_score: float = 0.0
         self.entry_exec_passed: bool = True
+        self.strategy_mode: str = STRATEGY_MODE_LEGACY
+        self.active_strategy: str = "legacy"
+        self.strategy_label: str = "Legacy"
         self.execution_reject_reason: Optional[str] = None
         self.execution_reject_ts: int = 0
     
@@ -6317,6 +6464,9 @@ class CoinOpportunity:
                 "entryThresholdMult": round(float(self.entry_threshold_mult), 3),
                 "entryExecScore": round(float(self.entry_exec_score), 2),
                 "entryExecPassed": bool(self.entry_exec_passed),
+                "strategyMode": self.strategy_mode,
+                "activeStrategy": self.active_strategy,
+                "strategyLabel": self.strategy_label,
                 "executionRejectReason": self.execution_reject_reason,
                 "executionRejectTs": int(self.execution_reject_ts or 0),
             }
@@ -6854,6 +7004,9 @@ class LightweightCoinAnalyzer:
             self.opportunity.entry_threshold_mult = signal.get('entryThresholdMult', 1.0)
             self.opportunity.entry_exec_score = signal.get('entryExecScore', signal.get('confidenceScore', 0))
             self.opportunity.entry_exec_passed = signal.get('entryExecPassed', True)
+            self.opportunity.strategy_mode = signal.get('strategyMode', STRATEGY_MODE_LEGACY)
+            self.opportunity.active_strategy = signal.get('activeStrategy', 'legacy')
+            self.opportunity.strategy_label = signal.get('strategyLabel', 'Legacy')
             # Execution-stage reject reason (if any) for UI observability
             try:
                 if 'global_paper_trader' in globals():
@@ -16016,11 +16169,51 @@ class SignalGenerator:
             # Phase 128: Pass hurst to calculate_adaptive_threshold for per-coin dynamic threshold
             adaptive_threshold = calculate_adaptive_threshold(base_threshold, atr, price, hurst)
             effective_threshold = adaptive_threshold * leverage_factor
+
+        # =====================================================================
+        # SMART_V2: Auto strategy routing + strategy-specific tuning
+        # =====================================================================
+        strategy_mode = (
+            getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
+            if 'global_paper_trader' in globals() and global_paper_trader
+            else STRATEGY_MODE_LEGACY
+        )
+        pre_signal_side = "SHORT" if zscore > 0 else "LONG"
+        smart_v2_profile = get_smart_v2_strategy_profile(
+            mode=strategy_mode,
+            signal_side=pre_signal_side,
+            hurst=hurst,
+            adx=adx,
+            spread_pct=spread_pct,
+            volume_ratio=volume_ratio,
+            volatility_ratio=volatility_ratio,
+            market_regime=market_regime,
+            is_volume_spike=is_volume_spike,
+            imbalance=imbalance,
+            ob_imbalance_trend=ob_imbalance_trend,
+        )
+        strategy_mode = smart_v2_profile.get('strategy_mode', STRATEGY_MODE_LEGACY)
+        active_strategy = smart_v2_profile.get('active_strategy', 'legacy')
+        strategy_label = smart_v2_profile.get('strategy_label', 'Legacy')
+        strategy_threshold_mult = float(smart_v2_profile.get('threshold_mult', 1.0))
+        strategy_entry_mult = float(smart_v2_profile.get('entry_mult', 1.0))
+        strategy_exit_mult = float(smart_v2_profile.get('exit_mult', 1.0))
+        strategy_leverage_mult = float(smart_v2_profile.get('leverage_mult', 1.0))
+        strategy_score_bonus = int(smart_v2_profile.get('score_bonus', 0))
+        strategy_min_offset = int(smart_v2_profile.get('min_score_offset', 0))
+        strategy_notes = list(smart_v2_profile.get('notes', []))
+
+        if strategy_mode == STRATEGY_MODE_SMART_V2:
+            effective_threshold *= strategy_threshold_mult
+            min_score_required = int(_clamp(min_score_required + strategy_min_offset, 40, 95))
         
         # Phase 120: Log AFTER effective_threshold is calculated
         if self._attempt_count % 100 == 1:
             exceeds = "✅ PASS" if abs(zscore) > effective_threshold else "❌ FAIL"
-            logger.info(f"🔬 SIGNAL_CHECK #{self._attempt_count}: {symbol} H={hurst:.2f} Z={zscore:.2f} eff_thresh={effective_threshold:.2f} {exceeds}")
+            logger.info(
+                f"🔬 SIGNAL_CHECK #{self._attempt_count}: {symbol} H={hurst:.2f} Z={zscore:.2f} "
+                f"eff_thresh={effective_threshold:.2f} {exceeds} | mode={strategy_mode} strat={active_strategy}"
+            )
         
         # 2. CONFIDENCE SCORING SYSTEM (0-100)
         score = 0
@@ -16057,6 +16250,13 @@ class SignalGenerator:
         
         if signal_side is None:
             return None
+
+        # Strategy score tuning (post-side, pre-confluence).
+        if strategy_mode == STRATEGY_MODE_SMART_V2:
+            if strategy_score_bonus != 0:
+                score += strategy_score_bonus
+                reasons.append(f"S2B({strategy_score_bonus:+d})")
+            reasons.append(f"S2({strategy_label})")
         
         # =====================================================================
         # Phase 212: STRONG_TREND_FILTER kaldırıldı (ADX>40)
@@ -16750,23 +16950,36 @@ class SignalGenerator:
             balance_protector.peak_balance
         )
         
-        # COMBINED LEVERAGE: base × volatility × balance_protection × user_multiplier
+        # COMBINED LEVERAGE: base × volatility × balance_protection × user_multiplier × strategy_multiplier
         # Phase 152: price_factor kaldırıldı — get_volatility_adjusted_params zaten uyguluyor
         # Phase 216: User-controlled leverage multiplier from settings
         user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
-        final_leverage = int(round(base_leverage * volatility_factor * leverage_mult * user_lev_mult))
+        final_leverage = int(round(base_leverage * volatility_factor * leverage_mult * user_lev_mult * strategy_leverage_mult))
         
         # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
         
         # Log if any factor reduced leverage significantly
-        if volatility_factor < 0.9 or leverage_mult < 0.9 or user_lev_mult != 1.0:
-            logger.info(f"📊 Unified Leverage: base={base_leverage}x × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} × user={user_lev_mult:.1f} → {final_leverage}x | {symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)")
-        
+        if volatility_factor < 0.9 or leverage_mult < 0.9 or user_lev_mult != 1.0 or strategy_leverage_mult != 1.0:
+            logger.info(
+                f"📊 Unified Leverage: base={base_leverage}x × vol={volatility_factor:.2f} × bal={leverage_mult:.2f} "
+                f"× user={user_lev_mult:.1f} × strat={strategy_leverage_mult:.2f} → {final_leverage}x | "
+                f"{symbol} @ ${price:.6f} (ATR:{volatility_pct:.1f}%)"
+            )
+
         # Use spread-based SL/TP multipliers (override regime-based)
         atr_sl = spread_params['sl_multiplier']
         atr_tp = spread_params['tp_multiplier']
         trail_mult = spread_params['trail_multiplier']
+        effective_exit_tightness = _clamp(
+            (
+                getattr(global_paper_trader, 'exit_tightness', 1.0)
+                if 'global_paper_trader' in globals() and global_paper_trader
+                else 1.0
+            ) * strategy_exit_mult,
+            0.3,
+            15.0
+        )
         
         # Adjust based on Hurst regime (fine-tuning)
         if hurst < 0.45:  # Strong Mean Reversion
@@ -16796,14 +17009,19 @@ class SignalGenerator:
         # =====================================================================
         # PHASE HYBRID ENTRY: ATR + spread + volume + quality + settings multiplier
         # =====================================================================
-        entry_tightness = global_paper_trader.entry_tightness if 'global_paper_trader' in globals() and global_paper_trader else 1.0
+        entry_tightness = (
+            getattr(global_paper_trader, 'entry_tightness', 1.0)
+            if 'global_paper_trader' in globals() and global_paper_trader
+            else 1.0
+        )
+        effective_entry_tightness = _clamp(entry_tightness * strategy_entry_mult, 0.5, 15.0)
         atr_pct_percent = (atr / price * 100) if price > 0 else 2.0
         hybrid_entry = get_hybrid_entry_profile(
             atr_pct=atr_pct_percent,
             spread_pct=spread_pct,
             volume_ratio=volume_ratio,
             leverage=final_leverage,
-            entry_tightness=entry_tightness,
+            entry_tightness=effective_entry_tightness,
             confidence_score=score,
             eq_count=eq_pass_count,
             fib_active=fib_active_for_exec,
@@ -16871,15 +17089,15 @@ class SignalGenerator:
                     reasons.append(f"FibSkip(too_far,{dev_pct:.1f}%)")
         
         if signal_side == "LONG":
-            sl = ideal_entry - (atr * atr_sl) - spread_buffer
-            tp = ideal_entry + (atr * atr_tp)
-            trail_activation = ideal_entry + trail_act
-            trail_dist = atr * trail_mult
+            sl = ideal_entry - (atr * atr_sl * effective_exit_tightness) - spread_buffer
+            tp = ideal_entry + (atr * atr_tp * effective_exit_tightness)
+            trail_activation = ideal_entry + (trail_act * effective_exit_tightness)
+            trail_dist = atr * trail_mult * effective_exit_tightness
         else:
-            sl = ideal_entry + (atr * atr_sl) + spread_buffer
-            tp = ideal_entry - (atr * atr_tp)
-            trail_activation = ideal_entry - trail_act
-            trail_dist = atr * trail_mult
+            sl = ideal_entry + (atr * atr_sl * effective_exit_tightness) + spread_buffer
+            tp = ideal_entry - (atr * atr_tp * effective_exit_tightness)
+            trail_activation = ideal_entry - (trail_act * effective_exit_tightness)
+            trail_dist = atr * trail_mult * effective_exit_tightness
         
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
@@ -16923,7 +17141,11 @@ class SignalGenerator:
         reasons.append(f"Lev({final_leverage}x)")
         
         # Debug: Log the actual ATR% value and what level it maps to
-        logger.info(f"📊 Signal {signal_side}: Spread%={spread_pct:.2f}% PB%={pullback_pct*100:.2f}% (ATR:{atr_pct*100:.1f}%+Spread:{spread_pct:.2f}%) → Level={spread_params['level']} → Lev={base_leverage}x (after BalProt: {final_leverage}x)")  # Phase 223: label was ATR% but value was spread_pct
+        logger.info(
+            f"📊 Signal {signal_side}: Spread%={spread_pct:.2f}% PB%={pullback_pct*100:.2f}% "
+            f"(ATR:{atr_pct*100:.1f}%+Spread:{spread_pct:.2f}%) → Level={spread_params['level']} → "
+            f"Lev={base_leverage}x (after BalProt: {final_leverage}x) | mode={strategy_mode}/{active_strategy}"
+        )  # Phase 223: label was ATR% but value was spread_pct
         
         # Phase 127: Log successful signal generation for tracing
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
@@ -16941,6 +17163,14 @@ class SignalGenerator:
             'confidenceScore': score,
             'sizeMultiplier': size_mult,
             'leverage': final_leverage,  # Phase 29: Dynamic leverage
+            'strategyMode': strategy_mode,
+            'activeStrategy': active_strategy,
+            'strategyLabel': strategy_label,
+            'strategyNotes': strategy_notes,
+            'smartThresholdMult': strategy_threshold_mult,
+            'smartEntryMult': strategy_entry_mult,
+            'smartExitMult': strategy_exit_mult,
+            'smartLeverageMult': strategy_leverage_mult,
             'spreadLevel': spread_params['level'],
             'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
             'atrPct': round(atr_pct * 100, 2),  # Phase 160: Raw ATR% for bounce calc
@@ -16958,6 +17188,8 @@ class SignalGenerator:
             'fibEntry': fib_context.get('fib_entry', 0) if fib_context else 0,
             'atrEntry': atr_entry,
             'fibBlendAlpha': FIB_BLEND_ALPHA if fib_blend_applied else 0,
+            'effectiveEntryTightness': effective_entry_tightness,
+            'effectiveExitTightness': effective_exit_tightness,
             # Phase EQG: Entry Quality telemetry
             'volumeRatio': round(volume_ratio, 2),
             'isVolumeSpike': is_volume_spike,
@@ -17032,6 +17264,8 @@ class PaperTradingEngine:
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
         self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
+        # Strategy engine mode
+        self.strategy_mode = STRATEGY_MODE_LEGACY  # LEGACY | SMART_V2
         # Phase 200: Counter-signal adaptive exit tightness cache TTL
         self.counter_signal_ttl = 900  # 15 minutes
         # Phase 19: Server-side persistent logs
@@ -17402,7 +17636,8 @@ class PaperTradingEngine:
                 pos['counter_signal_modifier'] = 1.0
                 modifier = 1.0
         
-        return self.exit_tightness * modifier
+        base_et = float(pos.get('effectiveExitTightnessBase', self.exit_tightness) or self.exit_tightness)
+        return base_et * modifier
     
     # =========================================================================
     # DYNAMIC ATR MULTIPLIER
@@ -17689,9 +17924,15 @@ class PaperTradingEngine:
             tm_tp_mult = 1.0
             tm_trail_act_mult = 1.0
             tm_trail_dist_mult = 1.0
-        
-        adjusted_sl_atr = (self.sl_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = (self.tp_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
+
+        effective_exit_tightness = _clamp(
+            float(signal.get('effectiveExitTightness', self.exit_tightness)) if signal else self.exit_tightness,
+            0.3,
+            15.0
+        )
+
+        adjusted_sl_atr = (self.sl_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = (self.tp_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
         if signal and 'dynamic_trail_activation' in signal:
@@ -17703,8 +17944,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
         # Phase 224D G5: Apply regime profile multipliers
         try:
@@ -17796,6 +18037,7 @@ class PaperTradingEngine:
             'min_score_low': self.min_score_low,
             'min_score_high': self.min_score_high,
             'max_positions': self.max_positions,
+            'strategy_mode': self.strategy_mode,
             'market_regime': market_regime_detector.current_regime if 'market_regime_detector' in dir() or True else 'UNKNOWN',
         }
         try:
@@ -17851,6 +18093,10 @@ class PaperTradingEngine:
                 "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
                 "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
                 "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+                "strategyMode": signal.get('strategyMode', STRATEGY_MODE_LEGACY) if signal else STRATEGY_MODE_LEGACY,
+                "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
+                "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
+                "effectiveExitTightness": effective_exit_tightness,
                 # Phase 202: Trend Mode flag
                 "trend_mode": is_trend_mode,
             # Phase 155: AI Optimizer settings snapshot
@@ -18228,9 +18474,15 @@ class PaperTradingEngine:
             tm_tp_mult = 1.0
             tm_trail_act_mult = 1.0
             tm_trail_dist_mult = 1.0
-        
-        adjusted_sl_atr = (self.sl_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = (self.tp_atr / 10) * self.exit_tightness * dynamic_atr_mult * tm_tp_mult
+
+        effective_exit_tightness = _clamp(
+            float(order.get('effectiveExitTightness', self.exit_tightness)),
+            0.3,
+            15.0
+        )
+
+        adjusted_sl_atr = (self.sl_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = (self.tp_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
         if 'dynamic_trail_activation' in order:
@@ -18240,8 +18492,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * self.exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
         if side == 'LONG':
             sl = max(fill_price * 0.01, fill_price - (atr * adjusted_sl_atr))
@@ -18304,6 +18556,9 @@ class PaperTradingEngine:
             "signalScore": order.get('signalScore', 0),
             "mtfScore": order.get('mtfScore', 0),
             "zScore": order.get('zScore', 0),
+            "strategyMode": order.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "activeStrategy": order.get('activeStrategy', 'legacy'),
+            "strategyLabel": order.get('strategyLabel', 'Legacy'),
             # Phase 202: Trend Mode flag for stepped SL
             "trend_mode": is_trend_mode,
             # Phase 214: Failed Continuation Detector
@@ -18322,8 +18577,9 @@ class PaperTradingEngine:
             "volatility_pct": order.get('volatility_pct', (order.get('atr', fill_price * 0.02) / fill_price * 100) if fill_price > 0 else 2.0),
             "spreadPct": order.get('spreadPct', 0.05),
             "volumeRatio": order.get('volumeRatio', 1.0),
+            "effectiveExitTightnessBase": effective_exit_tightness,
             # Runtime trail telemetry (updated every tick)
-            "effectiveExitTightness": self.exit_tightness,
+            "effectiveExitTightness": effective_exit_tightness,
             "runtimeTrailDistance": trail_distance,
             "runtimeTrailDistancePct": round((trail_distance / fill_price * 100), 4) if fill_price > 0 else 0.0,
             "runtimeTrailActivationMovePct": 0.0,
@@ -18914,6 +19170,9 @@ class PaperTradingEngine:
                     # Phase 36: Load entry/exit tightness
                     self.entry_tightness = data.get('entry_tightness', 1.8)  # Default: Gevşek
                     self.exit_tightness = data.get('exit_tightness', 1.2)  # Default: 1.2x
+                    self.strategy_mode = str(data.get('strategy_mode', STRATEGY_MODE_LEGACY)).upper()
+                    if self.strategy_mode not in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
+                        self.strategy_mode = STRATEGY_MODE_LEGACY
                     # Phase 57: Load Kill Switch settings
                     if 'kill_switch_first_reduction' in data:
                         daily_kill_switch.first_reduction_pct = data.get('kill_switch_first_reduction', -100)
@@ -18980,6 +19239,7 @@ class PaperTradingEngine:
                 # Phase 36: Save entry/exit tightness
                 "entry_tightness": self.entry_tightness,
                 "exit_tightness": self.exit_tightness,
+                "strategy_mode": self.strategy_mode,
                 # Phase 57: Kill Switch settings
                 "kill_switch_first_reduction": daily_kill_switch.first_reduction_pct,
                 "kill_switch_full_close": daily_kill_switch.full_close_pct,
@@ -21193,6 +21453,7 @@ async def paper_trading_get_settings():
         # Phase 36: Entry/Exit tightness
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
+        "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         # Server-side logs
         "logs": global_paper_trader.logs[-50:],
         # Phase 52: Adaptive Trading System stats
@@ -21225,6 +21486,7 @@ async def paper_trading_update_settings(
     minScoreHigh: int = None,
     entryTightness: float = None,
     exitTightness: float = None,
+    strategyMode: str = None,
     killSwitchFirstReduction: float = None,
     killSwitchFullClose: float = None,
     leverageMultiplier: float = None
@@ -21269,6 +21531,21 @@ async def paper_trading_update_settings(
         global_paper_trader.entry_tightness = entryTightness
     if exitTightness is not None:
         global_paper_trader.exit_tightness = exitTightness
+    if strategyMode is not None:
+        old_mode = getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
+        normalized_mode = str(strategyMode).upper()
+        if normalized_mode not in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
+            return JSONResponse(
+                {"success": False, "error": f"Invalid strategyMode: {strategyMode}. Use LEGACY or SMART_V2"},
+                status_code=400
+            )
+        global_paper_trader.strategy_mode = normalized_mode
+        if old_mode != normalized_mode and global_paper_trader.pending_orders:
+            stale_count = len(global_paper_trader.pending_orders)
+            global_paper_trader.pending_orders.clear()
+            global_paper_trader.add_log(
+                f"⚠️ SETTINGS_CHANGED_STRATEGY_MODE: {stale_count} pending order temizlendi ({old_mode}→{normalized_mode})"
+            )
     
     # Phase 57: Kill Switch settings
     if killSwitchFirstReduction is not None:
@@ -21358,6 +21635,7 @@ async def paper_trading_update_settings(
         "minConfidenceScore": global_paper_trader.min_confidence_score,
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
+        "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
         "killSwitchFullClose": daily_kill_switch.full_close_pct,
         "updatedPositions": updated_positions

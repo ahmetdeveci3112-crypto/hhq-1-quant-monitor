@@ -234,6 +234,7 @@ export default function App() {
     minScoreHigh: 90,
     entryTightness: 1.8,
     exitTightness: 1.2,
+    strategyMode: 'LEGACY',
     killSwitchFirstReduction: -100,
     killSwitchFullClose: -150,
     leverageMultiplier: 1.0
@@ -654,6 +655,7 @@ export default function App() {
           minScoreHigh: data.minScoreHigh ?? 90,
           entryTightness: data.entryTightness ?? 1.8,
           exitTightness: data.exitTightness ?? 1.2,
+          strategyMode: (data.strategyMode === 'SMART_V2' ? 'SMART_V2' : 'LEGACY'),
           killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
           killSwitchFullClose: data.killSwitchFullClose ?? -150,
           leverageMultiplier: data.leverageMultiplier ?? 1.0
@@ -722,6 +724,7 @@ export default function App() {
           minScoreHigh: String(settings.minScoreHigh || 70),
           entryTightness: String(settings.entryTightness),
           exitTightness: String(settings.exitTightness),
+          strategyMode: String(settings.strategyMode || 'LEGACY'),
           killSwitchFirstReduction: String(settings.killSwitchFirstReduction),
           killSwitchFullClose: String(settings.killSwitchFullClose),
           leverageMultiplier: String(settings.leverageMultiplier ?? 1.0)

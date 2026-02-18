@@ -100,6 +100,40 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
           )}
 
+          {/* Strategy Engine Mode */}
+          <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
+            <h3 className="text-sm font-semibold text-cyan-400 uppercase tracking-wider mb-3">
+              Strateji Motoru
+            </h3>
+            <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'LEGACY' })}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${
+                    localSettings.strategyMode === 'LEGACY'
+                      ? 'bg-slate-600/70 border-slate-400 text-white'
+                      : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
+                  }`}
+                >
+                  Legacy
+                </button>
+                <button
+                  onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'SMART_V2' })}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${
+                    localSettings.strategyMode === 'SMART_V2'
+                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300'
+                      : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
+                  }`}
+                >
+                  SMART_V2
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-2">
+                Legacy: mevcut davranış. SMART_V2: coin rejimine göre strateji otomatik seçilir ve giriş/çıkış çarpanları optimize edilir.
+              </p>
+            </div>
+          </div>
+
           {/* Signal Algorithm Sensitivity Section */}
           <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-indigo-400 uppercase tracking-wider mb-4 flex items-center gap-2">

@@ -161,6 +161,20 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
         );
     }
 
+    // SMART_V2 strategy badge
+    if (signal.strategyMode === 'SMART_V2') {
+        const strat = signal.strategyLabel || signal.activeStrategy || 'SMART_V2';
+        badges.push(
+            <span
+                key="s2"
+                className="text-[9px] px-1 py-0.5 rounded font-bold bg-cyan-500/15 text-cyan-300"
+                title={`Aktif Strateji: ${strat}`}
+            >
+                S2:{strat}
+            </span>
+        );
+    }
+
     // Execution reject badge
     if (signal.executionRejectReason) {
         const rejectKey = getRejectReasonKey(signal.executionRejectReason);
