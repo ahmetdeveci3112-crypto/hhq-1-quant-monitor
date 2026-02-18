@@ -20535,12 +20535,20 @@ async def scanner_status():
         auto_restarted = True
         logger.warning("🔁 Scanner task auto-restarted via /scanner/status (detected dead task)")
 
+    # Keep running flag consistent with actual task state (important for frontend WS bootstrap).
+    if task_alive and not multi_coin_scanner.running:
+        multi_coin_scanner.running = True
+        logger.warning("🔁 Scanner running flag healed via /scanner/status (task alive, flag was false)")
+
     cache_age = 0
     if ui_state_cache.last_update > 0:
         cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update))
 
+    effective_running = multi_coin_scanner.running or task_alive
+
     return JSONResponse({
-        "running": multi_coin_scanner.running,
+        "running": effective_running,
+        "runningFlag": multi_coin_scanner.running,
         "totalCoins": len(multi_coin_scanner.coins),
         "analyzedCoins": len(multi_coin_scanner.analyzers),
         "taskAlive": task_alive,
