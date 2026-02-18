@@ -20993,21 +20993,56 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     last_full_state_sent = 0.0
     
     try:
-        async def send_full_state():
-            """Send full scanner snapshot from cache."""
-            if ui_state_cache.is_ready():
-                state = ui_state_cache.get_state()
-                await websocket.send_text(json.dumps(state, default=_safe_json_default))
+        def build_warmup_state() -> dict:
+            """Build non-empty fallback state while cache is warming up."""
+            scanner_stats = multi_coin_scanner.get_scanner_stats() if 'multi_coin_scanner' in globals() else {}
+            opps = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
+            min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
+            long_count = sum(1 for o in opps if o.get('signalAction') == 'LONG' and o.get('signalScore', 0) >= min_score)
+            short_count = sum(1 for o in opps if o.get('signalAction') == 'SHORT' and o.get('signalScore', 0) >= min_score)
+
+            if live_binance_trader.enabled:
+                positions = ui_state_cache.positions or global_paper_trader.positions
+                balance = ui_state_cache.balance or (ui_state_cache.live_balance or {}).get('walletBalance', 0)
             else:
-                await websocket.send_json({
-                    "type": "scanner_update",
-                    "opportunities": [],
-                    "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
-                    "portfolio": {"balance": 0, "positions": [], "trades": [], "stats": {}, "logs": [], "enabled": True},
-                    "tradingMode": ui_state_cache.trading_mode,
-                    "timestamp": datetime.now().timestamp(),
-                    "message": "Cache initializing... (first scan in progress)"
-                })
+                positions = ui_state_cache.positions or global_paper_trader.positions
+                balance = ui_state_cache.balance or global_paper_trader.balance
+
+            trades = ui_state_cache.trades or global_paper_trader.trades
+
+            return {
+                "type": "scanner_update",
+                "opportunities": opps,
+                "stats": {
+                    "totalCoins": scanner_stats.get('totalCoins', len(getattr(multi_coin_scanner, 'coins', []))),
+                    "analyzedCoins": scanner_stats.get('analyzedCoins', len(getattr(multi_coin_scanner, 'analyzers', {}))),
+                    "longSignals": long_count,
+                    "shortSignals": short_count,
+                    "activeSignals": long_count + short_count,
+                    "lastUpdate": datetime.now().timestamp()
+                },
+                "portfolio": {
+                    "balance": balance,
+                    "positions": positions,
+                    "trades": sorted(trades, key=lambda t: t.get('closeTime', 0), reverse=True),
+                    "stats": {
+                        **ui_state_cache.pnl_data,
+                        "liveBalance": ui_state_cache.live_balance,
+                        "winRate": 0,
+                        "totalTrades": len(trades)
+                    },
+                    "logs": (ui_state_cache.logs or global_paper_trader.logs)[-100:],
+                    "enabled": global_paper_trader.enabled
+                },
+                "tradingMode": "live" if live_binance_trader.enabled else "paper",
+                "timestamp": datetime.now().timestamp(),
+                "message": "Cache warming up (serving fallback scanner state)"
+            }
+
+        async def send_full_state():
+            """Send scanner snapshot. Uses fallback state while cache initializes."""
+            state = ui_state_cache.get_state() if ui_state_cache.is_ready() else build_warmup_state()
+            await websocket.send_text(json.dumps(state, default=_safe_json_default))
 
         async def send_fast_price_tick():
             """Send lightweight fast price updates for active symbols only."""
@@ -21015,15 +21050,17 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 return
 
             min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
+            source_opps = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
             signal_symbols = set()
-            for opp in ui_state_cache.opportunities:
+            for opp in source_opps:
                 if opp.get('signalAction') != 'NONE' and opp.get('signalScore', 0) >= min_score:
                     sym = opp.get('symbol')
                     if sym:
                         signal_symbols.add(sym)
 
+            source_positions = ui_state_cache.positions or global_paper_trader.positions
             position_symbols = set()
-            for pos in ui_state_cache.positions:
+            for pos in source_positions:
                 sym = pos.get('symbol')
                 if sym:
                     position_symbols.add(sym)
