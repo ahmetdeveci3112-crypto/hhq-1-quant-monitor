@@ -16545,7 +16545,8 @@ class PaperTradingEngine:
             'pending_created': 0, 'signal_confirmed': 0, 'pending_expired': 0,
             'stale_dropped': 0, 'trail_entry_start': 0, 'trail_entry_ok': 0,
             'trail_entry_fail': 0, 'trail_entry_timeout': 0, 'market_fallback': 0,
-            'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0
+            'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0,
+            'fallback_on_fail': 0, 'fallback_on_expire': 0
         }
         
         # =========================================================================
@@ -17321,6 +17322,14 @@ class PaperTradingEngine:
     async def check_pending_orders(self, opportunities: list):
         """Check all pending orders against current prices and execute or expire them."""
         current_time = int(datetime.now().timestamp() * 1000)
+        # High-score signals get market fallback on hard exits to improve fill rate.
+        MARKET_FALLBACK_MIN_SCORE = 80
+        # Stale logic tuned softer to avoid dropping still-valid candidates too early.
+        STALE_THRESHOLD_UNCONFIRMED_MIN = 15
+        STALE_THRESHOLD_CONFIRMED_MIN = 30
+        STALE_GRACE_MIN = 5
+        STALE_PENALTY_PER_MIN = 1
+        STALE_MIN_SCORE_BUFFER = 5
         
         for order in list(self.pending_orders):
             symbol = order.get('symbol', '')
@@ -17328,9 +17337,26 @@ class PaperTradingEngine:
             entry_price = order.get('entryPrice', 0)
             expires_at = order.get('expiresAt', 0)
             
-            # Check expiration first
+            # Find current price for this symbol (also used by expiry fallback)
+            current_price = None
+            for opp in opportunities:
+                if opp.get('symbol') == symbol:
+                    current_price = opp.get('price', 0)
+                    break
+            
+            # Check expiration first (with high-score market fallback for confirmed signals)
             if current_time > expires_at:
-                self.pending_orders.remove(order)
+                signal_score = order.get('signalScore', 0)
+                is_confirmed = order.get('confirmed', False)
+                if is_confirmed and signal_score >= MARKET_FALLBACK_MIN_SCORE and current_price and current_price > 0:
+                    self.pipeline_metrics['market_fallback'] += 1
+                    self.pipeline_metrics['fallback_on_expire'] += 1
+                    self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
+                    logger.info(f"🔥 MARKET FALLBACK(EXPIRE): {side} {symbol} score={signal_score} age_expired → market fill")
+                    await self.execute_pending_order(order, current_price, force_market=True)
+                    continue
+                if order in self.pending_orders:
+                    self.pending_orders.remove(order)
                 self.pipeline_metrics['pending_expired'] += 1
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
@@ -17339,25 +17365,19 @@ class PaperTradingEngine:
             # Phase 224B: Stale Signal Penalty — skor zamanla düşer
             created_at = order.get('createdAt', current_time)
             pending_age_min = (current_time - created_at) / 60000
-            # Fix 3: Confirmed orders get 20min stale threshold (was 10min for all)
-            stale_threshold_min = 20 if order.get('confirmed', False) else 10
+            is_confirmed = order.get('confirmed', False)
+            stale_threshold_min = STALE_THRESHOLD_CONFIRMED_MIN if is_confirmed else STALE_THRESHOLD_UNCONFIRMED_MIN
             if pending_age_min > stale_threshold_min:
-                stale_penalty = min(20, int((pending_age_min - stale_threshold_min) * 2))
+                stale_penalty = min(20, int((pending_age_min - stale_threshold_min) * STALE_PENALTY_PER_MIN))
                 original_score = order.get('signalScore', 70)
-                adjusted_score = max(40, original_score - stale_penalty)
-                if adjusted_score < self.min_confidence_score:
+                stale_floor = max(40, self.min_confidence_score - STALE_MIN_SCORE_BUFFER)
+                adjusted_score = max(stale_floor, original_score - stale_penalty)
+                if pending_age_min > (stale_threshold_min + STALE_GRACE_MIN) and adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['stale_dropped'] += 1
                     self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
-                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, stale_thresh={stale_threshold_min}min, score {original_score}→{adjusted_score})")
+                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, stale_thresh={stale_threshold_min}min+{STALE_GRACE_MIN}min, score {original_score}→{adjusted_score})")
                     continue
-            
-            # Find current price for this symbol
-            current_price = None
-            for opp in opportunities:
-                if opp.get('symbol') == symbol:
-                    current_price = opp.get('price', 0)
-                    break
             
             if not current_price or current_price <= 0:
                 continue
@@ -17504,7 +17524,16 @@ class PaperTradingEngine:
                     
                     # Cancel: dropped too far below entry
                     if current_price < entry_price - cancel_distance:
-                        self.pending_orders.remove(order)
+                        signal_score = order.get('signalScore', 0)
+                        if signal_score >= MARKET_FALLBACK_MIN_SCORE:
+                            self.pipeline_metrics['market_fallback'] += 1
+                            self.pipeline_metrics['fallback_on_fail'] += 1
+                            self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
+                            logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} dropped too far → market fill")
+                            await self.execute_pending_order(order, current_price, force_market=True)
+                            continue
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
@@ -17527,7 +17556,16 @@ class PaperTradingEngine:
                     
                     # Cancel: rose too far above entry
                     if current_price > entry_price + cancel_distance:
-                        self.pending_orders.remove(order)
+                        signal_score = order.get('signalScore', 0)
+                        if signal_score >= MARKET_FALLBACK_MIN_SCORE:
+                            self.pipeline_metrics['market_fallback'] += 1
+                            self.pipeline_metrics['fallback_on_fail'] += 1
+                            self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
+                            logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} rose too far → market fill")
+                            await self.execute_pending_order(order, current_price, force_market=True)
+                            continue
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
@@ -17537,7 +17575,7 @@ class PaperTradingEngine:
                 if elapsed_ms > trail_timeout_ms:
                     # Fix 2: Strong signals get market fallback instead of timeout
                     signal_score = order.get('signalScore', 0)
-                    if signal_score >= 85:
+                    if signal_score >= MARKET_FALLBACK_MIN_SCORE:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
                         logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
