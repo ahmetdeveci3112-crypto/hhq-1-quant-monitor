@@ -7,6 +7,7 @@ interface ActiveSignalsPanelProps {
     onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number) => Promise<void>;
     entryTightness?: number;
     minConfidenceScore?: number;
+    priceFlashMap?: Record<string, 'up' | 'down'>;
 }
 
 const formatPrice = (price: number): string => {
@@ -117,7 +118,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     return <div className="flex items-center gap-0.5 flex-wrap">{badges}</div>;
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40 }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
@@ -188,6 +189,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = getEntryPrice(signal, entryTightness);
         const isLoading = loadingSymbol === signal.symbol;
+        const priceFlash = priceFlashMap[signal.symbol];
 
         return (
             <div className={`p-3 rounded-lg border transition-colors ${isLong ? 'bg-emerald-500/5 border-emerald-500/30' : 'bg-rose-500/5 border-rose-500/30'
@@ -222,7 +224,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <div className="grid grid-cols-2 gap-2 mb-2">
                     <div>
                         <div className="text-[9px] text-slate-500 uppercase">Fiyat</div>
-                        <div className="text-xs font-mono text-white">${formatPrice(signal.price)}</div>
+                        <div className={`text-xs font-mono transition-colors duration-200 ${priceFlash === 'up' ? 'text-emerald-300' : priceFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(signal.price)}</div>
                     </div>
                     <div>
                         <div className="text-[9px] text-slate-500 uppercase">
@@ -351,6 +353,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
                                 const entryPrice = getEntryPrice(signal, entryTightness);
                                 const isLoading = loadingSymbol === signal.symbol;
+                                const priceFlash = priceFlashMap[signal.symbol];
                                 const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
                                 // Phase 218: Trail Entry
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
@@ -389,7 +392,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                 {signal.signalAction}
                                             </span>
                                         </td>
-                                        <td className="py-2.5 px-3 text-right font-mono text-xs text-slate-300">${formatPrice(signal.price)}</td>
+                                        <td className={`py-2.5 px-3 text-right font-mono text-xs transition-colors duration-200 ${priceFlash === 'up' ? 'text-emerald-300' : priceFlash === 'down' ? 'text-rose-300' : 'text-slate-300'}`}>${formatPrice(signal.price)}</td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs font-semibold ${isLong ? 'text-emerald-400' : 'text-rose-400'}`}>
                                             ${formatPrice(entryPrice)}
                                             {signal.entryPriceBackend ? (

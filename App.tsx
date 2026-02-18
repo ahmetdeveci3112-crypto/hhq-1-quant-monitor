@@ -209,7 +209,14 @@ export default function App() {
 
   // Connection and update status
   const [lastUpdateTime, setLastUpdateTime] = useState<Date | null>(null);
+  const [lastFastTickMs, setLastFastTickMs] = useState<number>(0);
   const [isConnected, setIsConnected] = useState(false);
+  const [signalPriceFlash, setSignalPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
+  const [positionPriceFlash, setPositionPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
+  const signalPriceRef = useRef<Record<string, number>>({});
+  const positionPriceRef = useRef<Record<string, number>>({});
+  const signalFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const positionFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Settings Modal
   const [showSettings, setShowSettings] = useState(false);
@@ -479,6 +486,134 @@ export default function App() {
       addLog('❌ API hatası: Market Order başarısız');
     }
   }, [addLog]);
+
+  // Keep latest price refs in sync with full scanner snapshots.
+  useEffect(() => {
+    const next: Record<string, number> = {};
+    for (const opp of opportunities) {
+      const px = Number(opp.price || 0);
+      if (px > 0) next[opp.symbol] = px;
+    }
+    signalPriceRef.current = next;
+  }, [opportunities]);
+
+  useEffect(() => {
+    const next: Record<string, number> = {};
+    for (const pos of portfolio.positions) {
+      const px = Number((pos as any).markPrice || (pos as any).currentPrice || pos.entryPrice || 0);
+      if (px > 0) next[pos.symbol] = px;
+    }
+    positionPriceRef.current = next;
+  }, [portfolio.positions]);
+
+  // Fast lightweight price ticks from /ws/scanner (type=price_tick).
+  // Merges only price/PnL fields to keep UI responsive between full snapshots.
+  const handleFastPriceTick = useCallback((data: any) => {
+    const raw = data?.prices;
+    if (!raw || typeof raw !== 'object') return;
+
+    const prices: Record<string, number> = {};
+    for (const [symbol, value] of Object.entries(raw)) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) prices[symbol] = n;
+    }
+    if (Object.keys(prices).length === 0) return;
+
+    setLastFastTickMs(Date.now());
+
+    const signalFlashMap: Record<string, 'up' | 'down'> = {};
+    const positionFlashMap: Record<string, 'up' | 'down'> = {};
+    for (const [symbol, px] of Object.entries(prices)) {
+      const prevSignalPx = Number(signalPriceRef.current[symbol] || 0);
+      if (prevSignalPx > 0 && Math.abs(px - prevSignalPx) >= 1e-12) {
+        signalFlashMap[symbol] = px >= prevSignalPx ? 'up' : 'down';
+      }
+      signalPriceRef.current[symbol] = px;
+
+      const prevPositionPx = Number(positionPriceRef.current[symbol] || 0);
+      if (prevPositionPx > 0 && Math.abs(px - prevPositionPx) >= 1e-12) {
+        positionFlashMap[symbol] = px >= prevPositionPx ? 'up' : 'down';
+      }
+      positionPriceRef.current[symbol] = px;
+    }
+
+    setOpportunities(prev => {
+      let changed = false;
+      const next = prev.map(opp => {
+        const px = prices[opp.symbol];
+        if (!px) return opp;
+        const prevPx = Number(opp.price || 0);
+        if (prevPx > 0 && Math.abs(px - prevPx) < 1e-12) return opp;
+        changed = true;
+        return { ...opp, price: px };
+      });
+      return changed ? next : prev;
+    });
+
+    setPortfolio(prev => {
+      let changed = false;
+      const nextPositions = prev.positions.map(pos => {
+        const px = prices[pos.symbol];
+        if (!px) return pos;
+
+        const prevPx = Number((pos as any).markPrice || (pos as any).currentPrice || pos.entryPrice || 0);
+        if (prevPx > 0 && Math.abs(px - prevPx) < 1e-12) return pos;
+
+        const entry = Number(pos.entryPrice || px);
+        const sizeUsd = Number(pos.sizeUsd || 0);
+        const size = Number(pos.size || (entry > 0 ? sizeUsd / entry : 0));
+        const lev = Number(pos.leverage || 1);
+
+        let pnl = Number(pos.unrealizedPnl || 0);
+        if (size > 0 && entry > 0) {
+          pnl = pos.side === 'LONG' ? (px - entry) * size : (entry - px) * size;
+        }
+        const pnlPct = sizeUsd > 0 ? (pnl / sizeUsd) * 100 * lev : Number(pos.unrealizedPnlPercent || 0);
+
+        changed = true;
+
+        return {
+          ...pos,
+          currentPrice: px,
+          markPrice: px,
+          unrealizedPnl: Number(pnl.toFixed(6)),
+          unrealizedPnlPercent: Number(pnlPct.toFixed(2))
+        } as Position;
+      });
+
+      if (!changed) return prev;
+
+      return {
+        ...prev,
+        positions: nextPositions
+      };
+    });
+
+    if (Object.keys(signalFlashMap).length > 0) {
+      setSignalPriceFlash(prev => ({ ...prev, ...signalFlashMap }));
+      if (signalFlashResetRef.current) clearTimeout(signalFlashResetRef.current);
+      signalFlashResetRef.current = setTimeout(() => {
+        setSignalPriceFlash({});
+        signalFlashResetRef.current = null;
+      }, 450);
+    }
+
+    if (Object.keys(positionFlashMap).length > 0) {
+      setPositionPriceFlash(prev => ({ ...prev, ...positionFlashMap }));
+      if (positionFlashResetRef.current) clearTimeout(positionFlashResetRef.current);
+      positionFlashResetRef.current = setTimeout(() => {
+        setPositionPriceFlash({});
+        positionFlashResetRef.current = null;
+      }, 450);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (signalFlashResetRef.current) clearTimeout(signalFlashResetRef.current);
+      if (positionFlashResetRef.current) clearTimeout(positionFlashResetRef.current);
+    };
+  }, []);
 
   // ============================================================================
   // PAPER TRADING ENGINE
@@ -786,6 +921,11 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
 
+          if (data.type === 'price_tick') {
+            handleFastPriceTick(data);
+            return;
+          }
+
           // Phase 31: Handle scanner update
           if (data.type === 'scanner_update') {
             // Phase 74: Detect trading mode from scanner_update
@@ -912,7 +1052,7 @@ export default function App() {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     };
-  }, [isRunning]);
+  }, [isRunning, handleFastPriceTick]);
 
   // Periodic equity curve update
   useEffect(() => {
@@ -951,6 +1091,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isRunning]);
 
+  const fastTickFresh = lastFastTickMs > 0 && (Date.now() - lastFastTickMs) <= 1200;
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-slate-300 font-sans selection:bg-indigo-500/30">
@@ -1005,6 +1146,12 @@ export default function App() {
               {lastUpdateTime && (
                 <span className="text-slate-500 border-l border-slate-700 pl-3">
                   Son: {lastUpdateTime.toLocaleTimeString('tr-TR')}
+                </span>
+              )}
+              {lastFastTickMs > 0 && (
+                <span className={`border-l border-slate-700 pl-3 flex items-center gap-1.5 font-semibold ${fastTickFresh ? 'text-cyan-400' : 'text-slate-600'}`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${fastTickFresh ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`}></span>
+                  FAST
                 </span>
               )}
             </div>
@@ -1236,6 +1383,7 @@ export default function App() {
                   [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                     const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
+                    const markFlash = positionPriceFlash[pos.symbol];
                     const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                     const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                     const isLong = pos.side === 'LONG';
@@ -1266,7 +1414,7 @@ export default function App() {
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
                           <div><span className="text-slate-500">Invested</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
                           <div><span className="text-slate-500">Entry</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
-                          <div><span className="text-slate-500">Mark</span><div className="font-mono text-white">${formatPrice(currentPrice)}</div></div>
+                          <div><span className="text-slate-500">Mark</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
                           <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
@@ -1328,6 +1476,7 @@ export default function App() {
                       [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
                         const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                         const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
+                        const markFlash = positionPriceFlash[pos.symbol];
                         const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
                         const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                         const isLong = pos.side === 'LONG';
@@ -1370,7 +1519,7 @@ export default function App() {
                             </td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">{formatCurrency(margin)}</td>
                             <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(pos.entryPrice)}</td>
-                            <td className="py-3 px-2 text-right font-mono text-slate-300">${formatPrice(currentPrice)}</td>
+                            <td className={`py-3 px-2 text-right font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-slate-300'}`}>${formatPrice(currentPrice)}</td>
                             <td className="py-3 px-2 text-right">
                               <div className="text-[10px] space-y-0.5">
                                 <div className="text-emerald-400">TP: ${formatPrice(tp)} <span className="text-slate-500">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
@@ -1569,6 +1718,7 @@ export default function App() {
                 onMarketOrder={handleMarketOrder}
                 entryTightness={settings.entryTightness}
                 minConfidenceScore={settings.minConfidenceScore || 40}
+                priceFlashMap={signalPriceFlash}
               />
             </div>
           )

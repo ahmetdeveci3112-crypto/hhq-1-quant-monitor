@@ -8876,6 +8876,18 @@ async def on_position_price_update(symbol: str, ticker: dict):
         pos['currentPrice'] = current_price
         pos['unrealizedPnl'] = round(pnl, 6)
         pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
+
+        # Keep UI cache hot between scanner cycles for faster frontend updates.
+        try:
+            for cached_pos in ui_state_cache.positions:
+                if cached_pos.get('symbol') != symbol:
+                    continue
+                cached_pos['currentPrice'] = current_price
+                cached_pos['markPrice'] = current_price
+                cached_pos['unrealizedPnl'] = round(pnl, 6)
+                cached_pos['unrealizedPnlPercent'] = round(pnl_percent, 2)
+        except Exception:
+            pass
         
         # ---- Pending limit close varsa SL/TP atla ----
         pending = pos.get('pending_limit_close')
@@ -20949,34 +20961,96 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("🚀 Phase 98: Scanner WebSocket connected - using cache")
     
-    stream_interval = 2  # Stream cached data every 2 seconds
+    full_state_interval = 2.0  # Full payload (opportunities + portfolio) cadence
+    fast_tick_interval = 0.35  # Fast price ticks for active signals/positions
+    last_full_state_sent = 0.0
     
     try:
+        async def send_full_state():
+            """Send full scanner snapshot from cache."""
+            if ui_state_cache.is_ready():
+                state = ui_state_cache.get_state()
+                await websocket.send_text(json.dumps(state, default=_safe_json_default))
+            else:
+                await websocket.send_json({
+                    "type": "scanner_update",
+                    "opportunities": [],
+                    "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
+                    "portfolio": {"balance": 0, "positions": [], "trades": [], "stats": {}, "logs": [], "enabled": True},
+                    "tradingMode": ui_state_cache.trading_mode,
+                    "timestamp": datetime.now().timestamp(),
+                    "message": "Cache initializing... (first scan in progress)"
+                })
+
+        async def send_fast_price_tick():
+            """Send lightweight fast price updates for active symbols only."""
+            if not binance_ws_manager.tickers:
+                return
+
+            min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
+            signal_symbols = set()
+            for opp in ui_state_cache.opportunities:
+                if opp.get('signalAction') != 'NONE' and opp.get('signalScore', 0) >= min_score:
+                    sym = opp.get('symbol')
+                    if sym:
+                        signal_symbols.add(sym)
+
+            position_symbols = set()
+            for pos in ui_state_cache.positions:
+                sym = pos.get('symbol')
+                if sym:
+                    position_symbols.add(sym)
+
+            tracked_symbols = signal_symbols.union(position_symbols)
+            if not tracked_symbols:
+                return
+
+            tickers = binance_ws_manager.get_tickers(list(tracked_symbols))
+            if not tickers:
+                return
+
+            all_prices = {}
+            signal_prices = {}
+            position_prices = {}
+            for sym, tick in tickers.items():
+                px = float(tick.get('last', 0) or 0)
+                if px <= 0:
+                    continue
+                all_prices[sym] = px
+                if sym in signal_symbols:
+                    signal_prices[sym] = px
+                if sym in position_symbols:
+                    position_prices[sym] = px
+
+            if not all_prices:
+                return
+
+            await websocket.send_text(json.dumps({
+                "type": "price_tick",
+                "prices": all_prices,
+                "signalPrices": signal_prices,
+                "positionPrices": position_prices,
+                "timestamp": datetime.now().timestamp()
+            }, default=_safe_json_default))
+
         # INSTANT: Send cached state immediately (no API calls!)
+        await send_full_state()
+        last_full_state_sent = datetime.now().timestamp()
         if ui_state_cache.is_ready():
-            state = ui_state_cache.get_state()
-            await websocket.send_text(json.dumps(state, default=_safe_json_default))
             logger.info(f"📦 Phase 98: Sent cached state instantly ({len(ui_state_cache.opportunities)} opportunities)")
         else:
-            # Cache not ready yet - send empty state with loading message
-            await websocket.send_json({
-                "type": "scanner_update",
-                "opportunities": [],
-                "stats": {"totalCoins": 0, "analyzedCoins": 0, "longSignals": 0, "shortSignals": 0, "activeSignals": 0},
-                "portfolio": {"balance": 0, "positions": [], "trades": [], "stats": {}, "logs": [], "enabled": True},
-                "tradingMode": ui_state_cache.trading_mode,
-                "timestamp": datetime.now().timestamp(),
-                "message": "Cache initializing... (first scan in progress)"
-            })
             logger.info("⏳ Phase 98: Cache not ready yet, sent empty state")
         
-        # Stream updates from cache (no Binance calls in this loop!)
+        # Stream fast ticks frequently + full state periodically.
         while True:
-            await asyncio.sleep(stream_interval)
-            
-            # Simply send the current cache state
-            state = ui_state_cache.get_state()
-            await websocket.send_text(json.dumps(state, default=_safe_json_default))
+            await asyncio.sleep(fast_tick_interval)
+
+            await send_fast_price_tick()
+
+            now_ts = datetime.now().timestamp()
+            if now_ts - last_full_state_sent >= full_state_interval:
+                await send_full_state()
+                last_full_state_sent = now_ts
             
     except WebSocketDisconnect:
         logger.info("Scanner WebSocket client disconnected")
