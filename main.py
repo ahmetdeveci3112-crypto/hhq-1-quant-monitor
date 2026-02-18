@@ -17443,7 +17443,7 @@ class PaperTradingEngine:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
                         logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
-                        await self.execute_pending_order(order, current_price)
+                        await self.execute_pending_order(order, current_price, force_market=True)
                         continue
                     # Normal timeout
                     self.pending_orders.remove(order)
@@ -17457,8 +17457,11 @@ class PaperTradingEngine:
                 if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
                     logger.debug(f"📍 TRAIL ENTRY WAIT: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} extreme=${extreme_price:.6f} dist={trail_pct:.2f}%")
     
-    async def execute_pending_order(self, order: dict, fill_price: float):
-        """Execute a pending order at the fill price."""
+    async def execute_pending_order(self, order: dict, fill_price: float, force_market: bool = False):
+        """Execute a pending order at the fill price.
+        Args:
+            force_market: If True, bypass spread/drift guards (used by market fallback).
+        """
         # Remove from pending
         if order in self.pending_orders:
             self.pending_orders.remove(order)
@@ -17589,7 +17592,7 @@ class PaperTradingEngine:
         # LIVE TRADING: Send order to Binance before creating local position
         # Phase 186: Limit entry + pre-trade spread filter
         # =====================================================================
-        if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
+        if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live' and not force_market:
             try:
                 # Phase 186 Feature C: Pre-trade spread filter
                 ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
@@ -17697,6 +17700,46 @@ class PaperTradingEngine:
                 logger.error(f"❌ LIVE ORDER ERROR: {e}")
                 self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
                 return  # Don't create position if there was an error
+        elif force_market and live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
+            # Force market: bypass spread/drift guards, send direct market order
+            try:
+                logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (no spread/drift check)...")
+                result = await live_binance_trader.place_limit_entry_order(
+                    symbol=symbol,
+                    side=side,
+                    size_usd=order['sizeUsd'],
+                    leverage=order['leverage']
+                )
+                if result:
+                    new_position['binance_order_id'] = result.get('id')
+                    actual_fill = result.get('price', fill_price)
+                    new_position['binance_fill_price'] = actual_fill
+                    new_position['isLive'] = True
+                    new_position['entry_method'] = 'MARKET_FALLBACK'
+                    new_position['entry_slippage'] = result.get('slippage_pct', 0)
+                    new_position['entry_spread'] = result.get('spread_pct', 0)
+                    logger.info(f"✅ FORCE MARKET SUCCESS: {result.get('id')} | slippage={abs(result.get('slippage_pct', 0)):.3f}%")
+                    # Recalculate SL/TP with actual fill
+                    if abs(actual_fill - fill_price) / fill_price > 0.001:
+                        new_position['entryPrice'] = actual_fill
+                        if side == 'LONG':
+                            new_position['stopLoss'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_sl_atr))
+                            new_position['takeProfit'] = actual_fill + (atr * adjusted_tp_atr)
+                            new_position['trailActivation'] = actual_fill + (atr * adjusted_trail_activation_atr)
+                            new_position['trailingStop'] = new_position['stopLoss']
+                        else:
+                            new_position['stopLoss'] = actual_fill + (atr * adjusted_sl_atr)
+                            new_position['takeProfit'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_tp_atr))
+                            new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
+                            new_position['trailingStop'] = new_position['stopLoss']
+                else:
+                    logger.error(f"❌ FORCE MARKET FAILED - skipping position creation")
+                    self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi")
+                    return
+            except Exception as e:
+                logger.error(f"❌ FORCE MARKET ERROR: {e}")
+                self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {str(e)[:80]}")
+                return
         
         # Paper Trading: Initial Margin = Position Size / Leverage
         # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
@@ -18145,6 +18188,10 @@ class PaperTradingEngine:
                     # Phase 224B: Load EV signal filter state
                     self.score_band_stats = data.get('score_band_stats', {})
                     self.last_signal_per_coin = data.get('last_signal_per_coin', {})
+                    # Pipeline metrics persistence
+                    saved_metrics = data.get('pipeline_metrics', {})
+                    if saved_metrics:
+                        self.pipeline_metrics.update(saved_metrics)
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 
@@ -18194,6 +18241,7 @@ class PaperTradingEngine:
                 # Phase 224B: EV signal filter state
                 "score_band_stats": self.score_band_stats,
                 "last_signal_per_coin": self.last_signal_per_coin,
+                "pipeline_metrics": self.pipeline_metrics,
             }
             with open(self.state_file, 'w') as f:
                 json.dump(data, f)
@@ -18222,6 +18270,9 @@ class PaperTradingEngine:
         }
         # Phase 32: Clear old logs on reset
         self.logs = []
+        # Reset pipeline metrics
+        for key in self.pipeline_metrics:
+            self.pipeline_metrics[key] = 0
         self.save_state()
         logger.info("🔄 Paper Trading Reset to $10,000")
 
