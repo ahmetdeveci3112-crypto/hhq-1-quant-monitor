@@ -4399,6 +4399,17 @@ EQ_MIN_DEPTH_USD = 120_000      # Legacy max cap for execution depth threshold
 EQ_MIN_DEPTH_USD_BASE = 20_000  # Dynamic min floor
 EQ_OBI_OPPOSE_VETO = 0.35       # Execution: OBI opposing veto threshold
 
+# Signal memory / reinforcement (same coin repeated signals)
+SIGNAL_MEMORY_ENABLED = True
+SIGNAL_MEMORY_TTL_SECONDS = 45 * 60
+SIGNAL_MEMORY_MAX_BONUS = 8
+SIGNAL_MEMORY_BONUS_STEP = 2
+SIGNAL_MEMORY_THINBOOK_RELAX_STEP = 0.10
+SIGNAL_MEMORY_THINBOOK_MIN_SCALE = 0.65
+SIGNAL_MEMORY_PENDING_EXTEND_STEP_SECONDS = 300
+SIGNAL_MEMORY_PENDING_EXTEND_MAX_SECONDS = 1800
+SIGNAL_MEMORY_OPPOSITE_FLIP_MIN_SCORE_GAP = 6
+
 # MTF soft-override for high-quality setups
 MTF_SOFT_OVERRIDE_ENABLED = True
 MTF_SOFT_OVERRIDE_MIN_SCORE = 110
@@ -10053,6 +10064,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'blacklisted': False,
         'obi_value': 0.0,  # Phase 211: OBI depth value (updated before save)
     }
+    signal_memory_ctx = {
+        "reinforce_count": 0,
+        "score_bonus": 0,
+        "thinbook_scale": 1.0,
+        "pending_extend_sec": 0,
+        "flip_recent": False,
+    }
     
     # Check if we already have a position in this symbol
     existing_position = None
@@ -10174,6 +10192,36 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             
     except Exception as btc_err:
         logger.warning(f"BTC Filter error: {btc_err}")
+
+    # =====================================================
+    # SIGNAL MEMORY / REINFORCEMENT
+    # Aynı coin'de ardışık sinyaller için score + timeout + depth adaptasyonu
+    # =====================================================
+    try:
+        signal_memory_ctx = global_paper_trader.register_signal_memory(
+            symbol=symbol,
+            side=action,
+            score=float(signal.get('confidenceScore', 0) or 0),
+            volume_ratio=float(signal.get('volumeRatio', 1.0) or 1.0),
+            spread_pct=float(signal.get('spreadPct', 0.05) or 0.05),
+        )
+        reinforce_count = int(signal_memory_ctx.get("reinforce_count", 0))
+        score_bonus = int(signal_memory_ctx.get("score_bonus", 0))
+        if score_bonus > 0:
+            before_score = int(signal.get('confidenceScore', 0) or 0)
+            signal['confidenceScore'] = before_score + score_bonus
+            logger.info(
+                f"🧠 SIG_MEMORY: {symbol} {action} reinforce={reinforce_count} "
+                f"score {before_score}->{signal['confidenceScore']} (+{score_bonus})"
+            )
+        signal['signalReinforceCount'] = reinforce_count
+        signal['memoryThinBookScale'] = float(signal_memory_ctx.get("thinbook_scale", 1.0) or 1.0)
+        signal['memoryExtensionSec'] = int(signal_memory_ctx.get("pending_extend_sec", 0) or 0)
+        signal['memoryFlipRecent'] = bool(signal_memory_ctx.get("flip_recent", False))
+        signal_log_data['memory_reinforce_count'] = reinforce_count
+        signal_log_data['memory_score_bonus'] = score_bonus
+    except Exception as mem_err:
+        logger.debug(f"Signal memory error: {mem_err}")
     
     # =====================================================
     # Phase 211: OBI DEPTH FILTER — L2 Order Book Pressure
@@ -10195,7 +10243,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 signal_score=float(signal_score),
                 leverage=signal_leverage
             )
-            if 0 < total_depth < dynamic_depth_threshold:
+            memory_scale = _clamp(float(signal.get('memoryThinBookScale', 1.0) or 1.0), 0.6, 1.0)
+            dynamic_depth_threshold *= memory_scale
+            reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
+            near_threshold_soft_pass = (
+                reinforce_count >= 2
+                and signal_score >= 95
+                and total_depth >= dynamic_depth_threshold * 0.82
+            )
+            if 0 < total_depth < dynamic_depth_threshold and not near_threshold_soft_pass:
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -10206,6 +10262,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                 )
                 return
+            elif near_threshold_soft_pass:
+                original_score = signal.get('confidenceScore', 60)
+                signal['confidenceScore'] = max(40, int(original_score) - 6)
+                global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
+                logger.info(
+                    f"🟨 THIN_BOOK_SOFT_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                    f"th=${dynamic_depth_threshold:.0f} reinforce={reinforce_count} "
+                    f"score {original_score}->{signal['confidenceScore']}"
+                )
         except Exception:
             pass  # depth data may not always be available
         
@@ -10247,11 +10312,21 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal_log_data['obi_value'] = round(obi_value, 4)
             vol_ratio_val = signal.get('volumeRatio', 1.0)
             if abs(obi_value) < 0.12 and vol_ratio_val < 1.2:
-                signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
-                logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
-                return
+                reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
+                if reinforce_count >= 2 and signal.get('confidenceScore', 0) >= 95:
+                    original_score = signal.get('confidenceScore', 60)
+                    signal['confidenceScore'] = max(40, int(original_score) - 8)
+                    global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
+                    logger.info(
+                        f"🟨 OBI_NEUTRAL_SOFT_PASS: {action} {symbol} OBI={obi_value:+.3f} vr={vol_ratio_val:.1f} "
+                        f"reinforce={reinforce_count} score {original_score}->{signal['confidenceScore']}"
+                    )
+                else:
+                    signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
+                    logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
+                    return
             logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
         
     except Exception as obi_err:
@@ -17291,7 +17366,8 @@ class PaperTradingEngine:
             'trail_entry_fail': 0, 'trail_entry_timeout': 0, 'market_fallback': 0,
             'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0,
             'fallback_on_fail': 0, 'fallback_on_expire': 0,
-            'thin_book_rejected': 0, 'mtf_rejected': 0, 'mtf_soft_override': 0
+            'thin_book_rejected': 0, 'mtf_rejected': 0, 'mtf_soft_override': 0,
+            'pending_reinforced': 0, 'pending_flipped': 0, 'memory_soft_pass': 0
         }
         # Symbol-level execution feedback for UI (latest rejection reason).
         self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
@@ -17308,6 +17384,7 @@ class PaperTradingEngine:
         # Phase 224A: MAE/MFE Diagnostics + Signal EV
         self.score_band_stats = {}  # {"60-70": {wins, losses, total_win, total_loss, avg_win, avg_loss}}
         self.last_signal_per_coin = {}  # {symbol: {side, time}} for flip detection
+        self.signal_memory = {}  # {symbol: {side, streak, last_seen, score, ...}}
         
         # Phase 60: AI Optimizer Toggle - kapalıyken dinamik hesaplamalar yapılmaz
         self.ai_optimizer_enabled = False  # Default: OFF - manuel ayarlar geçerli
@@ -17405,6 +17482,100 @@ class PaperTradingEngine:
             self.add_log(f"📊 Min Skor: {dynamic_score} ({mode}, WR:{win_rate*100:.0f}%)")
         
         return dynamic_score
+
+    # =========================================================================
+    # Signal Memory: same-coin reinforcement / flip context
+    # =========================================================================
+    def _prune_signal_memory(self, now_ms: int = None):
+        if not SIGNAL_MEMORY_ENABLED:
+            return
+        if now_ms is None:
+            now_ms = int(datetime.now().timestamp() * 1000)
+        ttl_ms = SIGNAL_MEMORY_TTL_SECONDS * 1000
+        for sym, mem in list(self.signal_memory.items()):
+            if now_ms - int(mem.get('last_seen', 0)) > ttl_ms:
+                self.signal_memory.pop(sym, None)
+
+    def register_signal_memory(
+        self,
+        symbol: str,
+        side: str,
+        score: float,
+        volume_ratio: float = 1.0,
+        spread_pct: float = 0.05
+    ) -> dict:
+        """
+        Track repeated signals per coin and produce reinforcement hints.
+        Returns tuning context used by execution filters/pending logic.
+        """
+        if not SIGNAL_MEMORY_ENABLED:
+            return {
+                "reinforce_count": 0,
+                "score_bonus": 0,
+                "thinbook_scale": 1.0,
+                "pending_extend_sec": 0,
+                "flip_recent": False,
+                "memory_side": side,
+            }
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        self._prune_signal_memory(now_ms)
+
+        safe_symbol = str(symbol or "").upper()
+        safe_side = "LONG" if str(side).upper() in ("LONG", "BUY") else "SHORT"
+        mem = self.signal_memory.get(safe_symbol)
+        flip_recent = False
+
+        if not mem:
+            mem = {
+                "side": safe_side,
+                "streak": 1,
+                "opposite_hits": 0,
+                "first_seen": now_ms,
+                "last_seen": now_ms,
+                "score": float(score or 0),
+                "volume_ratio": float(volume_ratio or 1.0),
+                "spread_pct": float(spread_pct or 0.05),
+            }
+        else:
+            prev_side = str(mem.get("side", safe_side)).upper()
+            last_seen = int(mem.get("last_seen", now_ms))
+            quick_window_ms = 4 * 60 * 1000
+
+            if prev_side == safe_side:
+                mem["streak"] = min(6, int(mem.get("streak", 1)) + 1)
+                mem["opposite_hits"] = max(0, int(mem.get("opposite_hits", 0)) - 1)
+            else:
+                mem["streak"] = 1
+                mem["opposite_hits"] = min(4, int(mem.get("opposite_hits", 0)) + 1)
+                flip_recent = (now_ms - last_seen) <= quick_window_ms
+
+            mem["side"] = safe_side
+            mem["last_seen"] = now_ms
+            mem["score"] = float(score or 0)
+            mem["volume_ratio"] = (float(mem.get("volume_ratio", 1.0)) * 0.65) + (float(volume_ratio or 1.0) * 0.35)
+            mem["spread_pct"] = (float(mem.get("spread_pct", 0.05)) * 0.65) + (float(spread_pct or 0.05) * 0.35)
+
+        self.signal_memory[safe_symbol] = mem
+
+        reinforce_count = max(0, int(mem.get("streak", 1)) - 1)
+        score_bonus = min(SIGNAL_MEMORY_MAX_BONUS, reinforce_count * SIGNAL_MEMORY_BONUS_STEP)
+        thinbook_relax = min(0.35, reinforce_count * SIGNAL_MEMORY_THINBOOK_RELAX_STEP)
+        thinbook_scale = max(SIGNAL_MEMORY_THINBOOK_MIN_SCALE, 1.0 - thinbook_relax)
+        pending_extend_sec = min(
+            SIGNAL_MEMORY_PENDING_EXTEND_MAX_SECONDS,
+            reinforce_count * SIGNAL_MEMORY_PENDING_EXTEND_STEP_SECONDS
+        )
+
+        return {
+            "reinforce_count": reinforce_count,
+            "score_bonus": score_bonus,
+            "thinbook_scale": thinbook_scale,
+            "pending_extend_sec": pending_extend_sec,
+            "flip_recent": flip_recent,
+            "memory_side": safe_side,
+            "opposite_hits": int(mem.get("opposite_hits", 0)),
+        }
     
     # =========================================================================
     # Phase 224B: EV-Based Signal Filter
@@ -17839,12 +18010,76 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Scale-in limit reached for {trade_symbol} {side}")
             return None  # Silently skip scale-in limit
         
-        # Check for existing pending order for same symbol (avoid duplicate pending)
-        existing_pending = [p for p in self.pending_orders if p.get('symbol') == trade_symbol]
+        # Check for existing pending order for same symbol
+        existing_pending = next((p for p in self.pending_orders if p.get('symbol') == trade_symbol), None)
         if existing_pending:
-            self.set_execution_feedback(trade_symbol, "PENDING_EXISTS")
-            logger.info(f"🚫 OPEN_POS SKIP: Pending order already exists for {trade_symbol}")
-            return None  # Already have pending order for this symbol
+            now_ms = int(datetime.now().timestamp() * 1000)
+            existing_side = existing_pending.get('side')
+            new_score = int(signal.get('confidenceScore', 0) if signal else 0)
+            old_score = int(existing_pending.get('signalScore', 0) or 0)
+            score_gap = new_score - old_score
+
+            if existing_side == side:
+                # Same direction: reinforce pending instead of dropping new signal.
+                reinforce_count = int(existing_pending.get('reinforcedCount', 0) or 0) + 1
+                existing_pending['reinforcedCount'] = reinforce_count
+                existing_pending['signalScore'] = max(old_score, new_score)
+                existing_pending['lastReinforceAt'] = now_ms
+                existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
+                existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
+                existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
+
+                # Blend entry with latest signal entry (small shift to avoid hard jumps).
+                try:
+                    new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
+                    old_entry = float(existing_pending.get('entryPrice', new_entry))
+                    blend_alpha = 0.35 if score_gap >= 0 else 0.20
+                    existing_pending['entryPrice'] = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
+                except Exception:
+                    pass
+
+                # Extend lifetime + speed up confirmation when reinforcement is strong.
+                extend_sec = max(
+                    180,
+                    int(signal.get('memoryExtensionSec', 0) if signal else 0)
+                )
+                existing_pending['expiresAt'] = max(
+                    int(existing_pending.get('expiresAt', now_ms)),
+                    now_ms + (extend_sec * 1000)
+                )
+                confirm_after = int(existing_pending.get('confirmAfter', now_ms))
+                if confirm_after > now_ms:
+                    remaining = confirm_after - now_ms
+                    speedup = 0.80 if reinforce_count <= 1 else 0.65
+                    existing_pending['confirmAfter'] = now_ms + int(remaining * speedup)
+
+                self.pipeline_metrics['pending_reinforced'] += 1
+                self.set_execution_feedback(trade_symbol, f"PENDING_REINFORCED({reinforce_count})")
+                logger.info(
+                    f"🔁 PENDING REINFORCE: {trade_symbol} {side} score {old_score}->{existing_pending['signalScore']} "
+                    f"reinforce={reinforce_count} entry={existing_pending.get('entryPrice', 0):.6f}"
+                )
+                return existing_pending
+
+            # Opposite direction: allow flip only if new signal is meaningfully stronger.
+            allow_flip = (
+                score_gap >= SIGNAL_MEMORY_OPPOSITE_FLIP_MIN_SCORE_GAP
+                or bool(signal.get('memoryFlipRecent', False) if signal else False)
+            )
+            if allow_flip:
+                self.pending_orders.remove(existing_pending)
+                self.pipeline_metrics['pending_flipped'] += 1
+                logger.info(
+                    f"🔀 PENDING FLIP: {trade_symbol} {existing_side}->{side} "
+                    f"(score {old_score}->{new_score}, gap={score_gap})"
+                )
+            else:
+                self.set_execution_feedback(trade_symbol, "PENDING_OPPOSITE_WEAK")
+                logger.info(
+                    f"🚫 OPEN_POS SKIP: Opposite pending exists for {trade_symbol} "
+                    f"({existing_side}->{side}, score gap={score_gap})"
+                )
+                return None
         
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
@@ -18029,6 +18264,14 @@ class PaperTradingEngine:
             signal_confirmation_delay_seconds = max(60, min(600, signal_confirmation_delay_seconds))  # 1-10dk cap
         except Exception:
             pass
+
+        reinforce_count = int(signal.get('signalReinforceCount', 0) if signal else 0)
+        if reinforce_count >= 2:
+            signal_confirmation_delay_seconds = max(30, int(signal_confirmation_delay_seconds * 0.75))
+
+        memory_extend_sec = int(signal.get('memoryExtensionSec', 0) if signal else 0)
+        memory_extend_sec = max(0, min(SIGNAL_MEMORY_PENDING_EXTEND_MAX_SECONDS, memory_extend_sec))
+        pending_timeout_seconds = self.pending_order_timeout_seconds + memory_extend_sec
         
         # Phase 155: AI Optimizer — snapshot settings at trade open time
         settings_snapshot = {
@@ -18074,8 +18317,8 @@ class PaperTradingEngine:
             "mtfScore": signal.get('mtf_score', 0) if signal else 0,
             "zScore": signal.get('zscore', 0) if signal else 0,
             "createdAt": int(datetime.now().timestamp() * 1000),
-            "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),  # 5 dakika sonra aktif
-            "expiresAt": int((datetime.now().timestamp() + self.pending_order_timeout_seconds) * 1000),
+            "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),
+            "expiresAt": int((datetime.now().timestamp() + pending_timeout_seconds) * 1000),
             "atr": atr,
             "confirmed": False,  # Henüz konfirme edilmedi
             # Phase 153: ADX and Hurst for dynamic bounce threshold
@@ -18096,6 +18339,8 @@ class PaperTradingEngine:
                 "strategyMode": signal.get('strategyMode', STRATEGY_MODE_LEGACY) if signal else STRATEGY_MODE_LEGACY,
                 "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
                 "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
+                "reinforcedCount": reinforce_count,
+                "memoryExtensionSec": memory_extend_sec,
                 "effectiveExitTightness": effective_exit_tightness,
                 # Phase 202: Trend Mode flag
                 "trend_mode": is_trend_mode,
@@ -18161,18 +18406,25 @@ class PaperTradingEngine:
             created_at = order.get('createdAt', current_time)
             pending_age_min = (current_time - created_at) / 60000
             is_confirmed = order.get('confirmed', False)
+            reinforced_count = int(order.get('reinforcedCount', 0) or 0)
             stale_threshold_min = STALE_THRESHOLD_CONFIRMED_MIN if is_confirmed else STALE_THRESHOLD_UNCONFIRMED_MIN
+            stale_threshold_min += min(20, reinforced_count * 4)
+            stale_grace_min = STALE_GRACE_MIN + min(10, reinforced_count * 2)
             if pending_age_min > stale_threshold_min:
                 stale_penalty = min(20, int((pending_age_min - stale_threshold_min) * STALE_PENALTY_PER_MIN))
                 original_score = order.get('signalScore', 70)
-                stale_floor = max(40, self.min_confidence_score - STALE_MIN_SCORE_BUFFER)
+                stale_floor = max(40, self.min_confidence_score - STALE_MIN_SCORE_BUFFER - min(8, reinforced_count * 2))
                 adjusted_score = max(stale_floor, original_score - stale_penalty)
-                if pending_age_min > (stale_threshold_min + STALE_GRACE_MIN) and adjusted_score < self.min_confidence_score:
+                if pending_age_min > (stale_threshold_min + stale_grace_min) and adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['stale_dropped'] += 1
                     self.set_execution_feedback(symbol, "STALE_SIGNAL")
                     self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
-                    logger.info(f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, stale_thresh={stale_threshold_min}min+{STALE_GRACE_MIN}min, score {original_score}→{adjusted_score})")
+                    logger.info(
+                        f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, "
+                        f"stale_thresh={stale_threshold_min}min+{stale_grace_min}min, reinforce={reinforced_count}, "
+                        f"score {original_score}→{adjusted_score})"
+                    )
                     continue
             
             if not current_price or current_price <= 0:
@@ -19199,6 +19451,7 @@ class PaperTradingEngine:
                     # Phase 224B: Load EV signal filter state
                     self.score_band_stats = data.get('score_band_stats', {})
                     self.last_signal_per_coin = data.get('last_signal_per_coin', {})
+                    self.signal_memory = data.get('signal_memory', {})
                     # Pipeline metrics persistence
                     saved_metrics = data.get('pipeline_metrics', {})
                     if saved_metrics:
@@ -19253,6 +19506,7 @@ class PaperTradingEngine:
                 # Phase 224B: EV signal filter state
                 "score_band_stats": self.score_band_stats,
                 "last_signal_per_coin": self.last_signal_per_coin,
+                "signal_memory": self.signal_memory,
                 "pipeline_metrics": self.pipeline_metrics,
             }
             with open(self.state_file, 'w') as f:
@@ -19284,6 +19538,7 @@ class PaperTradingEngine:
         self.logs = []
         # Clear pending orders
         self.pending_orders = []
+        self.signal_memory = {}
         # Reset pipeline metrics
         for key in self.pipeline_metrics:
             self.pipeline_metrics[key] = 0
