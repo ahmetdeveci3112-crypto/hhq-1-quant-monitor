@@ -17366,8 +17366,25 @@ class SignalGenerator:
         entry_quality_pass = True  # Default: pass
         
         if ENTRY_QUALITY_GATE_ENABLED:
+            strategy_mode_upper = str(strategy_mode).upper()
+            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+
+            eq_min_volume_ratio = EQ_MIN_VOLUME_RATIO
+            eq_min_imbalance = EQ_MIN_IMBALANCE
+            eq_min_ob_trend = EQ_MIN_OB_TREND
+            eq_min_volume_24h = EQ_MIN_VOLUME_24H
+            eq_max_spread = EQ_MAX_SPREAD
+
+            if adaptive_mode:
+                # LEGACY + SMART_V2: kontrollü gevşeme (mikrocap gürültüsünü tamamen açmadan)
+                eq_min_volume_ratio = max(0.35, EQ_MIN_VOLUME_RATIO * 0.35)
+                eq_min_imbalance = max(12.0, EQ_MIN_IMBALANCE * 0.5)
+                eq_min_ob_trend = max(0.15, EQ_MIN_OB_TREND * 0.5)
+                eq_min_volume_24h = max(350_000.0, EQ_MIN_VOLUME_24H * 0.3)
+                eq_max_spread = max(0.35, EQ_MAX_SPREAD)
+
             # Koşul A: Volume başlangıcı
-            cond_a = volume_ratio >= EQ_MIN_VOLUME_RATIO or is_volume_spike
+            cond_a = volume_ratio >= eq_min_volume_ratio or is_volume_spike
             if cond_a:
                 eq_pass_count += 1
                 eq_reasons.append(f"A:Vol({volume_ratio:.1f}x)")
@@ -17375,15 +17392,15 @@ class SignalGenerator:
             # Koşul B: OB yön baskısı
             cond_b = False
             if signal_side == "LONG":
-                cond_b = imbalance >= EQ_MIN_IMBALANCE or ob_imbalance_trend >= EQ_MIN_OB_TREND
+                cond_b = imbalance >= eq_min_imbalance or ob_imbalance_trend >= eq_min_ob_trend
             elif signal_side == "SHORT":
-                cond_b = imbalance <= -EQ_MIN_IMBALANCE or ob_imbalance_trend <= -EQ_MIN_OB_TREND
+                cond_b = imbalance <= -eq_min_imbalance or ob_imbalance_trend <= -eq_min_ob_trend
             if cond_b:
                 eq_pass_count += 1
                 eq_reasons.append(f"B:OB(imb={imbalance:.0f},tr={ob_imbalance_trend:.1f})")
 
             # Koşul C: Likidite yeterli
-            cond_c = volume_24h >= EQ_MIN_VOLUME_24H and spread_pct <= EQ_MAX_SPREAD
+            cond_c = volume_24h >= eq_min_volume_24h and spread_pct <= eq_max_spread
             if cond_c:
                 eq_pass_count += 1
                 eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
@@ -17391,8 +17408,6 @@ class SignalGenerator:
             # Gate kararı:
             # - Adaptive modes (LEGACY + SMART_V2): 1/3 ile soft-pass, 0/3 ise yüksek skorda kontrollü geçiş
             # - Other modes: 2/3 şartını korur
-            strategy_mode_upper = str(strategy_mode).upper()
-            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
             eq_required = 2 if not adaptive_mode else 1
             eq_hard_mode = (ENTRY_QUALITY_MODE == 'hard') and not adaptive_mode
             eq_penalty = 15 if not adaptive_mode else 8
@@ -17402,7 +17417,7 @@ class SignalGenerator:
                 fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
                 adaptive_hard_reject = adaptive_mode and eq_pass_count == 0 and score < 95
                 if eq_hard_mode or adaptive_hard_reject:
-                    logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.1f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
+                    logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.2f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
                     return None
                 else:  # soft mode
                     score -= eq_penalty
@@ -17493,16 +17508,16 @@ class SignalGenerator:
         if adaptive_mode:
             # Adaptive modes (LEGACY + SMART_V2): allow more mid-cap coverage while keeping microcaps filtered.
             min_volume = 300_000
-            vol_threshold = max(0.25, vol_threshold * 0.70)
+            vol_threshold = max(0.18, vol_threshold * 0.60)
         
         if volume_24h < min_volume:
             confirmation_passed = False
             confirmation_fails.append(f"LOW_LIQ(24h_Vol=${volume_24h/1_000_000:.1f}M < $0.5M)")
         
         # Phase EQG: Volume ratio kontrolü tekrar aktif
-        if volume_ratio < vol_threshold:
+        if (volume_ratio + 1e-9) < vol_threshold:
             confirmation_passed = False
-            confirmation_fails.append(f"LOW_VOL({volume_ratio:.1f}x<{vol_threshold:.1f})")
+            confirmation_fails.append(f"LOW_VOL({volume_ratio:.2f}x<{vol_threshold:.2f})")
         
         # Konfirmasyon 3: Hurst Regime Kontrolü (SADECE UYARI - VETO DEĞİL)
         if hurst > 0.65:
