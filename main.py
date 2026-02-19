@@ -4560,11 +4560,28 @@ SIGNAL_MEMORY_OPPOSITE_FLIP_MIN_SCORE_GAP = 6
 
 # MTF soft-override for high-quality setups
 MTF_SOFT_OVERRIDE_ENABLED = True
-MTF_SOFT_OVERRIDE_MIN_SCORE = 110
+MTF_SOFT_OVERRIDE_MIN_SCORE = 102
 MTF_SOFT_OVERRIDE_PENALTY = 12
-MTF_SOFT_OVERRIDE_MIN_EQ = 3
-MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX = 8
-MTF_SOFT_OVERRIDE_SMART_MIN_EQ = 2
+MTF_SOFT_OVERRIDE_MIN_EQ = 2
+MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX = 10
+MTF_SOFT_OVERRIDE_SMART_MIN_EQ = 1
+
+# Strong counter-trend MTF relax (pass with strict risk caps)
+MTF_COUNTERTREND_SOFTPASS_ENABLED = True
+MTF_COUNTERTREND_SOFTPASS_MIN_SCORE = 90
+MTF_COUNTERTREND_SOFTPASS_MIN_EQ = 1
+MTF_COUNTERTREND_SOFTPASS_MIN_EXEC = 60.0
+MTF_COUNTERTREND_SOFTPASS_PENALTY = 14
+MTF_COUNTERTREND_SOFTPASS_STRONG_EXTRA_PENALTY = 6
+MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE = 12
+MTF_COUNTERTREND_SOFTPASS_SIZE_MULT = 0.65
+
+# Volatile regime: strict by default, but allow near-threshold high-quality soft pass
+VOLATILE_VETO_SOFTPASS_ENABLED = True
+VOLATILE_VETO_SOFTPASS_MAX_GAP = 8
+VOLATILE_VETO_SOFTPASS_PENALTY_BASE = 4
+VOLATILE_VETO_SOFTPASS_LEVERAGE_CAP = 14
+VOLATILE_VETO_SOFTPASS_SIZE_MULT = 0.75
 
 # Thin-book guard soft-pass (controlled relax for high-quality SMART_V2 setups)
 THIN_BOOK_SMART_SOFTPASS_ENABLED = True
@@ -10531,7 +10548,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             # Legacy mode must stay tradable on mid-cap / thinner books.
             # SMART_V2 keeps stricter thresholding; LEGACY gets controlled relax.
             depth_mode_scale = 1.0
-            if strategy_mode_upper == STRATEGY_MODE_LEGACY:
+            if strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
                 if signal_score >= 110:
                     depth_mode_scale = 0.22
                 elif signal_score >= 95:
@@ -10545,14 +10562,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and total_depth >= dynamic_depth_threshold * 0.82
             )
             legacy_soft_pass = (
-                strategy_mode_upper == STRATEGY_MODE_LEGACY
+                strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
                 and signal_score >= 95
                 and eq_count >= 1
                 and signal_spread <= 0.24
                 and total_depth >= dynamic_depth_threshold * 0.30
             )
             legacy_micro_soft_pass = (
-                strategy_mode_upper == STRATEGY_MODE_LEGACY
+                strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
                 and signal_score >= 90
                 and eq_count >= 1
                 and signal_spread <= 0.12
@@ -10681,13 +10698,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal_log_data['obi_value'] = round(obi_value, 4)
             vol_ratio_val = signal.get('volumeRatio', 1.0)
             strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
-            neutral_obi_limit = 0.12 if strategy_mode_upper != STRATEGY_MODE_LEGACY else 0.10
-            neutral_vol_limit = 1.2 if strategy_mode_upper != STRATEGY_MODE_LEGACY else 0.9
+            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+            neutral_obi_limit = 0.10 if adaptive_mode else 0.12
+            neutral_vol_limit = 0.9 if adaptive_mode else 1.2
             if abs(obi_value) < neutral_obi_limit and vol_ratio_val < neutral_vol_limit:
                 reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
                 eq_count_local = len(signal.get('entryQualityReasons') or [])
                 legacy_soft_pass = (
-                    strategy_mode_upper == STRATEGY_MODE_LEGACY
+                    adaptive_mode
                     and signal.get('confidenceScore', 0) >= 92
                     and eq_count_local >= 1
                 )
@@ -10785,24 +10803,43 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         eq_count = len(signal.get('entryQualityReasons') or [])
         strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
         exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
+        adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
         smart_relax_enabled = (
-            strategy_mode_upper == STRATEGY_MODE_SMART_V2
+            adaptive_mode
             and bool(signal.get('entryQualityPass', False))
             and exec_score >= EXEC_QUALITY_STRICT_MIN_SCORE
         )
         mtf_min_score = int(MTF_SOFT_OVERRIDE_MIN_SCORE)
         mtf_min_eq = int(MTF_SOFT_OVERRIDE_MIN_EQ)
-        if strategy_mode_upper == STRATEGY_MODE_LEGACY:
-            mtf_min_score = max(85, mtf_min_score - 6)
+        if adaptive_mode:
+            mtf_min_score = max(88, mtf_min_score - 6)
             mtf_min_eq = max(1, mtf_min_eq - 1)
         if smart_relax_enabled:
             mtf_min_score = max(85, mtf_min_score - int(MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX))
             mtf_min_eq = int(MTF_SOFT_OVERRIDE_SMART_MIN_EQ)
+
+        mtf_score_raw = int(mtf_result.get('mtf_score', 0) or 0)
+        mtf_reason = str(mtf_result.get('reason', '') or '')
+        strong_countertrend = (mtf_score_raw <= -70) or ("çok güçlü karşı trend" in mtf_reason)
+
         soft_override_ok = (
             MTF_SOFT_OVERRIDE_ENABLED
             and signal_score >= mtf_min_score
             and eq_count >= mtf_min_eq
         )
+        counter_soft_override_ok = (
+            MTF_COUNTERTREND_SOFTPASS_ENABLED
+            and adaptive_mode
+            and signal_score >= MTF_COUNTERTREND_SOFTPASS_MIN_SCORE
+            and eq_count >= MTF_COUNTERTREND_SOFTPASS_MIN_EQ
+            and exec_score >= MTF_COUNTERTREND_SOFTPASS_MIN_EXEC
+        )
+        if strong_countertrend:
+            counter_soft_override_ok = (
+                counter_soft_override_ok
+                and signal_score >= (MTF_COUNTERTREND_SOFTPASS_MIN_SCORE + 6)
+            )
+
         if soft_override_ok:
             old_score = signal_score
             signal['confidenceScore'] = max(40, signal_score - MTF_SOFT_OVERRIDE_PENALTY)
@@ -10812,6 +10849,23 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.warning(
                 f"⚠️ MTF_SOFT_OVERRIDE: {action} {symbol} score {old_score}->{signal['confidenceScore']} "
                 f"(eq={eq_count}/3, min={mtf_min_score}, smart_relax={smart_relax_enabled}) | {mtf_result.get('reason', '')}"
+            )
+        elif counter_soft_override_ok:
+            old_score = signal_score
+            penalty = int(MTF_COUNTERTREND_SOFTPASS_PENALTY)
+            if strong_countertrend:
+                penalty += int(MTF_COUNTERTREND_SOFTPASS_STRONG_EXTRA_PENALTY)
+            signal['confidenceScore'] = max(40, signal_score - penalty)
+            signal['mtf_override'] = True
+            signal['mtf_override_reason'] = mtf_result.get('reason', '')
+            signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * MTF_COUNTERTREND_SOFTPASS_SIZE_MULT
+            old_lev = int(signal.get('leverage', 10) or 10)
+            signal['leverage'] = max(3, min(old_lev, int(MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE)))
+            global_paper_trader.pipeline_metrics['mtf_soft_override'] += 1
+            logger.warning(
+                f"⚠️ MTF_COUNTER_SOFT_OVERRIDE: {action} {symbol} score {old_score}->{signal['confidenceScore']} "
+                f"lev {old_lev}x->{signal['leverage']}x eq={eq_count}/3 exec={exec_score:.0f} "
+                f"strong={strong_countertrend} | {mtf_result.get('reason', '')}"
             )
         else:
             signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
@@ -17168,6 +17222,7 @@ class SignalGenerator:
         # Layer 15: ADX + Hurst Regime Bonus
         # Phase 152: ADX artık fonksiyon parametresi olarak alınıyor (L10455)
         # Override kaldırıldı — gerçek ADX değeri kullanılır
+        volatile_soft_risk_cap = False
         
         if adx < 20 and hurst < 0.45:
             # Strong range regime - ideal for mean reversion
@@ -17202,8 +17257,26 @@ class SignalGenerator:
             min_score_required += volatile_boost
             reasons.append(f"VOL_STRICT(+{volatile_boost})")
             if score < min_score_required:
-                logger.info(f"🚫 VOLATILE_VETO: {symbol} {signal_side} score={score} < volatile_min={min_score_required}")
-                return None
+                gap = int(min_score_required - score)
+                soft_pass_ok = (
+                    VOLATILE_VETO_SOFTPASS_ENABLED
+                    and gap <= VOLATILE_VETO_SOFTPASS_MAX_GAP
+                    and (is_volume_spike or volume_ratio >= 0.9)
+                    and spread_pct <= max(0.30, EQ_MAX_SPREAD + 0.05)
+                )
+                if soft_pass_ok:
+                    penalty = min(8, VOLATILE_VETO_SOFTPASS_PENALTY_BASE + max(0, gap))
+                    old_score = score
+                    score = max(40, score - penalty)
+                    volatile_soft_risk_cap = True
+                    reasons.append(f"VOL_SOFT(gap={gap},-{penalty})")
+                    logger.info(
+                        f"🟨 VOLATILE_SOFT_PASS: {symbol} {signal_side} "
+                        f"score {old_score}->{score} (strict_min={min_score_required}, gap={gap})"
+                    )
+                else:
+                    logger.info(f"🚫 VOLATILE_VETO: {symbol} {signal_side} score={score} < volatile_min={min_score_required}")
+                    return None
         
         # =====================================================================
         # Phase 212: BTC TREND GUARD kaldırıldı
@@ -17292,18 +17365,19 @@ class SignalGenerator:
                 eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
 
             # Gate kararı:
-            # - SMART_V2: en az 2/3 geçmeli (mevcut sıkı davranış korunur)
-            # - LEGACY: 0/3 hard reject, 1/3 soft-penalty ile geçiş
-            legacy_mode = str(strategy_mode).upper() == STRATEGY_MODE_LEGACY
-            eq_required = 2 if not legacy_mode else 1
-            eq_hard_mode = (ENTRY_QUALITY_MODE == 'hard') and not legacy_mode
-            eq_penalty = 15 if not legacy_mode else 8
+            # - Adaptive modes (LEGACY + SMART_V2): 1/3 ile soft-pass, 0/3 ise yüksek skorda kontrollü geçiş
+            # - Other modes: 2/3 şartını korur
+            strategy_mode_upper = str(strategy_mode).upper()
+            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+            eq_required = 2 if not adaptive_mode else 1
+            eq_hard_mode = (ENTRY_QUALITY_MODE == 'hard') and not adaptive_mode
+            eq_penalty = 15 if not adaptive_mode else 8
 
             if eq_pass_count < eq_required:
                 entry_quality_pass = False
                 fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
-                legacy_hard_reject = legacy_mode and eq_pass_count == 0
-                if eq_hard_mode or legacy_hard_reject:
+                adaptive_hard_reject = adaptive_mode and eq_pass_count == 0 and score < 95
+                if eq_hard_mode or adaptive_hard_reject:
                     logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.1f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
                     return None
                 else:  # soft mode
@@ -17390,10 +17464,10 @@ class SignalGenerator:
         # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123 + Phase EQG)
         # Phase EQG: 24h volume threshold artık EQ_MIN_VOLUME_24H ile kontrol ediliyor
         # Ama ek güvenlik olarak çok düşük hacim kontrolü kalıyor
-        legacy_mode = str(strategy_mode).upper() == STRATEGY_MODE_LEGACY
+        adaptive_mode = str(strategy_mode).upper() in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
         min_volume = 500_000  # $500K min 24h volume (hard floor)
-        if legacy_mode:
-            # Legacy: allow more mid-cap coverage while keeping microcaps filtered.
+        if adaptive_mode:
+            # Adaptive modes (LEGACY + SMART_V2): allow more mid-cap coverage while keeping microcaps filtered.
             min_volume = 300_000
             vol_threshold = max(0.25, vol_threshold * 0.70)
         
@@ -17447,7 +17521,7 @@ class SignalGenerator:
                 for f in confirmation_fails
             )
             legacy_soft_pass = (
-                legacy_mode
+                adaptive_mode
                 and only_liq_vol_fails
                 and score >= 88
                 and eq_pass_count >= 1
@@ -17512,10 +17586,15 @@ class SignalGenerator:
         # Phase 216: User-controlled leverage multiplier from settings
         user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
         final_leverage = int(round(base_leverage * volatility_factor * leverage_mult * user_lev_mult * strategy_leverage_mult))
-        
+
         # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
-        
+        if volatile_soft_risk_cap:
+            old_leverage = final_leverage
+            final_leverage = min(final_leverage, VOLATILE_VETO_SOFTPASS_LEVERAGE_CAP)
+            if final_leverage < old_leverage:
+                reasons.append(f"VOL_CAP({old_leverage}->{final_leverage}x)")
+
         # Log if any factor reduced leverage significantly
         if volatility_factor < 0.9 or leverage_mult < 0.9 or user_lev_mult != 1.0 or strategy_leverage_mult != 1.0:
             logger.info(
@@ -17690,6 +17769,9 @@ class SignalGenerator:
             reasons.append("📈 trend_conflict(-15%)")
         
         size_mult *= trend_size_reduction
+        if volatile_soft_risk_cap:
+            size_mult *= VOLATILE_VETO_SOFTPASS_SIZE_MULT
+            reasons.append(f"VOL_SIZE({VOLATILE_VETO_SOFTPASS_SIZE_MULT:.2f}x)")
         
         self.last_signal_time = now
         
