@@ -1556,9 +1556,10 @@ class LiveBinanceTrader:
                     else:
                         fb_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                     
-                    # Phase 231h: Breakeven prices
-                    be_long = entry_price * 1.001
-                    be_short = entry_price * 0.999
+                    # Phase 231h → 238A: Dynamic breakeven prices
+                    _fb_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FB')
+                    be_long = entry_price * (1 + _fb_buf)
+                    be_short = entry_price * (1 - _fb_buf)
                     
                     # Phase 231j: price_move >= 0.75 OR roi >= 5.0
                     if not trail_state['isActive'] and (fb_price_move >= 0.75 or roi_pct >= 5.0):
@@ -3603,11 +3604,13 @@ async def binance_position_sync_loop():
                                         pos['isTrailingActive'] = True
                                         # Breakeven on BOTH stopLoss AND trailingStop
                                         if pos['side'] == 'LONG':
-                                            be_price = entry_price * 1.001
+                                            _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
+                                            be_price = entry_price * (1 + _sync_buf)
                                             pos['stopLoss'] = max(pos.get('stopLoss', 0), be_price)
                                             pos['trailingStop'] = max(pos.get('trailingStop', 0), be_price)
                                         else:
-                                            be_price = entry_price * 0.999
+                                            _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
+                                            be_price = entry_price * (1 - _sync_buf)
                                             pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_price)
                                             pos['trailingStop'] = min(pos.get('trailingStop', float('inf')), be_price)
                                         logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL+Trail→breakeven")
@@ -4619,6 +4622,465 @@ EXEC_QUALITY_GATE_ENABLED = True
 EXEC_QUALITY_MIN_SCORE = 58.0
 EXEC_QUALITY_STRICT_MIN_SCORE = 66.0
 
+# =========================================================================
+# PHASE 237: SIGNAL QUALITY & FILL RATE — Feature Flags
+# All default False for canary rollout
+# =========================================================================
+SOFT_RISK_GATE_ENABLED = False
+ENTRY_TRADEABILITY_ENABLED = False
+PENDING_SM_V2_ENABLED = False
+REJECT_ATTRIBUTION_ENABLED = False
+
+# =========================================================================
+# PHASE 238A: BREAKEVEN BUFFER — Dynamic replacement for hardcoded 0.05%
+# =========================================================================
+BREAKEVEN_LIMIT_EXIT_ENABLED = False  # If True + is_live: try limit-close before market
+
+def compute_breakeven_buffer_pct(
+    spread_pct: float = 0.05,
+    expected_slippage_pct: float = 0.02,
+    is_live: bool = False,
+    spread_level: str = "LOW",
+    reason: str = "",
+) -> float:
+    """Compute dynamic breakeven buffer as a ratio (0.001 to 0.006).
+    
+    Formula: round_trip_fee + 0.6×spread + p90_slippage + safety_margin
+    Clamp: min 0.10% (0.001), max 0.60% (0.006)
+    Returns float ratio, e.g. 0.0015 for 0.15%.
+    """
+    try:
+        ROUND_TRIP_FEE_PCT = 0.10  # 0.05% maker+taker each side
+        # Spread contribution (60% of spread — partial fill expected)
+        spread_contrib = 0.6 * max(0, float(spread_pct))
+        # Slippage contribution
+        slip = max(0, float(expected_slippage_pct))
+        # Spread level bump (normalize — system uses title-case: High/Very High/Extreme/Ultra)
+        level_bump = 0.0
+        sl = str(spread_level).upper()
+        if sl in ("HIGH", "VERY HIGH", "EXTREME", "ULTRA"):
+            level_bump = 0.04
+        elif sl in ("NORMAL", "MEDIUM"):
+            level_bump = 0.02
+        # Live gets extra safety (real market impact)
+        live_bump = 0.02 if is_live else 0.0
+        # Safety margin
+        safety = 0.02
+        buffer_pct = ROUND_TRIP_FEE_PCT + spread_contrib + slip + level_bump + live_bump + safety
+        # Clamp [0.10%, 0.60%]
+        buffer_pct = max(0.10, min(0.60, round(buffer_pct, 4)))
+        return buffer_pct / 100  # ratio
+    except Exception:
+        return 0.0015  # Safe fallback: 0.15%
+
+
+# =========================================================================
+# PHASE 237A: SOFT RISK DOWNGRADE GATE
+# Converts certain hard-rejects into soft-passes with risk penalties
+# =========================================================================
+def evaluate_risk_gate(
+    signal: dict,
+    context: dict,
+) -> dict:
+    """
+    Hard reject koşullarını değerlendir, mümkünse SOFT_PASS'a dönüştür.
+    
+    context keys:
+      gate_type: "THIN_BOOK" | "OBI_NEUTRAL_LOW_VOL" | "BTC_FILTER" | "MTF_REJECT"
+      depth_ratio: float (THIN_BOOK için)
+      obi_value: float (OBI için)
+      vol_ratio: float
+      mtf_score: int (MTF için)
+      eq_count: int
+      exec_score: float
+      spread_pct: float
+      is_extreme: bool (BTC_FILTER extreme durumu)
+      strategy_mode: str
+      
+    Returns:
+      decision: "PASS" | "SOFT_PASS" | "HARD_REJECT"
+      reason_code: str
+      score_penalty: int
+      size_mult: float
+      leverage_cap: int | None
+    """
+    try:
+        gate = str(context.get("gate_type", "")).upper()
+        score = int(signal.get("confidenceScore", 0) or 0)
+        eq = int(context.get("eq_count", 0) or 0)
+        exec_s = float(context.get("exec_score", 0.0) or 0.0)
+        spread = float(context.get("spread_pct", 0.05) or 0.05)
+        strat = str(context.get("strategy_mode", "LEGACY")).upper()
+        is_smart = strat == "SMART_V2"
+
+        # === THIN_BOOK ===
+        if gate == "THIN_BOOK":
+            depth_r = float(context.get("depth_ratio", 0.0) or 0.0)
+            if depth_r >= 0.65 and score >= 85 and eq >= 1 and spread <= 0.25:
+                return {
+                    "decision": "SOFT_PASS",
+                    "reason_code": f"RISK_GATE(TB:dr={depth_r:.2f})",
+                    "score_penalty": 6,
+                    "size_mult": 0.6,
+                    "leverage_cap": 12,
+                }
+            return {"decision": "HARD_REJECT", "reason_code": f"RISK_GATE(TB:HARD:dr={depth_r:.2f})",
+                    "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+
+        # === OBI_NEUTRAL_LOW_VOL ===
+        if gate == "OBI_NEUTRAL_LOW_VOL":
+            obi = abs(float(context.get("obi_value", 0) or 0))
+            vr = float(context.get("vol_ratio", 0) or 0)
+            if score >= 88 and eq >= 1 and vr >= 0.6:
+                return {
+                    "decision": "SOFT_PASS",
+                    "reason_code": f"RISK_GATE(OBI:obi={obi:.3f},vr={vr:.1f})",
+                    "score_penalty": 5,
+                    "size_mult": 0.7,
+                    "leverage_cap": 10,
+                }
+            return {"decision": "HARD_REJECT", "reason_code": f"RISK_GATE(OBI:HARD)",
+                    "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+
+        # === BTC_FILTER ===
+        if gate == "BTC_FILTER":
+            is_extreme = bool(context.get("is_extreme", False))
+            if is_extreme:
+                return {"decision": "HARD_REJECT", "reason_code": "RISK_GATE(BTC:EXTREME)",
+                        "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+            if score >= 90 and eq >= 2:
+                return {
+                    "decision": "SOFT_PASS",
+                    "reason_code": "RISK_GATE(BTC:MODERATE)",
+                    "score_penalty": 4,
+                    "size_mult": 0.7,
+                    "leverage_cap": 8,
+                }
+            return {"decision": "HARD_REJECT", "reason_code": "RISK_GATE(BTC:HARD)",
+                    "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+
+        # === MTF_REJECT ===
+        if gate == "MTF_REJECT":
+            mtf_s = int(context.get("mtf_score", -100) or -100)
+            if mtf_s > -65 and eq >= 2 and score >= 92:
+                return {
+                    "decision": "SOFT_PASS",
+                    "reason_code": f"RISK_GATE(MTF:s={mtf_s},eq={eq})",
+                    "score_penalty": 8,
+                    "size_mult": 0.6,
+                    "leverage_cap": 10,
+                }
+            return {"decision": "HARD_REJECT", "reason_code": f"RISK_GATE(MTF:HARD:s={mtf_s})",
+                    "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+
+        return {"decision": "HARD_REJECT", "reason_code": f"RISK_GATE(UNKNOWN:{gate})",
+                "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+    except Exception:
+        return {"decision": "HARD_REJECT", "reason_code": "RISK_GATE(ERR)",
+                "score_penalty": 0, "size_mult": 1.0, "leverage_cap": None}
+
+
+# =========================================================================
+# PHASE 237B: ENTRY TRADEABILITY SCORE
+# Measures execution quality of the current market conditions
+# =========================================================================
+def compute_entry_tradeability(
+    signal: dict,
+    market_ctx: dict,
+) -> dict:
+    """
+    Computes 0-100 tradeability score based on execution quality.
+    
+    market_ctx keys:
+      spread_pct, depth_ratio, obi_value, obi_direction_stable,
+      volume_ratio, is_volume_spike, drift_risk, market_regime,
+      strategy_mode
+    
+    Returns:
+      score: 0-100
+      components: dict
+      decision: "PASS" | "SOFT_PASS" | "REJECT"
+    """
+    try:
+        spread = float(market_ctx.get("spread_pct", 0.05) or 0.05)
+        depth_r = float(market_ctx.get("depth_ratio", 1.0) or 1.0)
+        obi = float(market_ctx.get("obi_value", 0) or 0)
+        obi_stable = bool(market_ctx.get("obi_direction_stable", True))
+        vr = float(market_ctx.get("volume_ratio", 1.0) or 1.0)
+        is_vs = bool(market_ctx.get("is_volume_spike", False))
+        drift = float(market_ctx.get("drift_risk", 0) or 0)
+        regime = str(market_ctx.get("market_regime", "RANGING")).upper()
+        strat = str(market_ctx.get("strategy_mode", "LEGACY")).upper()
+
+        components = {}
+
+        # 1) Spread quality (0-25)
+        if spread <= 0.05:
+            sq = 25
+        elif spread <= 0.10:
+            sq = 20
+        elif spread <= 0.18:
+            sq = 12
+        elif spread <= 0.30:
+            sq = 6
+        else:
+            sq = 0
+        components["spread"] = sq
+
+        # 2) Depth/liquidity (0-25)
+        if depth_r >= 1.5:
+            dq = 25
+        elif depth_r >= 1.0:
+            dq = 20
+        elif depth_r >= 0.76:
+            dq = 12
+        elif depth_r >= 0.50:
+            dq = 6
+        else:
+            dq = 0
+        components["depth"] = dq
+
+        # 3) OBI stability (0-20)
+        signal_side = str(signal.get("action", "")).upper()
+        obi_aligned = (obi > 0.2 and signal_side == "LONG") or (obi < -0.2 and signal_side == "SHORT")
+        obi_opposing = (obi > 0.2 and signal_side == "SHORT") or (obi < -0.2 and signal_side == "LONG")
+        if obi_aligned and obi_stable:
+            oq = 20
+        elif obi_aligned:
+            oq = 15
+        elif not obi_opposing:
+            oq = 10
+        elif obi_opposing and abs(obi) < 0.35:
+            oq = 5
+        else:
+            oq = 0
+        components["obi"] = oq
+
+        # 4) Volume quality (0-20)
+        if is_vs and vr >= 2.0:
+            vq = 20
+        elif vr >= 1.5:
+            vq = 16
+        elif vr >= 1.0:
+            vq = 12
+        elif vr >= 0.7:
+            vq = 6
+        else:
+            vq = 2
+        components["volume"] = vq
+
+        # 5) Drift/slippage risk (0-10)
+        if drift <= 0.3:
+            drq = 10
+        elif drift <= 0.6:
+            drq = 6
+        elif drift <= 1.0:
+            drq = 3
+        else:
+            drq = 0
+        components["drift"] = drq
+
+        total = sq + dq + oq + vq + drq
+
+        # Strategy-specific thresholds
+        min_pass = 55 if strat == "SMART_V2" else 45
+        if regime == "VOLATILE":
+            min_pass += 5
+
+        min_soft = max(35, min_pass - 10)
+
+        if total >= min_pass:
+            decision = "PASS"
+        elif total >= min_soft:
+            decision = "SOFT_PASS"
+        else:
+            decision = "REJECT"
+
+        return {
+            "score": total,
+            "components": components,
+            "decision": decision,
+        }
+    except Exception:
+        return {"score": 50, "components": {}, "decision": "PASS"}
+
+
+# =========================================================================
+# PHASE 237C: PENDING ORDER STATE MACHINE
+# Explicit states with guarded transitions
+# =========================================================================
+PENDING_STATES = ("CREATED", "WAIT_CONFIRM", "TRAIL_ACTIVE", "READY_EXEC", "FILLING", "FILLED",
+                  "EXPIRED", "CANCELLED", "HARD_REJECTED")
+
+PENDING_TRANSITIONS = {
+    "CREATED": ("WAIT_CONFIRM", "EXPIRED", "CANCELLED", "HARD_REJECTED"),
+    "WAIT_CONFIRM": ("TRAIL_ACTIVE", "READY_EXEC", "EXPIRED", "CANCELLED"),
+    "TRAIL_ACTIVE": ("READY_EXEC", "EXPIRED", "CANCELLED"),
+    "READY_EXEC": ("FILLING", "EXPIRED", "CANCELLED"),
+    "FILLING": ("FILLED", "EXPIRED", "CANCELLED"),
+    # Terminal states
+    "FILLED": (),
+    "EXPIRED": (),
+    "CANCELLED": (),
+    "HARD_REJECTED": (),
+}
+
+
+def transition_pending_state(
+    order: dict,
+    new_state: str,
+    reason: str = "",
+    current_time_ms: int = 0,
+) -> bool:
+    """
+    Transition pending order to new_state with guard.
+    Returns True if transition was valid and applied, False otherwise.
+    """
+    try:
+        old_state = order.get("state", "CREATED")
+        allowed = PENDING_TRANSITIONS.get(old_state, ())
+        if new_state not in allowed:
+            logger.debug(
+                f"PENDING_STATE: illegal transition {old_state}→{new_state} "
+                f"for {order.get('symbol','?')} (reason={reason})"
+            )
+            return False
+        order["state"] = new_state
+        order["stateChangedAt"] = current_time_ms or int(time.time() * 1000)
+        order["transitionCount"] = int(order.get("transitionCount", 0) or 0) + 1
+        order["lastTransitionReason"] = reason
+        return True
+    except Exception:
+        return False
+
+
+# =========================================================================
+# PHASE 237D: REJECT ATTRIBUTION TRACKER
+# Tracks hard-rejected signals to measure false-negative rate
+# =========================================================================
+_reject_attribution_log = []  # [{symbol, side, price, score, reason, time_ms, atr}]
+_reject_attribution_summary = {}  # {reason: {total, fn_count}}
+REJECT_ATTRIBUTION_WINDOW_MS = 60 * 60 * 1000  # 60 min evaluation window
+REJECT_ATTRIBUTION_MAX_LOG = 500  # prevent unbounded growth
+
+
+def track_reject_for_attribution(
+    symbol: str,
+    side: str,
+    price: float,
+    score: int,
+    reason: str,
+    atr: float,
+    time_ms: int = 0,
+):
+    """Log a hard-rejected signal for later evaluation."""
+    try:
+        if not REJECT_ATTRIBUTION_ENABLED:
+            return
+        ts = time_ms or int(time.time() * 1000)
+        _reject_attribution_log.append({
+            "symbol": symbol, "side": side, "price": price,
+            "score": score, "reason": reason, "atr": atr, "ts": ts,
+            "evaluated": False, "is_fn": False,
+        })
+        # Trim oldest
+        while len(_reject_attribution_log) > REJECT_ATTRIBUTION_MAX_LOG:
+            _reject_attribution_log.pop(0)
+    except Exception:
+        pass
+
+
+def evaluate_reject_attribution(current_prices: dict):
+    """
+    Evaluate past rejects: if price moved +1R in signal direction
+    without first going -1R, count as false-negative.
+    """
+    try:
+        if not REJECT_ATTRIBUTION_ENABLED:
+            return
+        now_ms = int(time.time() * 1000)
+        for entry in _reject_attribution_log:
+            if entry.get("evaluated"):
+                continue
+            elapsed = now_ms - entry["ts"]
+            if elapsed < 30 * 60 * 1000:  # wait at least 30 min
+                continue
+            if elapsed > REJECT_ATTRIBUTION_WINDOW_MS:
+                entry["evaluated"] = True
+                continue
+
+            symbol = entry["symbol"]
+            current_price = current_prices.get(symbol, 0)
+            if current_price <= 0:
+                continue
+
+            entry_price = entry["price"]
+            atr = entry["atr"]
+            if atr <= 0:
+                entry["evaluated"] = True
+                continue
+
+            side = entry["side"]
+            # +1R = price moved 1×ATR in signal direction
+            if side == "LONG":
+                favorable = current_price >= entry_price + atr
+                adverse = current_price <= entry_price - atr
+            else:
+                favorable = current_price <= entry_price - atr
+                adverse = current_price >= entry_price + atr
+
+            if favorable:
+                entry["evaluated"] = True
+                entry["is_fn"] = True
+                reason = entry["reason"].split(":")[0] if ":" in entry["reason"] else entry["reason"]
+                _reject_attribution_summary.setdefault(reason, {"total": 0, "fn_count": 0})
+                _reject_attribution_summary[reason]["total"] += 1
+                _reject_attribution_summary[reason]["fn_count"] += 1
+                # P3 fix: increment pipeline false_negative_count
+                try:
+                    if 'global_paper_trader' in globals() and global_paper_trader:
+                        global_paper_trader.pipeline_metrics['false_negative_count'] = (
+                            global_paper_trader.pipeline_metrics.get('false_negative_count', 0) + 1
+                        )
+                except Exception:
+                    pass
+                logger.info(
+                    f"🔍 FN_TRACK: {symbol} {side} score={entry['score']} "
+                    f"reason={entry['reason']} → moved +1R, FALSE NEGATIVE"
+                )
+            elif adverse or elapsed > REJECT_ATTRIBUTION_WINDOW_MS:
+                entry["evaluated"] = True
+                entry["is_fn"] = False
+                reason = entry["reason"].split(":")[0] if ":" in entry["reason"] else entry["reason"]
+                _reject_attribution_summary.setdefault(reason, {"total": 0, "fn_count": 0})
+                _reject_attribution_summary[reason]["total"] += 1
+    except Exception:
+        pass
+
+
+def get_reject_attribution_summary() -> dict:
+    """Return summary for status endpoint."""
+    try:
+        total_fn = sum(v["fn_count"] for v in _reject_attribution_summary.values())
+        total_reject = sum(v["total"] for v in _reject_attribution_summary.values())
+        # Top blockers sorted by fn_count desc
+        top_blockers = sorted(
+            [{"reason": k, **v, "fn_pct": round(v["fn_count"] / max(1, v["total"]) * 100, 1)}
+             for k, v in _reject_attribution_summary.items()],
+            key=lambda x: x["fn_count"],
+            reverse=True,
+        )[:5]
+        return {
+            "falseNegativeCount": total_fn,
+            "totalRejected": total_reject,
+            "fnRate": round(total_fn / max(1, total_reject) * 100, 1),
+            "topRejectBlockers": top_blockers,
+        }
+    except Exception:
+        return {"falseNegativeCount": 0, "totalRejected": 0, "fnRate": 0, "topRejectBlockers": []}
+
+
+
 
 def get_dynamic_depth_threshold(
     spread_pct: float,
@@ -4704,6 +5166,190 @@ def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
     return None, None
 
 
+# =========================================================================
+# PHASE 236: BLENDED REGIME BIAS HELPERS
+# Coin-specific + BTC macro → weighted directional bias
+# =========================================================================
+
+def compute_coin_macro_bias(
+    coin_daily_trend: str = "NEUTRAL",
+    adx: float = 25.0,
+    hurst: float = 0.5,
+    adx_trend: str = "NEUTRAL",
+) -> dict:
+    """
+    Coin'in kendi macro trendini hesapla.
+    Returns: {dir: UP/DOWN/NEUTRAL, confidence: 0.0-1.0, source: str}
+    """
+    try:
+        direction = "NEUTRAL"
+        conf = 0.0
+        sources = []
+
+        # 1) coin_daily_trend (ağırlık: %50)
+        cdt = str(coin_daily_trend or "NEUTRAL").upper()
+        cdt_score = 0.0
+        if cdt == "STRONG_BULLISH":
+            cdt_score = 1.0
+        elif cdt == "BULLISH":
+            cdt_score = 0.6
+        elif cdt == "STRONG_BEARISH":
+            cdt_score = -1.0
+        elif cdt == "BEARISH":
+            cdt_score = -0.6
+        # NEUTRAL → 0.0
+        if cdt_score != 0.0:
+            sources.append(f"CDT={cdt}")
+
+        # 2) ADX trend yönü (ağırlık: %30)
+        adx_val = float(adx or 25.0)
+        at = str(adx_trend or "NEUTRAL").upper()
+        adx_score = 0.0
+        if at == "BULLISH" and adx_val > 20:
+            adx_score = min(1.0, (adx_val - 20) / 30)  # 20→0, 50→1
+            sources.append(f"ADX={adx_val:.0f}B")
+        elif at == "BEARISH" and adx_val > 20:
+            adx_score = -min(1.0, (adx_val - 20) / 30)
+            sources.append(f"ADX={adx_val:.0f}S")
+
+        # 3) Hurst (ağırlık: %20) — coin trending mi?
+        h = float(hurst or 0.5)
+        hurst_mult = 1.0
+        if h > 0.55:
+            hurst_mult = 1.0 + (h - 0.55) * 2.0  # trending → amplify
+            sources.append(f"H={h:.2f}T")
+        elif h < 0.40:
+            hurst_mult = 0.5  # mean-reverting → dampen directional bias
+            sources.append(f"H={h:.2f}R")
+
+        # Weighted combination
+        combined = cdt_score * 0.50 + adx_score * 0.30
+        # Hurst amplifies or dampens the magnitude
+        combined *= hurst_mult
+
+        # ADX strength also affects confidence
+        adx_conf = min(1.0, max(0.0, (adx_val - 15) / 35))  # 15→0, 50→1
+
+        if combined > 0.05:
+            direction = "UP"
+            conf = min(1.0, abs(combined) * 0.8 + adx_conf * 0.2)
+        elif combined < -0.05:
+            direction = "DOWN"
+            conf = min(1.0, abs(combined) * 0.8 + adx_conf * 0.2)
+        else:
+            direction = "NEUTRAL"
+            conf = 0.0
+
+        return {"dir": direction, "confidence": round(conf, 2), "source": "+".join(sources) or "NONE"}
+    except Exception:
+        return {"dir": "NEUTRAL", "confidence": 0.0, "source": "ERR"}
+
+
+def compute_btc_macro_bias(
+    macro_regime: str = "RANGING",
+    macro_trend_dir: str = "NEUTRAL",
+    btc_regime: str = "QUIET",
+) -> dict:
+    """
+    BTC/market macro yön bias'ı.
+    Returns: {dir: UP/DOWN/NEUTRAL, confidence: 0.0-1.0}
+    """
+    try:
+        mr = str(macro_regime or "RANGING").upper()
+        mtd = str(macro_trend_dir or "NEUTRAL").upper()
+        br = str(btc_regime or "QUIET").upper()
+
+        direction = "NEUTRAL"
+        conf = 0.0
+
+        if mr == "TRENDING_DOWN":
+            direction = "DOWN"
+            conf = 0.85
+        elif mr == "TRENDING_UP":
+            direction = "UP"
+            conf = 0.85
+        elif mr == "VOLATILE":
+            if mtd == "DOWN":
+                direction = "DOWN"
+                conf = 0.65
+            elif mtd == "UP":
+                direction = "UP"
+                conf = 0.65
+            else:
+                direction = "NEUTRAL"
+                conf = 0.0  # yön belirsiz
+        elif mr == "TRENDING":
+            if mtd == "DOWN":
+                direction = "DOWN"
+                conf = 0.55
+            elif mtd == "UP":
+                direction = "UP"
+                conf = 0.55
+
+        # BTC regime volatile + directional → boost
+        if br == "VOLATILE" and mtd != "NEUTRAL" and conf < 0.50:
+            direction = mtd
+            conf = 0.50
+
+        return {"dir": direction, "confidence": round(conf, 2)}
+    except Exception:
+        return {"dir": "NEUTRAL", "confidence": 0.0}
+
+
+def blend_macro_bias(
+    coin_bias: dict,
+    btc_bias: dict,
+    btc_corr: float = None,
+) -> dict:
+    """
+    Coin + BTC bias'ı ağırlıklı olarak birleştir.
+    Default: w_coin=0.65, w_btc=0.35
+    btc_corr varsa dinamik ağırlık.
+    Returns: {dir, confidence, w_coin, w_btc}
+    """
+    try:
+        w_coin = 0.65
+        w_btc = 0.35
+
+        # Dinamik ağırlık (btc_corr varsa)
+        if btc_corr is not None:
+            corr = max(0.0, min(1.0, abs(float(btc_corr))))
+            # Yüksek korelasyon → BTC daha önemli (max 0.50)
+            # Düşük korelasyon → coin daha önemli (coin min 0.50)
+            w_btc = 0.25 + corr * 0.25   # 0.25 → 0.50
+            w_coin = 1.0 - w_btc          # 0.75 → 0.50
+
+        c_dir = (coin_bias or {}).get("dir", "NEUTRAL")
+        c_conf = float((coin_bias or {}).get("confidence", 0.0))
+        b_dir = (btc_bias or {}).get("dir", "NEUTRAL")
+        b_conf = float((btc_bias or {}).get("confidence", 0.0))
+
+        # Numerik skor: UP=+1, DOWN=-1, NEUTRAL=0
+        dir_map = {"UP": 1.0, "DOWN": -1.0, "NEUTRAL": 0.0}
+        c_val = dir_map.get(c_dir, 0.0) * c_conf
+        b_val = dir_map.get(b_dir, 0.0) * b_conf
+
+        blended = c_val * w_coin + b_val * w_btc
+
+        if blended > 0.05:
+            final_dir = "UP"
+        elif blended < -0.05:
+            final_dir = "DOWN"
+        else:
+            final_dir = "NEUTRAL"
+
+        final_conf = min(1.0, abs(blended))
+
+        return {
+            "dir": final_dir,
+            "confidence": round(final_conf, 2),
+            "w_coin": round(w_coin, 2),
+            "w_btc": round(w_btc, 2),
+        }
+    except Exception:
+        return {"dir": "NEUTRAL", "confidence": 0.0, "w_coin": 0.65, "w_btc": 0.35}
+
+
 STRATEGY_MODE_LEGACY = "LEGACY"
 STRATEGY_MODE_SMART_V2 = "SMART_V2"
 
@@ -4719,7 +5365,8 @@ def get_smart_v2_strategy_profile(
     market_regime: str,
     is_volume_spike: bool,
     imbalance: float,
-    ob_imbalance_trend: float
+    ob_imbalance_trend: float,
+    macro_trend_dir: str = "NEUTRAL",  # Phase 235: "UP", "DOWN", "NEUTRAL"
 ) -> dict:
     """
     Select SMART_V2 strategy and return strategy-specific entry/exit tuning.
@@ -4836,6 +5483,29 @@ def get_smart_v2_strategy_profile(
     elif ob_alignment >= 3.5:
         profile["score_bonus"] += 2
         profile["notes"].append("OB_ALIGN_STRONG")
+    
+    # ===== Phase 235: REGIME-AWARE DIRECTIONAL TUNING =====
+    safe_macro_dir = str(macro_trend_dir or "NEUTRAL").upper()
+    is_pro_trend = (
+        (safe_macro_dir == "DOWN" and safe_side == "SHORT") or
+        (safe_macro_dir == "UP" and safe_side == "LONG")
+    )
+    is_counter_trend = (
+        (safe_macro_dir == "DOWN" and safe_side == "LONG") or
+        (safe_macro_dir == "UP" and safe_side == "SHORT")
+    )
+    if regime_upper == "VOLATILE" and is_pro_trend:
+        # Volatil + pro-trend: daha agresif entry, daha geniş TP
+        profile["entry_mult"] *= 0.85
+        profile["exit_mult"] *= 1.30
+        profile["score_bonus"] += 5
+        profile["min_score_offset"] = max(0, profile["min_score_offset"] - 5)
+        profile["notes"].append("PRO_TREND_VOL")
+    elif regime_upper == "VOLATILE" and is_counter_trend:
+        # Volatil + karşı-trend: çok seçici
+        profile["min_score_offset"] += 8
+        profile["leverage_mult"] *= 0.80
+        profile["notes"].append("COUNTER_TREND_STRICT")
 
     # Clamp outputs to safe bounds.
     profile["threshold_mult"] = _clamp(profile["threshold_mult"], 0.85, 1.30)
@@ -5637,8 +6307,10 @@ def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
     # ---- Calculate current profit state ----
     # Minimum profit depth: 0.3× ATR for meaningful move
     min_profit_depth = pos_atr * 0.3
-    # Breakeven zone: entry ± 0.05%
-    be_tolerance = entry_price * 0.0005
+    # Breakeven zone: dynamic buffer (Phase 238A)
+    _fc_spread = pos.get('spreadPct', 0.05)
+    _fc_buf = compute_breakeven_buffer_pct(spread_pct=_fc_spread, spread_level=pos.get('spreadLevel', 'LOW'), reason='FC_CHECK')
+    be_tolerance = entry_price * _fc_buf
     
     if side == 'LONG':
         price_vs_entry = candle_close_price - entry_price
@@ -8733,6 +9405,10 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         if cap_lev:
                             existing_cap = opp.get('overrideLeverageCap')
                             opp['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+                            # Phase 238B: Leverage pipeline transparency
+                            opp['leverageCapApplied'] = True
+                            opp['leverageCapValue'] = opp['overrideLeverageCap']
+                            opp['leverageCapReason'] = f"BTC_FILTER:{btc_reason.split(':')[0] if ':' in btc_reason else 'MODERATE'}"
                         if cap_size:
                             existing_size_cap = float(opp.get('overrideSizeMult', 1.0) or 1.0)
                             opp['overrideSizeMult'] = min(existing_size_cap, cap_size)
@@ -8743,6 +9419,10 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         existing_size_cap = float(opp.get('overrideSizeMult', 1.0) or 1.0)
                         opp['overrideSizeMult'] = min(existing_size_cap, 0.5)
                         opp['btcOverride'] = True
+                        # Phase 238B: Leverage pipeline
+                        opp['leverageCapApplied'] = True
+                        opp['leverageCapValue'] = opp['overrideLeverageCap']
+                        opp['leverageCapReason'] = 'BTC_FILTER:EXTREME'
                     filtered_opportunities.append(opp)
                 else:
                     opp['signalAction'] = 'NONE'
@@ -9497,8 +10177,13 @@ async def background_scanner_loop():
                             if fc_result == 'FAILED_CONTINUATION':
                                 fc_count = pos.get('fc_failed_count', 0)
                                 logger.warning(f"📊 FAILED_CONTINUATION: {pos_symbol} {pos['side']} — {fc_count} başarısız deneme, breakeven kapatılıyor")
-                                # Breakeven close: entry + spread buffer
-                                be_exit_price = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+                                # Breakeven close: dynamic buffer (Phase 238A)
+                                _be_spread = pos.get('spreadPct', 0.05)
+                                _be_buf = compute_breakeven_buffer_pct(spread_pct=_be_spread, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
+                                be_exit_price = entry_price * (1 + _be_buf) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf)
+                                pos['beBufferPct'] = round(_be_buf * 100, 4)
+                                pos['beBufferSource'] = 'dynamic'
+                                logger.info(f"BE_BUFFER: {pos_symbol} {pos['side']} reason=FC spread={_be_spread}% → buffer={_be_buf*100:.3f}%")
                                 global_paper_trader.close_position(pos, be_exit_price, 'FAILED_CONTINUATION')
                                 continue
                             
@@ -9550,9 +10235,10 @@ async def background_scanner_loop():
                                 entry_price=entry_price,
                             )
                             
-                            # Phase 231h: Fee buffer for breakeven (0.1% = taker fee both sides)
-                            be_long = entry_price * 1.001
-                            be_short = entry_price * 0.999
+                            # Phase 231h → 238A: Dynamic fee buffer for breakeven
+                            _sc_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP')
+                            be_long = entry_price * (1 + _sc_buf)
+                            be_short = entry_price * (1 - _sc_buf)
                             
                             if pos['side'] == 'LONG':
                                 trail_already_active = pos.get('isTrailingActive', False)
@@ -9610,6 +10296,20 @@ async def background_scanner_loop():
                 global_paper_trader.calculate_dynamic_min_score()
                 
                 await global_paper_trader.check_pending_orders(opportunities)
+                
+                # Phase 237D: Evaluate reject attribution with current prices
+                if REJECT_ATTRIBUTION_ENABLED:
+                    try:
+                        _current_prices = {}
+                        for opp in opportunities:
+                            _s = opp.get('symbol', '')
+                            _p = opp.get('currentPrice', opp.get('price', 0))
+                            if _s and _p:
+                                _current_prices[_s] = float(_p)
+                        if _current_prices:
+                            evaluate_reject_attribution(_current_prices)
+                    except Exception:
+                        pass
                 
                 # Broadcast position updates to UI (throttled)
                 if global_paper_trader.positions:
@@ -9943,7 +10643,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
         if fc_result_ws == 'FAILED_CONTINUATION':
             fc_count_ws = pos.get('fc_failed_count', 0)
             logger.warning(f"📊 FAILED_CONTINUATION (WS): {symbol} {pos['side']} — {fc_count_ws} başarısız deneme")
-            be_exit_ws = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+            _be_spread_ws = pos.get('spreadPct', 0.05)
+            _be_buf_ws = compute_breakeven_buffer_pct(spread_pct=_be_spread_ws, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
+            be_exit_ws = entry_price * (1 + _be_buf_ws) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf_ws)
+            pos['beBufferPct'] = round(_be_buf_ws * 100, 4)
+            pos['beBufferSource'] = 'dynamic'
+            logger.info(f"BE_BUFFER: {symbol} {pos['side']} reason=FC(WS) spread={_be_spread_ws}% → buffer={_be_buf_ws*100:.3f}%")
             global_paper_trader.close_position(pos, be_exit_ws, 'FAILED_CONTINUATION')
             continue
         
@@ -9993,9 +10698,10 @@ async def on_position_price_update(symbol: str, ticker: dict):
             entry_price=entry_price,
         )
         
-        # Phase 231h: Fee buffer for breakeven
-        be_long = entry_price * 1.001
-        be_short = entry_price * 0.999
+        # Phase 231h → 238A: Dynamic fee buffer for breakeven
+        _ws_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_WS')
+        be_long = entry_price * (1 + _ws_buf)
+        be_short = entry_price * (1 - _ws_buf)
         
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
@@ -10216,7 +10922,12 @@ async def position_price_update_loop():
                         if fc_result_bu == 'FAILED_CONTINUATION':
                             fc_count_bu = pos.get('fc_failed_count', 0)
                             logger.warning(f"📊 FAILED_CONTINUATION (backup): {symbol} {pos['side']} — {fc_count_bu} başarısız deneme")
-                            be_exit_bu = entry_price * 1.0005 if pos['side'] == 'LONG' else entry_price * 0.9995
+                            _be_spread_bu = pos.get('spreadPct', 0.05)
+                            _be_buf_bu = compute_breakeven_buffer_pct(spread_pct=_be_spread_bu, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
+                            be_exit_bu = entry_price * (1 + _be_buf_bu) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf_bu)
+                            pos['beBufferPct'] = round(_be_buf_bu * 100, 4)
+                            pos['beBufferSource'] = 'dynamic'
+                            logger.info(f"BE_BUFFER: {symbol} {pos['side']} reason=FC(backup) spread={_be_spread_bu}% → buffer={_be_buf_bu*100:.3f}%")
                             global_paper_trader.close_position(pos, be_exit_bu, 'FAILED_CONTINUATION')
                             continue
                         
@@ -10266,9 +10977,10 @@ async def position_price_update_loop():
                             entry_price=entry_price,
                         )
                         
-                        # Phase 231h: Fee buffer for breakeven
-                        be_long = entry_price * 1.001
-                        be_short = entry_price * 0.999
+                        # Phase 231h → 238A: Dynamic fee buffer for breakeven
+                        _fast_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FAST')
+                        be_long = entry_price * (1 + _fast_buf)
+                        be_short = entry_price * (1 - _fast_buf)
                         
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
@@ -10482,6 +11194,10 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         if btc_filter.last_override:
             signal['overrideLeverageCap'] = 3
             signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), 0.5)
+            # Phase 238B: Leverage pipeline
+            signal['leverageCapApplied'] = True
+            signal['leverageCapValue'] = 3
+            signal['leverageCapReason'] = 'BTC_FILTER:EXTREME'
             logger.info(f"💪 OVERRIDE CAPS: {symbol} | leverage≤3x, size≤0.5x")
         
         # Apply penalty to signal score and size
@@ -10495,6 +11211,10 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             if cap_lev:
                 existing_cap = signal.get('overrideLeverageCap')
                 signal['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+                # Phase 238B: Leverage pipeline
+                signal['leverageCapApplied'] = True
+                signal['leverageCapValue'] = signal['overrideLeverageCap']
+                signal['leverageCapReason'] = f"BTC_FILTER:{btc_reason.split(':')[0] if ':' in btc_reason else 'MODERATE'}"
             if cap_size:
                 signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), cap_size)
             signal['btc_adjustment'] = btc_reason
@@ -10619,16 +11339,54 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
             )
             if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass):
-                signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
-                signal_log_data['obi_value'] = round(obi_value, 4)
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
-                reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
-                logger.info(
-                    f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
-                    f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
-                )
-                return
+                # Phase 237: Soft Risk Gate fallback before hard reject
+                if SOFT_RISK_GATE_ENABLED:
+                    _rg = evaluate_risk_gate(signal, {
+                        'gate_type': 'THIN_BOOK',
+                        'depth_ratio': total_depth / max(1, dynamic_depth_threshold),
+                        'eq_count': eq_count,
+                        'exec_score': exec_score,
+                        'spread_pct': signal_spread,
+                        'strategy_mode': strategy_mode_upper,
+                    })
+                    if _rg['decision'] == 'SOFT_PASS':
+                        _old_s = signal.get('confidenceScore', 60)
+                        signal['confidenceScore'] = max(40, int(_old_s) - _rg['score_penalty'])
+                        signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * _rg['size_mult']
+                        if _rg['leverage_cap']:
+                            signal['leverage'] = max(3, min(int(signal.get('leverage', 10) or 10), _rg['leverage_cap']))
+                            # Phase 238B: Leverage pipeline
+                            signal['leverageCapApplied'] = True
+                            signal['leverageCapValue'] = _rg['leverage_cap']
+                            signal['leverageCapReason'] = f"RISK_GATE:THIN_BOOK:{_rg.get('reason_code','')}"
+                        global_paper_trader.pipeline_metrics['risk_gate_soft_pass'] += 1
+                        global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
+                        logger.info(f"🛡️ RISK_GATE: {action} {symbol} THIN_BOOK→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg['reason_code']}")
+                    else:
+                        signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
+                        signal_log_data['obi_value'] = round(obi_value, 4)
+                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
+                        global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
+                        reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
+                        logger.info(
+                            f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
+                            f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
+                        )
+                        track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'THIN_BOOK', signal.get('atr', 0))
+                        return
+                else:
+                    signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
+                    signal_log_data['obi_value'] = round(obi_value, 4)
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
+                    reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
+                    logger.info(
+                        f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
+                        f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
+                    )
+                    track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'THIN_BOOK', signal.get('atr', 0))
+                    return
             elif near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
                 if near_threshold_soft_pass:
@@ -10670,6 +11428,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     old_lev = int(signal.get('leverage', 10) or 10)
                     signal['leverage'] = max(3, min(old_lev, 12))
                     signal['sizeMultiplier'] = min(float(signal.get('sizeMultiplier', 1.0) or 1.0), 0.70)
+                    # Phase 238B: Leverage pipeline
+                    if signal['leverage'] < old_lev:
+                        signal['leverageCapApplied'] = True
+                        signal['leverageCapValue'] = 12
+                        signal['leverageCapReason'] = 'THIN_BOOK_LEGACY_MICRO'
                     logger.info(
                         f"🟨 THIN_BOOK_LEGACY_MICRO_PASS: {action} {symbol} depth=${total_depth:.0f} "
                         f"th=${dynamic_depth_threshold:.0f} lev {old_lev}x->{signal['leverage']}x "
@@ -10743,11 +11506,44 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         f"reinforce={reinforce_count} eq={eq_count_local}/3 score {original_score}->{signal['confidenceScore']}"
                     )
                 else:
-                    signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
-                    logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
-                    return
+                    # Phase 237: Soft Risk Gate fallback for OBI
+                    if SOFT_RISK_GATE_ENABLED:
+                        _rg_obi = evaluate_risk_gate(signal, {
+                            'gate_type': 'OBI_NEUTRAL_LOW_VOL',
+                            'obi_value': obi_value,
+                            'vol_ratio': vol_ratio_val,
+                            'eq_count': eq_count_local,
+                            'spread_pct': signal.get('spreadPct', 0.05),
+                            'strategy_mode': strategy_mode_upper,
+                        })
+                        if _rg_obi['decision'] == 'SOFT_PASS':
+                            _old_s = signal.get('confidenceScore', 60)
+                            signal['confidenceScore'] = max(40, int(_old_s) - _rg_obi['score_penalty'])
+                            signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * _rg_obi['size_mult']
+                            if _rg_obi['leverage_cap']:
+                                signal['leverage'] = max(3, min(int(signal.get('leverage', 10) or 10), _rg_obi['leverage_cap']))
+                                # Phase 238B: Leverage pipeline
+                                signal['leverageCapApplied'] = True
+                                signal['leverageCapValue'] = _rg_obi['leverage_cap']
+                                signal['leverageCapReason'] = f"RISK_GATE:OBI_NEUTRAL:{_rg_obi.get('reason_code','')}"
+                            global_paper_trader.pipeline_metrics['risk_gate_soft_pass'] += 1
+                            global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
+                            logger.info(f"🛡️ RISK_GATE: {action} {symbol} OBI→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg_obi['reason_code']}")
+                        else:
+                            signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
+                            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                            global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
+                            reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
+                            logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
+                            track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal.get('confidenceScore', 0), 'OBI_NEUTRAL_LOW_VOL', signal.get('atr', 0))
+                            return
+                    else:
+                        signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
+                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
+                        logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
+                        track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal.get('confidenceScore', 0), 'OBI_NEUTRAL_LOW_VOL', signal.get('atr', 0))
+                        return
             logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
         
     except Exception as obi_err:
@@ -10885,6 +11681,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * MTF_COUNTERTREND_SOFTPASS_SIZE_MULT
             old_lev = int(signal.get('leverage', 10) or 10)
             signal['leverage'] = max(3, min(old_lev, int(MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE)))
+            # Phase 238B: Leverage pipeline
+            if signal['leverage'] < old_lev:
+                signal['leverageCapApplied'] = True
+                signal['leverageCapValue'] = int(MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE)
+                signal['leverageCapReason'] = 'MTF_COUNTERTREND'
             global_paper_trader.pipeline_metrics['mtf_soft_override'] += 1
             logger.warning(
                 f"⚠️ MTF_COUNTER_SOFT_OVERRIDE: {action} {symbol} score {old_score}->{signal['confidenceScore']} "
@@ -10892,15 +11693,86 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 f"strong={strong_countertrend} | {mtf_result.get('reason', '')}"
             )
         else:
-            signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
-            global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
-            reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
-            logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
-            return
+            # Phase 237: Soft Risk Gate fallback for MTF
+            if SOFT_RISK_GATE_ENABLED:
+                _rg_mtf = evaluate_risk_gate(signal, {
+                    'gate_type': 'MTF_REJECT',
+                    'mtf_score': int(mtf_result.get('mtf_score', -100) or -100),
+                    'eq_count': eq_count,
+                    'exec_score': exec_score,
+                    'spread_pct': signal.get('spreadPct', 0.05),
+                    'strategy_mode': strategy_mode_upper,
+                })
+                if _rg_mtf['decision'] == 'SOFT_PASS':
+                    _old_s = signal.get('confidenceScore', 60)
+                    signal['confidenceScore'] = max(40, int(_old_s) - _rg_mtf['score_penalty'])
+                    signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * _rg_mtf['size_mult']
+                    if _rg_mtf['leverage_cap']:
+                        signal['leverage'] = max(3, min(int(signal.get('leverage', 10) or 10), _rg_mtf['leverage_cap']))
+                        # Phase 238B: Leverage pipeline
+                        signal['leverageCapApplied'] = True
+                        signal['leverageCapValue'] = _rg_mtf['leverage_cap']
+                        signal['leverageCapReason'] = f"RISK_GATE:MTF:{_rg_mtf.get('reason_code','')}"
+                    signal['mtf_override'] = True
+                    signal['mtf_override_reason'] = mtf_result.get('reason', '')
+                    global_paper_trader.pipeline_metrics['risk_gate_soft_pass'] += 1
+                    global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
+                    logger.info(f"🛡️ RISK_GATE: {action} {symbol} MTF→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg_mtf['reason_code']}")
+                else:
+                    signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
+                    global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
+                    reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
+                    logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
+                    track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'MTF_REJECTED', signal.get('atr', 0))
+                    return
+            else:
+                signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
+                reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
+                logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
+                track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'MTF_REJECTED', signal.get('atr', 0))
+                return
     
     # Phase 127: Log MTF confirmation pass
     logger.info(f"✅ MTF_CONFIRMATION PASS: {symbol} {action} (score: {mtf_result.get('mtf_score', 0)})")
+    
+    # Phase 237B: Entry Tradeability Score — BEFORE marking accepted
+    if ENTRY_TRADEABILITY_ENABLED:
+        try:
+            _td = compute_entry_tradeability(signal, {
+                'spread_pct': signal.get('spreadPct', 0.05),
+                'depth_ratio': total_depth / max(1, dynamic_depth_threshold) if total_depth > 0 else 1.0,
+                'obi_value': obi_value,
+                'obi_direction_stable': True,
+                'volume_ratio': signal.get('volumeRatio', 1.0),
+                'is_volume_spike': signal.get('isVolumeSpike', False),
+                'drift_risk': 0.0,
+                'market_regime': market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
+                'strategy_mode': strategy_mode_upper,
+            })
+            signal['tradeabilityScore'] = _td['score']
+            signal['tradeabilityDecision'] = _td['decision']
+            signal['tradeabilityReasons'] = _td['components']
+            if _td['decision'] == 'REJECT':
+                global_paper_trader.pipeline_metrics['tradeability_reject_count'] += 1
+                signal_log_data['reject_reason'] = f"TRADEABILITY_REJECT:score={_td['score']}"
+                signal_log_data['accepted'] = False
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                logger.info(f"📉 TRADEABILITY: {action} {symbol} score={_td['score']} → REJECT (components={_td['components']})")
+                return  # Tradeability too low
+            elif _td['decision'] == 'SOFT_PASS' and SOFT_RISK_GATE_ENABLED:
+                _old_s = signal.get('confidenceScore', 60)
+                signal['confidenceScore'] = max(40, int(_old_s) - 4)
+                signal['sizeMultiplier'] = float(signal.get('sizeMultiplier', 1.0) or 1.0) * 0.8
+                global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
+                logger.info(f"📉 TRADEABILITY: {action} {symbol} score={_td['score']} → SOFT_PASS (score {_old_s}→{signal['confidenceScore']})")
+            else:
+                logger.debug(f"📈 TRADEABILITY: {action} {symbol} score={_td['score']} → PASS")
+        except Exception as _td_err:
+            logger.debug(f"Tradeability error: {_td_err}")
     
     # Signal is ACCEPTED
     signal_log_data['accepted'] = True
@@ -10911,9 +11783,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     mtf_score = mtf_result.get('mtf_score', 0)
     score_modifier = mtf_result.get('score_modifier', 1.0)
     if score_modifier > 1.0:
-        logger.info(f"✅ MTF BONUS: {action} {symbol} (skor: +{mtf_score}) - pozisyon +%10 büyük")
+        logger.info(f"✅ MTF BONUS: {action} {symbol} (skor: +{mtf_score}) - pozisyon +%{int((score_modifier-1)*100)} büyük")
     elif score_modifier < 1.0:
-        logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - pozisyon -%20 küçük")
+        logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - pozisyon -%{int((1-score_modifier)*100)} küçük")
     
     # Add MTF size modifier to signal for position sizing
     signal['mtf_size_modifier'] = score_modifier
@@ -10955,6 +11827,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         signal['leverage'] = adjusted_leverage
         signal['tf_count'] = tf_count
         signal['mtf_leverage_mult'] = mtf_mult
+        # Phase 238B: Capture raw leverage before caps (first assignment = raw)
+        if 'signalLeverageRaw' not in signal:
+            signal['signalLeverageRaw'] = current_leverage
         
         # Log if MTF adjusted leverage
         if mtf_mult != 1.0:
@@ -11498,8 +12373,8 @@ class MultiTimeframeConfirmation:
         
         # Decision based on score
         if total_score > 50:
-            # Strong alignment - BONUS
-            result['score_modifier'] = 1.15  # +15% bonus
+            # Strong alignment - BONUS (Phase 235: 1.15→1.20 pro-trend ödüllendirme)
+            result['score_modifier'] = 1.20  # +20% bonus
             result['reason'] = f"MTF uyumlu (+{total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}, 1d:{result['trends']['1d']}"
         
         elif total_score >= 0:
@@ -11508,9 +12383,9 @@ class MultiTimeframeConfirmation:
             result['reason'] = f"MTF nötr ({total_score}): 15m:{result['trends']['15m']}, 1h:{result['trends']['1h']}, 4h:{result['trends']['4h']}, 1d:{result['trends']['1d']}"
         
         elif total_score > -25:
-            # Against trend but not too strong - PENALTY
-            result['score_modifier'] = 0.8  # -20% penalty
-            result['reason'] = f"MTF karşıt ({total_score}): pozisyon açılacak ama %20 düşük skor"
+            # Against trend but not too strong - PENALTY (Phase 235: 0.8→0.85 hafifletme)
+            result['score_modifier'] = 0.85  # -15% penalty
+            result['reason'] = f"MTF karşıt ({total_score}): pozisyon açılacak ama %15 düşük skor"
         
         else:
             # Strongly against trend - BLOCK (< -25)
@@ -16781,6 +17656,12 @@ class SignalGenerator:
             else STRATEGY_MODE_LEGACY
         )
         pre_signal_side = "SHORT" if zscore > 0 else "LONG"
+        # Phase 235: Pass macro trend direction for regime-aware directional tuning
+        _s2_trend_dir = "NEUTRAL"
+        try:
+            _s2_trend_dir = market_regime_detector.trend_direction
+        except Exception:
+            pass
         smart_v2_profile = get_smart_v2_strategy_profile(
             mode=strategy_mode,
             signal_side=pre_signal_side,
@@ -16793,6 +17674,7 @@ class SignalGenerator:
             is_volume_spike=is_volume_spike,
             imbalance=imbalance,
             ob_imbalance_trend=ob_imbalance_trend,
+            macro_trend_dir=_s2_trend_dir,
         )
         strategy_mode = smart_v2_profile.get('strategy_mode', STRATEGY_MODE_LEGACY)
         active_strategy = smart_v2_profile.get('active_strategy', 'legacy')
@@ -17257,6 +18139,99 @@ class SignalGenerator:
             reasons.append(f"TREND_WARN({adx:.0f},{hurst:.2f})")
         
         # =====================================================================
+        # PHASE 236: BLENDED REGIME BIAS
+        # Coin macro (65%) + BTC macro (35%) → weighted directional bias
+        # Confidence-based magnitude: high→±20/25, mid→±12/15, low→0
+        # SMART_V2: full bias, LEGACY: half bias
+        # =====================================================================
+        regime_bias = 0
+        regime_bias_reasons = []
+        _blended_dir = "NEUTRAL"  # used by VOLATILE_VETO below
+        try:
+            # -- BTC macro bias --
+            macro_regime = market_regime_detector.current_regime
+            macro_trend_dir = market_regime_detector.trend_direction
+            btc_regime = market_regime_manager.current_regime
+            btc_bias = compute_btc_macro_bias(macro_regime, macro_trend_dir, btc_regime)
+
+            # -- Coin macro bias --
+            coin_bias = compute_coin_macro_bias(
+                coin_daily_trend=coin_daily_trend,
+                adx=adx,
+                hurst=hurst,
+                adx_trend=adx_trend,
+            )
+
+            # -- Blend --
+            # -- Blend (btc_corr from coin_profile if available) --
+            _btc_corr = None
+            try:
+                if coin_profile and isinstance(coin_profile, dict):
+                    _btc_corr = coin_profile.get('btc_correlation', coin_profile.get('btcCorrelation', None))
+            except Exception:
+                pass
+            blended = blend_macro_bias(coin_bias, btc_bias, btc_corr=_btc_corr)
+            _blended_dir = blended["dir"]
+            blended_conf = blended["confidence"]
+
+            # Observability: birleşim detayı
+            regime_bias_reasons.append(
+                f"REGIME_BLEND("
+                f"COIN:{coin_bias['dir']}@{coin_bias['confidence']:.2f},"
+                f"BTC:{btc_bias['dir']}@{btc_bias['confidence']:.2f},"
+                f"W:{blended['w_coin']}/{blended['w_btc']},"
+                f"DIR:{_blended_dir},CONF:{blended_conf:.2f})"
+            )
+
+            # Pro-trend / counter-trend
+            is_pro_trend = (
+                (_blended_dir == "DOWN" and signal_side == "SHORT") or
+                (_blended_dir == "UP" and signal_side == "LONG")
+            )
+            is_counter_trend = (
+                (_blended_dir == "DOWN" and signal_side == "LONG") or
+                (_blended_dir == "UP" and signal_side == "SHORT")
+            )
+
+            # Confidence-based bias magnitude
+            if blended_conf >= 0.70:
+                pro_bias, counter_bias = 20, -25
+            elif blended_conf >= 0.45:
+                pro_bias, counter_bias = 12, -15
+            else:
+                pro_bias, counter_bias = 0, 0  # conf düşük → bias yok
+
+            # SMART_V2 vs LEGACY scaling
+            _strat = str(strategy_mode or "").upper()
+            if _strat != STRATEGY_MODE_SMART_V2:
+                # LEGACY: bias'ı yarıya yakın
+                pro_bias = int(pro_bias * 0.55)
+                counter_bias = int(counter_bias * 0.55)
+
+            if is_pro_trend and pro_bias > 0:
+                regime_bias = pro_bias
+                regime_bias_reasons.append(f"REGIME_BIAS(+{pro_bias})")
+            elif is_counter_trend and counter_bias < 0:
+                regime_bias = counter_bias
+                regime_bias_reasons.append(f"REGIME_BIAS({counter_bias})")
+
+            if regime_bias != 0:
+                score += regime_bias
+                reasons.extend(regime_bias_reasons)
+                logger.info(
+                    f"🎭 REGIME_BIAS: {symbol} {signal_side} "
+                    f"coin={coin_bias['dir']}@{coin_bias['confidence']:.2f}({coin_bias.get('source','')}) "
+                    f"btc={btc_bias['dir']}@{btc_bias['confidence']:.2f} "
+                    f"→ blend={_blended_dir}@{blended_conf:.2f} "
+                    f"bias={regime_bias:+d} strat={_strat} → score={score}"
+                )
+            elif regime_bias_reasons:
+                # bias=0 ama blend logla (gözlemlenebilirlik)
+                reasons.extend(regime_bias_reasons)
+        except Exception as regime_bias_err:
+            logger.debug(f"Regime bias error: {regime_bias_err}")
+        
+        # =====================================================================
         # PHASE 156: REGIME-SIGNAL VETO FILTER
         # Trend rejiminde karşı yönlü mean-reversion sinyallerini veto et
         # VOLATILE rejimde min_score'u artır
@@ -17276,8 +18251,19 @@ class SignalGenerator:
                 return None
         
         # Veto 2: Macro VOLATILE rejimde daha yüksek conviction iste
+        # Phase 236: blended_dir ile yön-farkında pro-trend belirleme
         if market_regime == "VOLATILE":
-            volatile_boost = int(min_score_required * 0.15)  # %15 artır
+            try:
+                _is_pro_trend = (
+                    (_blended_dir == "DOWN" and signal_side == "SHORT") or
+                    (_blended_dir == "UP" and signal_side == "LONG")
+                )
+            except Exception:
+                _is_pro_trend = False
+            if _is_pro_trend:
+                volatile_boost = int(min_score_required * 0.05)  # %5 artış (trendle uyumlu)
+            else:
+                volatile_boost = int(min_score_required * 0.15)  # %15 artış (trende karşı, strict)
             min_score_required += volatile_boost
             reasons.append(f"VOL_STRICT(+{volatile_boost})")
             if score < min_score_required:
@@ -17973,7 +18959,11 @@ class PaperTradingEngine:
             'pending_reinforced': 0, 'pending_flipped': 0, 'memory_soft_pass': 0,
             'thin_book_soft_override': 0, 'thin_book_super_override': 0,
             'order_attempted': 0, 'order_success': 0, 'order_failed': 0,
-            'market_fallback_failed': 0
+            'market_fallback_failed': 0,
+            # Phase 237: Signal quality counters
+            'soft_pass_count': 0, 'hard_reject_count': 0,
+            'tradeability_reject_count': 0, 'false_negative_count': 0,
+            'risk_gate_soft_pass': 0,
         }
         # Settings log spam guard
         self._last_settings_log_ts = 0
@@ -18720,14 +19710,21 @@ class PaperTradingEngine:
         spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
         
         # Use leverage from signal (spread-adjusted) or calculate
+        raw_leverage = 0  # Phase 238B
         if signal and 'leverage' in signal:
             adjusted_leverage = signal['leverage']
+            raw_leverage = signal.get('signalLeverageRaw', adjusted_leverage)
         else:
             session_adjusted_leverage = session_manager.adjust_leverage(self.leverage)
             leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
             user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
             adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
             adjusted_leverage = max(3, min(75, adjusted_leverage))
+            raw_leverage = adjusted_leverage
+        
+        # Phase 238B: Capture raw before caps
+        if not raw_leverage:
+            raw_leverage = adjusted_leverage
         
         # Phase 230B: Override leverage cap (BTC counter-trend protection)
         if signal and signal.get('overrideLeverageCap'):
@@ -18735,6 +19732,14 @@ class PaperTradingEngine:
             if adjusted_leverage > cap:
                 logger.info(f"💪 OVERRIDE LEV CAP: {self.symbol} {adjusted_leverage}x → {cap}x")
                 adjusted_leverage = cap
+        
+        # Phase 238B: LEV_PIPE log
+        _lev_cap_reason = signal.get('leverageCapReason', 'none') if signal else 'none'
+        if raw_leverage != adjusted_leverage:
+            logger.info(f"LEV_PIPE: {trade_symbol} raw={raw_leverage} → effective={adjusted_leverage} cap={_lev_cap_reason}")
+        if signal:
+            signal['signalLeverageRaw'] = raw_leverage
+            signal['signalLeverageEffective'] = adjusted_leverage
         
         # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
         dynamic_risk = self.get_dynamic_risk_per_trade()
@@ -18906,12 +19911,12 @@ class PaperTradingEngine:
         except:
             settings_snapshot['obi_value_at_entry'] = 0
         
-            pending_order = {
+        pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
             "side": side,
-            "signalPrice": price,  # Price when signal was generated
-            "entryPrice": entry_price,  # Pullback price to wait for
+            "signalPrice": price,
+            "entryPrice": entry_price,
             "pullbackPct": pullback_pct,
             "size": position_size,
             "sizeUsd": position_size_usd,
@@ -18921,7 +19926,6 @@ class PaperTradingEngine:
             "trailDistance": trail_distance,
             "leverage": adjusted_leverage,
             "spreadLevel": spread_level,
-            # Phase 49: Additional data for analysis
             "signalScore": signal.get('confidenceScore', 0) if signal else 0,
             "mtfScore": signal.get('mtf_score', 0) if signal else 0,
             "zScore": signal.get('zscore', 0) if signal else 0,
@@ -18929,34 +19933,38 @@ class PaperTradingEngine:
             "confirmAfter": int((datetime.now().timestamp() + signal_confirmation_delay_seconds) * 1000),
             "expiresAt": int((datetime.now().timestamp() + pending_timeout_seconds) * 1000),
             "atr": atr,
-            "confirmed": False,  # Henüz konfirme edilmedi
-            # Phase 153: ADX and Hurst for dynamic bounce threshold
+            "confirmed": False,
             "adx": signal.get('adx', 0) if signal else 0,
             "hurst": signal.get('hurst', 0.5) if signal else 0.5,
-            # Dynamic trail params (per-coin)
             "dynamic_trail_activation": signal.get('dynamic_trail_activation', self.trail_activation_atr) if signal else self.trail_activation_atr,
             "dynamic_trail_distance": signal.get('dynamic_trail_distance', self.trail_distance_atr) if signal else self.trail_distance_atr,
-            # Dynamic trail activation threshold data
             "volatility_pct": (atr / price * 100) if price > 0 else 2.0,
             "spreadPct": signal.get('spreadPct', 0.05) if signal else 0.05,
-                "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
-                "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
-                "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
-                "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
-                "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
-                "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
-                "strategyMode": signal.get('strategyMode', STRATEGY_MODE_LEGACY) if signal else STRATEGY_MODE_LEGACY,
-                "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
-                "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
-                "reinforcedCount": reinforce_count,
-                "memoryExtensionSec": memory_extend_sec,
-                "effectiveExitTightness": effective_exit_tightness,
-                # Phase 202: Trend Mode flag
-                "trend_mode": is_trend_mode,
-            # Phase 155: AI Optimizer settings snapshot
+            "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
+            "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
+            "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
+            "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
+            "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
+            "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+            "strategyMode": signal.get('strategyMode', STRATEGY_MODE_LEGACY) if signal else STRATEGY_MODE_LEGACY,
+            "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
+            "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
+            "reinforcedCount": reinforce_count,
+            "memoryExtensionSec": memory_extend_sec,
+            "effectiveExitTightness": effective_exit_tightness,
+            "trend_mode": is_trend_mode,
             "settingsSnapshot": settings_snapshot,
-            # Phase 224D3: CanaryMode A/B test flag
             "is_canary": canary_mode.should_use_canary(f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}"),
+            # Phase 237C: State machine fields
+            "state": "CREATED" if PENDING_SM_V2_ENABLED else "LEGACY",
+            "stateChangedAt": int(datetime.now().timestamp() * 1000),
+            "transitionCount": 0,
+            "lastTransitionReason": "initial",
+            # Phase 238B: Leverage pipeline fields
+            "signalLeverageRaw": signal.get('signalLeverageRaw', adjusted_leverage) if signal else adjusted_leverage,
+            "signalLeverageEffective": adjusted_leverage,
+            "leverageCapApplied": signal.get('leverageCapApplied', False) if signal else False,
+            "leverageCapReason": signal.get('leverageCapReason', '') if signal else '',
         }
         
         self.pending_orders.append(pending_order)
@@ -19009,6 +20017,8 @@ class PaperTradingEngine:
                 self.set_execution_feedback(symbol, "PENDING_EXPIRED")
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
+                if PENDING_SM_V2_ENABLED:
+                    transition_pending_state(order, 'EXPIRED', 'timeout', current_time)
                 continue
             
             # Phase 224B: Stale Signal Penalty — skor zamanla düşer
@@ -19089,7 +20099,8 @@ class PaperTradingEngine:
                     self.clear_execution_feedback(symbol)
                     self.add_log(f"✅ SIGNAL CONFIRMED: {side} {symbol} @ ${current_price:.4f} (5dk bekleme tamamlandı)")
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
-            
+                    if PENDING_SM_V2_ENABLED:
+                        transition_pending_state(order, 'WAIT_CONFIRM', 'signal_confirmed', current_time)            
             # =================================================================
             # Phase 175: TRAILING ENTRY (mirrors Trailing Take Profit logic)
             # Instead of bounce+volume+trending, simply track bottom/peak
@@ -19112,6 +20123,8 @@ class PaperTradingEngine:
                     order['trailingEntryActive'] = True
                     self.pipeline_metrics['trail_entry_start'] += 1
                     order['trailEntryStartTime'] = current_time
+                    if PENDING_SM_V2_ENABLED:
+                        transition_pending_state(order, 'TRAIL_ACTIVE', 'reached_entry', current_time)
                     # Initialize extreme price (bottom for LONG, peak for SHORT)
                     order['extremePrice'] = current_price
 
@@ -19448,6 +20461,11 @@ class PaperTradingEngine:
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
             "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
+            # Phase 238B: Leverage pipeline fields
+            "signalLeverageRaw": order.get('signalLeverageRaw', order['leverage']),
+            "signalLeverageEffective": order['leverage'],
+            "leverageCapApplied": order.get('leverageCapApplied', False),
+            "leverageCapReason": order.get('leverageCapReason', ''),
         }
         
         # =====================================================================
@@ -20283,9 +21301,14 @@ class PaperTradingEngine:
         
         # Apply BalanceProtector leverage multiplier
         leverage_mult = balance_protector.calculate_leverage_multiplier(self.balance)
-        user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+        # Phase 238 fix: WS path already bakes user_mult into signal['leverage']
+        if signal.get('leverage_includes_user_mult'):
+            user_lev_mult = 1.0  # already included — avoid double-scaling
+        else:
+            user_lev_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
         adjusted_leverage = int(session_adjusted_leverage * leverage_mult * user_lev_mult)
         adjusted_leverage = max(3, min(75, adjusted_leverage))
+        raw_leverage = signal.get('signalLeverageRaw', adjusted_leverage)  # Phase 238B
         
         # Phase 230B: Override leverage cap (BTC counter-trend protection)
         if signal.get('overrideLeverageCap'):
@@ -20293,6 +21316,13 @@ class PaperTradingEngine:
             if adjusted_leverage > cap:
                 logger.info(f"💪 OVERRIDE LEV CAP: {symbol} {adjusted_leverage}x → {cap}x")
                 adjusted_leverage = cap
+        
+        # Phase 238B: LEV_PIPE log
+        _lev_cap_reason2 = signal.get('leverageCapReason', 'none')
+        if raw_leverage != adjusted_leverage:
+            logger.info(f"LEV_PIPE: {symbol} raw={raw_leverage} → effective={adjusted_leverage} cap={_lev_cap_reason2}")
+        signal['signalLeverageRaw'] = raw_leverage
+        signal['signalLeverageEffective'] = adjusted_leverage
         
         # Get size multiplier from signal and BalanceProtector
         signal_size_mult = signal.get('sizeMultiplier', 1.0)
@@ -20354,6 +21384,11 @@ class PaperTradingEngine:
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
             "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
+            # Phase 238B: Leverage pipeline fields
+            "signalLeverageRaw": signal.get('signalLeverageRaw', adjusted_leverage),
+            "signalLeverageEffective": adjusted_leverage,
+            "leverageCapApplied": signal.get('leverageCapApplied', False),
+            "leverageCapReason": signal.get('leverageCapReason', ''),
         }
         
         # Paper Trading: Initial Margin = Position Size / Leverage
@@ -21731,7 +22766,9 @@ async def paper_trading_status():
         "liveEnabled": live_binance_trader.enabled,
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
         "pendingOrdersCount": len(global_paper_trader.pending_orders),
-        "lastOrderError": live_binance_trader.last_order_error
+        "lastOrderError": live_binance_trader.last_order_error,
+        # Phase 237D: Reject attribution summary
+        "falseNegativeSummary": get_reject_attribution_summary() if REJECT_ATTRIBUTION_ENABLED else {},
     })
 
 
@@ -23203,6 +24240,38 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             except Exception as fib_err:
                                 logger.debug(f"FIB context error: {fib_err}")
                         
+                        # Phase 235 P2 FIX: Regime-aware params for WS parity with Scanner
+                        _ws_market_regime = 'RANGING'
+                        _ws_adx = 25.0
+                        _ws_adx_trend = 'NEUTRAL'
+                        _ws_coin_daily_trend = 'NEUTRAL'
+                        _ws_ob_imbalance_trend = 0.0
+                        _ws_funding_rate = 0.0
+                        _ws_is_volume_spike = False
+                        try:
+                            _ws_market_regime = market_regime_detector.current_regime
+                        except Exception:
+                            pass
+                        try:
+                            trend_data_ws = mtf_confirmation.coin_trends.get(active_symbol, {})
+                            _ws_adx = trend_data_ws.get('adx_4h', 25.0)
+                            _ws_adx_trend = trend_data_ws.get('adx_trend_4h', 'NEUTRAL')
+                            _ws_coin_daily_trend = trend_data_ws.get('daily_trend', 'NEUTRAL')
+                        except Exception:
+                            pass
+                        try:
+                            _ws_ob_imbalance_trend = obi_detector.obi_cache.get(active_symbol, {}).get('obi_trend', 0.0)
+                        except Exception:
+                            pass
+                        try:
+                            _ws_funding_rate = funding_oi_tracker.funding_rates.get(active_symbol, 0.0)
+                        except Exception:
+                            pass
+                        try:
+                            _ws_is_volume_spike = metrics.get('volumeRatio', 1.0) >= 2.0
+                        except Exception:
+                            pass
+                        
                         signal = streamer.signal_generator.generate_signal(
                             hurst=metrics['hurst'],
                             zscore=metrics['zScore'],
@@ -23211,15 +24280,23 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             atr=metrics['atr'],
                             vwap_zscore=metrics.get('vwap_zscore', 0),
                             htf_trend=getattr(streamer, 'last_htf_trend', "NEUTRAL"),
-                            leverage=getattr(streamer.signal_generator, 'leverage', 10), # Safe access
-                            basis_pct=basis_pct, # NEW: Spot-Futures Spread
-                            whale_zscore=whale_z, # NEW: Whale Sentiment
-                            nearest_fvg=nearest_fvg, # NEW: SMC Filter
-                            breakout=breakout, # NEW: Phase 11 Breakout
-                            spread_pct=metrics.get('spreadPct', 0.05), # Phase 13
-                            volatility_ratio=metrics.get('volatilityRatio', 1.0), # Phase 13
-                            coin_profile=streamer.coin_profile,  # Phase 28: Dynamic optimization
-                            fib_context=ws_fib_context  # Phase FIB: Fibonacci context
+                            leverage=getattr(streamer.signal_generator, 'leverage', 10),
+                            basis_pct=basis_pct,
+                            whale_zscore=whale_z,
+                            nearest_fvg=nearest_fvg,
+                            breakout=breakout,
+                            spread_pct=metrics.get('spreadPct', 0.05),
+                            volatility_ratio=metrics.get('volatilityRatio', 1.0),
+                            coin_profile=streamer.coin_profile,
+                            fib_context=ws_fib_context,
+                            # Phase 235 P2: Regime-aware params (Scanner parity)
+                            market_regime=_ws_market_regime,
+                            adx=_ws_adx,
+                            adx_trend=_ws_adx_trend,
+                            is_volume_spike=_ws_is_volume_spike,
+                            coin_daily_trend=_ws_coin_daily_trend,
+                            ob_imbalance_trend=_ws_ob_imbalance_trend,
+                            funding_rate=_ws_funding_rate,
                         )
                         
                         # =====================================================
@@ -23252,9 +24329,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             
                             # Log MTF result (Cloud Scanner parity)
                             if score_modifier > 1.0:
-                                logger.info(f"✅ MTF BONUS: {action} {active_symbol} (skor: +{mtf_score}) - pozisyon +%10 büyük")
+                                logger.info(f"✅ MTF BONUS: {action} {active_symbol} (skor: +{mtf_score}) - pozisyon +%{int((score_modifier-1)*100)} büyük")
                             elif score_modifier < 1.0 and mtf_confirmed:
-                                logger.info(f"⚠️ MTF PENALTY: {action} {active_symbol} (skor: {mtf_score}) - pozisyon -%20 küçük")
+                                logger.info(f"⚠️ MTF PENALTY: {action} {active_symbol} (skor: {mtf_score}) - pozisyon -%{int((1-score_modifier)*100)} küçük")
                             
                             if not mtf_confirmed:
                                 logger.info(f"🚫 MTF RED: {action} {active_symbol} (skor: {mtf_score}) - sinyal reddedildi")
@@ -23427,6 +24504,10 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                             if cap_lev:
                                                 existing_cap = signal.get('overrideLeverageCap')
                                                 signal['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+                                                # Phase 238B: Leverage pipeline
+                                                signal['leverageCapApplied'] = True
+                                                signal['leverageCapValue'] = signal['overrideLeverageCap']
+                                                signal['leverageCapReason'] = f"BTC_FILTER:{btc_reason.split(':')[0] if ':' in btc_reason else 'MODERATE'}"
                                             if cap_size:
                                                 signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), cap_size)
                                         signal['btc_adjustment'] = btc_reason
@@ -23436,6 +24517,10 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                             existing_cap = signal.get('overrideLeverageCap')
                                             signal['overrideLeverageCap'] = min(existing_cap, 3) if existing_cap else 3
                                             signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), 0.5)
+                                            # Phase 238B: Leverage pipeline
+                                            signal['leverageCapApplied'] = True
+                                            signal['leverageCapValue'] = signal['overrideLeverageCap']
+                                            signal['leverageCapReason'] = 'BTC_FILTER:EXTREME'
                                             logger.info(f"💪 WS OVERRIDE CAPS: {active_symbol} | leverage≤3x, size≤0.5x")
                                 except Exception as btc_err:
                                     logger.warning(f"BTC Filter error: {btc_err}")
