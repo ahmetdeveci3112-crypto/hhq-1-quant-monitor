@@ -18706,15 +18706,15 @@ class PaperTradingEngine:
         # =========================================================================
         # Create a pending order that waits for price to reach pullback level
         
-            # Entry is already dynamically calculated in SignalGenerator (includes entry_tightness).
-            # Avoid double-scaling entry_tightness here.
-            if signal and 'entryPrice' in signal and signal.get('entryPrice', 0) > 0:
-                entry_price = float(signal.get('entryPrice'))
-                pullback_pct = float(signal.get('pullbackPct', 0))
-            else:
-                # No pullback, use current price
-                entry_price = price
-                pullback_pct = 0
+        # Entry is already dynamically calculated in SignalGenerator (includes entry_tightness).
+        # Avoid double-scaling entry_tightness here.
+        if signal and 'entryPrice' in signal and signal.get('entryPrice', 0) > 0:
+            entry_price = float(signal.get('entryPrice'))
+            pullback_pct = float(signal.get('pullbackPct', 0))
+        else:
+            # No pullback, use current price
+            entry_price = price
+            pullback_pct = 0
         
         # Get spread-adjusted parameters from signal
         spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
