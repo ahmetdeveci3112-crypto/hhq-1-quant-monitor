@@ -2959,7 +2959,8 @@ class LiveBinanceTrader:
             'trading_mode': self.trading_mode,
             'last_balance': self.last_balance,
             'position_count': len(self.last_positions),
-            'last_sync': self.last_sync_time
+            'last_sync': self.last_sync_time,
+            'last_order_error': self.last_order_error
         }
 
 
@@ -4519,6 +4520,16 @@ THIN_BOOK_SMART_SOFTPASS_MIN_EXEC = 66.0
 THIN_BOOK_SMART_SOFTPASS_MIN_EQ = 2
 THIN_BOOK_SMART_SOFTPASS_MAX_SPREAD = 0.18
 THIN_BOOK_SMART_SOFTPASS_PENALTY = 8
+
+# Ultra-selective relax (only very high-quality SMART_V2 setups)
+THIN_BOOK_SUPER_SOFTPASS_ENABLED = True
+THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO = 0.70
+THIN_BOOK_SUPER_SOFTPASS_MIN_SCORE = 118
+THIN_BOOK_SUPER_SOFTPASS_MIN_EXEC = 72.0
+THIN_BOOK_SUPER_SOFTPASS_MIN_EQ = 3
+THIN_BOOK_SUPER_SOFTPASS_MAX_SPREAD = 0.14
+THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO = 1.20
+THIN_BOOK_SUPER_SOFTPASS_PENALTY = 10
 
 # Hybrid execution quality gate (entry strictness)
 EXEC_QUALITY_GATE_ENABLED = True
@@ -10388,6 +10399,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             eq_count = len(signal.get('entryQualityReasons') or [])
             exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
             signal_spread = float(signal.get('spreadPct', 0.2) or 0.2)
+            signal_volume_ratio = float(signal.get('volumeRatio', 1.0) or 1.0)
             near_threshold_soft_pass = (
                 reinforce_count >= 2
                 and signal_score >= 95
@@ -10402,7 +10414,17 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_spread <= THIN_BOOK_SMART_SOFTPASS_MAX_SPREAD
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SMART_SOFTPASS_DEPTH_RATIO
             )
-            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or smart_soft_pass):
+            super_soft_pass = (
+                THIN_BOOK_SUPER_SOFTPASS_ENABLED
+                and strategy_mode_upper == STRATEGY_MODE_SMART_V2
+                and signal_score >= THIN_BOOK_SUPER_SOFTPASS_MIN_SCORE
+                and eq_count >= THIN_BOOK_SUPER_SOFTPASS_MIN_EQ
+                and exec_score >= THIN_BOOK_SUPER_SOFTPASS_MIN_EXEC
+                and signal_spread <= THIN_BOOK_SUPER_SOFTPASS_MAX_SPREAD
+                and signal_volume_ratio >= THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO
+                and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
+            )
+            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or smart_soft_pass or super_soft_pass):
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -10413,12 +10435,26 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                 )
                 return
-            elif near_threshold_soft_pass or smart_soft_pass:
+            elif near_threshold_soft_pass or smart_soft_pass or super_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
-                score_penalty = 6 if near_threshold_soft_pass else THIN_BOOK_SMART_SOFTPASS_PENALTY
+                if near_threshold_soft_pass:
+                    score_penalty = 6
+                elif super_soft_pass:
+                    score_penalty = THIN_BOOK_SUPER_SOFTPASS_PENALTY
+                else:
+                    score_penalty = THIN_BOOK_SMART_SOFTPASS_PENALTY
                 signal['confidenceScore'] = max(40, int(original_score) - score_penalty)
                 global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
-                if smart_soft_pass:
+                if super_soft_pass:
+                    global_paper_trader.pipeline_metrics['thin_book_super_override'] = (
+                        global_paper_trader.pipeline_metrics.get('thin_book_super_override', 0) + 1
+                    )
+                    logger.info(
+                        f"🟨 THIN_BOOK_SUPER_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} eq={eq_count}/3 exec={exec_score:.0f} vr={signal_volume_ratio:.2f} "
+                        f"score {original_score}->{signal['confidenceScore']}"
+                    )
+                elif smart_soft_pass:
                     global_paper_trader.pipeline_metrics['thin_book_soft_override'] = (
                         global_paper_trader.pipeline_metrics.get('thin_book_soft_override', 0) + 1
                     )
@@ -17572,8 +17608,13 @@ class PaperTradingEngine:
             'fallback_on_fail': 0, 'fallback_on_expire': 0,
             'thin_book_rejected': 0, 'mtf_rejected': 0, 'mtf_soft_override': 0,
             'pending_reinforced': 0, 'pending_flipped': 0, 'memory_soft_pass': 0,
-            'thin_book_soft_override': 0
+            'thin_book_soft_override': 0, 'thin_book_super_override': 0,
+            'order_attempted': 0, 'order_success': 0, 'order_failed': 0,
+            'market_fallback_failed': 0
         }
+        # Settings log spam guard
+        self._last_settings_log_ts = 0
+        self._last_settings_log_signature = ""
         # Symbol-level execution feedback for UI (latest rejection reason).
         self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
         
@@ -18903,6 +18944,7 @@ class PaperTradingEngine:
         
         # Phase 55: Check if already have position in this coin
         symbol = order.get('symbol', '')
+        is_live_mode = live_binance_trader.enabled and live_binance_trader.trading_mode == 'live'
         existing_position = next((p for p in self.positions if p['symbol'] == symbol), None)
         if existing_position:
             self.add_log(f"⚠️ {symbol}'de zaten pozisyon var, yeni order iptal edildi")
@@ -19049,7 +19091,7 @@ class PaperTradingEngine:
         # LIVE TRADING: Send order to Binance before creating local position
         # Phase 186: Limit entry + pre-trade spread filter
         # =====================================================================
-        if live_binance_trader.enabled and live_binance_trader.trading_mode == 'live' and not force_market:
+        if is_live_mode and not force_market:
             try:
                 # Phase 186 Feature C: Pre-trade spread filter
                 ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
@@ -19099,6 +19141,7 @@ class PaperTradingEngine:
                     logger.debug(f"Price drift check error: {drift_err}")
                 
                 logger.info(f"🔴 LIVE ORDER: Sending {side} {symbol} to Binance (LIMIT entry)...")
+                self.pipeline_metrics['order_attempted'] += 1
                 
                 # Phase 186 Feature B: Use limit entry with market fallback
                 result = await live_binance_trader.place_limit_entry_order(
@@ -19109,6 +19152,7 @@ class PaperTradingEngine:
                 )
                 
                 if result:
+                    self.pipeline_metrics['order_success'] += 1
                     # ===== Phase 201: Post-Fill Max Slippage Rejection =====
                     fill_slippage = abs(result.get('slippage_pct', 0))
                     MAX_FILL_SLIPPAGE_PCT = 0.5  # Max 0.5% fill slippage
@@ -19151,6 +19195,7 @@ class PaperTradingEngine:
                             new_position['trailingStop'] = new_position['stopLoss']
                         logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${new_position['stopLoss']:.6f} TP=${new_position['takeProfit']:.6f}")
                 else:
+                    self.pipeline_metrics['order_failed'] += 1
                     order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
                     self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
@@ -19158,6 +19203,7 @@ class PaperTradingEngine:
                     return  # Don't create position if Binance order failed
                     
             except Exception as e:
+                self.pipeline_metrics['order_failed'] += 1
                 error_msg = str(e)[:80]  # Truncate long error messages
                 order_error = live_binance_trader.last_order_error
                 if order_error:
@@ -19166,10 +19212,11 @@ class PaperTradingEngine:
                 self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
                 self.set_execution_feedback(symbol, "BINANCE_ORDER_ERROR")
                 return  # Don't create position if there was an error
-        elif force_market and live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
+        elif force_market and is_live_mode:
             # Force market: bypass spread/drift guards, send direct market order
             try:
                 logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (MARKET, no spread/drift check)...")
+                self.pipeline_metrics['order_attempted'] += 1
                 result = await live_binance_trader.place_market_order(
                     symbol=symbol,
                     side=side,
@@ -19177,6 +19224,7 @@ class PaperTradingEngine:
                     leverage=order['leverage']
                 )
                 if result:
+                    self.pipeline_metrics['order_success'] += 1
                     new_position['binance_order_id'] = result.get('id')
                     actual_fill = result.get('price', fill_price)
                     new_position['binance_fill_price'] = actual_fill
@@ -19199,12 +19247,16 @@ class PaperTradingEngine:
                             new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
                             new_position['trailingStop'] = new_position['stopLoss']
                 else:
+                    self.pipeline_metrics['order_failed'] += 1
+                    self.pipeline_metrics['market_fallback_failed'] += 1
                     order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ FORCE MARKET FAILED - skipping position creation")
                     self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
                     self.set_execution_feedback(symbol, f"MARKET_FALLBACK_FAILED:{order_error}")
                     return
             except Exception as e:
+                self.pipeline_metrics['order_failed'] += 1
+                self.pipeline_metrics['market_fallback_failed'] += 1
                 order_error = live_binance_trader.last_order_error
                 error_msg = str(e)[:80]
                 if order_error:
@@ -19213,6 +19265,10 @@ class PaperTradingEngine:
                 self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {error_msg}")
                 self.set_execution_feedback(symbol, "MARKET_FALLBACK_ERROR")
                 return
+        else:
+            # Paper mode execution observability parity
+            self.pipeline_metrics['order_attempted'] += 1
+            self.pipeline_metrics['order_success'] += 1
         
         # Paper Trading: Initial Margin = Position Size / Leverage
         # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
@@ -21310,7 +21366,9 @@ async def paper_trading_status():
         "equityCurve": global_paper_trader.equity_curve[-200:],  # Last 200 points
         "tradingMode": live_binance_trader.trading_mode,  # paper or live
         "liveEnabled": live_binance_trader.enabled,
-        "pipelineMetrics": global_paper_trader.pipeline_metrics
+        "pipelineMetrics": global_paper_trader.pipeline_metrics,
+        "pendingOrdersCount": len(global_paper_trader.pending_orders),
+        "lastOrderError": live_binance_trader.last_order_error
     })
 
 
@@ -21343,7 +21401,8 @@ async def live_trading_status():
             "enabled": False,
             "trading_mode": env_trading_mode,
             "message": "Live trading not enabled. Set TRADING_MODE=live to activate.",
-            "init_error": init_error or getattr(live_binance_trader, 'last_error', None)
+            "init_error": init_error or getattr(live_binance_trader, 'last_error', None),
+            "lastOrderError": live_binance_trader.last_order_error
         })
     
     try:
@@ -21364,6 +21423,7 @@ async def live_trading_status():
             "position_count": len(positions),
             "last_sync": live_binance_trader.last_sync_time,
             "status": live_binance_trader.get_status(),
+            "lastOrderError": live_binance_trader.last_order_error,
             # PnL data from Binance income history
             "todayPnl": pnl_data.get('todayPnl', 0),
             "todayPnlPercent": pnl_data.get('todayPnlPercent', 0),
@@ -21378,7 +21438,8 @@ async def live_trading_status():
         return JSONResponse({
             "enabled": True,
             "trading_mode": "live",
-            "error": str(e)
+            "error": str(e),
+            "lastOrderError": live_binance_trader.last_order_error
         }, status_code=500)
 
 
@@ -21936,7 +21997,10 @@ async def paper_trading_get_settings():
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
         "killSwitchFullClose": daily_kill_switch.full_close_pct,
         # Phase 216: Leverage multiplier
-        "leverageMultiplier": getattr(global_paper_trader, 'leverage_multiplier', 1.0)
+        "leverageMultiplier": getattr(global_paper_trader, 'leverage_multiplier', 1.0),
+        # Execution diagnostics
+        "lastOrderError": live_binance_trader.last_order_error,
+        "pipelineMetrics": global_paper_trader.pipeline_metrics
     })
 
 @app.post("/paper-trading/settings")
@@ -22037,8 +22101,25 @@ async def paper_trading_update_settings(
             global_paper_trader.add_log(f"⚠️ SETTINGS_CHANGED_LEVERAGE_MULTIPLIER: {stale_count} pending orders cleared (lev {old_mult:.1f}x→{clamped:.1f}x)")
             logger.info(f"🗑️ Cleared {stale_count} pending orders due to leverage multiplier change")
     
-    # Log settings change (simplified)
-    global_paper_trader.add_log(f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
+    # Settings log throttle: skip noisy duplicate logs
+    settings_log_message = (
+        f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} "
+        f"TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} "
+        f"Giriş:{global_paper_trader.entry_tightness:.2f} Çıkış:{global_paper_trader.exit_tightness:.2f} "
+        f"Str:{getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)} "
+        f"LevM:{getattr(global_paper_trader, 'leverage_multiplier', 1.0):.2f} "
+        f"KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}"
+    )
+    now_ms = int(datetime.now().timestamp() * 1000)
+    throttle_ms = 90 * 1000
+    last_sig = getattr(global_paper_trader, "_last_settings_log_signature", "")
+    last_ts = int(getattr(global_paper_trader, "_last_settings_log_ts", 0) or 0)
+    if settings_log_message != last_sig or (now_ms - last_ts) >= throttle_ms:
+        global_paper_trader.add_log(settings_log_message)
+        global_paper_trader._last_settings_log_signature = settings_log_message
+        global_paper_trader._last_settings_log_ts = now_ms
+    else:
+        logger.debug("Settings log throttled (duplicate payload)")
     global_paper_trader.save_state()
     logger.info(f"Settings updated: MaxPositions:{global_paper_trader.max_positions} Z-Threshold:{global_paper_trader.z_score_threshold} KillSwitch:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}")
     
