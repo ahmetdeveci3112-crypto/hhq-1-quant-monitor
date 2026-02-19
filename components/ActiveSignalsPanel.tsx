@@ -118,9 +118,110 @@ const getLiveEntryThresholdMult = (
     return Math.max(0.7, Math.min(2.6, liveMult));
 };
 
+const fmtNum = (value: number | null | undefined, digits: number = 2, fallback: string = '-'): string => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+};
+
+const getQualityTooltip = (signal: CoinOpportunity): string => {
+    const lines: string[] = [];
+    const eqCount = signal.entryQualityReasons?.length || 0;
+    const eqReasons = eqCount > 0 ? signal.entryQualityReasons?.join(', ') : 'Kriter detayı yok';
+    const side = signal.signalAction || 'NONE';
+    const strategy = signal.strategyLabel || signal.activeStrategy || signal.strategyMode || 'LEGACY';
+
+    lines.push(`${signal.symbol} • ${side} kalite özeti`);
+    lines.push(`Skor: ${signal.signalScore}/100`);
+    lines.push(`EQ: ${signal.entryQualityPass ? 'GEÇTİ' : 'GEÇMEDİ'} (${eqCount}/3)`);
+    lines.push(`EQ detay: ${eqReasons}`);
+    lines.push(`Execution: ${fmtNum(signal.entryExecScore, 1)} (${signal.entryExecPassed === false ? 'zayıf' : 'uygun'})`);
+    lines.push(`Hacim: ${fmtNum(signal.volumeRatio, 2)}x${signal.isVolumeSpike ? ' (sıçrama var)' : ''}`);
+    lines.push(`OrderBook: imb ${fmtNum(signal.imbalance, 1)} | trend ${fmtNum(signal.obImbalanceTrend, 1)}`);
+    if (signal.fibActive) {
+        lines.push(`Fibonacci: aktif | seviye ${signal.fibLevel || '-'} | bonus +${signal.fibBonus || 0}`);
+    } else {
+        lines.push('Fibonacci: pasif');
+    }
+    lines.push(`Strateji: ${strategy}`);
+
+    if (signal.btcFilterNote) {
+        lines.push(`BTC notu: ${signal.btcFilterNote}`);
+    }
+    if (signal.btcOverride) {
+        const levCap = signal.overrideLeverageCap ? `${signal.overrideLeverageCap}x` : '-';
+        const sizeCap = signal.overrideSizeMult ? `${fmtNum(signal.overrideSizeMult, 2)}x` : '-';
+        lines.push(`BTC override: aktif | lev cap ${levCap} | boyut cap ${sizeCap}`);
+    }
+    if (signal.executionRejectReason) {
+        lines.push(`Son red: ${signal.executionRejectReason}`);
+    }
+
+    return lines.join('\n');
+};
+
+interface TrailTooltipInput {
+    signal: CoinOpportunity;
+    isLong: boolean;
+    pbPct: number;
+    atrPct: number;
+    spreadPct: number;
+    volumeRatio: number;
+    leverage: number;
+    entryTightness: number;
+    liveThresholdMult: number;
+    liveMovePct: number;
+    liveRoiPct: number;
+    snapshotMovePct: number;
+    snapshotRoiPct: number;
+    snapshotThresholdMult: number;
+}
+
+const getTrailEntryTooltip = ({
+    signal,
+    isLong,
+    pbPct,
+    atrPct,
+    spreadPct,
+    volumeRatio,
+    leverage,
+    entryTightness,
+    liveThresholdMult,
+    liveMovePct,
+    liveRoiPct,
+    snapshotMovePct,
+    snapshotRoiPct,
+    snapshotThresholdMult
+}: TrailTooltipInput): string => {
+    const lines: string[] = [];
+    const side = isLong ? 'LONG' : 'SHORT';
+    const hasSnapshotTrail = snapshotMovePct > 0;
+    const dynAct = signal.dynamic_trail_activation;
+    const dynDist = signal.dynamic_trail_distance;
+
+    lines.push(`${signal.symbol} • ${side} takip girişi`);
+    lines.push(`Anlık eşik: min hareket ${fmtNum(liveMovePct, 2)}% | min ROI ${fmtNum(liveRoiPct, 1)}%`);
+    if (hasSnapshotTrail) {
+        lines.push(`Sinyal anı: min hareket ${fmtNum(snapshotMovePct, 2)}% | min ROI ${fmtNum(snapshotRoiPct, 1)}%`);
+    } else {
+        lines.push('Sinyal anı trail eşiği: veri yok');
+    }
+    lines.push(`Formül girdileri: ATR ${fmtNum(atrPct, 2)}% | spread ${fmtNum(spreadPct, 3)}% | hacim ${fmtNum(volumeRatio, 2)}x | lev ${leverage}x`);
+    lines.push(`Çarpanlar: canlı ${fmtNum(liveThresholdMult, 2)}x | sinyal ${fmtNum(snapshotThresholdMult, 2)}x | giriş ayarı ${fmtNum(entryTightness, 2)}x`);
+    lines.push(`Pullback hedefi: ${isLong ? '↓' : '↑'}${fmtNum(pbPct, 2)}%`);
+    if (typeof dynAct === 'number' && typeof dynDist === 'number') {
+        lines.push(`Trail ATR param: aktivasyon ${fmtNum(dynAct, 2)}x | mesafe ${fmtNum(dynDist, 2)}x`);
+    }
+    if (signal.executionRejectReason) {
+        lines.push(`Not: ${signal.executionRejectReason}`);
+    }
+
+    return lines.join('\n');
+};
+
 // Quality badge component
-const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
+const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string }> = ({ signal, qualityTooltip }) => {
     const badges: React.ReactNode[] = [];
+    const withDetails = (headline: string) => qualityTooltip ? `${headline}\n${qualityTooltip}` : headline;
 
     // EQ badge
     if (signal.entryQualityPass) {
@@ -128,7 +229,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
         const isStrong = count >= 3;
         badges.push(
             <span key="eq" className={`text-[9px] px-1 py-0.5 rounded font-bold ${isStrong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
-                title={`Giriş Kalitesi: ${signal.entryQualityReasons?.join(', ') || 'geçti'}`}>
+                title={withDetails(`Giriş Kalitesi: ${signal.entryQualityReasons?.join(', ') || 'geçti'}`)}>
                 EQ{isStrong ? '★' : ''}{count}/3
             </span>
         );
@@ -138,7 +239,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     if (signal.fibActive) {
         badges.push(
             <span key="fib" className="text-[9px] px-1 py-0.5 rounded font-bold bg-purple-500/20 text-purple-400"
-                title={`Fib Level: ${signal.fibLevel || '?'} | Bonus: +${signal.fibBonus || 0} | Alpha: ${signal.fibBlendAlpha || 0}`}>
+                title={withDetails(`Fib Level: ${signal.fibLevel || '?'} | Bonus: +${signal.fibBonus || 0} | Alpha: ${signal.fibBlendAlpha || 0}`)}>
                 FIB{signal.fibBonus ? `+${signal.fibBonus}` : ''}
             </span>
         );
@@ -148,14 +249,14 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
     if (signal.isVolumeSpike) {
         badges.push(
             <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
-                title={`Hacim Oranı: ${signal.volumeRatio || 0}x`}>
+                title={withDetails(`Hacim Oranı: ${signal.volumeRatio || 0}x`)}>
                 🔥VOL
             </span>
         );
     } else if ((signal.volumeRatio || 0) >= 1.25) {
         badges.push(
             <span key="vol" className="text-[9px] px-1 py-0.5 rounded font-bold bg-amber-500/10 text-amber-500/60"
-                title={`Hacim Oranı: ${signal.volumeRatio}x`}>
+                title={withDetails(`Hacim Oranı: ${signal.volumeRatio}x`)}>
                 Vol{signal.volumeRatio}x
             </span>
         );
@@ -168,7 +269,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
             <span
                 key="s2"
                 className="text-[9px] px-1 py-0.5 rounded font-bold bg-cyan-500/15 text-cyan-300"
-                title={`Aktif Strateji: ${strat}`}
+                title={withDetails(`Aktif Strateji: ${strat}`)}
             >
                 S2:{strat}
             </span>
@@ -182,7 +283,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity }> = ({ signal }) => {
             <span
                 key="rej"
                 className="text-[9px] px-1 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                title={`İşleme Alınmadı: ${signal.executionRejectReason}`}
+                title={withDetails(`İşleme Alınmadı: ${signal.executionRejectReason}`)}
             >
                 RET:{rejectKey}
             </span>
@@ -263,11 +364,32 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = getEntryPrice(signal, entryTightness);
+        const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
         const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
         const spreadPct = typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05;
         const volumeRatio = signal.volumeRatio || 1.0;
         const liveThresholdMult = getLiveEntryThresholdMult(entryTightness, spreadPct, volumeRatio);
         const liveTrail = getDynamicTrailEntryThreshold(atrPct, spreadPct, volumeRatio, leverage, liveThresholdMult);
+        const snapshotTrailEntryPct = (signal.trailEntryMinMovePct && signal.trailEntryMinMovePct > 0) ? signal.trailEntryMinMovePct : 0;
+        const snapshotTrailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0) ? signal.trailEntryMinRoiPct : 0;
+        const snapshotThresholdMult = signal.entryThresholdMult || 1.0;
+        const trailTitle = getTrailEntryTooltip({
+            signal,
+            isLong,
+            pbPct,
+            atrPct,
+            spreadPct,
+            volumeRatio,
+            leverage,
+            entryTightness,
+            liveThresholdMult,
+            liveMovePct: liveTrail.minMove,
+            liveRoiPct: liveTrail.minRoi,
+            snapshotMovePct: snapshotTrailEntryPct,
+            snapshotRoiPct: snapshotTrailEntryRoi,
+            snapshotThresholdMult
+        });
+        const qualityTooltip = getQualityTooltip(signal);
         const isLoading = loadingSymbol === signal.symbol;
         const priceFlash = priceFlashMap[signal.symbol];
 
@@ -296,8 +418,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 </div>
 
                 {/* Quality Badges */}
-                <div className="mb-2">
-                    <QualityBadges signal={signal} />
+                <div className="mb-2" title={qualityTooltip}>
+                    <QualityBadges signal={signal} qualityTooltip={qualityTooltip} />
                 </div>
 
                 {/* Middle: Price Info */}
@@ -325,7 +447,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(2)}%</span>
                         <span
                             className="text-cyan-400"
-                            title={`Anlık trail giriş eşiği: hareket ${liveTrail.minMove.toFixed(2)}% | ROI ${liveTrail.minRoi.toFixed(1)}% | giriş çarpanı ${entryTightness.toFixed(1)}x`}
+                            title={trailTitle}
                         >
                             Trail:{liveTrail.minMove.toFixed(2)}%
                         </span>
@@ -459,9 +581,23 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const snapshotTrailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0) ? signal.trailEntryMinRoiPct : 0;
                                 const snapshotThresholdMult = signal.entryThresholdMult || 1.0;
                                 const hasSnapshotTrail = snapshotTrailEntryPct > 0;
-                                const trailTitle = hasSnapshotTrail
-                                    ? `Anlık trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}% | canlı çarpan ${liveThresholdMult.toFixed(2)}x | Sinyal anı: ${snapshotTrailEntryPct.toFixed(2)}% / ${snapshotTrailEntryRoi.toFixed(1)}% (çarpan ${snapshotThresholdMult.toFixed(2)}x)`
-                                    : `Anlık trail giriş: min hareket ${trailEntryPct.toFixed(2)}% | min ROI ${trailEntryRoi.toFixed(1)}% | canlı çarpan ${liveThresholdMult.toFixed(2)}x`;
+                                const trailTitle = getTrailEntryTooltip({
+                                    signal,
+                                    isLong,
+                                    pbPct,
+                                    atrPct,
+                                    spreadPct,
+                                    volumeRatio,
+                                    leverage,
+                                    entryTightness,
+                                    liveThresholdMult,
+                                    liveMovePct: trailEntryPct,
+                                    liveRoiPct: trailEntryRoi,
+                                    snapshotMovePct: snapshotTrailEntryPct,
+                                    snapshotRoiPct: snapshotTrailEntryRoi,
+                                    snapshotThresholdMult
+                                });
+                                const qualityTooltip = getQualityTooltip(signal);
 
                                 return (
                                     <tr key={signal.symbol} className={`border-b border-slate-800/20 hover:bg-slate-800/30 transition-colors`}>
@@ -494,8 +630,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                 }`}>{signal.signalScore}</span>
                                             <span className="text-[10px] text-slate-600">/100</span>
                                         </td>
-                                        <td className="py-2.5 px-2 text-center">
-                                            <QualityBadges signal={signal} />
+                                        <td className="py-2.5 px-2 text-center" title={qualityTooltip}>
+                                            <QualityBadges signal={signal} qualityTooltip={qualityTooltip} />
                                         </td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs ${Math.abs(signal.zscore || 0) >= 2 ? 'text-amber-400' : 'text-slate-400'}`}>
                                             {(signal.zscore || 0).toFixed(2)}
@@ -506,7 +642,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                         <td className="py-2.5 px-3 text-center">
                                             <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                                         </td>
-                                        <td className="py-2.5 px-3 text-center">
+                                        <td className="py-2.5 px-3 text-center" title={trailTitle}>
                                             {pbPct > 0 ? (
                                                 <div className="flex flex-col items-center gap-0.5">
                                                     <span className="text-[10px] font-mono font-semibold text-amber-400">

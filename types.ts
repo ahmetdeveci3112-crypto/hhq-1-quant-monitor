@@ -326,6 +326,12 @@ export interface CoinOpportunity {
   entryThresholdMult?: number;
   entryExecScore?: number;
   entryExecPassed?: boolean;
+  entryExecNotes?: string[];
+  btcFilterNote?: string;
+  btcFilterBlocked?: string;
+  btcOverride?: boolean;
+  overrideLeverageCap?: number;
+  overrideSizeMult?: number;
   strategyMode?: 'LEGACY' | 'SMART_V2';
   activeStrategy?: string;
   strategyLabel?: string;
