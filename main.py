@@ -1222,6 +1222,8 @@ class LiveBinanceTrader:
         self.exchange = None
         self.enabled = False
         self.initialized = False
+        self.last_error = None
+        self.last_order_error = None
         self.last_balance = 0.0
         self.last_positions = []
         self.last_sync_time = 0
@@ -1766,10 +1768,65 @@ class LiveBinanceTrader:
                 return True
             logger.error(f"❌ Leverage set FAILED for {symbol} -> {leverage}x: {e}")
             return False  # Real error — caller should abort order
+
+    def _extract_exchange_error(self, error: Exception) -> str:
+        """Normalize exchange error to a short, UI-safe message."""
+        try:
+            msg = str(error)
+        except Exception:
+            msg = repr(error)
+        msg = (msg or "unknown_exchange_error").replace("\n", " ").strip()
+        return msg[:220]
+
+    def _normalize_order_amount(self, ccxt_symbol: str, price: float, target_usd: float, market: dict) -> tuple:
+        """
+        Normalize amount for Binance futures constraints.
+        Returns: (amount, notional_usd, min_notional_usd)
+        """
+        safe_price = max(float(price or 0), 1e-12)
+        amount = max(0.0, float(target_usd or 0) / safe_price)
+        limits = (market or {}).get('limits', {})
+        min_amount = float((limits.get('amount') or {}).get('min') or 0.0)
+        min_cost = float((limits.get('cost') or {}).get('min') or 0.0)
+        min_notional = max(5.0, min_cost)
+
+        if min_amount > 0 and amount < min_amount:
+            amount = min_amount
+        if amount * safe_price < min_notional:
+            amount = max(amount, min_notional / safe_price)
+
+        try:
+            amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
+        except Exception:
+            pass
+
+        if min_amount > 0 and amount < min_amount:
+            amount = min_amount
+            try:
+                amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
+            except Exception:
+                pass
+
+        notional = amount * safe_price
+        if notional < min_notional * 0.98:
+            amount_precision = (market or {}).get('precision', {}).get('amount')
+            if isinstance(amount_precision, int):
+                step = 10 ** (-amount_precision)
+                amount = math.ceil((min_notional / safe_price) / step) * step
+                amount = round(amount, amount_precision)
+                try:
+                    amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
+                except Exception:
+                    pass
+                notional = amount * safe_price
+
+        return amount, notional, min_notional
     
     async def place_market_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
         """Market emir gönder — Phase 186: with execution quality logging."""
+        self.last_order_error = None
         if not self.enabled or not self.exchange:
+            self.last_order_error = "live_trader_disabled"
             logger.error("❌ LiveBinanceTrader not enabled, order rejected")
             return None
             
@@ -1779,6 +1836,7 @@ class LiveBinanceTrader:
             # Kaldıraç ayarla — abort if real failure
             set_ok = await self.set_leverage(symbol, leverage)
             if not set_ok:
+                self.last_order_error = f"set_leverage_failed:{leverage}x"
                 logger.error(f"❌ Aborting market order {symbol}: leverage set to {leverage}x failed")
                 return None
             
@@ -1789,17 +1847,29 @@ class LiveBinanceTrader:
             best_ask = ticker.get('ask', price)
             mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
             spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
-            
-            amount = size_usd / price
-            
-            # Minimum lot size kontrolü
+
+            # Amount precision + min lot + min notional normalization
             markets = await self.exchange.load_markets()
             market = markets.get(ccxt_symbol)
-            if market:
-                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
-                if amount < min_amount:
-                    logger.warning(f"⚠️ Amount {amount} below minimum {min_amount}, adjusting...")
-                    amount = min_amount
+            if not market:
+                self.last_order_error = f"market_not_found:{ccxt_symbol}"
+                logger.error(f"❌ BINANCE ORDER FAILED: {side} {symbol} | Unknown market {ccxt_symbol}")
+                return None
+            amount, effective_notional, min_notional = self._normalize_order_amount(
+                ccxt_symbol=ccxt_symbol,
+                price=price,
+                target_usd=size_usd,
+                market=market,
+            )
+            if effective_notional < min_notional * 0.95 or amount <= 0:
+                self.last_order_error = (
+                    f"amount_too_small:notional={effective_notional:.3f}<min={min_notional:.3f}"
+                )
+                logger.error(
+                    f"❌ BINANCE ORDER FAILED: {side} {symbol} | "
+                    f"invalid normalized amount={amount} notional={effective_notional:.3f} min={min_notional:.3f}"
+                )
+                return None
             
             send_time = datetime.now().timestamp()
             
@@ -1827,7 +1897,7 @@ class LiveBinanceTrader:
             latency_ms = (fill_time - send_time) * 1000
             
             logger.info(f"📤 BINANCE ORDER SENT: {side} {symbol}")
-            logger.info(f"   💵 Size: ${size_usd:.2f} | Amount: {amount:.6f}")
+            logger.info(f"   💵 Size: ${size_usd:.2f} | Effective: ${effective_notional:.2f} | Amount: {amount:.6f}")
             logger.info(f"   📊 Leverage: {leverage}x | Price: ${price:.4f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
             logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} MARKET | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
@@ -1838,7 +1908,7 @@ class LiveBinanceTrader:
                 'side': side,
                 'amount': amount,
                 'price': avg_fill,  # Use actual fill price
-                'cost': size_usd,
+                'cost': effective_notional,
                 'status': order.get('status', 'filled'),
                 'timestamp': int(datetime.now().timestamp() * 1000),
                 'slippage_pct': slippage_pct,
@@ -1847,7 +1917,8 @@ class LiveBinanceTrader:
             }
             
         except Exception as e:
-            logger.error(f"❌ BINANCE ORDER FAILED: {side} {symbol} | Error: {e}")
+            self.last_order_error = self._extract_exchange_error(e)
+            logger.error(f"❌ BINANCE ORDER FAILED: {side} {symbol} | Error: {self.last_order_error}")
             return None
     
     async def place_limit_entry_order(self, symbol: str, side: str, size_usd: float, leverage: int) -> dict:
@@ -1856,7 +1927,9 @@ class LiveBinanceTrader:
         LONG: limit at best_ask + 2 ticks (crosses spread slightly for fast fill)
         SHORT: limit at best_bid - 2 ticks
         """
+        self.last_order_error = None
         if not self.enabled or not self.exchange:
+            self.last_order_error = "live_trader_disabled"
             logger.error("❌ LiveBinanceTrader not enabled, order rejected")
             return None
             
@@ -1865,6 +1938,7 @@ class LiveBinanceTrader:
         try:
             set_ok = await self.set_leverage(symbol, leverage)
             if not set_ok:
+                self.last_order_error = f"set_leverage_failed:{leverage}x"
                 logger.error(f"❌ Aborting limit entry {symbol}: leverage set to {leverage}x failed")
                 return None
             
@@ -1892,20 +1966,33 @@ class LiveBinanceTrader:
             except Exception as ob_err:
                 logger.debug(f"Order book depth check error: {ob_err}")
             
-            amount = size_usd / price
-            
-            # Minimum lot size
+            # Minimum lot size + precision + min notional
             markets = await self.exchange.load_markets()
             market = markets.get(ccxt_symbol)
+            if not market:
+                self.last_order_error = f"market_not_found:{ccxt_symbol}"
+                logger.error(f"❌ LIMIT ENTRY FAILED: {side} {symbol} | Unknown market {ccxt_symbol}")
+                return None
+            amount, effective_notional, min_notional = self._normalize_order_amount(
+                ccxt_symbol=ccxt_symbol,
+                price=price,
+                target_usd=size_usd,
+                market=market,
+            )
+            if effective_notional < min_notional * 0.95 or amount <= 0:
+                self.last_order_error = (
+                    f"amount_too_small:notional={effective_notional:.3f}<min={min_notional:.3f}"
+                )
+                logger.error(
+                    f"❌ LIMIT ENTRY FAILED: {side} {symbol} | "
+                    f"invalid normalized amount={amount} notional={effective_notional:.3f} min={min_notional:.3f}"
+                )
+                return None
             tick_size = 0.0001  # Default
-            if market:
-                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
-                if amount < min_amount:
-                    amount = min_amount
-                # Get price tick size
-                tick_size = market.get('precision', {}).get('price', 0.0001)
-                if isinstance(tick_size, int):
-                    tick_size = 10 ** (-tick_size)  # ccxt sometimes returns precision as decimal places
+            # Get price tick size
+            tick_size = market.get('precision', {}).get('price', 0.0001)
+            if isinstance(tick_size, int):
+                tick_size = 10 ** (-tick_size)  # ccxt sometimes returns precision as decimal places
             
             # Aggressive limit pricing: cross the spread slightly
             order_side = 'buy' if side == 'LONG' else 'sell'
@@ -1961,7 +2048,7 @@ class LiveBinanceTrader:
                     'side': side,
                     'amount': filled,
                     'price': avg_fill,
-                    'cost': size_usd,
+                    'cost': effective_notional,
                     'status': 'filled',
                     'timestamp': int(datetime.now().timestamp() * 1000),
                     'slippage_pct': slippage_pct,
@@ -1982,6 +2069,10 @@ class LiveBinanceTrader:
                     pass  # May already be filled/cancelled
                 
                 if remaining > 0:
+                    try:
+                        remaining = float(self.exchange.amount_to_precision(ccxt_symbol, remaining))
+                    except Exception:
+                        pass
                     # Market fallback for unfilled portion
                     logger.warning(f"🔄 LIMIT→MARKET FALLBACK: {side} {symbol} | {remaining:.4f} unfilled → market")
                     try:
@@ -2001,7 +2092,8 @@ class LiveBinanceTrader:
                             avg_fill = fallback_fill
                             
                     except Exception as fb_err:
-                        logger.error(f"❌ MARKET FALLBACK FAILED: {side} {symbol} | {fb_err}")
+                        self.last_order_error = self._extract_exchange_error(fb_err)
+                        logger.error(f"❌ MARKET FALLBACK FAILED: {side} {symbol} | {self.last_order_error}")
                         if filled <= 0:
                             return None  # Total failure
                         # If partially filled via limit, continue with what we have
@@ -2019,7 +2111,7 @@ class LiveBinanceTrader:
                     'side': side,
                     'amount': filled + remaining,  # Total intended
                     'price': avg_fill,
-                    'cost': size_usd,
+                    'cost': effective_notional,
                     'status': 'filled',
                     'timestamp': int(datetime.now().timestamp() * 1000),
                     'slippage_pct': slippage_pct,
@@ -2028,7 +2120,8 @@ class LiveBinanceTrader:
                 }
                 
         except Exception as e:
-            logger.error(f"❌ LIMIT ENTRY FAILED: {side} {symbol} | {e} — falling back to market")
+            self.last_order_error = self._extract_exchange_error(e)
+            logger.error(f"❌ LIMIT ENTRY FAILED: {side} {symbol} | {self.last_order_error} — falling back to market")
             # Full market fallback on any error
             return await self.place_market_order(symbol, side, size_usd, leverage)
     
@@ -4415,6 +4508,17 @@ MTF_SOFT_OVERRIDE_ENABLED = True
 MTF_SOFT_OVERRIDE_MIN_SCORE = 110
 MTF_SOFT_OVERRIDE_PENALTY = 12
 MTF_SOFT_OVERRIDE_MIN_EQ = 3
+MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX = 8
+MTF_SOFT_OVERRIDE_SMART_MIN_EQ = 2
+
+# Thin-book guard soft-pass (controlled relax for high-quality SMART_V2 setups)
+THIN_BOOK_SMART_SOFTPASS_ENABLED = True
+THIN_BOOK_SMART_SOFTPASS_DEPTH_RATIO = 0.76
+THIN_BOOK_SMART_SOFTPASS_MIN_SCORE = 108
+THIN_BOOK_SMART_SOFTPASS_MIN_EXEC = 66.0
+THIN_BOOK_SMART_SOFTPASS_MIN_EQ = 2
+THIN_BOOK_SMART_SOFTPASS_MAX_SPREAD = 0.18
+THIN_BOOK_SMART_SOFTPASS_PENALTY = 8
 
 # Hybrid execution quality gate (entry strictness)
 EXEC_QUALITY_GATE_ENABLED = True
@@ -4485,6 +4589,25 @@ def get_dynamic_depth_threshold(
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
+
+
+def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
+    """
+    Map BTC counter-trend penalty to risk caps.
+    Returns: (leverage_cap, size_multiplier_cap)
+    """
+    p = max(0.0, float(btc_penalty or 0.0))
+    if p >= 0.80:
+        return 2, 0.25
+    if p >= 0.60:
+        return 3, 0.35
+    if p >= 0.45:
+        return 4, 0.50
+    if p >= 0.30:
+        return 6, 0.70
+    if p >= 0.20:
+        return 8, 0.85
+    return None, None
 
 
 STRATEGY_MODE_LEGACY = "LEGACY"
@@ -8445,10 +8568,19 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         original_score = opp.get('signalScore', 0)
                         opp['signalScore'] = int(original_score * (1 - btc_penalty))
                         opp['btcFilterNote'] = btc_reason
+                        cap_lev, cap_size = get_btc_penalty_risk_caps(btc_penalty)
+                        if cap_lev:
+                            existing_cap = opp.get('overrideLeverageCap')
+                            opp['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+                        if cap_size:
+                            existing_size_cap = float(opp.get('overrideSizeMult', 1.0) or 1.0)
+                            opp['overrideSizeMult'] = min(existing_size_cap, cap_size)
                     # Phase 230B: Apply override risk caps
                     if btc_filter.last_override:
-                        opp['overrideLeverageCap'] = 3
-                        opp['overrideSizeMult'] = 0.5
+                        existing_cap = opp.get('overrideLeverageCap')
+                        opp['overrideLeverageCap'] = min(existing_cap, 3) if existing_cap else 3
+                        existing_size_cap = float(opp.get('overrideSizeMult', 1.0) or 1.0)
+                        opp['overrideSizeMult'] = min(existing_size_cap, 0.5)
                         opp['btcOverride'] = True
                     filtered_opportunities.append(opp)
                 else:
@@ -10178,6 +10310,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             score_penalty = int(original_score * btc_penalty)
             signal['confidenceScore'] = max(40, original_score - score_penalty)
             signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 - btc_penalty)
+            cap_lev, cap_size = get_btc_penalty_risk_caps(btc_penalty)
+            if cap_lev:
+                existing_cap = signal.get('overrideLeverageCap')
+                signal['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+            if cap_size:
+                signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), cap_size)
             signal['btc_adjustment'] = btc_reason
             logger.info(f"⚠️ BTC PENALTY: {action} {symbol} | Score: -{score_penalty} | Size: -{btc_penalty*100:.0f}%")
         elif btc_penalty < 0:
@@ -10246,12 +10384,25 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             memory_scale = _clamp(float(signal.get('memoryThinBookScale', 1.0) or 1.0), 0.6, 1.0)
             dynamic_depth_threshold *= memory_scale
             reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
+            strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
+            eq_count = len(signal.get('entryQualityReasons') or [])
+            exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
+            signal_spread = float(signal.get('spreadPct', 0.2) or 0.2)
             near_threshold_soft_pass = (
                 reinforce_count >= 2
                 and signal_score >= 95
                 and total_depth >= dynamic_depth_threshold * 0.82
             )
-            if 0 < total_depth < dynamic_depth_threshold and not near_threshold_soft_pass:
+            smart_soft_pass = (
+                THIN_BOOK_SMART_SOFTPASS_ENABLED
+                and strategy_mode_upper == STRATEGY_MODE_SMART_V2
+                and signal_score >= THIN_BOOK_SMART_SOFTPASS_MIN_SCORE
+                and eq_count >= THIN_BOOK_SMART_SOFTPASS_MIN_EQ
+                and exec_score >= THIN_BOOK_SMART_SOFTPASS_MIN_EXEC
+                and signal_spread <= THIN_BOOK_SMART_SOFTPASS_MAX_SPREAD
+                and total_depth >= dynamic_depth_threshold * THIN_BOOK_SMART_SOFTPASS_DEPTH_RATIO
+            )
+            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or smart_soft_pass):
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -10262,15 +10413,26 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                 )
                 return
-            elif near_threshold_soft_pass:
+            elif near_threshold_soft_pass or smart_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
-                signal['confidenceScore'] = max(40, int(original_score) - 6)
+                score_penalty = 6 if near_threshold_soft_pass else THIN_BOOK_SMART_SOFTPASS_PENALTY
+                signal['confidenceScore'] = max(40, int(original_score) - score_penalty)
                 global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
-                logger.info(
-                    f"🟨 THIN_BOOK_SOFT_PASS: {action} {symbol} depth=${total_depth:.0f} "
-                    f"th=${dynamic_depth_threshold:.0f} reinforce={reinforce_count} "
-                    f"score {original_score}->{signal['confidenceScore']}"
-                )
+                if smart_soft_pass:
+                    global_paper_trader.pipeline_metrics['thin_book_soft_override'] = (
+                        global_paper_trader.pipeline_metrics.get('thin_book_soft_override', 0) + 1
+                    )
+                    logger.info(
+                        f"🟨 THIN_BOOK_SMART_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} eq={eq_count}/3 exec={exec_score:.0f} "
+                        f"score {original_score}->{signal['confidenceScore']}"
+                    )
+                else:
+                    logger.info(
+                        f"🟨 THIN_BOOK_SOFT_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} reinforce={reinforce_count} "
+                        f"score {original_score}->{signal['confidenceScore']}"
+                    )
         except Exception:
             pass  # depth data may not always be available
         
@@ -10404,10 +10566,22 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if not mtf_result['confirmed']:
         signal_score = int(signal.get('confidenceScore', 0) or 0)
         eq_count = len(signal.get('entryQualityReasons') or [])
+        strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
+        exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
+        smart_relax_enabled = (
+            strategy_mode_upper == STRATEGY_MODE_SMART_V2
+            and bool(signal.get('entryQualityPass', False))
+            and exec_score >= EXEC_QUALITY_STRICT_MIN_SCORE
+        )
+        mtf_min_score = int(MTF_SOFT_OVERRIDE_MIN_SCORE)
+        mtf_min_eq = int(MTF_SOFT_OVERRIDE_MIN_EQ)
+        if smart_relax_enabled:
+            mtf_min_score = max(85, mtf_min_score - int(MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX))
+            mtf_min_eq = int(MTF_SOFT_OVERRIDE_SMART_MIN_EQ)
         soft_override_ok = (
             MTF_SOFT_OVERRIDE_ENABLED
-            and signal_score >= MTF_SOFT_OVERRIDE_MIN_SCORE
-            and eq_count >= MTF_SOFT_OVERRIDE_MIN_EQ
+            and signal_score >= mtf_min_score
+            and eq_count >= mtf_min_eq
         )
         if soft_override_ok:
             old_score = signal_score
@@ -10417,7 +10591,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             global_paper_trader.pipeline_metrics['mtf_soft_override'] += 1
             logger.warning(
                 f"⚠️ MTF_SOFT_OVERRIDE: {action} {symbol} score {old_score}->{signal['confidenceScore']} "
-                f"(eq={eq_count}/3) | {mtf_result.get('reason', '')}"
+                f"(eq={eq_count}/3, min={mtf_min_score}, smart_relax={smart_relax_enabled}) | {mtf_result.get('reason', '')}"
             )
         else:
             signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
@@ -11674,13 +11848,43 @@ class BTCCorrelationFilter:
         
         # ===================================================================
         # GÜNLÜK TREND FİLTRESİ (EN GÜÇLÜ)
-        # Günlük trend ters yöndeyse sinyali tamamen reddet
+        # Sadece ekstrem durumda blokaj; diğer durumlarda yüksek penalty + risk cap
         # ===================================================================
         if self.btc_trend_daily == "STRONG_BEARISH" and signal_action == "LONG":
-            return (False, 1.0, "🚫 Daily STRONG_BEARISH - LONG blocked")
+            override_allowed, factors_detail = self._check_coin_strength_override(
+                symbol, signal_action, coin_change_pct, volume_24h, zscore, spread_pct
+            )
+            if override_allowed:
+                self.last_override = True
+                return (True, 0.35, f"💪 Daily Strong Bearish override ({factors_detail})")
+            is_extreme_bear = (
+                self.emergency_mode == "BEARISH"
+                or self.flash_crash_active
+                or self.btc_change_1h <= -2.5
+                or self.btc_change_4h <= -4.5
+                or self.btc_change_1d <= -6.0
+            )
+            if is_extreme_bear and not self.btc_momentum_improving:
+                return (False, 1.0, "🚫 Daily STRONG_BEARISH + weak momentum - LONG blocked")
+            return (True, 0.60, "Daily STRONG_BEARISH - LONG high risk")
         
         if self.btc_trend_daily == "STRONG_BULLISH" and signal_action == "SHORT":
-            return (False, 1.0, "🚫 Daily STRONG_BULLISH - SHORT blocked")
+            override_allowed, factors_detail = self._check_coin_strength_override(
+                symbol, signal_action, coin_change_pct, volume_24h, zscore, spread_pct
+            )
+            if override_allowed:
+                self.last_override = True
+                return (True, 0.35, f"💪 Daily Strong Bullish override ({factors_detail})")
+            is_extreme_bull = (
+                self.emergency_mode == "BULLISH"
+                or self.flash_pump_active
+                or self.btc_change_1h >= 2.5
+                or self.btc_change_4h >= 4.5
+                or self.btc_change_1d >= 6.0
+            )
+            if is_extreme_bull and not self.btc_momentum_weakening:
+                return (False, 1.0, "🚫 Daily STRONG_BULLISH + strong momentum - SHORT blocked")
+            return (True, 0.60, "Daily STRONG_BULLISH - SHORT high risk")
         
         # Günlük trend orta düzeyde ters ise yüksek ceza
         if self.btc_trend_daily == "BEARISH" and signal_action == "LONG":
@@ -11717,8 +11921,8 @@ class BTCCorrelationFilter:
             penalty = -0.2  # Günlük aynı yöndeyse daha büyük bonus (was -0.15)
             reason = "✅ BTC trend aligned with signal"
         
-        # Yüksek penalty ise reddet (threshold sıkılaştırıldı)
-        allowed = penalty < 0.35  # was 0.30
+        # Yüksek penalty ise reddet (orta seviye terslikte artık penalty+risk cap ile izin ver)
+        allowed = penalty < 0.55
         
         return (allowed, penalty, reason)
     
@@ -17367,7 +17571,8 @@ class PaperTradingEngine:
             'signal_missed': 0, 'spread_rejected': 0, 'drift_rejected': 0, 'filled': 0,
             'fallback_on_fail': 0, 'fallback_on_expire': 0,
             'thin_book_rejected': 0, 'mtf_rejected': 0, 'mtf_soft_override': 0,
-            'pending_reinforced': 0, 'pending_flipped': 0, 'memory_soft_pass': 0
+            'pending_reinforced': 0, 'pending_flipped': 0, 'memory_soft_pass': 0,
+            'thin_book_soft_override': 0
         }
         # Symbol-level execution feedback for UI (latest rejection reason).
         self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
@@ -18946,13 +19151,17 @@ class PaperTradingEngine:
                             new_position['trailingStop'] = new_position['stopLoss']
                         logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${new_position['stopLoss']:.6f} TP=${new_position['takeProfit']:.6f}")
                 else:
+                    order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
-                    self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi (yetersiz bakiye veya symbol hatası)")
-                    self.set_execution_feedback(symbol, "BINANCE_ORDER_FAILED")
+                    self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
+                    self.set_execution_feedback(symbol, f"BINANCE_ORDER_FAILED:{order_error}")
                     return  # Don't create position if Binance order failed
                     
             except Exception as e:
                 error_msg = str(e)[:80]  # Truncate long error messages
+                order_error = live_binance_trader.last_order_error
+                if order_error:
+                    error_msg = f"{error_msg} | {order_error[:80]}"
                 logger.error(f"❌ LIVE ORDER ERROR: {e}")
                 self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
                 self.set_execution_feedback(symbol, "BINANCE_ORDER_ERROR")
@@ -18990,13 +19199,18 @@ class PaperTradingEngine:
                             new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
                             new_position['trailingStop'] = new_position['stopLoss']
                 else:
+                    order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ FORCE MARKET FAILED - skipping position creation")
-                    self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi")
-                    self.set_execution_feedback(symbol, "MARKET_FALLBACK_FAILED")
+                    self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
+                    self.set_execution_feedback(symbol, f"MARKET_FALLBACK_FAILED:{order_error}")
                     return
             except Exception as e:
+                order_error = live_binance_trader.last_order_error
+                error_msg = str(e)[:80]
+                if order_error:
+                    error_msg = f"{error_msg} | {order_error[:80]}"
                 logger.error(f"❌ FORCE MARKET ERROR: {e}")
-                self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {str(e)[:80]}")
+                self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {error_msg}")
                 self.set_execution_feedback(symbol, "MARKET_FALLBACK_ERROR")
                 return
         
@@ -22737,11 +22951,19 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                         signal = None
                                     elif btc_penalty != 0:
                                         signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 - btc_penalty)
+                                        if btc_penalty > 0:
+                                            cap_lev, cap_size = get_btc_penalty_risk_caps(btc_penalty)
+                                            if cap_lev:
+                                                existing_cap = signal.get('overrideLeverageCap')
+                                                signal['overrideLeverageCap'] = min(existing_cap, cap_lev) if existing_cap else cap_lev
+                                            if cap_size:
+                                                signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), cap_size)
                                         signal['btc_adjustment'] = btc_reason
                                         logger.info(f"BTC ADJUSTMENT: {btc_reason} | Size: {signal.get('sizeMultiplier', 1.0):.2f}x")
                                         # Phase 230B: Override risk caps
                                         if btc_filter.last_override:
-                                            signal['overrideLeverageCap'] = 3
+                                            existing_cap = signal.get('overrideLeverageCap')
+                                            signal['overrideLeverageCap'] = min(existing_cap, 3) if existing_cap else 3
                                             signal['sizeMultiplier'] = min(signal.get('sizeMultiplier', 1.0), 0.5)
                                             logger.info(f"💪 WS OVERRIDE CAPS: {active_symbol} | leverage≤3x, size≤0.5x")
                                 except Exception as btc_err:
