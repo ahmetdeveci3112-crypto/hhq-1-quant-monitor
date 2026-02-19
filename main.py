@@ -10522,17 +10522,34 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 leverage=signal_leverage
             )
             memory_scale = _clamp(float(signal.get('memoryThinBookScale', 1.0) or 1.0), 0.6, 1.0)
-            dynamic_depth_threshold *= memory_scale
             reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
             strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
             eq_count = len(signal.get('entryQualityReasons') or [])
             exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
             signal_spread = float(signal.get('spreadPct', 0.2) or 0.2)
             signal_volume_ratio = float(signal.get('volumeRatio', 1.0) or 1.0)
+            # Legacy mode must stay tradable on mid-cap / thinner books.
+            # SMART_V2 keeps stricter thresholding; LEGACY gets controlled relax.
+            depth_mode_scale = 1.0
+            if strategy_mode_upper == STRATEGY_MODE_LEGACY:
+                if signal_score >= 110:
+                    depth_mode_scale = 0.22
+                elif signal_score >= 95:
+                    depth_mode_scale = 0.26
+                else:
+                    depth_mode_scale = 0.30
+            dynamic_depth_threshold *= (memory_scale * depth_mode_scale)
             near_threshold_soft_pass = (
                 reinforce_count >= 2
                 and signal_score >= 95
                 and total_depth >= dynamic_depth_threshold * 0.82
+            )
+            legacy_soft_pass = (
+                strategy_mode_upper == STRATEGY_MODE_LEGACY
+                and signal_score >= 95
+                and eq_count >= 1
+                and signal_spread <= 0.24
+                and total_depth >= dynamic_depth_threshold * 0.30
             )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
@@ -10553,7 +10570,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_volume_ratio >= THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
             )
-            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or smart_soft_pass or super_soft_pass):
+            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or smart_soft_pass or super_soft_pass):
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -10564,10 +10581,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                 )
                 return
-            elif near_threshold_soft_pass or smart_soft_pass or super_soft_pass:
+            elif near_threshold_soft_pass or legacy_soft_pass or smart_soft_pass or super_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
                 if near_threshold_soft_pass:
                     score_penalty = 6
+                elif legacy_soft_pass:
+                    score_penalty = 5
                 elif super_soft_pass:
                     score_penalty = THIN_BOOK_SUPER_SOFTPASS_PENALTY
                 else:
@@ -10591,6 +10610,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         f"🟨 THIN_BOOK_SMART_PASS: {action} {symbol} depth=${total_depth:.0f} "
                         f"th=${dynamic_depth_threshold:.0f} eq={eq_count}/3 exec={exec_score:.0f} "
                         f"score {original_score}->{signal['confidenceScore']}"
+                    )
+                elif legacy_soft_pass:
+                    logger.info(
+                        f"🟨 THIN_BOOK_LEGACY_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} eq={eq_count}/3 score {original_score}->{signal['confidenceScore']}"
                     )
                 else:
                     logger.info(
@@ -10740,6 +10764,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         )
         mtf_min_score = int(MTF_SOFT_OVERRIDE_MIN_SCORE)
         mtf_min_eq = int(MTF_SOFT_OVERRIDE_MIN_EQ)
+        if strategy_mode_upper == STRATEGY_MODE_LEGACY:
+            mtf_min_score = max(85, mtf_min_score - 6)
+            mtf_min_eq = max(1, mtf_min_eq - 1)
         if smart_relax_enabled:
             mtf_min_score = max(85, mtf_min_score - int(MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX))
             mtf_min_eq = int(MTF_SOFT_OVERRIDE_SMART_MIN_EQ)
@@ -17236,17 +17263,25 @@ class SignalGenerator:
                 eq_pass_count += 1
                 eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
 
-            # Gate kararı: en az 2/3 geçmeli
-            if eq_pass_count < 2:
+            # Gate kararı:
+            # - SMART_V2: en az 2/3 geçmeli (mevcut sıkı davranış korunur)
+            # - LEGACY: 0/3 hard reject, 1/3 soft-penalty ile geçiş
+            legacy_mode = str(strategy_mode).upper() == STRATEGY_MODE_LEGACY
+            eq_required = 2 if not legacy_mode else 1
+            eq_hard_mode = (ENTRY_QUALITY_MODE == 'hard') and not legacy_mode
+            eq_penalty = 15 if not legacy_mode else 8
+
+            if eq_pass_count < eq_required:
                 entry_quality_pass = False
                 fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
-                if ENTRY_QUALITY_MODE == 'hard':
+                legacy_hard_reject = legacy_mode and eq_pass_count == 0
+                if eq_hard_mode or legacy_hard_reject:
                     logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.1f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
                     return None
                 else:  # soft mode
-                    score -= 15
-                    reasons.append(fail_detail)
-                    logger.info(f"⚠️ {fail_detail}: {symbol} {signal_side} score-=15 → {score}")
+                    score -= eq_penalty
+                    reasons.append(f"{fail_detail}-P{eq_penalty}")
+                    logger.info(f"⚠️ {fail_detail}: {symbol} {signal_side} score-={eq_penalty} → {score}")
             else:
                 reasons.append(f"EQ_PASS({eq_pass_count}/3)")
                 if eq_pass_count == 3:
