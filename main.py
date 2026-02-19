@@ -4479,15 +4479,27 @@ def detect_volume_spike(volumes: list, lookback: int = 20, threshold: float = 2.
         return False, 1.0
     
     try:
-        recent_volumes = np.array(volumes[-(lookback + 1):-1])  # Exclude current
-        current_volume = volumes[-1]
-        
-        avg_volume = np.mean(recent_volumes)
-        
+        recent_volumes = np.array(volumes[-(lookback + 1):-1], dtype=float)  # Exclude current
+        current_volume = float(volumes[-1] or 0.0)
+
+        # WebSocket volume feed anlık olarak eksik gelebilir.
+        # Bu durumda LOW_VOL false-negative üretmemek için nötr davran.
+        if current_volume <= 0:
+            return False, 1.0
+
+        positive_recent = recent_volumes[recent_volumes > 0]
+        if len(positive_recent) < max(5, lookback // 3):
+            return False, 1.0
+
+        avg_volume = np.mean(positive_recent)
         if avg_volume <= 0:
             return False, 1.0
-        
+
         volume_ratio = current_volume / avg_volume
+        if not np.isfinite(volume_ratio):
+            return False, 1.0
+
+        volume_ratio = float(np.clip(volume_ratio, 0.1, 10.0))
         is_spike = volume_ratio >= threshold
         
         return is_spike, volume_ratio
@@ -7323,12 +7335,22 @@ class BinanceWebSocketManager:
             
             # Preserve existing bid/ask from bookTicker (futures ticker@arr doesn't have b/a)
             existing = self.tickers.get(symbol, {})
+            raw_base_volume = float(ticker.get('v', 0) or 0)  # 24h cumulative base volume
+            prev_raw_base_volume = float(existing.get('_baseVolumeRaw', raw_base_volume) or raw_base_volume)
+            volume_delta = raw_base_volume - prev_raw_base_volume
+            if symbol not in self.tickers:
+                # İlk pakette delta güvenilir değil; nötr başlat
+                volume_delta = 0.0
+            elif volume_delta < 0:
+                # Binance 24h window reset olabilir
+                volume_delta = raw_base_volume
             
             self.tickers[symbol] = {
                 'last': float(ticker.get('c', 0)),  # Close price
                 'percentage': float(ticker.get('P', 0)),  # Price change percent
                 'quoteVolume': float(ticker.get('q', 0)),  # Quote volume (USDT)
-                'baseVolume': float(ticker.get('v', 0)),  # Base asset volume (Phase 178)
+                'baseVolume': raw_base_volume,  # 24h cumulative base asset volume
+                'volumeDelta': max(0.0, float(volume_delta)),  # Incremental volume since previous WS update
                 'high': float(ticker.get('h', 0)),  # High
                 'low': float(ticker.get('l', 0)),  # Low
                 'bid': existing.get('bid', 0),  # Preserved from bookTicker
@@ -7336,7 +7358,8 @@ class BinanceWebSocketManager:
                 'bidQty': existing.get('bidQty', bid_qty),  # Preserved from bookTicker
                 'askQty': existing.get('askQty', ask_qty),  # Preserved from bookTicker
                 'imbalance': existing.get('imbalance', 0),  # Preserved from bookTicker
-                'timestamp': int(ticker.get('E', 0))  # Event time
+                'timestamp': int(ticker.get('E', 0)),  # Event time
+                '_baseVolumeRaw': raw_base_volume,  # Internal state for delta calc
             }
         
         # Phase 178: SMT Divergence moved to update_btc_eth_state() for candle-based data
@@ -8441,7 +8464,8 @@ class MultiCoinScanner:
                 price = ticker.get('last', 0)
                 high = ticker.get('high', price)
                 low = ticker.get('low', price)
-                volume = ticker.get('baseVolume', 0)
+                # WebSocket path uses incremental delta volume; REST fallback has only baseVolume.
+                volume = ticker.get('volumeDelta', ticker.get('baseVolume', 0))
                 imbalance = ticker.get('imbalance', 0)  # L1 Order Book imbalance from WebSocket
                 
                 if price <= 0:
