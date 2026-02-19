@@ -2973,6 +2973,60 @@ background_scanner_task = None
 position_updater_task = None
 binance_sync_task = None
 
+# Scanner runtime safeguards (prevents loop stalls from blocking trade execution).
+SCANNER_SCAN_TIMEOUT_SEC = 35.0
+SCANNER_MTF_UPDATE_TIMEOUT_SEC = 2.5
+SCANNER_MTF_UPDATE_MAX_SYMBOLS = 20
+SCANNER_MTF_UPDATE_BUDGET_SEC = 6.0
+SCANNER_STALE_CACHE_SEC = 45
+SCANNER_RESTART_COOLDOWN_SEC = 20
+
+# UI cache refresh safeguards.
+UI_TRADE_FETCH_INTERVAL_SEC = 300
+UI_TRADE_FETCH_TIMEOUT_SEC = 25.0
+_last_scanner_restart_ts = 0.0
+
+
+def _is_scanner_task_alive() -> bool:
+    """Return True when scanner task exists and is not done."""
+    global background_scanner_task
+    return background_scanner_task is not None and not background_scanner_task.done()
+
+
+async def restart_background_scanner(reason: str, force: bool = False) -> bool:
+    """
+    Cancel and recreate scanner task.
+    Handles alive-but-stuck tasks and enforces a short restart cooldown.
+    """
+    global background_scanner_task, _last_scanner_restart_ts
+    now_ts = datetime.now().timestamp()
+    if not force and (now_ts - _last_scanner_restart_ts) < SCANNER_RESTART_COOLDOWN_SEC:
+        return False
+
+    old_task = background_scanner_task
+    current_task = asyncio.current_task()
+
+    if old_task and not old_task.done():
+        old_task.cancel()
+        # Avoid deadlock if restart is requested from within scanner task itself.
+        if old_task is not current_task:
+            try:
+                await asyncio.wait_for(old_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Scanner cancel timeout; creating new task anyway")
+            except asyncio.CancelledError:
+                pass
+            except Exception as cancel_err:
+                logger.warning(f"⚠️ Scanner cancel error ignored: {cancel_err}")
+
+    if 'multi_coin_scanner' in globals():
+        multi_coin_scanner.running = True
+
+    background_scanner_task = asyncio.create_task(background_scanner_loop())
+    _last_scanner_restart_ts = now_ts
+    logger.warning(f"🔁 Scanner task restarted ({reason})")
+    return True
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: start background scanner and position updater on startup."""
@@ -7938,6 +7992,7 @@ class UIStateCache:
         # Phase 157: Delayed trade history fetch after position close
         self.pending_trade_fetch_time = 0  # Unix timestamp when to fetch
         self.last_binance_trade_fetch = 0  # Last successful fetch time
+        self.trade_fetch_in_progress = False  # Prevent overlapping heavy Binance trade sync jobs
     
     def trigger_trade_fetch(self, delay_seconds: int = 3):
         """Schedule a Binance trade history fetch after delay."""
@@ -8530,6 +8585,60 @@ multi_coin_scanner = MultiCoinScanner(max_coins=999)
 
 
 # ============================================================================
+# PHASE 98: ASYNC TRADE CACHE REFRESH (non-blocking for scanner loop)
+# ============================================================================
+
+async def _refresh_binance_trade_cache_async(trigger: str = "periodic"):
+    """
+    Refresh Binance trade history in the background.
+    Kept separate from scanner loop so heavy trade enrichment does not block entries.
+    """
+    if not live_binance_trader.enabled:
+        return
+    if ui_state_cache.trade_fetch_in_progress:
+        return
+
+    ui_state_cache.trade_fetch_in_progress = True
+    fetch_started = datetime.now().timestamp()
+    try:
+        logger.info(f"📊 BINANCE_FETCH_ASYNC: trigger={trigger} limit=300 days=7")
+        binance_trades = await asyncio.wait_for(
+            live_binance_trader.get_trade_history(limit=300, days_back=7),
+            timeout=UI_TRADE_FETCH_TIMEOUT_SEC
+        )
+        if not binance_trades:
+            ui_state_cache.last_binance_trade_fetch = fetch_started
+            return
+
+        saved_count = 0
+        for bt in binance_trades:
+            try:
+                bt_copy = bt.copy()
+                bt_copy['incomeId'] = f"{bt.get('symbol', 'UNK')}_{bt.get('closeTime', bt.get('timestamp', 0))}"
+                await sqlite_manager.save_binance_trade(bt_copy)
+                saved_count += 1
+            except Exception as save_err:
+                logger.debug(f"Save trade error: {save_err}")
+
+        sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
+        ui_state_cache.binance_trades = binance_trades
+        ui_state_cache.trades = sqlite_trades
+        ui_state_cache.last_binance_trade_fetch = datetime.now().timestamp()
+        ui_state_cache.pending_trade_fetch_time = 0
+        logger.info(
+            f"📊 BINANCE_FETCH_ASYNC_DONE: saved={saved_count} loaded={len(sqlite_trades)} trigger={trigger}"
+        )
+    except asyncio.TimeoutError:
+        ui_state_cache.last_binance_trade_fetch = fetch_started
+        logger.warning(f"⏱️ BINANCE_FETCH_ASYNC_TIMEOUT: trigger={trigger} > {UI_TRADE_FETCH_TIMEOUT_SEC:.0f}s")
+    except Exception as e:
+        ui_state_cache.last_binance_trade_fetch = fetch_started
+        logger.warning(f"📊 BINANCE_FETCH_ASYNC_ERROR: trigger={trigger} err={e}")
+    finally:
+        ui_state_cache.trade_fetch_in_progress = False
+
+
+# ============================================================================
 # PHASE 98: UI CACHE UPDATE FUNCTION
 # Called by background scanner to populate cache with fresh Binance data.
 # ============================================================================
@@ -8621,12 +8730,22 @@ async def update_ui_cache(opportunities: list, stats: dict):
         # Fetch Binance data (live mode) or use paper trader data
         if live_binance_trader.enabled:
             try:
-                # Parallel fetch for speed
-                balance_task = asyncio.create_task(live_binance_trader.get_balance())
-                positions_task = asyncio.create_task(live_binance_trader.get_positions())
-                
-                balance_data = await balance_task
-                positions = await positions_task
+                # Use sync-loop snapshots to avoid blocking scanner with extra Binance API calls.
+                balance_data = (
+                    getattr(global_paper_trader, 'liveBalance', None)
+                    or ui_state_cache.live_balance
+                    or {}
+                )
+                if not balance_data:
+                    balance_data = {
+                        "walletBalance": global_paper_trader.balance,
+                        "marginBalance": global_paper_trader.balance,
+                        "availableBalance": global_paper_trader.balance,
+                        "unrealizedPnl": 0.0,
+                    }
+                positions = list(getattr(live_binance_trader, 'last_positions', []) or [])
+                if not positions:
+                    positions = [dict(p) for p in global_paper_trader.positions if p.get('isLive')]
                 
                 # Phase 155: Merge Binance positions with exit params from global_paper_trader
                 # global_paper_trader.positions has TP/SL/Trail data from sync loop
@@ -8702,14 +8821,8 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
                 ui_state_cache.trading_mode = "live"
                 logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
-                
-                # Cache PnL data (don't fetch every cycle - expensive)
-                if not ui_state_cache._initialized or datetime.now().timestamp() - ui_state_cache.last_update > 30:
-                    try:
-                        pnl_data = await live_binance_trader.get_pnl_from_binance()
-                        ui_state_cache.pnl_data = pnl_data
-                    except:
-                        pass
+                if not ui_state_cache.pnl_data:
+                    ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
                         
             except Exception as e:
                 logger.warning(f"Binance data fetch error: {e}")
@@ -8730,7 +8843,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
         now = datetime.now().timestamp()
         time_since_last_fetch = now - ui_state_cache.last_binance_trade_fetch
         triggered = ui_state_cache.pending_trade_fetch_time > 0 and now >= ui_state_cache.pending_trade_fetch_time
-        periodic = time_since_last_fetch > 60
+        periodic = time_since_last_fetch > UI_TRADE_FETCH_INTERVAL_SEC
         
         # Phase 187b: Startup instant load from SQLite trades table (full data)
         if not ui_state_cache.trades:
@@ -8742,49 +8855,24 @@ async def update_ui_cache(opportunities: list, stats: dict):
             except Exception as e:
                 logger.debug(f"SQLite instant load error: {e}")
         
-        should_fetch_binance = live_binance_trader.enabled and (triggered or periodic)
+        should_fetch_binance = (
+            live_binance_trader.enabled
+            and not ui_state_cache.trade_fetch_in_progress
+            and (triggered or periodic)
+        )
         
         logger.info(f"📊 TRADE_CHECK: should={should_fetch_binance}, enabled={live_binance_trader.enabled}, triggered={triggered}, periodic={periodic}, since={time_since_last_fetch:.0f}s")
         
         if should_fetch_binance:
-            try:
-                logger.info(f"📊 BINANCE_FETCH: Starting Binance trade history fetch (limit=1000, days=7)...")
-                # Fetch up to 1000 trades to get the most recent ones after sorting
-                binance_trades = await live_binance_trader.get_trade_history(limit=1000, days_back=7)
-                logger.info(f"📊 BINANCE_RESULT: Got {len(binance_trades) if binance_trades else 0} trades")
-                if binance_trades and len(binance_trades) > 0:
-                    # Log first and last trade timestamps for debugging
-                    first_trade = binance_trades[0] if binance_trades else {}
-                    last_trade = binance_trades[-1] if binance_trades else {}
-                    logger.info(f"📊 BINANCE_DATES: First trade={first_trade.get('date', 'N/A')} {first_trade.get('time', 'N/A')}, Last trade={last_trade.get('date', 'N/A')} {last_trade.get('time', 'N/A')}")
-                    
-                    # Phase 181 v2: SQLite-primary approach
-                    # 1. Save each Binance trade to SQLite (enrichment happens in save_binance_trade)
-                    # 2. Reload from SQLite (get_binance_trades does LEFT JOIN with position_closes)
-                    # This ensures dedup + enrichment from engine close data
-                    
-                    saved_count = 0
-                    for bt in binance_trades:
-                        try:
-                            bt_copy = bt.copy()
-                            bt_copy['incomeId'] = f"{bt.get('symbol', 'UNK')}_{bt.get('closeTime', bt.get('timestamp', 0))}"
-                            await sqlite_manager.save_binance_trade(bt_copy)
-                            saved_count += 1
-                        except Exception as e:
-                            logger.debug(f"Save trade error: {e}")
-                    
-                    # Phase 187b: Reload from trades table — canonical source with full data
-                    sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
-                    
-                    ui_state_cache.binance_trades = binance_trades
-                    ui_state_cache.trades = sqlite_trades
-                    ui_state_cache.last_binance_trade_fetch = now
-                    ui_state_cache.pending_trade_fetch_time = 0
-                    logger.info(f"📊 Phase 187b: Saved {saved_count} Binance trades → Loaded {len(sqlite_trades)} from trades table (full data)")
-            except Exception as e:
-                import traceback
-                logger.error(f"📊 BINANCE_ERROR: {e}")
-                logger.error(f"📊 TRACEBACK: {traceback.format_exc()}")
+            # Reserve fetch slot immediately to prevent burst task creation.
+            ui_state_cache.last_binance_trade_fetch = now
+            if triggered:
+                ui_state_cache.pending_trade_fetch_time = 0
+            fetch_trigger = "triggered" if triggered else "periodic"
+            safe_create_task(
+                _refresh_binance_trade_cache_async(trigger=fetch_trigger),
+                name=f"ui_trade_refresh_{fetch_trigger}"
+            )
         
         # Phase 150: Old fallback removed — SQLite instant load handles this at startup
         
@@ -8830,7 +8918,7 @@ async def background_scanner_loop():
         last_coin_refresh = datetime.now().timestamp()
         coin_refresh_interval = 1800  # 30 minutes
         
-        while True:
+        while multi_coin_scanner.running:
             try:
                 # PHASE 104: Track loop iterations
                 if not hasattr(multi_coin_scanner, '_loop_iteration'):
@@ -8880,8 +8968,16 @@ async def background_scanner_loop():
                         logger.info(f"🆕 New coins detected: {new_count - old_count} added (total: {new_count})")
                     last_coin_refresh = now
                 
-                # Scan all coins
-                opportunities = await multi_coin_scanner.scan_all_coins()
+                # Scan all coins (guard against hanging network calls).
+                try:
+                    opportunities = await asyncio.wait_for(
+                        multi_coin_scanner.scan_all_coins(),
+                        timeout=SCANNER_SCAN_TIMEOUT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"⏱️ SCAN TIMEOUT: scan_all_coins > {SCANNER_SCAN_TIMEOUT_SEC:.0f}s (cycle skipped)")
+                    await asyncio.sleep(1)
+                    continue
                 stats = multi_coin_scanner.get_scanner_stats()
                 
                 # PHASE 105: Periodic scan summary log (first 5 iterations + every 50th)
@@ -8894,7 +8990,11 @@ async def background_scanner_loop():
                     logger.info(f"🔄 SCAN #{loop_iter}: {len(opportunities)} coins | BTC prices={sample_prices}")
                 
                 # PHASE 98: Update UI cache with latest data (instant delivery to UI)
-                await update_ui_cache(opportunities, stats)
+                try:
+                    await asyncio.wait_for(update_ui_cache(opportunities, stats), timeout=8.0)
+                except asyncio.TimeoutError:
+                    logger.error("⏱️ UI cache update timeout (>8s), skipping this cycle")
+                    continue
                 
                 # Phase 152: Periodic status summary to UI logs (every ~60 sec)
                 if loop_iter % 20 == 0 and 'global_paper_trader' in globals():
@@ -8941,24 +9041,53 @@ async def background_scanner_loop():
                             logger.debug(f"MTF Guard error: {mtf_guard_err}")
                     
                     # UPDATE MTF TRENDS for coins with active signals (before processing)
-                    # Phase FIB: Also update for ALL scanned opportunities (cache TTL prevents re-fetch)
-                    # This ensures OHLCV cache is warm for Fibonacci context on new signals
-                    mtf_update_symbols = set()
+                    # Bounded by time/symbol budget so scanner loop cannot stall.
+                    mtf_update_symbols = []
+                    mtf_seen = set()
+
                     for signal in multi_coin_scanner.active_signals:
                         s = signal.get('symbol', '')
-                        if s:
-                            mtf_update_symbols.add(s)
-                    if FIB_ENABLED:
+                        if s and s not in mtf_seen:
+                            mtf_seen.add(s)
+                            mtf_update_symbols.append(s)
+
+                    # FIB pre-warm only in SMART_V2 to keep LEGACY path lightweight.
+                    strategy_mode_upper = str(getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)).upper()
+                    if FIB_ENABLED and strategy_mode_upper == STRATEGY_MODE_SMART_V2:
                         for opp in opportunities:
                             s = opp.get('symbol', '')
-                            if s and opp.get('signalScore', 0) > 0:
-                                mtf_update_symbols.add(s)
+                            if s and s not in mtf_seen and opp.get('signalScore', 0) > 0:
+                                mtf_seen.add(s)
+                                mtf_update_symbols.append(s)
+                            if len(mtf_update_symbols) >= (SCANNER_MTF_UPDATE_MAX_SYMBOLS * 2):
+                                break
+
+                    mtf_budget_start = datetime.now().timestamp()
+                    mtf_updated = 0
+                    mtf_timeout_count = 0
                     for sym in mtf_update_symbols:
+                        if mtf_updated >= SCANNER_MTF_UPDATE_MAX_SYMBOLS:
+                            break
+                        if datetime.now().timestamp() - mtf_budget_start >= SCANNER_MTF_UPDATE_BUDGET_SEC:
+                            break
                         try:
                             if multi_coin_scanner.exchange:
-                                await mtf_confirmation.update_coin_trend(sym, multi_coin_scanner.exchange)
+                                await asyncio.wait_for(
+                                    mtf_confirmation.update_coin_trend(sym, multi_coin_scanner.exchange),
+                                    timeout=SCANNER_MTF_UPDATE_TIMEOUT_SEC
+                                )
+                                mtf_updated += 1
+                        except asyncio.TimeoutError:
+                            mtf_timeout_count += 1
+                            logger.debug(f"MTF update timeout for {sym}")
                         except Exception as mtf_err:
                             logger.debug(f"MTF update error for {sym}: {mtf_err}")
+
+                    if (loop_iter % 20 == 0) and (mtf_timeout_count > 0 or len(mtf_update_symbols) > mtf_updated):
+                        logger.info(
+                            f"📊 MTF_BUDGET: requested={len(mtf_update_symbols)} updated={mtf_updated} "
+                            f"timeouts={mtf_timeout_count} budget={SCANNER_MTF_UPDATE_BUDGET_SEC:.1f}s"
+                        )
                     
                     for signal in multi_coin_scanner.active_signals:
                         try:
@@ -10714,9 +10843,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         # Update volume profile if stale (every hour)
         if datetime.now().timestamp() - coin_vp.last_update > 3600:
             # Try to get OHLCV from scanner's exchange
-            if multi_coin_scanner.exchange:
+            if multi_coin_scanner.exchange and signal.get('confidenceScore', 0) >= 80:
                 ccxt_symbol = symbol.replace('USDT', '/USDT')
-                ohlcv_4h = await multi_coin_scanner.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
+                ohlcv_4h = await asyncio.wait_for(
+                    multi_coin_scanner.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100),
+                    timeout=1.5
+                )
                 if ohlcv_4h:
                     coin_vp.calculate_profile(ohlcv_4h)
                     logger.debug(f"Updated VP for {symbol}: POC={coin_vp.poc:.6f}")
@@ -11082,12 +11214,28 @@ class MultiTimeframeConfirmation:
         
         try:
             ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
-            
-            # Fetch all 4 timeframes
-            ohlcv_15m = await exchange.fetch_ohlcv(ccxt_symbol, '15m', limit=30)
-            ohlcv_1h = await exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=30)
-            ohlcv_4h = await exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=30)
-            ohlcv_1d = await exchange.fetch_ohlcv(ccxt_symbol, '1d', limit=30)
+            fetch_timeout = 2.0
+
+            async def fetch_ohlcv_safe(timeframe: str):
+                try:
+                    return await asyncio.wait_for(
+                        exchange.fetch_ohlcv(ccxt_symbol, timeframe, limit=30),
+                        timeout=fetch_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug(f"MTF fetch timeout {symbol} {timeframe}")
+                    return []
+                except Exception as fetch_err:
+                    logger.debug(f"MTF fetch error {symbol} {timeframe}: {fetch_err}")
+                    return []
+
+            # Fetch 4 TF in parallel with per-request timeout.
+            ohlcv_15m, ohlcv_1h, ohlcv_4h, ohlcv_1d = await asyncio.gather(
+                fetch_ohlcv_safe('15m'),
+                fetch_ohlcv_safe('1h'),
+                fetch_ohlcv_safe('4h'),
+                fetch_ohlcv_safe('1d'),
+            )
             
             # Calculate trends
             if ohlcv_15m and len(ohlcv_15m) >= 10:
@@ -11156,10 +11304,16 @@ class MultiTimeframeConfirmation:
                 result['ohlcv_4h'] = ohlcv_4h[-30:]
             
             self.coin_trends[symbol] = result
-            logger.debug(f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, 4h={result['trend_4h']}, 1d={result['trend_1d']}, 4h_20_chg={result.get('price_change_4h_20', 0):.1f}%")
+            logger.debug(
+                f"MTF {symbol}: 15m={result['trend_15m']}, 1h={result['trend_1h']}, "
+                f"4h={result['trend_4h']}, 1d={result['trend_1d']}, "
+                f"4h_20_chg={result.get('price_change_4h_20', 0):.1f}%"
+            )
             
         except Exception as e:
             logger.debug(f"MTF update failed for {symbol}: {e}")
+            # Cache neutral fallback to avoid retry storms on every scanner cycle.
+            self.coin_trends[symbol] = result
         
         return result
     
@@ -21896,18 +22050,28 @@ async def get_performance_summary():
 @app.post("/scanner/start")
 async def scanner_start():
     """Start the background scanner."""
-    global background_scanner_task
+    task_alive = _is_scanner_task_alive()
+    cache_age = 0
+    if ui_state_cache.last_update > 0:
+        cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update))
 
-    task_alive = background_scanner_task is not None and not background_scanner_task.done()
-
-    # Heal stale state: running flag true but task is dead
     if multi_coin_scanner.running and task_alive:
+        if cache_age > SCANNER_STALE_CACHE_SEC:
+            restarted = await restart_background_scanner(
+                reason=f"api_start_stale_cache_{cache_age}s"
+            )
+            return JSONResponse({
+                "success": True,
+                "running": True,
+                "message": "Scanner stale detected, restarted" if restarted else "Scanner running (restart cooldown)",
+                "cacheAgeSec": cache_age,
+                "staleRestarted": restarted
+            })
         return JSONResponse({"success": True, "running": True, "message": "Scanner already running"})
 
     multi_coin_scanner.running = True
     if not task_alive:
-        background_scanner_task = asyncio.create_task(background_scanner_loop())
-        logger.warning("🔁 Scanner task auto-restarted via /scanner/start (stale running state healed)")
+        await restart_background_scanner(reason="api_start", force=True)
 
     logger.info("🚀 Scanner started via API")
     return JSONResponse({"success": True, "running": True, "message": "Scanner started"})
@@ -21915,32 +22079,46 @@ async def scanner_start():
 @app.post("/scanner/stop")
 async def scanner_stop():
     """Stop the background scanner."""
+    global background_scanner_task
     multi_coin_scanner.running = False
+    if _is_scanner_task_alive():
+        background_scanner_task.cancel()
+        try:
+            await asyncio.wait_for(background_scanner_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ scanner_stop: cancel timeout")
+        except asyncio.CancelledError:
+            pass
+        except Exception as stop_err:
+            logger.warning(f"⚠️ scanner_stop cancel error: {stop_err}")
+    background_scanner_task = None
     logger.info("🛑 Scanner stopped via API")
     return JSONResponse({"success": True, "running": False, "message": "Scanner stopped"})
 
 @app.get("/scanner/status")
 async def scanner_status():
     """Get scanner running status."""
-    global background_scanner_task
-    task_alive = background_scanner_task is not None and not background_scanner_task.done()
+    task_alive = _is_scanner_task_alive()
+    cache_age = 0
+    if ui_state_cache.last_update > 0:
+        cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update))
 
     # Self-heal: if scanner marked running but task died, restart automatically.
     auto_restarted = False
+    stale_restarted = False
     if multi_coin_scanner.running and not task_alive:
-        background_scanner_task = asyncio.create_task(background_scanner_loop())
-        task_alive = True
-        auto_restarted = True
-        logger.warning("🔁 Scanner task auto-restarted via /scanner/status (detected dead task)")
+        auto_restarted = await restart_background_scanner(reason="status_dead_task")
+        task_alive = _is_scanner_task_alive()
+    elif multi_coin_scanner.running and task_alive and cache_age > SCANNER_STALE_CACHE_SEC:
+        stale_restarted = await restart_background_scanner(
+            reason=f"status_stale_cache_{cache_age}s"
+        )
+        task_alive = _is_scanner_task_alive()
 
     # Keep running flag consistent with actual task state (important for frontend WS bootstrap).
     if task_alive and not multi_coin_scanner.running:
         multi_coin_scanner.running = True
         logger.warning("🔁 Scanner running flag healed via /scanner/status (task alive, flag was false)")
-
-    cache_age = 0
-    if ui_state_cache.last_update > 0:
-        cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update))
 
     effective_running = multi_coin_scanner.running or task_alive
 
@@ -21952,7 +22130,9 @@ async def scanner_status():
         "taskAlive": task_alive,
         "cacheInitialized": ui_state_cache._initialized,
         "cacheAgeSec": cache_age,
-        "autoRestarted": auto_restarted
+        "autoRestarted": auto_restarted,
+        "staleRestarted": stale_restarted,
+        "staleThresholdSec": SCANNER_STALE_CACHE_SEC
     })
 
 # Phase 17: Settings endpoints
@@ -22434,11 +22614,12 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("🚀 Phase 98: Scanner WebSocket connected - using cache")
 
-    # Auto-heal on client connect: running=true but scanner task is dead.
-    task_alive = background_scanner_task is not None and not background_scanner_task.done()
-    if multi_coin_scanner.running and not task_alive:
-        background_scanner_task = asyncio.create_task(background_scanner_loop())
-        logger.warning("🔁 Scanner task auto-restarted via /ws/scanner connect")
+    # Auto-heal on client connect: dead task OR stale cache.
+    task_alive = _is_scanner_task_alive()
+    cache_age = int(max(0, datetime.now().timestamp() - ui_state_cache.last_update)) if ui_state_cache.last_update > 0 else 0
+    if multi_coin_scanner.running and (not task_alive or cache_age > SCANNER_STALE_CACHE_SEC):
+        reason = "ws_connect_dead_task" if not task_alive else f"ws_connect_stale_cache_{cache_age}s"
+        await restart_background_scanner(reason=reason)
     
     full_state_interval = 2.0  # Full payload (opportunities + portfolio) cadence
     fast_tick_interval = 0.35  # Fast price ticks for active signals/positions
