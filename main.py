@@ -10662,15 +10662,25 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             # Phase EQG: Neutral OBI + düşük hacim ise reject
             signal_log_data['obi_value'] = round(obi_value, 4)
             vol_ratio_val = signal.get('volumeRatio', 1.0)
-            if abs(obi_value) < 0.12 and vol_ratio_val < 1.2:
+            strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
+            neutral_obi_limit = 0.12 if strategy_mode_upper != STRATEGY_MODE_LEGACY else 0.10
+            neutral_vol_limit = 1.2 if strategy_mode_upper != STRATEGY_MODE_LEGACY else 0.9
+            if abs(obi_value) < neutral_obi_limit and vol_ratio_val < neutral_vol_limit:
                 reinforce_count = int(signal.get('signalReinforceCount', 0) or 0)
-                if reinforce_count >= 2 and signal.get('confidenceScore', 0) >= 95:
+                eq_count_local = len(signal.get('entryQualityReasons') or [])
+                legacy_soft_pass = (
+                    strategy_mode_upper == STRATEGY_MODE_LEGACY
+                    and signal.get('confidenceScore', 0) >= 92
+                    and eq_count_local >= 1
+                )
+                if (reinforce_count >= 2 and signal.get('confidenceScore', 0) >= 95) or legacy_soft_pass:
                     original_score = signal.get('confidenceScore', 60)
-                    signal['confidenceScore'] = max(40, int(original_score) - 8)
+                    penalty = 6 if legacy_soft_pass else 8
+                    signal['confidenceScore'] = max(40, int(original_score) - penalty)
                     global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
                     logger.info(
                         f"🟨 OBI_NEUTRAL_SOFT_PASS: {action} {symbol} OBI={obi_value:+.3f} vr={vol_ratio_val:.1f} "
-                        f"reinforce={reinforce_count} score {original_score}->{signal['confidenceScore']}"
+                        f"reinforce={reinforce_count} eq={eq_count_local}/3 score {original_score}->{signal['confidenceScore']}"
                     )
                 else:
                     signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
@@ -17362,7 +17372,12 @@ class SignalGenerator:
         # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123 + Phase EQG)
         # Phase EQG: 24h volume threshold artık EQ_MIN_VOLUME_24H ile kontrol ediliyor
         # Ama ek güvenlik olarak çok düşük hacim kontrolü kalıyor
+        legacy_mode = str(strategy_mode).upper() == STRATEGY_MODE_LEGACY
         min_volume = 500_000  # $500K min 24h volume (hard floor)
+        if legacy_mode:
+            # Legacy: allow more mid-cap coverage while keeping microcaps filtered.
+            min_volume = 300_000
+            vol_threshold = max(0.25, vol_threshold * 0.70)
         
         if volume_24h < min_volume:
             confirmation_passed = False
@@ -17409,8 +17424,28 @@ class SignalGenerator:
         
         # Konfirmasyon başarısız mı?
         if not confirmation_passed:
-            logger.info(f"🚫 CONF_FAIL: {symbol} {signal_side} score={score} failed: {', '.join(confirmation_fails)}")
-            return None
+            only_liq_vol_fails = all(
+                f.startswith("LOW_LIQ(") or f.startswith("LOW_VOL(")
+                for f in confirmation_fails
+            )
+            legacy_soft_pass = (
+                legacy_mode
+                and only_liq_vol_fails
+                and score >= 88
+                and eq_pass_count >= 1
+            )
+            if legacy_soft_pass:
+                penalty = 8 if len(confirmation_fails) >= 2 else 5
+                score = max(40, score - penalty)
+                reasons.append(f"CONF_SOFT({len(confirmation_fails)})")
+                logger.info(
+                    f"🟨 CONF_SOFT_PASS: {symbol} {signal_side} score-={penalty} → {score} "
+                    f"| fails={';'.join(confirmation_fails)}"
+                )
+                confirmation_passed = True
+            else:
+                logger.info(f"🚫 CONF_FAIL: {symbol} {signal_side} score={score} failed: {', '.join(confirmation_fails)}")
+                return None
         
         # Tüm konfirmasyonlar geçti - devam et
         
