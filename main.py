@@ -10551,6 +10551,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_spread <= 0.24
                 and total_depth >= dynamic_depth_threshold * 0.30
             )
+            legacy_micro_soft_pass = (
+                strategy_mode_upper == STRATEGY_MODE_LEGACY
+                and signal_score >= 90
+                and eq_count >= 1
+                and signal_spread <= 0.12
+                and total_depth >= 1_200
+            )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
                 and strategy_mode_upper == STRATEGY_MODE_SMART_V2
@@ -10570,7 +10577,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_volume_ratio >= THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
             )
-            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or smart_soft_pass or super_soft_pass):
+            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass):
                 signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -10581,10 +10588,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                 )
                 return
-            elif near_threshold_soft_pass or legacy_soft_pass or smart_soft_pass or super_soft_pass:
+            elif near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
                 if near_threshold_soft_pass:
                     score_penalty = 6
+                elif legacy_micro_soft_pass:
+                    score_penalty = 9
                 elif legacy_soft_pass:
                     score_penalty = 5
                 elif super_soft_pass:
@@ -10615,6 +10624,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     logger.info(
                         f"🟨 THIN_BOOK_LEGACY_PASS: {action} {symbol} depth=${total_depth:.0f} "
                         f"th=${dynamic_depth_threshold:.0f} eq={eq_count}/3 score {original_score}->{signal['confidenceScore']}"
+                    )
+                elif legacy_micro_soft_pass:
+                    old_lev = int(signal.get('leverage', 10) or 10)
+                    signal['leverage'] = max(3, min(old_lev, 12))
+                    signal['sizeMultiplier'] = min(float(signal.get('sizeMultiplier', 1.0) or 1.0), 0.70)
+                    logger.info(
+                        f"🟨 THIN_BOOK_LEGACY_MICRO_PASS: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} lev {old_lev}x->{signal['leverage']}x "
+                        f"score {original_score}->{signal['confidenceScore']}"
                     )
                 else:
                     logger.info(
