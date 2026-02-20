@@ -123,6 +123,21 @@ const fmtNum = (value: number | null | undefined, digits: number = 2, fallback: 
     return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 };
 
+// Phase 239V2: Shared helper for consistent pullback value extraction
+const getPullbackValues = (signal: CoinOpportunity, entryPrice: number): { finalPb: number; floorPb: number | null } => {
+    const calcFallback = signal.price > 0 ? Math.abs((entryPrice - signal.price) / signal.price * 100) : 0;
+    // Explicit numeric guard: skip pullbackDynFinal=0 (legacy/missing telemetry)
+    const dynFinal = (typeof signal.pullbackDynFinal === 'number' && signal.pullbackDynFinal > 0)
+        ? signal.pullbackDynFinal : null;
+    const basePb = (typeof signal.pullbackPct === 'number' && signal.pullbackPct >= 0)
+        ? signal.pullbackPct : calcFallback;
+    const finalPb = dynFinal ?? basePb;
+    // Floor with backward-compat (pullbackMinDyn from older payloads)
+    const floorRaw = signal.pullbackDynFloor ?? signal.pullbackMinDyn ?? null;
+    const floorPb = (typeof floorRaw === 'number' && floorRaw > 0) ? floorRaw : null;
+    return { finalPb, floorPb };
+};
+
 const getQualityTooltip = (signal: CoinOpportunity): string => {
     const lines: string[] = [];
     const eqCount = signal.entryQualityReasons?.length || 0;
@@ -364,7 +379,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         const spreadInfo = getSpreadInfoFromSignal(signal, entryTightness);
         const leverage = signal.leverage || spreadInfo.leverage;
         const entryPrice = getEntryPrice(signal, entryTightness);
-        const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
+        const pbPct = signal.pullbackPct ?? Math.abs((entryPrice - signal.price) / signal.price * 100);
+        const { finalPb, floorPb } = getPullbackValues(signal, entryPrice);
         const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
         const spreadPct = typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05;
         const volumeRatio = signal.volumeRatio || 1.0;
@@ -444,7 +460,15 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         <span className="bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                         <span className="text-slate-500">Z:{(signal.zscore || 0).toFixed(1)}</span>
                         <span className="text-slate-500">H:{(signal.hurst || 0).toFixed(2)}</span>
-                        <span className="text-amber-400">PB:{(signal.pullbackPct || 0).toFixed(2)}%</span>
+                        <span className="text-amber-400" title={`Final: ${finalPb.toFixed(2)}% | Floor: ${floorPb != null ? floorPb.toFixed(2) + '%' : '-'} | Band: ${signal.pullbackDynRegimeBand ?? '-'}`}>
+                            PB:{finalPb.toFixed(2)}%
+                        </span>
+                        {typeof signal.recheckScore === 'number' && signal.recheckScore > 0 ? (
+                            <span className={`${signal.recheckScore >= 80 ? 'text-emerald-400' : signal.recheckScore >= 65 ? 'text-amber-400' : 'text-rose-400'}`}
+                                title={`Recheck: ${signal.recheckDecision || '-'} (${signal.recheckScore}) | ${(signal.recheckReasons || []).join(', ')}`}>
+                                RCK:{signal.recheckScore.toFixed(0)}
+                            </span>
+                        ) : null}
                         <span
                             className="text-cyan-400"
                             title={trailTitle}
@@ -563,7 +587,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const isLoading = loadingSymbol === signal.symbol;
                                 const priceFlash = priceFlashMap[signal.symbol];
                                 const leverage = signal.leverage || spreadInfo.leverage;
-                                const pbPct = signal.pullbackPct || Math.abs((entryPrice - signal.price) / signal.price * 100);
+                                const pbPct = signal.pullbackPct ?? Math.abs((entryPrice - signal.price) / signal.price * 100);
+                                const { finalPb, floorPb } = getPullbackValues(signal, entryPrice);
                                 const atrPct = signal.atr && signal.price ? (signal.atr / signal.price * 100) : 0;
                                 const spreadPct = typeof signal.spreadPct === 'number' ? signal.spreadPct : 0.05;
                                 const volumeRatio = signal.volumeRatio || 1.0;
@@ -643,10 +668,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded font-bold">{leverage}x</span>
                                         </td>
                                         <td className="py-2.5 px-3 text-center" title={trailTitle}>
-                                            {pbPct > 0 ? (
+                                            {finalPb > 0 ? (
                                                 <div className="flex flex-col items-center gap-0.5">
-                                                    <span className="text-[10px] font-mono font-semibold text-amber-400">
-                                                        {isLong ? '↓' : '↑'}{pbPct.toFixed(2)}%
+                                                    <span className="text-[10px] font-mono font-semibold text-amber-400"
+                                                        title={`Final: ${finalPb.toFixed(2)}% | Floor: ${floorPb != null ? floorPb.toFixed(2) + '%' : '-'} | Band: ${signal.pullbackDynRegimeBand ?? '-'}`}>
+                                                        {isLong ? '↓' : '↑'}{finalPb.toFixed(2)}%
                                                     </span>
                                                     <span
                                                         className="text-[10px] font-mono font-semibold text-cyan-400"
@@ -657,6 +683,18 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     <span className="text-[9px] font-mono text-slate-500">
                                                         x{liveThresholdMult.toFixed(2)}
                                                     </span>
+                                                    {signal.pullbackDynRegimeBand ? (
+                                                        <span className="text-[9px] font-mono text-violet-400">
+                                                            {signal.pullbackDynRegimeBand}
+                                                        </span>
+                                                    ) : null}
+                                                    {typeof signal.recheckScore === 'number' && signal.recheckScore > 0 ? (
+                                                        <span className={`text-[9px] font-mono font-bold ${signal.recheckScore >= 80 ? 'text-emerald-400' :
+                                                            signal.recheckScore >= 65 ? 'text-amber-400' : 'text-rose-400'
+                                                            }`} title={`Recheck: ${signal.recheckDecision || '-'} (${signal.recheckScore}) | ${(signal.recheckReasons || []).join(', ')}`}>
+                                                            RCK:{signal.recheckScore.toFixed(0)}
+                                                        </span>
+                                                    ) : null}
                                                     {hasSnapshotTrail ? (
                                                         <span className="text-[9px] font-mono text-slate-600">
                                                             an:{snapshotTrailEntryPct.toFixed(2)}%

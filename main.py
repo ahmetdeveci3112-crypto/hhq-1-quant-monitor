@@ -414,11 +414,26 @@ class SQLiteManager:
                     return json.loads(row[0])
                 return default
     
+    @staticmethod
+    def _is_rich_value(val, field_type='numeric'):
+        """Check if a value is 'rich' (non-default). Used by merge/upsert to prevent default values from overwriting."""
+        if val is None:
+            return False
+        if field_type == 'numeric':
+            return val != 0 and val != 0.0
+        elif field_type == 'text':
+            return val not in ('', 'unknown', 'MARKET', '{}', '[]')
+        elif field_type == 'score':
+            return val is not None and val > 0
+        return val is not None
+
     async def save_trade(self, trade: dict):
-        """Save a completed trade — Phase 186: ALL fields persisted."""
+        """Save a completed trade — Phase 239: Merge/upsert semantics.
+        Default/empty values (0, 'unknown', '') will NOT overwrite existing rich data.
+        Only richer values replace existing ones."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
-                INSERT OR REPLACE INTO trades 
+                INSERT INTO trades 
                 (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, 
                  open_time, close_time, close_reason, leverage, signal_score, mtf_score, z_score, 
                  spread_level, settings_snapshot,
@@ -426,6 +441,42 @@ class SQLiteManager:
                  margin, roi, is_live, entry_method, entry_slippage, entry_spread, 
                  binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  symbol = COALESCE(excluded.symbol, trades.symbol),
+                  side = COALESCE(excluded.side, trades.side),
+                  entry_price = CASE WHEN excluded.entry_price > 0 THEN excluded.entry_price ELSE trades.entry_price END,
+                  exit_price = CASE WHEN excluded.exit_price > 0 THEN excluded.exit_price ELSE trades.exit_price END,
+                  size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE trades.size END,
+                  size_usd = CASE WHEN excluded.size_usd > 0 THEN excluded.size_usd ELSE trades.size_usd END,
+                  pnl = COALESCE(excluded.pnl, trades.pnl),
+                  pnl_percent = CASE WHEN excluded.pnl_percent != 0 THEN excluded.pnl_percent ELSE trades.pnl_percent END,
+                  open_time = CASE WHEN excluded.open_time > 0 THEN excluded.open_time ELSE trades.open_time END,
+                  close_time = COALESCE(excluded.close_time, trades.close_time),
+                  close_reason = CASE WHEN excluded.close_reason IS NOT NULL AND excluded.close_reason != 'Closed' AND excluded.close_reason != 'Synced from Binance' THEN excluded.close_reason ELSE COALESCE(trades.close_reason, excluded.close_reason) END,
+                  leverage = CASE WHEN excluded.leverage > 0 AND excluded.leverage != 10 THEN excluded.leverage WHEN trades.leverage > 0 THEN trades.leverage ELSE excluded.leverage END,
+                  signal_score = CASE WHEN excluded.signal_score > 0 THEN excluded.signal_score ELSE trades.signal_score END,
+                  mtf_score = CASE WHEN excluded.mtf_score > 0 THEN excluded.mtf_score ELSE trades.mtf_score END,
+                  z_score = CASE WHEN excluded.z_score != 0 THEN excluded.z_score ELSE trades.z_score END,
+                  spread_level = CASE WHEN excluded.spread_level IS NOT NULL AND excluded.spread_level != 'unknown' THEN excluded.spread_level ELSE COALESCE(trades.spread_level, excluded.spread_level) END,
+                  settings_snapshot = CASE WHEN excluded.settings_snapshot IS NOT NULL AND excluded.settings_snapshot != '{}' THEN excluded.settings_snapshot ELSE COALESCE(trades.settings_snapshot, excluded.settings_snapshot) END,
+                  stop_loss = CASE WHEN excluded.stop_loss > 0 THEN excluded.stop_loss ELSE trades.stop_loss END,
+                  take_profit = CASE WHEN excluded.take_profit > 0 THEN excluded.take_profit ELSE trades.take_profit END,
+                  atr = CASE WHEN excluded.atr > 0 THEN excluded.atr ELSE trades.atr END,
+                  trailing_stop = CASE WHEN excluded.trailing_stop > 0 THEN excluded.trailing_stop ELSE trades.trailing_stop END,
+                  trail_activation = CASE WHEN excluded.trail_activation > 0 THEN excluded.trail_activation ELSE trades.trail_activation END,
+                  is_trailing_active = CASE WHEN excluded.is_trailing_active > 0 THEN excluded.is_trailing_active ELSE trades.is_trailing_active END,
+                  margin = CASE WHEN excluded.margin > 0 THEN excluded.margin ELSE trades.margin END,
+                  roi = CASE WHEN excluded.roi != 0 THEN excluded.roi ELSE trades.roi END,
+                  is_live = CASE WHEN excluded.is_live > 0 THEN excluded.is_live ELSE trades.is_live END,
+                  entry_method = CASE WHEN excluded.entry_method IS NOT NULL AND excluded.entry_method != 'MARKET' THEN excluded.entry_method ELSE COALESCE(trades.entry_method, excluded.entry_method) END,
+                  entry_slippage = CASE WHEN excluded.entry_slippage != 0 THEN excluded.entry_slippage ELSE trades.entry_slippage END,
+                  entry_spread = CASE WHEN excluded.entry_spread != 0 THEN excluded.entry_spread ELSE trades.entry_spread END,
+                  binance_fill_price = CASE WHEN excluded.binance_fill_price > 0 THEN excluded.binance_fill_price ELSE trades.binance_fill_price END,
+                  binance_order_id = CASE WHEN excluded.binance_order_id IS NOT NULL AND excluded.binance_order_id != '' THEN excluded.binance_order_id ELSE COALESCE(trades.binance_order_id, excluded.binance_order_id) END,
+                  hurst = CASE WHEN excluded.hurst != 0.5 AND excluded.hurst > 0 THEN excluded.hurst WHEN trades.hurst != 0.5 AND trades.hurst > 0 THEN trades.hurst ELSE excluded.hurst END,
+                  adx = CASE WHEN excluded.adx > 0 THEN excluded.adx ELSE trades.adx END,
+                  pullback_pct = CASE WHEN excluded.pullback_pct > 0 THEN excluded.pullback_pct ELSE trades.pullback_pct END,
+                  close_metrics_json = CASE WHEN excluded.close_metrics_json IS NOT NULL AND excluded.close_metrics_json != '{}' THEN excluded.close_metrics_json ELSE COALESCE(trades.close_metrics_json, excluded.close_metrics_json) END
             ''', (
                 trade.get('id'),
                 trade.get('symbol'),
@@ -724,14 +775,140 @@ class SQLiteManager:
             logger.warning(f"⚠️ get_all_open_times error: {e}")
             return {}
     
-    async def get_all_settings(self) -> dict:
-        """Get all settings from database."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute('SELECT key, value FROM settings') as cursor:
-                rows = await cursor.fetchall()
-                return {row['key']: json.loads(row['value']) for row in rows}
-    
+
+
+    async def lookup_position_close_metadata(self, symbol: str, close_time: int, window_ms: int = 3600000) -> dict:
+        """Phase 239: Lookup position_closes for metadata enrichment.
+        Returns dict of metadata fields or empty dict if not found."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT * FROM position_closes 
+                    WHERE symbol = ? AND ABS(timestamp - ?) < ?
+                    ORDER BY ABS(timestamp - ?) ASC LIMIT 1
+                ''', (symbol, close_time, window_ms, close_time)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return dict(row)
+            return {}
+        except Exception as e:
+            logger.debug(f"lookup_position_close_metadata error: {e}")
+            return {}
+
+    async def get_trade_data_quality_24h(self) -> dict:
+        """Phase 239: Get trade metadata quality stats for last 24 hours."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cutoff_ms = int((datetime.now().timestamp() - 86400) * 1000)
+                async with db.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN pullback_pct = 0 OR pullback_pct IS NULL THEN 1 ELSE 0 END) as missing_pullback,
+                        SUM(CASE WHEN signal_score = 0 OR signal_score IS NULL THEN 1 ELSE 0 END) as missing_score,
+                        SUM(CASE WHEN spread_level = 'unknown' OR spread_level IS NULL THEN 1 ELSE 0 END) as missing_spread
+                    FROM trades WHERE close_time > ?
+                ''', (cutoff_ms,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        total = row[0] or 0
+                        missing_pb = row[1] or 0
+                        missing_score = row[2] or 0
+                        missing_spread = row[3] or 0
+                        # Phase 239 fix: per-field average instead of max (prevents inflated coverage)
+                        avg_missing = (missing_pb + missing_score + missing_spread) / 3.0
+                        coverage = round(((total - avg_missing) / max(total, 1)) * 100, 1)
+                        return {
+                            'trades_total_24h': total,
+                            'trades_missing_pullback_24h': missing_pb,
+                            'trades_missing_score_24h': missing_score,
+                            'trades_missing_spread_24h': missing_spread,
+                            'trade_metadata_coverage_pct_24h': coverage,
+                        }
+            return {'trades_total_24h': 0, 'trade_metadata_coverage_pct_24h': 100.0}
+        except Exception as e:
+            logger.debug(f"get_trade_data_quality_24h error: {e}")
+            return {'trades_total_24h': 0, 'trade_metadata_coverage_pct_24h': 0, 'error': str(e)}
+
+    async def backfill_missing_metadata(self, hours_back: int = 48) -> int:
+        """Phase 239: Backfill missing trade metadata from position_closes.
+        Idempotent — only updates fields that are currently default/empty.
+        Returns number of trades updated."""
+        updated = 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cutoff_ms = int((datetime.now().timestamp() - hours_back * 3600) * 1000)
+                db.row_factory = aiosqlite.Row
+                # Find trades with missing metadata
+                async with db.execute('''
+                    SELECT id, symbol, close_time FROM trades 
+                    WHERE close_time > ? AND (
+                        (signal_score = 0 OR signal_score IS NULL) OR
+                        (spread_level = 'unknown' OR spread_level IS NULL) OR
+                        (pullback_pct = 0 OR pullback_pct IS NULL)
+                    )
+                ''', (cutoff_ms,)) as cursor:
+                    rows = await cursor.fetchall()
+                
+                for row in rows:
+                    trade_id = row['id']
+                    symbol = row['symbol']
+                    close_time = row['close_time'] or 0
+                    
+                    # Look up position_closes
+                    pc = await self.lookup_position_close_metadata(symbol, close_time)
+                    if not pc:
+                        continue
+                    
+                    # Build SET clause only for fields that have richer data in position_closes
+                    updates = []
+                    params = []
+                    if pc.get('signal_score', 0) > 0:
+                        updates.append('signal_score = CASE WHEN signal_score = 0 OR signal_score IS NULL THEN ? ELSE signal_score END')
+                        params.append(pc['signal_score'])
+                    if pc.get('spread_level') and pc['spread_level'] != 'unknown':
+                        updates.append("spread_level = CASE WHEN spread_level = 'unknown' OR spread_level IS NULL THEN ? ELSE spread_level END")
+                        params.append(pc['spread_level'])
+                    if pc.get('entry_price', 0) > 0:
+                        updates.append('entry_price = CASE WHEN entry_price = 0 OR entry_price IS NULL THEN ? ELSE entry_price END')
+                        params.append(pc['entry_price'])
+                    if pc.get('exit_price', 0) > 0:
+                        updates.append('exit_price = CASE WHEN exit_price = 0 OR exit_price IS NULL THEN ? ELSE exit_price END')
+                        params.append(pc['exit_price'])
+                    if pc.get('leverage', 0) > 0:
+                        updates.append('leverage = CASE WHEN leverage = 0 OR leverage IS NULL THEN ? ELSE leverage END')
+                        params.append(pc['leverage'])
+                    if pc.get('hurst', 0.5) != 0.5 and pc.get('hurst', 0) > 0:
+                        updates.append('hurst = CASE WHEN hurst = 0.5 OR hurst IS NULL THEN ? ELSE hurst END')
+                        params.append(pc['hurst'])
+                    if pc.get('stop_loss', 0) > 0:
+                        updates.append('stop_loss = CASE WHEN stop_loss = 0 OR stop_loss IS NULL THEN ? ELSE stop_loss END')
+                        params.append(pc['stop_loss'])
+                    if pc.get('take_profit', 0) > 0:
+                        updates.append('take_profit = CASE WHEN take_profit = 0 OR take_profit IS NULL THEN ? ELSE take_profit END')
+                        params.append(pc['take_profit'])
+                    if pc.get('atr', 0) > 0:
+                        updates.append('atr = CASE WHEN atr = 0 OR atr IS NULL THEN ? ELSE atr END')
+                        params.append(pc['atr'])
+                    # Phase 239 fix: removed side backfill — risky on fuzzy time match
+                    if pc.get('original_reason') and pc['original_reason'] != 'Closed':
+                        updates.append("close_reason = CASE WHEN close_reason = 'Synced from Binance' OR close_reason = 'Closed' THEN ? ELSE close_reason END")
+                        params.append(pc.get('reason', pc['original_reason']))
+                    
+                    if updates:
+                        params.append(trade_id)
+                        sql = f"UPDATE trades SET {', '.join(updates)} WHERE id = ?"
+                        await db.execute(sql, params)
+                        updated += 1
+                
+                if updated > 0:
+                    await db.commit()
+                    logger.info(f"📊 BACKFILL: Updated metadata for {updated}/{len(rows)} trades from position_closes")
+                
+        except Exception as e:
+            logger.error(f"backfill_missing_metadata error: {e}")
+        return updated
+
     async def save_all_settings(self, settings: dict):
         """Save all settings to database."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -2833,6 +3010,46 @@ class LiveBinanceTrader:
                     'mtfScore': 0
                 }
                 
+                # Phase 239: Enrich from position_closes for metadata
+                try:
+                    pc_data = await sqlite_manager.lookup_position_close_metadata(symbol, timestamp)
+                    if pc_data:
+                        if pc_data.get('signal_score', 0) > 0:
+                            trade['signalScore'] = pc_data['signal_score']
+                        if pc_data.get('spread_level') and pc_data['spread_level'] != 'unknown':
+                            trade['spreadLevel'] = pc_data['spread_level']
+                        if pc_data.get('entry_price', 0) > 0:
+                            trade['entryPrice'] = pc_data['entry_price']
+                        if pc_data.get('exit_price', 0) > 0:
+                            trade['exitPrice'] = pc_data['exit_price']
+                        if pc_data.get('side'):
+                            trade['side'] = pc_data['side']
+                        if pc_data.get('leverage', 0) > 0:
+                            trade['leverage'] = pc_data['leverage']
+                        if pc_data.get('size_usd', 0) > 0:
+                            trade['sizeUsd'] = pc_data['size_usd']
+                        if pc_data.get('margin', 0) > 0:
+                            trade['margin'] = pc_data['margin']
+                        if pc_data.get('roi', 0) != 0:
+                            trade['roi'] = pc_data['roi']
+                        if pc_data.get('hurst', 0.5) != 0.5:
+                            trade['hurst'] = pc_data['hurst']
+                        if pc_data.get('entry_method') and pc_data['entry_method'] != 'MARKET':
+                            trade['entry_method'] = pc_data['entry_method']
+                        if pc_data.get('stop_loss', 0) > 0:
+                            trade['stopLoss'] = pc_data['stop_loss']
+                        if pc_data.get('take_profit', 0) > 0:
+                            trade['takeProfit'] = pc_data['take_profit']
+                        if pc_data.get('atr', 0) > 0:
+                            trade['atr'] = pc_data['atr']
+                        trade['pullbackPct'] = pc_data.get('pullback_pct', 0) or 0
+                        if pc_data.get('original_reason') and pc_data['original_reason'] != 'Closed':
+                            trade['reason'] = pc_data.get('reason', trade['reason'])
+                            trade['closeReason'] = pc_data.get('reason', trade['closeReason'])
+                        logger.info(f"📋 SYNC ENRICHED: {symbol} score={trade.get('signalScore',0)} spread={trade.get('spreadLevel','?')}")
+                except Exception as enrich_err:
+                    logger.debug(f"Sync enrichment failed for {symbol}: {enrich_err}")
+                
                 if global_paper_trader:
                     global_paper_trader.trades.append(trade)
                     synced_count += 1
@@ -3068,6 +3285,9 @@ async def lifespan(app: FastAPI):
                 
                 # Backfill last 1000 trades to SQLite (one-time on startup)
                 asyncio.create_task(live_binance_trader.backfill_trade_history_to_sqlite(1000))
+                
+                # Phase 239: Backfill missing metadata from position_closes
+                asyncio.create_task(sqlite_manager.backfill_missing_metadata(48))
             else:
                 logger.error("❌ LiveBinanceTrader failed to initialize! Sync loop will retry...")
         except Exception as e:
@@ -3080,6 +3300,8 @@ async def lifespan(app: FastAPI):
         logger.info("🔄 Binance position sync loop started (with auto-reconnect)!")
     else:
         logger.info("📄 Paper trading mode - no Binance connection")
+        # Phase 239 fix: run metadata backfill in paper mode too
+        asyncio.create_task(sqlite_manager.backfill_missing_metadata(48))
     
     # Start Liquidation Tracker
     logger.info("💀 Starting Liquidation Tracker...")
@@ -5620,6 +5842,276 @@ def compute_execution_quality_score(
         "notes": notes[:6],
     }
 
+# ============================================================================
+# Phase 239V2: Dynamic Minimum Pullback Floor
+# ============================================================================
+def compute_dynamic_min_pullback_pct(
+    atr_pct: float,
+    spread_pct: float,
+    volume_ratio: float,
+    ob_imbalance: float,
+    ob_imbalance_trend: float,
+    side: str,
+    signal_score: float,
+    adx: float = 20.0,
+    hurst: float = 0.50,
+    coin_daily_trend: str = 'NEUTRAL',
+    entry_algo_multiplier: float = 1.0,
+    # legacy compat — ignored in V2
+    ob_trend: str = 'neutral',
+    regime: str = 'neutral',
+) -> dict:
+    """Compute dynamic minimum pullback percentage (V2).
+
+    Returns dict with:
+      final_pct      — percent value (e.g. 0.85 = 0.85%)
+      base           — raw base before adjustments
+      adj_total      — sum of all adjustments
+      tight_mult     — sqrt-based entry_tightness multiplier
+      regime_band    — 'aligned' | 'neutral' | 'counter'
+      clamp_min/max  — band limits applied
+    """
+    import math
+
+    atr_p = _clamp(float(atr_pct or 2.0), 0.5, 7.0)
+    sp = float(spread_pct or 0.0)
+    vol_r = float(volume_ratio or 1.0)
+    ob_trend_val = float(ob_imbalance_trend or 0.0)
+    sc = float(signal_score or 0)
+    _adx = float(adx or 20.0)
+    _hurst = float(hurst or 0.50)
+
+    # ── base ──────────────────────────────────────────────────────
+    base = 0.50 + 0.16 * atr_p + 1.40 * max(sp - 0.03, 0.0)
+
+    # ── volume adjustment ─────────────────────────────────────────
+    vol_adj = 0.0
+    if vol_r < 1.0:
+        vol_adj = min(0.32, (1.0 - vol_r) * 0.28)
+    elif vol_r > 2.5:
+        vol_adj = -min(0.12, (vol_r - 2.5) * 0.06)
+
+    # ── order-book adjustment (uses raw trend value) ──────────────
+    ob_adj = 0.0
+    if side == 'LONG' and ob_trend_val < -4.0:
+        ob_adj = 0.20
+    elif side == 'SHORT' and ob_trend_val > 4.0:
+        ob_adj = 0.20
+    elif side == 'LONG' and ob_trend_val > 4.0:
+        ob_adj = -0.06
+    elif side == 'SHORT' and ob_trend_val < -4.0:
+        ob_adj = -0.06
+
+    # ── score adjustment ──────────────────────────────────────────
+    score_adj = 0.0
+    if sc >= 115:
+        score_adj = -0.10
+    elif sc >= 100:
+        score_adj = -0.05
+
+    # ── regime classification ─────────────────────────────────────
+    trend_aligned = (
+        (side == 'LONG' and coin_daily_trend in ('BULLISH', 'STRONG_BULLISH')) or
+        (side == 'SHORT' and coin_daily_trend in ('BEARISH', 'STRONG_BEARISH'))
+    )
+    trend_opposed = (
+        (side == 'LONG' and coin_daily_trend in ('BEARISH', 'STRONG_BEARISH')) or
+        (side == 'SHORT' and coin_daily_trend in ('BULLISH', 'STRONG_BULLISH'))
+    )
+
+    if _adx > 25 and trend_aligned:
+        regime_band = 'aligned'
+        clamp_min, clamp_max = 0.45, 1.35
+    elif (_adx > 25 and trend_opposed) or _hurst > 0.65:
+        regime_band = 'counter'
+        clamp_min, clamp_max = 0.70, 2.60
+    else:
+        regime_band = 'neutral'
+        clamp_min, clamp_max = 0.60, 1.90
+
+    # ── regime adjustment ─────────────────────────────────────────
+    regime_adj = 0.0
+    if regime_band == 'counter':
+        regime_adj = 0.15
+    elif regime_band == 'aligned':
+        regime_adj = -0.06
+
+    adj_total = vol_adj + ob_adj + score_adj + regime_adj
+
+    # ── entry_tightness (sqrt, dampened) ──────────────────────────
+    et = _clamp(float(entry_algo_multiplier or 1.0), 0.5, 15.0)
+    tight_mult = 1.0 + (math.sqrt(et) - 1.0) * 0.25
+
+    raw = (base + adj_total) * tight_mult
+    final = _clamp(raw, clamp_min, clamp_max)
+
+    logger.info(
+        f"PULLBACK_V2: side={side} atr={atr_p:.1f} sp={sp:.3f} vol={vol_r:.2f} "
+        f"ob_tr={ob_trend_val:.1f} score={sc:.0f} regime={regime_band} "
+        f"base={base:.3f} adj={adj_total:.3f} tight={tight_mult:.3f} "
+        f"raw={raw:.3f} clamp=[{clamp_min},{clamp_max}] final={final:.3f}%"
+    )
+
+    return {
+        'final_pct': round(final, 4),
+        'base': round(base, 4),
+        'adj_total': round(adj_total, 4),
+        'tight_mult': round(tight_mult, 4),
+        'regime_band': regime_band,
+        'clamp_min': clamp_min,
+        'clamp_max': clamp_max,
+    }
+
+
+# ============================================================================
+# Phase 239V2: Pending Revalidation Gate (fill öncesi son kontrol)
+# ============================================================================
+def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int) -> dict:
+    """Revalidate pending order conditions just before execution.
+
+    Returns dict with UNIFIED decision model:
+      decision       — 'PASS' | 'WARN_WAIT' | 'FAIL_DROP'
+      allow_market   — bool, whether market fallback is permitted
+      recheck_score  — float 0-100
+      reasons        — list[str] of sub-component notes
+      reason_summary — str, single-line summary for logging
+    """
+    reasons = []
+    score = 0.0
+    hard_reject = False
+
+    if not opportunity:
+        # No live data — execute (conservative: better fill than miss)
+        return {
+            'decision': 'PASS', 'allow_market': False, 'recheck_score': 50.0,
+            'reasons': ['NO_LIVE_DATA'], 'reason_summary': 'NO_LIVE_DATA',
+        }
+
+    order_side = order.get('side', '')
+    order_spread = float(order.get('spreadPct', 0.05) or 0.05)
+    order_signal_score = float(order.get('signalScore', 0) or 0)
+    created_at = int(order.get('createdAt', now_ms) or now_ms)
+    age_min = (now_ms - created_at) / 60000.0
+
+    live_side = opportunity.get('signalAction', 'NONE')
+    live_spread = float(opportunity.get('spreadPct', 0) or 0)
+    live_vol_ratio = float(opportunity.get('volumeRatio', 1.0) or 1.0)
+    live_ob_trend = float(opportunity.get('obImbalanceTrend', 0) or 0)
+
+    # ── 1. Direction alignment (30 pt) ─────────────────────────
+    if live_side == order_side:
+        score += 30
+        reasons.append(f"DIR_OK({live_side})")
+    elif live_side == 'NONE':
+        score += 15
+        reasons.append("DIR_NEUTRAL")
+    else:
+        hard_reject = True
+        reasons.append(f"DIR_FLIP({order_side}→{live_side})")
+
+    # ── 2. Spread health (20 pt) ──────────────────────────────
+    spread_limit = max(order_spread * 1.8, 0.35)
+    if live_spread <= order_spread * 1.0:
+        score += 20
+        reasons.append("SPREAD_OK")
+    elif live_spread <= order_spread * 1.3:
+        score += 14
+        reasons.append(f"SPREAD_MILD({live_spread:.3f})")
+    elif live_spread <= spread_limit:
+        score += 6
+        reasons.append(f"SPREAD_HIGH({live_spread:.3f})")
+    else:
+        hard_reject = True
+        reasons.append(f"SPREAD_REJECT({live_spread:.3f}>{spread_limit:.3f})")
+
+    # ── 3. Order book alignment (20 pt) ───────────────────────
+    if order_side == 'LONG':
+        if live_ob_trend > 2:
+            score += 20
+            reasons.append("OB_ALIGNED")
+        elif live_ob_trend > -2:
+            score += 12
+            reasons.append("OB_NEUTRAL")
+        elif live_ob_trend > -5:
+            score += 4
+            reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
+        else:
+            hard_reject = True
+            reasons.append(f"OB_VETO({live_ob_trend:.1f})")
+    else:  # SHORT
+        if live_ob_trend < -2:
+            score += 20
+            reasons.append("OB_ALIGNED")
+        elif live_ob_trend < 2:
+            score += 12
+            reasons.append("OB_NEUTRAL")
+        elif live_ob_trend < 5:
+            score += 4
+            reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
+        else:
+            hard_reject = True
+            reasons.append(f"OB_VETO({live_ob_trend:.1f})")
+
+    # ── 4. Volume / liquidity health (15 pt) ──────────────────
+    if live_vol_ratio >= 1.0:
+        score += 15
+        reasons.append("VOL_OK")
+    elif live_vol_ratio >= 0.7:
+        score += 10
+        reasons.append(f"VOL_THIN({live_vol_ratio:.2f})")
+    elif live_vol_ratio >= 0.4:
+        score += 4
+        reasons.append(f"VOL_LOW({live_vol_ratio:.2f})")
+    else:
+        if live_spread > 0.20:
+            hard_reject = True
+            reasons.append(f"LIQ_REJECT(vol={live_vol_ratio:.2f},sp={live_spread:.3f})")
+        else:
+            score += 2
+            reasons.append(f"VOL_VERYLOW({live_vol_ratio:.2f})")
+
+    # ── 5. Freshness / regime drift (15 pt) ───────────────────
+    if age_min < 10:
+        score += 15
+        reasons.append("FRESH")
+    elif age_min < 20:
+        score += 12
+        reasons.append(f"AGE_OK({age_min:.0f}m)")
+    elif age_min < 30:
+        score += 6
+        reasons.append(f"AGE_OLD({age_min:.0f}m)")
+    else:
+        score += 2
+        reasons.append(f"AGE_STALE({age_min:.0f}m)")
+
+    # ── Unified decision ──────────────────────────────────────
+    if hard_reject or score < 40:
+        decision = 'FAIL_DROP'
+        allow_market = False
+    elif score >= 65:
+        decision = 'PASS'
+        allow_market = score >= 80 and order_signal_score >= 95
+    else:
+        decision = 'WARN_WAIT'
+        allow_market = False
+
+    reason_summary = ', '.join(reasons[:4])
+    logger.info(
+        f"ENTRY_RECHECK_DECISION: {order.get('symbol','')} {order_side} "
+        f"decision={decision} score={score:.0f} hard={hard_reject} "
+        f"| {reason_summary}"
+    )
+
+    return {
+        'decision': decision,
+        'allow_market': allow_market,
+        'recheck_score': round(score, 1),
+        'reasons': reasons,
+        'reason_summary': reason_summary,
+    }
+
+
+
 
 def get_hybrid_entry_profile(
     atr_pct: float,
@@ -7325,6 +7817,15 @@ class CoinOpportunity:
         self.strategy_label: str = "Legacy"
         self.execution_reject_reason: Optional[str] = None
         self.execution_reject_ts: int = 0
+        # Phase 239V2: Pullback + recheck telemetry
+        self.pullback_dyn_base: float = 0.0
+        self.pullback_dyn_final: float = 0.0
+        self.pullback_dyn_floor: float = 0.0
+        self.pullback_dyn_regime_band: str = 'neutral'
+        self.pullback_model_version: str = 'v2'
+        self.recheck_score: float = 0.0
+        self.recheck_decision: str = ''
+        self.recheck_reasons: list = []
     
     def to_dict(self) -> dict:
         return {
@@ -7369,6 +7870,15 @@ class CoinOpportunity:
                 "strategyLabel": self.strategy_label,
                 "executionRejectReason": self.execution_reject_reason,
                 "executionRejectTs": int(self.execution_reject_ts or 0),
+                # Phase 239V2: Pullback + recheck telemetry
+                "pullbackDynBase": round(float(self.pullback_dyn_base), 4),
+                "pullbackDynFinal": round(float(self.pullback_dyn_final), 4),
+                "pullbackDynFloor": round(float(self.pullback_dyn_floor), 4),
+                "pullbackDynRegimeBand": str(self.pullback_dyn_regime_band),
+                "pullbackModelVersion": str(self.pullback_model_version),
+                "recheckScore": round(float(self.recheck_score), 1),
+                "recheckDecision": str(self.recheck_decision),
+                "recheckReasons": list(self.recheck_reasons) if self.recheck_reasons else [],
             }
 
 
@@ -7908,6 +8418,15 @@ class LightweightCoinAnalyzer:
             self.opportunity.active_strategy = signal.get('activeStrategy', 'legacy')
             self.opportunity.strategy_label = signal.get('strategyLabel', 'Legacy')
             # Execution-stage reject reason (if any) for UI observability
+            # Phase 239V2: Pullback + recheck telemetry
+            self.opportunity.pullback_dyn_base = signal.get('pullbackDynBase', 0)
+            self.opportunity.pullback_dyn_final = signal.get('pullbackDynFinal', 0)
+            self.opportunity.pullback_dyn_floor = signal.get('pullbackDynFloor', 0)
+            self.opportunity.pullback_dyn_regime_band = signal.get('pullbackDynRegimeBand', 'neutral')
+            self.opportunity.pullback_model_version = signal.get('pullbackModelVersion', 'v2')
+            self.opportunity.recheck_score = signal.get('recheckScore', 0)
+            self.opportunity.recheck_decision = signal.get('recheckDecision', '')
+            self.opportunity.recheck_reasons = signal.get('recheckReasons', [])
             try:
                 if 'global_paper_trader' in globals():
                     feedback = global_paper_trader.get_execution_feedback(self.symbol)
@@ -18691,13 +19210,44 @@ class SignalGenerator:
             is_volume_spike=is_volume_spike,
         )
         pullback_pct = float(hybrid_entry.get('pullback_pct', 0.8)) / 100.0  # percent -> fraction
-        pullback_pct = _clamp(pullback_pct, 0.0, 0.12)
         atr_pct = atr_pct_percent / 100.0
         
         # =====================================================================
-        # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de pullback bypass
+        # Phase 239V2: Dynamic minimum pullback floor (regime-aware)
+        # =====================================================================
+        dyn_result = compute_dynamic_min_pullback_pct(
+            atr_pct=atr_pct_percent,
+            spread_pct=spread_pct,
+            volume_ratio=volume_ratio,
+            ob_imbalance=imbalance,
+            ob_imbalance_trend=ob_imbalance_trend,
+            side=signal_side,
+            signal_score=score,
+            adx=adx,
+            hurst=hurst,
+            coin_daily_trend=coin_daily_trend,
+            entry_algo_multiplier=effective_entry_tightness,
+        )
+        dyn_min_pb_pct = dyn_result['final_pct']
+        dyn_regime_band = dyn_result['regime_band']
+        dyn_min_pb_frac = dyn_min_pb_pct / 100.0  # percent -> fraction
+        
+        # Apply floor: pullback must be at least dynamic minimum
+        if pullback_pct < dyn_min_pb_frac:
+            original_pb = pullback_pct
+            pullback_pct = dyn_min_pb_frac
+            reasons.append(f"DYN_FLOOR({original_pb*100:.2f}%→{pullback_pct*100:.2f}%)")
+        
+        # Upper clamp uses regime band max (converted to fraction)
+        dyn_clamp_max_frac = dyn_result['clamp_max'] / 100.0
+        pullback_pct = _clamp(pullback_pct, dyn_min_pb_frac, max(0.12, dyn_clamp_max_frac))
+        
+        # (PULLBACK_V2_FINAL log is emitted below, after momentum/EQ relax)
+        
+        # =====================================================================
+        # PHASE 152: MOMENTUM ENTRY — Güçlü trend'de kontrollü gevşeme
         # ADX > 30 (güçlü trend) + Hurst > 0.55 (trending rejim) + 
-        # Coin daily trend aligned → Direkt market entry, pullback yok
+        # Coin daily trend aligned → Pullback'i %45'e düşür (tam bypass değil)
         # =====================================================================
         strong_momentum = (
             adx > 30 and
@@ -18710,15 +19260,32 @@ class SignalGenerator:
         
         if strong_momentum:
             original_pullback = pullback_pct
-            pullback_pct = 0.0  # Market entry — no pullback
-            reasons.append(f"⚡ MOMENTUM_ENTRY(ADX={adx:.0f},H={hurst:.2f})")
-            logger.info(f"⚡ MOMENTUM ENTRY: {symbol} {signal_side} — pullback {original_pullback*100:.1f}%→0% | ADX={adx:.1f} H={hurst:.2f} trend={coin_daily_trend}")
+            # Phase 239: Controlled relaxation instead of full bypass
+            pullback_pct = max(0.0035, pullback_pct * 0.45)  # min 0.35%, reduce to 45% of locked
+            reasons.append(f"⚡ MOMENTUM_RELAX(ADX={adx:.0f},H={hurst:.2f},pb {original_pullback*100:.2f}%→{pullback_pct*100:.2f}%)")
+            logger.info(f"⚡ MOMENTUM RELAXATION: {symbol} {signal_side} — pullback {original_pullback*100:.2f}%→{pullback_pct*100:.2f}% | ADX={adx:.1f} H={hurst:.2f} trend={coin_daily_trend}")
         elif ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3:
             # PHASE EQG: STRONG QUALITY PULLBACK REDUCTION
             # 3/3 kalite koşulu geçtiyse → daha erken giriş (trend başlangıcını yakala)
             original_pb = pullback_pct
             pullback_pct *= 0.82
             reasons.append(f"EQ_EARLY(pb {original_pb*100:.1f}%→{pullback_pct*100:.1f}%)")
+        
+        # =====================================================================
+        # Phase 239V2: FINAL FLOOR GUARD — absolute invariant
+        # No relax (momentum, EQ, fib) may break the dynamic floor.
+        # =====================================================================
+        pre_final_pb = pullback_pct
+        if pullback_pct < dyn_min_pb_frac:
+            pullback_pct = dyn_min_pb_frac
+            reasons.append(f"FLOOR_GUARD({pre_final_pb*100:.2f}%→{pullback_pct*100:.2f}%)")
+        
+        logger.info(
+            f"PULLBACK_V2_FINAL: {symbol} {signal_side} hybrid={hybrid_entry.get('pullback_pct', 0.8):.2f}% "
+            f"dyn_floor={dyn_min_pb_pct:.3f}% pre_final={pre_final_pb*100:.3f}% "
+            f"final={pullback_pct*100:.3f}% tight={dyn_result.get('tight_mult', 1):.3f} "
+            f"regime={dyn_regime_band}"
+        )
         
         if signal_side == "LONG":
             atr_entry = price * (1 - pullback_pct)
@@ -18837,6 +19404,13 @@ class SignalGenerator:
             'smartLeverageMult': strategy_leverage_mult,
             'spreadLevel': spread_params['level'],
             'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
+            'pullbackMinDyn': round(dyn_min_pb_pct, 4),  # Phase 239V2: Dynamic floor (percent)
+            'pullbackModelVersion': 'v2',  # Phase 239V2
+            'pullbackDynBase': dyn_result.get('base', 0),
+            'pullbackDynAdj': dyn_result.get('adj_total', 0),
+            'pullbackDynFinal': round(pullback_pct * 100, 4),  # locked final (percent)
+            'pullbackDynFloor': round(dyn_min_pb_pct, 4),       # dynamic floor (percent)
+            'pullbackDynRegimeBand': dyn_regime_band,
             'atrPct': round(atr_pct * 100, 2),  # Phase 160: Raw ATR% for bounce calc
             'coinDailyTrend': coin_daily_trend,  # Phase 110: For position sizing
             'trendSizeReduction': trend_size_reduction,  # Phase 110: Applied reduction
@@ -19629,11 +20203,30 @@ class PaperTradingEngine:
                 existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
 
                 # Blend entry with latest signal entry (small shift to avoid hard jumps).
+                # Phase 239 fix: guard with pullbackLocked so entry never drifts past locked boundary.
                 try:
                     new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
                     old_entry = float(existing_pending.get('entryPrice', new_entry))
                     blend_alpha = 0.35 if score_gap >= 0 else 0.20
-                    existing_pending['entryPrice'] = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
+                    blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
+                    
+                    # Clamp: blended entry must not exceed locked pullback entry
+                    locked_entry_frac = float(existing_pending.get('pullbackLocked', 0))
+                    # Defensive: real fraction is clamped ≤0.12; anything above is legacy percent
+                    if locked_entry_frac > 0.12:
+                        locked_entry_frac = locked_entry_frac / 100.0
+                    if locked_entry_frac > 0:
+                        signal_price = float(existing_pending.get('signalPrice', price))
+                        if side == 'LONG':
+                            # LONG: locked entry = signalPrice * (1 - fraction)
+                            locked_limit = signal_price * (1 - locked_entry_frac)
+                            blended = min(blended, locked_limit)
+                        else:
+                            # SHORT: locked entry = signalPrice * (1 + fraction)
+                            locked_limit = signal_price * (1 + locked_entry_frac)
+                            blended = max(blended, locked_limit)
+                    
+                    existing_pending['entryPrice'] = blended
                 except Exception:
                     pass
 
@@ -19910,7 +20503,36 @@ class PaperTradingEngine:
             settings_snapshot['obi_value_at_entry'] = round(obi_cached.get('obi', 0), 4)
         except:
             settings_snapshot['obi_value_at_entry'] = 0
-        
+        # Phase 239V2: Extract dynamic pullback telemetry from signal dict
+        # (dyn_result / dyn_min_pb_pct / dyn_regime_band are NOT in open_position scope)
+        def _safe_float(val, default: float) -> float:
+            try:
+                v = float(val)
+                if v != v or v == float('inf') or v == float('-inf'):  # NaN/inf guard
+                    return default
+                return v
+            except (TypeError, ValueError):
+                return default
+
+        _sig = signal if isinstance(signal, dict) else {}
+        _dyn_floor = _safe_float(_sig.get('pullbackDynFloor', _sig.get('pullbackMinDyn', pullback_pct)), pullback_pct)
+        _dyn_base = _safe_float(_sig.get('pullbackDynBase', 0), 0.0)
+        _dyn_adj = _safe_float(_sig.get('pullbackDynAdj', 0), 0.0)
+        _dyn_final = _safe_float(_sig.get('pullbackDynFinal', pullback_pct), pullback_pct)
+        _dyn_band = str(_sig.get('pullbackDynRegimeBand', 'neutral') or 'neutral').lower()
+        # Clamp consistency
+        if _dyn_floor <= 0:
+            _dyn_floor = pullback_pct
+        if _dyn_final <= 0:
+            _dyn_final = pullback_pct
+        if _dyn_final < _dyn_floor:
+            _dyn_final = _dyn_floor
+        if _dyn_floor != pullback_pct or _dyn_final != pullback_pct:
+            logger.debug(
+                f"DYN_TELEM: {trade_symbol} floor={_dyn_floor:.4f} final={_dyn_final:.4f} "
+                f"base={_dyn_base:.4f} band={_dyn_band}"
+            )
+
         pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
@@ -19918,6 +20540,15 @@ class PaperTradingEngine:
             "signalPrice": price,
             "entryPrice": entry_price,
             "pullbackPct": pullback_pct,
+            # Phase 239V2: Dynamic pullback lock + telemetry (from signal dict)
+            "pullbackMinDyn": round(_dyn_floor, 4),
+            "pullbackLocked": round(pullback_pct / 100.0, 6),  # FRACTION
+            "pullbackModelVersion": "v2",
+            "pullbackDynBase": round(_dyn_base, 4),
+            "pullbackDynAdj": round(_dyn_adj, 4),
+            "pullbackDynFinal": round(_dyn_final, 4),
+            "pullbackDynFloor": round(_dyn_floor, 4),
+            "pullbackDynRegimeBand": _dyn_band,
             "size": position_size,
             "sizeUsd": position_size_usd,
             "stopLoss": sl,
@@ -20009,7 +20640,7 @@ class PaperTradingEngine:
                     self.pipeline_metrics['fallback_on_expire'] += 1
                     self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
                     logger.info(f"🔥 MARKET FALLBACK(EXPIRE): {side} {symbol} score={signal_score} age_expired → market fill")
-                    await self.execute_pending_order(order, current_price, force_market=True)
+                    await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
                     continue
                 if order in self.pending_orders:
                     self.pending_orders.remove(order)
@@ -20225,8 +20856,9 @@ class PaperTradingEngine:
                                 f"bottom=${extreme_price:.6f} reversal={reversal_pct:.2f}% (min={min_reversal_pct:.2f}%)"
                             )
                             self.pipeline_metrics['trail_entry_ok'] += 1
-                            await self.execute_pending_order(order, current_price)
-                            continue
+                            if await self._gate_and_execute(order, current_price, opportunities, current_time):
+                                continue
+                            continue  # wait also skips to next order
 
                     # Cancel: dropped too far below entry
                     if current_price < entry_price - cancel_distance:
@@ -20236,7 +20868,7 @@ class PaperTradingEngine:
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
                             logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} dropped too far → market fill")
-                            await self.execute_pending_order(order, current_price, force_market=True)
+                            await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
@@ -20264,7 +20896,8 @@ class PaperTradingEngine:
                                 f"peak=${extreme_price:.6f} reversal={reversal_pct:.2f}% (min={min_reversal_pct:.2f}%)"
                             )
                             self.pipeline_metrics['trail_entry_ok'] += 1
-                            await self.execute_pending_order(order, current_price)
+                            if await self._gate_and_execute(order, current_price, opportunities, current_time):
+                                continue
                             continue
 
                     # Cancel: rose too far above entry
@@ -20275,7 +20908,7 @@ class PaperTradingEngine:
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
                             logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} rose too far → market fill")
-                            await self.execute_pending_order(order, current_price, force_market=True)
+                            await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
@@ -20293,7 +20926,7 @@ class PaperTradingEngine:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
                         logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
-                        await self.execute_pending_order(order, current_price, force_market=True)
+                        await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
                         continue
                     # Normal timeout
                     if order in self.pending_orders:
@@ -20309,6 +20942,56 @@ class PaperTradingEngine:
                 if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
                     logger.debug(f"📍 TRAIL ENTRY WAIT: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} extreme=${extreme_price:.6f} dist={trail_pct:.2f}%")
     
+    async def _gate_and_execute(self, order: dict, fill_price: float,
+                                 opportunities: list, current_time: int,
+                                 force_market: bool = False) -> bool:
+        """Revalidation gate wrapper around execute_pending_order.
+        Returns True if order was executed or removed, False if wait (order stays).
+        Uses unified decision: PASS / WARN_WAIT / FAIL_DROP.
+        """
+        symbol = order.get('symbol', '')
+        side = order.get('side', '')
+        _opp = next((o for o in opportunities if o.get('symbol') == symbol), None)
+        rv = revalidate_pending_entry(order, _opp, current_time)
+
+        decision = rv['decision']
+        order['recheckScore'] = rv['recheck_score']
+        order['recheckReasons'] = rv['reasons']
+        order['recheckDecision'] = decision
+        order['recheckLastAt'] = current_time
+
+        if decision == 'FAIL_DROP':
+            if order in self.pending_orders:
+                self.pending_orders.remove(order)
+            self.pipeline_metrics.setdefault('recheck_fail', 0)
+            self.pipeline_metrics['recheck_fail'] += 1
+            self.set_execution_feedback(symbol, "ENTRY_RECHECK_FAIL")
+            self.add_log(
+                f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
+                f"| {rv['reason_summary']}"
+            )
+            return True  # order removed
+
+        if decision == 'WARN_WAIT' and not force_market:
+            self.pipeline_metrics.setdefault('recheck_warn', 0)
+            self.pipeline_metrics['recheck_warn'] += 1
+            order['confirmAfter'] = max(
+                int(order.get('confirmAfter', current_time)),
+                current_time + 30_000
+            )
+            logger.info(
+                f"⚠️ ENTRY_RECHECK_WAIT: {symbol} {side} score={rv['recheck_score']:.0f} "
+                f"→ waiting 30s | {rv['reason_summary']}"
+            )
+            return False  # order stays, not executed
+
+        # PASS — execute
+        self.pipeline_metrics.setdefault('recheck_pass', 0)
+        self.pipeline_metrics['recheck_pass'] += 1
+        # force_market is passed through as-is; recheck does NOT downgrade it.
+        await self.execute_pending_order(order, fill_price, force_market=force_market)
+        return True
+
     async def execute_pending_order(self, order: dict, fill_price: float, force_market: bool = False):
         """Execute a pending order at the fill price.
         Args:
@@ -20427,6 +21110,18 @@ class PaperTradingEngine:
             "leverage": order['leverage'],
             "spreadLevel": order['spreadLevel'],
             "pullbackPct": order.get('pullbackPct', 1.0),  # Adverse exit kontrolü için
+            # Phase 239V2: Dynamic pullback telemetry (propagated from pending order)
+            "pullbackMinDyn": order.get('pullbackMinDyn', 0.60),
+            "pullbackLocked": order.get('pullbackLocked', 0),
+            "pullbackModelVersion": order.get('pullbackModelVersion', 'v2'),
+            "pullbackDynBase": order.get('pullbackDynBase', 0),
+            "pullbackDynAdj": order.get('pullbackDynAdj', 0),
+            "pullbackDynFinal": order.get('pullbackDynFinal', 0),
+            "pullbackDynFloor": order.get('pullbackDynFloor', 0),
+            "pullbackDynRegimeBand": order.get('pullbackDynRegimeBand', 'neutral'),
+            "recheckScore": order.get('recheckScore', 0),
+            "recheckDecision": order.get('recheckDecision', 'PASS'),
+            "recheckReasons": order.get('recheckReasons', []),
             # Phase 49: Carry forward analysis data from pending order
             "signalScore": order.get('signalScore', 0),
             "mtfScore": order.get('mtfScore', 0),
@@ -22754,6 +23449,13 @@ async def paper_trading_status():
     """Get current paper trading status - used for initial UI sync."""
     today_pnl_data = global_paper_trader.get_today_pnl()
     stats_with_today = {**global_paper_trader.stats, **today_pnl_data}
+    
+    # Phase 239: Data quality metrics
+    try:
+        data_quality = await sqlite_manager.get_trade_data_quality_24h()
+    except Exception:
+        data_quality = {}
+    
     return JSONResponse({
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
@@ -22769,6 +23471,14 @@ async def paper_trading_status():
         "lastOrderError": live_binance_trader.last_order_error,
         # Phase 237D: Reject attribution summary
         "falseNegativeSummary": get_reject_attribution_summary() if REJECT_ATTRIBUTION_ENABLED else {},
+        # Phase 239: Trade metadata quality
+        "dataQuality": data_quality,
+        # Phase 239V2: Revalidation gate stats
+        "recheckStats": {
+            "pass": global_paper_trader.pipeline_metrics.get('recheck_pass', 0),
+            "fail": global_paper_trader.pipeline_metrics.get('recheck_fail', 0),
+            "warn": global_paper_trader.pipeline_metrics.get('recheck_warn', 0),
+        },
     })
 
 

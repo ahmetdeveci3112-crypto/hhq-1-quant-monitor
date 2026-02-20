@@ -338,6 +338,17 @@ export interface CoinOpportunity {
   // Execution-stage reject reason from backend pipeline (if signal couldn't become an order)
   executionRejectReason?: string | null;
   executionRejectTs?: number;
+  // Phase 239V2: Dynamic pullback V2 telemetry
+  pullbackDynBase?: number;
+  pullbackDynFinal?: number;   // locked final pullback (percent)
+  pullbackDynFloor?: number;   // dynamic minimum floor (percent)
+  pullbackMinDyn?: number;     // legacy compat: older payload floor field
+  pullbackDynRegimeBand?: string;
+  pullbackModelVersion?: string;
+  // Phase 239V2: Revalidation gate (unified decision model)
+  recheckScore?: number;
+  recheckDecision?: string;  // 'PASS' | 'WARN_WAIT' | 'FAIL_DROP' | ''
+  recheckReasons?: string[];
 }
 
 export interface ScannerStats {
