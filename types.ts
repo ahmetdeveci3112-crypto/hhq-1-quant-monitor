@@ -99,9 +99,9 @@ export type CloseReason =
   | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
   // Phase 142: Portfolio Recovery Close
   | 'RECOVERY_CLOSE_ALL'
-  // Phase 232: New reasons
+  // Phase 232 / Phase 206: New reasons
   | 'FAILED_CONTINUATION' | 'PORTFOLIO_DRAWDOWN'
-  | 'BREAKEVEN_CLOSE' | 'RECOVERY_TRAIL_CLOSE'
+  | 'BREAKEVEN_CLOSE' | 'RECOVERY_TRAIL_CLOSE' | 'TRAILING_DD_LOCK'
   // Manual & Signal-based
   | 'MANUAL' | 'MANUAL_CLOSE' | 'SIGNAL' | 'SIGNAL_REVERSAL_PROFIT' | 'SIGNAL_REVERSAL'
   // External & System
@@ -347,8 +347,10 @@ export interface CoinOpportunity {
   pullbackModelVersion?: string;
   // Phase 239V2: Revalidation gate (unified decision model)
   recheckScore?: number;
-  recheckDecision?: string;  // 'PASS' | 'WARN_WAIT' | 'FAIL_DROP' | ''
   recheckReasons?: string[];
+  // Phase 205: pandas-ta observability
+  squeezeFiring?: boolean;
+  chopIndex?: number;
 }
 
 export interface ScannerStats {

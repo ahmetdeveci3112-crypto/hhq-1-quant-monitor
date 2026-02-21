@@ -13,6 +13,7 @@ const REASON_MAP: Record<string, string> = {
     'TRAILING': '📈 Trailing: Takip Eden SL Tetiklendi',
     'TRAILING_STOP': '📈 Trailing: Trailing Stop Aktif',
     'TRAIL_EXIT': '📈 Trail: Trailing Stop Çıkışı',
+    'TRAILING_DD_LOCK': '🛡️ Profit Lock: Karlılık Zirveden Fazla Düştü',
 
     // ===== BREAKEVEN =====
     'BREAKEVEN_CLOSE': '🔒 Breakeven: Fiyat Giriş Noktasına Döndü',
@@ -97,6 +98,7 @@ export const translateReason = (reason: string | undefined): string => {
     if (reason.includes('KILL_SWITCH_PARTIAL')) return REASON_MAP['KILL_SWITCH_PARTIAL'];
     if (reason.includes('KILL_SWITCH')) return '🚨 Kill Switch: Zarar Limiti Aşıldı';
     if (reason.includes('KILL')) return '🚨 Kill Switch Tetiklendi';
+    if (reason.includes('TRAILING_DD_LOCK')) return REASON_MAP['TRAILING_DD_LOCK'];
     if (reason.includes('TIME_GRADUAL')) return REASON_MAP['TIME_GRADUAL'];
     if (reason.includes('TIME_FORCE')) return REASON_MAP['TIME_FORCE'];
     if (reason.includes('EARLY_TRAIL')) return REASON_MAP['EARLY_TRAIL'];

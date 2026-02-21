@@ -158,6 +158,9 @@ const getQualityTooltip = (signal: CoinOpportunity): string => {
         lines.push('Fibonacci: pasif');
     }
     lines.push(`Strateji: ${strategy}`);
+    if (signal.chopIndex !== undefined) {
+        lines.push(`CHOP Endeksi: ${signal.chopIndex.toFixed(1)}`);
+    }
 
     if (signal.btcFilterNote) {
         lines.push(`BTC notu: ${signal.btcFilterNote}`);
@@ -238,6 +241,26 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
     const badges: React.ReactNode[] = [];
     const withDetails = (headline: string) => qualityTooltip ? `${headline}\n${qualityTooltip}` : headline;
 
+    // Phase 205: Squeeze badge
+    if (signal.squeezeFiring) {
+        badges.push(
+            <span key="sqz" className="text-[9px] px-1 py-0.5 rounded font-bold bg-fuchsia-500/20 text-fuchsia-400"
+                title={withDetails(`TTM Squeeze 🗜️ Patlamaya Hazır!`)}>
+                🗜️SQZ
+            </span>
+        );
+    }
+
+    // Phase 208: SMC Order Block / FVG Zone badge (from reason parsing)
+    if (signal.reason && (signal.reason.includes('OB:') || signal.reason.includes('FVG:'))) {
+        badges.push(
+            <span key="smc" className="text-[9px] px-1 py-0.5 rounded font-bold bg-blue-500/20 text-blue-400"
+                title={withDetails(`SMC: ${signal.reason.includes('OB:') ? 'Order Block' : 'Fair Value Gap'} Bölgesi`)}>
+                🧱SMC
+            </span>
+        );
+    }
+
     // EQ badge
     if (signal.entryQualityPass) {
         const count = signal.entryQualityReasons?.length || 0;
@@ -277,16 +300,21 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
         );
     }
 
-    // SMART_V2 strategy badge
-    if (signal.strategyMode === 'SMART_V2') {
-        const strat = signal.strategyLabel || signal.activeStrategy || 'SMART_V2';
+    // SMART_V2 & Strategy Router badge (Phase 207)
+    if (signal.strategyMode === 'SMART_V2' || signal.activeStrategy || signal.strategyLabel) {
+        const strat = signal.strategyLabel || signal.activeStrategy || signal.strategyMode || 'SMART_V2';
+        let bgClass = "bg-cyan-500/15 text-cyan-300"; // default
+
+        if (strat.includes('TREND')) bgClass = "bg-emerald-500/20 text-emerald-300 border border-emerald-500/20";
+        if (strat.includes('MEAN_REOVERSION') || strat.includes('RSI')) bgClass = "bg-amber-500/20 text-amber-300 border border-amber-500/20";
+
         badges.push(
             <span
                 key="s2"
-                className="text-[9px] px-1 py-0.5 rounded font-bold bg-cyan-500/15 text-cyan-300"
+                className={`text-[9px] px-1 py-0.5 rounded font-bold ${bgClass}`}
                 title={withDetails(`Aktif Strateji: ${strat}`)}
             >
-                S2:{strat}
+                {strat.replace('SMART_V2', 'S2')}
             </span>
         );
     }
@@ -465,7 +493,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         </span>
                         {typeof signal.recheckScore === 'number' && signal.recheckScore > 0 ? (
                             <span className={`${signal.recheckScore >= 80 ? 'text-emerald-400' : signal.recheckScore >= 65 ? 'text-amber-400' : 'text-rose-400'}`}
-                                title={`Recheck: ${signal.recheckDecision || '-'} (${signal.recheckScore}) | ${(signal.recheckReasons || []).join(', ')}`}>
+                                title={`Recheck Score: ${signal.recheckScore} | ${(signal.recheckReasons || []).join(', ')}`}>
                                 RCK:{signal.recheckScore.toFixed(0)}
                             </span>
                         ) : null}
@@ -691,7 +719,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     {typeof signal.recheckScore === 'number' && signal.recheckScore > 0 ? (
                                                         <span className={`text-[9px] font-mono font-bold ${signal.recheckScore >= 80 ? 'text-emerald-400' :
                                                             signal.recheckScore >= 65 ? 'text-amber-400' : 'text-rose-400'
-                                                            }`} title={`Recheck: ${signal.recheckDecision || '-'} (${signal.recheckScore}) | ${(signal.recheckReasons || []).join(', ')}`}>
+                                                            }`} title={`Recheck Score: ${signal.recheckScore} | ${(signal.recheckReasons || []).join(', ')}`}>
                                                             RCK:{signal.recheckScore.toFixed(0)}
                                                         </span>
                                                     ) : null}

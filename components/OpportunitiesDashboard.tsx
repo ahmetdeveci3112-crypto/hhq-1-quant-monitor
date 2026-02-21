@@ -169,6 +169,12 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                             RET:{getRejectReasonKey(coin.executionRejectReason)}
                         </span>
                     )}
+                    {coin.squeezeFiring && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-fuchsia-500/20 text-fuchsia-400"
+                            title="TTM Squeeze 🗜️ Patlamaya Hazır!">
+                            🗜️SQZ
+                        </span>
+                    )}
                 </div>
             )}
 
