@@ -4133,6 +4133,9 @@ def calculate_enhanced_indicators(highs: list, lows: list, closes: list, volumes
         'ema_21': 0.0,
         'ema_cross': 'NEUTRAL',
         'vwap_value': 0.0,
+        'squeeze_on': False,
+        'squeeze_hist': 0.0,
+        'chop_value': 50.0,
     }
     
     if len(closes) < 30:
@@ -4237,6 +4240,32 @@ def calculate_enhanced_indicators(highs: list, lows: list, closes: list, volumes
                         result['vwap_value'] = float(vwap.iloc[-1] or 0)
                 except Exception:
                     pass
+
+            # Choppiness Index (14)
+            # CHOP > 61.8 means choppy/ranging, CHOP < 38.2 means trending
+            try:
+                chop = df.ta.chop(length=14)
+                if chop is not None and not chop.empty:
+                    result['chop_value'] = float(chop.iloc[-1] or 50.0)
+            except Exception:
+                pass
+
+            # TTM Squeeze
+            # Identifies periods of market consolidation (squeeze) and momentum breakouts
+            try:
+                # Returns DataFrame with columns like SQZ_20_2.0_20_1.5, SQZ_ON, SQZ_OFF, SQZ_NO
+                sqz = df.ta.squeeze(length=20, bb_std=2.0, kc_mult=1.5, mom_length=20)
+                if sqz is not None and not sqz.empty:
+                    sqz_on_col = [c for c in sqz.columns if 'SQZ_ON' in c]
+                    # The main momentum histogram column
+                    sqz_hist_col = [c for c in sqz.columns if c.startswith('SQZ_') and 'ON' not in c and 'OFF' not in c and 'NO' not in c]
+                    
+                    if sqz_on_col:
+                        result['squeeze_on'] = bool(sqz[sqz_on_col[0]].iloc[-1] == 1)
+                    if sqz_hist_col:
+                        result['squeeze_hist'] = float(sqz[sqz_hist_col[0]].iloc[-1] or 0.0)
+            except Exception as sqz_err:
+                logger.debug(f"Squeeze calc error: {sqz_err}")
         
         else:
             # Manual fallback calculations (basic versions)
@@ -18615,6 +18644,32 @@ class SignalGenerator:
             elif signal_side == "SHORT" and ema_cross == 'BEARISH':
                 score += 5
                 reasons.append("EMA_BEAR+5")
+
+            # Layer 23: TTM Squeeze Momentum Confirmation (+5/-10)
+            # Squeeze ON = consolide (patlamadı), Squeeze OFF + Histogram = Patlama!
+            sqz_on = ei.get('squeeze_on', False)
+            sqz_hist = ei.get('squeeze_hist', 0.0)
+            if sqz_on:
+                # Hala sıkışma alanında, net bir kopuş (breakout) yok
+                score -= 10
+                reasons.append("SQZ_ON-10")
+            elif signal_side == "LONG" and sqz_hist > 0:
+                score += 5
+                reasons.append("SQZ_BULL+5")
+            elif signal_side == "SHORT" and sqz_hist < 0:
+                score += 5
+                reasons.append("SQZ_BEAR+5")
+
+            # Layer 24: Choppiness Index (CHOP) Penalty/Bonus (-20/+5)
+            # CHOP > 61.8 = Aşırı yatay, yönsüzlük (Breakout için KÖTÜ)
+            # CHOP < 38.2 = Güçlü trend (Breakout için İYİ)
+            chop = ei.get('chop_value', 50.0)
+            if chop > 61.8:
+                score -= 20
+                reasons.append(f"CHOP_RNG({chop:.1f})-20")
+            elif chop < 38.2:
+                score += 5
+                reasons.append(f"CHOP_TRD({chop:.1f})+5")
         
         # =====================================================================
         # PHASE FIB: FIBONACCI ZONE CONFLUENCE (Layer 23, max +12)
