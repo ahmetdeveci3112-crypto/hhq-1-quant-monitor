@@ -383,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-21 | 207 | Jesse-Inspired Strategy Router: CoinProfiler'a "MAJOR/MEME" tip sınıflandırması eklendi. Strateji rotalaması için StrategyRouter ile Trend vs. Mean Reversion dinamik ağırlıklandırıldı. |
 | 2026-02-21 | 206 | Freqtrade Trailing Max Drawdown Guard (Kâr Kilidi): Günlük zirve bakiyeden %5 düşüşte tüm işlemleri durdurur. |
 | 2026-02-21 | 205 | pandas-ta entegrasyonu: TTM Squeeze Momentum (+5/-10) ve Choppiness Index (-20/+5) filtreleri eklendi |
 | 2026-02-21 | 204 | Core Math Fixes (ATR RMA, Hurst, EMA) & Adaptive Macro Regime Exits |

@@ -13996,8 +13996,18 @@ class CoinProfiler:
                 sl_atr = 2.0
                 tp_atr = 3.0
             
+            # Phase 207: Coin Type Sınıflandırması
+            symbol_upper = symbol.upper()
+            if symbol_upper.startswith(('BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'AVAX')):
+                coin_type = "MAJOR"
+            elif avg_atr_pct > 3.5 or any(meme in symbol_upper for meme in ['PEPE', 'SHIB', 'DOGE', 'FLOKI', 'BONK', 'WIF', 'BOME', 'MEME', 'TURBO', '1000']):
+                coin_type = "MEME"
+            else:
+                coin_type = "ALTCOIN"
+            
             profile = {
                 'symbol': symbol,
+                'coin_type': coin_type,
                 'avg_atr_pct': round(avg_atr_pct, 4),
                 'zscore_95th': round(zscore_95th, 4),
                 'zscore_std': round(zscore_std, 4),
@@ -14020,8 +14030,17 @@ class CoinProfiler:
     
     def _get_default_profile(self, symbol: str) -> dict:
         """Varsayılan profil (analiz başarısız olursa)."""
+        symbol_upper = symbol.upper()
+        if symbol_upper.startswith(('BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'AVAX')):
+            coin_type = "MAJOR"
+        elif any(meme in symbol_upper for meme in ['PEPE', 'SHIB', 'DOGE', 'FLOKI', 'BONK', 'WIF', 'BOME', 'MEME', 'TURBO', '1000']):
+            coin_type = "MEME"
+        else:
+            coin_type = "ALTCOIN"
+            
         return {
             'symbol': symbol,
+            'coin_type': coin_type,
             'avg_atr_pct': 2.0,
             'zscore_95th': 2.0,
             'zscore_std': 0.5,
@@ -14070,6 +14089,83 @@ class CoinProfiler:
 
 # Global CoinProfiler instance
 coin_profiler = CoinProfiler()
+
+# ============================================================================
+# PHASE 207: JESSE-INSPIRED STRATEGY ROUTER
+# ============================================================================
+
+class StrategyRouter:
+    """
+    Phase 207: Jesse-Inspired Strategy Router
+    Coin'in profiline ve hacimsel/volatilite yapısına göre en uygun stratejiyi seçer 
+    veya uyumsuz stratejileri bloke eder (örn: Major coinlerde MeanReversion kısıtlaması).
+    """
+    
+    @staticmethod
+    def route_strategy(coin_profile: dict, zscore: float, hurst: float, adx: float, market_regime: str) -> dict:
+        """
+        Gelen coin profilini ve koşulları değerlendirerek strateji rotası ve skor ağırlıkları döndürür.
+        """
+        coin_type = coin_profile.get('coin_type', 'ALTCOIN')
+        avg_atr = coin_profile.get('avg_atr_pct', 2.0)
+        
+        # Varsayılan Rota
+        route = {
+            'recommended_strategy': 'mixed',
+            'trend_weight': 1.0,
+            'mean_reversion_weight': 1.0,
+            'reason': 'Normative behavior',
+            'veto_mr': False,
+            'veto_tf': False
+        }
+        
+        # KURAL 1: MAJOR COINLER TEPKİSELDİR (Trend)
+        if coin_type == "MAJOR":
+            if market_regime != "RANGING" and adx > 25:
+                route['recommended_strategy'] = 'trend_following'
+                route['trend_weight'] = 1.3
+                route['mean_reversion_weight'] = 0.4  # Z-Score sinyali çıksa bile zayıflar
+                route['reason'] = 'Major Coin in Trend (Favoring TF)'
+                if adx > 35:
+                    route['veto_mr'] = True # Çok güçlü trendde Mean Reversion iptal
+            else:
+                route['recommended_strategy'] = 'mean_reversion'
+                route['trend_weight'] = 0.8
+                route['mean_reversion_weight'] = 1.1
+                route['reason'] = 'Major Coin in Range (Favoring MR)'
+                
+        # KURAL 2: MEME COINLER SERT FİTİL ATAR (Mean Reversion)
+        elif coin_type == "MEME" or avg_atr > 4.0:
+            if adx < 35:
+                route['recommended_strategy'] = 'mean_reversion'
+                route['trend_weight'] = 0.5
+                route['mean_reversion_weight'] = 1.4
+                route['reason'] = 'Meme/Volatile in Range (Favoring Contratrend)'
+                route['veto_tf'] = True # Hacimsiz anlarda Trend Following fake atar
+            else:
+                route['recommended_strategy'] = 'momentum_breakout'
+                route['trend_weight'] = 1.5
+                route['mean_reversion_weight'] = 0.2
+                route['reason'] = 'Meme Coin Breakout (High Momentum)'
+                route['veto_mr'] = True # Hacimli patlamada MR iptal
+
+        # KURAL 3: DEFAULT ALTCOIN
+        else:
+            if adx > 25 and hurst > 0.55:
+                route['recommended_strategy'] = 'trend_following'
+                route['trend_weight'] = 1.2
+                route['mean_reversion_weight'] = 0.8
+                route['reason'] = 'Trending Altcoin'
+            elif hurst < 0.45:
+                route['recommended_strategy'] = 'mean_reversion'
+                route['trend_weight'] = 0.8
+                route['mean_reversion_weight'] = 1.2
+                route['reason'] = 'Ranging Altcoin'
+
+        return route
+
+strategy_router = StrategyRouter()
+
 
 
 # ============================================================================
@@ -18239,6 +18335,20 @@ class SignalGenerator:
                 f"eff_thresh={effective_threshold:.2f} {exceeds} | mode={strategy_mode} strat={active_strategy}"
             )
         
+        # PHASE 207: JESSE-INSPIRED STRATEGY ROUTING
+        # Coin'in karakterine ve piyasa rejimine gore rota cikar
+        router_profile = {}
+        if coin_profile:
+            # Check for global strategy_router inside generate_signal scope
+            if 'strategy_router' in globals():
+                router_profile = strategy_router.route_strategy(
+                    coin_profile=coin_profile,
+                    zscore=zscore,
+                    hurst=hurst,
+                    adx=adx,
+                    market_regime=market_regime
+                )
+        
         # 2. CONFIDENCE SCORING SYSTEM (0-100)
         score = 0
         reasons = []
@@ -18255,6 +18365,11 @@ class SignalGenerator:
         
         # Simple mean reversion logic (contrarian)
         if abs(zscore) > effective_threshold:
+            # Phase 207: Strategy Router VETO check for Mean Reversion
+            if router_profile.get('veto_mr', False):
+                logger.debug(f"🛑 VETO: Router engelledi ({symbol}, MR_VETO) - {router_profile.get('reason')}")
+                return None
+                
             if zscore > effective_threshold:
                 signal_side = "SHORT"
                 reasons.append(f"Z(+{zscore:.1f})")
@@ -18262,8 +18377,13 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
-            # Phase 152: Base score 50 — Z-Score güçlü sinyal, 1 aligned katman yeterli
-            score += 50
+            # Phase 152: Base score 50
+            # Phase 207: Router Ağırlığı ile Çarp
+            mr_weight = router_profile.get('mean_reversion_weight', 1.0)
+            base_score = int(50 * mr_weight)
+            score += base_score
+            if mr_weight != 1.0:
+                reasons.append(f"ROUTE_MR(x{mr_weight})")
             
             # Phase 152: Hurst etkisi artık SADECE threshold'da (calculate_adaptive_threshold)
             # Scoring'deki çifte etki kaldırıldı — tutarlılık için
@@ -18292,8 +18412,13 @@ class SignalGenerator:
             # ADX trend alignment bonus (sadece yön uyumlu sinyallere)
             if (adx_trend == "BULLISH" and signal_side == "LONG") or \
                (adx_trend == "BEARISH" and signal_side == "SHORT"):
-                score += 5
-                reasons.append(f"ADX_ALIGN({adx:.0f})")
+                
+                # Phase 207: Trend Following Ağırlığı Uygula
+                if not router_profile.get('veto_tf', False):
+                    tf_weight = router_profile.get('trend_weight', 1.0)
+                    bonus = int(5 * tf_weight)
+                    score += bonus
+                    reasons.append(f"ADX_ALIGN({adx:.0f})+{bonus}")
         
         # Volume spike warning (for breakout detection)
         if is_volume_spike:
@@ -18585,24 +18710,33 @@ class SignalGenerator:
         if enhanced_indicators:
             ei = enhanced_indicators
             
+            # Phase 207: Strategy Router Multipliers
+            tf_weight = router_profile.get('trend_weight', 1.0) if not router_profile.get('veto_tf', False) else 0.0
+            mr_weight = router_profile.get('mean_reversion_weight', 1.0) if not router_profile.get('veto_mr', False) else 0.0
+            
             # Layer 19: MACD Momentum Confirmation (+5/+8)
             # MACD histogram sinyal yönünü onaylıyorsa bonus
             macd_hist = ei.get('macd_histogram', 0)
             macd_cross = ei.get('macd_signal_cross', 'NEUTRAL')
-            if signal_side == "LONG":
-                if macd_cross == 'BULLISH':
-                    score += 8
-                    reasons.append("MACD_CROSS_BULL+8")
-                elif macd_hist > 0:
-                    score += 5
-                    reasons.append(f"MACD_POS+5")
-            elif signal_side == "SHORT":
-                if macd_cross == 'BEARISH':
-                    score += 8
-                    reasons.append("MACD_CROSS_BEAR+8")
-                elif macd_hist < 0:
-                    score += 5
-                    reasons.append(f"MACD_NEG+5")
+            if tf_weight > 0:
+                if signal_side == "LONG":
+                    if macd_cross == 'BULLISH':
+                        bonus = int(8 * tf_weight)
+                        score += bonus
+                        reasons.append(f"MACD_CROSS_BULL+{bonus}")
+                    elif macd_hist > 0:
+                        bonus = int(5 * tf_weight)
+                        score += bonus
+                        reasons.append(f"MACD_POS+{bonus}")
+                elif signal_side == "SHORT":
+                    if macd_cross == 'BEARISH':
+                        bonus = int(8 * tf_weight)
+                        score += bonus
+                        reasons.append(f"MACD_CROSS_BEAR+{bonus}")
+                    elif macd_hist < 0:
+                        bonus = int(5 * tf_weight)
+                        score += bonus
+                        reasons.append(f"MACD_NEG+{bonus}")
             
             # Layer 20: Bollinger Bands Position Confirmation (+5/+8)
             # LONG + fiyat alt BB'de = düşük fiyat desteği, SHORT + fiyat üst BB'de
@@ -18620,30 +18754,38 @@ class SignalGenerator:
             # StochRSI crossover + extreme zone = güçlü momentum sinyali
             stoch_k = ei.get('stoch_rsi_k', 50)
             stoch_cross = ei.get('stoch_rsi_cross', 'NEUTRAL')
-            if signal_side == "LONG":
-                if stoch_cross == 'BULLISH':
-                    score += 8
-                    reasons.append(f"SRSI_BULL({stoch_k:.0f})+8")
-                elif stoch_k < 20:
-                    score += 5
-                    reasons.append(f"SRSI_OS({stoch_k:.0f})+5")
-            elif signal_side == "SHORT":
-                if stoch_cross == 'BEARISH':
-                    score += 8
-                    reasons.append(f"SRSI_BEAR({stoch_k:.0f})+8")
-                elif stoch_k > 80:
-                    score += 5
-                    reasons.append(f"SRSI_OB({stoch_k:.0f})+5")
+            if mr_weight > 0:
+                if signal_side == "LONG":
+                    if stoch_cross == 'BULLISH':
+                        bonus = int(8 * mr_weight)
+                        score += bonus
+                        reasons.append(f"SRSI_BULL({stoch_k:.0f})+{bonus}")
+                    elif stoch_k < 20:
+                        bonus = int(5 * mr_weight)
+                        score += bonus
+                        reasons.append(f"SRSI_OS({stoch_k:.0f})+{bonus}")
+                elif signal_side == "SHORT":
+                    if stoch_cross == 'BEARISH':
+                        bonus = int(8 * mr_weight)
+                        score += bonus
+                        reasons.append(f"SRSI_BEAR({stoch_k:.0f})+{bonus}")
+                    elif stoch_k > 80:
+                        bonus = int(5 * mr_weight)
+                        score += bonus
+                        reasons.append(f"SRSI_OB({stoch_k:.0f})+{bonus}")
             
             # Layer 22: EMA Crossover Trend Confirmation (+5)
             # EMA(8) x EMA(21) — kısa vadeli trend yönü
             ema_cross = ei.get('ema_cross', 'NEUTRAL')
-            if signal_side == "LONG" and ema_cross == 'BULLISH':
-                score += 5
-                reasons.append("EMA_BULL+5")
-            elif signal_side == "SHORT" and ema_cross == 'BEARISH':
-                score += 5
-                reasons.append("EMA_BEAR+5")
+            if tf_weight > 0:
+                if signal_side == "LONG" and ema_cross == 'BULLISH':
+                    bonus = int(5 * tf_weight)
+                    score += bonus
+                    reasons.append(f"EMA_BULL+{bonus}")
+                elif signal_side == "SHORT" and ema_cross == 'BEARISH':
+                    bonus = int(5 * tf_weight)
+                    score += bonus
+                    reasons.append(f"EMA_BEAR+{bonus}")
 
             # Layer 23: TTM Squeeze Momentum Confirmation (+5/-10)
             # Squeeze ON = consolide (patlamadı), Squeeze OFF + Histogram = Patlama!
