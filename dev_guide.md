@@ -383,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-21 | 204 | Core Math Fixes (ATR RMA, Hurst, EMA) & Adaptive Macro Regime Exits |
 | 2026-02-11 | 193 | Trading Kütüphane Entegrasyonları: pandas-ta, CCXT WS, StoplossGuard, FreqAI ML, Optuna Hyperopt |
 | 2026-02-07 | 149 | Code Quality Refactor: safe_create_task, pending_close_reasons persist, WhaleDetector cleanup |
 | 2026-02-06 | 148 | Binance Trade History Sync (5 min periodic) |

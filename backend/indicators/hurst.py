@@ -77,15 +77,7 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
         # autocorr = -0.5 → H = 0.25 (strong mean reversion)
         hurst = 0.5 + (avg_autocorr * 0.5)
         
-        # Add variance-based adjustment for more differentiation
-        # High variance coins get slight trending bias, low variance slight MR bias
-        returns_std = np.std(returns)
-        median_std = 0.02  # Typical crypto daily return std
-        
-        if returns_std > median_std * 2:
-            hurst += 0.05  # Volatile = slight trending bias
-        elif returns_std < median_std * 0.5:
-            hurst -= 0.05  # Calm = slight MR bias
+        # Remove manual variance-based adjustment for pure autocorrelation Hurst
         
         # Clamp to reasonable bounds
         hurst = max(0.15, min(0.85, hurst))

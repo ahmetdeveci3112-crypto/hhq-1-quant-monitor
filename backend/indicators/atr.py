@@ -28,7 +28,7 @@ def calculate_atr(highs: list, lows: list, closes: list, period: int = 14) -> fl
     if len(closes) < period + 1:
         # Not enough data, estimate from price volatility
         if closes:
-            return np.std(closes[-20:]) * 2 if len(closes) >= 20 else closes[-1] * 0.02
+            return closes[-1] * 0.02  # Fallback to 2% of price instead of std * 2
         return 0.0
     
     try:
@@ -45,7 +45,10 @@ def calculate_atr(highs: list, lows: list, closes: list, period: int = 14) -> fl
         
         # ATR is the moving average of True Range
         if len(true_range) >= period:
-            atr = np.mean(true_range[-period:])
+            # Wilder's Smoothing (RMA)
+            atr = np.mean(true_range[:period])  # SMA for the first ATR
+            for tr in true_range[period:]:
+                atr = (atr * (period - 1) + tr) / period
             return float(atr)
         return float(np.mean(true_range))
         

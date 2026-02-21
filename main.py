@@ -12622,13 +12622,18 @@ class MultiTimeframeConfirmation:
         if len(closes) < 10:
             return {"trend": "NEUTRAL", "strength": 0.0}
         
-        closes_arr = np.array(closes[-30:] if len(closes) >= 30 else closes)
+        # Use full available closes (up to 100) for proper EMA warmup
+        closes_arr = np.array(closes[-100:] if len(closes) >= 100 else closes)
         
-        # Simple EMA10
-        alpha = 2 / (10 + 1)
-        ema = closes_arr[0]
-        for c in closes_arr[1:]:
-            ema = alpha * c + (1 - alpha) * ema
+        # Simple EMA10 with proper SMA warm-up
+        period = 10
+        if len(closes_arr) <= period:
+            ema = np.mean(closes_arr)
+        else:
+            ema = np.mean(closes_arr[:period])
+            alpha = 2 / (period + 1)
+            for c in closes_arr[period:]:
+                ema = alpha * c + (1 - alpha) * ema
         
         current_price = closes_arr[-1]
         
@@ -14335,35 +14340,24 @@ class PositionBasedKillSwitch:
     def get_dynamic_thresholds(self, leverage: int) -> tuple:
         """
         Calculate dynamic thresholds based on position's leverage.
-        
-        Higher leverage = LOOSER thresholds (more tolerance for volatility)
-        Lower leverage = TIGHTER thresholds (less tolerance needed)
-        
-        Logic: High leverage coins (BTC/ETH) are low spread, so we give more room.
-               Low leverage coins (shitcoins) are high spread, but we close earlier
-               because they have higher risk.
+        Phase 203: Leverage factor scaling removed. 
+        A 30% loss of invested margin is 30% regardless of leverage.
+        Returns strict Portfolio Margin Risk thresholds.
         
         Returns: (first_reduction_pct, full_close_pct)
         """
         if leverage <= 0:
             leverage = 10  # Default
         
-        # Adjustment factor: leverage / 10
-        # Higher leverage = larger factor = looser threshold
-        # Lower leverage = smaller factor = tighter threshold
-        # Using sqrt for smoother scaling
-        factor = (leverage / 10.0) ** 0.5  # sqrt scaling
+        # Factor is exactly 1.0 to enforce strict threshold limits across all leverages
+        factor = 1.0
         
-        # Use UI-configured thresholds (first_reduction_pct, full_close_pct) as base
-        # These can be changed via Settings Modal
         first_reduction = self.first_reduction_pct * factor
         full_close = self.full_close_pct * factor
         
         # Clamp to reasonable bounds
-        # Min: -40% (very tight) for low leverage shitcoins
-        # Max: -120% (loose) for high leverage majors
-        first_reduction = max(-200.0, min(-30.0, first_reduction))
-        full_close = max(-300.0, min(-60.0, full_close))
+        first_reduction = max(-100.0, min(-10.0, first_reduction))
+        full_close = max(-150.0, min(-20.0, full_close))
         
         return (first_reduction, full_close)
 
@@ -15243,16 +15237,14 @@ class BreakevenStopManager:
         # Track breakeven state per position: {symbol: {active: bool, entry_price: float, activation_time: datetime}}
         self.breakeven_state = {}
         
-        # Phase 182: ATR-based dynamic activation thresholds
-        # Activation = max(floor, ATR_pct * atr_mult)
-        # This ensures breakeven only activates after a move meaningful for that coin's volatility
-        # Phase 190: Lowered activation thresholds for faster breakeven
+        # Phase 203: Increased ATR-based dynamic activation thresholds
+        # Increased floor and atr_mult to prevent early break-even stops due to market noise
         self.activation_config = {
-            'Very Low':  {'floor': 0.5, 'atr_mult': 1.0},   # BTC: max(0.5%, ATR*1.0)
-            'Low':       {'floor': 0.7, 'atr_mult': 1.2},   # SOL/AVAX
-            'Normal':    {'floor': 1.0, 'atr_mult': 1.5},   # Mid-cap
-            'High':      {'floor': 1.5, 'atr_mult': 2.0},   # Low liquidity
-            'Very High': {'floor': 2.0, 'atr_mult': 2.5},   # Meme coins
+            'Very Low':  {'floor': 1.0, 'atr_mult': 1.5},   # BTC: max(1.0%, ATR*1.5)
+            'Low':       {'floor': 1.2, 'atr_mult': 1.5},   # SOL/AVAX
+            'Normal':    {'floor': 1.5, 'atr_mult': 1.8},   # Mid-cap
+            'High':      {'floor': 2.0, 'atr_mult': 2.0},   # Low liquidity
+            'Very High': {'floor': 2.5, 'atr_mult': 2.5},   # Meme coins
             'Extreme':   {'floor': 3.0, 'atr_mult': 3.0},   # Hyper-volatile
             'Ultra':     {'floor': 4.0, 'atr_mult': 4.0},   # Extreme edge cases
         }
@@ -19963,14 +19955,15 @@ class PaperTradingEngine:
     # =========================================================================
     
     def get_effective_exit_tightness(self, pos: dict) -> float:
-        """Get per-position exit_tightness with counter-signal modifier.
+        """Get per-position exit_tightness with counter-signal modifier and BTC Macro Regime control.
         
-        If an opposing signal was recently received for this coin,
-        the modifier reduces exit_tightness → tighter exits.
-        If no opposing signal or modifier expired, returns global exit_tightness.
+        Phase 204: Adaptive Exits using BTC Macro + Coin Regime
+        If BTC is strongly trending opposite to our position, tighten exits to take profit early.
+        If BTC is trending in our direction, widen exits to ride the trend.
         """
         modifier = pos.get('counter_signal_modifier', 1.0)
         cs_time = pos.get('counter_signal_time', 0)
+        side = pos.get('side', 'NONE')
         
         # Expire modifier after TTL (15 minutes)
         if modifier < 1.0 and cs_time > 0:
@@ -19981,7 +19974,34 @@ class PaperTradingEngine:
                 modifier = 1.0
         
         base_et = float(pos.get('effectiveExitTightnessBase', self.exit_tightness) or self.exit_tightness)
-        return base_et * modifier
+        effective_et = base_et * modifier
+        
+        # Phase 204: BTC Macro Regime checks
+        try:
+            # Check BTC trend (mtf_confirmation global)
+            btc_trends = mtf_confirmation.coin_trends.get('BTCUSDT', {})
+            btc_1d_trend = btc_trends.get('trend_1d', 'NEUTRAL')
+            btc_4h_trend = btc_trends.get('trend_4h', 'NEUTRAL')
+            
+            is_btc_bullish = btc_1d_trend in ['BULLISH', 'STRONG_BULLISH'] or btc_4h_trend in ['BULLISH', 'STRONG_BULLISH']
+            is_btc_bearish = btc_1d_trend in ['BEARISH', 'STRONG_BEARISH'] or btc_4h_trend in ['BEARISH', 'STRONG_BEARISH']
+            
+            # Counter-trend to BTC Macro: Tighten
+            if side == 'LONG' and is_btc_bearish:
+                effective_et = min(effective_et, base_et * 0.7)  # Tighten by 30% against macro
+            elif side == 'SHORT' and is_btc_bullish:
+                effective_et = min(effective_et, base_et * 0.7)  # Tighten by 30% against macro
+                
+            # Pro-trend with BTC Macro: Loosen slightly
+            elif side == 'LONG' and is_btc_bullish:
+                effective_et = max(effective_et, base_et * 1.25) # Loosen by 25% with macro
+            elif side == 'SHORT' and is_btc_bearish:
+                effective_et = max(effective_et, base_et * 1.25) # Loosen by 25% with macro
+                
+        except Exception as e:
+            pass # Failsafe
+            
+        return max(0.3, min(15.0, effective_et)) # Clamp to bounds
     
     # =========================================================================
     # DYNAMIC ATR MULTIPLIER
