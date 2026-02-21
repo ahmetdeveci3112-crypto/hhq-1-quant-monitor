@@ -383,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-21 | 206 | Freqtrade Trailing Max Drawdown Guard (Kâr Kilidi): Günlük zirve bakiyeden %5 düşüşte tüm işlemleri durdurur. |
 | 2026-02-21 | 205 | pandas-ta entegrasyonu: TTM Squeeze Momentum (+5/-10) ve Choppiness Index (-20/+5) filtreleri eklendi |
 | 2026-02-21 | 204 | Core Math Fixes (ATR RMA, Hurst, EMA) & Adaptive Macro Regime Exits |
 | 2026-02-11 | 193 | Trading Kütüphane Entegrasyonları: pandas-ta, CCXT WS, StoplossGuard, FreqAI ML, Optuna Hyperopt |

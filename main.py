@@ -19558,6 +19558,9 @@ class PaperTradingEngine:
         # Phase 20: Advanced Risk Management Config
         self.max_position_age_hours = 24
         self.daily_drawdown_limit = 5.0  # %5 günlük kayıp limiti
+        self.trailing_drawdown_limit = 5.0  # Phase 206: Zirveden %5 düşüş limiti (Profit Lock)
+        self.daily_peak_equity = 10000.0
+        self.daily_peak_date = ""
         self.emergency_sl_pct = 3.5   # Phase 212: %5→%3.5 (10x lev = %35 margin max kayıp)
         self.current_spread_pct = 0.05  # Will be updated from WebSocket
         self.daily_start_balance = 10000.0
@@ -21811,6 +21814,61 @@ class PaperTradingEngine:
                 self.save_state()
             return True
         return False
+
+    def check_trailing_drawdown(self) -> bool:
+        """Phase 206: Freqtrade Trailing Max Drawdown Guard (Profit Lock)
+        Sistemin gun icinde ulastigi tepe (peak) degerinden belirli bir yuzde 
+        dusus yasanirsa mevcut tum pozisyonlari kapatir ve profit lock uygular.
+        """
+        if self.balance <= 0:
+            return False
+
+        turkey_tz = pytz.timezone('Europe/Istanbul')
+        now_turkey = datetime.now(turkey_tz)
+        today_date = now_turkey.strftime("%Y-%m-%d")
+        
+        # Reset peak at new day
+        if getattr(self, 'daily_peak_date', '') != today_date:
+            self.daily_peak_date = today_date
+            self.daily_peak_equity = self.balance
+            
+        total_unrealized = sum(p.get('unrealizedPnl', 0) for p in self.positions)
+        current_equity = self.balance + total_unrealized
+        
+        # Update daily peak
+        if current_equity > getattr(self, 'daily_peak_equity', 0):
+            self.daily_peak_equity = current_equity
+            
+        if getattr(self, 'daily_peak_equity', 0) <= 0:
+            return False
+            
+        peak_drawdown_pct = ((self.daily_peak_equity - current_equity) / self.daily_peak_equity) * 100
+        limit = getattr(self, 'trailing_drawdown_limit', 5.0)
+        
+        # Kâr kilidi: Zirve ile cari arasi fark treshold'u asarsa
+        if peak_drawdown_pct >= limit:
+            if not getattr(self, '_trailing_dd_locked_today', False):
+                self._trailing_dd_locked_today = True  # Prevent spamming
+                if self.positions:
+                    for pos in list(self.positions):
+                        current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
+                        self.close_position(pos, current_price, 'TRAILING_DD_LOCK')
+                        
+                self.add_log(f"🔒 PROFIT LOCK: Günlük zirveden %{peak_drawdown_pct:.1f} düşüş. Pozisyonlar kapatıldı.")
+                logger.warning(f"🔒 TRAILING DD LOCK: Peak Equity ${self.daily_peak_equity:.2f}, Current ${current_equity:.2f} (-{peak_drawdown_pct:.1f}%)")
+                
+                # Trading'i durdur
+                if self.enabled:
+                    self.enabled = False
+                    self.add_log(f"🚨 PROFIT LOCK: Auto-Buy gün sonuna kadar (veya manuel açılana dek) durduruldu.")
+                    self.save_state()
+                return True
+                
+        # Reset prevention flag if we recovered
+        elif peak_drawdown_pct < limit * 0.5:
+            self._trailing_dd_locked_today = False
+            
+        return False
         
         
     def load_state(self):
@@ -21856,6 +21914,9 @@ class PaperTradingEngine:
                     # Phase 217: Load leverage multiplier + daily_start_balance
                     self.leverage_multiplier = data.get('leverage_multiplier', 1.0)
                     self.daily_start_balance = data.get('daily_start_balance', self.balance)
+                    self.daily_peak_equity = data.get('daily_peak_equity', self.daily_start_balance)
+                    self.daily_peak_date = data.get('daily_peak_date', "")
+                    self.trailing_drawdown_limit = data.get('trailing_drawdown_limit', 5.0)
                     # Sync with parameter_optimizer
                     try:
                         parameter_optimizer.enabled = self.ai_optimizer_enabled
@@ -21922,6 +21983,9 @@ class PaperTradingEngine:
                 # Phase 217: Leverage multiplier + daily_start_balance
                 "leverage_multiplier": getattr(self, 'leverage_multiplier', 1.0),
                 "daily_start_balance": self.daily_start_balance,
+                "daily_peak_equity": getattr(self, 'daily_peak_equity', self.daily_start_balance),
+                "daily_peak_date": getattr(self, 'daily_peak_date', ""),
+                "trailing_drawdown_limit": getattr(self, 'trailing_drawdown_limit', 5.0),
                 # Phase 19: Save logs
                 "logs": self.logs[-100:],
                 # Phase 224B: EV signal filter state
@@ -22183,6 +22247,9 @@ class PaperTradingEngine:
         """Update positions with Phase 20 Advanced Risk Management."""
         # Phase 20: Check daily drawdown first
         if self.check_daily_drawdown():
+            return
+        # Phase 206: Check trailing drawdown (Profit Lock)
+        if self.check_trailing_drawdown():
             return
         # Phase 217: Check portfolio-level drawdown
         if self.check_portfolio_drawdown():
