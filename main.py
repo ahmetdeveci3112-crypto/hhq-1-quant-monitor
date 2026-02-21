@@ -1437,7 +1437,7 @@ class LiveBinanceTrader:
             
             # Bağlantı testi - bakiye çek
             balance = await self.exchange.fetch_balance()
-            self.last_balance = float(balance.get('USDT', {}).get('free', 0))
+            self.last_balance = float((balance.get('USDT') or {}).get('free') or 0)
             
             logger.info(f"✅ Binance Futures bağlantısı başarılı!")
             logger.info(f"💰 Kullanılabilir Bakiye: ${self.last_balance:.2f} USDT")
@@ -1479,9 +1479,9 @@ class LiveBinanceTrader:
             # Fallback to USDT if raw info not available
             usdt = balance.get('USDT', {})
             if wallet_balance == 0:
-                wallet_balance = float(usdt.get('total', 0))
+                wallet_balance = float(usdt.get('total') or 0)
             if available_balance == 0:
-                available_balance = float(usdt.get('free', 0))
+                available_balance = float(usdt.get('free') or 0)
             
             result = {
                 # Correct Binance Futures fields
@@ -1987,7 +1987,8 @@ class LiveBinanceTrader:
 
         notional = amount * safe_price
         if notional < min_notional * 0.98:
-            amount_precision = (market or {}).get('precision', {}).get('amount')
+            precision_info = (market or {}).get('precision') or {}
+            amount_precision = precision_info.get('amount')
             if isinstance(amount_precision, int):
                 step = 10 ** (-amount_precision)
                 amount = math.ceil((min_notional / safe_price) / step) * step
@@ -2061,8 +2062,9 @@ class LiveBinanceTrader:
             )
             
             fill_time = datetime.now().timestamp()
-            avg_fill = float(order.get('average', price))
-            fee_cost = float(order.get('fee', {}).get('cost', 0))
+            avg_fill = float(order.get('average') or price)
+            fee_info = order.get('fee') or {}
+            fee_cost = float(fee_info.get('cost') or 0)
             
             # Phase 186: Calculate slippage
             if side == 'LONG':
@@ -2078,7 +2080,7 @@ class LiveBinanceTrader:
             logger.info(f"   💵 Size: ${size_usd:.2f} | Effective: ${effective_notional:.2f} | Amount: {amount:.6f}")
             logger.info(f"   📊 Leverage: {leverage}x | Price: ${price:.4f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
-            logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} MARKET | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
+            logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} MARKET | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
             
             return {
                 'id': order.get('id'),
@@ -2168,7 +2170,8 @@ class LiveBinanceTrader:
                 return None
             tick_size = 0.0001  # Default
             # Get price tick size
-            tick_size = market.get('precision', {}).get('price', 0.0001)
+            precision_info = market.get('precision') or {}
+            tick_size = precision_info.get('price', 0.0001)
             if isinstance(tick_size, int):
                 tick_size = 10 ** (-tick_size)  # ccxt sometimes returns precision as decimal places
             
@@ -2202,23 +2205,24 @@ class LiveBinanceTrader:
             # Check fill status
             order_check = await self.exchange.fetch_order(order_id, ccxt_symbol)
             status = order_check.get('status', 'unknown')
-            filled = float(order_check.get('filled', 0))
-            remaining = float(order_check.get('remaining', 0))
-            avg_fill = float(order_check.get('average', 0))
+            filled = float(order_check.get('filled') or 0)
+            remaining = float(order_check.get('remaining') or 0)
+            avg_fill = float(order_check.get('average') or 0)
             
             fill_time = datetime.now().timestamp()
             latency_ms = (fill_time - send_time) * 1000
             
             if status == 'closed' and remaining <= 0:
                 # Fully filled via limit! Best case — reduced slippage
-                fee_cost = float(order_check.get('fee', {}).get('cost', 0))
+                fee_info = order_check.get('fee') or {}
+                fee_cost = float(fee_info.get('cost') or 0)
                 
                 if side == 'LONG':
                     slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else 0
                 else:
                     slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
                 
-                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT_FILLED | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT_FILLED | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
                 
                 return {
                     'id': order_id,
@@ -2260,12 +2264,12 @@ class LiveBinanceTrader:
                             remaining,
                             params={'reduceOnly': False}
                         )
-                        fallback_fill = float(fallback_order.get('average', price))
+                        fallback_fill = float(fallback_order.get('average') or price)
                         
                         # Weighted average fill price
                         if filled > 0:
-                            total_filled = filled + float(fallback_order.get('filled', remaining))
-                            avg_fill = (avg_fill * filled + fallback_fill * float(fallback_order.get('filled', remaining))) / total_filled if total_filled > 0 else fallback_fill
+                            total_filled = filled + float(fallback_order.get('filled') or remaining)
+                            avg_fill = (avg_fill * filled + fallback_fill * float(fallback_order.get('filled') or remaining)) / total_filled if total_filled > 0 else fallback_fill
                         else:
                             avg_fill = fallback_fill
                             
@@ -2281,7 +2285,7 @@ class LiveBinanceTrader:
                 else:
                     slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
                 
-                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT→MKT | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT→MKT | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
                 
                 return {
                     'id': order_id,
@@ -2334,8 +2338,9 @@ class LiveBinanceTrader:
             )
             
             fill_time = datetime.now().timestamp()
-            avg_fill = float(order.get('average', 0))
-            fee_cost = float(order.get('fee', {}).get('cost', 0))
+            avg_fill = float(order.get('average') or 0)
+            fee_info = order.get('fee') or {}
+            fee_cost = float(fee_info.get('cost') or 0)
             latency_ms = (fill_time - send_time) * 1000
             
             # Slippage: for CLOSE, selling LONG hits bid, buying SHORT hits ask
@@ -2348,7 +2353,7 @@ class LiveBinanceTrader:
             
             logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
-            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${best_bid:.6f} ask=${best_ask:.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
+            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
             
             return {
                 'id': order.get('id'),
@@ -2463,10 +2468,10 @@ class LiveBinanceTrader:
             order = await self.exchange.fetch_order(order_id, ccxt_symbol)
             return {
                 'status': order.get('status', 'unknown'),  # open, closed, canceled
-                'filled': float(order.get('filled', 0)),
-                'remaining': float(order.get('remaining', 0)),
-                'average': float(order.get('average', 0)),  # Average fill price
-                'price': float(order.get('price', 0)),
+                'filled': float(order.get('filled') or 0.0),
+                'remaining': float(order.get('remaining') or 0.0),
+                'average': float(order.get('average') or 0.0),  # Average fill price
+                'price': float(order.get('price') or 0.0),
             }
         except Exception as e:
             logger.warning(f"⚠️ Check order status failed: {symbol} #{order_id} - {e}")
@@ -2633,11 +2638,11 @@ class LiveBinanceTrader:
             
             for income in all_income:
                 income_type = income.get('incomeType', '')
-                pnl = float(income.get('income', 0))
-                timestamp = int(income.get('time', 0))
+                pnl = float(income.get('income') or 0)
+                timestamp = int(income.get('time') or 0)
                 
                 # Only count trading-related income (exclude transfers, deposits)
-                if income_type in ['REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION']:
+                if income_type in ('REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION'):
                     total_pnl += pnl
                     
                     if timestamp >= today_start_ms:
@@ -2709,8 +2714,8 @@ class LiveBinanceTrader:
             
             for income in income_history:
                 symbol = income.get('symbol', 'UNKNOWN')
-                pnl = float(income.get('income', 0))
-                timestamp = int(income.get('time', 0))
+                pnl = float(income.get('income') or 0)
+                timestamp = int(income.get('time') or 0)
                 
                 if pnl == 0:
                     continue  # Skip zero PnL (partial fills without actual close)
@@ -2789,9 +2794,9 @@ class LiveBinanceTrader:
                         for t in user_trades:
                             t_time = int(t.get('time', 0))
                             t_side = t.get('side', '')
-                            t_price = float(t.get('price', 0))
-                            t_qty = float(t.get('qty', 0))
-                            realized = float(t.get('realizedPnl', 0))
+                            t_price = float(t.get('price') or 0)
+                            t_qty = float(t.get('qty') or 0)
+                            realized = float(t.get('realizedPnl') or 0)
                             t_order_id = str(t.get('orderId', ''))  # Phase 229
                             
                             # If this trade has realized PnL matching our close, it's the exit
@@ -2811,8 +2816,8 @@ class LiveBinanceTrader:
                         # Try to find entry price from earlier trades
                         entry_side = 'BUY' if side == 'LONG' else 'SELL'
                         for t in reversed(user_trades):
-                            if t.get('side') == entry_side and float(t.get('price', 0)) > 0:
-                                entry_price = float(t.get('price', 0))
+                            if t.get('side') == entry_side and float(t.get('price') or 0) > 0:
+                                entry_price = float(t.get('price') or 0)
                                 break
                         
                         # If we found exit but no entry, estimate from PnL
@@ -2974,8 +2979,8 @@ class LiveBinanceTrader:
             
             for income in income_history:
                 symbol = income.get('symbol', 'UNKNOWN')
-                pnl = float(income.get('income', 0))
-                timestamp = int(income.get('time', 0))
+                pnl = float(income.get('income') or 0)
+                timestamp = int(income.get('time') or 0)
                 
                 # Create unique ID
                 trade_id = f"{symbol}_{timestamp}"
@@ -3101,8 +3106,8 @@ class LiveBinanceTrader:
             
             for income in income_history:
                 symbol = income.get('symbol', 'UNKNOWN')
-                pnl = float(income.get('income', 0))
-                timestamp = int(income.get('time', 0))
+                pnl = float(income.get('income') or 0)
+                timestamp = int(income.get('time') or 0)
                 
                 # Skip very small PnL
                 if abs(pnl) < 0.01:
@@ -3254,6 +3259,21 @@ async def lifespan(app: FastAPI):
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
     
+    # Phase 211: Persist Global Settings on startup
+    try:
+        settings_payload = {
+            'entry_tightness': global_paper_trader.entry_tightness,
+            'exit_tightness': global_paper_trader.exit_tightness,
+            'max_positions': global_paper_trader.max_positions,
+            'strategy_mode': global_paper_trader.strategy_mode,
+            'min_confidence_score': global_paper_trader.min_confidence_score,
+            'z_score_threshold': global_paper_trader.z_score_threshold
+        }
+        asyncio.create_task(sqlite_manager.save_setting('global_config', settings_payload))
+        logger.info("💾 Phase 211: Global settings persisted to DB on startup")
+    except Exception as e:
+        logger.warning(f"Failed to persist global settings: {e}")
+    
     # Phase 187b: Load ALL trades from SQLite into paper_trader.trades
     # This ensures WebSocket/REST endpoints serve complete historical data from the start
     try:
@@ -3370,6 +3390,7 @@ async def binance_position_sync_loop():
     reconnect_interval = 30  # seconds between reconnect attempts
     last_reconnect_attempt = 0
     _phase218_recalc_done = False  # One-time flag
+    _orphan_cleanup_done = False  # Phase 243: One-time orphan order cleanup
     
     while True:
         try:
@@ -3439,6 +3460,37 @@ async def binance_position_sync_loop():
                     logger.warning(f"🔧 Phase 218: Fixed {fixed_count}/{len(global_paper_trader.positions)} positions with wrong SL/TP")
                 else:
                     logger.info("✅ Phase 218: All positions have correct SL/TP — no fix needed")
+            
+            # ================================================================
+            # Phase 243: ONE-TIME ORPHAN ORDER CLEANUP
+            # Cancel stale reduceOnly limit orders that have no matching position
+            # Prevents "ghost" breakeven/trailing orders accumulating on Binance
+            # ================================================================
+            if not _orphan_cleanup_done and live_binance_trader.enabled and live_binance_trader.exchange:
+                _orphan_cleanup_done = True
+                try:
+                    open_orders = await live_binance_trader.exchange.fetch_open_orders()
+                    engine_symbols = {p.get('symbol') for p in global_paper_trader.positions}
+                    orphan_cancelled = 0
+                    for o in open_orders:
+                        is_reduce = o.get('reduceOnly') or (o.get('info', {}).get('reduceOnly') == 'true')
+                        if is_reduce:
+                            # Normalize symbol: CCXT uses "SOL/USDT:USDT" format
+                            raw_sym = o.get('symbol', '')
+                            norm_sym = raw_sym.replace('/', '').replace(':USDT', '')
+                            if norm_sym not in engine_symbols:
+                                try:
+                                    await live_binance_trader.exchange.cancel_order(o['id'], raw_sym)
+                                    orphan_cancelled += 1
+                                    logger.warning(f"🗑️ ORPHAN_CLEANUP: Cancelled stale reduceOnly order {o['id']} for {norm_sym}")
+                                except Exception as cancel_err:
+                                    logger.warning(f"⚠️ ORPHAN_CLEANUP: Failed to cancel {o['id']}: {cancel_err}")
+                    if orphan_cancelled > 0:
+                        logger.warning(f"🗑️ Phase 243: Cleaned up {orphan_cancelled} orphan reduceOnly orders")
+                    else:
+                        logger.info("✅ Phase 243: No orphan orders found")
+                except Exception as cleanup_err:
+                    logger.warning(f"Orphan order cleanup failed: {cleanup_err}")
             
             # Phase 189: Auto-reconnect if Binance connection lost or failed on startup
             if not live_binance_trader.enabled and live_binance_trader.trading_mode == 'live':
@@ -3622,12 +3674,20 @@ async def binance_position_sync_loop():
                         tickers = binance_ws_manager.get_tickers([symbol])
                         ticker = tickers.get(symbol) if tickers else None
                         
-                        if ticker and entry_price > 0:
-                            # Estimate ATR from 24h high/low range (rough approximation)
-                            high_24h = float(ticker.get('high', entry_price * 1.02))
-                            low_24h = float(ticker.get('low', entry_price * 0.98))
-                            estimated_atr = (high_24h - low_24h) / 3  # ~3 ATR in 24h range
+                        # Phase 243: Prefer real 14-period ATR from scanner cache
+                        sync_analyzer = multi_coin_scanner.analyzers.get(symbol) if hasattr(multi_coin_scanner, 'analyzers') else None
+                        if sync_analyzer and hasattr(sync_analyzer, 'highs') and hasattr(sync_analyzer, 'closes') and len(list(sync_analyzer.closes)) >= 14:
+                            _h, _l, _c = list(sync_analyzer.highs), list(sync_analyzer.lows), list(sync_analyzer.closes)
+                            estimated_atr = calculate_atr(_h, _l, _c, period=14)
+                            volatility_pct = (estimated_atr / entry_price * 100) if entry_price > 0 else 2.0
+                            logger.info(f"📐 SYNC_ATR: {symbol} using real 14-period ATR={estimated_atr:.6f} ({volatility_pct:.2f}%)")
+                        elif ticker and entry_price > 0:
+                            # Fallback: 24h range estimation (unchanged)
+                            high_24h = float(ticker.get('high') or entry_price * 1.02)
+                            low_24h = float(ticker.get('low') or entry_price * 0.98)
+                            estimated_atr = (high_24h - low_24h) / 3
                             volatility_pct = (estimated_atr / entry_price) * 100 if entry_price > 0 else 2.0
+                            logger.info(f"📐 SYNC_ATR: {symbol} using 24h range fallback ATR={estimated_atr:.6f} ({volatility_pct:.2f}%)")
                         else:
                             # Fallback to 2% estimate
                             estimated_atr = entry_price * 0.02 if entry_price > 0 else 0.02
@@ -3662,8 +3722,9 @@ async def binance_position_sync_loop():
                         if bp['side'] == 'LONG':
                             # For LONG: if mark > entry, position is profitable
                             if mark_price > entry_price:
-                                # TP beyond current price, SL at breakeven or below entry
-                                stop_loss = entry_price  # Breakeven
+                                # Phase 243: Protect 50% of unrealized profit instead of breakeven
+                                profit_distance = mark_price - entry_price
+                                stop_loss = entry_price + (profit_distance * 0.5)  # Lock 50% profit
                                 take_profit = mark_price + (atr * global_paper_trader.tp_atr / 10)
                                 trail_activation = entry_price + min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
@@ -3673,8 +3734,9 @@ async def binance_position_sync_loop():
                         else:
                             # For SHORT: if mark < entry, position is profitable
                             if mark_price < entry_price:
-                                # TP beyond current price, SL at breakeven or above entry
-                                stop_loss = entry_price  # Breakeven
+                                # Phase 243: Protect 50% of unrealized profit instead of breakeven
+                                profit_distance = entry_price - mark_price
+                                stop_loss = entry_price - (profit_distance * 0.5)  # Lock 50% profit
                                 take_profit = mark_price - (atr * global_paper_trader.tp_atr / 10)
                                 trail_activation = entry_price - min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
@@ -11707,6 +11769,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'htf_trend': 'NEUTRAL',
         'blacklisted': False,
         'obi_value': 0.0,  # Phase 211: OBI depth value (updated before save)
+        'telemetry': signal.get('telemetry', {}), # Phase 211: Full parameter telemetry
     }
     signal_memory_ctx = {
         "reinforce_count": 0,
@@ -20799,6 +20862,15 @@ class PaperTradingEngine:
             settings_snapshot['obi_value_at_entry'] = round(obi_cached.get('obi', 0), 4)
         except:
             settings_snapshot['obi_value_at_entry'] = 0
+            
+        # Phase 211: Merge the full signal telemetry into the settings snapshot
+        if signal and 'telemetry' in signal:
+            try:
+                tel = signal['telemetry']
+                settings_snapshot.update(tel if isinstance(tel, dict) else json.loads(tel))
+            except Exception as tel_err:
+                logger.debug(f"Telemetry update error: {tel_err}")
+                
         # Phase 239V2: Extract dynamic pullback telemetry from signal dict
         # (dyn_result / dyn_min_pb_pct / dyn_regime_band are NOT in open_position scope)
         def _safe_float(val, default: float) -> float:
@@ -21939,7 +22011,8 @@ class PaperTradingEngine:
             
             # En kötü %50'sini kapat
             close_count = max(1, len(sorted_positions) // 2)
-            for pos in sorted_positions[:close_count]:
+            to_close = list(sorted_positions[:close_count])  # Phase 243: snapshot to prevent list mutation
+            for pos in to_close:
                 current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
                 self.close_position(pos, current_price, 'PORTFOLIO_DRAWDOWN')
             
@@ -22733,12 +22806,9 @@ class PaperTradingEngine:
         Close a position and record it in trade history.
         For live trading, also schedules async Binance close.
         """
-        # Phase 232: Idempotent guard — prevent double close
-        if pos not in self.positions:
-            logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already removed from positions, skipping close")
-            return None
-        if pos.get('_closing'):
-            logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already closing, skipping")
+        # Phase 243: Atomic idempotent guard — check and set flag before any work
+        if pos.get('_closing') or pos not in self.positions:
+            logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already closing/removed, skipping ({reason})")
             return None
         pos['_closing'] = True
         
@@ -22777,7 +22847,7 @@ class PaperTradingEngine:
             "size": pos.get('size', 0),
             "sizeUsd": pos.get('sizeUsd', 0),
             "pnl": pnl,
-            "pnlPercent": (pnl / pos.get('sizeUsd', 1)) * 100 * pos.get('leverage', 10) if pos.get('sizeUsd', 0) > 0 else 0,
+            "pnlPercent": (pnl / initial_margin * 100) if initial_margin > 0 else 0,
             "margin": initial_margin,
             "roi": (pnl / initial_margin * 100) if initial_margin > 0 else 0,
             "openTime": pos.get('openTime', 0),
