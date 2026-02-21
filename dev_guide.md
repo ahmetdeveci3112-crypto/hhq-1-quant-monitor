@@ -1438,7 +1438,7 @@ Market order ile giriş yaparken oluşan slippage (fiyat kayması) kayıpların�
 | Limit + Market Fallback | 186 | 3s limit → market fallback |
 | EXEC_QUALITY Log | 186 | Slippage loglama |
 
-## Phase 202: Hybrid Trend Mode (Momentum Strategy)
+# Phase 202: Hybrid Trend Mode (Momentum Strategy)
 
 **Referans:** Freqtrade `custom_stoploss`, pandas-ta ADX+Supertrend, Jesse KAMA Trend Following
 
@@ -1494,3 +1494,41 @@ Trend Mode pozisyonlarda kâr seviyesine göre SL kilitlenir:
 | Signal'e aktarma | `process_cloud_signal` | main.py |
 | Wider params | `open_position`, `execute_pending_order` | main.py |
 | Stepped SL lock | Exit loop (Cloud + WS) | main.py |
+
+---
+
+# Phase 208: Smart Money Concepts (SMC) Market Structure Integration
+
+**Referans:** `smartmoneyconcepts` paketi
+**Dosyalar:** `main.py` (`extract_smc_features`, `generate_signal`)
+
+Daha önce manual algoritmalarla tespit edilen FVG (Fair Value Gap) mantığı, doğrudan finansal doğruluğu kabul görmüş `smartmoneyconcepts` paketine aktarıldı. SMC Analizi için MTF onayında çekilen `1h` (1 Saatlik) mumlar kullanılarak daha kuvvetli Order Block'lar tespit edilmektedir.
+
+### Mimari Detaylar
+1. **Helper Fonksiyonu:** `extract_smc_features(ohlcv)` fonksiyonu `smartmoneyconcepts.fvg` ve `smartmoneyconcepts.ob` algoritmalarını işleyerek Dataframe çıkartır. 
+2. **Unmitigated Zones:** En güncel, henüz test edilip bozulmamış (`MitigatedIndex == 0`) Order Block (OB) ve Fair Value Gap (FVG)'ler tespit edilir.
+3. **Scoring Logic:** (Layer 8)
+   - *Pozitif Etki*: Eğer seçili yön ve fiyat, uyumlu bir OB'ye (Örn; LONG pozisyon, Bullish OB içinde) temas ediyorsa `+20` skor. FVG içerisinde ise `+10` skor verilir.
+   - *Negatif Etki*: Ters yönlü bir OB (Direnç) alanında fiyatlanıyorsa `-20` skorla sinyalin tetiklenmesi riski cezalandırılır. (Örn; LONG pozisyon ama fiyat Bearish OB direncinde).
+
+---
+
+## Phase 209: Jesse-Inspired Hyperparameter Optimization (Optuna)
+
+**Referans:** Jesse Framework (`metrics.py`)
+**Dosyalar:** `hyperopt.py` (`HHQHyperOptimizer`)
+
+Parametre optimizasyon sürecimizin odağı "Win Rate" hesaplamasından, fonların kullandığı Riske Göre Düzeltilmiş Getiri (**Risk-Adjusted Return**) modellerine geçirilmiştir.
+
+### Matematiksel Fitness Metrikleri
+- **Sharpe Ratio:** `(Mean Return - Risk Free Rate) / Standard Deviation`. İşlem sayısının karekökü ile çarpılarak istatistiksel geçerliliğine göre bonus verilir.
+- **Calmar Ratio:** `Total Return / Maximum Drawdown`. Kârı yüksek tutarken hesabı patlatma (Max DD) riskini minimize eder.
+- **Sortino Ratio:** Sharpe ile benzerdir, ancak volatilitenin sadece "zarar veren" negatif kısmını (`Downside Deviation`) cezalandırır.
+- **Max Drawdown:** Sermayenin en yüksek noktasından itibaren yaşanan en büyük yüzdesel düşüşü ölçer.
+
+### Stratejiye Özgü Optimizasyon (Strategy Routing)
+Sinyallerin hangi stratejiye (`TREND` vs `MEAN_REVERSION`) ait olduğuna göre Optuna arama uzayları ayrıştırılmıştır:
+- **Trend Following (`HYPERPARAMETERS_TREND`):** Daha geniş ATR limitleri (SL/TP) ve daha esnek Z-Score kuralları ile büyük trendleri yakalaması hedeflenir.
+- **Mean Reversion (`HYPERPARAMETERS_MR`):** Daha dar SL limitleri, çok kesin Z-Score girişleri ve hızlı Trailing kırılımları hedeflenir.
+
+Optimizer başlatılırken `HHQHyperOptimizer(strategy_mode="TREND")` veya `"MEAN_REVERSION"` parametresi verilerek arama uzayları otomatik değiştirilir ve hedeflenen metrik (Örn; `objective_type='calmar'`) üzerinden PnL serisi test edilir.

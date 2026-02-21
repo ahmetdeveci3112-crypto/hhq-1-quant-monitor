@@ -1,0 +1,15 @@
+{
+  "best_params": {
+    "sl_atr": 2.7236399314140263,
+    "tp_atr": 1.3003461427271223,
+    "exit_tightness": 1.1109501836612345,
+    "entry_tightness": 1.7728346813220837,
+    "z_score_threshold": 1.767371206986816,
+    "min_confidence": 65,
+    "trail_activation": 0.7163312982616861,
+    "trail_distance": 0.8523481937965618
+  },
+  "best_score": 3.9060234946056354,
+  "optimization_count": 1,
+  "timestamp": 1771685255.64526
+}

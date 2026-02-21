@@ -31,6 +31,80 @@ except ImportError:
     logger.warning("⚠️ Optuna not installed, hyperparameter optimization disabled")
 
 
+# ============================================================================
+# JESSE-INSPIRED FITNESS METRICS (Phase 209)
+# ============================================================================
+
+def calculate_max_drawdown(pnls: List[float]) -> float:
+    """
+    Calculate Maximum Drawdown from a list of trade PnL percentages.
+    Returns a positive float representing maximum % drop from peak.
+    """
+    if not pnls:
+        return 0.0
+    
+    cumulative_pnl = np.cumsum(pnls)
+    # Include 0 to account for drawdowns right from the start
+    running_max = np.maximum.accumulate(np.insert(cumulative_pnl, 0, 0))
+    # Remove the 0 we just inserted to match the shape
+    running_max = running_max[1:]
+    
+    drawdowns = running_max - cumulative_pnl
+    return float(np.max(drawdowns))
+
+def calculate_sharpe_ratio(pnls: List[float], risk_free_rate: float = 0.0) -> float:
+    """
+    Calculate Sharpe Ratio for trade PnL percentages.
+    Scales by sqrt(N) to favor strategies with statistically significant trade counts.
+    """
+    if not pnls or len(pnls) < 2:
+        return 0.0
+    arr = np.array(pnls)
+    std_dev = np.std(arr)
+    if std_dev == 0:
+        return 0.0
+    
+    mean_pnl = np.mean(arr) - risk_free_rate
+    return float((mean_pnl / std_dev) * np.sqrt(len(pnls)))
+
+def calculate_calmar_ratio(pnls: List[float]) -> float:
+    """
+    Calculate Calmar Ratio: Return / Max Drawdown
+    """
+    if not pnls:
+        return 0.0
+    
+    total_return = sum(pnls)
+    if total_return <= 0:
+        return 0.0
+        
+    mdd = calculate_max_drawdown(pnls)
+    if mdd == 0:
+        return float(total_return)
+        
+    return float(total_return / mdd)
+
+def calculate_sortino_ratio(pnls: List[float], risk_free_rate: float = 0.0) -> float:
+    """
+    Calculate Sortino Ratio: Mean Return / Downside Deviation
+    """
+    if not pnls or len(pnls) < 2:
+        return 0.0
+    
+    arr = np.array(pnls)
+    downside_returns = arr[arr < 0]
+    
+    if len(downside_returns) == 0:
+        return float(np.mean(arr) * np.sqrt(len(pnls)))
+        
+    downside_std = np.std(downside_returns)
+    if downside_std == 0:
+        return 0.0
+        
+    mean_pnl = np.mean(arr) - risk_free_rate
+    return float((mean_pnl / downside_std) * np.sqrt(len(pnls)))
+
+
 class HHQHyperOptimizer:
     """
     Jesse-inspired hyperparameter optimizer using Optuna.
@@ -55,16 +129,42 @@ class HHQHyperOptimizer:
         {'name': 'trail_distance',   'type': 'float', 'min': 0.3,  'max': 2.0,  'default': 1.0},
     ]
     
-    def __init__(self, data_dir: str = './data'):
+    HYPERPARAMETERS_TREND = [
+        {'name': 'sl_atr',           'type': 'float', 'min': 1.5,  'max': 4.0,  'default': 2.0},
+        {'name': 'tp_atr',           'type': 'float', 'min': 2.0,  'max': 8.0,  'default': 4.0},
+        {'name': 'exit_tightness',   'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.0},
+        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.5},
+        {'name': 'z_score_threshold','type': 'float', 'min': 0.8,  'max': 2.5,  'default': 1.2},
+        {'name': 'min_confidence',   'type': 'int',   'min': 50,   'max': 90,   'default': 65},
+        {'name': 'trail_activation', 'type': 'float', 'min': 1.0,  'max': 4.0,  'default': 2.0},
+        {'name': 'trail_distance',   'type': 'float', 'min': 0.5,  'max': 3.0,  'default': 1.0},
+    ]
+
+    HYPERPARAMETERS_MR = [
+        {'name': 'sl_atr',           'type': 'float', 'min': 0.8,  'max': 3.0,  'default': 1.5},
+        {'name': 'tp_atr',           'type': 'float', 'min': 1.0,  'max': 4.0,  'default': 2.0},
+        {'name': 'exit_tightness',   'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.5},
+        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.8},
+        {'name': 'z_score_threshold','type': 'float', 'min': 1.5,  'max': 3.5,  'default': 2.0},
+        {'name': 'min_confidence',   'type': 'int',   'min': 65,   'max': 95,   'default': 75},
+        {'name': 'trail_activation', 'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.0},
+        {'name': 'trail_distance',   'type': 'float', 'min': 0.3,  'max': 1.5,  'default': 0.5},
+    ]
+    
+    def __init__(self, data_dir: str = './data', strategy_mode: str = 'DEFAULT'):
         self.data_dir = data_dir
+        self.strategy_mode = strategy_mode
         self.best_params: Dict[str, Any] = {}
         self.best_score: float = 0.0
+        self.objective_type: str = 'calmar'  # 'calmar', 'sharpe', 'sortino', or 'profit_factor'
         self.study = None
         self.trade_data: List[Dict] = []
         self.is_optimized = False
         self.optimization_count = 0
         self.last_optimization_time = 0
         self.enabled = True
+        
+        self.active_hyperparameters = self._get_hyperparameters()
         
         # Auto-optimize settings
         self.auto_optimize_every = 100  # trades
@@ -77,10 +177,17 @@ class HHQHyperOptimizer:
         logger.info(f"HHQHyperOptimizer initialized (optuna={'✅' if OPTUNA_AVAILABLE else '❌'}, "
                     f"auto_every={self.auto_optimize_every})")
     
+    def _get_hyperparameters(self) -> List[Dict]:
+        if self.strategy_mode == 'TREND':
+            return self.HYPERPARAMETERS_TREND
+        elif self.strategy_mode == 'MEAN_REVERSION':
+            return self.HYPERPARAMETERS_MR
+        return self.HYPERPARAMETERS
+
     def _suggest_params(self, trial) -> Dict[str, Any]:
         """Suggest parameter values for an Optuna trial."""
         params = {}
-        for hp in self.HYPERPARAMETERS:
+        for hp in self.active_hyperparameters:
             if hp['type'] == 'float':
                 params[hp['name']] = trial.suggest_float(hp['name'], hp['min'], hp['max'])
             elif hp['type'] == 'int':
@@ -167,21 +274,26 @@ class HHQHyperOptimizer:
         if trades_taken < 10:
             return -100.0  # Penalty for too few trades
         
-        # Objective: Sharpe-like ratio
-        if pnls:
-            mean_pnl = np.mean(pnls)
-            std_pnl = np.std(pnls) if np.std(pnls) > 0 else 1.0
-            sharpe = mean_pnl / std_pnl * np.sqrt(trades_taken)
+        # Calculate selected objective (Phase 209)
+        if not pnls:
+            return 0.0
             
-            # Profit factor bonus
-            profit_factor = winning_pnl / losing_pnl if losing_pnl > 0 else 10.0
-            
-            # Combined score: Sharpe + log(profit_factor) + sqrt(trades)
+        profit_factor = winning_pnl / losing_pnl if losing_pnl > 0 else 10.0
+        
+        if self.objective_type == 'calmar':
+            calmar = calculate_calmar_ratio(pnls)
+            score = calmar + np.log1p(profit_factor) + np.sqrt(trades_taken) * 0.1
+        elif self.objective_type == 'sharpe':
+            sharpe = calculate_sharpe_ratio(pnls)
+            score = sharpe + np.log1p(profit_factor) + np.sqrt(trades_taken) * 0.1
+        elif self.objective_type == 'sortino':
+            sortino = calculate_sortino_ratio(pnls)
+            score = sortino + np.log1p(profit_factor) + np.sqrt(trades_taken) * 0.1
+        else: # Legacy / Profit Factor
+            sharpe = calculate_sharpe_ratio(pnls)
             score = sharpe + np.log1p(profit_factor) + np.sqrt(trades_taken) * 0.1
             
-            return score
-        
-        return 0.0
+        return score
     
     async def optimize(self, trades: List[Dict] = None, n_trials: int = None) -> Dict[str, Any]:
         """
@@ -211,7 +323,7 @@ class HHQHyperOptimizer:
             self.study = optuna.create_study(direction='maximize')
             
             # Add default params as first trial
-            default_params = {hp['name']: hp['default'] for hp in self.HYPERPARAMETERS}
+            default_params = {hp['name']: hp['default'] for hp in self.active_hyperparameters}
             self.study.enqueue_trial(default_params)
             
             # Run optimization
@@ -226,7 +338,6 @@ class HHQHyperOptimizer:
             self.trades_since_optimize = 0
             
             # Compare with defaults
-            default_params = {hp['name']: hp['default'] for hp in self.HYPERPARAMETERS}
             default_score = self._evaluate_with_params(default_params)
             
             improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0

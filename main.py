@@ -4387,6 +4387,74 @@ def calculate_hurst(prices: list, min_window: int = 10) -> float:
 
 
 # ============================================================================
+# SMART MONEY CONCEPTS (SMC) CALCULATION - Phase 208
+# ============================================================================
+
+def extract_smc_features(ohlcv: list) -> dict:
+    """
+    Extract Order Blocks (OB) and Fair Value Gaps (FVG) using smartmoneyconcepts.
+    Requires at least 15 candles, returns the nearest unmitigated FVG/OB.
+    """
+    result = {
+        'fvg_bullish': None,
+        'fvg_bearish': None,
+        'ob_bullish': None,
+        'ob_bearish': None
+    }
+    
+    if not ohlcv or len(ohlcv) < 15:
+        return result
+        
+    try:
+        import pandas as pd
+        from smartmoneyconcepts import smc
+        
+        # ohlcv format: [timestamp, open, high, low, close, volume]
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # 1. Swing Highs/Lows
+        swing_hl = smc.swing_highs_lows(df, swing_length=3)
+        
+        # 2. Order Blocks (OB)
+        ob = smc.ob(df, swing_highs_lows=swing_hl)
+        ob_unmitigated = ob[ob['MitigatedIndex'].isna() | (ob['MitigatedIndex'] == 0)]
+        
+        bull_obs = ob_unmitigated[ob_unmitigated['OB'] == 1]
+        bear_obs = ob_unmitigated[ob_unmitigated['OB'] == -1]
+        
+        if not bull_obs.empty:
+            last_bull = bull_obs.iloc[-1]
+            result['ob_bullish'] = {'top': float(last_bull['Top']), 'bottom': float(last_bull['Bottom'])}
+            
+        if not bear_obs.empty:
+            last_bear = bear_obs.iloc[-1]
+            result['ob_bearish'] = {'top': float(last_bear['Top']), 'bottom': float(last_bear['Bottom'])}
+            
+        # 3. Fair Value Gaps (FVG)
+        fvg = smc.fvg(df)
+        fvg_unmitigated = fvg[fvg['MitigatedIndex'].isna() | (fvg['MitigatedIndex'] == 0)]
+        
+        bull_fvgs = fvg_unmitigated[fvg_unmitigated['FVG'] == 1]
+        bear_fvgs = fvg_unmitigated[fvg_unmitigated['FVG'] == -1]
+        
+        if not bull_fvgs.empty:
+            last_bull_fvg = bull_fvgs.iloc[-1]
+            result['fvg_bullish'] = {'top': float(last_bull_fvg['Top']), 'bottom': float(last_bull_fvg['Bottom'])}
+            
+        if not bear_fvgs.empty:
+            last_bear_fvg = bear_fvgs.iloc[-1]
+            result['fvg_bearish'] = {'top': float(last_bear_fvg['Top']), 'bottom': float(last_bear_fvg['Bottom'])}
+            
+        return result
+        
+    except ImportError:
+        logger.debug("smartmoneyconcepts package not installed. Skipping SMC.")
+    except Exception as e:
+        logger.debug(f"SMC feature extraction error: {e}")
+        
+    return result
+
+# ============================================================================
 # ADX (Average Directional Index) CALCULATION - Phase 137
 # ============================================================================
 
@@ -8365,11 +8433,13 @@ class LightweightCoinAnalyzer:
         # Phase 177: Use real bid-ask spread, conservative fallback (0.10%) if not yet received
         effective_spread = self.opportunity.bid_ask_spread_pct if self.opportunity.has_real_spread else 0.10
         
+        # Fetch MTF trend data for SMC (Phase 208) and FIB (Phase FIB)
+        trend_data = mtf_confirmation.coin_trends.get(self.symbol, {}) if 'mtf_confirmation' in globals() else {}
+        
         # Phase FIB: Build Fibonacci context for Cloud Scanner (OHLCV already cached by update_coin_trend)
         cs_fib_context = None
         if FIB_ENABLED:
             try:
-                trend_data = mtf_confirmation.coin_trends.get(self.symbol, {}) if 'mtf_confirmation' in globals() else {}
                 if trend_data:
                     # Pre-determine signal side from z-score direction (not threshold)
                     # P2 fix: actual threshold is dynamic (effective_threshold), so just use direction
@@ -8400,6 +8470,7 @@ class LightweightCoinAnalyzer:
             basis_pct=basis_pct,
             symbol=self.symbol,  # For liquidation cascade lookup
             whale_zscore=whale_tracker.get_whale_zscore(self.symbol),  # Whale activity
+            smc_data=trend_data.get('smc_1h'),  # Phase 208
             rsi=rsi_value,  # RSI for Layer 10
             volume_ratio=volume_ratio,  # Volume spike for Layer 11
             sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
@@ -12808,6 +12879,9 @@ class MultiTimeframeConfirmation:
                 closes_1h = [c[4] for c in ohlcv_1h]
                 trend_1h = self.get_trend_from_closes(closes_1h)
                 result['trend_1h'] = trend_1h['trend']
+                
+                # Phase 208: SMC extraction from 1H candles
+                result['smc_1h'] = extract_smc_features(ohlcv_1h)
             
             if ohlcv_4h and len(ohlcv_4h) >= 10:
                 closes_4h = [c[4] for c in ohlcv_4h]
@@ -18201,7 +18275,7 @@ class SignalGenerator:
         leverage: int = 10,
         basis_pct: float = 0.0,
         whale_zscore: float = 0.0,
-        nearest_fvg: Optional[Dict] = None,
+        smc_data: Optional[Dict] = None,
         breakout: Optional[str] = None,
         spread_pct: float = 0.05, # Phase 13
         volatility_ratio: float = 1.0, # Phase 13
@@ -18550,34 +18624,36 @@ class SignalGenerator:
             reasons.append(f"WhaleSell(Z:{whale_zscore:.1f})")
 
         # Layer 8: SMC Fair Value Gaps (Magnets/Filters) - Max +/- 20 pts
-        if nearest_fvg:
-            fvg_type = nearest_fvg['type'] # BULLISH or BEARISH
-            # Distance check (is price INSIDE or very close?)
-            # Top/Bottom are price levels.
-            # If LONG and FVG is BEARISH (Resistance) and we are close below it -> DANGER
-            # If LONG and FVG is BULLISH (Support) and we are close above it -> SUPPORT
+        # Layer 8: SMC Fair Value Gaps and Order Blocks (Phase 208) - Max +/- 30 pts
+        if smc_data:
+            ob_bull = smc_data.get('ob_bullish')
+            ob_bear = smc_data.get('ob_bearish')
+            fvg_bull = smc_data.get('fvg_bullish')
+            fvg_bear = smc_data.get('fvg_bearish')
             
-            # Simple Logic: Check Type compatibility
-            # Bullish FVG supports LONGs. Bearish FVG supports SHORTs.
+            in_bull_ob = ob_bull and ob_bull['bottom'] <= price <= ob_bull['top']
+            in_bear_ob = ob_bear and ob_bear['bottom'] <= price <= ob_bear['top']
             
             if signal_side == "LONG":
-                if fvg_type == "BULLISH":
-                    score += 10
-                    reasons.append("SMC(Support)")
-                elif fvg_type == "BEARISH":
-                     # HITTING RESISTANCE?
-                     # Only if we are below it and close.
-                     # Simplified: Just penalize fighting the magnet type
-                     score -= 20
-                     reasons.append("SMC(Resistance!)")
-                     
-            elif signal_side == "SHORT":
-                if fvg_type == "BEARISH":
-                    score += 10
-                    reasons.append("SMC(Resistance)")
-                elif fvg_type == "BULLISH":
+                if in_bull_ob:
+                    score += 20
+                    reasons.append("SMC(In Bull OB)")
+                elif in_bear_ob:
                     score -= 20
-                    reasons.append("SMC(Support!)")
+                    reasons.append("SMC(In Bear OB!)")
+                elif fvg_bull and fvg_bull['bottom'] <= price <= fvg_bull['top']:
+                    score += 10
+                    reasons.append("SMC(In Bull FVG)")
+            elif signal_side == "SHORT":
+                if in_bear_ob:
+                    score += 20
+                    reasons.append("SMC(In Bear OB)")
+                elif in_bull_ob:
+                    score -= 20
+                    reasons.append("SMC(In Bull OB!)")
+                elif fvg_bear and fvg_bear['bottom'] <= price <= fvg_bear['top']:
+                    score += 10
+                    reasons.append("SMC(In Bear FVG)")
                     
         # Layer 9: Dynamic S/R Breakout (Trend Following) - Phase 11
         # If Breakout Signal exists AND Hurst > 0.5 (Trend Regime)
@@ -25201,7 +25277,6 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                     signal = None
                     try:
                         whale_z = streamer.whale_detector.get_zscore()
-                        nearest_fvg = streamer.smc_analyzer.get_nearest_fvg(price) # Phase 10
                         
                         # Check Breakout (Phase 11)
                         open_price = ticker.get('open', price)
@@ -25277,7 +25352,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                             leverage=getattr(streamer.signal_generator, 'leverage', 10),
                             basis_pct=basis_pct,
                             whale_zscore=whale_z,
-                            nearest_fvg=nearest_fvg,
+                            smc_data=trend_data_ws.get('smc_1h'),
                             breakout=breakout,
                             spread_pct=metrics.get('spreadPct', 0.05),
                             volatility_ratio=metrics.get('volatilityRatio', 1.0),
