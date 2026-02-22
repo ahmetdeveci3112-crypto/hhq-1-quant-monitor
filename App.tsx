@@ -198,6 +198,8 @@ export default function App() {
 
   // Phase 31: Multi-Coin Scanner State
   const [opportunities, setOpportunities] = useState<CoinOpportunity[]>([]);
+  // Phase 259: Persistent Active Signals UI state
+  const [persistentSignals, setPersistentSignals] = useState<any[]>([]);
   const [scannerStats, setScannerStats] = useState<ScannerStats>({
     totalCoins: 0,
     analyzedCoins: 0,
@@ -346,6 +348,11 @@ export default function App() {
       // Update opportunities from scanner (instant data on connect)
       if (data.opportunities && data.opportunities.length > 0) {
         setOpportunities(data.opportunities);
+      }
+
+      // Phase 259: Update persistent signals array
+      if (data.persistentActiveSignals) {
+        setPersistentSignals(data.persistentActiveSignals);
       }
 
       // Update scanner stats

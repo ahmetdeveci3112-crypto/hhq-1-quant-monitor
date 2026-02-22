@@ -10032,10 +10032,34 @@ class UIStateCache:
     
     def get_state(self) -> dict:
         """Return complete UI state for WebSocket - instant, no API calls."""
+        # Phase 259: Generate persistent signals array for UI
+        now_ts = datetime.now().timestamp()
+        persistent_signals = []
+        if 'active_signals' in globals():
+            for sym, sig in active_signals.items():
+                if sig.get('state') == 'ACTIVE':
+                    persistent_signals.append({
+                        "symbol": sym,
+                        "signalAction": sig.get('side', 'NONE'),
+                        "signalScore": sig.get('score', 0),
+                        "createdTs": sig.get('created_ts', 0),
+                        "lastRefreshTs": sig.get('last_refresh_ts', 0),
+                        "state": sig.get('state'),
+                        "counterCount": sig.get('counter_count', 0),
+                        "reentryCount": sig.get('reentry_count', 0),
+                        "lastCloseTs": sig.get('last_close_ts', 0),
+                        "ageSec": max(0, now_ts - sig.get('created_ts', now_ts))
+                    })
+        
+        # Phase 259: Update activeSignals count to use persistent array length
+        stats_copy = self.stats.copy()
+        stats_copy['activeSignals'] = len(persistent_signals)
+
         return {
             "type": "scanner_update",
             "opportunities": self.opportunities,
-            "stats": self.stats,
+            "persistentActiveSignals": persistent_signals,
+            "stats": stats_copy,
             "portfolio": {
                 "balance": self.balance,
                 "positions": self.positions,
@@ -26663,15 +26687,35 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
 
             trades = ui_state_cache.trades or global_paper_trader.trades
 
+            # Phase 259: Generate persistent signals array for UI
+            now_ts = datetime.now().timestamp()
+            persistent_signals = []
+            if 'active_signals' in globals():
+                for sym, sig in active_signals.items():
+                    if sig.get('state') == 'ACTIVE':
+                        persistent_signals.append({
+                            "symbol": sym,
+                            "signalAction": sig.get('side', 'NONE'),
+                            "signalScore": sig.get('score', 0),
+                            "createdTs": sig.get('created_ts', 0),
+                            "lastRefreshTs": sig.get('last_refresh_ts', 0),
+                            "state": sig.get('state'),
+                            "counterCount": sig.get('counter_count', 0),
+                            "reentryCount": sig.get('reentry_count', 0),
+                            "lastCloseTs": sig.get('last_close_ts', 0),
+                            "ageSec": max(0, now_ts - sig.get('created_ts', now_ts))
+                        })
+
             return {
                 "type": "scanner_update",
                 "opportunities": opps,
+                "persistentActiveSignals": persistent_signals,
                 "stats": {
                     "totalCoins": scanner_stats.get('totalCoins', len(getattr(multi_coin_scanner, 'coins', []))),
                     "analyzedCoins": scanner_stats.get('analyzedCoins', len(getattr(multi_coin_scanner, 'analyzers', {}))),
                     "longSignals": long_count,
                     "shortSignals": short_count,
-                    "activeSignals": long_count + short_count,
+                    "activeSignals": len(persistent_signals), # Phase 259
                     "lastUpdate": datetime.now().timestamp()
                 },
                 "portfolio": {

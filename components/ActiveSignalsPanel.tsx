@@ -3,7 +3,8 @@ import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp,
 import { CoinOpportunity } from '../types';
 
 interface ActiveSignalsPanelProps {
-    signals: CoinOpportunity[];
+    signals: any[]; // Phase 259: Accepts persistentSignals (or opportunities fallback)
+    opportunities?: CoinOpportunity[]; // Phase 259: Real-time telemetry source
     onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number) => Promise<void>;
     entryTightness?: number;
     minConfidenceScore?: number;
@@ -337,13 +338,36 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
     return <div className="flex items-center gap-0.5 flex-wrap">{badges}</div>;
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, opportunities = [], onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
     const [qualityFilter, setQualityFilter] = useState<QualityFilter>('all');
 
-    const activeSignals = signals
+    // Phase 259: Merge persistent signal with live opportunity telemetry
+    const enrichedSignals = signals.map(sig => {
+        // If it's already a full opportunity (fallback mode), use it directly
+        if (sig.price !== undefined && !sig.state) return sig;
+
+        // Find matching live opportunity for real-time telemetry
+        const liveOpp = opportunities.find(o => o.symbol === sig.symbol) || {};
+
+        // Merge: Persistent state is king, liveOpp provides telemetry (prices, indicators)
+        return {
+            ...liveOpp, // Base telemetry
+            ...sig,     // Override with persistent state (symbol, signalAction, signalScore, etc.)
+            // Ensure essential UI fields have a fallback if liveOpp doesn't exist
+            price: liveOpp.price || 0,
+            spreadPct: liveOpp.spreadPct ?? 0.05,
+            volumeRatio: liveOpp.volumeRatio ?? 1.0,
+            zscore: liveOpp.zscore ?? 0,
+            hurst: liveOpp.hurst ?? 0,
+            leverage: liveOpp.leverage || 10,
+            lastSignalTime: sig.lastRefreshTs || liveOpp.lastSignalTime || (Date.now() / 1000)
+        } as CoinOpportunity;
+    });
+
+    const activeSignals = enrichedSignals
         .filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore)
         .filter(s => {
             switch (qualityFilter) {
@@ -396,7 +420,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     );
 
     // Count for filter badges
-    const allSignals = signals.filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore);
+    const allSignals = enrichedSignals.filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore);
     const eqCount = allSignals.filter(s => s.entryQualityPass).length;
     const fibCount = allSignals.filter(s => s.fibActive).length;
     const volCount = allSignals.filter(s => s.isVolumeSpike).length;
