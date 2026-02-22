@@ -4974,8 +4974,7 @@ VOLATILITY_LEVELS = {
 FIB_ENABLED = True               # Master switch — ACTIVE (Canary Aşama 1)
 FIB_SCORE_ENABLED = True         # Score bonus layer (Layer 23)
 FIB_ENTRY_ENABLED = True         # Entry blend layer — ACTIVE
-FIB_MAX_ENTRY_DEV_PCT = 1.0      # Max deviation between fib_entry and atr_entry (%)
-FIB_BLEND_ALPHA = 0.35           # Blend weight (0=pure ATR, 1=pure fib)
+FIB_BLEND_ALPHA = 0.35           # Blend weight (legacy, used in telemetry output)
 
 # ============================================================================
 # ENTRY QUALITY GATE — Feature Flags
@@ -6225,7 +6224,9 @@ def detect_candle_sr_levels(
     current_cluster = [price_levels[0]]
     
     for p in price_levels[1:]:
-        if p - current_cluster[-1] <= cluster_tolerance:
+        # Anchor-based clustering: compare to cluster START (not last element)
+        # Prevents chain drift: [100,101,102,103,104] won't merge into one cluster
+        if p - current_cluster[0] <= cluster_tolerance:
             current_cluster.append(p)
         else:
             if len(current_cluster) >= 2:  # Minimum 2 touches for validity
@@ -6357,22 +6358,22 @@ def compute_structural_entry_price(
     }
 
 
-def compute_structural_trail_stop(
-    base_trail_stop: float,
+def compute_structural_sl(
+    base_sl: float,
     signal_side: str,
     current_price: float,
     sr_levels: dict,
     composite_vol: dict,
     atr: float,
 ) -> dict:
-    """Phase 249: Validate trail stop against structural S/R levels.
+    """Phase 249: Validate initial Stop Loss against structural S/R levels.
     
-    If a strong S/R level is within 1 ATR of the ATR-based trail stop,
-    move the trail to just beyond the structural level (better protection).
+    If a strong S/R level is within 1 ATR of the ATR-based SL,
+    move SL to just beyond the structural level (better protection).
     WILD category → skip structural adjustment (unreliable S/R).
     """
     result = {
-        'trail_stop': base_trail_stop,
+        'sl': base_sl,
         'adjusted': False,
         'structural_level': None,
         'source': 'atr_only',
@@ -6382,54 +6383,54 @@ def compute_structural_trail_stop(
     if composite_vol.get('category') == 'WILD':
         return result
     
-    if not sr_levels or atr <= 0 or base_trail_stop <= 0:
+    if not sr_levels or atr <= 0 or base_sl <= 0:
         return result
     
     structural_level = None
-    buffer = atr * 0.15  # Place trail just beyond the structural level
+    buffer = atr * 0.15  # Place SL just beyond the structural level
     
     if signal_side == 'LONG':
-        # LONG: trail stop is below price → find nearest support near/below trail
+        # LONG: SL is below price → find nearest support near/below SL
         supports = sr_levels.get('supports', [])
         for sup in supports:
             sup_price = sup['price']
-            # Support should be between (trail - 1 ATR) and price
-            if base_trail_stop - atr <= sup_price <= current_price:
+            # Support should be between (sl - 1 ATR) and price
+            if base_sl - atr <= sup_price <= current_price:
                 if sup['touches'] >= 2:  # Minimum 2 touches for credibility
                     structural_level = sup_price
                     break
         
         if structural_level:
-            new_trail = structural_level - buffer
-            # Only adjust if structural trail is within 1 ATR of ATR-based trail
-            if abs(new_trail - base_trail_stop) <= atr:
-                result['trail_stop'] = new_trail
+            new_sl = structural_level - buffer
+            # Only adjust if structural SL is within 1 ATR of ATR-based SL
+            if abs(new_sl - base_sl) <= atr:
+                result['sl'] = new_sl
                 result['adjusted'] = True
                 result['structural_level'] = structural_level
                 result['source'] = 'support_adjusted'
     
     elif signal_side == 'SHORT':
-        # SHORT: trail stop is above price → find nearest resistance near/above trail
+        # SHORT: SL is above price → find nearest resistance near/above SL
         resistances = sr_levels.get('resistances', [])
         for res in resistances:
             res_price = res['price']
-            if current_price <= res_price <= base_trail_stop + atr:
+            if current_price <= res_price <= base_sl + atr:
                 if res['touches'] >= 2:
                     structural_level = res_price
                     break
         
         if structural_level:
-            new_trail = structural_level + buffer
-            if abs(new_trail - base_trail_stop) <= atr:
-                result['trail_stop'] = new_trail
+            new_sl = structural_level + buffer
+            if abs(new_sl - base_sl) <= atr:
+                result['sl'] = new_sl
                 result['adjusted'] = True
                 result['structural_level'] = structural_level
                 result['source'] = 'resistance_adjusted'
     
     if result['adjusted']:
         logger.info(
-            f"📐 STRUCTURAL_TRAIL: {signal_side} base={base_trail_stop:.6f} "
-            f"→ adjusted={result['trail_stop']:.6f} "
+            f"📐 STRUCTURAL_SL: {signal_side} base={base_sl:.6f} "
+            f"→ adjusted={result['sl']:.6f} "
             f"({result['source']} @ {structural_level:.6f})"
         )
     
@@ -20235,19 +20236,19 @@ class SignalGenerator:
             trail_activation = ideal_entry - (trail_act * effective_exit_tightness)
             trail_dist = atr * trail_mult * effective_exit_tightness
         
-        # 5. Structural trail stop validation (adjust SL if near strong S/R)
+        # 5. Structural SL validation (adjust SL if near strong S/R)
         if sr_levels and (sr_levels.get('nearest_support') or sr_levels.get('nearest_resistance')):
-            struct_trail = compute_structural_trail_stop(
-                base_trail_stop=sl,
+            struct_sl = compute_structural_sl(
+                base_sl=sl,
                 signal_side=signal_side,
                 current_price=price,
                 sr_levels=sr_levels,
                 composite_vol=comp_vol,
                 atr=atr,
             )
-            if struct_trail['adjusted']:
-                sl = struct_trail['trail_stop']
-                reasons.append(f"SL_SR({struct_trail['source']})")
+            if struct_sl['adjusted']:
+                sl = struct_sl['sl']
+                reasons.append(f"SL_SR({struct_sl['source']})")
         
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
