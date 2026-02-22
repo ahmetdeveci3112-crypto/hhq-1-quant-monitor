@@ -6462,7 +6462,6 @@ def compute_adaptive_tp_ladder(
     hurst: float = 0.50,
     coin_daily_trend: str = 'NEUTRAL',
     exec_score: float = 70.0,
-    confidence_score: float = 75.0,
     spread_level: str = 'Normal',
 ) -> dict:
     """Phase 250: Compute adaptive 3-tier TP ladder.
@@ -15491,6 +15490,8 @@ class TimeBasedPositionManager:
                     # --- Phase 250: Use locked ladder if available ---
                     if pos.get('tp_ladder_levels') and TP_LADDER_ADAPTIVE_ENABLED:
                         tp_levels = [lv.copy() for lv in pos['tp_ladder_levels']]
+                        # base_tp_pct from locked telemetry (for log line below)
+                        base_tp_pct = pos.get('tp_ladder_telemetry', {}).get('base_tp_pct', 0)
                         
                         # Runtime adaptation: small multiplier for unhit levels
                         if TP_LADDER_RUNTIME_ADJUST_ENABLED:
@@ -22363,7 +22364,6 @@ class PaperTradingEngine:
                     hurst=order.get('hurst', 0.50),
                     coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
                     exec_score=order.get('entryExecScore', 70.0),
-                    confidence_score=order.get('signalScore', 75.0),
                     spread_level=order.get('spreadLevel', 'Normal'),
                 )
                 new_position['tp_ladder_levels'] = _tp_ladder['levels']
