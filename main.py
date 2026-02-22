@@ -10519,7 +10519,8 @@ class MultiCoinScanner:
             try:
                 # Fetch 5-minute candles (last 100 = ~8 hours of data)
                 ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
-                ohlcv = await self.exchange.fetch_ohlcv(ccxt_symbol, '5m', limit=100)
+                # Phase 256: Route through DataProvider for caching + freshness
+                ohlcv = await data_provider.get_ohlcv(self.exchange, ccxt_symbol, '5m', limit=100)
                 
                 if ohlcv and len(ohlcv) >= 20:
                     analyzer = self.get_or_create_analyzer(symbol)
@@ -24952,6 +24953,7 @@ async def exit_telemetry():
             'protection': prot_status,
             'active_signals': signal_summary,
             'signal_count': len(signal_summary),
+            'data_health': data_provider.get_health() if data_provider else {},
             'timestamp': datetime.now().isoformat(),
         })
     except Exception as e:
@@ -25212,6 +25214,169 @@ class ProtectionManager:
         }
 
 protection_manager = ProtectionManager(global_paper_trader)
+
+# ============================================================================
+# Phase 256: DATA PROVIDER LAYER
+# OHLCV cache + freshness + missing-candle validation + health telemetry
+# ============================================================================
+
+class DataProvider:
+    """Phase 256: Centralized data access with cache, freshness, and health.
+    
+    Features:
+    - TTL-based OHLCV cache: avoids redundant exchange calls
+    - Freshness validation: detects stale data (last candle too old)
+    - Missing candle detection: gaps in expected candle sequence
+    - Health telemetry: hit/miss/stale counters per (symbol, timeframe)
+    """
+    
+    # Timeframe → expected candle interval in seconds
+    TF_INTERVAL_SEC = {
+        '1m': 60, '3m': 180, '5m': 300, '15m': 900,
+        '30m': 1800, '1h': 3600, '2h': 7200, '4h': 14400,
+        '6h': 21600, '8h': 28800, '12h': 43200, '1d': 86400,
+    }
+    
+    # Timeframe → cache TTL (how long to reuse cached data)
+    TF_CACHE_TTL_SEC = {
+        '1m': 30, '3m': 60, '5m': 120, '15m': 300,
+        '30m': 600, '1h': 900, '4h': 1800, '1d': 3600,
+    }
+    
+    # Staleness threshold: candle older than N * interval → stale
+    STALENESS_MULTIPLIER = 3.0
+    
+    def __init__(self):
+        self._cache = {}  # (symbol, tf) → {'data': list, 'ts': float, 'limit': int}
+        self._health = {}  # (symbol, tf) → {'hits': 0, 'misses': 0, 'stale': 0, 'missing': 0}
+    
+    async def get_ohlcv(self, exchange, symbol: str, timeframe: str, limit: int = 100) -> list:
+        """Fetch OHLCV data with caching and freshness checks.
+        
+        Returns: list of candles (same format as exchange.fetch_ohlcv)
+        """
+        key = (symbol, timeframe)
+        now = time.time()
+        ttl = self.TF_CACHE_TTL_SEC.get(timeframe, 300)
+        
+        # Init health counters
+        if key not in self._health:
+            self._health[key] = {'hits': 0, 'misses': 0, 'stale': 0, 'missing': 0, 'last_fetch_ts': 0}
+        
+        # Check cache
+        cached = self._cache.get(key)
+        if cached and (now - cached['ts']) < ttl and cached['limit'] >= limit:
+            self._health[key]['hits'] += 1
+            return cached['data']
+        
+        # Cache miss → fetch from exchange
+        self._health[key]['misses'] += 1
+        try:
+            data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            self._cache[key] = {'data': data, 'ts': now, 'limit': limit}
+            self._health[key]['last_fetch_ts'] = now
+            
+            # Freshness check
+            if data:
+                self._check_freshness(key, data, timeframe, now)
+            
+            return data
+        except Exception as e:
+            logger.warning(f"📊 DATAPROVIDER: fetch failed {symbol} {timeframe}: {e}")
+            # Return stale cache if available
+            if cached:
+                self._health[key]['stale'] += 1
+                logger.info(f"📊 DATAPROVIDER: returning stale cache for {symbol} {timeframe}")
+                return cached['data']
+            return []
+    
+    def _check_freshness(self, key: tuple, data: list, timeframe: str, now: float):
+        """Check if the latest candle is fresh enough."""
+        interval = self.TF_INTERVAL_SEC.get(timeframe, 300)
+        last_candle_ts = data[-1][0] / 1000  # ms → s
+        age = now - last_candle_ts
+        threshold = interval * self.STALENESS_MULTIPLIER
+        
+        if age > threshold:
+            self._health[key]['stale'] += 1
+            logger.warning(
+                f"📊 DATAPROVIDER_STALE: {key[0]} {timeframe} "
+                f"last_candle={age:.0f}s ago (threshold={threshold:.0f}s)"
+            )
+        
+        # Missing candle detection: check gaps
+        if len(data) >= 3:
+            expected_gap = interval * 1000  # ms
+            gaps = 0
+            for i in range(1, min(10, len(data))):
+                actual_gap = data[i][0] - data[i-1][0]
+                if actual_gap > expected_gap * 1.5:  # Allow 50% tolerance
+                    gaps += 1
+            if gaps > 0:
+                self._health[key]['missing'] += gaps
+    
+    def is_data_stale(self, symbol: str, timeframe: str) -> bool:
+        """Check if cached data for a symbol/tf is considered stale."""
+        key = (symbol, timeframe)
+        cached = self._cache.get(key)
+        if not cached or not cached['data']:
+            return True
+        
+        interval = self.TF_INTERVAL_SEC.get(timeframe, 300)
+        last_ts = cached['data'][-1][0] / 1000
+        age = time.time() - last_ts
+        return age > interval * self.STALENESS_MULTIPLIER
+    
+    def get_score_penalty(self, symbol: str, timeframe: str = '5m') -> float:
+        """Get a score penalty factor (0.0-1.0) based on data freshness.
+        
+        Returns 1.0 (no penalty) if data is fresh, lower values if stale.
+        """
+        key = (symbol, timeframe)
+        cached = self._cache.get(key)
+        if not cached or not cached['data']:
+            return 0.7  # No data → moderate penalty
+        
+        interval = self.TF_INTERVAL_SEC.get(timeframe, 300)
+        last_ts = cached['data'][-1][0] / 1000
+        age = time.time() - last_ts
+        
+        if age <= interval * 1.5:
+            return 1.0  # Fresh
+        elif age <= interval * 3.0:
+            return 0.9  # Slightly stale
+        elif age <= interval * 6.0:
+            return 0.75  # Stale
+        else:
+            return 0.5  # Very stale
+    
+    def get_health(self) -> dict:
+        """Get data health telemetry for all tracked symbols/timeframes."""
+        now = time.time()
+        result = {}
+        for (sym, tf), stats in self._health.items():
+            cache_entry = self._cache.get((sym, tf))
+            cache_age = round(now - cache_entry['ts'], 0) if cache_entry else None
+            result[f"{sym}:{tf}"] = {
+                **stats,
+                'cache_age_sec': cache_age,
+                'is_stale': self.is_data_stale(sym, tf),
+            }
+        return result
+    
+    def invalidate(self, symbol: str = None, timeframe: str = None):
+        """Invalidate cache entries. If symbol is None, invalidate all."""
+        if symbol is None:
+            self._cache.clear()
+            return
+        keys_to_remove = [
+            k for k in self._cache
+            if k[0] == symbol and (timeframe is None or k[1] == timeframe)
+        ]
+        for k in keys_to_remove:
+            del self._cache[k]
+
+data_provider = DataProvider()
 
 # Phase 138: Global dictionary to track close reasons for Binance sync
 # When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
