@@ -18419,55 +18419,6 @@ def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float
     return threshold
 
 # ============================================================================
-# SIGNAL GENERATOR (4-Layer Logic)
-# ============================================================================
-
-class SignalGenerator:
-    """
-    4-Layer signal generation based on DEVELOPER_HANDBOOK.
-    
-    Layer 1: Hurst Regime Filter
-    Layer 2: Z-Score Threshold
-    Layer 3: Liquidation Cascade
-    Layer 4: Order Book Confirmation
-    """
-    
-    def __init__(self):
-        self.last_signal_time: float = 0
-        self.min_signal_interval: float = 15.0  # RELAXED: 30s -> 15s for more signals
-        self.liquidation_threshold: float = 100000  # $100k for cascade detection
-        self.recent_liquidations: deque = deque(maxlen=50)
-        self.leverage: int = 10 # Default Leverage
-        logger.info(f"SignalGenerator Initialized (RELAXED). Leverage: {self.leverage}")
-        
-    def check_liquidation_cascade(self) -> tuple[bool, float]:
-        """
-        Check if there's a liquidation cascade.
-        Returns (is_cascade, total_volume)
-        """
-        now = datetime.now().timestamp()
-        # Look at liquidations in the last 30 seconds
-        recent = [liq for liq in self.recent_liquidations 
-                  if now - liq['timestamp'] < 30]
-        
-        if not recent:
-            return False, 0
-            
-        total_volume = sum(liq['amount'] for liq in recent)
-        is_cascade = total_volume > self.liquidation_threshold
-        
-        return is_cascade, total_volume
-    
-    def add_liquidation(self, side: str, amount: float, price: float):
-        """Add a liquidation event."""
-        self.recent_liquidations.append({
-            'side': side,
-            'amount': amount,
-            'price': price,
-            'timestamp': datetime.now().timestamp()
-        })
-    
-# ============================================================================
 # PHASE 247: HYBRID TREND DIRECTION FILTER
 # İlham: Freqtrade TEMA guard + Hummingbot MACD+BB + Jesse EMA cross
 # 5 indikatör oylama sistemi ile trend yönü belirleme
@@ -18598,6 +18549,55 @@ def determine_trend_direction(
     }
 
 
+# ============================================================================
+# SIGNAL GENERATOR (4-Layer Logic)
+# ============================================================================
+
+class SignalGenerator:
+    """
+    4-Layer signal generation based on DEVELOPER_HANDBOOK.
+    
+    Layer 1: Hurst Regime Filter
+    Layer 2: Z-Score Threshold
+    Layer 3: Liquidation Cascade
+    Layer 4: Order Book Confirmation
+    """
+    
+    def __init__(self):
+        self.last_signal_time: float = 0
+        self.min_signal_interval: float = 15.0  # RELAXED: 30s -> 15s for more signals
+        self.liquidation_threshold: float = 100000  # $100k for cascade detection
+        self.recent_liquidations: deque = deque(maxlen=50)
+        self.leverage: int = 10 # Default Leverage
+        logger.info(f"SignalGenerator Initialized (RELAXED). Leverage: {self.leverage}")
+        
+    def check_liquidation_cascade(self) -> tuple[bool, float]:
+        """
+        Check if there's a liquidation cascade.
+        Returns (is_cascade, total_volume)
+        """
+        now = datetime.now().timestamp()
+        # Look at liquidations in the last 30 seconds
+        recent = [liq for liq in self.recent_liquidations 
+                  if now - liq['timestamp'] < 30]
+        
+        if not recent:
+            return False, 0
+            
+        total_volume = sum(liq['amount'] for liq in recent)
+        is_cascade = total_volume > self.liquidation_threshold
+        
+        return is_cascade, total_volume
+    
+    def add_liquidation(self, side: str, amount: float, price: float):
+        """Add a liquidation event."""
+        self.recent_liquidations.append({
+            'side': side,
+            'amount': amount,
+            'price': price,
+            'timestamp': datetime.now().timestamp()
+        })
+    
     def generate_signal(
         self,
         hurst: float,
