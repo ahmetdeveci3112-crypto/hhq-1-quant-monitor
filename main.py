@@ -11151,14 +11151,14 @@ async def background_scanner_loop():
                                         
                                         logger.warning(f"✅ LIMIT_FILLED: {pos_symbol} {pos['side']} @ ${exit_avg:.6f} | Reason: {reason} | Elapsed: {elapsed:.0f}s")
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, exit_avg, reason)
+                                        exit_engine.request_exit(pos, exit_avg, reason)
                                         continue
                                     elif status == 'canceled' or status == 'expired':
                                         # Phase 232: Distinct reason for cancelled orders
                                         cancel_reason = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                                         logger.warning(f"⚠️ LIMIT_CANCELLED: {pos_symbol} order {order_id} — market close")
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, cancel_reason)
+                                        exit_engine.request_exit(pos, current_price, cancel_reason)
                                         continue
                                     elif elapsed >= timeout:
                                         # Phase 232: Distinct reason for timeout
@@ -11166,7 +11166,7 @@ async def background_scanner_loop():
                                         logger.warning(f"⏰ LIMIT_TIMEOUT: {pos_symbol} {reason} not filled in {elapsed:.0f}s → cancel + market")
                                         await live_binance_trader.cancel_order(pos_symbol, order_id)
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, timeout_reason)
+                                        exit_engine.request_exit(pos, current_price, timeout_reason)
                                         continue
                                     else:
                                         # Still open — skip this position's SL/TP checks
@@ -11180,7 +11180,7 @@ async def background_scanner_loop():
                                         except:
                                             pass
                                         del pos['pending_limit_close']
-                                        global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
+                                        exit_engine.request_exit(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                                         continue
                             
                             # Check SL/TP
@@ -11196,7 +11196,7 @@ async def background_scanner_loop():
                                 excess_pct = abs(current_price - trailing_stop_ws) / entry_price * 100
                                 reason = 'EMERGENCY_SL'
                                 logger.warning(f"🚨 EMERGENCY SL (pre-guard): {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop_ws:.6f} | Aşım: {excess_pct:.2f}%")
-                                global_paper_trader.close_position(pos, current_price, reason)
+                                exit_engine.request_exit(pos, current_price, reason)
                                 continue
                             
                             # Phase 210: Flash Trade Guard — minimum 60s hold time
@@ -11303,7 +11303,7 @@ async def background_scanner_loop():
                                 excess_pct = abs(current_price - trailing_stop) / entry_price * 100
                                 reason = 'EMERGENCY_SL'
                                 logger.warning(f"🚨 EMERGENCY SL: {pos_symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}% | Candle close: ${candle_close_price:.6f}")
-                                global_paper_trader.close_position(pos, current_price, reason)
+                                exit_engine.request_exit(pos, current_price, reason)
                                 continue
                             
                             now_ts = datetime.now().timestamp()
@@ -11313,7 +11313,7 @@ async def background_scanner_loop():
                                 if pos.get('isTrailingActive', False):
                                     reason = 'TRAIL_EXIT'
                                     logger.info(f"🔴 TRAIL EXIT (immediate): {pos_symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
-                                    global_paper_trader.close_position(pos, current_price, reason)
+                                    exit_engine.request_exit(pos, current_price, reason)
                                     continue
                                 
                                 # Start timer on first breach (SL only, not trail)
@@ -11348,11 +11348,11 @@ async def background_scanner_loop():
                                                 continue
                                             else:
                                                 logger.warning(f"📙 TRAIL_LIMIT_FAIL: {pos_symbol} limit failed, market close")
-                                                global_paper_trader.close_position(pos, current_price, 'TRAIL_EXIT')
+                                                exit_engine.request_exit(pos, current_price, 'TRAIL_EXIT')
                                                 continue
                                         except Exception as e:
                                             logger.error(f"Trail limit error {pos_symbol}: {e}")
-                                            global_paper_trader.close_position(pos, current_price, 'TRAIL_EXIT')
+                                            exit_engine.request_exit(pos, current_price, 'TRAIL_EXIT')
                                             continue
                                     else:
                                         # Illiquid coin or regular SL → market close (execution certainty)
@@ -11360,7 +11360,7 @@ async def background_scanner_loop():
                                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                                         pos_roi = pos.get('unrealizedPnlPercent', 0)
                                         reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive', False) and pos_roi >= 0) else 'SL_HIT'
-                                        global_paper_trader.close_position(pos, current_price, reason)
+                                        exit_engine.request_exit(pos, current_price, reason)
                                         continue
                             else:
                                 # Price recovered - reset counter (spike bypassed!)
@@ -11401,15 +11401,15 @@ async def background_scanner_loop():
                                         else:
                                             # Limit failed → immediate market close
                                             logger.warning(f"📗 TP_LIMIT_FAIL: {pos_symbol} limit failed, falling back to market")
-                                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                            exit_engine.request_exit(pos, current_price, 'TP_HIT')
                                             continue
                                     except Exception as e:
                                         logger.error(f"TP limit error {pos_symbol}: {e}")
-                                        global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                        exit_engine.request_exit(pos, current_price, 'TP_HIT')
                                         continue
                                 else:
                                     # Paper trading → immediate close
-                                    global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                                    exit_engine.request_exit(pos, current_price, 'TP_HIT')
                                     continue
                             
                             # ===================================================================
@@ -11427,7 +11427,7 @@ async def background_scanner_loop():
                                 pos['beBufferPct'] = round(_be_buf * 100, 4)
                                 pos['beBufferSource'] = 'dynamic'
                                 logger.info(f"BE_BUFFER: {pos_symbol} {pos['side']} reason=FC spread={_be_spread}% → buffer={_be_buf*100:.3f}%")
-                                global_paper_trader.close_position(pos, be_exit_price, 'FAILED_CONTINUATION')
+                                exit_engine.request_exit(pos, be_exit_price, 'FAILED_CONTINUATION')
                                 continue
                             
                             # Update trailing stop if in profit
@@ -11738,19 +11738,19 @@ async def on_position_price_update(symbol: str, ticker: dict):
                         exit_avg_ws = fill_price
                     logger.warning(f"✅ WS_LIMIT_FILLED: {symbol} @ ${exit_avg_ws:.6f} | {reason} | {elapsed:.0f}s")
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, exit_avg_ws, reason)
+                    exit_engine.request_exit(pos, exit_avg_ws, reason)
                     continue
                 elif chk_status in ('canceled', 'expired'):
                     cancel_reason_ws = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, cancel_reason_ws)
+                    exit_engine.request_exit(pos, current_price, cancel_reason_ws)
                     continue
                 elif elapsed >= timeout:
                     timeout_reason_ws = f"{'TP_TIMEOUT' if 'TP' in reason else 'TRAIL_TIMEOUT'}_MARKET_FALLBACK({reason})"
                     logger.warning(f"⏰ WS_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
                     await live_binance_trader.cancel_order(symbol, order_id)
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, timeout_reason_ws)
+                    exit_engine.request_exit(pos, current_price, timeout_reason_ws)
                     continue
                 else:
                     continue  # Still pending — skip SL/TP
@@ -11761,7 +11761,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     except:
                         pass
                     del pos['pending_limit_close']
-                    global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
+                    exit_engine.request_exit(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                     continue
             continue  # pending_limit_close aktif, SL/TP atla
         
@@ -11836,7 +11836,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
         if check_emergency_sl_static(pos, current_price, trailing_stop):
             excess_pct = abs(current_price - trailing_stop) / entry_price * 100
             logger.warning(f"🚨 EMERGENCY SL (WS): {symbol} {pos['side']} @ ${current_price:.6f} | SL ${trailing_stop:.6f} | Aşım: {excess_pct:.2f}%")
-            global_paper_trader.close_position(pos, current_price, 'EMERGENCY_SL')
+            exit_engine.request_exit(pos, current_price, 'EMERGENCY_SL')
             continue
         
         now_ts = datetime.now().timestamp()
@@ -11845,7 +11845,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             if pos.get('isTrailingActive', False):
                 reason = 'TRAIL_EXIT'
                 logger.info(f"🔴 TRAIL EXIT (immediate, WS): {symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
-                global_paper_trader.close_position(pos, current_price, reason)
+                exit_engine.request_exit(pos, current_price, reason)
                 continue
             
             if pos['slConfirmCount'] == 0:
@@ -11855,13 +11855,13 @@ async def on_position_price_update(symbol: str, ticker: dict):
             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
                 reason = 'SL_HIT'
                 logger.info(f"🔴 SL CONFIRMED (WS): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                global_paper_trader.close_position(pos, current_price, reason)
+                exit_engine.request_exit(pos, current_price, reason)
                 continue
             elif breach_duration >= SL_MAX_WAIT_SECONDS:
                 # Phase 217: Sakin piyasada tick gelmese bile süre doldu
                 reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
                 logger.info(f"🔴 SL TIMEOUT (WS): {symbol} @ ${current_price:.6f} | {breach_duration:.0f}s timeout")
-                global_paper_trader.close_position(pos, current_price, reason)
+                exit_engine.request_exit(pos, current_price, reason)
                 continue
         else:
             if pos['slConfirmCount'] > 0:
@@ -11873,11 +11873,11 @@ async def on_position_price_update(symbol: str, ticker: dict):
         # TP Hit Check (anında — kar için onay gerekmez)
         # Phase 205: Use candle close for TP decision
         if pos['side'] == 'LONG' and candle_close_price >= tp:
-            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+            exit_engine.request_exit(pos, current_price, 'TP_HIT')
             logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
             continue
         elif pos['side'] == 'SHORT' and candle_close_price <= tp:
-            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+            exit_engine.request_exit(pos, current_price, 'TP_HIT')
             logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
             continue
         
@@ -11892,7 +11892,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             pos['beBufferPct'] = round(_be_buf_ws * 100, 4)
             pos['beBufferSource'] = 'dynamic'
             logger.info(f"BE_BUFFER: {symbol} {pos['side']} reason=FC(WS) spread={_be_spread_ws}% → buffer={_be_buf_ws*100:.3f}%")
-            global_paper_trader.close_position(pos, be_exit_ws, 'FAILED_CONTINUATION')
+            exit_engine.request_exit(pos, be_exit_ws, 'FAILED_CONTINUATION')
             continue
         
         # ---- Trailing Stop Güncelle ----
@@ -12081,19 +12081,19 @@ async def position_price_update_loop():
                                         exit_avg_fast = fill_price
                                     logger.warning(f"✅ FAST_LIMIT_FILLED: {symbol} @ ${exit_avg_fast:.6f} | {reason} | {elapsed:.0f}s")
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, exit_avg_fast, reason)
+                                    exit_engine.request_exit(pos, exit_avg_fast, reason)
                                     continue
                                 elif chk_status in ('canceled', 'expired'):
                                     cancel_reason_fast = f"LIMIT_CANCELLED_MARKET_FALLBACK({reason})"
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, cancel_reason_fast)
+                                    exit_engine.request_exit(pos, current_price, cancel_reason_fast)
                                     continue
                                 elif elapsed >= timeout:
                                     timeout_reason_fast = f"{'TP_TIMEOUT' if 'TP' in reason else 'TRAIL_TIMEOUT'}_MARKET_FALLBACK({reason})"
                                     logger.warning(f"⏰ FAST_TIMEOUT: {symbol} {reason} {elapsed:.0f}s → market")
                                     await live_binance_trader.cancel_order(symbol, order_id)
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, timeout_reason_fast)
+                                    exit_engine.request_exit(pos, current_price, timeout_reason_fast)
                                     continue
                                 else:
                                     continue  # Still pending — skip SL/TP checks
@@ -12104,7 +12104,7 @@ async def position_price_update_loop():
                                     except:
                                         pass
                                     del pos['pending_limit_close']
-                                    global_paper_trader.close_position(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
+                                    exit_engine.request_exit(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                                     continue
                         
                         # Check SL/TP exits with SPIKE BYPASS
@@ -12139,7 +12139,7 @@ async def position_price_update_loop():
                             if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
                                 reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
                                 logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                global_paper_trader.close_position(pos, current_price, reason)
+                                exit_engine.request_exit(pos, current_price, reason)
                                 continue
                         else:
                             if pos['slConfirmCount'] > 0:
@@ -12150,11 +12150,11 @@ async def position_price_update_loop():
                         
                         # TP Hit Check (immediate - no confirmation for profits)
                         if pos['side'] == 'LONG' and current_price >= tp:
-                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                            exit_engine.request_exit(pos, current_price, 'TP_HIT')
                             logger.info(f"✅ TP triggered: LONG {symbol} @ ${current_price:.6f}")
                             continue
                         elif pos['side'] == 'SHORT' and current_price <= tp:
-                            global_paper_trader.close_position(pos, current_price, 'TP_HIT')
+                            exit_engine.request_exit(pos, current_price, 'TP_HIT')
                             logger.info(f"✅ TP triggered: SHORT {symbol} @ ${current_price:.6f}")
                             continue
                         
@@ -12171,7 +12171,7 @@ async def position_price_update_loop():
                             pos['beBufferPct'] = round(_be_buf_bu * 100, 4)
                             pos['beBufferSource'] = 'dynamic'
                             logger.info(f"BE_BUFFER: {symbol} {pos['side']} reason=FC(backup) spread={_be_spread_bu}% → buffer={_be_buf_bu*100:.3f}%")
-                            global_paper_trader.close_position(pos, be_exit_bu, 'FAILED_CONTINUATION')
+                            exit_engine.request_exit(pos, be_exit_bu, 'FAILED_CONTINUATION')
                             continue
                         
                         # Update trailing stop if in profit
@@ -24727,6 +24727,120 @@ async def server_ip():
 
 # Phase 16: Global Paper Trader for REST API access
 global_paper_trader = PaperTradingEngine()
+
+# ============================================================================
+# Phase 251: EXIT DECISION ENGINE
+# Unified exit gate — all close paths go through request_exit()
+# Provides: double-close prevention, priority override, reason normalization
+# ============================================================================
+
+class ExitDecisionEngine:
+    """Phase 251: Unified exit decision gate.
+    
+    All close paths call request_exit() instead of close_position() directly.
+    Provides:
+    - exit_pending guard (double-close prevention per symbol)
+    - priority-based exit override (EMERGENCY > TRAIL > TP > TIME)
+    - close_reason normalization & source tracking
+    - telemetry logging for exit decisions
+    """
+    EXIT_PRIORITY = {
+        'EMERGENCY_SL': 100,
+        'KILL_SWITCH': 95,
+        'RECOVERY_CLOSE_ALL': 93,
+        'RECOVERY_EXIT': 90,
+        'PROTECTION_LOCK': 85,
+        'FAILED_CONTINUATION': 70,
+        'TRAIL_EXIT': 60,
+        'TP_HIT': 50,
+        'TIME_GRADUAL': 40,
+        'TIME_EXIT': 35,
+    }
+    
+    def __init__(self, paper_trader):
+        self.paper_trader = paper_trader
+        self._exit_pending = {}   # symbol → {reason, ts, priority, source}
+        self._exit_log = []       # last N exit decisions for telemetry
+        self._stats = {'total': 0, 'skipped': 0, 'upgraded': 0}
+    
+    def request_exit(self, pos, exit_price: float, reason: str, source: str = 'UNKNOWN'):
+        """Request position exit through unified gate.
+        
+        Args:
+            pos: Position dict
+            exit_price: Exit price
+            reason: Close reason string
+            source: Caller identifier (SCANNER, WEBSOCKET, FAST_UPDATER, etc.)
+        
+        Returns: trade dict or None if skipped
+        """
+        symbol = pos.get('symbol', '')
+        new_pri = self._get_priority(reason)
+        
+        # Double-close guard: if already pending, only allow higher priority
+        if symbol in self._exit_pending:
+            existing = self._exit_pending[symbol]
+            if new_pri <= existing['priority']:
+                self._stats['skipped'] += 1
+                logger.info(
+                    f"⏭️ EXIT_SKIP: {symbol} already pending exit "
+                    f"({existing['reason']} pri={existing['priority']}) > "
+                    f"new ({reason} pri={new_pri}) from {source}"
+                )
+                return None
+            # Higher priority → upgrade
+            self._stats['upgraded'] += 1
+            logger.info(
+                f"🔄 EXIT_UPGRADE: {symbol} {existing['reason']}→{reason} "
+                f"(pri {existing['priority']}→{new_pri}) source={source}"
+            )
+        
+        # Mark as pending
+        self._exit_pending[symbol] = {
+            'reason': reason, 'ts': time.time(),
+            'priority': new_pri, 'source': source,
+        }
+        
+        # Execute close through paper trader
+        self._stats['total'] += 1
+        try:
+            result = self.paper_trader.close_position(pos, exit_price, reason)
+            logger.info(
+                f"🚪 EXIT_ENGINE: {symbol} closed | reason={reason} "
+                f"price={exit_price:.6f} source={source} pri={new_pri}"
+            )
+        except Exception as e:
+            logger.error(f"❌ EXIT_ENGINE error: {symbol} {reason} - {e}")
+            result = None
+        finally:
+            # Cleanup pending flag
+            self._exit_pending.pop(symbol, None)
+        
+        # Track last 50 exits for telemetry
+        self._exit_log.append({
+            'symbol': symbol, 'reason': reason,
+            'source': source, 'ts': time.time(),
+        })
+        if len(self._exit_log) > 50:
+            self._exit_log = self._exit_log[-50:]
+        
+        return result
+    
+    def is_exit_pending(self, symbol: str) -> bool:
+        """Check if a symbol has an exit already in progress."""
+        return symbol in self._exit_pending
+    
+    def _get_priority(self, reason: str) -> int:
+        reason_upper = reason.upper()
+        for key, pri in self.EXIT_PRIORITY.items():
+            if key in reason_upper:
+                return pri
+        return 30  # default low priority
+    
+    def get_stats(self) -> dict:
+        return {**self._stats, 'pending': list(self._exit_pending.keys())}
+
+exit_engine = ExitDecisionEngine(global_paper_trader)
 
 # Phase 138: Global dictionary to track close reasons for Binance sync
 # When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
