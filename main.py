@@ -25040,6 +25040,12 @@ async def phase193_hyperopt_run(request: Request):
         hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))  # Phase 246: trades not trade_history
     
     result = await hhq_hyperoptimizer.optimize(n_trials=n_trials)
+    
+    # Phase 246C: Apply best params to runtime trader
+    if 'error' not in result and 'global_paper_trader' in globals():
+        applied = hhq_hyperoptimizer.apply_to_trader(global_paper_trader)
+        result['params_applied'] = applied
+    
     return JSONResponse(result)
 
 

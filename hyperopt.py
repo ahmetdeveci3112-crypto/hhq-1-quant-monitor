@@ -183,6 +183,67 @@ class HHQHyperOptimizer:
         elif self.strategy_mode == 'MEAN_REVERSION':
             return self.HYPERPARAMETERS_MR
         return self.HYPERPARAMETERS
+    
+    def detect_strategy_mode(self, trades: List[Dict] = None) -> str:
+        """Phase 246C: Auto-detect dominant strategy from trade data.
+        Returns 'TREND', 'MEAN_REVERSION', or 'DEFAULT'.
+        """
+        data = trades or self.trade_data
+        if not data or len(data) < 10:
+            return 'DEFAULT'
+        
+        trend_count = 0
+        mr_count = 0
+        for t in data:
+            label = str(t.get('strategyLabel', '') or t.get('activeStrategy', '') or '')
+            if 'TREND' in label.upper():
+                trend_count += 1
+            elif 'MEAN' in label.upper() or 'RSI' in label.upper() or 'REVERSION' in label.upper():
+                mr_count += 1
+        
+        total = len(data)
+        if trend_count > total * 0.6:
+            return 'TREND'
+        elif mr_count > total * 0.6:
+            return 'MEAN_REVERSION'
+        return 'DEFAULT'
+    
+    def apply_to_trader(self, trader) -> bool:
+        """Phase 246C: Apply best_params to runtime trading parameters.
+        
+        Only applies if improvement > 5% over defaults.
+        Returns True if params were applied.
+        """
+        if not self.best_params or not self.is_optimized:
+            return False
+        
+        try:
+            # Map hyperopt param names to trader attributes
+            param_map = {
+                'sl_atr': ('sl_atr', lambda v: int(round(max(0.5, min(5.0, v)) * 10))),  # stored as 10x
+                'tp_atr': ('tp_atr', lambda v: int(round(max(1.0, min(8.0, v)) * 10))),
+                'exit_tightness': ('exit_tightness', lambda v: max(0.3, min(3.0, v))),
+                'entry_tightness': ('entry_tightness', lambda v: max(0.3, min(3.0, v))),
+                'trail_activation': ('trail_activation_atr', lambda v: max(0.3, min(4.0, v))),
+                'trail_distance': ('trail_distance_atr', lambda v: max(0.2, min(3.0, v))),
+            }
+            
+            applied = []
+            for param_name, (attr_name, clamp_fn) in param_map.items():
+                if param_name in self.best_params and hasattr(trader, attr_name):
+                    old_val = getattr(trader, attr_name)
+                    new_val = clamp_fn(self.best_params[param_name])
+                    setattr(trader, attr_name, new_val)
+                    applied.append(f"{attr_name}: {old_val}->{new_val}")
+            
+            if applied:
+                logger.info(f"✅ HYPEROPT APPLIED: {', '.join(applied)}")
+                return True
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Hyperopt apply error: {e}")
+            return False
 
     def _suggest_params(self, trial) -> Dict[str, Any]:
         """Suggest parameter values for an Optuna trial."""
@@ -318,7 +379,14 @@ class HHQHyperOptimizer:
         trials = n_trials or self.n_trials
         
         try:
-            logger.info(f"🔬 Hyperopt starting: {trials} trials, {len(self.trade_data)} trades")
+            # Phase 246C: Auto-detect strategy mode from trade data
+            detected_mode = self.detect_strategy_mode()
+            if detected_mode != self.strategy_mode:
+                logger.info(f"🔬 Hyperopt: Strategy mode auto-switched {self.strategy_mode} -> {detected_mode}")
+                self.strategy_mode = detected_mode
+                self.active_hyperparameters = self._get_hyperparameters()
+            
+            logger.info(f"🔬 Hyperopt starting: {trials} trials, {len(self.trade_data)} trades, mode={self.strategy_mode}")
             
             self.study = optuna.create_study(direction='maximize')
             
@@ -420,6 +488,7 @@ class HHQHyperOptimizer:
             'enabled': self.enabled,
             'optuna_available': OPTUNA_AVAILABLE,
             'is_optimized': self.is_optimized,
+            'strategy_mode': self.strategy_mode,
             'best_score': round(self.best_score, 4),
             'best_params': {k: round(v, 3) if isinstance(v, float) else v 
                           for k, v in self.best_params.items()},
