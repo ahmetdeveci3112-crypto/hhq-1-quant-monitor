@@ -12313,6 +12313,16 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             return None
     except Exception:
         pass
+    
+    # Phase 254: Protection Manager — SL streak lock gate
+    try:
+        prot_blocked, prot_reason = protection_manager.should_block_signal(symbol, action)
+        if prot_blocked:
+            logger.info(f"🔒 PROT_BLOCK: {symbol} {action} blocked — {prot_reason}")
+            reject_feedback(f"PROT_BLOCK:{prot_reason}")
+            return None
+    except Exception:
+        pass
 
     atr = signal.get('atr', 0)
     
@@ -25016,6 +25026,145 @@ class ExitDecisionEngine:
         return {**self._stats, 'pending': list(self._exit_pending.keys())}
 
 exit_engine = ExitDecisionEngine(global_paper_trader)
+
+# ============================================================================
+# Phase 254: PROTECTION MANAGER (Freqtrade-inspired)
+# Lookback + stoploss streak + cooldown + pair/global lock
+# ============================================================================
+
+class ProtectionManager:
+    """Phase 254: Trade protection gate.
+    
+    Blocks new signal entries based on:
+    - Stoploss streak per pair: N consecutive SL hits → pair lock
+    - Global stoploss streak: M consecutive SL hits across all pairs → global lock
+    - Cooldown after lock expiry
+    """
+    
+    def __init__(self, paper_trader):
+        self.paper_trader = paper_trader
+        self._pair_locks = {}    # symbol → {'until': timestamp, 'reason': str}
+        self._global_lock = None  # {'until': timestamp, 'reason': str} or None
+        
+        # Configurable thresholds
+        self.LOOKBACK_WINDOW_SEC = 1800    # 30 min lookback
+        self.PAIR_SL_STREAK_LIMIT = 3     # 3 consecutive SL on same pair → lock
+        self.GLOBAL_SL_STREAK_LIMIT = 5   # 5 consecutive SL globally → lock
+        self.PAIR_LOCK_DURATION_SEC = 600  # 10 min pair lock
+        self.GLOBAL_LOCK_DURATION_SEC = 900  # 15 min global lock
+    
+    def should_block_signal(self, symbol: str, action: str) -> tuple:
+        """Check if a signal should be blocked.
+        
+        Returns: (blocked: bool, reason: str)
+        """
+        now = time.time()
+        
+        # Check global lock
+        if self._global_lock and now < self._global_lock['until']:
+            remaining = self._global_lock['until'] - now
+            reason = f"PROTECTION_LOCK:GLOBAL_SL_STREAK ({remaining:.0f}s remaining)"
+            return True, reason
+        elif self._global_lock:
+            self._global_lock = None  # Expired
+        
+        # Check pair lock
+        if symbol in self._pair_locks:
+            lock = self._pair_locks[symbol]
+            if now < lock['until']:
+                remaining = lock['until'] - now
+                reason = f"PROTECTION_LOCK:{symbol}_SL_STREAK ({remaining:.0f}s remaining)"
+                return True, reason
+            else:
+                del self._pair_locks[symbol]  # Expired
+        
+        # Analyze recent trade history
+        self._check_streaks(now)
+        
+        # Re-check after analysis (streak check may have created new locks)
+        if self._global_lock and now < self._global_lock['until']:
+            remaining = self._global_lock['until'] - now
+            return True, f"PROTECTION_LOCK:GLOBAL_SL_STREAK ({remaining:.0f}s remaining)"
+        
+        if symbol in self._pair_locks:
+            lock = self._pair_locks[symbol]
+            if now < lock['until']:
+                remaining = lock['until'] - now
+                return True, f"PROTECTION_LOCK:{symbol}_SL_STREAK ({remaining:.0f}s remaining)"
+        
+        return False, ''
+    
+    def _check_streaks(self, now: float):
+        """Analyze recent trades for stoploss streaks."""
+        cutoff = now - self.LOOKBACK_WINDOW_SEC
+        
+        # Get recent trades from paper trader
+        recent_trades = []
+        for trade in reversed(self.paper_trader.trade_history):
+            close_time = trade.get('closeTime', 0) / 1000  # ms → s
+            if close_time < cutoff:
+                break
+            recent_trades.append(trade)
+        
+        if not recent_trades:
+            return
+        
+        # Check per-pair streaks
+        pair_trades = {}
+        for trade in recent_trades:
+            sym = trade.get('symbol', '')
+            if sym not in pair_trades:
+                pair_trades[sym] = []
+            pair_trades[sym].append(trade)
+        
+        for sym, trades in pair_trades.items():
+            # Count consecutive SL from most recent
+            sl_streak = 0
+            for t in trades:  # Already reverse chronological
+                reason = (t.get('reason', '') or '').upper()
+                if 'SL_HIT' in reason or 'EMERGENCY_SL' in reason:
+                    sl_streak += 1
+                else:
+                    break
+            
+            if sl_streak >= self.PAIR_SL_STREAK_LIMIT and sym not in self._pair_locks:
+                self._pair_locks[sym] = {
+                    'until': now + self.PAIR_LOCK_DURATION_SEC,
+                    'reason': f"PAIR_SL_STREAK:{sl_streak}",
+                }
+                logger.warning(f"🔒 PROTECTION_LOCK: {sym} locked for {self.PAIR_LOCK_DURATION_SEC}s (SL streak={sl_streak})")
+        
+        # Check global streak
+        global_sl_streak = 0
+        all_trades_sorted = sorted(recent_trades, key=lambda t: t.get('closeTime', 0), reverse=True)
+        for t in all_trades_sorted:
+            reason = (t.get('reason', '') or '').upper()
+            if 'SL_HIT' in reason or 'EMERGENCY_SL' in reason:
+                global_sl_streak += 1
+            else:
+                break
+        
+        if global_sl_streak >= self.GLOBAL_SL_STREAK_LIMIT and not self._global_lock:
+            self._global_lock = {
+                'until': now + self.GLOBAL_LOCK_DURATION_SEC,
+                'reason': f"GLOBAL_SL_STREAK:{global_sl_streak}",
+            }
+            logger.warning(f"🔒 PROTECTION_LOCK: GLOBAL locked for {self.GLOBAL_LOCK_DURATION_SEC}s (SL streak={global_sl_streak})")
+    
+    def get_status(self) -> dict:
+        now = time.time()
+        active_pair_locks = {
+            sym: {'remaining': lock['until'] - now, 'reason': lock['reason']}
+            for sym, lock in self._pair_locks.items()
+            if now < lock['until']
+        }
+        return {
+            'global_locked': self._global_lock is not None and now < self._global_lock.get('until', 0),
+            'global_remaining': max(0, self._global_lock['until'] - now) if self._global_lock else 0,
+            'pair_locks': active_pair_locks,
+        }
+
+protection_manager = ProtectionManager(global_paper_trader)
 
 # Phase 138: Global dictionary to track close reasons for Binance sync
 # When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
