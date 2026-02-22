@@ -18528,8 +18528,10 @@ def determine_trend_direction(
     # ADX < 25: Ranging market, both sides allowed (mean reversion territory)
     
     # Momentum confirmation (anti-falling-knife)
-    momentum_confirming_long = safe_macd_hist > 0
-    momentum_confirming_short = safe_macd_hist < 0
+    # MACD histogram must be turning in signal direction
+    # >= 0 ensures we don't block all trades if MACD defaults to exactly 0.0
+    momentum_confirming_long = safe_macd_hist >= 0
+    momentum_confirming_short = safe_macd_hist <= 0
     
     return {
         'direction': direction,
@@ -18795,11 +18797,13 @@ class SignalGenerator:
             # Phase 247: TREND DIRECTION GATE (Katman 1)
             # Güçlü trend'de counter-trend sinyalleri engelle
             # =====================================================================
+            safe_adx_local = float(adx) if adx is not None else 20.0
+            
             if signal_side == "LONG" and not trend_dir['allow_long']:
                 logger.info(
                     f"🚫 TREND_GATE: {symbol} LONG engellendi | "
                     f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
-                    f"ADX={adx:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
+                    f"ADX={safe_adx_local:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
                     f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
                 )
                 return None
@@ -18807,7 +18811,7 @@ class SignalGenerator:
                 logger.info(
                     f"🚫 TREND_GATE: {symbol} SHORT engellendi | "
                     f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
-                    f"ADX={adx:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
+                    f"ADX={safe_adx_local:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
                     f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
                 )
                 return None
@@ -18817,16 +18821,16 @@ class SignalGenerator:
             # MACD histogram sinyal yönünde olmalı (ADX > 20 ise)
             # Freqtrade'in "TEMA is rising" korumasının karşılığı
             # =====================================================================
-            if signal_side == "LONG" and not trend_dir['momentum_confirming_long'] and adx > 20:
+            if signal_side == "LONG" and not trend_dir['momentum_confirming_long'] and safe_adx_local > 20:
                 logger.info(
                     f"🔪 MOMENTUM_GATE: {symbol} LONG engellendi | "
-                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (< 0, momentum dönmedi) ADX={adx:.0f}"
+                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (< 0, momentum dönmedi) ADX={safe_adx_local:.0f}"
                 )
                 return None
-            if signal_side == "SHORT" and not trend_dir['momentum_confirming_short'] and adx > 20:
+            if signal_side == "SHORT" and not trend_dir['momentum_confirming_short'] and safe_adx_local > 20:
                 logger.info(
                     f"🔪 MOMENTUM_GATE: {symbol} SHORT engellendi | "
-                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (> 0, momentum dönmedi) ADX={adx:.0f}"
+                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (> 0, momentum dönmedi) ADX={safe_adx_local:.0f}"
                 )
                 return None
             
