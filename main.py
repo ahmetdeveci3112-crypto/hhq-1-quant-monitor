@@ -4984,6 +4984,15 @@ TP_LADDER_RUNTIME_ADJUST_ENABLED = True  # Allow small runtime adjustments
 TP_LADDER_VERSION = "v1_adaptive"       # Version tag for telemetry
 
 # ============================================================================
+# Phase 252: PERSISTENT SIGNAL LIFECYCLE — Feature Flags
+# ============================================================================
+PERSISTENT_SIGNAL_MODE = True             # Master switch for signal lifecycle
+COUNTER_SIGNAL_CONFIRM_COUNT = 2          # Opposites needed to invalidate
+COUNTER_SIGNAL_CONFIRM_WINDOW_SEC = 30    # Window for counter confirmations
+MAX_REENTRY_PER_SIGNAL = 2                # Max re-entry attempts per signal
+MIN_REENTRY_COOLDOWN_SEC = 90             # Cooldown between re-entries
+
+# ============================================================================
 # ENTRY QUALITY GATE — Feature Flags
 # Phase EQG: Filter out low-volume, weak-momentum entries
 # ============================================================================
@@ -12348,36 +12357,184 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             existing_position = pos
             break
     
-    # Don't open new position if we already have one in this symbol
-    if existing_position:
-        existing_side = existing_position.get('side', '')
+    # ================================================================
+    # Phase 252: PERSISTENT SIGNAL LIFECYCLE
+    # Signal stays active until confirmed counter-signal invalidates it
+    # ================================================================
+    now_ts = time.time()
+    
+    if PERSISTENT_SIGNAL_MODE:
+        existing_signal = active_signals.get(symbol)
         
-        # Phase 200: Counter-signal detection — ters sinyal varsa exit_tightness modifier uygula
-        if existing_side != action:
-            # Ters sinyal! Skor bazlı modifier hesapla
-            signal_score = signal.get('confidenceScore', 0)  # Phase 223: was 'score' (field didn't exist)
-            if signal_score >= 90:
-                modifier = 0.4
-            elif signal_score >= 80:
-                modifier = 0.55
-            elif signal_score >= 65:
-                modifier = 0.7
-            elif signal_score >= 50:
-                modifier = 0.85
+        if existing_signal:
+            if existing_signal['side'] == action:
+                # ─── SAME DIRECTION: Refresh signal ───
+                existing_signal['last_refresh_ts'] = now_ts
+                existing_signal['score'] = signal.get('confidenceScore', existing_signal['score'])
+                existing_signal['state'] = 'ACTIVE'
+                existing_signal['counter_count'] = 0  # Reset counter
+                existing_signal['counter_first_ts'] = 0
+                logger.info(
+                    f"🔄 SIGNAL_REFRESH: {symbol} {action} score={existing_signal['score']:.0f} "
+                    f"age={now_ts - existing_signal['created_ts']:.0f}s"
+                )
+                
+                if existing_position:
+                    # Already have same-direction position — skip
+                    signal_log_data['reject_reason'] = 'EXISTING_POSITION_SIGNAL_REFRESH'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("EXISTING_POSITION")
+                    return
             else:
-                modifier = 1.0  # Zayıf sinyal, etki yok
-            
-            if modifier < 1.0:
-                existing_position['counter_signal_modifier'] = modifier
-                existing_position['counter_signal_time'] = datetime.now().timestamp()
-                effective_et = global_paper_trader.exit_tightness * modifier
-                logger.info(f"⚡ COUNTER SIGNAL: {symbol} {action} (skor:{signal_score}) vs açık {existing_side} → exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f} (x{modifier})")
+                # ─── OPPOSITE DIRECTION: Counter-signal confirmation ───
+                if existing_signal['counter_count'] == 0:
+                    existing_signal['counter_first_ts'] = now_ts
+                existing_signal['counter_count'] += 1
+                
+                counter_age = now_ts - existing_signal['counter_first_ts']
+                
+                if (existing_signal['counter_count'] >= COUNTER_SIGNAL_CONFIRM_COUNT 
+                    and counter_age <= COUNTER_SIGNAL_CONFIRM_WINDOW_SEC):
+                    # ─── COUNTER CONFIRMED: Invalidate old signal, create new ───
+                    logger.warning(
+                        f"🔄 SIGNAL_FLIP: {symbol} {existing_signal['side']}→{action} "
+                        f"confirmed ({existing_signal['counter_count']} in {counter_age:.0f}s)"
+                    )
+                    # Apply existing counter_signal_modifier logic to position
+                    if existing_position:
+                        signal_score = signal.get('confidenceScore', 0)
+                        if signal_score >= 90:
+                            modifier = 0.4
+                        elif signal_score >= 80:
+                            modifier = 0.55
+                        elif signal_score >= 65:
+                            modifier = 0.7
+                        elif signal_score >= 50:
+                            modifier = 0.85
+                        else:
+                            modifier = 1.0
+                        
+                        if modifier < 1.0:
+                            existing_position['counter_signal_modifier'] = modifier
+                            existing_position['counter_signal_time'] = now_ts
+                            effective_et = global_paper_trader.exit_tightness * modifier
+                            logger.info(
+                                f"⚡ COUNTER_CONFIRMED: {symbol} {action} (score:{signal_score}) "
+                                f"→ exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f}"
+                            )
+                    
+                    # Create new active signal (flip)
+                    active_signals[symbol] = {
+                        'side': action,
+                        'score': signal.get('confidenceScore', 0),
+                        'created_ts': now_ts,
+                        'last_refresh_ts': now_ts,
+                        'ttl_sec': 600,
+                        'state': 'ACTIVE',
+                        'counter_count': 0,
+                        'counter_first_ts': 0,
+                        'reentry_count': 0,
+                        'last_close_ts': existing_signal.get('last_close_ts', 0),
+                    }
+                    
+                    if existing_position:
+                        signal_log_data['reject_reason'] = 'COUNTER_FLIP_EXISTING_POS'
+                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        reject_feedback("COUNTER_FLIP_EXISTING_POS")
+                        return
+                    # No position → fall through to re-entry check below
+                
+                elif counter_age > COUNTER_SIGNAL_CONFIRM_WINDOW_SEC:
+                    # Window expired — reset counter
+                    existing_signal['counter_count'] = 1
+                    existing_signal['counter_first_ts'] = now_ts
+                    logger.info(
+                        f"⏳ COUNTER_RESET: {symbol} {action} vs {existing_signal['side']} "
+                        f"window expired ({counter_age:.0f}s > {COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s), reset to 1"
+                    )
+                    signal_log_data['reject_reason'] = 'COUNTER_PENDING'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("COUNTER_PENDING")
+                    return
+                else:
+                    # Within window but not enough confirmations yet
+                    logger.info(
+                        f"⏳ COUNTER_PENDING: {symbol} {action} vs {existing_signal['side']} "
+                        f"count={existing_signal['counter_count']}/{COUNTER_SIGNAL_CONFIRM_COUNT} "
+                        f"window={counter_age:.0f}s/{COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s"
+                    )
+                    signal_log_data['reject_reason'] = 'COUNTER_PENDING'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("COUNTER_PENDING")
+                    return
+        else:
+            # ─── NO EXISTING SIGNAL: Register new signal ───
+            active_signals[symbol] = {
+                'side': action,
+                'score': signal.get('confidenceScore', 0),
+                'created_ts': now_ts,
+                'last_refresh_ts': now_ts,
+                'ttl_sec': 600,
+                'state': 'ACTIVE',
+                'counter_count': 0,
+                'counter_first_ts': 0,
+                'reentry_count': 0,
+                'last_close_ts': 0,
+            }
+            logger.info(f"📡 SIGNAL_NEW: {symbol} {action} registered, score={signal.get('confidenceScore', 0):.0f}")
         
-        signal_log_data['reject_reason'] = 'EXISTING_POSITION'
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-        reject_feedback("EXISTING_POSITION")
-        logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
-        return
+        # ─── Re-entry check: No position but valid signal exists ───
+        if not existing_position:
+            sig = active_signals.get(symbol)
+            if sig and sig['side'] == action:
+                # Check re-entry limits
+                if sig['reentry_count'] >= MAX_REENTRY_PER_SIGNAL:
+                    logger.info(f"🚫 REENTRY_LIMIT: {symbol} {action} max re-entries reached ({sig['reentry_count']}/{MAX_REENTRY_PER_SIGNAL})")
+                    signal_log_data['reject_reason'] = 'REENTRY_LIMIT'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("REENTRY_LIMIT")
+                    return
+                if sig['last_close_ts'] > 0 and (now_ts - sig['last_close_ts']) < MIN_REENTRY_COOLDOWN_SEC:
+                    remaining = MIN_REENTRY_COOLDOWN_SEC - (now_ts - sig['last_close_ts'])
+                    logger.info(f"🚫 REENTRY_COOLDOWN: {symbol} {action} cooldown {remaining:.0f}s remaining")
+                    signal_log_data['reject_reason'] = 'REENTRY_COOLDOWN'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("REENTRY_COOLDOWN")
+                    return
+                # Mark as re-entry attempt (count incremented after fill in execute_pending_order)
+                signal['_is_reentry'] = True
+                signal['_reentry_count'] = sig['reentry_count']
+                logger.info(f"♻️ REENTRY_ATTEMPT: {symbol} {action} attempt #{sig['reentry_count']+1}/{MAX_REENTRY_PER_SIGNAL}")
+    else:
+        # Legacy mode: original existing position check
+        if existing_position:
+            existing_side = existing_position.get('side', '')
+            
+            # Phase 200: Counter-signal detection
+            if existing_side != action:
+                signal_score = signal.get('confidenceScore', 0)
+                if signal_score >= 90:
+                    modifier = 0.4
+                elif signal_score >= 80:
+                    modifier = 0.55
+                elif signal_score >= 65:
+                    modifier = 0.7
+                elif signal_score >= 50:
+                    modifier = 0.85
+                else:
+                    modifier = 1.0
+                
+                if modifier < 1.0:
+                    existing_position['counter_signal_modifier'] = modifier
+                    existing_position['counter_signal_time'] = datetime.now().timestamp()
+                    effective_et = global_paper_trader.exit_tightness * modifier
+                    logger.info(f"⚡ COUNTER SIGNAL: {symbol} {action} (skor:{signal_score}) vs açık {existing_side} → exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f} (x{modifier})")
+            
+            signal_log_data['reject_reason'] = 'EXISTING_POSITION'
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback("EXISTING_POSITION")
+            logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
+            return
     
     # Check max positions
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
@@ -23656,6 +23813,13 @@ class PaperTradingEngine:
             return None
         pos['_closing'] = True
         
+        # Phase 252: Update active_signals lifecycle on position close
+        _close_symbol = pos.get('symbol', '')
+        if _close_symbol in active_signals:
+            active_signals[_close_symbol]['last_close_ts'] = time.time()
+            active_signals[_close_symbol]['reentry_count'] = active_signals[_close_symbol].get('reentry_count', 0) + 1
+            logger.info(f"📡 SIGNAL_POS_CLOSED: {_close_symbol} reentry_count={active_signals[_close_symbol]['reentry_count']}")
+        
         # Calculate PnL
         # Phase 244B: Use actual Binance fill price for entry if available (slippage correction)
         effective_entry = pos.get('entryPrice', 0)
@@ -24846,6 +25010,10 @@ exit_engine = ExitDecisionEngine(global_paper_trader)
 # When engine triggers SL/TP/Trail, reason is stored here instead of writing to trade history
 # Binance sync will use this to set proper reason when detecting closed position
 pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timestamp": int}}
+
+# Phase 252: Active signal lifecycle tracking
+# Signals persist until invalidated by confirmed counter-signal
+active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
 
 # Phase 205: Last closed candle's close price per symbol
 # Updated by scanner candle builder (5m) — used for exit decisions instead of tick price
