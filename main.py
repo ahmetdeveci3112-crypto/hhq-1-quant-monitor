@@ -18467,6 +18467,137 @@ class SignalGenerator:
             'timestamp': datetime.now().timestamp()
         })
     
+# ============================================================================
+# PHASE 247: HYBRID TREND DIRECTION FILTER
+# İlham: Freqtrade TEMA guard + Hummingbot MACD+BB + Jesse EMA cross
+# 5 indikatör oylama sistemi ile trend yönü belirleme
+# ============================================================================
+
+def determine_trend_direction(
+    ema_cross: str = 'NEUTRAL',
+    macd_histogram: float = 0.0,
+    macd_cross: str = 'NEUTRAL',
+    adx: float = 20.0,
+    adx_trend: str = 'NEUTRAL',
+    coin_daily_trend: str = 'NEUTRAL',
+    bb_position: float = 0.0,
+    stoch_rsi_cross: str = 'NEUTRAL',
+) -> dict:
+    """
+    Phase 247: 5-indicator voting system for trend direction.
+    
+    Determines whether LONG/SHORT entries should be allowed based on
+    multiple indicator consensus. Inspired by:
+      - Freqtrade: TEMA rising guard
+      - Hummingbot: MACD histogram + BB position
+      - Jesse: EMA cross filter
+    
+    Returns:
+        dict with direction, strength, allow_long, allow_short, momentum flags
+    """
+    bullish_votes = 0
+    bearish_votes = 0
+    notes = []
+    
+    # Vote 1: EMA 8/21 Crossover (trend direction)
+    if ema_cross == 'BULLISH':
+        bullish_votes += 1
+        notes.append('EMA↑')
+    elif ema_cross == 'BEARISH':
+        bearish_votes += 1
+        notes.append('EMA↓')
+    
+    # Vote 2: MACD Histogram (momentum direction)
+    if macd_histogram > 0:
+        bullish_votes += 1
+        notes.append('MACD_H↑')
+    elif macd_histogram < 0:
+        bearish_votes += 1
+        notes.append('MACD_H↓')
+    
+    # Vote 3: ADX Trend (directional movement)
+    if adx_trend == 'BULLISH':
+        bullish_votes += 1
+        notes.append('ADX↑')
+    elif adx_trend == 'BEARISH':
+        bearish_votes += 1
+        notes.append('ADX↓')
+    
+    # Vote 4: Coin Daily Trend (higher timeframe)
+    if 'BULLISH' in coin_daily_trend:
+        bullish_votes += 1
+        notes.append('D1↑')
+    elif 'BEARISH' in coin_daily_trend:
+        bearish_votes += 1
+        notes.append('D1↓')
+    
+    # Vote 5: MACD Signal Crossover (momentum shift)
+    if macd_cross == 'BULLISH':
+        bullish_votes += 1
+        notes.append('MACD_X↑')
+    elif macd_cross == 'BEARISH':
+        bearish_votes += 1
+        notes.append('MACD_X↓')
+    
+    # Determine overall direction
+    if bullish_votes > bearish_votes:
+        direction = 'BULLISH'
+        strength = bullish_votes
+    elif bearish_votes > bullish_votes:
+        direction = 'BEARISH'
+        strength = bearish_votes
+    else:
+        direction = 'NEUTRAL'
+        strength = 0
+    
+    # Default: allow both directions
+    allow_long = True
+    allow_short = True
+    
+    # Gate logic based on ADX (trend strength) + vote consensus
+    is_strong_trend = False
+    
+    if adx > 30:
+        # Strong trend: 3+ votes sufficient to block counter-trend
+        if bearish_votes >= 3:
+            allow_long = False
+            is_strong_trend = True
+            notes.append('GATE:NO_LONG(ADX>30,3+bear)')
+        if bullish_votes >= 3:
+            allow_short = False
+            is_strong_trend = True
+            notes.append('GATE:NO_SHORT(ADX>30,3+bull)')
+    elif adx > 25:
+        # Moderate trend: 4+ votes needed to block
+        if bearish_votes >= 4:
+            allow_long = False
+            is_strong_trend = True
+            notes.append('GATE:NO_LONG(ADX>25,4+bear)')
+        if bullish_votes >= 4:
+            allow_short = False
+            is_strong_trend = True
+            notes.append('GATE:NO_SHORT(ADX>25,4+bull)')
+    # ADX < 25: Ranging market, both sides allowed (mean reversion territory)
+    
+    # Momentum confirmation (anti-falling-knife)
+    # MACD histogram must be turning in signal direction
+    momentum_confirming_long = macd_histogram > 0
+    momentum_confirming_short = macd_histogram < 0
+    
+    return {
+        'direction': direction,
+        'strength': max(bullish_votes, bearish_votes),
+        'bullish_votes': bullish_votes,
+        'bearish_votes': bearish_votes,
+        'is_strong_trend': is_strong_trend,
+        'allow_long': allow_long,
+        'allow_short': allow_short,
+        'momentum_confirming_long': momentum_confirming_long,
+        'momentum_confirming_short': momentum_confirming_short,
+        'notes': notes,
+    }
+
+
     def generate_signal(
         self,
         hurst: float,
@@ -18632,16 +18763,28 @@ class SignalGenerator:
         reasons = []
         
         # =====================================================================
-        # PHASE 108: SIMPLIFIED MEAN REVERSION SIGNAL DIRECTION
-        # Z-Score is designed for mean reversion - always use contrarian logic:
-        # - zscore > +threshold (overbought) → SHORT (price will revert down)
-        # - zscore < -threshold (oversold) → LONG (price will revert up)
-        # Hurst is used for SCORING only, not direction determination.
+        # PHASE 247: HYBRID TREND DIRECTION FILTER + Z-SCORE TRIGGER
+        # Katman 1: Trend yönü filtresi (EMA, MACD, ADX, D1 trend oylama)
+        # Katman 2: Z-Score mean reversion tetikleyicisi
+        # İlham: Freqtrade TEMA guard + Hummingbot MACD+BB + Jesse EMA cross
         # =====================================================================
+        
+        # Phase 247: Compute trend direction from all available indicators
+        _ei = enhanced_indicators or {}
+        trend_dir = determine_trend_direction(
+            ema_cross=_ei.get('ema_cross', 'NEUTRAL'),
+            macd_histogram=_ei.get('macd_histogram', 0.0),
+            macd_cross=_ei.get('macd_signal_cross', 'NEUTRAL'),
+            adx=adx,
+            adx_trend=adx_trend,
+            coin_daily_trend=coin_daily_trend,
+            bb_position=_ei.get('bb_position', 0.0),
+            stoch_rsi_cross=_ei.get('stoch_rsi_cross', 'NEUTRAL'),
+        )
         
         signal_side = None
         
-        # Simple mean reversion logic (contrarian)
+        # Katman 2: Z-Score mean reversion trigger (contrarian)
         if abs(zscore) > effective_threshold:
             # Phase 207: Strategy Router VETO check for Mean Reversion
             if router_profile.get('veto_mr', False):
@@ -18655,6 +18798,55 @@ class SignalGenerator:
                 signal_side = "LONG"
                 reasons.append(f"Z({zscore:.1f})")
             
+            # =====================================================================
+            # Phase 247: TREND DIRECTION GATE (Katman 1)
+            # Güçlü trend'de counter-trend sinyalleri engelle
+            # =====================================================================
+            if signal_side == "LONG" and not trend_dir['allow_long']:
+                logger.info(
+                    f"🚫 TREND_GATE: {symbol} LONG engellendi | "
+                    f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
+                    f"ADX={adx:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
+                    f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
+                )
+                return None
+            if signal_side == "SHORT" and not trend_dir['allow_short']:
+                logger.info(
+                    f"🚫 TREND_GATE: {symbol} SHORT engellendi | "
+                    f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
+                    f"ADX={adx:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
+                    f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
+                )
+                return None
+            
+            # =====================================================================
+            # Phase 247: ANTI-FALLING-KNIFE — Momentum Doğrulaması
+            # MACD histogram sinyal yönünde olmalı (ADX > 20 ise)
+            # Freqtrade'in "TEMA is rising" korumasının karşılığı
+            # =====================================================================
+            if signal_side == "LONG" and not trend_dir['momentum_confirming_long'] and adx > 20:
+                logger.info(
+                    f"🔪 MOMENTUM_GATE: {symbol} LONG engellendi | "
+                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (< 0, momentum dönmedi) ADX={adx:.0f}"
+                )
+                return None
+            if signal_side == "SHORT" and not trend_dir['momentum_confirming_short'] and adx > 20:
+                logger.info(
+                    f"🔪 MOMENTUM_GATE: {symbol} SHORT engellendi | "
+                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (> 0, momentum dönmedi) ADX={adx:.0f}"
+                )
+                return None
+            
+            # Phase 247: Pro-trend score bonus
+            if trend_dir['direction'] == 'BULLISH' and signal_side == 'LONG':
+                pro_bonus = min(15, trend_dir['strength'] * 3)
+                score += pro_bonus
+                reasons.append(f"PRO_TREND+{pro_bonus}")
+            elif trend_dir['direction'] == 'BEARISH' and signal_side == 'SHORT':
+                pro_bonus = min(15, trend_dir['strength'] * 3)
+                score += pro_bonus
+                reasons.append(f"PRO_TREND+{pro_bonus}")
+            
             # Phase 152: Base score 50
             # Phase 207: Router Ağırlığı ile Çarp
             mr_weight = router_profile.get('mean_reversion_weight', 1.0)
@@ -18664,7 +18856,6 @@ class SignalGenerator:
                 reasons.append(f"ROUTE_MR(x{mr_weight})")
             
             # Phase 152: Hurst etkisi artık SADECE threshold'da (calculate_adaptive_threshold)
-            # Scoring'deki çifte etki kaldırıldı — tutarlılık için
             if hurst < 0.45:
                 reasons.append(f"H_MR({hurst:.2f})")  # Log only, no score change
         else:
