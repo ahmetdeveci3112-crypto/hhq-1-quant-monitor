@@ -5054,6 +5054,92 @@ PENDING_SM_V2_ENABLED = False
 REJECT_ATTRIBUTION_ENABLED = False
 
 # =========================================================================
+# PHASE 245: TRADE COST ESTIMATOR + TICK-SIZE UTILITIES
+# Central cost model feeding all entry/exit parameters
+# =========================================================================
+
+def estimate_trade_cost(
+    spread_pct: float = 0.05,
+    leverage: int = 10,
+    expected_hold_hours: float = 4.0,
+    is_live: bool = True
+) -> dict:
+    """Estimate total round-trip cost of a trade.
+    
+    Returns dict with cost breakdown as percentages of notional.
+    Used by TP floor, trail floor, score gate, ET floor.
+    """
+    fee_pct = 0.08              # Round-trip fee (BNB discount ~0.072)
+    slip_pct = max(0.02, float(spread_pct) * 0.5)  # Slippage ≈ half the spread
+    funding_per_8h = 0.01       # Average funding rate per 8h
+    funding_total = max(0, (float(expected_hold_hours) / 8.0)) * funding_per_8h
+    
+    total_cost_pct = fee_pct + slip_pct + funding_total
+    safe_lev = max(1, int(leverage))
+    
+    return {
+        'total_pct': round(total_cost_pct, 4),         # ~0.13-0.25%
+        'price_move_pct': round(total_cost_pct, 4),    # Same as total (notional basis)
+        'roi_pct': round(total_cost_pct * safe_lev, 2),  # ~1.3-2.5% (10x)
+        'fee_pct': fee_pct,
+        'slip_pct': round(slip_pct, 4),
+        'funding_pct': round(funding_total, 4),
+        'min_profitable_move': round(total_cost_pct * 2, 4),  # Min price move to profit
+    }
+
+def get_tick_size(symbol: str) -> float:
+    """Get Binance tick size for a symbol from CCXT markets cache.
+    
+    Falls back to price-based heuristic if markets not available.
+    """
+    try:
+        if 'live_binance_trader' in globals() and live_binance_trader.exchange:
+            # Try CCXT format first: SYMBOL/USDT:USDT
+            ccxt_sym = symbol.replace('USDT', '/USDT:USDT') if '/' not in symbol else symbol
+            market = live_binance_trader.exchange.market(ccxt_sym)
+            if market:
+                prec = market.get('precision', {})
+                ts = prec.get('price', 0.0001)
+                if isinstance(ts, int):
+                    ts = 10 ** (-ts)
+                return float(ts)
+    except Exception:
+        pass
+    # Fallback: estimate from symbol price (conservative)
+    return 0.0001
+
+def snap_to_tick(price: float, tick_size: float, direction: str = 'nearest') -> float:
+    """Snap a price to the nearest valid tick.
+    
+    direction: 'up' (ceil), 'down' (floor), 'nearest' (round)
+    """
+    if tick_size <= 0 or price <= 0:
+        return price
+    import math
+    if direction == 'up':
+        return math.ceil(price / tick_size) * tick_size
+    elif direction == 'down':
+        return math.floor(price / tick_size) * tick_size
+    else:
+        return round(price / tick_size) * tick_size
+
+def ensure_tick_safe_buffer(entry_price: float, buffer_pct: float, tick_size: float, side: str = 'LONG') -> float:
+    """Ensure a breakeven/SL buffer is at least 3 ticks from entry.
+    
+    For micro-price coins, pct-based buffers can be smaller than tick size.
+    This function returns the effective buffer (price delta) that is at least 3 ticks.
+    
+    Returns: float (price delta, always positive)
+    """
+    pct_buffer = abs(entry_price * buffer_pct)
+    tick_buffer = tick_size * 3  # Minimum 3 ticks
+    effective = max(pct_buffer, tick_buffer)
+    # Snap to tick grid
+    effective = snap_to_tick(effective, tick_size, direction='up')
+    return effective
+
+
+# =========================================================================
 # PHASE 238A: BREAKEVEN BUFFER — Dynamic replacement for hardcoded 0.05%
 # =========================================================================
 BREAKEVEN_LIMIT_EXIT_ENABLED = False  # If True + is_live: try limit-close before market
@@ -5065,14 +5151,14 @@ def compute_breakeven_buffer_pct(
     spread_level: str = "LOW",
     reason: str = "",
 ) -> float:
-    """Compute dynamic breakeven buffer as a ratio (0.001 to 0.006).
+    """Compute dynamic breakeven buffer as a ratio (0.001 to 0.008).
     
     Formula: round_trip_fee + 0.6×spread + p90_slippage + safety_margin
-    Clamp: min 0.10% (0.001), max 0.60% (0.006)
+    Phase 245: Updated fee to real measured value, wider clamp range.
     Returns float ratio, e.g. 0.0015 for 0.15%.
     """
     try:
-        ROUND_TRIP_FEE_PCT = 0.10  # 0.05% maker+taker each side
+        ROUND_TRIP_FEE_PCT = 0.08  # Phase 245: Real measured fee (BNB discount)
         # Spread contribution (60% of spread — partial fill expected)
         spread_contrib = 0.6 * max(0, float(spread_pct))
         # Slippage contribution
@@ -5089,8 +5175,8 @@ def compute_breakeven_buffer_pct(
         # Safety margin
         safety = 0.02
         buffer_pct = ROUND_TRIP_FEE_PCT + spread_contrib + slip + level_bump + live_bump + safety
-        # Clamp [0.10%, 0.60%]
-        buffer_pct = max(0.10, min(0.60, round(buffer_pct, 4)))
+        # Phase 245: Wider clamp [0.12%, 0.80%] for high-spread coins
+        buffer_pct = max(0.12, min(0.80, round(buffer_pct, 4)))
         return buffer_pct / 100  # ratio
     except Exception:
         return 0.0015  # Safe fallback: 0.15%
@@ -6893,11 +6979,16 @@ def get_dynamic_trail_activation_threshold(
         vol_factor = 1.25    # Düşük volume: daha geç trail
     
     min_price_move = round(base_move * spread_factor * vol_factor * th_mult, 3)
-    min_price_move = max(0.4, min(3.5, min_price_move))  # Hard clamp
     
-    # ROI = min_price_move × leverage (ama min 4%, max 20%)
+    # Phase 245: Cost-aware floor — trail must clear 2× trade cost
+    cost = estimate_trade_cost(spread_pct, leverage)
+    cost_floor = cost['min_profitable_move']  # 2× total cost
+    min_price_move = max(cost_floor, min(3.5, min_price_move))  # Cost floor replaces old 0.4% hard floor
+    
+    # ROI = min_price_move × leverage (ama min cost_roi × 2, max 28%)
     min_roi = round(min_price_move * max(1, leverage), 1)
-    min_roi = max(4.0, min(28.0, min_roi))
+    min_roi_floor = max(4.0, cost['roi_pct'] * 2)  # Phase 245: ROI floor from cost
+    min_roi = max(min_roi_floor, min(28.0, min_roi))
     
     return min_price_move, min_roi
 
@@ -19212,6 +19303,18 @@ class SignalGenerator:
         # Sadece Z-Score, OB, VWAP, MTF (veto için), Liq Cascade, Basis, Whale, FVG, Breakout skorları kullanıldı
         
         # Phase 137 DEBUG: Trace log to confirm signals reach this point
+        # Phase 245: Cost-aware min score bump — high-cost trades need higher conviction
+        try:
+            _cost_spread = float(spread_pct) if 'spread_pct' in dir() else 0.05
+            _cost_info = estimate_trade_cost(_cost_spread, leverage)
+            if _cost_info['total_pct'] > 0.20:  # High-cost trade
+                cost_score_bump = int((_cost_info['total_pct'] - 0.15) * 50)  # +2.5 per 0.05% extra
+                cost_score_bump = min(cost_score_bump, 10)  # Cap at +10
+                min_score_required += cost_score_bump
+                reasons.append(f"COST_BUMP(+{cost_score_bump})")
+        except Exception:
+            pass
+        
         logger.info(f"📍 PRE_SCORE: {symbol} {signal_side} score={score} min={min_score_required} | reasons: {','.join(reasons[:4])}")
         
         if score < min_score_required:
@@ -20382,7 +20485,17 @@ class PaperTradingEngine:
         except Exception as e:
             pass # Failsafe
             
-        return max(0.3, min(15.0, effective_et)) # Clamp to bounds
+        # Phase 245: Cost-aware ET floor — prevent sub-cost exits
+        min_et_floor = 0.3
+        try:
+            _pos_spread = float(pos.get('spreadPct', 0.05))
+            if _pos_spread > 0.10:
+                min_et_floor = max(min_et_floor, 0.7)  # High spread → wider minimum ET
+            elif _pos_spread > 0.05:
+                min_et_floor = max(min_et_floor, 0.5)
+        except Exception:
+            pass
+        return max(min_et_floor, min(15.0, effective_et)) # Phase 245: cost-aware floor
     
     # =========================================================================
     # DYNAMIC ATR MULTIPLIER
@@ -20824,6 +20937,30 @@ class PaperTradingEngine:
             sl = entry_price + (atr * adjusted_sl_atr)
             tp = max(entry_price * 0.01, entry_price - (atr * adjusted_tp_atr))
             trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_activation_atr))
+        
+        # Phase 245 Component 2: TP must be at least 3× trade cost away from entry
+        try:
+            _sig_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
+            _cost = estimate_trade_cost(_sig_spread, adjusted_leverage)
+            _min_tp_distance = entry_price * (_cost['min_profitable_move'] * 3 / 100)
+            _current_tp_distance = abs(tp - entry_price)
+            if _current_tp_distance < _min_tp_distance:
+                if side == 'LONG':
+                    tp = entry_price + _min_tp_distance
+                else:
+                    tp = max(entry_price * 0.01, entry_price - _min_tp_distance)
+                logger.info(f"💰 TP_COST_FLOOR: {trade_symbol} TP widened to cover 3× cost (min_dist={_min_tp_distance:.6f})")
+        except Exception:
+            pass
+        
+        # Phase 245 Component 7: Snap SL/TP/trail to tick grid for micro-price coins
+        try:
+            _tick = get_tick_size(trade_symbol)
+            sl = snap_to_tick(sl, _tick, 'down' if side == 'LONG' else 'up')
+            tp = snap_to_tick(tp, _tick, 'up' if side == 'LONG' else 'down')
+            trail_activation = snap_to_tick(trail_activation, _tick, 'up' if side == 'LONG' else 'down')
+        except Exception:
+            pass
         
         trail_distance = atr * adjusted_trail_distance_atr
         
@@ -21471,6 +21608,30 @@ class PaperTradingEngine:
             sl = fill_price + (atr * adjusted_sl_atr)
             tp = max(fill_price * 0.01, fill_price - (atr * adjusted_tp_atr))
             trail_activation = max(fill_price * 0.01, fill_price - (atr * adjusted_trail_activation_atr))
+        
+        # Phase 245 Component 2: TP must be at least 3× trade cost away from fill
+        try:
+            _ord_spread = float(order.get('spreadPct', 0.05))
+            _cost = estimate_trade_cost(_ord_spread, adjusted_leverage)
+            _min_tp_distance = fill_price * (_cost['min_profitable_move'] * 3 / 100)
+            _current_tp_distance = abs(tp - fill_price)
+            if _current_tp_distance < _min_tp_distance:
+                if side == 'LONG':
+                    tp = fill_price + _min_tp_distance
+                else:
+                    tp = max(fill_price * 0.01, fill_price - _min_tp_distance)
+                logger.info(f"💰 TP_COST_FLOOR: {symbol} TP widened to cover 3× cost (WS path)")
+        except Exception:
+            pass
+        
+        # Phase 245 Component 7: Snap SL/TP/trail to tick grid
+        try:
+            _tick = get_tick_size(symbol)
+            sl = snap_to_tick(sl, _tick, 'down' if side == 'LONG' else 'up')
+            tp = snap_to_tick(tp, _tick, 'up' if side == 'LONG' else 'down')
+            trail_activation = snap_to_tick(trail_activation, _tick, 'up' if side == 'LONG' else 'down')
+        except Exception:
+            pass
         
         trail_distance = atr * adjusted_trail_distance_atr
         

@@ -383,6 +383,7 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-22 | 245 | Maliyet Farkındalıklı Adaptif Trading: TradeCostEstimator, tick-size safe SL/TP, TP cost floor, trail cost floor, breakeven fee fix, cost-aware scoring, ET floor |
 | 2026-02-22 | 244 | PNL Regresyon Düzeltmeleri: Router ağırlıkları yumuşatıldı, BTC Macro ET yumuşatıldı, Kill Switch sqrt factor geri getirildi, fee-adjusted PNL hesaplaması |
 | 2026-02-21 | 243 | Algorithm Audit: Sync ATR, profitable SL, idempotent guard, pnlPercent, list mutation, orphan cleanup, income tuple |
 | 2026-02-21 | 207 | Jesse-Inspired Strategy Router: CoinProfiler'a "MAJOR/MEME" tip sınıflandırması eklendi. Strateji rotalaması için StrategyRouter ile Trend vs. Mean Reversion dinamik ağırlıklandırıldı. |
