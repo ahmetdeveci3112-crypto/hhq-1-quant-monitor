@@ -18431,8 +18431,6 @@ def determine_trend_direction(
     adx: float = 20.0,
     adx_trend: str = 'NEUTRAL',
     coin_daily_trend: str = 'NEUTRAL',
-    bb_position: float = 0.0,
-    stoch_rsi_cross: str = 'NEUTRAL',
 ) -> dict:
     """
     Phase 247: 5-indicator voting system for trend direction.
@@ -18450,97 +18448,94 @@ def determine_trend_direction(
     bearish_votes = 0
     notes = []
     
+    # Safe string conversion to prevent TypeError if None is passed
+    safe_ema_cross = str(ema_cross or '').upper()
+    safe_adx_trend = str(adx_trend or '').upper()
+    safe_daily_trend = str(coin_daily_trend or '').upper()
+    safe_macd_cross = str(macd_cross or '').upper()
+    safe_adx = float(adx) if adx is not None else 20.0
+    safe_macd_hist = float(macd_histogram) if macd_histogram is not None else 0.0
+    
     # Vote 1: EMA 8/21 Crossover (trend direction)
-    if ema_cross == 'BULLISH':
+    if safe_ema_cross == 'BULLISH':
         bullish_votes += 1
         notes.append('EMA↑')
-    elif ema_cross == 'BEARISH':
+    elif safe_ema_cross == 'BEARISH':
         bearish_votes += 1
         notes.append('EMA↓')
     
     # Vote 2: MACD Histogram (momentum direction)
-    if macd_histogram > 0:
+    if safe_macd_hist > 0:
         bullish_votes += 1
         notes.append('MACD_H↑')
-    elif macd_histogram < 0:
+    elif safe_macd_hist < 0:
         bearish_votes += 1
         notes.append('MACD_H↓')
     
     # Vote 3: ADX Trend (directional movement)
-    if adx_trend == 'BULLISH':
+    if safe_adx_trend == 'BULLISH':
         bullish_votes += 1
         notes.append('ADX↑')
-    elif adx_trend == 'BEARISH':
+    elif safe_adx_trend == 'BEARISH':
         bearish_votes += 1
         notes.append('ADX↓')
     
     # Vote 4: Coin Daily Trend (higher timeframe)
-    if 'BULLISH' in coin_daily_trend:
+    if 'BULLISH' in safe_daily_trend:
         bullish_votes += 1
         notes.append('D1↑')
-    elif 'BEARISH' in coin_daily_trend:
+    elif 'BEARISH' in safe_daily_trend:
         bearish_votes += 1
         notes.append('D1↓')
     
     # Vote 5: MACD Signal Crossover (momentum shift)
-    if macd_cross == 'BULLISH':
+    if safe_macd_cross == 'BULLISH':
         bullish_votes += 1
         notes.append('MACD_X↑')
-    elif macd_cross == 'BEARISH':
+    elif safe_macd_cross == 'BEARISH':
         bearish_votes += 1
         notes.append('MACD_X↓')
     
     # Determine overall direction
     if bullish_votes > bearish_votes:
         direction = 'BULLISH'
-        strength = bullish_votes
     elif bearish_votes > bullish_votes:
         direction = 'BEARISH'
-        strength = bearish_votes
     else:
         direction = 'NEUTRAL'
-        strength = 0
     
     # Default: allow both directions
     allow_long = True
     allow_short = True
     
     # Gate logic based on ADX (trend strength) + vote consensus
-    is_strong_trend = False
-    
-    if adx > 30:
+    if safe_adx > 30:
         # Strong trend: 3+ votes sufficient to block counter-trend
         if bearish_votes >= 3:
             allow_long = False
-            is_strong_trend = True
             notes.append('GATE:NO_LONG(ADX>30,3+bear)')
         if bullish_votes >= 3:
             allow_short = False
-            is_strong_trend = True
             notes.append('GATE:NO_SHORT(ADX>30,3+bull)')
-    elif adx > 25:
+    elif safe_adx > 25:
         # Moderate trend: 4+ votes needed to block
         if bearish_votes >= 4:
             allow_long = False
-            is_strong_trend = True
             notes.append('GATE:NO_LONG(ADX>25,4+bear)')
         if bullish_votes >= 4:
             allow_short = False
-            is_strong_trend = True
             notes.append('GATE:NO_SHORT(ADX>25,4+bull)')
     # ADX < 25: Ranging market, both sides allowed (mean reversion territory)
     
     # Momentum confirmation (anti-falling-knife)
-    # MACD histogram must be turning in signal direction
-    momentum_confirming_long = macd_histogram > 0
-    momentum_confirming_short = macd_histogram < 0
+    momentum_confirming_long = safe_macd_hist > 0
+    momentum_confirming_short = safe_macd_hist < 0
     
     return {
         'direction': direction,
         'strength': max(bullish_votes, bearish_votes),
         'bullish_votes': bullish_votes,
         'bearish_votes': bearish_votes,
-        'is_strong_trend': is_strong_trend,
         'allow_long': allow_long,
         'allow_short': allow_short,
         'momentum_confirming_long': momentum_confirming_long,
@@ -18778,8 +18773,6 @@ class SignalGenerator:
             adx=adx,
             adx_trend=adx_trend,
             coin_daily_trend=coin_daily_trend,
-            bb_position=_ei.get('bb_position', 0.0),
-            stoch_rsi_cross=_ei.get('stoch_rsi_cross', 'NEUTRAL'),
         )
         
         signal_side = None
