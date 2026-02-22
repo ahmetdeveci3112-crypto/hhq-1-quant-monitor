@@ -4526,13 +4526,19 @@ def extract_smc_features(ohlcv: list) -> dict:
         bull_obs = ob_unmitigated[ob_unmitigated['OB'] == 1]
         bear_obs = ob_unmitigated[ob_unmitigated['OB'] == -1]
         
+        # Get current price for nearest-to-price selection
+        current_price = float(df['close'].iloc[-1])
+        
         if not bull_obs.empty:
-            last_bull = bull_obs.iloc[-1]
-            result['ob_bullish'] = {'top': float(last_bull['Top']), 'bottom': float(last_bull['Bottom'])}
+            # Phase 246: Select nearest-to-price OB (not last)
+            bull_obs_dist = bull_obs.apply(lambda r: abs(current_price - (float(r['Top']) + float(r['Bottom'])) / 2), axis=1)
+            nearest_bull = bull_obs.loc[bull_obs_dist.idxmin()]
+            result['ob_bullish'] = {'top': float(nearest_bull['Top']), 'bottom': float(nearest_bull['Bottom'])}
             
         if not bear_obs.empty:
-            last_bear = bear_obs.iloc[-1]
-            result['ob_bearish'] = {'top': float(last_bear['Top']), 'bottom': float(last_bear['Bottom'])}
+            bear_obs_dist = bear_obs.apply(lambda r: abs(current_price - (float(r['Top']) + float(r['Bottom'])) / 2), axis=1)
+            nearest_bear = bear_obs.loc[bear_obs_dist.idxmin()]
+            result['ob_bearish'] = {'top': float(nearest_bear['Top']), 'bottom': float(nearest_bear['Bottom'])}
             
         # 3. Fair Value Gaps (FVG)
         fvg = smc.fvg(df)
@@ -4542,12 +4548,14 @@ def extract_smc_features(ohlcv: list) -> dict:
         bear_fvgs = fvg_unmitigated[fvg_unmitigated['FVG'] == -1]
         
         if not bull_fvgs.empty:
-            last_bull_fvg = bull_fvgs.iloc[-1]
-            result['fvg_bullish'] = {'top': float(last_bull_fvg['Top']), 'bottom': float(last_bull_fvg['Bottom'])}
+            bull_fvg_dist = bull_fvgs.apply(lambda r: abs(current_price - (float(r['Top']) + float(r['Bottom'])) / 2), axis=1)
+            nearest_bull_fvg = bull_fvgs.loc[bull_fvg_dist.idxmin()]
+            result['fvg_bullish'] = {'top': float(nearest_bull_fvg['Top']), 'bottom': float(nearest_bull_fvg['Bottom'])}
             
         if not bear_fvgs.empty:
-            last_bear_fvg = bear_fvgs.iloc[-1]
-            result['fvg_bearish'] = {'top': float(last_bear_fvg['Top']), 'bottom': float(last_bear_fvg['Bottom'])}
+            bear_fvg_dist = bear_fvgs.apply(lambda r: abs(current_price - (float(r['Top']) + float(r['Bottom'])) / 2), axis=1)
+            nearest_bear_fvg = bear_fvgs.loc[bear_fvg_dist.idxmin()]
+            result['fvg_bearish'] = {'top': float(nearest_bear_fvg['Top']), 'bottom': float(nearest_bear_fvg['Bottom'])}
             
         return result
         
@@ -23082,6 +23090,7 @@ class PaperTradingEngine:
             "signalScore": pos.get('signalScore', 0),
             "mtfScore": pos.get('mtfScore', 0),
             "zScore": pos.get('zScore', 0),
+            "zscore": pos.get('zScore', 0),  # Phase 246: lowercase alias for hyperopt compatibility
             "spreadLevel": pos.get('spreadLevel', 'unknown'),
             "stopLoss": pos.get('stopLoss', 0),
             "takeProfit": pos.get('takeProfit', 0),
@@ -25028,7 +25037,7 @@ async def phase193_hyperopt_run(request: Request):
     
     # Load trade data from paper trader if not already loaded
     if not hhq_hyperoptimizer.trade_data and 'global_paper_trader' in globals():
-        hhq_hyperoptimizer.trade_data = list(global_paper_trader.trade_history)
+        hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))  # Phase 246: trades not trade_history
     
     result = await hhq_hyperoptimizer.optimize(n_trials=n_trials)
     return JSONResponse(result)
