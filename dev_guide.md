@@ -1599,3 +1599,30 @@ Clamp aralığı da genişletildi: first_reduction [-150, -20], full_close [-200
 - Tahmini günlük fee etkisi: ~$1.60 (445 trade/gün bazında)
 - Bu düzeltme **sadece raporlamayı** etkiler, trading kararlarını değiştirmez
 
+### Düzeltme 5: Slippage Düzeltmesi (Phase 244B)
+
+**Dosya:** `main.py` → `close_position()`
+
+PNL hesaplamasında `pos['entryPrice']` yerine `pos['binance_fill_price']` kullanılıyor (varsa ve live trade ise). Bu, girişteki slippage'ı PNL'ye yansıtır.
+
+```python
+# Eski: pnl = (exit_price - pos['entryPrice']) * size
+# Yeni: effective_entry = pos['binance_fill_price'] if available else pos['entryPrice']
+#       pnl = (exit_price - effective_entry) * size
+```
+
+### Düzeltme 6: Funding Fee Takibi (Phase 244B)
+
+**Dosya:** `main.py` → `binance_position_sync_loop()` + `close_position()`
+
+Binance her 8 saatte funding fee alır/verir. Artık:
+1. Sync loop her 60 saniyede `FUNDING_FEE` income çeker
+2. Her pozisyona `accumulated_funding` alanı eklenir (dedup: `_funding_ids` set)
+3. Pozisyon kapanışında `pnl += accumulated_funding` (işaretli — negatif fee düşer, pozitif eklenir)
+
+| Bileşen | Açıklama |
+|---------|----------|
+| `accumulated_funding` | Pozisyon ömrü boyunca toplanan funding fee (pozitif veya negatif) |
+| `_funding_ids` | Çift sayımı önleyen set (symbol_timestamp formatında) |
+| Fetch sıklığı | 60 saniye (API rate limit dostu) |
+

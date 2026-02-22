@@ -3529,6 +3529,47 @@ async def binance_position_sync_loop():
                 }
                 
                 # ================================================================
+                # Phase 244B: FUNDING FEE ACCUMULATION PER POSITION
+                # Fetch recent funding fees and assign to open positions
+                # ================================================================
+                try:
+                    if global_paper_trader.positions and live_binance_trader.exchange:
+                        # Only fetch every ~60 seconds (controlled by flag)
+                        _funding_last_fetch = getattr(live_binance_trader, '_funding_last_fetch', 0)
+                        now_ts = datetime.now().timestamp()
+                        if now_ts - _funding_last_fetch > 60:  # Every 60 seconds
+                            live_binance_trader._funding_last_fetch = now_ts
+                            try:
+                                recent_income = await live_binance_trader.exchange.fapiPrivateGetIncome({
+                                    'incomeType': 'FUNDING_FEE',
+                                    'limit': 100
+                                })
+                                # Map funding to positions by symbol
+                                for inc in recent_income:
+                                    inc_symbol = (inc.get('symbol') or '').replace('USDT', '') + 'USDT'
+                                    inc_time = int(inc.get('time') or 0)
+                                    inc_amount = float(inc.get('income') or 0)
+                                    # Find matching position and accumulate if funding is newer than position open
+                                    for pos in global_paper_trader.positions:
+                                        pos_symbol = pos.get('symbol', '')
+                                        pos_open = pos.get('openTime', 0)
+                                        if pos_symbol == inc_symbol and inc_time > pos_open:
+                                            # Track which funding IDs we've already counted
+                                            counted_ids = pos.get('_funding_ids', set())
+                                            funding_id = f"{inc_symbol}_{inc_time}"
+                                            if funding_id not in counted_ids:
+                                                counted_ids.add(funding_id)
+                                                pos['_funding_ids'] = counted_ids
+                                                old_funding = pos.get('accumulated_funding', 0)
+                                                pos['accumulated_funding'] = old_funding + inc_amount
+                                                if abs(inc_amount) > 0.001:
+                                                    logger.debug(f"💰 FUNDING: {pos_symbol} +${inc_amount:+.4f} (total: ${pos.get('accumulated_funding', 0):+.4f})")
+                            except Exception as fund_err:
+                                logger.debug(f"Funding fee fetch error: {fund_err}")
+                except Exception as fund_outer_err:
+                    pass  # Non-critical, don't break sync
+                
+                # ================================================================
                 # Phase 142: Portfolio Recovery Trailing Check
                 # ================================================================
                 try:
@@ -22814,16 +22855,28 @@ class PaperTradingEngine:
         pos['_closing'] = True
         
         # Calculate PnL
+        # Phase 244B: Use actual Binance fill price for entry if available (slippage correction)
+        effective_entry = pos.get('entryPrice', 0)
+        fill_entry = pos.get('binance_fill_price', 0)
+        if fill_entry > 0 and pos.get('isLive', False):
+            effective_entry = fill_entry  # Use real Binance fill instead of signal price
+        
         if pos['side'] == 'LONG':
-            pnl = (exit_price - pos['entryPrice']) * pos['size']
+            pnl = (exit_price - effective_entry) * pos['size']
         else:
-            pnl = (pos['entryPrice'] - exit_price) * pos['size']
+            pnl = (effective_entry - exit_price) * pos['size']
         
         # Phase 244: Deduct estimated round-trip trading fees for accurate PNL reporting
         # Binance Futures fee ~0.04% per side (0.036% with BNB), round-trip = ~0.08%
         notional = abs(exit_price * pos['size'])
         estimated_fee = notional * 0.0008  # 0.08% round-trip
         pnl -= estimated_fee
+        
+        # Phase 244B: Deduct accumulated funding fees (tracked per position in sync loop)
+        accumulated_funding = pos.get('accumulated_funding', 0)
+        if accumulated_funding != 0:
+            pnl += accumulated_funding  # funding can be + or - (already signed)
+            logger.info(f"📊 PNL_FUNDING: {pos.get('symbol')} funding adjustment: ${accumulated_funding:+.4f}")
         
         # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
         initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))
