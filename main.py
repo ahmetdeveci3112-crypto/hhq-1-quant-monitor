@@ -6176,8 +6176,9 @@ def compute_dynamic_min_pullback_pct(
     _adx = float(adx or 20.0)
     _hurst = float(hurst or 0.50)
 
-    # ── base ──────────────────────────────────────────────────────
-    base = 0.50 + 0.16 * atr_p + 1.40 * max(sp - 0.03, 0.0)
+    # ── base ───────────────────────────────────────────────────────────
+    # Phase 248: Higher ATR weight (0.42→0.55) for better volatile coin coverage
+    base = 0.50 + 0.55 * atr_p + 0.60 * max(sp - 0.03, 0.0)
 
     # ── volume adjustment ─────────────────────────────────────────
     vol_adj = 0.0
@@ -6214,15 +6215,16 @@ def compute_dynamic_min_pullback_pct(
         (side == 'SHORT' and coin_daily_trend in ('BULLISH', 'STRONG_BULLISH'))
     )
 
+    # Phase 248: Wider clamp ranges (~50% wider max for each band)
     if _adx > 25 and trend_aligned:
         regime_band = 'aligned'
-        clamp_min, clamp_max = 0.45, 1.35
+        clamp_min, clamp_max = 0.45, 2.00    # Was 1.35 → 2.00
     elif (_adx > 25 and trend_opposed) or _hurst > 0.65:
         regime_band = 'counter'
-        clamp_min, clamp_max = 0.70, 2.60
+        clamp_min, clamp_max = 0.65, 3.80    # Was 0.70/2.60 → 0.65/3.80
     else:
         regime_band = 'neutral'
-        clamp_min, clamp_max = 0.60, 1.90
+        clamp_min, clamp_max = 0.55, 2.80    # Was 0.60/1.90 → 0.55/2.80
 
     # ── regime adjustment ─────────────────────────────────────────
     regime_adj = 0.0
@@ -6514,7 +6516,8 @@ def get_hybrid_runtime_trail_distance(
     safe_atr_pct = max(0.3, float(atr_pct))
     safe_spread_pct = max(0.01, float(spread_pct))
     safe_vol_ratio = max(0.2, float(volume_ratio))
-    tightness_mult = math.sqrt(_clamp(exit_tightness, 0.3, 15.0))
+    # Phase 248: Dampened tightness — prevents extreme UI values from overriding adaptive widening
+    tightness_mult = 1.0 + (math.sqrt(_clamp(exit_tightness, 0.5, 10.0)) - 1.0) * 0.5
 
     # Volatility expansion
     if safe_atr_pct < 1.0:
@@ -6531,7 +6534,9 @@ def get_hybrid_runtime_trail_distance(
         volatility_mult = 1.90
 
     micro_mult = 1.0 + max(0.0, safe_spread_pct - 0.08) * 2.2
-    if safe_vol_ratio < 1.0:
+    if safe_vol_ratio < 0.5:
+        micro_mult *= 1.35  # Phase 248: Stronger noise buffer for thin books
+    elif safe_vol_ratio < 1.0:
         micro_mult *= 1.15
     elif safe_vol_ratio >= 2.0:
         micro_mult *= 0.92
@@ -6541,15 +6546,14 @@ def get_hybrid_runtime_trail_distance(
 
     dynamic_distance = base * volatility_mult * tightness_mult * micro_mult * trend_mult
 
-    # Profit-aware tightening (less aggressive to avoid premature exits)
-    if roi_pct >= 30:
-        dynamic_distance *= 0.68
-    elif roi_pct >= 20:
-        dynamic_distance *= 0.78
-    elif roi_pct >= 12:
-        dynamic_distance *= 0.88
-    elif roi_pct >= 6:
-        dynamic_distance *= 0.95
+    # Phase 248: Relaxed profit tightening — let trends run longer
+    if roi_pct >= 40:
+        dynamic_distance *= 0.72    # Was 30→0.68
+    elif roi_pct >= 25:
+        dynamic_distance *= 0.82    # Was 20→0.78
+    elif roi_pct >= 15:
+        dynamic_distance *= 0.92    # Was 12→0.88
+    # roi < 15: no tightening (was 6→0.95)
 
     return _clamp(dynamic_distance, base * 0.6, base * 3.5)
 
@@ -6873,24 +6877,12 @@ def get_dynamic_trail_params(
     """
     import math
     
-    # 1. BASE VALUES FROM VOLATILITY
+    # Phase 248: Continuous ATR-based scaling (replaces bracket steps)
     # Low volatility → wider trails (let profits run)
     # High volatility → tighter trails (lock in profits quickly)
-    if volatility_pct <= 2.0:
-        base_activation = 2.0   # Need big move before trail
-        base_distance = 1.5     # Wide trail distance
-    elif volatility_pct <= 4.0:
-        base_activation = 1.5
-        base_distance = 1.0
-    elif volatility_pct <= 6.0:
-        base_activation = 1.2
-        base_distance = 0.8
-    elif volatility_pct <= 10.0:
-        base_activation = 1.0
-        base_distance = 0.6
-    else:
-        base_activation = 0.8   # Quick activation for very volatile
-        base_distance = 0.5     # Tight trail
+    # Formula: activation decreases linearly from ~2.2 at ATR=1% to ~0.8 at ATR=10%
+    base_activation = max(0.8, 2.4 - volatility_pct * 0.16)
+    base_distance = max(0.4, base_activation * 0.65)
     
     # 2. HURST ADJUSTMENT
     # Trending (>0.5) → wider trails to capture bigger moves
@@ -6929,19 +6921,19 @@ def get_dynamic_trail_params(
     final_activation = base_activation * hurst_mult * max(0.5, risk_mult)
     final_distance = base_distance * hurst_mult * max(0.5, risk_mult)
     
-    # Clamp to reasonable ranges
-    final_activation = max(0.5, min(3.0, final_activation))  # 0.5-3.0 range
-    final_distance = max(0.3, min(2.5, final_distance))      # 0.3-2.5 range (Phase 213: was 2.0)
+    # Phase 248: Wider clamp ranges for volatile coins
+    final_activation = max(0.5, min(4.0, final_activation))  # Was 3.0 → 4.0
+    final_distance = max(0.3, min(3.5, final_distance))      # Was 2.5 → 3.5
     
     # Phase 213: Enforce minimum 2x distance for trending coins
     if hurst >= 0.55:
         final_distance = max(final_distance, base_distance * 1.5)  # At least 1.5x base for trending
     
-    # Phase 231: Cap at settings values — user settings always respected
+    # Phase 248: Settings as FLOOR (not cap) — adaptive logic can go wider for volatile coins
     if settings_activation > 0:
-        final_activation = min(final_activation, settings_activation)
+        final_activation = max(final_activation, settings_activation * 0.8)
     if settings_distance > 0:
-        final_distance = min(final_distance, settings_distance)
+        final_distance = max(final_distance, settings_distance * 0.8)
     
     return round(final_activation, 2), round(final_distance, 2)
 
@@ -6973,7 +6965,8 @@ def get_dynamic_trail_activation_threshold(
     th_mult = _clamp(threshold_mult, 0.60, 3.00)
 
     # Base: ATR'nin %40'ı (min 0.5%, max 2.0%)
-    base_move = max(0.5, min(2.0, atr_pct * 0.40))
+    # Phase 248: Wider base_move cap for volatile coins (was 2.0)
+    base_move = max(0.5, min(3.5, atr_pct * 0.40))
     
     # Spread factor: yüksek spread → daha geniş eşik (noise filtresi)
     # 0.05% normal spread, üstü = ek buffer
@@ -6992,7 +6985,7 @@ def get_dynamic_trail_activation_threshold(
     # Phase 245: Cost-aware floor — trail must clear 2× trade cost
     cost = estimate_trade_cost(spread_pct, leverage)
     cost_floor = cost['min_profitable_move']  # 2× total cost
-    min_price_move = max(cost_floor, min(3.5, min_price_move))  # Cost floor replaces old 0.4% hard floor
+    min_price_move = max(cost_floor, min(5.0, min_price_move))  # Phase 248: was 3.5 → 5.0 cap
     
     # ROI = min_price_move × leverage (ama min cost_roi × 2, max 28%)
     min_roi = round(min_price_move * max(1, leverage), 1)
