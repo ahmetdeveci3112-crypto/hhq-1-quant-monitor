@@ -6402,8 +6402,9 @@ def compute_structural_sl(
         
         if structural_level:
             new_sl = structural_level - buffer
-            # Only adjust if structural SL is within 1 ATR of ATR-based SL
-            if abs(new_sl - base_sl) <= atr:
+            # Direction guard: SL must TIGHTEN (move UP toward entry), never widen
+            # LONG SL is below entry → higher SL = tighter = less risk
+            if new_sl >= base_sl and abs(new_sl - base_sl) <= atr:
                 result['sl'] = new_sl
                 result['adjusted'] = True
                 result['structural_level'] = structural_level
@@ -6421,7 +6422,9 @@ def compute_structural_sl(
         
         if structural_level:
             new_sl = structural_level + buffer
-            if abs(new_sl - base_sl) <= atr:
+            # Direction guard: SL must TIGHTEN (move DOWN toward entry), never widen
+            # SHORT SL is above entry → lower SL = tighter = less risk
+            if new_sl <= base_sl and abs(new_sl - base_sl) <= atr:
                 result['sl'] = new_sl
                 result['adjusted'] = True
                 result['structural_level'] = structural_level

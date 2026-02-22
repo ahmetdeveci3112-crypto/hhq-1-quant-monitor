@@ -217,6 +217,20 @@ class HHQHyperOptimizer:
         if not self.best_params or not self.is_optimized:
             return False
         
+        # Phase 249 fix: Enforce >5% improvement threshold
+        try:
+            default_params = {hp['name']: hp['default'] for hp in self.active_hyperparameters}
+            default_score = self._evaluate_with_params(default_params)
+            if default_score != 0:
+                improvement = (self.best_score - default_score) / abs(default_score) * 100
+            else:
+                improvement = 0
+            if improvement < 5.0:
+                logger.info(f"⏭️ Hyperopt skip apply: improvement={improvement:+.1f}% < 5% threshold")
+                return False
+        except Exception:
+            pass  # If check fails, proceed with apply
+        
         try:
             # Map hyperopt param names to trader attributes
             param_map = {
@@ -380,8 +394,9 @@ class HHQHyperOptimizer:
         
         try:
             # Phase 246C: Auto-detect strategy mode from trade data
+            # Fix: Only override if detected is NOT DEFAULT (prevents good mode → DEFAULT regression)
             detected_mode = self.detect_strategy_mode()
-            if detected_mode != self.strategy_mode:
+            if detected_mode != 'DEFAULT' and detected_mode != self.strategy_mode:
                 logger.info(f"🔬 Hyperopt: Strategy mode auto-switched {self.strategy_mode} -> {detected_mode}")
                 self.strategy_mode = detected_mode
                 self.active_hyperparameters = self._get_hyperparameters()
