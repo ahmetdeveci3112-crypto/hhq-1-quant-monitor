@@ -3600,7 +3600,7 @@ async def binance_position_sync_loop():
                             try:
                                 current_price = pos.get('currentPrice', pos.get('markPrice', pos.get('entryPrice', 0)))
                                 pnl_before = pos.get('unrealizedPnl', 0)
-                                global_paper_trader.close_position(pos, current_price, "RECOVERY_CLOSE_ALL")
+                                global_paper_trader.close_via_engine(pos, current_price, "RECOVERY_CLOSE_ALL", 'RECOVERY')
                                 closed_count += 1
                                 total_pnl += pnl_before
                             except Exception as pe:
@@ -12516,6 +12516,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 signal['_is_reentry'] = True
                 signal['_reentry_count'] = sig['reentry_count']
                 logger.info(f"♻️ REENTRY_ATTEMPT: {symbol} {action} attempt #{sig['reentry_count']+1}/{MAX_REENTRY_PER_SIGNAL}")
+        elif existing_position:
+            # Phase 257: P1 fix — existing position guard in persistent mode
+            # Without this, code falls through to open a duplicate position
+            signal_log_data['reject_reason'] = 'EXISTING_POSITION'
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback("EXISTING_POSITION")
+            logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')}) [persistent mode]")
+            return
     else:
         # Legacy mode: original existing position check
         if existing_position:
@@ -13266,7 +13274,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             if multi_coin_scanner.exchange and signal.get('confidenceScore', 0) >= 80:
                 ccxt_symbol = symbol.replace('USDT', '/USDT')
                 ohlcv_4h = await asyncio.wait_for(
-                    multi_coin_scanner.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100),
+                    data_provider.get_ohlcv(multi_coin_scanner.exchange, ccxt_symbol, '4h', limit=100),
                     timeout=1.5
                 )
                 if ohlcv_4h:
@@ -13644,7 +13652,7 @@ class MultiTimeframeConfirmation:
             async def fetch_ohlcv_safe(timeframe: str):
                 try:
                     return await asyncio.wait_for(
-                        exchange.fetch_ohlcv(ccxt_symbol, timeframe, limit=30),
+                        data_provider.get_ohlcv(exchange, ccxt_symbol, timeframe, limit=30),
                         timeout=fetch_timeout
                     )
                 except asyncio.TimeoutError:
@@ -13941,15 +13949,15 @@ class BTCCorrelationFilter:
             # Phase 60e: BTC 15m, 30m, 1H, 4H ve 1D verileri çek
             # Rate limit fix: 100ms delay between calls
             logger.info("📊 Fetching BTC OHLCV data...")
-            ohlcv_15m = await exchange.fetch_ohlcv('BTC/USDT', '15m', limit=4)
+            ohlcv_15m = await data_provider.get_ohlcv(exchange, 'BTC/USDT', '15m', limit=4)
             await asyncio.sleep(0.1)
-            ohlcv_30m = await exchange.fetch_ohlcv('BTC/USDT', '30m', limit=4)
+            ohlcv_30m = await data_provider.get_ohlcv(exchange, 'BTC/USDT', '30m', limit=4)
             await asyncio.sleep(0.1)
-            ohlcv_1h = await exchange.fetch_ohlcv('BTC/USDT', '1h', limit=24)
+            ohlcv_1h = await data_provider.get_ohlcv(exchange, 'BTC/USDT', '1h', limit=24)
             await asyncio.sleep(0.1)
-            ohlcv_4h = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=12)
+            ohlcv_4h = await data_provider.get_ohlcv(exchange, 'BTC/USDT', '4h', limit=12)
             await asyncio.sleep(0.1)
-            ohlcv_1d = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=3)
+            ohlcv_1d = await data_provider.get_ohlcv(exchange, 'BTC/USDT', '1d', limit=3)
             logger.info(f"📊 BTC OHLCV fetched: 15m={len(ohlcv_15m) if ohlcv_15m else 0}, 30m={len(ohlcv_30m) if ohlcv_30m else 0}, 1h={len(ohlcv_1h) if ohlcv_1h else 0}, 4h={len(ohlcv_4h) if ohlcv_4h else 0}, 1d={len(ohlcv_1d) if ohlcv_1d else 0}")
             
             # Phase 60e: 15m momentum hesapla
@@ -14135,11 +14143,11 @@ class BTCCorrelationFilter:
             # =================================================================
             try:
                 # Rate limit fix: 100ms delay between calls
-                eth_30m = await exchange.fetch_ohlcv('ETH/USDT', '30m', limit=4)
+                eth_30m = await data_provider.get_ohlcv(exchange, 'ETH/USDT', '30m', limit=4)
                 await asyncio.sleep(0.1)
-                eth_1h = await exchange.fetch_ohlcv('ETH/USDT', '1h', limit=4)
+                eth_1h = await data_provider.get_ohlcv(exchange, 'ETH/USDT', '1h', limit=4)
                 await asyncio.sleep(0.1)
-                eth_4h = await exchange.fetch_ohlcv('ETH/USDT', '4h', limit=4)
+                eth_4h = await data_provider.get_ohlcv(exchange, 'ETH/USDT', '4h', limit=4)
                 
                 if eth_30m and len(eth_30m) >= 2:
                     curr = eth_30m[-1][4]
@@ -15444,7 +15452,7 @@ class PositionBasedKillSwitch:
                 # Check loss thresholds using POSITION LOSS with DYNAMIC thresholds
                 if position_loss_pct <= full_threshold:
                     # Full close threshold reached
-                    paper_trader.close_position(pos, current_price, 'KILL_SWITCH_FULL')
+                    paper_trader.close_via_engine(pos, current_price, 'KILL_SWITCH_FULL', 'KILL_SWITCH')
                     # Note: close_position already handles Binance close for isLive positions
                     actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
                     logger.warning(f"🚨 KILL SWITCH FULL [{leverage}x]: Closed {side} {symbol} at {position_loss_pct:.1f}% loss (threshold: {full_threshold:.0f}%)")
@@ -22889,7 +22897,7 @@ class PaperTradingEngine:
                             
                     # Check recovery SL hit
                     if current_price <= pos['recovery_sl']:
-                        self.close_position(pos, current_price, 'RECOVERY_EXIT')
+                        self.close_via_engine(pos, current_price, 'RECOVERY_EXIT', 'RECOVERY')
                         return True
                         
         elif pos['side'] == 'SHORT':
@@ -22912,7 +22920,7 @@ class PaperTradingEngine:
                             pos['recovery_sl'] = new_recovery_sl
                             
                     if current_price >= pos['recovery_sl']:
-                        self.close_position(pos, current_price, 'RECOVERY_EXIT')
+                        self.close_via_engine(pos, current_price, 'RECOVERY_EXIT', 'RECOVERY')
                         return True
         
         return False
@@ -22951,7 +22959,7 @@ class PaperTradingEngine:
                 if pos['gradual_high'] - current_price >= atr * bounce_mult:
                     self.add_log(f"📉 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
                     pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_GRADUAL', 'roi': round(((current_price - pos['entryPrice']) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
-                    self.close_position(pos, current_price, 'TIME_GRADUAL')
+                    self.close_via_engine(pos, current_price, 'TIME_GRADUAL', 'TIME_MGR')
                     return True
                     
             # For SHORT: Close when price dips then comes back
@@ -22965,14 +22973,14 @@ class PaperTradingEngine:
                 if current_price - pos['gradual_low'] >= atr * bounce_mult:
                     self.add_log(f"📈 BOUNCED EXIT: Aşamalı tasfiye tamamlandı")
                     pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_GRADUAL', 'roi': round(((pos['entryPrice'] - current_price) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
-                    self.close_position(pos, current_price, 'TIME_GRADUAL')
+                    self.close_via_engine(pos, current_price, 'TIME_GRADUAL', 'TIME_MGR')
                     return True
             
             # Hard limit: force close regardless
             if age_hours > adjusted_hard_limit:
                 self.add_log(f"🆘 {adjusted_hard_limit:.0f}h+ SAAT: Zorunlu çıkış (x{et:.1f})")
                 pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TIME_FORCE', 'roi': round(((current_price - pos['entryPrice']) / pos['entryPrice'] * 100) if pos.get('side') == 'LONG' and pos['entryPrice'] > 0 else ((pos['entryPrice'] - current_price) / pos['entryPrice'] * 100) if pos['entryPrice'] > 0 else 0, 1)})
-                self.close_position(pos, current_price, 'TIME_FORCE')
+                self.close_via_engine(pos, current_price, 'TIME_FORCE', 'TIME_MGR')
                 return True
                 
         return False
@@ -23008,7 +23016,7 @@ class PaperTradingEngine:
             
         if loss_pct >= effective_emergency_pct:
             self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f}, x{et:.1f})")
-            self.close_position(pos, current_price, 'EMERGENCY_SL')
+            self.close_via_engine(pos, current_price, 'EMERGENCY_SL', 'EMERGENCY')
             return True
         return False
     
@@ -23036,7 +23044,7 @@ class PaperTradingEngine:
             to_close = list(sorted_positions[:close_count])  # Phase 243: snapshot to prevent list mutation
             for pos in to_close:
                 current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
-                self.close_position(pos, current_price, 'PORTFOLIO_DRAWDOWN')
+                self.close_via_engine(pos, current_price, 'PORTFOLIO_DRAWDOWN', 'DRAWDOWN')
             
             self.add_log(
                 f"🚨 PORTFÖY KORUMA: Toplam kayıp %{abs(loss_pct):.1f} "
@@ -23085,7 +23093,7 @@ class PaperTradingEngine:
                 loss_pct = ((entry - current_price) / entry) * 100
                 self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
                 pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
-                self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
+                self.close_via_engine(pos, current_price, 'ADVERSE_TIME_EXIT', 'ADVERSE')
                 return True
                 
         elif pos['side'] == 'SHORT':
@@ -23101,7 +23109,7 @@ class PaperTradingEngine:
                 loss_pct = ((current_price - entry) / entry) * 100
                 self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
                 pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
-                self.close_position(pos, current_price, 'ADVERSE_TIME_EXIT')
+                self.close_via_engine(pos, current_price, 'ADVERSE_TIME_EXIT', 'ADVERSE')
                 return True
         
         return False
@@ -23166,7 +23174,7 @@ class PaperTradingEngine:
                 if self.positions:
                     for pos in list(self.positions):
                         current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
-                        self.close_position(pos, current_price, 'TRAILING_DD_LOCK')
+                        self.close_via_engine(pos, current_price, 'TRAILING_DD_LOCK', 'DRAWDOWN')
                         
                 self.add_log(f"🔒 PROFIT LOCK: Günlük zirveden %{peak_drawdown_pct:.1f} düşüş. Pozisyonlar kapatıldı.")
                 logger.warning(f"🔒 TRAILING DD LOCK: Peak Equity ${self.daily_peak_equity:.2f}, Current ${current_equity:.2f} (-{peak_drawdown_pct:.1f}%)")
@@ -23349,7 +23357,7 @@ class PaperTradingEngine:
         pos = next((p for p in self.positions if p['id'] == position_id), None)
         if not pos:
             return False
-        self.close_position(pos, current_price, 'MANUAL')
+        self.close_via_engine(pos, current_price, 'MANUAL', 'USER')
         return True
 
     def on_signal(self, signal: Dict, current_price: float):
@@ -23394,7 +23402,7 @@ class PaperTradingEngine:
             # 1. PROFITABLE: Close immediately to lock profit
             if pnl_pct > 0.5:  # At least 0.5% profit
                 self.add_log(f"🔄 SİNYAL TERSİNE DÖNDÜ: {pos['side']} %{pnl_pct:.1f} karlı kapatılıyor!")
-                self.close_position(pos, current_price, 'SIGNAL_REVERSAL_PROFIT')
+                self.close_via_engine(pos, current_price, 'SIGNAL_REVERSAL_PROFIT', 'SIGNAL')
                 continue
             
             # 2. SMALL LOSS (-2% to 0.5%): Activate breakeven trailing
@@ -23710,7 +23718,7 @@ class PaperTradingEngine:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                         reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
-                        self.close_position(pos, current_price, reason)
+                        self.close_via_engine(pos, current_price, reason, 'TRAILING')
                 else:
                     if pos['slConfirmCount'] > 0:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} LONG | {pos['slConfirmCount']} ticks")
@@ -23718,7 +23726,7 @@ class PaperTradingEngine:
                     pos['slBreachStartTime'] = 0
                     if current_price >= pos['takeProfit']:
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
-                        self.close_position(pos, current_price, 'TP_HIT')
+                        self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
                     
             elif pos['side'] == 'SHORT':
                 # SHORT: ROI must be >= threshold (positive ROI means price went down)
@@ -23749,7 +23757,7 @@ class PaperTradingEngine:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                         reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
-                        self.close_position(pos, current_price, reason)
+                        self.close_via_engine(pos, current_price, reason, 'TRAILING')
                 else:
                     if pos['slConfirmCount'] > 0:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} SHORT | {pos['slConfirmCount']} ticks")
@@ -23757,7 +23765,7 @@ class PaperTradingEngine:
                     pos['slBreachStartTime'] = 0
                     if current_price <= pos['takeProfit']:
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
-                        self.close_position(pos, current_price, 'TP_HIT')
+                        self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
 
     def _format_detailed_reason(self, reason: str, pos: Dict, exit_price: float, pnl_percent: float) -> str:
         """
@@ -23823,6 +23831,18 @@ class PaperTradingEngine:
         }
         
         return reason_map.get(reason, f"📋 {reason} ({pnl_percent:+.1f}%)")
+
+    def close_via_engine(self, pos: Dict, exit_price: float, reason: str, source: str = 'INTERNAL'):
+        """Phase 257: Bridge to exit_engine for unified exit gate.
+        Routes through exit_engine for double-close prevention + priority + telemetry.
+        Falls back to direct close_position if exit_engine is unavailable.
+        """
+        try:
+            if exit_engine:
+                return exit_engine.request_exit(pos, exit_price, reason, source)
+        except Exception:
+            pass
+        return self.close_position(pos, exit_price, reason)
 
     def close_position(self, pos: Dict, exit_price: float, reason: str):
         """
@@ -25149,7 +25169,7 @@ class ProtectionManager:
         
         # Get recent trades from paper trader
         recent_trades = []
-        for trade in reversed(self.paper_trader.trade_history):
+        for trade in reversed(self.paper_trader.trades):  # Phase 257: was trade_history (wrong attr → trades)
             close_time = trade.get('closeTime', 0) / 1000  # ms → s
             if close_time < cutoff:
                 break
@@ -27102,7 +27122,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     
                                     # Update volume profile if stale (every hour)
                                     if datetime.now().timestamp() - coin_vp.last_update > 3600:
-                                        ohlcv_4h = await streamer.exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=100)
+                                        ohlcv_4h = await data_provider.get_ohlcv(streamer.exchange, ccxt_symbol, '4h', limit=100)
                                         if ohlcv_4h:
                                             coin_vp.calculate_profile(ohlcv_4h)
                                             logger.debug(f"Updated VP for {active_symbol}: POC={coin_vp.poc:.6f}")
