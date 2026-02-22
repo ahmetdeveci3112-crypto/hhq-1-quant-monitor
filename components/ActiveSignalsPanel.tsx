@@ -368,7 +368,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     });
 
     const activeSignals = enrichedSignals
-        .filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore)
+        .filter(s => s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.state === 'ACTIVE'))
         .filter(s => {
             switch (qualityFilter) {
                 case 'eq_pass': return s.entryQualityPass === true;
@@ -420,7 +420,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     );
 
     // Count for filter badges
-    const allSignals = enrichedSignals.filter(s => s.signalAction !== 'NONE' && s.signalScore >= minConfidenceScore);
+    const allSignals = enrichedSignals.filter(s => s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.state === 'ACTIVE'));
     const eqCount = allSignals.filter(s => s.entryQualityPass).length;
     const fibCount = allSignals.filter(s => s.fibActive).length;
     const volCount = allSignals.filter(s => s.isVolumeSpike).length;
