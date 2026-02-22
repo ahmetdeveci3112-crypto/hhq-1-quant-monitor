@@ -40,6 +40,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+LIVE_START_BALANCE_USD = float(os.getenv("LIVE_START_BALANCE_USD", "100"))
 
 # Phase 193: pandas-ta for enhanced technical indicators
 try:
@@ -2307,8 +2308,9 @@ class LiveBinanceTrader:
             # Full market fallback on any error
             return await self.place_market_order(symbol, side, size_usd, leverage)
     
-    async def close_position(self, symbol: str, side: str, amount: float) -> dict:
-        """Pozisyon kapat (reduceOnly=True) — Market order. Phase 186: with exec logging."""
+    async def close_position(self, symbol: str, side: str, amount: float, trace_id: str = None) -> dict:
+        """Pozisyon kapat (reduceOnly=True) — Market order. Phase 186: with exec logging.
+        Phase 261: Added trace_id for full layer telemetry."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, close rejected")
             return None
@@ -2351,9 +2353,10 @@ class LiveBinanceTrader:
                 reference = best_ask if best_ask else avg_fill
                 slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else 0
             
-            logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}")
+            trace_str = f" [trace: {trace_id}]" if trace_id else ""
+            logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}{trace_str}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
-            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
+            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms{trace_str}")
             
             return {
                 'id': order.get('id'),
@@ -2368,6 +2371,36 @@ class LiveBinanceTrader:
             
         except Exception as e:
             logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} | Error: {e}")
+            
+            # Phase 261: ReduceOnly Retry Hardening (-2022 fix)
+            # Before retrying, verify with Binance if the position is already flat.
+            try:
+                bin_positions = await self.get_positions()
+                remaining_amt = amount
+                found_pos = False
+                for bp in bin_positions:
+                    if bp.get('symbol') == symbol:
+                        remaining_amt = float(bp.get('size', 0))
+                        found_pos = True
+                        break
+                
+                if not found_pos or remaining_amt <= 0.00001:  # Epsilon
+                    logger.warning(f"✅ REDUCE_ONLY_FIX: {side} {symbol} is already flat (rem={remaining_amt}). Graceful success.")
+                    return {
+                        'id': 'already_closed_fallback',
+                        'symbol': symbol,
+                        'side': side,
+                        'amount': amount,
+                        'status': 'filled',
+                        'timestamp': int(datetime.now().timestamp() * 1000),
+                    }
+                
+                if remaining_amt < amount:
+                    logger.warning(f"⚠️ RETRY_SNAP: {symbol} requested {amount:.6f}, actual remaining is {remaining_amt:.6f}. Snapping.")
+                    amount = remaining_amt
+            except Exception as pos_check_err:
+                logger.error(f"❌ FAILED TO FETCH POSITION FOR RETRY CHECK {symbol}: {pos_check_err}")
+
             # Phase 217: Retry with exponential backoff to prevent ghost positions
             for retry in range(3):
                 try:
@@ -2669,7 +2702,8 @@ class LiveBinanceTrader:
     
     async def get_pnl_from_binance(self) -> dict:
         """
-        Binance Futures income history'den Today's PnL ve Total PnL hesapla.
+        Binance Futures income history'den Today's Realized PnL al.
+        Total PnL ise başlangıç bakiyesine göre (default: 100 USDT) hesaplanır.
         Returns: {todayPnl, todayPnlPercent, totalPnl, totalPnlPercent, todayTradesCount}
         """
         if not self.enabled or not self.exchange:
@@ -2717,12 +2751,18 @@ class LiveBinanceTrader:
                         today_trades_count += 1
                         # Removed noisy individual income logging (Phase 105)
             
-            # Calculate percentages based on wallet balance
-            wallet_balance = self.last_balance if self.last_balance > 0 else 100
-            today_pnl_percent = (today_pnl / wallet_balance) * 100
-            total_pnl_percent = (total_pnl / wallet_balance) * 100
+            # Today's % aligns with Binance card behavior (realized / current margin balance).
+            current_balance = self.last_balance if self.last_balance > 0 else LIVE_START_BALANCE_USD
+            today_pnl_percent = (today_pnl / current_balance) * 100 if current_balance > 0 else 0
             
-            logger.info(f"📊 PnL from Binance: Today=${today_pnl:.2f} ({today_pnl_percent:.2f}%) | Total=${total_pnl:.2f}")
+            # Total PnL must be baseline-based (user requirement): current_balance - start_balance.
+            total_pnl = current_balance - LIVE_START_BALANCE_USD
+            total_pnl_percent = (total_pnl / LIVE_START_BALANCE_USD) * 100 if LIVE_START_BALANCE_USD > 0 else 0
+            
+            logger.info(
+                f"📊 PnL from Binance: Today=${today_pnl:.2f} ({today_pnl_percent:.2f}%) "
+                f"| Total=${total_pnl:.2f} (baseline=${LIVE_START_BALANCE_USD:.2f})"
+            )
             
             return {
                 'todayPnl': round(today_pnl, 2),
@@ -10886,7 +10926,16 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
                 ui_state_cache.trading_mode = "live"
                 logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
-                if not ui_state_cache.pnl_data:
+                cached_pnl = getattr(live_binance_trader, 'cached_pnl', None)
+                if cached_pnl:
+                    ui_state_cache.pnl_data = {
+                        "todayPnl": cached_pnl.get("todayPnl", 0),
+                        "todayPnlPercent": cached_pnl.get("todayPnlPercent", 0),
+                        "totalPnl": cached_pnl.get("totalPnl", 0),
+                        "totalPnlPercent": cached_pnl.get("totalPnlPercent", 0),
+                        "todayTradesCount": cached_pnl.get("todayTradesCount", 0)
+                    }
+                elif not ui_state_cache.pnl_data:
                     ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
                         
             except Exception as e:
@@ -12208,56 +12257,20 @@ async def position_price_update_loop():
                                     exit_engine.request_exit(pos, current_price, f"ERROR_TIMEOUT_MARKET_FALLBACK({reason})")
                                     continue
                         
-                        # Check SL/TP exits with SPIKE BYPASS
-                        # Phase 190: Skip if limit close is pending (breakeven or TP)
-                        if pos.get('pending_limit_close'):
-                            continue
-                        sl = pos.get('stopLoss', 0)
-                        tp = pos.get('takeProfit', 0)
-                        trailing_stop = pos.get('trailingStop', sl)
+                        # =====================================================================
+                        # PHASE 261: SINGLE EXIT AUTHORITY
+                        # Fast loop no longer triggers SL or TP directly to prevent race conditions.
+                        # It only updates PnL, trail levels, and monitors pending limit closes.
+                        # Actual SL/TP/Trail exit triggering is now handled exclusively by the WS loop.
+                        # =====================================================================
                         
-                        # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation
-                        SL_CONFIRMATION_TICKS = 5
-                        SL_CONFIRMATION_SECONDS = 15
-                        
-                        if 'slConfirmCount' not in pos:
-                            pos['slConfirmCount'] = 0
-                        if 'slBreachStartTime' not in pos:
-                            pos['slBreachStartTime'] = 0
-                        
-                        sl_breached = False
-                        if pos['side'] == 'LONG' and current_price <= trailing_stop:
-                            sl_breached = True
-                        elif pos['side'] == 'SHORT' and current_price >= trailing_stop:
-                            sl_breached = True
-                        
-                        now_ts = datetime.now().timestamp()
-                        if sl_breached:
-                            if pos['slConfirmCount'] == 0:
-                                pos['slBreachStartTime'] = now_ts
-                            pos['slConfirmCount'] += 1
-                            breach_duration = now_ts - pos['slBreachStartTime']
-                            if pos['slConfirmCount'] >= SL_CONFIRMATION_TICKS and breach_duration >= SL_CONFIRMATION_SECONDS:
-                                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
-                                logger.info(f"🔴 SL CONFIRMED (fast): {symbol} @ ${current_price:.6f} | {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
-                                exit_engine.request_exit(pos, current_price, reason)
-                                continue
-                        else:
-                            if pos['slConfirmCount'] > 0:
-                                bypass_duration = now_ts - pos['slBreachStartTime']
-                                logger.info(f"⚡ Spike bypassed (fast): {symbol} | {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
-                            pos['slConfirmCount'] = 0
-                            pos['slBreachStartTime'] = 0
-                        
-                        # TP Hit Check (immediate - no confirmation for profits)
-                        if pos['side'] == 'LONG' and current_price >= tp:
-                            exit_engine.request_exit(pos, current_price, 'TP_HIT')
-                            logger.info(f"✅ TP triggered: LONG {symbol} @ ${current_price:.6f}")
-                            continue
-                        elif pos['side'] == 'SHORT' and current_price <= tp:
-                            exit_engine.request_exit(pos, current_price, 'TP_HIT')
-                            logger.info(f"✅ TP triggered: SHORT {symbol} @ ${current_price:.6f}")
-                            continue
+                        # Phase 261: Flash Trade Guard — minimum 60s hold time for fast loop fallbacks
+                        MIN_HOLD_SECONDS_FAST = 60
+                        open_time_ms_fast = pos.get('openTime', 0)
+                        if open_time_ms_fast > 0:
+                            hold_duration_fast = datetime.now().timestamp() - (open_time_ms_fast / 1000)
+                            if hold_duration_fast < MIN_HOLD_SECONDS_FAST:
+                                continue  # Skip fast loop exit checks — too early
                         
                         # ---- Phase 214: FAILED CONTINUATION DETECTOR (backup) ----
                         # Phase 214 fix: Use candle close price, not tick price
@@ -16524,6 +16537,17 @@ class BreakevenStopManager:
                         if not limit_result:
                             logger.error(f"❌ BREAKEVEN LIMIT ORDER FAILED: {symbol} - will retry next cycle")
                 else:
+                    # Phase 261 Hotfix: Zombie State Prevention (-2022/immediate-close fix)
+                    # If a state was loaded from SQLite but the position was already closed, 
+                    # a NEW trade on this symbol will falsely inherit the old active state.
+                    cached_entry = float(state.get('entry_price', 0))
+                    if cached_entry > 0 and abs(entry_price - cached_entry) / max(entry_price, 0.0001) > 0.005:
+                        logger.warning(f"🧹 ZOMBIE BREAKEVEN CLEARED: {symbol} {side} | current_entry=${entry_price:.6f} != cached=${cached_entry:.6f}")
+                        if state_key in self.breakeven_state:
+                            del self.breakeven_state[state_key]
+                        safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"delete_zombie_bk_{symbol}")
+                        continue  # Let it evaluate fresh next cycle
+
                     # Phase 179: Breakeven active — monitor limit order status
                     order_id = state.get('order_id')
                     
@@ -23956,9 +23980,9 @@ class PaperTradingEngine:
                 return exit_engine.request_exit(pos, exit_price, reason, source)
         except Exception:
             pass
-        return self.close_position(pos, exit_price, reason)
+        return self.close_position(pos, exit_price, reason, source=source)
 
-    def close_position(self, pos: Dict, exit_price: float, reason: str):
+    def close_position(self, pos: Dict, exit_price: float, reason: str, trace_id: str = None, source: str = 'UNKNOWN'):
         """
         Close a position and record it in trade history.
         For live trading, also schedules async Binance close.
@@ -24019,6 +24043,28 @@ class PaperTradingEngine:
         except Exception as e:
             logger.warning(f"⚠️ Failed to close position in SQLite: {e}")
         
+        # =====================================================================
+        # Phase 261: Post-fill Reason Normalization
+        # Validates if the fill price actually satisfied the trigger reason.
+        # =====================================================================
+        original_reason = reason
+        side = pos.get('side', 'LONG')
+        tp_price = pos.get('takeProfit', 0)
+        sl_price = pos.get('trailingStop', pos.get('stopLoss', 0))
+        
+        if reason == 'TP_HIT' and tp_price > 0:
+            if side == 'LONG' and exit_price < tp_price:
+                reason = f"SLIPPAGE_EXIT({original_reason})"
+                logger.warning(f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} but exit ${exit_price:.6f} < TP ${tp_price:.6f} → {reason}")
+            elif side == 'SHORT' and exit_price > tp_price:
+                reason = f"SLIPPAGE_EXIT({original_reason})"
+                logger.warning(f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} but exit ${exit_price:.6f} > TP ${tp_price:.6f} → {reason}")
+        elif reason in ['SL_HIT', 'TRAIL_EXIT', 'EMERGENCY_SL'] and sl_price > 0:
+            if side == 'LONG' and exit_price > sl_price:
+                reason = f"SLIPPAGE_EXIT({original_reason})"
+            elif side == 'SHORT' and exit_price < sl_price:
+                reason = f"SLIPPAGE_EXIT({original_reason})"
+        
         # Record trade
         trade = {
             "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
@@ -24066,8 +24112,9 @@ class PaperTradingEngine:
             "mae_pct": round(pos.get('mae_pct', 0), 2),
             "mfe_pct": round(pos.get('mfe_pct', 0), 2),
             "decision_trace": pos.get('decision_trace', [])[-5:],
-            # Phase 232: Canonical reason + legacy closeReason
+            # Phase 232 / 261: Canonical reason + legacy closeReason
             "closeReason": reason,
+            "original_reason": original_reason,
             # Phase 232: Close metrics snapshot
             "close_metrics_json": json.dumps({
                 'entry': pos.get('entryPrice', 0),
@@ -24211,6 +24258,10 @@ class PaperTradingEngine:
                 safe_create_task(sqlite_manager.save_trade(trade))
             except Exception as e:
                 logger.debug(f"SQLite save error: {e}")
+            
+            # Phase 261: Clear exit lock immediately for paper trades
+            if trace_id and 'exit_engine' in globals() and exit_engine:
+                exit_engine.clear_lock(symbol, trace_id)
         
         # Update Stats (for both LIVE and PAPER)
         self.stats['totalTrades'] += 1
@@ -24270,11 +24321,11 @@ class PaperTradingEngine:
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount))
+                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount, trace_id))
                 else:
-                    loop.run_until_complete(self._close_on_binance(symbol, side, amount))
+                    loop.run_until_complete(self._close_on_binance(symbol, side, amount, trace_id))
             except RuntimeError:
-                asyncio.run(self._close_on_binance(symbol, side, amount))
+                asyncio.run(self._close_on_binance(symbol, side, amount, trace_id))
             
             # Phase 157: Schedule Binance trade history fetch after close
             ui_state_cache.trigger_trade_fetch(delay_seconds=3)
@@ -24305,9 +24356,10 @@ class PaperTradingEngine:
         except Exception as e:
             logger.debug(f"Coin performance record error: {e}")
     
-    async def _close_on_binance(self, symbol: str, side: str, amount: float):
+    async def _close_on_binance(self, symbol: str, side: str, amount: float, trace_id: str = None):
         """Helper to close position on Binance asynchronously.
         Phase 87: Now fetches actual Binance position size to prevent partial closes.
+        Phase 261: Clears exit_inflight lock when done.
         """
         try:
             # Phase 87: Get ACTUAL position size from Binance (not paper trader)
@@ -24322,10 +24374,11 @@ class PaperTradingEngine:
                         logger.warning(f"⚠️ Size mismatch: Paper={amount:.4f}, Binance={actual_amount:.4f} - using Binance size")
                     break
             
-            result = await live_binance_trader.close_position(symbol, side, actual_amount)
+            result = await live_binance_trader.close_position(symbol, side, actual_amount, trace_id=trace_id)
             if result:
                 close_order_id = str(result.get('id', ''))
-                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f} | OrderID: {close_order_id[:12]}")
+                trace_str = f" [trace={trace_id}]" if trace_id else ""
+                logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f} | OrderID: {close_order_id[:12]}{trace_str}")
                 
                 # Phase 229: Save close_order_id to pending_close_reasons + SQLite
                 if close_order_id and symbol in pending_close_reasons:
@@ -24336,6 +24389,10 @@ class PaperTradingEngine:
                 logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
         except Exception as e:
             logger.error(f"❌ LIVE CLOSE ERROR: {e}")
+        finally:
+            # Phase 261: Safely release the inflight lock
+            if trace_id and 'exit_engine' in globals() and exit_engine:
+                exit_engine.clear_lock(symbol, trace_id)
 
 
 
@@ -25127,7 +25184,7 @@ class ExitDecisionEngine:
     
     def __init__(self, paper_trader):
         self.paper_trader = paper_trader
-        self._exit_pending = {}   # symbol → {reason, ts, priority, source}
+        self.exit_inflight = {}   # Phase 261: symbol -> {started_at, reason, source, trace_id}
         self._exit_log = []       # last N exit decisions for telemetry
         self._stats = {'total': 0, 'skipped': 0, 'upgraded': 0}
     
@@ -25143,60 +25200,61 @@ class ExitDecisionEngine:
         Returns: trade dict or None if skipped
         """
         symbol = pos.get('symbol', '')
-        new_pri = self._get_priority(reason)
         
-        # Double-close guard: if already pending, only allow higher priority
-        if symbol in self._exit_pending:
-            existing = self._exit_pending[symbol]
-            if new_pri <= existing['priority']:
-                self._stats['skipped'] += 1
-                logger.info(
-                    f"⏭️ EXIT_SKIP: {symbol} already pending exit "
-                    f"({existing['reason']} pri={existing['priority']}) > "
-                    f"new ({reason} pri={new_pri}) from {source}"
-                )
-                return None
-            # Higher priority → upgrade
-            self._stats['upgraded'] += 1
-            logger.info(
-                f"🔄 EXIT_UPGRADE: {symbol} {existing['reason']}→{reason} "
-                f"(pri {existing['priority']}→{new_pri}) source={source}"
+        # Phase 261: Symbol-level exit lock (exit_inflight)
+        if symbol in self.exit_inflight:
+            existing = self.exit_inflight[symbol]
+            logger.warning(
+                f"⏭️ EXIT_SKIP (LOCKED): {symbol} already inflight "
+                f"({existing['reason']}) since {existing['started_at']}. Ignoring {reason} from {source}."
             )
+            self._stats['skipped'] += 1
+            return None
         
         # Mark as pending
-        self._exit_pending[symbol] = {
-            'reason': reason, 'ts': time.time(),
-            'priority': new_pri, 'source': source,
+        trace_id = f"EXIT_{symbol}_{int(time.time()*1000)}"
+        self.exit_inflight[symbol] = {
+            'started_at': time.time(),
+            'reason': reason,
+            'source': source,
+            'trace_id': trace_id
         }
         
         # Execute close through paper trader
         self._stats['total'] += 1
         try:
-            result = self.paper_trader.close_position(pos, exit_price, reason)
             logger.info(
-                f"🚪 EXIT_ENGINE: {symbol} closed | reason={reason} "
-                f"price={exit_price:.6f} source={source} pri={new_pri}"
+                f"🚪 [LOCK_ACQUIRED] EXIT_ENGINE: {symbol} | trace_id={trace_id} "
+                f"reason={reason} price={exit_price:.6f} source={source}"
             )
+            # Pass trace_id down to paper_trader
+            result = self.paper_trader.close_position(pos, exit_price, reason, trace_id=trace_id, source=source)
         except Exception as e:
             logger.error(f"❌ EXIT_ENGINE error: {symbol} {reason} - {e}")
+            self.clear_lock(symbol, trace_id)
             result = None
-        finally:
-            # Cleanup pending flag
-            self._exit_pending.pop(symbol, None)
         
         # Track last 50 exits for telemetry
         self._exit_log.append({
             'symbol': symbol, 'reason': reason,
             'source': source, 'ts': time.time(),
+            'trace_id': trace_id
         })
         if len(self._exit_log) > 50:
             self._exit_log = self._exit_log[-50:]
         
         return result
-    
+
+    def clear_lock(self, symbol: str, trace_id: str = None):
+        """Phase 261: Safely clear the inflight lock, optionally verifying trace_id."""
+        if symbol in self.exit_inflight:
+            if trace_id is None or self.exit_inflight[symbol].get('trace_id') == trace_id:
+                del self.exit_inflight[symbol]
+                logger.info(f"🔓 [LOCK_RELEASED] {symbol} | trace_id={trace_id}")
+
     def is_exit_pending(self, symbol: str) -> bool:
         """Check if a symbol has an exit already in progress."""
-        return symbol in self._exit_pending
+        return symbol in self.exit_inflight
     
     def _get_priority(self, reason: str) -> int:
         reason_upper = reason.upper()
@@ -25206,7 +25264,7 @@ class ExitDecisionEngine:
         return 30  # default low priority
     
     def get_stats(self) -> dict:
-        return {**self._stats, 'pending': list(self._exit_pending.keys()), 'recent_exits': self._exit_log[-20:]}
+        return {**self._stats, 'pending': list(self.exit_inflight.keys()), 'recent_exits': self._exit_log[-20:]}
 
 exit_engine = ExitDecisionEngine(global_paper_trader)
 
