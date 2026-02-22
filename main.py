@@ -6137,6 +6137,305 @@ def compute_execution_quality_score(
         "notes": notes[:6],
     }
 
+
+# ============================================================================
+# Phase 249: HYBRID STRUCTURAL ENTRY/EXIT HELPERS
+# ============================================================================
+
+def compute_composite_volatility(
+    atr_pct: float,
+    spread_pct: float,
+    volume_ratio: float,
+) -> dict:
+    """Phase 249: Unified volatility score (0-100) from ATR + spread + volume.
+    
+    All adaptive entry/exit functions use this single score.
+    Lower = calm/liquid (BTC, ETH), Higher = volatile/thin (meme, micro).
+    """
+    safe_atr = max(0.1, float(atr_pct or 1.0))
+    safe_spread = max(0.0, float(spread_pct or 0.0))
+    safe_vol = max(0.1, float(volume_ratio or 1.0))
+    
+    # Normalized components (each 0-1)
+    atr_norm = min(1.0, safe_atr / 8.0)
+    spread_norm = min(1.0, safe_spread / 0.30)
+    vol_norm = max(0.0, min(1.0, (1.5 - safe_vol) / 1.5))
+    
+    # Weighted sum (ATR 50%, spread 30%, volume 20%)
+    raw = atr_norm * 50 + spread_norm * 30 + vol_norm * 20
+    
+    if raw < 25:
+        category = 'CALM'
+    elif raw < 45:
+        category = 'NORMAL'
+    elif raw < 65:
+        category = 'ACTIVE'
+    else:
+        category = 'WILD'
+    
+    return {
+        'score': round(raw, 1),
+        'category': category,
+        'atr_norm': round(atr_norm, 3),
+        'spread_norm': round(spread_norm, 3),
+        'vol_norm': round(vol_norm, 3),
+    }
+
+
+def detect_candle_sr_levels(
+    ohlcv_4h: list,
+    current_price: float,
+    atr: float,
+    lookback: int = 20,
+    cluster_pct: float = 0.3,
+) -> dict:
+    """Phase 249: Detect support/resistance levels from 4H candle closes/highs/lows.
+    
+    Method: Collect close/high/low prices → cluster nearby levels → rank by touches.
+    Returns nearest support (below price) and resistance (above price).
+    """
+    result = {
+        'supports': [],
+        'resistances': [],
+        'nearest_support': None,
+        'nearest_resistance': None,
+    }
+    
+    if not ohlcv_4h or len(ohlcv_4h) < 10 or atr <= 0 or current_price <= 0:
+        return result
+    
+    # Collect price levels from last N candles
+    bars = ohlcv_4h[-lookback:] if len(ohlcv_4h) >= lookback else ohlcv_4h
+    price_levels = []
+    for bar in bars:
+        try:
+            h, l, c = float(bar[2]), float(bar[3]), float(bar[4])
+            price_levels.extend([h, l, c])
+        except (IndexError, TypeError, ValueError):
+            continue
+    
+    if len(price_levels) < 15:
+        return result
+    
+    # Cluster: group prices within cluster_pct% of each other
+    cluster_tolerance = current_price * (cluster_pct / 100.0)
+    price_levels.sort()
+    
+    clusters = []
+    current_cluster = [price_levels[0]]
+    
+    for p in price_levels[1:]:
+        if p - current_cluster[-1] <= cluster_tolerance:
+            current_cluster.append(p)
+        else:
+            if len(current_cluster) >= 2:  # Minimum 2 touches for validity
+                avg_price = sum(current_cluster) / len(current_cluster)
+                clusters.append({
+                    'price': round(avg_price, 8),
+                    'touches': len(current_cluster),
+                })
+            current_cluster = [p]
+    
+    # Don't forget last cluster
+    if len(current_cluster) >= 2:
+        avg_price = sum(current_cluster) / len(current_cluster)
+        clusters.append({
+            'price': round(avg_price, 8),
+            'touches': len(current_cluster),
+        })
+    
+    if not clusters:
+        return result
+    
+    # Compute strength: touches × (1 / (distance/ATR + 0.5))
+    for cl in clusters:
+        dist = abs(cl['price'] - current_price)
+        cl['strength'] = round(cl['touches'] / (dist / atr + 0.5), 2)
+    
+    # Split into supports (below price) and resistances (above price)
+    buffer = atr * 0.1  # Small buffer to avoid exact-price matches
+    supports = [c for c in clusters if c['price'] < current_price - buffer]
+    resistances = [c for c in clusters if c['price'] > current_price + buffer]
+    
+    # Sort by strength (highest first)
+    supports.sort(key=lambda x: x['strength'], reverse=True)
+    resistances.sort(key=lambda x: x['strength'], reverse=True)
+    
+    result['supports'] = supports[:5]
+    result['resistances'] = resistances[:5]
+    
+    # Nearest: closest to current price among strong levels
+    if supports:
+        nearest_sup = max(supports, key=lambda x: x['price'])
+        result['nearest_support'] = nearest_sup['price']
+    if resistances:
+        nearest_res = min(resistances, key=lambda x: x['price'])
+        result['nearest_resistance'] = nearest_res['price']
+    
+    return result
+
+
+def compute_structural_entry_price(
+    atr_entry: float,
+    signal_side: str,
+    price: float,
+    fib_context: dict,
+    sr_levels: dict,
+    composite_vol: dict,
+    atr: float,
+) -> dict:
+    """Phase 249: Optimal entry from pullback + Fibonacci + S/R weighted blend.
+    
+    Pullback (atr_entry) is ALWAYS computed (fallback).
+    Fib and S/R are blended in based on availability and composite_vol category.
+    CALM coins → high structural weight (60%), WILD → low (20%).
+    """
+    # Structural weight based on market quality
+    weight_map = {
+        'CALM': 0.60,
+        'NORMAL': 0.50,
+        'ACTIVE': 0.35,
+        'WILD': 0.20,
+    }
+    structural_weight = weight_map.get(composite_vol.get('category', 'NORMAL'), 0.40)
+    
+    candidates = [{
+        'price': atr_entry,
+        'source': 'pullback',
+        'weight': 1.0 - structural_weight,
+    }]
+    
+    max_deviation = atr * 2.0  # Don't blend if structural level is > 2 ATR away
+    
+    # Fibonacci entry candidate
+    fib_entry = 0
+    if fib_context and fib_context.get('fib_active') and fib_context.get('fib_entry', 0) > 0:
+        fib_entry = fib_context['fib_entry']
+        if abs(fib_entry - atr_entry) <= max_deviation:
+            candidates.append({
+                'price': fib_entry,
+                'source': 'fibonacci',
+                'weight': structural_weight * 0.6,
+            })
+    
+    # S/R entry candidate
+    sr_price = 0
+    if signal_side == 'LONG' and sr_levels.get('nearest_support'):
+        sr_price = sr_levels['nearest_support']
+    elif signal_side == 'SHORT' and sr_levels.get('nearest_resistance'):
+        sr_price = sr_levels['nearest_resistance']
+    
+    if sr_price > 0 and abs(sr_price - atr_entry) <= max_deviation:
+        candidates.append({
+            'price': sr_price,
+            'source': 'sr_level',
+            'weight': structural_weight * 0.4,
+        })
+    
+    # Weighted average
+    total_weight = sum(c['weight'] for c in candidates)
+    if total_weight > 0:
+        optimal_entry = sum(c['price'] * c['weight'] for c in candidates) / total_weight
+    else:
+        optimal_entry = atr_entry
+    
+    method = 'hybrid' if len(candidates) > 1 else 'pullback_only'
+    sources = '+'.join(c['source'] for c in candidates)
+    
+    logger.info(
+        f"📐 STRUCTURAL_ENTRY: {signal_side} atr={atr_entry:.6f} "
+        f"fib={fib_entry:.6f} sr={sr_price:.6f} → optimal={optimal_entry:.6f} "
+        f"method={method} sw={structural_weight:.2f} cat={composite_vol.get('category','?')} "
+        f"sources={sources}"
+    )
+    
+    return {
+        'optimal_entry': optimal_entry,
+        'candidates': candidates,
+        'structural_weight': structural_weight,
+        'method': method,
+    }
+
+
+def compute_structural_trail_stop(
+    base_trail_stop: float,
+    signal_side: str,
+    current_price: float,
+    sr_levels: dict,
+    composite_vol: dict,
+    atr: float,
+) -> dict:
+    """Phase 249: Validate trail stop against structural S/R levels.
+    
+    If a strong S/R level is within 1 ATR of the ATR-based trail stop,
+    move the trail to just beyond the structural level (better protection).
+    WILD category → skip structural adjustment (unreliable S/R).
+    """
+    result = {
+        'trail_stop': base_trail_stop,
+        'adjusted': False,
+        'structural_level': None,
+        'source': 'atr_only',
+    }
+    
+    # Skip for WILD coins — S/R unreliable in thin books
+    if composite_vol.get('category') == 'WILD':
+        return result
+    
+    if not sr_levels or atr <= 0 or base_trail_stop <= 0:
+        return result
+    
+    structural_level = None
+    buffer = atr * 0.15  # Place trail just beyond the structural level
+    
+    if signal_side == 'LONG':
+        # LONG: trail stop is below price → find nearest support near/below trail
+        supports = sr_levels.get('supports', [])
+        for sup in supports:
+            sup_price = sup['price']
+            # Support should be between (trail - 1 ATR) and price
+            if base_trail_stop - atr <= sup_price <= current_price:
+                if sup['touches'] >= 2:  # Minimum 2 touches for credibility
+                    structural_level = sup_price
+                    break
+        
+        if structural_level:
+            new_trail = structural_level - buffer
+            # Only adjust if structural trail is within 1 ATR of ATR-based trail
+            if abs(new_trail - base_trail_stop) <= atr:
+                result['trail_stop'] = new_trail
+                result['adjusted'] = True
+                result['structural_level'] = structural_level
+                result['source'] = 'support_adjusted'
+    
+    elif signal_side == 'SHORT':
+        # SHORT: trail stop is above price → find nearest resistance near/above trail
+        resistances = sr_levels.get('resistances', [])
+        for res in resistances:
+            res_price = res['price']
+            if current_price <= res_price <= base_trail_stop + atr:
+                if res['touches'] >= 2:
+                    structural_level = res_price
+                    break
+        
+        if structural_level:
+            new_trail = structural_level + buffer
+            if abs(new_trail - base_trail_stop) <= atr:
+                result['trail_stop'] = new_trail
+                result['adjusted'] = True
+                result['structural_level'] = structural_level
+                result['source'] = 'resistance_adjusted'
+    
+    if result['adjusted']:
+        logger.info(
+            f"📐 STRUCTURAL_TRAIL: {signal_side} base={base_trail_stop:.6f} "
+            f"→ adjusted={result['trail_stop']:.6f} "
+            f"({result['source']} @ {structural_level:.6f})"
+        )
+    
+    return result
+
+
 # ============================================================================
 # Phase 239V2: Dynamic Minimum Pullback Floor
 # ============================================================================
@@ -19883,29 +20182,48 @@ class SignalGenerator:
             atr_entry = price * (1 + pullback_pct)
         
         # =====================================================================
-        # PHASE FIB: FIBONACCI ENTRY BLEND
-        # Blend ATR-based entry with Fibonacci entry (alpha=0.35)
-        # strong_momentum → bypass (market entry), fib kapalı
-        # deviation > max_dev → fallback to ATR entry
-        # Phase EQG: EQ_STRONG durumunda Fib deviation limiti genişletilir (1.0% → 1.5%)
+        # PHASE 249: HYBRID STRUCTURAL ENTRY/EXIT SYSTEM
+        # Replaces old Fib-only blend with pullback + Fib + S/R weighted blend.
+        # Composite volatility score determines structural weight.
+        # CALM coins = 60% structural, WILD = 20% (fallback to pullback).
         # =====================================================================
-        ideal_entry = atr_entry  # Default: ATR-based entry
+        
+        # 1. Compute composite volatility score
+        atr_pct_for_vol = (atr / price * 100) if price > 0 else 2.0
+        comp_vol = compute_composite_volatility(atr_pct_for_vol, spread_pct, volume_ratio)
+        
+        # 2. Detect S/R from 4H candles (cached in mtf_confirmation)
+        _sr_ohlcv_4h = []
+        try:
+            if 'mtf_confirmation' in globals():
+                _sr_trend_data = mtf_confirmation.coin_trends.get(symbol, {})
+                _sr_ohlcv_4h = _sr_trend_data.get('ohlcv_4h', [])
+        except Exception:
+            pass
+        sr_levels = detect_candle_sr_levels(_sr_ohlcv_4h, price, atr)
+        
+        # 3. Compute structural entry (pullback + fib + S/R hybrid)
+        ideal_entry = atr_entry  # Fallback
         fib_blend_applied = False
-        max_dev = 1.5 if (ENTRY_QUALITY_GATE_ENABLED and eq_pass_count == 3) else FIB_MAX_ENTRY_DEV_PCT
+        structural_result = None
         
-        if not strong_momentum and FIB_ENABLED and FIB_ENTRY_ENABLED and fib_context:
-            fib_entry = fib_context.get('fib_entry', 0)
-            if fib_entry > 0 and fib_context.get('fib_active'):
-                dev_pct = abs(fib_entry - atr_entry) / price * 100 if price > 0 else 999
-                if dev_pct <= max_dev:
-                    alpha = FIB_BLEND_ALPHA
-                    ideal_entry = atr_entry * (1 - alpha) + fib_entry * alpha
-                    fib_blend_applied = True
-                    reasons.append(f"FibBlend(a={alpha})")
-                    logger.info(f"📐 FIB ENTRY: {symbol} {signal_side} atr_entry={atr_entry:.6f} fib_entry={fib_entry:.6f} → blend={ideal_entry:.6f} (dev={dev_pct:.2f}% max={max_dev:.1f}%)")
-                else:
-                    reasons.append(f"FibSkip(too_far,{dev_pct:.1f}%)")
+        if not strong_momentum:
+            structural_result = compute_structural_entry_price(
+                atr_entry=atr_entry,
+                signal_side=signal_side,
+                price=price,
+                fib_context=fib_context if (FIB_ENABLED and FIB_ENTRY_ENABLED) else {},
+                sr_levels=sr_levels,
+                composite_vol=comp_vol,
+                atr=atr,
+            )
+            ideal_entry = structural_result['optimal_entry']
+            if structural_result['method'] == 'hybrid':
+                fib_blend_applied = True
+                sources_str = '+'.join(c['source'] for c in structural_result['candidates'])
+                reasons.append(f"STRUCT({comp_vol['category']},{sources_str})")
         
+        # 4. SL/TP/Trail computed from ideal_entry
         if signal_side == "LONG":
             sl = ideal_entry - (atr * atr_sl * effective_exit_tightness) - spread_buffer
             tp = ideal_entry + (atr * atr_tp * effective_exit_tightness)
@@ -19916,6 +20234,20 @@ class SignalGenerator:
             tp = ideal_entry - (atr * atr_tp * effective_exit_tightness)
             trail_activation = ideal_entry - (trail_act * effective_exit_tightness)
             trail_dist = atr * trail_mult * effective_exit_tightness
+        
+        # 5. Structural trail stop validation (adjust SL if near strong S/R)
+        if sr_levels and (sr_levels.get('nearest_support') or sr_levels.get('nearest_resistance')):
+            struct_trail = compute_structural_trail_stop(
+                base_trail_stop=sl,
+                signal_side=signal_side,
+                current_price=price,
+                sr_levels=sr_levels,
+                composite_vol=comp_vol,
+                atr=atr,
+            )
+            if struct_trail['adjusted']:
+                sl = struct_trail['trail_stop']
+                reasons.append(f"SL_SR({struct_trail['source']})")
         
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
@@ -20033,6 +20365,13 @@ class SignalGenerator:
                 'entryExecScore': exec_quality_score,
                 'entryExecPassed': exec_quality_passed,
                 'entryExecNotes': exec_quality_notes,
+                # Phase 249: Structural entry/exit telemetry
+                'compositeVolScore': comp_vol.get('score', 0),
+                'compositeVolCategory': comp_vol.get('category', 'NORMAL'),
+                'structuralMethod': structural_result.get('method', 'pullback_only') if structural_result else 'pullback_only',
+                'structuralWeight': structural_result.get('structural_weight', 0) if structural_result else 0,
+                'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
+                'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
             }
 
 
