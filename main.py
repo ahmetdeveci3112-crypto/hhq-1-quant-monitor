@@ -18427,7 +18427,7 @@ def calculate_adaptive_threshold(base_threshold: float, atr: float, price: float
 def determine_trend_direction(
     ema_cross: str = 'NEUTRAL',
     macd_histogram: float = 0.0,
-    macd_cross: str = 'NEUTRAL',
+    bb_position: float = 0.0,
     adx: float = 20.0,
     adx_trend: str = 'NEUTRAL',
     coin_daily_trend: str = 'NEUTRAL',
@@ -18452,9 +18452,9 @@ def determine_trend_direction(
     safe_ema_cross = str(ema_cross or '').upper()
     safe_adx_trend = str(adx_trend or '').upper()
     safe_daily_trend = str(coin_daily_trend or '').upper()
-    safe_macd_cross = str(macd_cross or '').upper()
     safe_adx = float(adx) if adx is not None else 20.0
     safe_macd_hist = float(macd_histogram) if macd_histogram is not None else 0.0
+    safe_bb_pos = float(bb_position) if bb_position is not None else 0.0
     
     # Vote 1: EMA 8/21 Crossover (trend direction)
     if safe_ema_cross == 'BULLISH':
@@ -18488,13 +18488,15 @@ def determine_trend_direction(
         bearish_votes += 1
         notes.append('D1↓')
     
-    # Vote 5: MACD Signal Crossover (momentum shift)
-    if safe_macd_cross == 'BULLISH':
+    # Vote 5: Bollinger Band Position (price location — replaces MACD cross for diversity)
+    # bb_position < -0.5 = price near lower band (bullish for MR)
+    # bb_position > 0.5 = price near upper band (bearish for MR)
+    if safe_bb_pos < -0.5:
         bullish_votes += 1
-        notes.append('MACD_X↑')
-    elif safe_macd_cross == 'BEARISH':
+        notes.append('BB↑')
+    elif safe_bb_pos > 0.5:
         bearish_votes += 1
-        notes.append('MACD_X↓')
+        notes.append('BB↓')
     
     # Determine overall direction
     if bullish_votes > bearish_votes:
@@ -18763,7 +18765,7 @@ class SignalGenerator:
         trend_dir = determine_trend_direction(
             ema_cross=_ei.get('ema_cross', 'NEUTRAL'),
             macd_histogram=_ei.get('macd_histogram', 0.0),
-            macd_cross=_ei.get('macd_signal_cross', 'NEUTRAL'),
+            bb_position=_ei.get('bb_position', 0.0),
             adx=adx,
             adx_trend=adx_trend,
             coin_daily_trend=coin_daily_trend,
@@ -18843,22 +18845,9 @@ class SignalGenerator:
             reasons.append(f"S2({strategy_label})")
         
         # =====================================================================
-        # Phase 212: STRONG_TREND_FILTER kaldırıldı (ADX>40)
-        # REGIME_VETO (ADX>30 + Hurst>0.55) aynı işi daha hassas yapıyor.
-        # ADX>40 filtresi hiç tetiklenmiyordu çünkü REGIME_VETO daha önce yakalıyordu.
-        # ADX trend alignment bonusu korundu.
+        # Phase 212/247: ADX_ALIGN bonusu kaldırıldı — PRO_TREND zaten aynı durumu ödüllendiriyor.
+        # Çift bonus engellendi (Clean Code review).
         # =====================================================================
-        if adx > 30 and adx_trend != "NEUTRAL":
-            # ADX trend alignment bonus (sadece yön uyumlu sinyallere)
-            if (adx_trend == "BULLISH" and signal_side == "LONG") or \
-               (adx_trend == "BEARISH" and signal_side == "SHORT"):
-                
-                # Phase 207: Trend Following Ağırlığı Uygula
-                if not router_profile.get('veto_tf', False):
-                    tf_weight = router_profile.get('trend_weight', 1.0)
-                    bonus = int(5 * tf_weight)
-                    score += bonus
-                    reasons.append(f"ADX_ALIGN({adx:.0f})+{bonus}")
         
         # Volume spike warning (for breakout detection)
         if is_volume_spike:
@@ -19360,23 +19349,10 @@ class SignalGenerator:
             logger.debug(f"Regime bias error: {regime_bias_err}")
         
         # =====================================================================
-        # PHASE 156: REGIME-SIGNAL VETO FILTER
-        # Trend rejiminde karşı yönlü mean-reversion sinyallerini veto et
-        # VOLATILE rejimde min_score'u artır
+        # PHASE 156: REGIME_VETO kaldırıldı — Phase 247 TREND_GATE
+        # aynı işi 5-indikatör oylama sistemi ile daha esnek yapıyor.
+        # Çift filtreleme engellendi (Clean Code review).
         # =====================================================================
-        
-        # Veto 1: Coin-level trend regime (ADX + Hurst)
-        # ADX > 30 VE Hurst > 0.55 → güçlü trend, MR sinyali riskli
-        is_coin_trending = adx > 30 and hurst > 0.55
-        
-        if is_coin_trending:
-            # Trend yönüne karşı sinyal = VETO
-            if adx_trend == "BULLISH" and signal_side == "SHORT":
-                logger.info(f"🚫 REGIME_VETO: {symbol} SHORT rejected — coin in BULLISH trend (ADX={adx:.0f}, H={hurst:.2f})")
-                return None
-            elif adx_trend == "BEARISH" and signal_side == "LONG":
-                logger.info(f"🚫 REGIME_VETO: {symbol} LONG rejected — coin in BEARISH trend (ADX={adx:.0f}, H={hurst:.2f})")
-                return None
         
         # Veto 2: Macro VOLATILE rejimde daha yüksek conviction iste
         # Phase 236: blended_dir ile yön-farkında pro-trend belirleme
