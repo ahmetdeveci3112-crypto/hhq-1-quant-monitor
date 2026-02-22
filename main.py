@@ -18926,6 +18926,10 @@ class SignalGenerator:
         """
         now = datetime.now().timestamp()
         
+        # Phase 249 fix: None-safe guards for ADX and coin_daily_trend
+        adx = float(adx or 25.0)
+        coin_daily_trend = coin_daily_trend or 'NEUTRAL'
+        
         # PHASE 102: Debug signal generation attempts (log every 100th)
         if not hasattr(self, '_attempt_count'):
             self._attempt_count = 0
@@ -20305,6 +20309,15 @@ class SignalGenerator:
         )  # Phase 223: label was ATR% but value was spread_pct
         
         # Phase 127: Log successful signal generation for tracing
+        # Phase 249 fix: Re-check score after all penalties
+        # Penalties (EQ soft, exec weak, confirmation) may have dropped score below threshold
+        if score < min_score_required:
+            logger.info(
+                f"❌ SCORE_RECHECK_FAIL: {symbol} {signal_side} score={score} < min={min_score_required} "
+                f"(dropped below threshold after penalties)"
+            )
+            return None
+        
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
         
         return {
