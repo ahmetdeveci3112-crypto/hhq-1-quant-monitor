@@ -15644,9 +15644,11 @@ class TimeBasedPositionManager:
                     atr = pos.get('atr', current_price * 0.02)
                     leverage = pos.get('leverage', 10)
                     
-                    # --- Phase 250: Use locked ladder if available ---
+                    # --- Phase 250/253: Use locked ladder if available ---
                     if pos.get('tp_ladder_levels') and TP_LADDER_ADAPTIVE_ENABLED:
-                        tp_levels = [lv.copy() for lv in pos['tp_ladder_levels']]
+                        # Phase 253: Always derive from anchor (immutable), never from mutable tp_ladder_levels
+                        _anchor_src = pos.get('tp_ladder_anchor_levels', pos.get('tp_ladder_levels', []))
+                        tp_levels = [lv.copy() for lv in _anchor_src]
                         # base_tp_pct from locked telemetry (for log line below)
                         base_tp_pct = pos.get('tp_ladder_telemetry', {}).get('base_tp_pct', 0)
                         
@@ -15674,6 +15676,12 @@ class TimeBasedPositionManager:
                                     lo, hi = lock_clamps.get(lv['key'], (0.85, 1.30))
                                     clamped_mult = max(lo, min(hi, runtime_mult))
                                     lv['pct'] = round(lv['pct'] * clamped_mult, 4)
+                        
+                        # Phase 253: Write effective TP levels to telemetry
+                        _tp_telem = pos.get('tp_ladder_telemetry', {})
+                        _tp_telem['effective_tp_levels'] = [{'key': lv['key'], 'pct': lv['pct']} for lv in tp_levels]
+                        _tp_telem['runtime_mult'] = pos.get('tp_ladder_runtime_mult', 1.0)
+                        pos['tp_ladder_telemetry'] = _tp_telem
                     else:
                         # --- Legacy fallback for old positions ---
                         atr_pct = (atr / current_price * 100) if current_price > 0 else 2.0
@@ -22526,6 +22534,9 @@ class PaperTradingEngine:
                 new_position['tp_ladder_levels'] = _tp_ladder['levels']
                 new_position['tp_ladder_version'] = _tp_ladder['version']
                 new_position['tp_ladder_anchor_entry'] = fill_price
+                # Phase 253: Immutable anchor levels — runtime TP always derived from these
+                import copy
+                new_position['tp_ladder_anchor_levels'] = copy.deepcopy(_tp_ladder['levels'])
                 new_position['tp_ladder_runtime_mult'] = 1.0
                 new_position['tp_ladder_state'] = {}
                 new_position['tp_ladder_telemetry'] = _tp_ladder['telemetry']
