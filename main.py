@@ -16496,27 +16496,33 @@ class BreakevenStopManager:
                 activation_threshold = max(config['floor'], atr_pct * config['atr_mult'])
                 
                 # Phase 182: Minimum hold time guard (30 min)
-                open_time = pos.get('openTime', 0)
+                open_time = int(pos.get('openTime') or 0)
                 if open_time > 0:
                     age_minutes = (datetime.now().timestamp() * 1000 - open_time) / 60000
                 else:
                     age_minutes = 999  # Unknown age, don't block
                 
                 # State key (Phase 261 Hotfix 4: Position Fingerprint)
+                entry_oid = str(pos.get('binance_order_id') or '').strip()
                 legacy_key = f"{symbol}_{side}"
-                state_key = f"{symbol}_{side}_{open_time}"
+                
+                if entry_oid:
+                    state_key = f"{symbol}_{side}_{entry_oid}"
+                elif open_time > 0:
+                    state_key = f"{symbol}_{side}_{open_time}"
+                else:
+                    logger.warning(f"⏩ BREAKEVEN_SKIP_NO_FINGERPRINT: {symbol} {side}")
+                    continue
                 
                 # Check if breakeven already activated for this position
                 state = self.breakeven_state.get(state_key, {})
                 
-                # Phase 261 Hotfix 4: Backwards compatibility migration
+                # Phase 261 Hotfix 4: Purge legacy keys to prevent stale carryovers
                 if not state and legacy_key in self.breakeven_state:
-                    state = self.breakeven_state[legacy_key]
-                    if state:
-                        self.breakeven_state[state_key] = state
-                        del self.breakeven_state[legacy_key]
-                        safe_create_task(sqlite_manager.delete_breakeven_state(legacy_key))
-                        logger.info(f"🔄 Migrated legacy breakeven state {legacy_key} to {state_key}")
+                    logger.warning(f"🧹 LEGACY_BREAKEVEN_PURGED: {legacy_key}")
+                    del self.breakeven_state[legacy_key]
+                    safe_create_task(sqlite_manager.delete_breakeven_state(legacy_key), name=f"purge_legacy_{symbol}")
+                    state = {}  # fresh only
                 
                 if not state.get('active', False):
                     # Phase 221: Phase 220 zaten breakeven set ettiyse atla
@@ -16598,6 +16604,13 @@ class BreakevenStopManager:
 
                     # Phase 179: Breakeven active — monitor limit order status
                     order_id = state.get('order_id')
+                    
+                    if not order_id:
+                        logger.warning(f"🧹 STALE_ACTIVE_BREAKEVEN_PURGED: {state_key} (no order_id)")
+                        if state_key in self.breakeven_state:
+                            del self.breakeven_state[state_key]
+                        safe_create_task(sqlite_manager.delete_breakeven_state(state_key), name=f"purge_stale_active_bk_{symbol}")
+                        continue
                     
                     if order_id:
                         # Check if limit order has been filled
