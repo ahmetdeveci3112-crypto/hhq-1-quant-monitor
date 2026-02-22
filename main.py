@@ -18527,12 +18527,6 @@ def determine_trend_direction(
             notes.append('GATE:NO_SHORT(ADX>25,4+bull)')
     # ADX < 25: Ranging market, both sides allowed (mean reversion territory)
     
-    # Momentum confirmation (anti-falling-knife)
-    # MACD histogram must be turning in signal direction
-    # >= 0 ensures we don't block all trades if MACD defaults to exactly 0.0
-    momentum_confirming_long = safe_macd_hist >= 0
-    momentum_confirming_short = safe_macd_hist <= 0
-    
     return {
         'direction': direction,
         'strength': max(bullish_votes, bearish_votes),
@@ -18540,8 +18534,6 @@ def determine_trend_direction(
         'bearish_votes': bearish_votes,
         'allow_long': allow_long,
         'allow_short': allow_short,
-        'momentum_confirming_long': momentum_confirming_long,
-        'momentum_confirming_short': momentum_confirming_short,
         'notes': notes,
     }
 
@@ -18813,24 +18805,6 @@ class SignalGenerator:
                     f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
                     f"ADX={safe_adx_local:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
                     f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
-                )
-                return None
-            
-            # =====================================================================
-            # Phase 247: ANTI-FALLING-KNIFE — Momentum Doğrulaması
-            # MACD histogram sinyal yönünde olmalı (ADX > 20 ise)
-            # Freqtrade'in "TEMA is rising" korumasının karşılığı
-            # =====================================================================
-            if signal_side == "LONG" and not trend_dir['momentum_confirming_long'] and safe_adx_local > 20:
-                logger.info(
-                    f"🔪 MOMENTUM_GATE: {symbol} LONG engellendi | "
-                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (< 0, momentum dönmedi) ADX={safe_adx_local:.0f}"
-                )
-                return None
-            if signal_side == "SHORT" and not trend_dir['momentum_confirming_short'] and safe_adx_local > 20:
-                logger.info(
-                    f"🔪 MOMENTUM_GATE: {symbol} SHORT engellendi | "
-                    f"MACD hist={_ei.get('macd_histogram', 0):.4f} (> 0, momentum dönmedi) ADX={safe_adx_local:.0f}"
                 )
                 return None
             
