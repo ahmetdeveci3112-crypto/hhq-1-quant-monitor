@@ -291,11 +291,26 @@ class SQLiteManager:
                     activation_price REAL NOT NULL,
                     activation_time TEXT NOT NULL,
                     spread_level TEXT DEFAULT 'Normal',
+                    order_id TEXT,
+                    contracts REAL DEFAULT 0,
+                    open_time INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
             await db.commit()
+            
+            # Phase 261 Hotfix 4: Alter breakeven_states
+            bk_migration_columns = [
+                ('order_id', 'TEXT'),
+                ('contracts', 'REAL DEFAULT 0'),
+                ('open_time', 'INTEGER DEFAULT 0')
+            ]
+            for col_name, col_type in bk_migration_columns:
+                try:
+                    await db.execute(f'ALTER TABLE breakeven_states ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
             
             # Phase 49: Migration - Add new columns to trades table if they don't exist
             try:
@@ -1242,14 +1257,15 @@ class SQLiteManager:
     # ================================================================
     async def save_breakeven_state(self, state_key: str, symbol: str, side: str, 
                                     entry_price: float, activation_price: float,
-                                    activation_time: str, spread_level: str = 'Normal'):
+                                    activation_time: str, spread_level: str = 'Normal',
+                                    order_id: str = None, contracts: float = 0.0, open_time: int = 0):
         """Save breakeven state to SQLite."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
                 INSERT OR REPLACE INTO breakeven_states 
-                (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level))
+                (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level, order_id, contracts, open_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level, order_id, contracts, open_time))
             await db.commit()
         logger.info(f"💾 Breakeven state saved: {state_key}")
     
@@ -1265,19 +1281,40 @@ class SQLiteManager:
         states = {}
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level FROM breakeven_states') as cursor:
+                async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level, order_id, contracts, open_time FROM breakeven_states') as cursor:
                     async for row in cursor:
                         states[row[0]] = {
                             'active': True,
                             'entry_price': row[3],
                             'activation_price': row[4],
                             'activation_time': row[5],
-                            'spread_level': row[6]
+                            'spread_level': row[6] if len(row) > 6 else 'Normal',
+                            'order_id': row[7] if len(row) > 7 else None,
+                            'contracts': row[8] if len(row) > 8 else 0.0,
+                            'open_time': row[9] if len(row) > 9 else 0
                         }
             if states:
                 logger.info(f"📂 Loaded {len(states)} breakeven states from SQLite: {list(states.keys())}")
         except Exception as e:
-            logger.error(f"Failed to load breakeven states: {e}")
+            # Fallback to old schema if new columns aren't there yet
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level FROM breakeven_states') as cursor:
+                        async for row in cursor:
+                            states[row[0]] = {
+                                'active': True,
+                                'entry_price': row[3],
+                                'activation_price': row[4],
+                                'activation_time': row[5],
+                                'spread_level': row[6],
+                                'order_id': None,
+                                'contracts': 0.0,
+                                'open_time': 0
+                            }
+                if states:
+                    logger.info(f"📂 Loaded {len(states)} breakeven states from SQLite (old schema fallback): {list(states.keys())}")
+            except Exception as e2:
+                logger.error(f"Failed to load breakeven states: {e2}")
         return states
 
 # Global SQLite manager
@@ -16465,11 +16502,21 @@ class BreakevenStopManager:
                 else:
                     age_minutes = 999  # Unknown age, don't block
                 
-                # State key
-                state_key = f"{symbol}_{side}"
+                # State key (Phase 261 Hotfix 4: Position Fingerprint)
+                legacy_key = f"{symbol}_{side}"
+                state_key = f"{symbol}_{side}_{open_time}"
                 
                 # Check if breakeven already activated for this position
                 state = self.breakeven_state.get(state_key, {})
+                
+                # Phase 261 Hotfix 4: Backwards compatibility migration
+                if not state and legacy_key in self.breakeven_state:
+                    state = self.breakeven_state[legacy_key]
+                    if state:
+                        self.breakeven_state[state_key] = state
+                        del self.breakeven_state[legacy_key]
+                        safe_create_task(sqlite_manager.delete_breakeven_state(legacy_key))
+                        logger.info(f"🔄 Migrated legacy breakeven state {legacy_key} to {state_key}")
                 
                 if not state.get('active', False):
                     # Phase 221: Phase 220 zaten breakeven set ettiyse atla
@@ -16531,7 +16578,8 @@ class BreakevenStopManager:
                         # Phase 154: Persist to SQLite
                         safe_create_task(sqlite_manager.save_breakeven_state(
                             state_key, symbol, side, entry_price, current_price,
-                            datetime.now().isoformat(), spread_level
+                            datetime.now().isoformat(), spread_level,
+                            order_id, abs(contracts), open_time
                         ), name=f"persist_breakeven_{symbol}")
                         
                         if not limit_result:
