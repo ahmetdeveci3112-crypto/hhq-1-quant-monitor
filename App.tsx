@@ -1313,7 +1313,7 @@ export default function App() {
                     <div className="col-span-2">
                       <div className="text-xs text-slate-500 uppercase">Toplam Kazanç</div>
                       <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({portfolio.balanceUsd > 0 ? ((portfolio.stats.totalPnl / portfolio.balanceUsd) * 100).toFixed(2) : '0.00'}%)
+                        {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({(portfolio.stats.totalPnlPercent || 0).toFixed(2)}%)
                       </div>
                     </div>
                   </>
@@ -1374,7 +1374,7 @@ export default function App() {
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Toplam Kazanç</div>
                         <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({portfolio.balanceUsd > 0 ? ((portfolio.stats.totalPnl / portfolio.balanceUsd) * 100).toFixed(2) : '0.00'}%)
+                          {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({(portfolio.stats.totalPnlPercent || 0).toFixed(2)}%)
                         </div>
                       </div>
                     </div>
