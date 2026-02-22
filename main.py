@@ -24910,6 +24910,53 @@ async def server_ip():
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.get("/api/exit-telemetry")
+async def exit_telemetry():
+    """Phase 255: Exit telemetry dashboard — combined engine/protection/signal stats."""
+    try:
+        now = time.time()
+        
+        # Exit engine stats
+        engine_stats = exit_engine.get_stats() if exit_engine else {}
+        
+        # Protection manager status
+        prot_status = protection_manager.get_status() if protection_manager else {}
+        
+        # Active signals summary
+        signal_summary = {}
+        for sym, sig in active_signals.items():
+            age = now - sig.get('created_ts', now)
+            signal_summary[sym] = {
+                'side': sig.get('side'),
+                'score': sig.get('score', 0),
+                'age_sec': round(age, 0),
+                'state': sig.get('state', 'UNKNOWN'),
+                'reentry_count': sig.get('reentry_count', 0),
+                'counter_count': sig.get('counter_count', 0),
+                'last_close_sec_ago': round(now - sig['last_close_ts'], 0) if sig.get('last_close_ts', 0) > 0 else None,
+            }
+        
+        # Per-reason counters from recent exit log
+        reason_counts = {}
+        for entry in engine_stats.get('recent_exits', []):
+            r = entry.get('reason', 'UNKNOWN')
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        
+        return JSONResponse({
+            'exit_engine': {
+                'total': engine_stats.get('total', 0),
+                'skipped': engine_stats.get('skipped', 0),
+                'upgraded': engine_stats.get('upgraded', 0),
+                'reason_counts': reason_counts,
+            },
+            'protection': prot_status,
+            'active_signals': signal_summary,
+            'signal_count': len(signal_summary),
+            'timestamp': datetime.now().isoformat(),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 # Phase 16: Global Paper Trader for REST API access
 global_paper_trader = PaperTradingEngine()
 
@@ -25023,7 +25070,7 @@ class ExitDecisionEngine:
         return 30  # default low priority
     
     def get_stats(self) -> dict:
-        return {**self._stats, 'pending': list(self._exit_pending.keys())}
+        return {**self._stats, 'pending': list(self._exit_pending.keys()), 'recent_exits': self._exit_log[-20:]}
 
 exit_engine = ExitDecisionEngine(global_paper_trader)
 
