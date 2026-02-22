@@ -2442,6 +2442,73 @@ class LiveBinanceTrader:
             logger.error(f"❌ BREAKEVEN LIMIT ORDER FAILED: {side} {symbol} @ ${price} | Error: {e}")
             return None
     
+    async def set_stop_loss(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
+        """Phase 258: Place a STOP_MARKET order on Binance to set SL for an open position.
+        Cancels any existing SL orders for this symbol first, then places new one.
+        
+        Args:
+            symbol: e.g. 'BTCUSDT'
+            side: 'LONG' or 'SHORT' (the position side, not the order side)
+            amount: contracts to protect
+            stop_price: price at which SL triggers
+        """
+        if not self.enabled or not self.exchange:
+            logger.error("❌ set_stop_loss: LiveBinanceTrader not enabled")
+            return None
+        
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        
+        try:
+            # 1) Cancel existing SL orders for this symbol
+            try:
+                open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
+                for order in open_orders:
+                    order_type = (order.get('type') or '').lower()
+                    if 'stop' in order_type:
+                        await self.exchange.cancel_order(order['id'], ccxt_symbol)
+                        logger.info(f"🗑️ Cancelled old SL order {order['id']} for {symbol}")
+            except Exception as cancel_err:
+                logger.warning(f"⚠️ Could not cancel old SL orders for {symbol}: {cancel_err}")
+            
+            # 2) Snap price to market precision
+            markets = await self.exchange.load_markets()
+            market = markets.get(ccxt_symbol)
+            if market:
+                stop_price = float(self.exchange.price_to_precision(ccxt_symbol, stop_price))
+                amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
+            
+            # 3) Place STOP_MARKET order (reduceOnly)
+            close_side = 'sell' if side == 'LONG' else 'buy'
+            order = await self.exchange.create_order(
+                ccxt_symbol,
+                'STOP_MARKET',
+                close_side,
+                amount,
+                None,  # no limit price for stop market
+                params={
+                    'stopPrice': stop_price,
+                    'reduceOnly': True,
+                    'workingType': 'MARK_PRICE',
+                }
+            )
+            
+            order_id = order.get('id', 'N/A')
+            logger.warning(f"🔒 SET_STOP_LOSS: {side} {symbol} | SL @ ${stop_price} | Amount: {amount} | Order: {order_id}")
+            
+            return {
+                'id': order_id,
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'stopPrice': stop_price,
+                'status': order.get('status', 'open'),
+                'timestamp': int(datetime.now().timestamp() * 1000)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ SET_STOP_LOSS FAILED: {side} {symbol} @ ${stop_price} | Error: {e}")
+            return None
+    
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Phase 179: Cancel an open order."""
         if not self.enabled or not self.exchange:
@@ -15812,16 +15879,19 @@ class TimeBasedPositionManager:
                                         'Extreme': 0.015, 'Ultra': 0.020
                                     }
                                     fee_buffer = fee_buffers.get(spread_level, 0.006)
+                                    # Phase 258: Use ensure_tick_safe_buffer to handle micro-price coins
+                                    _tick = get_tick_size(symbol)
+                                    safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, side)
                                     if side == 'LONG':
-                                        breakeven_sl = entry_price * (1 + fee_buffer)
+                                        breakeven_sl = snap_to_tick(entry_price + safe_delta, _tick, 'up')
                                         if breakeven_sl > pos.get('stopLoss', 0):
                                             pos['stopLoss'] = breakeven_sl
                                     else:  # SHORT
-                                        breakeven_sl = entry_price * (1 - fee_buffer)
+                                        breakeven_sl = snap_to_tick(entry_price - safe_delta, _tick, 'down')
                                         if breakeven_sl < pos.get('stopLoss', float('inf')):
                                             pos['stopLoss'] = breakeven_sl
                                     pos['breakeven_activated'] = True
-                                    logger.warning(f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → breakeven ${breakeven_sl:.6f} (entry+{fee_buffer*100:.1f}%)")
+                                    logger.warning(f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → breakeven ${breakeven_sl:.6f} (delta=${safe_delta:.6f}, tick={_tick})")
                                     
                                     # 3) For LIVE positions: Update SL on Binance
                                     if pos.get('isLive', False):
@@ -16374,14 +16444,34 @@ class BreakevenStopManager:
                         continue
                     
                     if profit_pct >= activation_threshold:
-                        # Phase 182: Calculate limit price with fee buffer
+                        # Phase 258: Calculate limit price with tick-safe buffer + orderbook snap
                         fee_buffer = self.fee_buffers.get(spread_level, 0.0015)
+                        _tick = get_tick_size(symbol)
+                        safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, side)
                         if side == 'LONG':
-                            limit_price = entry_price * (1 + fee_buffer)
+                            limit_price = snap_to_tick(entry_price + safe_delta, _tick, 'up')
                         else:
-                            limit_price = entry_price * (1 - fee_buffer)
+                            limit_price = snap_to_tick(entry_price - safe_delta, _tick, 'down')
                         
-                        logger.warning(f"🔒 BREAKEVEN v2: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold:.2f}% (ATR={atr_pct:.2f}%, floor={config['floor']}%, spread={spread_level}) | Limit @ ${limit_price:.6f} (entry+{fee_buffer*100:.2f}%)")
+                        # P1-2: Try orderbook snap — use best bid/ask if it improves the price
+                        try:
+                            if live_trader and live_trader.exchange:
+                                ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
+                                ob = await live_trader.exchange.fetch_order_book(ccxt_sym, 5)
+                                if side == 'LONG' and ob.get('asks'):
+                                    # For LONG breakeven: sell at ask side, pick first ask >= limit_price
+                                    best_level = next((a[0] for a in ob['asks'] if a[0] >= limit_price), None)
+                                    if best_level and best_level <= limit_price * 1.003:  # max 0.3% deviation
+                                        limit_price = best_level
+                                elif side == 'SHORT' and ob.get('bids'):
+                                    # For SHORT breakeven: buy at bid side, pick first bid <= limit_price
+                                    best_level = next((b[0] for b in ob['bids'] if b[0] <= limit_price), None)
+                                    if best_level and best_level >= limit_price * 0.997:
+                                        limit_price = best_level
+                        except Exception:
+                            pass  # Fallback to tick-snapped price
+                        
+                        logger.warning(f"🔒 BREAKEVEN v2: {symbol} {side} profit={profit_pct:.2f}% >= {activation_threshold:.2f}% (ATR={atr_pct:.2f}%, floor={config['floor']}%, spread={spread_level}) | Limit @ ${limit_price:.6f} (delta=${safe_delta:.6f}, tick={_tick})")
                         
                         # Place limit close order at entry + fee buffer
                         limit_result = await live_trader.close_position_limit(
