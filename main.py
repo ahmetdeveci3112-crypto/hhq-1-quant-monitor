@@ -14260,11 +14260,10 @@ class StrategyRouter:
         if coin_type == "MAJOR":
             if market_regime != "RANGING" and adx > 25:
                 route['recommended_strategy'] = 'trend_following'
-                route['trend_weight'] = 1.3
-                route['mean_reversion_weight'] = 0.4  # Z-Score sinyali çıksa bile zayıflar
+                route['trend_weight'] = 1.2  # Phase 244: 1.3→1.2 (daha yumuşak)
+                route['mean_reversion_weight'] = 0.7  # Phase 244: 0.4→0.7 (sinyal üretimini boğma)
                 route['reason'] = 'Major Coin in Trend (Favoring TF)'
-                if adx > 35:
-                    route['veto_mr'] = True # Çok güçlü trendde Mean Reversion iptal
+                # Phase 244: veto_mr kaldırıldı — sinyal asla tamamen iptal edilmesin
             else:
                 route['recommended_strategy'] = 'mean_reversion'
                 route['trend_weight'] = 0.8
@@ -14275,16 +14274,16 @@ class StrategyRouter:
         elif coin_type == "MEME" or avg_atr > 4.0:
             if adx < 35:
                 route['recommended_strategy'] = 'mean_reversion'
-                route['trend_weight'] = 0.5
-                route['mean_reversion_weight'] = 1.4
+                route['trend_weight'] = 0.6  # Phase 244: 0.5→0.6 (biraz daha alan)
+                route['mean_reversion_weight'] = 1.3  # Phase 244: 1.4→1.3 (biraz daha dengeli)
                 route['reason'] = 'Meme/Volatile in Range (Favoring Contratrend)'
-                route['veto_tf'] = True # Hacimsiz anlarda Trend Following fake atar
+                # Phase 244: veto_tf kaldırıldı — sinyal zayıflasın ama iptal edilmesin
             else:
                 route['recommended_strategy'] = 'momentum_breakout'
-                route['trend_weight'] = 1.5
-                route['mean_reversion_weight'] = 0.2
+                route['trend_weight'] = 1.2  # Phase 244: 1.5→1.2
+                route['mean_reversion_weight'] = 0.5  # Phase 244: 0.2→0.5 (tamamen kapatma)
                 route['reason'] = 'Meme Coin Breakout (High Momentum)'
-                route['veto_mr'] = True # Hacimli patlamada MR iptal
+                # Phase 244: veto_mr kaldırıldı
 
         # KURAL 3: DEFAULT ALTCOIN
         else:
@@ -14611,15 +14610,16 @@ class PositionBasedKillSwitch:
         if leverage <= 0:
             leverage = 10  # Default
         
-        # Factor is exactly 1.0 to enforce strict threshold limits across all leverages
-        factor = 1.0
+        # Phase 244: Restore sqrt-based leverage scaling (was factor=1.0 in Phase 204)
+        # Higher leverage = looser threshold, lower leverage = tighter
+        factor = max(0.8, min(1.5, (leverage / 10.0) ** 0.5))
         
         first_reduction = self.first_reduction_pct * factor
         full_close = self.full_close_pct * factor
         
         # Clamp to reasonable bounds
-        first_reduction = max(-100.0, min(-10.0, first_reduction))
-        full_close = max(-150.0, min(-20.0, full_close))
+        first_reduction = max(-150.0, min(-20.0, first_reduction))
+        full_close = max(-200.0, min(-40.0, full_close))
         
         return (first_reduction, full_close)
 
@@ -20322,20 +20322,21 @@ class PaperTradingEngine:
             btc_1d_trend = btc_trends.get('trend_1d', 'NEUTRAL')
             btc_4h_trend = btc_trends.get('trend_4h', 'NEUTRAL')
             
-            is_btc_bullish = btc_1d_trend in ['BULLISH', 'STRONG_BULLISH'] or btc_4h_trend in ['BULLISH', 'STRONG_BULLISH']
-            is_btc_bearish = btc_1d_trend in ['BEARISH', 'STRONG_BEARISH'] or btc_4h_trend in ['BEARISH', 'STRONG_BEARISH']
+            # Phase 244: Only use 1D trend (4H too short-term, causes premature exits)
+            is_btc_bullish = btc_1d_trend in ['BULLISH', 'STRONG_BULLISH']
+            is_btc_bearish = btc_1d_trend in ['BEARISH', 'STRONG_BEARISH']
             
-            # Counter-trend to BTC Macro: Tighten
+            # Counter-trend to BTC Macro: Tighten (softened from 0.7 to 0.85)
             if side == 'LONG' and is_btc_bearish:
-                effective_et = min(effective_et, base_et * 0.7)  # Tighten by 30% against macro
+                effective_et = min(effective_et, base_et * 0.85)  # Phase 244: 0.7→0.85
             elif side == 'SHORT' and is_btc_bullish:
-                effective_et = min(effective_et, base_et * 0.7)  # Tighten by 30% against macro
+                effective_et = min(effective_et, base_et * 0.85)  # Phase 244: 0.7→0.85
                 
-            # Pro-trend with BTC Macro: Loosen slightly
+            # Pro-trend with BTC Macro: Loosen slightly (softened from 1.25 to 1.15)
             elif side == 'LONG' and is_btc_bullish:
-                effective_et = max(effective_et, base_et * 1.25) # Loosen by 25% with macro
+                effective_et = max(effective_et, base_et * 1.15) # Phase 244: 1.25→1.15
             elif side == 'SHORT' and is_btc_bearish:
-                effective_et = max(effective_et, base_et * 1.25) # Loosen by 25% with macro
+                effective_et = max(effective_et, base_et * 1.15) # Phase 244: 1.25→1.15
                 
         except Exception as e:
             pass # Failsafe
@@ -22817,6 +22818,12 @@ class PaperTradingEngine:
             pnl = (exit_price - pos['entryPrice']) * pos['size']
         else:
             pnl = (pos['entryPrice'] - exit_price) * pos['size']
+        
+        # Phase 244: Deduct estimated round-trip trading fees for accurate PNL reporting
+        # Binance Futures fee ~0.04% per side (0.036% with BNB), round-trip = ~0.08%
+        notional = abs(exit_price * pos['size'])
+        estimated_fee = notional * 0.0008  # 0.08% round-trip
+        pnl -= estimated_fee
         
         # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
         initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))

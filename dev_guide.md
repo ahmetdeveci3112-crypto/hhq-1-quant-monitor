@@ -383,6 +383,8 @@ flyctl deploy
 
 | Tarih | Phase | Açıklama |
 |-------|-------|----------|
+| 2026-02-22 | 244 | PNL Regresyon Düzeltmeleri: Router ağırlıkları yumuşatıldı, BTC Macro ET yumuşatıldı, Kill Switch sqrt factor geri getirildi, fee-adjusted PNL hesaplaması |
+| 2026-02-21 | 243 | Algorithm Audit: Sync ATR, profitable SL, idempotent guard, pnlPercent, list mutation, orphan cleanup, income tuple |
 | 2026-02-21 | 207 | Jesse-Inspired Strategy Router: CoinProfiler'a "MAJOR/MEME" tip sınıflandırması eklendi. Strateji rotalaması için StrategyRouter ile Trend vs. Mean Reversion dinamik ağırlıklandırıldı. |
 | 2026-02-21 | 206 | Freqtrade Trailing Max Drawdown Guard (Kâr Kilidi): Günlük zirve bakiyeden %5 düşüşte tüm işlemleri durdurur. |
 | 2026-02-21 | 205 | pandas-ta entegrasyonu: TTM Squeeze Momentum (+5/-10) ve Choppiness Index (-20/+5) filtreleri eklendi |
@@ -1532,3 +1534,68 @@ Sinyallerin hangi stratejiye (`TREND` vs `MEAN_REVERSION`) ait olduğuna göre O
 - **Mean Reversion (`HYPERPARAMETERS_MR`):** Daha dar SL limitleri, çok kesin Z-Score girişleri ve hızlı Trailing kırılımları hedeflenir.
 
 Optimizer başlatılırken `HHQHyperOptimizer(strategy_mode="TREND")` veya `"MEAN_REVERSION"` parametresi verilerek arama uzayları otomatik değiştirilir ve hedeflenen metrik (Örn; `objective_type='calmar'`) üzerinden PnL serisi test edilir.
+
+---
+
+## Phase 244: PNL Regresyon Düzeltmeleri (2026-02-22)
+
+### Problem
+Phase 204/207 sonrası PNL performansında bozulma tespit edildi. Binance gerçek PnL ile DB'deki hesaplanan PnL arasında ~$4.40 tutarsızlık vardı.
+
+### Düzeltme 1: Strategy Router Ağırlıklarının Yumuşatılması
+
+**Dosya:** `main.py` → `StrategyRouter.route_strategy()`
+
+| Parametre | Eski | Yeni | Neden |
+|-----------|------|------|-------|
+| Major/Trend `trend_weight` | 1.3 | 1.2 | Aşırı TF bias azaltıldı |
+| Major/Trend `mean_reversion_weight` | 0.4 | 0.7 | Base skor 50×0.4=20 çok düşüktü |
+| Major/Trend `veto_mr` | True (ADX>35) | **Kaldırıldı** | Sinyal asla tamamen iptal edilmemeli |
+| Meme/Range `trend_weight` | 0.5 | 0.6 | Biraz daha nefes alanı |
+| Meme/Range `veto_tf` | True | **Kaldırıldı** | Sinyal sadece zayıflasın |
+| Meme/Breakout `trend_weight` | 1.5 | 1.2 | Çok agresif TF kaldırıldı |
+| Meme/Breakout `mean_reversion_weight` | 0.2 | 0.5 | MR tamamen kapatılmasın |
+| Meme/Breakout `veto_mr` | True | **Kaldırıldı** | |
+
+### Düzeltme 2: BTC Macro Exit Tightness Yumuşatması
+
+**Dosya:** `main.py` → `get_effective_exit_tightness()`
+
+| Parametre | Eski | Yeni | Neden |
+|-----------|------|------|-------|
+| Counter-trend çarpanı | ×0.7 | ×0.85 | %30 sıkıştırma çok agresifti |
+| Pro-trend çarpanı | ×1.25 | ×1.15 | %25 gevşeme kayıpları uzatıyordu |
+| Kullanılan trend | 1D + 4H | **Sadece 1D** | 4H çok kısa vadeli, saatlik dalgalanmalar tüm portfolio'yu etkiliyordu |
+
+### Düzeltme 3: Kill Switch Kaldıraç Ölçeklemesi Geri Getirildi
+
+**Dosya:** `main.py` → `PositionBasedKillSwitch.get_dynamic_thresholds()`
+
+```python
+# Eski (Phase 204): factor = 1.0 (tüm kaldıraçlara eşit)
+# Yeni (Phase 244): factor = max(0.8, min(1.5, (leverage / 10.0) ** 0.5))
+```
+
+| Kaldıraç | Eski Factor | Yeni Factor | Etki |
+|----------|------------|------------|------|
+| 5x | 1.0 | 0.8 | Daha sıkı (düşük lev = az risk toleransı) |
+| 10x | 1.0 | 1.0 | Aynı |
+| 20x | 1.0 | 1.41 | Daha geniş (yüksek lev = daha fazla nefes alanı) |
+
+Clamp aralığı da genişletildi: first_reduction [-150, -20], full_close [-200, -40]
+
+### Düzeltme 4: Fee-Adjusted PNL Hesaplaması
+
+**Dosya:** `main.py` → `close_position()`
+
+Önceki PnL hesaplaması trading fee'leri dahil etmiyordu. Bu, DB'deki PnL ile Binance gerçek PnL arasında ~$4.40/gün tutarsızlık yaratıyordu.
+
+```python
+# Eski: pnl = (exit_price - entry_price) * size
+# Yeni: pnl = (exit_price - entry_price) * size - (notional * 0.0008)
+```
+
+- Round-trip fee: %0.08 (giriş %0.04 + çıkış %0.04, BNB indirimi ile %0.036)
+- Tahmini günlük fee etkisi: ~$1.60 (445 trade/gün bazında)
+- Bu düzeltme **sadece raporlamayı** etkiler, trading kararlarını değiştirmez
+
