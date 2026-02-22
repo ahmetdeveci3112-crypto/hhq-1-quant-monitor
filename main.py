@@ -4977,6 +4977,13 @@ FIB_ENTRY_ENABLED = True         # Entry blend layer — ACTIVE
 FIB_BLEND_ALPHA = 0.35           # Blend weight (legacy, used in telemetry output)
 
 # ============================================================================
+# Phase 250: ADAPTIVE TP LADDER — Feature Flags
+# ============================================================================
+TP_LADDER_ADAPTIVE_ENABLED = True      # Master switch for adaptive TP ladder
+TP_LADDER_RUNTIME_ADJUST_ENABLED = True  # Allow small runtime adjustments
+TP_LADDER_VERSION = "v1_adaptive"       # Version tag for telemetry
+
+# ============================================================================
 # ENTRY QUALITY GATE — Feature Flags
 # Phase EQG: Filter out low-volume, weak-momentum entries
 # ============================================================================
@@ -6438,6 +6445,125 @@ def compute_structural_sl(
         )
     
     return result
+
+
+# ============================================================================
+# Phase 250: ADAPTIVE TP LADDER
+# ============================================================================
+
+def compute_adaptive_tp_ladder(
+    side: str,
+    entry_price: float,
+    atr: float,
+    leverage: int = 10,
+    spread_pct: float = 0.05,
+    volume_ratio: float = 1.0,
+    adx: float = 25.0,
+    hurst: float = 0.50,
+    coin_daily_trend: str = 'NEUTRAL',
+    exec_score: float = 70.0,
+    confidence_score: float = 75.0,
+    spread_level: str = 'Normal',
+) -> dict:
+    """Phase 250: Compute adaptive 3-tier TP ladder.
+    
+    Base formula: atr_pct * spread_mult → tp1/tp2/tp3 with ROI floors.
+    Close ratios adapt: low quality → 50/30/20, strong trend → 30/30/40.
+    Cost floor: each TP >= N× estimated trade cost.
+    
+    Returns:
+        {
+            'levels': [{'key': 'tp1', 'pct': float, 'close_pct': float}, ...],
+            'version': str,
+            'telemetry': {...}
+        }
+    """
+    safe_entry = max(0.0001, float(entry_price or 1.0))
+    safe_atr = max(safe_entry * 0.005, float(atr or safe_entry * 0.02))
+    safe_lev = max(1, int(leverage or 10))
+    safe_adx = float(adx or 25.0)
+    safe_hurst = float(hurst or 0.50)
+    safe_exec = float(exec_score or 70.0)
+    safe_vol_ratio = float(volume_ratio or 1.0)
+    
+    # ATR as percentage of price
+    atr_pct = safe_atr / safe_entry * 100
+    
+    # Spread multiplier (reuse existing table)
+    spread_mults = {
+        'Very Low': 0.5, 'Low': 0.75, 'Normal': 1.0,
+        'High': 1.5, 'Very High': 2.5, 'Extreme': 3.5, 'Ultra': 5.0,
+    }
+    s_mult = spread_mults.get(spread_level, 1.0)
+    
+    # Base TP percentage
+    base_tp_pct = atr_pct * s_mult
+    
+    # ── TP levels with leverage-normalized ROI floors ──
+    tp1_pct = max(base_tp_pct * 1.0, 8.0 / safe_lev)    # ~8% ROI minimum
+    tp2_pct = max(base_tp_pct * 2.0, 20.0 / safe_lev)   # ~20% ROI minimum
+    tp3_pct = max(base_tp_pct * 3.5, 40.0 / safe_lev)   # ~40% ROI minimum
+    
+    # ── Cost floor ──
+    # Estimate: 2× taker fee (0.04%) + spread → minimum profitable move
+    est_cost_pct = (0.04 * 2) + float(spread_pct or 0.05)
+    tp1_pct = max(tp1_pct, est_cost_pct * 2.0)   # TP1 >= 2× cost
+    tp2_pct = max(tp2_pct, est_cost_pct * 3.0)   # TP2 >= 3× cost
+    tp3_pct = max(tp3_pct, est_cost_pct * 4.0)   # TP3 >= 4× cost
+    
+    # Ensure ordering: tp1 < tp2 < tp3
+    tp2_pct = max(tp2_pct, tp1_pct * 1.3)
+    tp3_pct = max(tp3_pct, tp2_pct * 1.3)
+    
+    # ── Adaptive close ratios ──
+    # Default: 40/30/30
+    close1, close2, close3 = 0.40, 0.30, 0.30
+    
+    # Check trend alignment
+    trend_aligned = (
+        (side == 'LONG' and coin_daily_trend in ('BULLISH', 'STRONG_BULLISH')) or
+        (side == 'SHORT' and coin_daily_trend in ('BEARISH', 'STRONG_BEARISH'))
+    )
+    
+    # Low quality → close more early (50/30/20)
+    if safe_exec < 60 or safe_vol_ratio < 0.9:
+        close1, close2, close3 = 0.50, 0.30, 0.20
+    # Strong aligned trend → hold more for TP3 (30/30/40)
+    elif safe_adx > 30 and trend_aligned:
+        close1, close2, close3 = 0.30, 0.30, 0.40
+    
+    # Assert sum = 1.0
+    total = close1 + close2 + close3
+    close1, close2, close3 = close1/total, close2/total, close3/total
+    
+    levels = [
+        {'key': 'tp1', 'pct': round(tp1_pct, 4), 'close_pct': round(close1, 2)},
+        {'key': 'tp2', 'pct': round(tp2_pct, 4), 'close_pct': round(close2, 2)},
+        {'key': 'tp3', 'pct': round(tp3_pct, 4), 'close_pct': round(close3, 2)},
+    ]
+    
+    telemetry = {
+        'atr_pct': round(atr_pct, 3),
+        'spread_mult': s_mult,
+        'base_tp_pct': round(base_tp_pct, 3),
+        'cost_floor_pct': round(est_cost_pct, 4),
+        'close_split': f"{close1:.0%}/{close2:.0%}/{close3:.0%}",
+        'trend_aligned': trend_aligned,
+        'exec_score': safe_exec,
+    }
+    
+    logger.info(
+        f"📊 TP_LADDER_INIT: {side} entry={safe_entry:.4f} "
+        f"tp1={tp1_pct:.3f}%({close1:.0%}) tp2={tp2_pct:.3f}%({close2:.0%}) "
+        f"tp3={tp3_pct:.3f}%({close3:.0%}) "
+        f"base={base_tp_pct:.3f}% cost_floor={est_cost_pct:.4f}%"
+    )
+    
+    return {
+        'levels': levels,
+        'version': TP_LADDER_VERSION,
+        'telemetry': telemetry,
+    }
 
 
 # ============================================================================
@@ -15352,46 +15478,61 @@ class TimeBasedPositionManager:
                     logger.info(f"📊 POS_DEBUG: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} entry={entry_price:.4f} curr={current_price:.4f}")
                 
                 # ===============================================
-                # PHASE 137: DYNAMIC PARTIAL TAKE PROFIT
-                # Spread ve volatiliteye göre dinamik TP seviyeleri
+                # PHASE 250: ADAPTIVE PARTIAL TAKE PROFIT
+                # Uses locked TP ladder from position (computed at fill)
+                # Legacy fallback for old positions without tp_ladder_levels
                 # ===============================================
                 if unrealized_pnl > 0 and contracts > 0:
-                    # Get spread level and ATR for dynamic TP calculation
-                    spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223: was only 'spread_level'
+                    # Get spread level and ATR for TP calculation
+                    spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))
                     atr = pos.get('atr', current_price * 0.02)
-                    
-                    # ATR as percentage of price
-                    atr_pct = (atr / current_price * 100) if current_price > 0 else 2.0
-                    
-                    # Spread multipliers for TP levels
-                    spread_mults = {
-                        'Very Low': 0.5,   # BTC/ETH - tighter TPs
-                        'Low': 0.75,
-                        'Normal': 1.0,
-                        'High': 1.5,
-                        'Very High': 2.5,  # Meme coins - wider TPs
-                        'Extreme': 3.5,    # Hyper-volatile
-                        'Ultra': 5.0       # Extreme edge cases
-                    }
-                    mult = spread_mults.get(spread_level, 1.0)
-                    
-                    # Dynamic base for TP levels: ATR_pct * multiplier
-                    base_tp_pct = atr_pct * mult
-                    
-                    # Phase 224C2: Leverage-normalized TP levels
-                    # TP hedefleri margin-based ROI olarak tanımlanır
                     leverage = pos.get('leverage', 10)
                     
-                    # ROI-based TP targets (margin üzerinden)
-                    tp1_price_pct = max(base_tp_pct * 1.0, 8.0 / leverage)   # ~8% ROI
-                    tp2_price_pct = max(base_tp_pct * 2.0, 20.0 / leverage)  # ~20% ROI
-                    tp3_price_pct = max(base_tp_pct * 3.5, 40.0 / leverage)  # ~40% ROI
-                    
-                    tp_levels = [
-                        {'pct': tp1_price_pct, 'close_pct': 0.40, 'key': 'tp1'},
-                        {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
-                        {'pct': tp3_price_pct, 'close_pct': 0.30, 'key': 'tp3'},
-                    ]
+                    # --- Phase 250: Use locked ladder if available ---
+                    if pos.get('tp_ladder_levels') and TP_LADDER_ADAPTIVE_ENABLED:
+                        tp_levels = [lv.copy() for lv in pos['tp_ladder_levels']]
+                        
+                        # Runtime adaptation: small multiplier for unhit levels
+                        if TP_LADDER_RUNTIME_ADJUST_ENABLED:
+                            runtime_mult = pos.get('tp_ladder_runtime_mult', 1.0)
+                            partial_tp_state = pos.get('partial_tp_state', {})
+                            
+                            # Adjust runtime_mult based on conditions (max 5% per cycle)
+                            _vol_pct = pos.get('volatility_pct', 2.0)
+                            if _vol_pct > 4.0:
+                                # High vol → pull TPs closer (protect gains)
+                                runtime_mult = max(0.85, runtime_mult - 0.03)
+                            elif _vol_pct < 1.0:
+                                # Low vol + no TP3 hit → let runners run
+                                if not partial_tp_state.get('tp3'):
+                                    runtime_mult = min(1.20, runtime_mult + 0.02)
+                            
+                            pos['tp_ladder_runtime_mult'] = runtime_mult
+                            
+                            # Apply runtime_mult to unhit levels with clamps
+                            lock_clamps = {'tp1': (0.85, 1.10), 'tp2': (0.85, 1.20), 'tp3': (0.85, 1.30)}
+                            for lv in tp_levels:
+                                if not partial_tp_state.get(lv['key']):
+                                    lo, hi = lock_clamps.get(lv['key'], (0.85, 1.30))
+                                    clamped_mult = max(lo, min(hi, runtime_mult))
+                                    lv['pct'] = round(lv['pct'] * clamped_mult, 4)
+                    else:
+                        # --- Legacy fallback for old positions ---
+                        atr_pct = (atr / current_price * 100) if current_price > 0 else 2.0
+                        spread_mults = {
+                            'Very Low': 0.5, 'Low': 0.75, 'Normal': 1.0,
+                            'High': 1.5, 'Very High': 2.5, 'Extreme': 3.5, 'Ultra': 5.0,
+                        }
+                        mult = spread_mults.get(spread_level, 1.0)
+                        base_tp_pct = atr_pct * mult
+                        tp1_price_pct = max(base_tp_pct * 1.0, 8.0 / leverage)
+                        tp2_price_pct = max(base_tp_pct * 2.0, 20.0 / leverage)
+                        tp3_price_pct = max(base_tp_pct * 3.5, 40.0 / leverage)
+                        tp_levels = [
+                            {'pct': tp1_price_pct, 'close_pct': 0.40, 'key': 'tp1'},
+                            {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
+                            {'pct': tp3_price_pct, 'close_pct': 0.30, 'key': 'tp3'},
+                        ]
                     
                     # Current profit percentage
                     if entry_price > 0:
@@ -22208,6 +22349,31 @@ class PaperTradingEngine:
             "leverageCapReason": order.get('leverageCapReason', ''),
         }
         
+        # Phase 250: Compute adaptive TP ladder at fill time and lock to position
+        if TP_LADDER_ADAPTIVE_ENABLED:
+            try:
+                _tp_ladder = compute_adaptive_tp_ladder(
+                    side=side,
+                    entry_price=fill_price,
+                    atr=atr,
+                    leverage=order['leverage'],
+                    spread_pct=order.get('spreadPct', 0.05),
+                    volume_ratio=order.get('volumeRatio', 1.0),
+                    adx=order.get('adx', 25.0),
+                    hurst=order.get('hurst', 0.50),
+                    coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                    exec_score=order.get('entryExecScore', 70.0),
+                    confidence_score=order.get('signalScore', 75.0),
+                    spread_level=order.get('spreadLevel', 'Normal'),
+                )
+                new_position['tp_ladder_levels'] = _tp_ladder['levels']
+                new_position['tp_ladder_version'] = _tp_ladder['version']
+                new_position['tp_ladder_anchor_entry'] = fill_price
+                new_position['tp_ladder_runtime_mult'] = 1.0
+                new_position['tp_ladder_state'] = {}
+                new_position['tp_ladder_telemetry'] = _tp_ladder['telemetry']
+            except Exception as tp_err:
+                logger.warning(f"⚠️ TP_LADDER compute error: {tp_err}, will use legacy")
         # =====================================================================
         # LIVE TRADING: Send order to Binance before creating local position
         # Phase 186: Limit entry + pre-trade spread filter
