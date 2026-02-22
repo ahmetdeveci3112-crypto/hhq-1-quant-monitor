@@ -953,6 +953,11 @@ export default function App() {
               setOpportunities(data.opportunities);
             }
 
+            // Phase 259: Update persistent signals array
+            if (data.persistentActiveSignals) {
+              setPersistentSignals(data.persistentActiveSignals);
+            }
+
             // Update scanner stats
             if (data.stats) {
               setScannerStats(data.stats);
@@ -1758,7 +1763,8 @@ export default function App() {
           activeTab === 'signals' && (
             <div className="grid grid-cols-1 gap-4">
               <ActiveSignalsPanel
-                signals={opportunities}
+                signals={true /* USE_PERSISTENT_SIGNALS_UI */ ? (persistentSignals || []) : opportunities}
+                opportunities={opportunities} /* Pass opportunities for real-time telemetry merge */
                 onMarketOrder={handleMarketOrder}
                 entryTightness={settings.entryTightness}
                 minConfidenceScore={settings.minConfidenceScore || 40}
