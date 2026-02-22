@@ -37,3 +37,4 @@ venv/
 # Project Specific
 verify_*.py
 main_v2.py
+*.db

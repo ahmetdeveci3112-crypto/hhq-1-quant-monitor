@@ -3555,15 +3555,16 @@ async def binance_position_sync_loop():
                                         pos_open = pos.get('openTime', 0)
                                         if pos_symbol == inc_symbol and inc_time > pos_open:
                                             # Track which funding IDs we've already counted
-                                            counted_ids = pos.get('_funding_ids', set())
+                                            counted_ids = set(pos.get('_funding_ids', []))  # Phase 246: list→set for dedup
                                             funding_id = f"{inc_symbol}_{inc_time}"
                                             if funding_id not in counted_ids:
                                                 counted_ids.add(funding_id)
-                                                pos['_funding_ids'] = counted_ids
+                                                pos['_funding_ids'] = list(counted_ids)  # Phase 246: set→list for JSON safety
                                                 old_funding = pos.get('accumulated_funding', 0)
                                                 pos['accumulated_funding'] = old_funding + inc_amount
                                                 if abs(inc_amount) > 0.001:
                                                     logger.debug(f"💰 FUNDING: {pos_symbol} +${inc_amount:+.4f} (total: ${pos.get('accumulated_funding', 0):+.4f})")
+                                            break  # Phase 246: Only assign to first (oldest) matching position
                             except Exception as fund_err:
                                 logger.debug(f"Funding fee fetch error: {fund_err}")
                 except Exception as fund_outer_err:
@@ -22325,6 +22326,7 @@ class PaperTradingEngine:
         if getattr(self, 'daily_peak_date', '') != today_date:
             self.daily_peak_date = today_date
             self.daily_peak_equity = self.balance
+            self._trailing_dd_locked_today = False  # Phase 246: Yeni gün = temiz slate
             
         total_unrealized = sum(p.get('unrealizedPnl', 0) for p in self.positions)
         current_equity = self.balance + total_unrealized
@@ -23063,7 +23065,8 @@ class PaperTradingEngine:
             "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
             "symbol": pos.get('symbol', 'UNKNOWN'),
             "side": pos.get('side', 'LONG'),
-            "entryPrice": pos.get('entryPrice', 0),
+            "entryPrice": effective_entry,  # Phase 246: PNL ile aynı entry (fill price if live)
+            "originalEntryPrice": pos.get('entryPrice', 0),  # Sinyal entry referans
             "exitPrice": exit_price,
             "size": pos.get('size', 0),
             "sizeUsd": pos.get('sizeUsd', 0),

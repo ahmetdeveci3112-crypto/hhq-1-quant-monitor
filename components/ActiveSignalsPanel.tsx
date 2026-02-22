@@ -252,10 +252,10 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
     }
 
     // Phase 208: SMC Order Block / FVG Zone badge (from reason parsing)
-    if (signal.reason && (signal.reason.includes('OB:') || signal.reason.includes('FVG:'))) {
+    if (signal.reason && (signal.reason.includes('OB') || signal.reason.includes('FVG'))) {
         badges.push(
             <span key="smc" className="text-[9px] px-1 py-0.5 rounded font-bold bg-blue-500/20 text-blue-400"
-                title={withDetails(`SMC: ${signal.reason.includes('OB:') ? 'Order Block' : 'Fair Value Gap'} Bölgesi`)}>
+                title={withDetails(`SMC: ${signal.reason.includes('OB') ? 'Order Block' : 'Fair Value Gap'} Bölgesi`)}>
                 🧱SMC
             </span>
         );
@@ -306,7 +306,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
         let bgClass = "bg-cyan-500/15 text-cyan-300"; // default
 
         if (strat.includes('TREND')) bgClass = "bg-emerald-500/20 text-emerald-300 border border-emerald-500/20";
-        if (strat.includes('MEAN_REOVERSION') || strat.includes('RSI')) bgClass = "bg-amber-500/20 text-amber-300 border border-amber-500/20";
+        if (strat.includes('MEAN_REVERSION') || strat.includes('MEAN_REOVERSION') || strat.includes('RSI')) bgClass = "bg-amber-500/20 text-amber-300 border border-amber-500/20";
 
         badges.push(
             <span
