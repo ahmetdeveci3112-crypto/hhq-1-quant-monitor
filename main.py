@@ -18934,35 +18934,13 @@ class SignalGenerator:
             vwap_aligned = True
             reasons.append(f"VWAP({vwap_zscore:.1f})")
             
-        # Layer 4: Coin Daily Trend (Max 15 pts)
-        # Phase 152: COIN-ONLY — BTC kontrolü should_allow_signal'da yapılıyor (çifte filtre fixlendi)
-        # Sadece coin'in kendi daily trend'ine göre skor
-        mtf_score = 0
-        if signal_side == "LONG":
-            if coin_daily_trend == "STRONG_BULLISH":
-                mtf_score = 15
-            elif coin_daily_trend == "BULLISH":
-                mtf_score = 10
-            elif coin_daily_trend == "NEUTRAL":
-                mtf_score = 0
-            elif coin_daily_trend == "BEARISH":
-                mtf_score = -10
-            elif coin_daily_trend == "STRONG_BEARISH":
-                mtf_score = -20  # Güçlü penalty ama VETO değil
-        else: # SHORT
-            if coin_daily_trend == "STRONG_BEARISH":
-                mtf_score = 15
-            elif coin_daily_trend == "BEARISH":
-                mtf_score = 10
-            elif coin_daily_trend == "NEUTRAL":
-                mtf_score = 0
-            elif coin_daily_trend == "BULLISH":
-                mtf_score = -10
-            elif coin_daily_trend == "STRONG_BULLISH":
-                mtf_score = -20  # Güçlü penalty ama VETO değil
-            
-        score += mtf_score
-        reasons.append(f"COIN_TREND({coin_daily_trend}={mtf_score})")
+        # Layer 4: Coin Daily Trend — REMOVED from scoring (Phase 247 fix)
+        # coin_daily_trend artık 2 yerde aktif:
+        #   1. Phase 247 TREND_GATE: yön kapısında oy veriyor
+        #   2. Phase 236 REGIME_BLEND: skor bias'ı veriyor
+        # Layer 4 kaldırıldı çünkü 3. kez skorlamak -25 to -45 haksız penalty yaratıyordu.
+        # Observability: sadece log, skor etkisi yok
+        reasons.append(f"D1({coin_daily_trend})")
         
         # Layer 5: Liquidation Cascade (Bonus) - Max 15 pts
         # Uses real-time liquidation stream from Binance
