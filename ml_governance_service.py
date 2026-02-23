@@ -51,6 +51,48 @@ class MLGovernanceService:
             f"auto_rollback={'✅' if self.auto_rollback else '❌'})"
         )
 
+    async def hydrate_registry(self):
+        """Reload registry from DB on startup so rollback/promote work after restart."""
+        if not self._sqlite or not self.enabled:
+            return 0
+        try:
+            import aiosqlite
+            count = 0
+            async with aiosqlite.connect(self._sqlite.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT model_key, version, role, status, created_ts, metric_json, artifact_path, promoted_from, notes "
+                    "FROM ml_model_registry WHERE status IN ('active', 'retired') ORDER BY created_ts ASC"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        mk = row['model_key']
+                        entry = {
+                            'model_key': mk,
+                            'version': row['version'],
+                            'role': row['role'],
+                            'status': row['status'],
+                            'created_ts': row['created_ts'],
+                            'metrics': json.loads(row['metric_json'] or '{}'),
+                            'artifact_path': row['artifact_path'] or '',
+                            'promoted_from': row['promoted_from'] or '',
+                            'notes': row['notes'] or '',
+                        }
+                        if mk not in self._registry:
+                            self._registry[mk] = {'champion': None, 'challenger': None, 'history': []}
+                        reg = self._registry[mk]
+                        reg['history'].append(entry)
+                        if entry['role'] == 'champion' and entry['status'] == 'active':
+                            reg['champion'] = entry
+                        elif entry['role'] == 'challenger' and entry['status'] == 'active':
+                            reg['challenger'] = entry
+                        count += 1
+            logger.info(f"ML Governance: hydrated {count} registry entries from DB ({list(self._registry.keys())})")
+            return count
+        except Exception as e:
+            logger.warning(f"ML Governance hydrate error: {e}")
+            return 0
+
     # ------------------------------------------------------------------
     # Registry management
     # ------------------------------------------------------------------

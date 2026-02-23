@@ -4248,6 +4248,14 @@ async def lifespan(app: FastAPI):
         safe_create_task(_entry_forecast_retrain_loop(), name="entry_forecast_retrain")
         logger.info(f"🔮 Phase 266: Entry forecast retrain loop started (every {ENTRY_FORECAST_RETRAIN_EVERY_SEC}s, min {ENTRY_FORECAST_RETRAIN_MIN_SAMPLES} samples)")
     
+    # Phase 267B: Hydrate ML Governance registry from DB on startup
+    if ml_governance_service and ml_governance_service.enabled:
+        try:
+            hydrated = await ml_governance_service.hydrate_registry()
+            logger.info(f"🏆 ML Governance: hydrated {hydrated} entries from DB")
+        except Exception as _h_err:
+            logger.warning(f"ML Governance hydrate failed: {_h_err}")
+
     # Phase 267B: Background ML Governance rollback check loop
     async def _ml_governance_rollback_loop():
         """Periodically check champion model health and trigger rollback if degraded."""
@@ -4266,19 +4274,29 @@ async def lifespan(app: FastAPI):
                 wins = sum(1 for t in recent_trades if (t.get('pnl') or 0) > 0)
                 total = len(recent_trades)
                 win_rate = wins / total if total > 0 else 0
-                total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
-                avg_pnl_pct = total_pnl / total if total > 0 else 0
+                total_pnl_usdt = sum(t.get('pnl', 0) for t in recent_trades)
+                total_margin = sum(t.get('margin', t.get('sizeUsd', 100)) for t in recent_trades)
+                # P1 fix: drawdown as percentage of total margin (matches drawdown_guard_pct semantics)
+                pnl_pct = (total_pnl_usdt / max(total_margin, 1)) * 100
                 
-                recent_metrics = {
-                    'brier': 1.0 - win_rate,  # proxy: lower = better
-                    'pnl': avg_pnl_pct * 100,  # as percentage
-                    'win_rate': win_rate,
-                    'sample_count': total,
-                }
-                
-                # Check each model key
+                # Check each model key with model-specific brier comparison
                 for model_key in list(ml_governance_service._registry.keys()):
-                    check = ml_governance_service.check_rollback(model_key, recent_metrics)
+                    champion = ml_governance_service.get_champion(model_key)
+                    if not champion:
+                        continue
+                    
+                    # P1 fix: compute brier delta relative to THIS model's training brier
+                    train_brier = champion.get('metrics', {}).get('brier', 0.5)
+                    recent_brier = 1.0 - win_rate  # proxy
+                    
+                    model_metrics = {
+                        'brier': recent_brier,
+                        'pnl': pnl_pct,  # now proper percentage of margin
+                        'win_rate': win_rate,
+                        'sample_count': total,
+                    }
+                    
+                    check = ml_governance_service.check_rollback(model_key, model_metrics)
                     if check.get('should_rollback'):
                         _result = ml_governance_service.rollback(model_key, notes=check.get('reason', ''))
                         logger.warning(f"🔄 ML_AUTO_ROLLBACK: {model_key} → {_result}")
@@ -20021,6 +20039,9 @@ except Exception as _mgs_err:
     logger.warning(f"MLGovernanceService import failed: {_mgs_err}")
     ml_governance_service = None
 
+# Phase 267B: Hydrate ML Governance registry from DB (deferred to lifespan for async)
+_ml_governance_needs_hydrate = True  # Flag for lifespan startup
+
 # Phase 267C: PnL Attribution Service
 try:
     from pnl_attribution_service import PnLAttributionService
@@ -28155,7 +28176,7 @@ async def phase193_entry_forecast_retrain():
         # Phase 267B: Register with ML Governance
         if ml_governance_service and ml_governance_service.enabled:
             try:
-                ml_governance_service.register_model(
+                _reg = ml_governance_service.register_model(
                     model_key='entry_forecast',
                     version=result.get('model_version', f"ef-{int(time.time())}"),
                     metrics={
@@ -28166,6 +28187,11 @@ async def phase193_entry_forecast_retrain():
                         'sample_count': result.get('sample_count', len(rows)),
                     }
                 )
+                # P3 fix: Auto-promote check for manual retrain
+                if _reg.get('role') == 'challenger':
+                    _promo = ml_governance_service.check_promotion('entry_forecast')
+                    if _promo.get('should_promote'):
+                        ml_governance_service.promote('entry_forecast', notes=_promo.get('reason', ''))
             except Exception:
                 pass
     
