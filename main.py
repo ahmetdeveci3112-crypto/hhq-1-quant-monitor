@@ -403,6 +403,53 @@ class SQLiteManager:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_efe_symbol_created ON entry_forecast_events(symbol, created_ts)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_efe_outcome ON entry_forecast_events(outcome_label, outcome_ts)')
 
+            # Phase 267B: ML Governance tables
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_model_registry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_key TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'shadow',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_ts INTEGER NOT NULL,
+                    metric_json TEXT DEFAULT '{}',
+                    artifact_path TEXT,
+                    promoted_from TEXT,
+                    notes TEXT
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_mlreg_key_role ON ml_model_registry(model_key, role)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_mlreg_status ON ml_model_registry(status)')
+            await db.executescript('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_mlreg_key_version ON ml_model_registry(model_key, version);
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_model_eval_windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_key TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    window_start INTEGER,
+                    window_end INTEGER,
+                    samples INTEGER DEFAULT 0,
+                    pnl REAL DEFAULT 0,
+                    winrate REAL DEFAULT 0,
+                    f1 REAL DEFAULT 0,
+                    brier REAL DEFAULT 0,
+                    uplift_vs_champion REAL DEFAULT 0
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_mleval_key_ver ON ml_model_eval_windows(model_key, version)')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_model_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    model_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT DEFAULT '{}'
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_mlevt_key_ts ON ml_model_events(model_key, ts DESC)')
+
             await db.commit()
             # Phase 261 Hotfix 4: Alter breakeven_states
             bk_migration_columns = [
@@ -1767,6 +1814,60 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Failed to get latest entry forecast model run: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Phase 267B: ML Governance persistence
+    # ------------------------------------------------------------------
+    async def save_ml_governance_registry(self, entry: dict):
+        """Persist ML model registry entry."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    INSERT OR REPLACE INTO ml_model_registry
+                    (model_key, version, role, status, created_ts, metric_json, artifact_path, promoted_from, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    entry.get('model_key', ''), entry.get('version', ''),
+                    entry.get('role', 'shadow'), entry.get('status', 'active'),
+                    entry.get('created_ts', int(time.time())),
+                    json.dumps(entry.get('metrics', {})),
+                    entry.get('artifact_path', ''), entry.get('promoted_from', ''),
+                    entry.get('notes', ''),
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"ML governance registry save error: {e}")
+
+    async def save_ml_governance_eval_window(self, entry: dict):
+        """Persist ML model evaluation window."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    INSERT INTO ml_model_eval_windows
+                    (model_key, version, window_start, window_end, samples, pnl, winrate, f1, brier, uplift_vs_champion)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    entry.get('model_key', ''), entry.get('version', ''),
+                    entry.get('window_start', 0), entry.get('window_end', 0),
+                    entry.get('samples', 0), entry.get('pnl', 0),
+                    entry.get('winrate', 0), entry.get('f1', 0),
+                    entry.get('brier', 0), entry.get('uplift_vs_champion', 0),
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"ML governance eval window save error: {e}")
+
+    async def save_ml_governance_event(self, ts: int, model_key: str, event_type: str, payload: dict):
+        """Persist ML governance event."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    INSERT INTO ml_model_events (ts, model_key, event_type, payload_json)
+                    VALUES (?, ?, ?, ?)
+                ''', (ts, model_key, event_type, json.dumps(payload)))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"ML governance event save error: {e}")
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -19808,6 +19909,14 @@ except Exception as _prs_err:
     logger.warning(f"PortfolioRiskService import failed: {_prs_err}")
     portfolio_risk_service = None
 
+# Phase 267B: ML Governance Service
+try:
+    from ml_governance_service import MLGovernanceService
+    ml_governance_service = MLGovernanceService(sqlite_manager=sqlite_manager)
+except Exception as _mgs_err:
+    logger.warning(f"MLGovernanceService import failed: {_mgs_err}")
+    ml_governance_service = None
+
 class ExitForecastModel:
     """Predicts likelihood to hold vs aggressive exit."""
     def __init__(self):
@@ -27804,6 +27913,7 @@ async def phase193_status():
         },
         "entry_forecast": _build_entry_forecast_telemetry(),
         "risk": portfolio_risk_service.get_status() if portfolio_risk_service else {'enabled': False},
+        "ml_governance": ml_governance_service.get_status() if ml_governance_service else {'enabled': False},
         "param_limits": PARAM_LIMITS
     })
 
@@ -27931,6 +28041,54 @@ async def api_risk_telemetry():
     return JSONResponse(portfolio_risk_service.get_telemetry(
         global_paper_trader.positions, global_paper_trader.balance
     ))
+
+# ================================================================
+# Phase 267B: ML Governance API
+# ================================================================
+
+@app.get("/api/ml/governance/status")
+async def api_ml_governance_status():
+    """Phase 267B: ML governance status."""
+    if not ml_governance_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    return JSONResponse(ml_governance_service.get_status())
+
+@app.post("/api/ml/governance/promote")
+async def api_ml_governance_promote(request: Request):
+    """Phase 267B: Promote challenger to champion."""
+    if not ml_governance_service:
+        return JSONResponse({'error': 'service not initialized'}, status_code=400)
+    body = await request.json()
+    result = ml_governance_service.promote(
+        model_key=body.get('model_key', 'entry_forecast'),
+        version=body.get('version'),
+        notes=body.get('notes', ''),
+    )
+    return JSONResponse(result)
+
+@app.post("/api/ml/governance/rollback")
+async def api_ml_governance_rollback(request: Request):
+    """Phase 267B: Rollback champion."""
+    if not ml_governance_service:
+        return JSONResponse({'error': 'service not initialized'}, status_code=400)
+    body = await request.json()
+    result = ml_governance_service.rollback(
+        model_key=body.get('model_key', 'entry_forecast'),
+        notes=body.get('notes', ''),
+    )
+    return JSONResponse(result)
+
+@app.post("/api/ml/governance/policy")
+async def api_ml_governance_policy(request: Request):
+    """Phase 267B: Update promotion policy."""
+    if not ml_governance_service:
+        return JSONResponse({'error': 'service not initialized'}, status_code=400)
+    body = await request.json()
+    result = ml_governance_service.set_policy(
+        model_key=body.get('model_key', 'entry_forecast'),
+        policy=body.get('policy', {}),
+    )
+    return JSONResponse({'success': True, 'policy': result})
 
 @app.post("/phase193/hyperopt/run")
 async def phase193_hyperopt_run(request: Request):
