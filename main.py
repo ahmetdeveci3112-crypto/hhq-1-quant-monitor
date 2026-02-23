@@ -10981,17 +10981,18 @@ async def update_ui_cache(opportunities: list, stats: dict):
         # Update opportunities and stats
         ui_state_cache.opportunities = filtered_opportunities
         
-        # Calculate signal counts from filtered opportunities (only those above min confidence threshold)
-        min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
-        long_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'LONG' and o.get('signalScore', 0) >= min_score)
-        short_count = sum(1 for o in filtered_opportunities if o.get('signalAction') == 'SHORT' and o.get('signalScore', 0) >= min_score)
+        # Phase 263: Keep UI counters consistent with Active Signals tab.
+        # Long/Short/Active should come from persistent active signals, not opportunities.
+        persistent_signals = get_persistent_active_signals_snapshot()
+        long_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
+        short_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
         
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
             "analyzedCoins": len(filtered_opportunities),
             "longSignals": long_count,
             "shortSignals": short_count,
-            "activeSignals": long_count + short_count,
+            "activeSignals": len(persistent_signals),
             "btcState": btc_filter.get_state(),
             "lastUpdate": datetime.now().timestamp()
         }
@@ -27323,9 +27324,6 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             """Build non-empty fallback state while cache is warming up."""
             scanner_stats = multi_coin_scanner.get_scanner_stats() if 'multi_coin_scanner' in globals() else {}
             opps = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
-            min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
-            long_count = sum(1 for o in opps if o.get('signalAction') == 'LONG' and o.get('signalScore', 0) >= min_score)
-            short_count = sum(1 for o in opps if o.get('signalAction') == 'SHORT' and o.get('signalScore', 0) >= min_score)
 
             if live_binance_trader.enabled:
                 positions = ui_state_cache.positions or global_paper_trader.positions
@@ -27338,6 +27336,8 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
 
             # Phase 259: Generate persistent signals array for UI
             persistent_signals = get_persistent_active_signals_snapshot()
+            long_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
+            short_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
 
             return {
                 "type": "scanner_update",
@@ -27488,7 +27488,10 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                 pnl_data = await live_binance_trader.get_pnl_from_binance()
             except:
                 pnl_data = {'todayPnl': 0, 'todayPnlPercent': 0, 'totalPnl': 0, 'totalPnlPercent': 0}
-            
+
+            _ps_live = get_persistent_active_signals_snapshot()
+            _ps_live_long = sum(1 for s in _ps_live if s.get('signalAction') == 'LONG')
+            _ps_live_short = sum(1 for s in _ps_live if s.get('signalAction') == 'SHORT')
             initial_state = {
                 "balance": initial_balance,
                 "positions": initial_positions,
@@ -27507,8 +27510,9 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                     # Scanner stats
                     "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
                     "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
-                    "longSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'LONG'),
-                    "shortSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'SHORT')
+                    "longSignals": _ps_live_long,
+                    "shortSignals": _ps_live_short,
+                    "activeSignals": len(_ps_live)
                 },
                 "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
                 "tradingMode": "live"
@@ -27516,6 +27520,9 @@ async def ui_websocket_endpoint(websocket: WebSocket):
         else:
             # Paper mode: Use paper trader data
             pnl_data = global_paper_trader.get_today_pnl()
+            _ps_paper = get_persistent_active_signals_snapshot()
+            _ps_paper_long = sum(1 for s in _ps_paper if s.get('signalAction') == 'LONG')
+            _ps_paper_short = sum(1 for s in _ps_paper if s.get('signalAction') == 'SHORT')
             initial_state = {
                 "balance": global_paper_trader.balance,
                 "positions": global_paper_trader.positions,
@@ -27531,8 +27538,9 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                     # Scanner stats
                     "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
                     "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
-                    "longSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'LONG'),
-                    "shortSignals": sum(1 for o in (multi_coin_scanner.opportunities or []) if o.get('signalAction') == 'SHORT')
+                    "longSignals": _ps_paper_long,
+                    "shortSignals": _ps_paper_short,
+                    "activeSignals": len(_ps_paper)
                 },
                 "logs": global_paper_trader.logs[-100:] if hasattr(global_paper_trader, 'logs') else [],
                 "tradingMode": "paper"
