@@ -24433,9 +24433,12 @@ class PaperTradingEngine:
         try:
             if exit_engine:
                 return exit_engine.request_exit(pos, exit_price, reason, source)
-        except Exception:
-            pass
-        return self.close_position(pos, exit_price, reason, source=source)
+            else:
+                logger.error(f"❌ EXIT_ENGINE_UNAVAILABLE: Cannot close {pos.get('symbol')} ({reason})")
+                return None
+        except Exception as e:
+            logger.error(f"❌ EXIT_ENGINE_ROUTING_ERROR: {e}")
+            return None
 
     def close_position(self, pos: Dict, exit_price: float, reason: str, trace_id: str = None, source: str = 'UNKNOWN'):
         """
@@ -25600,6 +25603,7 @@ async def exit_telemetry():
                 'skipped': engine_stats.get('skipped', 0),
                 'upgraded': engine_stats.get('upgraded', 0),
                 'reason_counts': reason_counts,
+                'recent_exits': engine_stats.get('recent_exits', []),
             },
             'protection': prot_status,
             'active_signals': signal_summary,
