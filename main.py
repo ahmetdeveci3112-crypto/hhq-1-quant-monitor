@@ -5334,6 +5334,11 @@ ENTRY_TRADEABILITY_ENABLED = False
 PENDING_SM_V2_ENABLED = False
 REJECT_ATTRIBUTION_ENABLED = False
 ENTRY_FORECAST_ENABLED = True  # Phase 262: Optimistic Entry Forecast v1
+EXIT_FORECAST_ENABLED = False  # Phase 262: Optimistic Exit Forecast v1 (Dark Launch)
+EXIT_FORECAST_HOLD_MIN_SEC = 20
+EXIT_FORECAST_BLOCK_REASONS = {'EMERGENCY_SL', 'KILL_SWITCH', 'PROTECTION_LOCK', 'SL_HIT', 'TP_HIT'}
+EXIT_FORECAST_MIN_HOLD_PROB = 0.62
+EXIT_FORECAST_MAX_DELAY_SEC = 45
 
 # =========================================================================
 # PHASE 245: TRADE COST ESTIMATOR + TICK-SIZE UTILITIES
@@ -19263,6 +19268,64 @@ class EntryForecastModel:
 
 entry_forecast_model = EntryForecastModel()
 
+class ExitForecastModel:
+    """Predicts likelihood to hold vs aggressive exit."""
+    def __init__(self):
+        self.enabled = EXIT_FORECAST_ENABLED
+
+    def build_exit_features(self, pos: dict, current_price: float, reason: str, source: str) -> dict:
+        entry = pos.get('entryPrice', current_price)
+        side = pos.get('side', 'LONG')
+        pnl_pct = ((current_price - entry) / entry * 100) if side == 'LONG' else ((entry - current_price) / entry * 100)
+        
+        open_time = pos.get('openTime', 0)
+        age_min = (time.time() - (open_time / 1000)) / 60.0 if open_time > 0 else 0
+        
+        atr = pos.get('atr', current_price * 0.01)
+        atr_pct = (atr / current_price * 100) if current_price > 0 else 0
+        
+        tp = pos.get('takeProfit', current_price)
+        tp_dist = abs(tp - entry)
+        tp_progress = (abs(current_price - entry) / tp_dist) if tp_dist > 0 else 0
+        
+        return {
+            'pnl_pct': pnl_pct,
+            'age_min': age_min,
+            'atr_pct': atr_pct,
+            'spread_pct': pos.get('entry_spread', 0),
+            'vol_ratio': pos.get('volumeRatio', 1.0),
+            'adx': pos.get('adx', 20.0),
+            'hurst': pos.get('hurst', 0.5),
+            'trend_alignment': 1.0 if pos.get('emaCross') == 'BULLISH' and side == 'LONG' or pos.get('emaCross') == 'BEARISH' and side == 'SHORT' else 0.0,
+            'reason_priority': 1.0 if 'TIME' in reason or 'TIMEOUT' in reason else 0.0,
+            'tp_progress': tp_progress
+        }
+
+    def predict_hold_prob(self, features: dict) -> float:
+        if not self.enabled: return 0.5
+        prob = 0.5
+        if features['pnl_pct'] > 0 and features['tp_progress'] < 0.8:
+            prob += 0.2
+        if features['trend_alignment'] > 0:
+            prob += 0.1
+        if features['age_min'] < 5:
+            prob += 0.1
+        if features['vol_ratio'] > 1.5:
+            prob -= 0.15
+        return max(0.0, min(1.0, prob))
+
+    def predict_exit_aggressiveness(self, features: dict) -> float:
+        if not self.enabled: return 0.5
+        aggr = 0.5
+        if features['pnl_pct'] < -1.0:
+            aggr += 0.3
+        if features['trend_alignment'] == 0:
+            aggr += 0.2
+        if features.get('reason_priority', 1.0) < 0.5:
+            aggr += 0.2
+        return max(0.0, min(1.0, aggr))
+
+exit_forecast_model = ExitForecastModel()
 
 # Global CoinPerformanceTracker instance
 coin_performance_tracker = CoinPerformanceTracker()
@@ -24504,6 +24567,11 @@ class PaperTradingEngine:
             "mae_pct": round(pos.get('mae_pct', 0), 2),
             "mfe_pct": round(pos.get('mfe_pct', 0), 2),
             "decision_trace": pos.get('decision_trace', [])[-5:],
+            # Phase 262: Exit Forecast parameters
+            "exitForecastHoldProb": pos.get('exitForecastHoldProb', 0.5),
+            "exitForecastAggressiveness": pos.get('exitForecastAggressiveness', 0.5),
+            "exitDeferredCount": pos.get('_exit_deferred_count', 0),
+            "exitReasonNorm": pos.get('exitReasonNorm', reason),
             # Phase 232 / 261: Canonical reason + legacy closeReason
             "closeReason": reason,
             "original_reason": original_reason,
@@ -25579,6 +25647,19 @@ class ExitDecisionEngine:
         self.exit_inflight = {}   # Phase 261: symbol -> {started_at, reason, source, trace_id}
         self._exit_log = []       # last N exit decisions for telemetry
         self._stats = {'total': 0, 'skipped': 0, 'upgraded': 0}
+
+    def _normalize_reason(self, reason: str) -> tuple:
+        reason_upper = reason.upper()
+        if 'TRAIL_TIMEOUT' in reason_upper: return 'TRAIL_TIMEOUT', 'TIME'
+        if 'ERROR_TIMEOUT' in reason_upper: return 'EXEC_TIMEOUT', 'TIME'
+        if 'TIMEOUT' in reason_upper: return 'TIMEOUT', 'TIME'
+        if 'TIME' in reason_upper: return 'TIME_EXIT', 'TIME'
+        if 'TP_HIT' in reason_upper: return 'TP_HIT', 'PROFIT'
+        if 'SL_HIT' in reason_upper: return 'SL_HIT', 'LOSS'
+        if 'EMERGENCY_SL' in reason_upper: return 'EMERGENCY_SL', 'LOSS'
+        if 'KILL_SWITCH' in reason_upper: return 'KILL_SWITCH', 'LOSS'
+        if 'TRAIL' in reason_upper: return 'TRAIL_EXIT', 'PROFIT'
+        return reason_upper.split('(')[0].strip(), 'OTHER'
     
     def request_exit(self, pos, exit_price: float, reason: str, source: str = 'UNKNOWN'):
         """Request position exit through unified gate.
@@ -25592,8 +25673,41 @@ class ExitDecisionEngine:
         Returns: trade dict or None if skipped
         """
         symbol = pos.get('symbol', '')
+        reason_norm, reason_class = self._normalize_reason(reason)
+        now = time.time()
+        age_sec = now - (pos.get('openTime', now * 1000) / 1000)
         
+        hold_prob = 0.5
+        aggr = 0.5
+        deferred = False
+        defer_sec = 0
+        
+        if EXIT_FORECAST_ENABLED and reason_norm not in EXIT_FORECAST_BLOCK_REASONS and age_sec >= EXIT_FORECAST_HOLD_MIN_SEC:
+            deferred_until = pos.get('_exit_deferred_until', 0)
+            if now < deferred_until:
+                self._stats['skipped'] += 1
+                return None
+                
+            features = exit_forecast_model.build_exit_features(pos, exit_price, reason_norm, source)
+            hold_prob = exit_forecast_model.predict_hold_prob(features)
+            aggr = exit_forecast_model.predict_exit_aggressiveness(features)
+            
+            if hold_prob >= EXIT_FORECAST_MIN_HOLD_PROB and reason_class in ['TIME', 'MOMENTUM', 'OTHER']:
+                pos['_exit_deferred_until'] = now + EXIT_FORECAST_MAX_DELAY_SEC
+                pos['_exit_deferred_count'] = pos.get('_exit_deferred_count', 0) + 1
+                self._stats['skipped'] += 1
+                defer_sec = EXIT_FORECAST_MAX_DELAY_SEC
+                logger.info(f"⏳ EXIT_DEFER_FORECAST: {symbol} {reason_norm} hold_prob={hold_prob:.2f}. Deferring for {defer_sec}s.")
+                self._exit_log.append({
+                    'symbol': symbol, 'reason': reason, 'reason_norm': reason_norm, 'reason_class': reason_class,
+                    'source': source, 'ts': now, 'trace_id': f"DEFER_{symbol}_{int(now*1000)}",
+                    'hold_prob': round(hold_prob, 3), 'aggressiveness': round(aggr, 3), 
+                    'deferred': True, 'defer_seconds': defer_sec, 'position_age_sec': round(age_sec, 1)
+                })
+                return None
+
         # Phase 261: Symbol-level exit lock (exit_inflight)
+        # Lock check comes AFTER defer logic
         if symbol in self.exit_inflight:
             existing = self.exit_inflight[symbol]
             logger.warning(
@@ -25612,6 +25726,11 @@ class ExitDecisionEngine:
             'trace_id': trace_id
         }
         
+        # Pass forecast params to trade record
+        pos['exitForecastHoldProb'] = hold_prob
+        pos['exitForecastAggressiveness'] = aggr
+        pos['exitReasonNorm'] = reason_norm
+        
         # Execute close through paper trader
         self._stats['total'] += 1
         try:
@@ -25628,9 +25747,11 @@ class ExitDecisionEngine:
         
         # Track last 50 exits for telemetry
         self._exit_log.append({
-            'symbol': symbol, 'reason': reason,
+            'symbol': symbol, 'reason': reason, 'reason_norm': reason_norm, 'reason_class': reason_class,
             'source': source, 'ts': time.time(),
-            'trace_id': trace_id
+            'trace_id': trace_id,
+            'hold_prob': round(hold_prob, 3), 'aggressiveness': round(aggr, 3),
+            'deferred': False, 'defer_seconds': 0, 'position_age_sec': round(age_sec, 1)
         })
         if len(self._exit_log) > 50:
             self._exit_log = self._exit_log[-50:]
