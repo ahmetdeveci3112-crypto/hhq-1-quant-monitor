@@ -330,6 +330,49 @@ class SQLiteManager:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_optimizer_runs_ts ON optimizer_runs(run_ts DESC)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_optimizer_params_run ON optimizer_run_params(run_id)')
 
+            # Phase 263: FreqAI ML Persistence
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_training_samples (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts INTEGER NOT NULL,
+                  target INTEGER NOT NULL,                 -- 0/1
+                  features_json TEXT NOT NULL,             -- serialized FEATURE_NAMES map
+                  symbol TEXT,
+                  side TEXT,
+                  pnl REAL,
+                  close_reason TEXT,
+                  trade_id TEXT,                           -- optional unique id
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_model_runs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_ts INTEGER NOT NULL,
+                  sample_count INTEGER DEFAULT 0,
+                  accuracy REAL DEFAULT 0,
+                  f1_score REAL DEFAULT 0,
+                  train_count INTEGER DEFAULT 0,
+                  model_type TEXT DEFAULT 'lightgbm',
+                  metadata_json TEXT DEFAULT '{}'
+                )
+            ''')
+            
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS ml_model_run_features (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL,
+                  feature_name TEXT NOT NULL,
+                  importance REAL DEFAULT 0,
+                  FOREIGN KEY(run_id) REFERENCES ml_model_runs(id)
+                )
+            ''')
+            
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_samples_ts ON ml_training_samples(ts DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_runs_ts ON ml_model_runs(run_ts DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_features_run ON ml_model_run_features(run_id)')
+
             await db.commit()
             # Phase 261 Hotfix 4: Alter breakeven_states
             bk_migration_columns = [
@@ -1411,6 +1454,98 @@ class SQLiteManager:
             logger.error(f"Failed to load optimizer history: {e}")
             
         return history
+
+    # ================================================================
+    # Phase 263: FreqAI ML Persistence
+    # ================================================================
+    async def save_ml_training_sample(self, ts: int, target: int, features: dict, 
+                                      symbol: str = None, side: str = None, 
+                                      pnl: float = None, close_reason: str = None, 
+                                      trade_id: str = None):
+        """Persist a single trade sample for FreqAI training."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    INSERT INTO ml_training_samples 
+                    (ts, target, features_json, symbol, side, pnl, close_reason, trade_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (ts, target, json.dumps(features), symbol, side, pnl, close_reason, trade_id))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save ML training sample: {e}")
+
+    async def get_ml_training_samples(self, limit: int = 5000) -> list:
+        """Hydrate historical training samples up to limit."""
+        samples = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT * FROM ml_training_samples ORDER BY ts ASC LIMIT ?
+                ''', (limit,)) as cursor:
+                    rows = await cursor.fetchall()
+                    
+                for row in rows:
+                    samples.append({
+                        'timestamp': row['ts'],
+                        'target': row['target'],
+                        'features': json.loads(row['features_json'])
+                    })
+        except Exception as e:
+            logger.error(f"Failed to load ML training samples: {e}")
+        return samples
+
+    async def save_ml_model_run(self, run_ts: int, sample_count: int, accuracy: float, 
+                                f1_score: float, train_count: int, model_type: str, 
+                                importance_dict: dict, metadata: dict = None) -> int:
+        """Persist a model training run and its feature importance."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    INSERT INTO ml_model_runs 
+                    (run_ts, sample_count, accuracy, f1_score, train_count, model_type, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (run_ts, sample_count, accuracy, f1_score, train_count, model_type, json.dumps(metadata or {})))
+                run_id = cursor.lastrowid
+                
+                if importance_dict:
+                    imp_rows = [(run_id, k, v) for k, v in importance_dict.items()]
+                    await db.executemany('''
+                        INSERT INTO ml_model_run_features (run_id, feature_name, importance)
+                        VALUES (?, ?, ?)
+                    ''', imp_rows)
+                    
+                await db.commit()
+                return run_id
+        except Exception as e:
+            logger.error(f"Failed to save ML model run: {e}")
+            return -1
+
+    async def get_latest_ml_model_run(self) -> dict:
+        """Get the most recent trained ML model stats."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT * FROM ml_model_runs ORDER BY run_ts DESC LIMIT 1
+                ''') as cursor:
+                    row = await cursor.fetchone()
+                    
+                if not row:
+                    return None
+                    
+                run_dict = dict(row)
+                run_dict['metadata'] = json.loads(run_dict['metadata_json'])
+                
+                # Fetch features
+                async with db.execute('SELECT feature_name, importance FROM ml_model_run_features WHERE run_id = ?', (run_dict['id'],)) as f_cursor:
+                    f_rows = await f_cursor.fetchall()
+                    run_dict['feature_importance'] = {f['feature_name']: f['importance'] for f in f_rows}
+                    
+                return run_dict
+        except Exception as e:
+            logger.error(f"Failed to load latest ML model run: {e}")
+            return None
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -3542,6 +3677,62 @@ async def lifespan(app: FastAPI):
         # Hydrate Hyperopt state if available
         if hhq_hyperoptimizer:
             await hhq_hyperoptimizer.load_initial_state()
+            
+        # =====================================================================
+        # Phase 263: FreqAI ML Hydration & JSON Migration
+        # =====================================================================
+        if freqai_model:
+            json_path = os.path.join(freqai_model.data_dir, 'freqai_training_data.json')
+            if os.path.exists(json_path):
+                logger.info("📦 Phase 263: Migrating FreqAI JSON data to SQLite...")
+                try:
+                    with open(json_path, 'r') as f:
+                        legacy_samples = json.load(f)
+                    for s in legacy_samples:
+                        await sqlite_manager.save_ml_training_sample(
+                            ts=int(s.get('timestamp', time.time())),
+                            target=s.get('target', 0),
+                            features=s.get('features', {}),
+                            symbol='UNKNOWN', side='UNKNOWN', pnl=0.0, close_reason='MIGRATED', trade_id=None
+                        )
+                    os.rename(json_path, json_path + '.migrated')
+                    logger.info(f"✅ Migrated {len(legacy_samples)} freqai records to SQLite.")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to migrate FreqAI JSON: {e}")
+
+            try:
+                samples = await sqlite_manager.get_ml_training_samples(limit=5000)
+                # First build callbacks to catch any hook triggers
+                def _on_trade_recorded_dummy(record):
+                    pass # Processed in close_position explicitly
+                freqai_model.on_trade_recorded = _on_trade_recorded_dummy
+                
+                def _on_model_trained(payload):
+                    safe_create_task(
+                        sqlite_manager.save_ml_model_run(
+                            run_ts=payload['run_ts'],
+                            sample_count=payload['sample_count'],
+                            accuracy=payload['accuracy'],
+                            f1_score=payload['f1_score'],
+                            train_count=payload['train_count'],
+                            model_type=payload['model_type'],
+                            importance_dict=payload['feature_importance']
+                        ),
+                        name="save_ml_run"
+                    )
+                freqai_model.on_model_trained = _on_model_trained
+                
+                # Now hydrate and optionally retrain to build the in-memory binary model
+                freqai_model.hydrate_training_data(samples, retrain=True)
+                
+                # Restore stats from DB if available (to overwrite baseline retrain metrics with historical continuity if preferred)
+                last_run = await sqlite_manager.get_latest_ml_model_run()
+                if last_run and freqai_model.train_count <= 1:
+                    freqai_model.train_count = last_run['train_count'] + 1 # Continue numbering
+                    
+                logger.info(f"🧠 Phase 263: FreqAI ML Hydrated (samples: {len(samples)})")
+            except Exception as e:
+                logger.error(f"Failed to hydrate FreqAI ML data: {e}")
             
     except Exception as e:
         logger.error(f"Failed to load optimizer history: {e}")
@@ -24626,7 +24817,21 @@ class PaperTradingEngine:
                     'leverage': pos.get('leverage', 10),
                     'atr_pct': (pos.get('atr', 0) / pos.get('entryPrice', 1)) * 100 if pos.get('entryPrice', 0) > 0 else 0,
                 }
-                freqai_model.record_trade(ml_features, pnl > 0)
+                ml_record = freqai_model.record_trade(ml_features, pnl > 0)
+                if ml_record:
+                    safe_create_task(
+                        sqlite_manager.save_ml_training_sample(
+                            ts=int(ml_record['timestamp']),
+                            target=ml_record['target'],
+                            features=ml_record['features'],
+                            symbol=pos.get('symbol', 'UNKNOWN'),
+                            side=pos.get('side', 'LONG'),
+                            pnl=pnl,
+                            close_reason=reason,
+                            trade_id=pos.get('id')
+                        ),
+                        name="save_ml_sample"
+                    )
             
             # 3. Hyperopt: Record trade data for parameter optimization
             if hhq_hyperoptimizer and hhq_hyperoptimizer.enabled:
@@ -27090,8 +27295,10 @@ async def phase193_freqai_retrain():
     if not freqai_model:
         return JSONResponse({"error": "FreqAI not available"}, status_code=400)
     success = freqai_model.force_retrain()
+    # The on_model_trained hook automatically persists the run to SQLite
     return JSONResponse({
         "success": success,
+        "run_persisted": success,
         "status": freqai_model.get_status()
     })
 

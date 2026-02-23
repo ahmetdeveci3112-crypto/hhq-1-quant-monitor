@@ -64,6 +64,10 @@ class HHQFreqAIModel:
         self.is_trained = False
         self.enabled = True
         
+        # Hooks for persistence
+        self.on_trade_recorded = None
+        self.on_model_trained = None
+        
         # Training data
         self.training_data: List[Dict] = []  # [{features: {}, target: 0/1}, ...]
         self.trades_since_retrain = 0
@@ -75,7 +79,7 @@ class HHQFreqAIModel:
         self.train_count = 0
         self.last_train_time = 0
         
-        # Load existing data
+        # Only load JSON as fallback (SQLite migration handles main data)
         self._load_training_data()
         
         # Auto-train if enough data
@@ -84,18 +88,25 @@ class HHQFreqAIModel:
         
         logger.info(f"HHQFreqAIModel initialized (data={len(self.training_data)} trades, "
                     f"trained={self.is_trained}, retrain_every={retrain_every})")
+
+    def hydrate_training_data(self, records: List[Dict], retrain: bool = True):
+        """Hydrate memory with historical DB records, keeping within limits."""
+        self.training_data = records[-5000:]
+        if retrain and len(self.training_data) >= 30:
+            self._train()
+        logger.info(f"FreqAI hydrated from DB: {len(self.training_data)} samples.")
     
     def _features_to_vector(self, features: Dict) -> np.ndarray:
         """Convert feature dict to numpy array in consistent order."""
         return np.array([features.get(name, 0.0) for name in self.FEATURE_NAMES])
     
-    def record_trade(self, features: Dict, is_profitable: bool):
+    def record_trade(self, features: Dict, is_profitable: bool) -> Optional[Dict]:
         """
         Record a trade outcome for training.
         Call this after each trade closes with the features at signal time.
         """
         if not SKLEARN_AVAILABLE:
-            return
+            return None
         
         record = {
             'features': {name: features.get(name, 0.0) for name in self.FEATURE_NAMES},
@@ -103,10 +114,17 @@ class HHQFreqAIModel:
             'timestamp': time.time(),
         }
         self.training_data.append(record)
+        if len(self.training_data) > 5000:
+            self.training_data = self.training_data[-5000:]
+            
         self.trades_since_retrain += 1
         
-        # Save to disk
-        self._save_training_data()
+        # Hook for external persistence (SQLite)
+        if self.on_trade_recorded:
+            self.on_trade_recorded(record)
+        else:
+            # Fallback to JSON if no hook
+            self._save_training_data()
         
         # Auto-retrain check
         if self.trades_since_retrain >= self.retrain_every and len(self.training_data) >= 30:
@@ -114,6 +132,8 @@ class HHQFreqAIModel:
         
         logger.info(f"FreqAI: Trade recorded (profitable={is_profitable}, "
                     f"total={len(self.training_data)}, until_retrain={self.retrain_every - self.trades_since_retrain})")
+                    
+        return record
     
     def predict_confidence(self, features: Dict) -> float:
         """
@@ -234,6 +254,19 @@ class HHQFreqAIModel:
                 f"samples={len(self.training_data)}, "
                 f"top_features: {top_5}"
             )
+            
+            # Fire hook
+            if self.on_model_trained:
+                run_payload = {
+                    'run_ts': int(self.last_train_time),
+                    'sample_count': len(self.training_data),
+                    'accuracy': self.accuracy,
+                    'f1_score': self.f1,
+                    'train_count': self.train_count,
+                    'model_type': 'lightgbm' if LIGHTGBM_AVAILABLE else 'random_forest',
+                    'feature_importance': self.feature_importance
+                }
+                self.on_model_trained(run_payload)
         
         except Exception as e:
             logger.error(f"FreqAI training error: {e}")
