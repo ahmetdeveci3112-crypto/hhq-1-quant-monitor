@@ -507,6 +507,15 @@ class SQLiteManager:
                 ('pullback_pct', 'REAL DEFAULT 0'),
                 # Phase 232: Close metrics snapshot
                 ('close_metrics_json', 'TEXT DEFAULT "{}"'),
+                # Phase 267C: PnL Attribution
+                ('pnl_gross', 'REAL DEFAULT 0'),
+                ('fee_cost', 'REAL DEFAULT 0'),
+                ('slippage_cost', 'REAL DEFAULT 0'),
+                ('funding_cost', 'REAL DEFAULT 0'),
+                ('pnl_signal_alpha', 'REAL DEFAULT 0'),
+                ('pnl_execution_alpha', 'REAL DEFAULT 0'),
+                ('pnl_timing_alpha', 'REAL DEFAULT 0'),
+                ('attribution_json', 'TEXT DEFAULT "{}"'),
             ]
             for col_name, col_type in migration_columns:
                 try:
@@ -19917,6 +19926,14 @@ except Exception as _mgs_err:
     logger.warning(f"MLGovernanceService import failed: {_mgs_err}")
     ml_governance_service = None
 
+# Phase 267C: PnL Attribution Service
+try:
+    from pnl_attribution_service import PnLAttributionService
+    pnl_attribution_service = PnLAttributionService()
+except Exception as _pas_err:
+    logger.warning(f"PnLAttributionService import failed: {_pas_err}")
+    pnl_attribution_service = None
+
 class ExitForecastModel:
     """Predicts likelihood to hold vs aggressive exit."""
     def __init__(self):
@@ -25375,6 +25392,23 @@ class PaperTradingEngine:
             }),
         }
         
+        # Phase 267C: PnL Attribution decomposition
+        if pnl_attribution_service and pnl_attribution_service.enabled:
+            try:
+                trade['accumulated_funding'] = accumulated_funding
+                trade['signalPrice'] = pos.get('signalPrice', pos.get('entryPrice', 0))
+                _attr = pnl_attribution_service.decompose_trade(trade)
+                trade['pnl_gross'] = _attr.get('pnl_gross', 0)
+                trade['fee_cost'] = _attr.get('fee_cost', 0)
+                trade['slippage_cost'] = _attr.get('slippage_cost', 0)
+                trade['funding_cost'] = _attr.get('funding_cost', 0)
+                trade['pnl_signal_alpha'] = _attr.get('pnl_signal_alpha', 0)
+                trade['pnl_execution_alpha'] = _attr.get('pnl_execution_alpha', 0)
+                trade['pnl_timing_alpha'] = _attr.get('pnl_timing_alpha', 0)
+                trade['attribution_json'] = _attr.get('attribution_json', '{}')
+            except Exception as _attr_err:
+                logger.debug(f"PnL attribution error: {_attr_err}")
+        
         # =====================================================================
         # PHASE 193: POST-CLOSE HOOKS (SL Guard, FreqAI, Hyperopt)
         # =====================================================================
@@ -27914,6 +27948,7 @@ async def phase193_status():
         "entry_forecast": _build_entry_forecast_telemetry(),
         "risk": portfolio_risk_service.get_status() if portfolio_risk_service else {'enabled': False},
         "ml_governance": ml_governance_service.get_status() if ml_governance_service else {'enabled': False},
+        "attribution": pnl_attribution_service.get_status() if pnl_attribution_service else {'enabled': False},
         "param_limits": PARAM_LIMITS
     })
 
@@ -28089,6 +28124,52 @@ async def api_ml_governance_policy(request: Request):
         policy=body.get('policy', {}),
     )
     return JSONResponse({'success': True, 'policy': result})
+
+# ================================================================
+# Phase 267C: PnL Attribution API
+# ================================================================
+
+@app.get("/api/pnl/attribution")
+async def api_pnl_attribution(window: str = '24h'):
+    """Phase 267C: PnL attribution by time window."""
+    if not pnl_attribution_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    hours = _parse_window_hours(window)
+    return JSONResponse(pnl_attribution_service.aggregate_by_window(
+        global_paper_trader.trade_history, hours
+    ))
+
+@app.get("/api/pnl/attribution/by-symbol")
+async def api_pnl_attribution_by_symbol(window: str = '7d'):
+    """Phase 267C: PnL attribution by symbol."""
+    if not pnl_attribution_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    hours = _parse_window_hours(window)
+    return JSONResponse(pnl_attribution_service.aggregate_by_symbol(
+        global_paper_trader.trade_history, hours
+    ))
+
+@app.get("/api/pnl/attribution/by-reason")
+async def api_pnl_attribution_by_reason(window: str = '7d'):
+    """Phase 267C: PnL attribution by reason bucket."""
+    if not pnl_attribution_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    hours = _parse_window_hours(window)
+    return JSONResponse(pnl_attribution_service.aggregate_by_reason(
+        global_paper_trader.trade_history, hours
+    ))
+
+def _parse_window_hours(window: str) -> float:
+    """Parse window string like '24h', '7d', '30d' to hours."""
+    try:
+        w = window.strip().lower()
+        if w.endswith('h'):
+            return float(w[:-1])
+        elif w.endswith('d'):
+            return float(w[:-1]) * 24
+        return 24.0
+    except (ValueError, TypeError):
+        return 24.0
 
 @app.post("/phase193/hyperopt/run")
 async def phase193_hyperopt_run(request: Request):
