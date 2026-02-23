@@ -372,6 +372,7 @@ class SQLiteManager:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_samples_ts ON ml_training_samples(ts DESC)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_runs_ts ON ml_model_runs(run_ts DESC)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_features_run ON ml_model_run_features(run_id)')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ml_samples_trade_id ON ml_training_samples(trade_id) WHERE trade_id IS NOT NULL')
 
             await db.commit()
             # Phase 261 Hotfix 4: Alter breakeven_states
@@ -1462,11 +1463,11 @@ class SQLiteManager:
                                       symbol: str = None, side: str = None, 
                                       pnl: float = None, close_reason: str = None, 
                                       trade_id: str = None):
-        """Persist a single trade sample for FreqAI training."""
+        """Persist a single trade sample for FreqAI training (idempotent on trade_id)."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute('''
-                    INSERT INTO ml_training_samples 
+                    INSERT OR IGNORE INTO ml_training_samples 
                     (ts, target, features_json, symbol, side, pnl, close_reason, trade_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (ts, target, json.dumps(features), symbol, side, pnl, close_reason, trade_id))
@@ -1547,6 +1548,81 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Failed to load latest ML model run: {e}")
             return None
+
+    async def backfill_ml_from_trades(self) -> dict:
+        """Phase 263: Backfill ml_training_samples from existing trades table.
+        Maps available trade columns to FreqAI FEATURE_NAMES.
+        Uses INSERT OR IGNORE so it's safe to call multiple times.
+        """
+        inserted = 0
+        skipped = 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT id, symbol, side, entry_price, exit_price, pnl, close_time,
+                           close_reason, leverage, signal_score, z_score, hurst, adx,
+                           entry_spread, atr, spread_level
+                    FROM trades
+                    WHERE close_time IS NOT NULL AND close_time > 0
+                    ORDER BY close_time ASC
+                ''') as cursor:
+                    rows = await cursor.fetchall()
+                
+                for row in rows:
+                    trade_id = row['id']
+                    if not trade_id:
+                        skipped += 1
+                        continue
+                    
+                    pnl = row['pnl'] or 0
+                    entry_price = row['entry_price'] or 0
+                    atr_val = row['atr'] or 0
+                    atr_pct = (atr_val / entry_price * 100) if entry_price > 0 else 0
+                    
+                    features = {
+                        'zscore': row['z_score'] or 0,
+                        'hurst': row['hurst'] or 0.5,
+                        'rsi': 50,           # not stored in trades
+                        'adx': row['adx'] or 25,
+                        'volume_ratio': 1.0,  # not stored
+                        'bb_position': 0,     # not stored
+                        'macd_histogram': 0,  # not stored
+                        'stoch_rsi_k': 50,    # not stored
+                        'ema_cross_bullish': 0,
+                        'vwap_zscore': 0,
+                        'spread_pct': row['entry_spread'] or 0,
+                        'funding_rate': 0,
+                        'imbalance': 0,
+                        'signal_score': row['signal_score'] or 0,
+                        'leverage': row['leverage'] or 10,
+                        'atr_pct': round(atr_pct, 4),
+                    }
+                    
+                    target = 1 if pnl > 0 else 0
+                    ts = row['close_time'] or 0
+                    # Convert ms to seconds if needed
+                    if ts > 1e12:
+                        ts = int(ts / 1000)
+                    
+                    try:
+                        await db.execute('''
+                            INSERT OR IGNORE INTO ml_training_samples
+                            (ts, target, features_json, symbol, side, pnl, close_reason, trade_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (ts, target, json.dumps(features), row['symbol'], row['side'], pnl, row['close_reason'], trade_id))
+                        if db.total_changes:
+                            inserted += 1
+                        else:
+                            skipped += 1
+                    except Exception:
+                        skipped += 1
+                
+                await db.commit()
+                logger.info(f"🔄 ML Backfill complete: {inserted} inserted, {skipped} skipped (total trades: {len(rows)})")
+        except Exception as e:
+            logger.error(f"Failed to backfill ML from trades: {e}")
+        return {'inserted': inserted, 'skipped': skipped}
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -3706,6 +3782,10 @@ async def lifespan(app: FastAPI):
                     logger.warning(f"⚠️ Failed to migrate FreqAI JSON: {e}")
 
             try:
+                # Phase 263: Backfill from trades table BEFORE hydration
+                backfill_result = await sqlite_manager.backfill_ml_from_trades()
+                logger.info(f"🔄 Phase 263: ML Backfill result: {backfill_result}")
+                
                 samples = await sqlite_manager.get_ml_training_samples(limit=5000)
                 # First build callbacks to catch any hook triggers
                 def _on_trade_recorded_dummy(record):
@@ -27305,6 +27385,23 @@ async def phase193_freqai_retrain():
         "success": success,
         "run_persisted": success,
         "status": freqai_model.get_status()
+    })
+
+@app.post("/phase193/freqai/backfill")
+async def phase193_freqai_backfill():
+    """Phase 263: Retroactively backfill ML training samples from trades table."""
+    result = await sqlite_manager.backfill_ml_from_trades()
+    # Re-hydrate after backfill
+    if freqai_model:
+        samples = await sqlite_manager.get_ml_training_samples(limit=5000)
+        freqai_model.hydrate_training_data(samples, retrain=True)
+    return JSONResponse({
+        "success": True,
+        "inserted": result.get('inserted', 0),
+        "skipped": result.get('skipped', 0),
+        "total_samples": len(freqai_model.training_data) if freqai_model else 0,
+        "is_trained": freqai_model.is_trained if freqai_model else False,
+        "status": freqai_model.get_status() if freqai_model else {}
     })
 
 @app.post("/phase193/hyperopt/run")

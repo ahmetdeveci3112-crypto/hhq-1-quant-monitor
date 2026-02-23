@@ -294,7 +294,7 @@ class HHQFreqAIModel:
     
     def force_retrain(self):
         """Force immediate retrain (for API endpoint)."""
-        if len(self.training_data) >= 20:
+        if len(self.training_data) >= 30:
             self._train()
             return True
         return False
