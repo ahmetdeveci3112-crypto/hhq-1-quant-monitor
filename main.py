@@ -28192,8 +28192,8 @@ async def phase193_entry_forecast_retrain():
                     _promo = ml_governance_service.check_promotion('entry_forecast')
                     if _promo.get('should_promote'):
                         ml_governance_service.promote('entry_forecast', notes=_promo.get('reason', ''))
-            except Exception:
-                pass
+            except Exception as _gov_err:
+                logger.warning(f"ML Governance manual retrain register/promote error: {_gov_err}")
     
     return JSONResponse({
         'labeled_count': labeled_count,
