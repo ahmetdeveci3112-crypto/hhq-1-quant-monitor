@@ -24,6 +24,7 @@ interface Props {
   onFreqAIRetrain?: () => void;
   onHyperoptRun?: (nTrials?: number, apply?: boolean, forceApply?: boolean) => void;
   onHyperoptSettings?: (s: any) => void;
+  onForceApplyLast?: () => void;
   settingsSnapshot?: { zScoreThreshold?: number; minConfidenceScore?: number; entryTightness?: number; exitTightness?: number; stopLossAtr?: number; takeProfit?: number; trailActivationAtr?: number; trailDistanceAtr?: number };
 }
 
@@ -33,7 +34,7 @@ const formatUnix = (ts?: number) => {
   return d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString('tr-TR', { day: '2-digit', month: '2-digit' });
 };
 
-export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, settingsSnapshot }) => {
+export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, onForceApplyLast, settingsSnapshot }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
   // Sync localSettings when settings prop changes (AI made changes)
@@ -794,7 +795,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                       🔬 Optimize+Apply
                     </button>
                     <button
-                      onClick={() => onHyperoptRun?.(30, true, true)}
+                      onClick={() => onForceApplyLast?.()}
                       className="text-[10px] font-bold py-2 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition-colors"
                     >
                       ⚡ Force Apply

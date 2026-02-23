@@ -27549,7 +27549,28 @@ async def phase193_hyperopt_settings(request: Request):
                 f"cooldown={hhq_hyperoptimizer.apply_cooldown_sec}s, "
                 f"min_trades={hhq_hyperoptimizer.min_trades_for_apply}")
     
+    # Phase 265 P3: Persist settings to disk
+    await hhq_hyperoptimizer.save_settings()
+    
     return JSONResponse(hhq_hyperoptimizer.get_status())
+
+@app.post("/phase193/hyperopt/force-apply-last")
+async def phase193_hyperopt_force_apply_last():
+    """Phase 265 P2: Force apply last best params without re-optimizing."""
+    if not hhq_hyperoptimizer:
+        return JSONResponse({"error": "Hyperopt not available"}, status_code=400)
+    
+    if not hhq_hyperoptimizer.best_params:
+        return JSONResponse({"error": "No best params available. Run optimize first."}, status_code=400)
+    
+    apply_res = await hhq_hyperoptimizer.maybe_apply_to_runtime(force=True)
+    
+    return JSONResponse({
+        "applied": apply_res["applied"],
+        "reason": apply_res["reason"],
+        "best_params": {k: round(v, 3) if isinstance(v, float) else v for k, v in hhq_hyperoptimizer.best_params.items()},
+        **hhq_hyperoptimizer.get_status()
+    })
 
 @app.post("/paper-trading/market-order")
 async def paper_trading_market_order(request: Request):

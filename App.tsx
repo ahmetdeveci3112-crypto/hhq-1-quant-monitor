@@ -878,6 +878,25 @@ export default function App() {
     }
   }, [addLog]);
 
+  // Phase 265 P2: Force apply last best params (no re-optimization)
+  const handleForceApplyLast = useCallback(async () => {
+    try {
+      addLog('⚡ Son en iyi parametreleri zorla uyguluyor...');
+      const res = await fetch(`${BACKEND_API_URL}/phase193/hyperopt/force-apply-last`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        const msg = data.applied ? '✅ Parametreler uygulandı' : `⏭️ Apply başarısız: ${data.reason}`;
+        addLog(`⚡ Force Apply: ${msg}`);
+        setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+      } else {
+        const err = await res.json();
+        addLog(`❌ Force Apply: ${err.error || 'Hata'}`);
+      }
+    } catch (err) {
+      addLog('❌ Force Apply hatası');
+    }
+  }, [addLog]);
+
   // Phase 52: Toggle AI Optimizer
   const toggleOptimizer = async () => {
     try {
@@ -1144,6 +1163,7 @@ export default function App() {
           onFreqAIRetrain={handleFreqAIRetrain}
           onHyperoptRun={handleHyperoptRun}
           onHyperoptSettings={handleHyperoptSettings}
+          onForceApplyLast={handleForceApplyLast}
           settingsSnapshot={settings}
         />
       )}

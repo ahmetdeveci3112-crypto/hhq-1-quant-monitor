@@ -182,6 +182,9 @@ class HHQHyperOptimizer:
         self.last_apply_params: Dict[str, Any] = {}
         self.last_optimize_time = 0
         
+        # Phase 265 P3: Load persisted settings (overrides env defaults if file exists)
+        self._load_settings()
+        
         logger.info(f"HHQHyperOptimizer initialized (optuna={'✅' if OPTUNA_AVAILABLE else '❌'}, "
                     f"auto_every={self.auto_optimize_every}, auto_apply={self.auto_apply_enabled})")
     
@@ -499,7 +502,7 @@ class HHQHyperOptimizer:
             improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0
             
             # Save
-            await self._save_best_params(default_score, improvement)
+            await self._save_best_params(default_score, improvement, applied=False)
             self.last_optimize_time = int(time.time())
             
             result = {
@@ -521,11 +524,16 @@ class HHQHyperOptimizer:
                 f"   Best params: {json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in self.best_params.items()})}"
             )
             
-            # Phase 265: Auto-apply if requested
-            if apply or force_apply or self.auto_apply_enabled:
+            # Phase 265 fix: Only auto-apply when explicitly requested.
+            # auto_apply_enabled only applies to the background auto-optimize path,
+            # NOT to user-triggered API calls (Dry Run sends apply=false).
+            if apply or force_apply:
                 apply_res = await self.maybe_apply_to_runtime(force=force_apply, improvement_pct=improvement)
                 result['params_applied'] = apply_res['applied']
                 result['apply_reason'] = apply_res['reason']
+                # Update DB record with actual applied status
+                if apply_res['applied']:
+                    await self._save_best_params(default_score, improvement, applied=True)
             
             return result
         
@@ -552,7 +560,7 @@ class HHQHyperOptimizer:
             and len(self.trade_data) >= 20
         )
     
-    async def _save_best_params(self, default_score: float = 0.0, improvement: float = 0.0):
+    async def _save_best_params(self, default_score: float = 0.0, improvement: float = 0.0, applied: bool = False):
         """Save best params to SQLite."""
         try:
             from main import sqlite_manager
@@ -572,12 +580,43 @@ class HHQHyperOptimizer:
                 score_before=default_score,
                 score_after=self.best_score,
                 improvement_pct=improvement,
-                applied=True,
+                applied=applied,
                 params=params_list,
                 metadata={'strategy_mode': self.strategy_mode, 'n_trials': self.n_trials}
             )
         except Exception as e:
             logger.warning(f"Hyperopt SQLite save error: {e}")
+    
+    async def save_settings(self):
+        """Phase 265 P3 fix: Persist auto-apply settings to disk."""
+        try:
+            settings_path = os.path.join(self.data_dir, 'hyperopt_settings.json')
+            settings = {
+                'auto_apply_enabled': self.auto_apply_enabled,
+                'min_apply_improvement_pct': self.min_apply_improvement_pct,
+                'apply_cooldown_sec': self.apply_cooldown_sec,
+                'min_trades_for_apply': self.min_trades_for_apply,
+            }
+            with open(settings_path, 'w') as f:
+                json.dump(settings, f)
+            logger.info(f"Hyperopt settings saved to {settings_path}")
+        except Exception as e:
+            logger.warning(f"Hyperopt settings save error: {e}")
+    
+    def _load_settings(self):
+        """Phase 265 P3 fix: Load auto-apply settings from disk."""
+        try:
+            settings_path = os.path.join(self.data_dir, 'hyperopt_settings.json')
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    settings = json.load(f)
+                self.auto_apply_enabled = settings.get('auto_apply_enabled', self.auto_apply_enabled)
+                self.min_apply_improvement_pct = settings.get('min_apply_improvement_pct', self.min_apply_improvement_pct)
+                self.apply_cooldown_sec = settings.get('apply_cooldown_sec', self.apply_cooldown_sec)
+                self.min_trades_for_apply = settings.get('min_trades_for_apply', self.min_trades_for_apply)
+                logger.info(f"Hyperopt settings loaded: auto_apply={self.auto_apply_enabled}")
+        except Exception as e:
+            logger.warning(f"Hyperopt settings load error: {e}")
     
     async def load_initial_state(self):
         """Load initial state from DB."""
