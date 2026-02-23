@@ -276,7 +276,7 @@ export default function App() {
   const [phase193Status, setPhase193Status] = useState<{
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
-    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string };
+    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
     ws_manager: { enabled: boolean; connected?: boolean };
     pandas_ta: boolean;
   } | null>(null);
@@ -839,22 +839,42 @@ export default function App() {
     }
   }, [addLog]);
 
-  // Phase 193: Hyperopt run
-  const handleHyperoptRun = useCallback(async (nTrials: number = 100) => {
+  // Phase 193/265: Hyperopt run (parametrized)
+  const handleHyperoptRun = useCallback(async (nTrials: number = 100, apply: boolean = false, forceApply: boolean = false) => {
     try {
-      addLog(`🔬 Hyperopt optimizasyon başlatılıyor (${nTrials} trial)...`);
+      const label = forceApply ? 'Force Apply' : apply ? 'Optimize + Uygula' : 'Dry Run';
+      addLog(`🔬 Hyperopt ${label} başlatılıyor (${nTrials} trial)...`);
       const res = await fetch(`${BACKEND_API_URL}/phase193/hyperopt/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ n_trials: nTrials })
+        body: JSON.stringify({ n_trials: nTrials, apply, force_apply: forceApply })
       });
       if (res.ok) {
         const data = await res.json();
-        addLog(`✅ Hyperopt tamamlandı: score=${data.best_score?.toFixed(4) || '?'}`);
+        const applyMsg = data.params_applied ? '✅ Parametreler uygulandı' : `⏭️ Apply: ${data.apply_reason || 'skipped'}`;
+        addLog(`✅ Hyperopt tamamlandı: score=${data.best_score?.toFixed(4) || '?'} | ${applyMsg}`);
         setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, is_optimized: true, ...data } } : prev);
       }
     } catch (err) {
       addLog('❌ Hyperopt çalıştırma hatası');
+    }
+  }, [addLog]);
+
+  // Phase 265: Hyperopt settings update
+  const handleHyperoptSettings = useCallback(async (patch: Record<string, any>) => {
+    try {
+      const res = await fetch(`${BACKEND_API_URL}/phase193/hyperopt/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+        addLog(`🔬 Hyperopt ayarları güncellendi`);
+      }
+    } catch (err) {
+      addLog('❌ Hyperopt ayar güncelleme hatası');
     }
   }, [addLog]);
 
@@ -1123,6 +1143,8 @@ export default function App() {
           onSLGuardSettings={handleSLGuardSettings}
           onFreqAIRetrain={handleFreqAIRetrain}
           onHyperoptRun={handleHyperoptRun}
+          onHyperoptSettings={handleHyperoptSettings}
+          settingsSnapshot={settings}
         />
       )}
 

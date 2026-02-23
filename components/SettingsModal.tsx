@@ -18,14 +18,22 @@ interface Props {
   phase193Status?: {
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; min_samples_for_train?: number };
-    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string };
+    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
   } | null;
   onSLGuardSettings?: (s: any) => void;
   onFreqAIRetrain?: () => void;
-  onHyperoptRun?: (n: number) => void;
+  onHyperoptRun?: (nTrials?: number, apply?: boolean, forceApply?: boolean) => void;
+  onHyperoptSettings?: (s: any) => void;
+  settingsSnapshot?: { zScoreThreshold?: number; minConfidenceScore?: number; entryTightness?: number; exitTightness?: number; stopLossAtr?: number; takeProfit?: number; trailActivationAtr?: number; trailDistanceAtr?: number };
 }
 
-export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun }) => {
+const formatUnix = (ts?: number) => {
+  if (!ts || ts === 0) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString('tr-TR', { day: '2-digit', month: '2-digit' });
+};
+
+export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, settingsSnapshot }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
   // Sync localSettings when settings prop changes (AI made changes)
@@ -711,31 +719,102 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-500 mb-3">
-                    🔬 Optuna ile Z-Skoru, SL/TP, giriş/çıkış gibi parametreleri otomatik optimize eder. En iyi kombinasyonu bulur.
+                    🔬 Optuna ile Z-Skoru, SL/TP, giriş/çıkış gibi parametreleri otomatik optimize eder.
                   </p>
+
+                  {/* Auto-Apply Toggle */}
+                  <div className="flex items-center justify-between bg-slate-900/50 rounded-lg p-2 mb-3">
+                    <span className="text-[10px] text-slate-400">Otomatik Uygula</span>
+                    <button
+                      onClick={() => onHyperoptSettings?.({ auto_apply_enabled: !phase193Status.hyperopt.auto_apply_enabled })}
+                      className={`w-9 h-5 rounded-full transition-colors relative ${phase193Status.hyperopt.auto_apply_enabled ? 'bg-cyan-500' : 'bg-slate-600'
+                        }`}
+                    >
+                      <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${phase193Status.hyperopt.auto_apply_enabled ? 'left-[18px]' : 'left-0.5'
+                        }`} />
+                    </button>
+                  </div>
+
+                  {/* Score & Telemetry */}
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div className="bg-slate-900/50 rounded p-2 text-center">
                       <div className="text-[10px] text-slate-500">En İyi Skor</div>
                       <div className="text-sm font-bold text-cyan-400">
                         {phase193Status.hyperopt.best_score?.toFixed(3) || '—'}
                       </div>
-                      <div className="text-[8px] text-slate-600">Sharpe benzeri metrik</div>
                     </div>
                     <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">İyileşme Oranı</div>
+                      <div className="text-[10px] text-slate-500">İyileşme</div>
                       <div className={`text-sm font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
                         {phase193Status.hyperopt.improvement_pct ? `+%${phase193Status.hyperopt.improvement_pct.toFixed(1)}` : '—'}
                       </div>
-                      <div className="text-[8px] text-slate-600">Öncekine göre</div>
                     </div>
                   </div>
-                  <button
-                    onClick={() => onHyperoptRun?.(100)}
-                    className="w-full text-xs font-bold py-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
-                  >
-                    🔬 Otomatik Optimize Et (100 Deneme)
-                  </button>
-                  <p className="text-[9px] text-slate-600 mt-1 text-center">100 farklı parametre kombinasyonu deneyerek en kârlı ayarları otomatik uygular</p>
+
+                  {/* Apply Telemetry */}
+                  <div className="bg-slate-900/50 rounded-lg p-2 mb-3 space-y-1">
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Son Optimize</span>
+                      <span className="text-slate-300">{formatUnix(phase193Status.hyperopt.last_optimize_time)}</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Son Apply</span>
+                      <span className="text-slate-300">{formatUnix(phase193Status.hyperopt.last_apply_time)}</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Sonuç</span>
+                      <span className={`font-bold ${phase193Status.hyperopt.last_apply_result === 'applied' ? 'text-emerald-400' : phase193Status.hyperopt.last_apply_result === 'never' ? 'text-slate-400' : 'text-amber-400'}`}>
+                        {phase193Status.hyperopt.last_apply_result || '—'}
+                      </span>
+                    </div>
+                    {phase193Status.hyperopt.last_apply_reason && phase193Status.hyperopt.last_apply_result !== 'never' && (
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-slate-500">Sebep</span>
+                        <span className="text-slate-400">{phase193Status.hyperopt.last_apply_reason}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Trade Verisi</span>
+                      <span className="text-slate-300">{phase193Status.hyperopt.trade_data_count || 0} adet</span>
+                    </div>
+                  </div>
+
+                  {/* Action Buttons */}
+                  <div className="grid grid-cols-3 gap-2 mb-3">
+                    <button
+                      onClick={() => onHyperoptRun?.(100, false, false)}
+                      className="text-[10px] font-bold py-2 rounded-lg bg-slate-700/50 text-slate-300 border border-slate-600 hover:bg-slate-600/50 transition-colors"
+                    >
+                      🧪 Dry Run
+                    </button>
+                    <button
+                      onClick={() => onHyperoptRun?.(100, true, false)}
+                      className="text-[10px] font-bold py-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+                    >
+                      🔬 Optimize+Apply
+                    </button>
+                    <button
+                      onClick={() => onHyperoptRun?.(30, true, true)}
+                      className="text-[10px] font-bold py-2 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition-colors"
+                    >
+                      ⚡ Force Apply
+                    </button>
+                  </div>
+
+                  {/* Runtime Active Params */}
+                  {settingsSnapshot && (
+                    <div className="bg-slate-900/50 rounded-lg p-2">
+                      <div className="text-[10px] text-slate-500 mb-1 font-medium">Runtime Aktif Parametreler</div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[10px]">
+                        <div className="flex justify-between"><span className="text-slate-500">Z-Score</span><span className="text-white font-mono">{settingsSnapshot.zScoreThreshold}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">minConf</span><span className="text-white font-mono">{settingsSnapshot.minConfidenceScore}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">Entry</span><span className="text-white font-mono">{settingsSnapshot.entryTightness}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">Exit</span><span className="text-white font-mono">{settingsSnapshot.exitTightness}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">SL ATR</span><span className="text-white font-mono">{settingsSnapshot.stopLossAtr}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">TP ATR</span><span className="text-white font-mono">{settingsSnapshot.takeProfit}</span></div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

@@ -171,11 +171,19 @@ class HHQHyperOptimizer:
         self.trades_since_optimize = 0
         self.n_trials = 100  # Optuna trials per optimization
         
-        # Load previous best params (Phase 262: now done async in lifespan via load_initial_state)
-        # self._load_best_params()
+        # Phase 265: Auto-apply settings
+        self.auto_apply_enabled = (os.getenv('HYPEROPT_AUTO_APPLY_ENABLED', 'false').lower() == 'true')
+        self.min_apply_improvement_pct = float(os.getenv('HYPEROPT_MIN_APPLY_IMPROVEMENT_PCT', '5'))
+        self.apply_cooldown_sec = int(os.getenv('HYPEROPT_APPLY_COOLDOWN_SEC', '1800'))
+        self.min_trades_for_apply = int(os.getenv('HYPEROPT_MIN_TRADES_FOR_APPLY', '100'))
+        self.last_apply_time = 0
+        self.last_apply_result = 'never'
+        self.last_apply_reason = ''
+        self.last_apply_params: Dict[str, Any] = {}
+        self.last_optimize_time = 0
         
         logger.info(f"HHQHyperOptimizer initialized (optuna={'✅' if OPTUNA_AVAILABLE else '❌'}, "
-                    f"auto_every={self.auto_optimize_every})")
+                    f"auto_every={self.auto_optimize_every}, auto_apply={self.auto_apply_enabled})")
     
     def _get_hyperparameters(self) -> List[Dict]:
         if self.strategy_mode == 'TREND':
@@ -260,6 +268,46 @@ class HHQHyperOptimizer:
         except Exception as e:
             logger.warning(f"Hyperopt apply error: {e}")
             return False
+
+    def _can_apply(self, improvement_pct: float = 0.0):
+        """Phase 265: Check if auto-apply conditions are met."""
+        if len(self.trade_data) < self.min_trades_for_apply:
+            return (False, 'insufficient_trades')
+        if improvement_pct < self.min_apply_improvement_pct:
+            return (False, 'low_improvement')
+        if self.last_apply_time and time.time() - self.last_apply_time < self.apply_cooldown_sec:
+            return (False, 'cooldown')
+        return (True, 'ok')
+    
+    async def maybe_apply_to_runtime(self, force: bool = False, trader=None, improvement_pct: float = 0.0) -> dict:
+        """Phase 265: Conditionally apply best params to runtime trader."""
+        if trader is None:
+            from main import global_paper_trader
+            trader = global_paper_trader
+        
+        if not force and not self.auto_apply_enabled:
+            self.last_apply_result = 'skipped'
+            self.last_apply_reason = 'auto_apply_disabled'
+            return {'applied': False, 'reason': 'auto_apply_disabled'}
+        
+        if not force:
+            ok, reason = self._can_apply(improvement_pct)
+            if not ok:
+                self.last_apply_result = 'skipped'
+                self.last_apply_reason = reason
+                logger.info(f"⏭️ Hyperopt apply skipped: {reason}")
+                return {'applied': False, 'reason': reason}
+        
+        applied = self.apply_to_trader(trader)
+        if applied:
+            self.last_apply_time = int(time.time())
+            self.last_apply_result = 'applied'
+            self.last_apply_reason = 'ok' if not force else 'forced'
+            self.last_apply_params = dict(self.best_params)
+        else:
+            self.last_apply_result = 'skipped'
+            self.last_apply_reason = 'apply_to_trader_returned_false'
+        return {'applied': applied, 'reason': self.last_apply_reason}
 
     def _suggest_params(self, trial) -> Dict[str, Any]:
         """Suggest parameter values for an Optuna trial."""
@@ -384,13 +432,16 @@ class HHQHyperOptimizer:
             
         return score
     
-    async def optimize(self, trades: List[Dict] = None, n_trials: int = None) -> Dict[str, Any]:
+    async def optimize(self, trades: List[Dict] = None, n_trials: int = None,
+                       apply: bool = False, force_apply: bool = False) -> Dict[str, Any]:
         """
         Run Optuna optimization on trade data.
         
         Args:
             trades: List of trade dicts (from SQLite). If None, uses cached data.
             n_trials: Number of optimization trials. Default: self.n_trials
+            apply: Whether to apply best params after optimization
+            force_apply: Force apply regardless of policy guards
         
         Returns:
             Dict with best params and score
@@ -449,6 +500,7 @@ class HHQHyperOptimizer:
             
             # Save
             await self._save_best_params(default_score, improvement)
+            self.last_optimize_time = int(time.time())
             
             result = {
                 'best_params': self.best_params,
@@ -458,6 +510,9 @@ class HHQHyperOptimizer:
                 'n_trials': trials,
                 'n_trades': len(self.trade_data),
                 'optimization_count': self.optimization_count,
+                'last_optimize_time': self.last_optimize_time,
+                'params_applied': False,
+                'apply_reason': 'not_requested',
             }
             
             logger.info(
@@ -465,6 +520,12 @@ class HHQHyperOptimizer:
                 f"(default={default_score:.4f}, improvement={improvement:+.1f}%)\n"
                 f"   Best params: {json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in self.best_params.items()})}"
             )
+            
+            # Phase 265: Auto-apply if requested
+            if apply or force_apply or self.auto_apply_enabled:
+                apply_res = await self.maybe_apply_to_runtime(force=force_apply, improvement_pct=improvement)
+                result['params_applied'] = apply_res['applied']
+                result['apply_reason'] = apply_res['reason']
             
             return result
         
@@ -551,6 +612,16 @@ class HHQHyperOptimizer:
             'trades_since_optimize': self.trades_since_optimize,
             'auto_optimize_every': self.auto_optimize_every,
             'last_optimization_time': self.last_optimization_time,
+            # Phase 265: Auto-apply telemetry
+            'auto_apply_enabled': self.auto_apply_enabled,
+            'min_apply_improvement_pct': self.min_apply_improvement_pct,
+            'apply_cooldown_sec': self.apply_cooldown_sec,
+            'min_trades_for_apply': self.min_trades_for_apply,
+            'last_optimize_time': self.last_optimize_time,
+            'last_apply_time': self.last_apply_time,
+            'last_apply_result': self.last_apply_result,
+            'last_apply_reason': self.last_apply_reason,
+            'last_apply_params_count': len(self.last_apply_params),
         }
 
 

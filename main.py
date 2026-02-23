@@ -27516,20 +27516,40 @@ async def phase193_hyperopt_run(request: Request):
     
     data = await request.json() if request.headers.get('content-type') == 'application/json' else {}
     n_trials = data.get('n_trials', 100)
+    apply = data.get('apply', False)
+    force_apply = data.get('force_apply', False)
     
     # Load trade data from paper trader if not already loaded
     if not hhq_hyperoptimizer.trade_data and 'global_paper_trader' in globals():
-        hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))  # Phase 246: trades not trade_history
+        hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))
     
-    result = await hhq_hyperoptimizer.optimize(n_trials=n_trials)
-    
-    # Phase 246C: Apply best params to runtime trader
-    if 'error' not in result and 'global_paper_trader' in globals():
-        applied = hhq_hyperoptimizer.apply_to_trader(global_paper_trader)
-        result['params_applied'] = applied
+    result = await hhq_hyperoptimizer.optimize(n_trials=n_trials, apply=apply, force_apply=force_apply)
     
     return JSONResponse(result)
 
+@app.post("/phase193/hyperopt/settings")
+async def phase193_hyperopt_settings(request: Request):
+    """Phase 265: Update hyperopt auto-apply policy."""
+    if not hhq_hyperoptimizer:
+        return JSONResponse({"error": "Hyperopt not available"}, status_code=400)
+    
+    data = await request.json()
+    
+    if 'auto_apply_enabled' in data:
+        hhq_hyperoptimizer.auto_apply_enabled = bool(data['auto_apply_enabled'])
+    if 'min_apply_improvement_pct' in data:
+        hhq_hyperoptimizer.min_apply_improvement_pct = max(0.0, min(50.0, float(data['min_apply_improvement_pct'])))
+    if 'apply_cooldown_sec' in data:
+        hhq_hyperoptimizer.apply_cooldown_sec = max(0, min(86400, int(data['apply_cooldown_sec'])))
+    if 'min_trades_for_apply' in data:
+        hhq_hyperoptimizer.min_trades_for_apply = max(20, min(5000, int(data['min_trades_for_apply'])))
+    
+    logger.info(f"🔬 Hyperopt settings updated: auto_apply={hhq_hyperoptimizer.auto_apply_enabled}, "
+                f"min_improve={hhq_hyperoptimizer.min_apply_improvement_pct}%, "
+                f"cooldown={hhq_hyperoptimizer.apply_cooldown_sec}s, "
+                f"min_trades={hhq_hyperoptimizer.min_trades_for_apply}")
+    
+    return JSONResponse(hhq_hyperoptimizer.get_status())
 
 @app.post("/paper-trading/market-order")
 async def paper_trading_market_order(request: Request):
