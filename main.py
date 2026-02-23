@@ -4111,6 +4111,14 @@ async def lifespan(app: FastAPI):
                                 }
                             )
                             logger.info(f"🏆 ML Governance: FreqAI registered → {_reg}")
+                            # Auto-promote if challenger was registered
+                            if _reg.get('role') == 'challenger':
+                                _promo = ml_governance_service.check_promotion('freqai')
+                                if _promo.get('should_promote'):
+                                    _result = ml_governance_service.promote('freqai', notes=_promo.get('reason', ''))
+                                    logger.warning(f"🏆 ML_AUTO_PROMOTE: freqai → {_result}")
+                                else:
+                                    logger.info(f"ML Governance: freqai promotion check → {_promo.get('reason')}")
                         except Exception as _gov_err:
                             logger.debug(f"ML Governance register error: {_gov_err}")
                 freqai_model.on_model_trained = _on_model_trained
@@ -4216,6 +4224,14 @@ async def lifespan(app: FastAPI):
                                 }
                             )
                             logger.info(f"🏆 ML Governance: entry_forecast registered → {_reg}")
+                            # Auto-promote if challenger was registered
+                            if _reg.get('role') == 'challenger':
+                                _promo = ml_governance_service.check_promotion('entry_forecast')
+                                if _promo.get('should_promote'):
+                                    _result = ml_governance_service.promote('entry_forecast', notes=_promo.get('reason', ''))
+                                    logger.warning(f"🏆 ML_AUTO_PROMOTE: entry_forecast → {_result}")
+                                else:
+                                    logger.info(f"ML Governance: entry_forecast promotion check → {_promo.get('reason')}")
                         except Exception as _gov_err:
                             logger.debug(f"ML Governance register error: {_gov_err}")
                     logger.info(f"✅ Entry forecast auto-retrain: {result}")
@@ -4231,6 +4247,52 @@ async def lifespan(app: FastAPI):
     if entry_forecast_service:
         safe_create_task(_entry_forecast_retrain_loop(), name="entry_forecast_retrain")
         logger.info(f"🔮 Phase 266: Entry forecast retrain loop started (every {ENTRY_FORECAST_RETRAIN_EVERY_SEC}s, min {ENTRY_FORECAST_RETRAIN_MIN_SAMPLES} samples)")
+    
+    # Phase 267B: Background ML Governance rollback check loop
+    async def _ml_governance_rollback_loop():
+        """Periodically check champion model health and trigger rollback if degraded."""
+        ML_ROLLBACK_CHECK_INTERVAL = 300  # 5 minutes
+        while True:
+            try:
+                await asyncio.sleep(ML_ROLLBACK_CHECK_INTERVAL)
+                if not ml_governance_service or not ml_governance_service.enabled or not ml_governance_service.auto_rollback:
+                    continue
+                
+                # Build recent metrics from last 50 trades
+                recent_trades = global_paper_trader.trades[-50:] if hasattr(global_paper_trader, 'trades') else []
+                if len(recent_trades) < 10:
+                    continue
+                
+                wins = sum(1 for t in recent_trades if (t.get('pnl') or 0) > 0)
+                total = len(recent_trades)
+                win_rate = wins / total if total > 0 else 0
+                total_pnl = sum(t.get('pnl', 0) for t in recent_trades)
+                avg_pnl_pct = total_pnl / total if total > 0 else 0
+                
+                recent_metrics = {
+                    'brier': 1.0 - win_rate,  # proxy: lower = better
+                    'pnl': avg_pnl_pct * 100,  # as percentage
+                    'win_rate': win_rate,
+                    'sample_count': total,
+                }
+                
+                # Check each model key
+                for model_key in list(ml_governance_service._registry.keys()):
+                    check = ml_governance_service.check_rollback(model_key, recent_metrics)
+                    if check.get('should_rollback'):
+                        _result = ml_governance_service.rollback(model_key, notes=check.get('reason', ''))
+                        logger.warning(f"🔄 ML_AUTO_ROLLBACK: {model_key} → {_result}")
+                    else:
+                        logger.debug(f"ML Governance rollback check: {model_key} → {check.get('reason')}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"ML Governance rollback loop error: {e}")
+                await asyncio.sleep(60)
+    
+    if ml_governance_service:
+        safe_create_task(_ml_governance_rollback_loop(), name="ml_governance_rollback")
+        logger.info("🏆 Phase 267B: ML Governance rollback check loop started (every 5min)")
     
     yield  # App is running
     
