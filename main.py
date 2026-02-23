@@ -19800,6 +19800,14 @@ except Exception as _efs_err:
     logger.warning(f"EntryForecastService import failed, using heuristic only: {_efs_err}")
     entry_forecast_service = None
 
+# Phase 267A: Portfolio VaR + Correlation Risk Budget
+try:
+    from portfolio_risk_service import PortfolioRiskService
+    portfolio_risk_service = PortfolioRiskService()
+except Exception as _prs_err:
+    logger.warning(f"PortfolioRiskService import failed: {_prs_err}")
+    portfolio_risk_service = None
+
 class ExitForecastModel:
     """Predicts likelihood to hold vs aggressive exit."""
     def __init__(self):
@@ -22544,6 +22552,26 @@ class PaperTradingEngine:
             self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
             logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
             return None
+        
+        # =========================================================================
+        # PHASE 267A: PORTFOLIO VaR + CORRELATION RISK GATE
+        # =========================================================================
+        if portfolio_risk_service and (portfolio_risk_service.var_enabled or portfolio_risk_service.corr_enabled):
+            _pos_notional = abs(price * signal.get('size', 0)) if signal.get('size') else self.balance * 0.02 * signal.get('leverage', 10)
+            _risk_check = portfolio_risk_service.check_entry_risk(
+                self.positions, self.balance,
+                trade_symbol, _pos_notional, side
+            )
+            if _risk_check.get('decision') == 'HARD_REJECT':
+                self.set_execution_feedback(trade_symbol, _risk_check.get('reason_code', 'RISK_BLOCK')[:40])
+                self.pipeline_metrics.setdefault('risk_var_block', 0)
+                self.pipeline_metrics.setdefault('risk_corr_block', 0)
+                if 'RISK_VAR' in _risk_check.get('reason_code', ''):
+                    self.pipeline_metrics['risk_var_block'] += 1
+                else:
+                    self.pipeline_metrics['risk_corr_block'] += 1
+                logger.info(f"🛡️ RISK_BLOCK: {side} {trade_symbol} {_risk_check['reason_code']}")
+                return None
         
         # =========================================================================
         # PHASE 33: POSITION SCALING LOGIC
@@ -27775,6 +27803,7 @@ async def phase193_status():
             "migration_ok": has_ml_tables,
         },
         "entry_forecast": _build_entry_forecast_telemetry(),
+        "risk": portfolio_risk_service.get_status() if portfolio_risk_service else {'enabled': False},
         "param_limits": PARAM_LIMITS
     })
 
@@ -27889,6 +27918,19 @@ async def phase193_entry_forecast_retrain():
         'used_samples': len(rows),
         'result': result
     })
+
+# ================================================================
+# Phase 267A: Portfolio Risk API
+# ================================================================
+
+@app.get("/api/risk/telemetry")
+async def api_risk_telemetry():
+    """Phase 267A: Portfolio VaR + correlation risk telemetry."""
+    if not portfolio_risk_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    return JSONResponse(portfolio_risk_service.get_telemetry(
+        global_paper_trader.positions, global_paper_trader.balance
+    ))
 
 @app.post("/phase193/hyperopt/run")
 async def phase193_hyperopt_run(request: Request):
