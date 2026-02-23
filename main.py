@@ -298,8 +298,39 @@ class SQLiteManager:
                 )
             ''')
             
+            # Phase 262: Optimizer runs & params
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS optimizer_runs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  optimizer_type TEXT NOT NULL,            -- PARAM_OPT | HYPEROPT
+                  run_ts INTEGER NOT NULL,
+                  trade_count INTEGER DEFAULT 0,
+                  objective TEXT,
+                  score_before REAL DEFAULT 0,
+                  score_after REAL DEFAULT 0,
+                  improvement_pct REAL DEFAULT 0,
+                  applied INTEGER DEFAULT 0,
+                  metadata_json TEXT DEFAULT '{}'
+                )
+            ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS optimizer_run_params (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL,
+                  param_name TEXT NOT NULL,
+                  old_value REAL,
+                  new_value REAL,
+                  target_value REAL,
+                  confidence REAL DEFAULT 0,
+                  FOREIGN KEY(run_id) REFERENCES optimizer_runs(id)
+                )
+            ''')
+
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_optimizer_runs_ts ON optimizer_runs(run_ts DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_optimizer_params_run ON optimizer_run_params(run_id)')
+
             await db.commit()
-            
             # Phase 261 Hotfix 4: Alter breakeven_states
             bk_migration_columns = [
                 ('order_id', 'TEXT'),
@@ -1316,6 +1347,70 @@ class SQLiteManager:
             except Exception as e2:
                 logger.error(f"Failed to load breakeven states: {e2}")
         return states
+    # ================================================================
+    # Phase 262: Optimizer Persistence
+    # ================================================================
+    async def save_optimizer_run(self, optimizer_type: str, run_ts: int, trade_count: int, 
+                                 objective: str, score_before: float, score_after: float, 
+                                 improvement_pct: float, applied: bool, 
+                                 params: list, metadata: dict = None) -> int:
+        """Save an optimizer run and its parameters to SQLite."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                INSERT INTO optimizer_runs 
+                (optimizer_type, run_ts, trade_count, objective, score_before, score_after, improvement_pct, applied, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (optimizer_type, run_ts, trade_count, objective, score_before, score_after, improvement_pct, int(applied), json.dumps(metadata or {})))
+            run_id = cursor.lastrowid
+            
+            if params:
+                param_rows = [
+                    (run_id, p['name'], p.get('old_value'), p.get('new_value'), p.get('target_value'), p.get('confidence', 0))
+                    for p in params
+                ]
+                await db.executemany('''
+                    INSERT INTO optimizer_run_params
+                    (run_id, param_name, old_value, new_value, target_value, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', param_rows)
+            
+            await db.commit()
+            return run_id
+
+    async def get_optimizer_history(self, limit: int = 10, run_type: str = None) -> list:
+        """Load optimizer history from SQLite."""
+        history = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                
+                query = 'SELECT * FROM optimizer_runs '
+                params = []
+                if run_type:
+                    query += 'WHERE optimizer_type = ? '
+                    params.append(run_type)
+                query += 'ORDER BY run_ts DESC LIMIT ?'
+                params.append(limit)
+                
+                async with db.execute(query, params) as cursor:
+                    runs = await cursor.fetchall()
+                    
+                for run in runs:
+                    run_dict = dict(run)
+                    run_dict['applied'] = bool(run_dict['applied'])
+                    run_dict['metadata'] = json.loads(run_dict['metadata_json']) if run_dict['metadata_json'] else {}
+                    
+                    async with db.execute('''
+                        SELECT * FROM optimizer_run_params WHERE run_id = ?
+                    ''', (run['id'],)) as p_cursor:
+                        params_raw = await p_cursor.fetchall()
+                        run_dict['params'] = [dict(p) for p in params_raw]
+                        
+                    history.append(run_dict)
+        except Exception as e:
+            logger.error(f"Failed to load optimizer history: {e}")
+            
+        return history
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -3433,7 +3528,24 @@ async def lifespan(app: FastAPI):
     # Phase 154: Load persisted breakeven states
     await breakeven_stop_manager.load_from_sqlite()
     logger.info(f"🔒 Breakeven states loaded: {len(breakeven_stop_manager.breakeven_state)} active")
-    
+    # Phase 262: Hydrate Optimizer History
+    try:
+        opt_history = await sqlite_manager.get_optimizer_history(limit=50, run_type='PARAM_OPT')
+        if opt_history:
+            parameter_optimizer.optimization_history = opt_history
+            # Set last optimization to the most recent run (index 0)
+            parameter_optimizer.last_optimization = opt_history[0]
+            logger.info(f"🤖 Phase 262: Loaded {len(opt_history)} parameter_optimizer runs from SQLite")
+        else:
+            logger.info("🤖 Phase 262: No previous parameter_optimizer history found.")
+            
+        # Hydrate Hyperopt state if available
+        if hhq_hyperoptimizer:
+            await hhq_hyperoptimizer.load_initial_state()
+            
+    except Exception as e:
+        logger.error(f"Failed to load optimizer history: {e}")
+
     # Initialize LiveBinanceTrader (if TRADING_MODE is live)
     # Note: Read TRADING_MODE here (after secrets are loaded) and update the trader
     trading_mode = os.environ.get('TRADING_MODE', 'paper')
@@ -5221,6 +5333,7 @@ SOFT_RISK_GATE_ENABLED = False
 ENTRY_TRADEABILITY_ENABLED = False
 PENDING_SM_V2_ENABLED = False
 REJECT_ATTRIBUTION_ENABLED = False
+ENTRY_FORECAST_ENABLED = True  # Phase 262: Optimistic Entry Forecast v1
 
 # =========================================================================
 # PHASE 245: TRADE COST ESTIMATOR + TICK-SIZE UTILITIES
@@ -8794,6 +8907,22 @@ class LightweightCoinAnalyzer:
         self._tick_count: int = 0
         self._last_candle_time: float = 0.0
         self._candle_interval: int = 300  # 5-minute candles (matches preload)
+        
+        # Phase 262: EMA stabilization for pullback inputs (60s window ≈ 20 scans @ 3s/scan -> alpha=0.1)
+        self.ema_atr: float = 0.0
+        self.ema_spread_pct: float = 0.0
+        self.ema_volume_ratio: float = 1.0
+        self.ema_ob_trend: float = 0.0
+
+    def _apply_ema(self, attr_name: str, new_value: float, alpha: float = 0.1) -> float:
+        current = getattr(self, attr_name)
+        if current == 0.0 and attr_name != 'ema_ob_trend':  # Initial hydration (trend can be 0)
+            setattr(self, attr_name, new_value)
+            return new_value
+        
+        smoothed = current + alpha * (new_value - current)
+        setattr(self, attr_name, smoothed)
+        return smoothed
     
     def get_coin_stats(self) -> dict:
         """
@@ -9136,7 +9265,8 @@ class LightweightCoinAnalyzer:
                 self._zscore_debug_count = 0
             if self._zscore_debug_count % 100 == 0:
                 logger.info(f"📊 ZSCORE_DEBUG: {self.symbol} closes={closes_count}/40 needed")
-        atr = calculate_atr(highs_list, lows_list, closes_list)
+        atr_raw = calculate_atr(highs_list, lows_list, closes_list)
+        atr_stable = self._apply_ema('ema_atr', atr_raw)
         
         # Phase 137: Calculate ADX for regime detection - now returns tuple with trend direction
         adx, adx_trend, plus_di, minus_di = calculate_adx(highs_list, lows_list, closes_list)
@@ -9149,7 +9279,7 @@ class LightweightCoinAnalyzer:
         
         self.opportunity.hurst = hurst
         self.opportunity.zscore = zscore
-        self.opportunity.atr = atr
+        self.opportunity.atr = atr_stable
         self.opportunity.adx = adx  # Phase 137: ADX for regime detection
         self.opportunity.adx_trend = adx_trend  # Trend direction: BULLISH/BEARISH/NEUTRAL
         self.opportunity.imbalance = imbalance
@@ -9160,8 +9290,8 @@ class LightweightCoinAnalyzer:
         # Phase 35: Calculate volatility as ATR percentage of price
         # This is the TRUE volatility measure - no artificial capping
         # BTC typically ~1.5%, SOL ~2.5%, DOGE ~4%, meme coins 5%+
-        if atr > 0 and self.opportunity.price > 0:
-            volatility_pct = (atr / self.opportunity.price) * 100
+        if atr_stable > 0 and self.opportunity.price > 0:
+            volatility_pct = (atr_stable / self.opportunity.price) * 100
             self.opportunity.spread_pct = volatility_pct  # Store actual volatility %
         
         # Calculate VWAP Z-Score for Layer 3 scoring
@@ -9186,14 +9316,16 @@ class LightweightCoinAnalyzer:
         
         # Calculate Volume Ratio for Layer 11 scoring
         # Phase XXX: Re-enabled volume spike detection for breakout warning
-        volume_ratio = 1.0
+        volume_ratio_raw = 1.0
         is_volume_spike = False
         if len(self.volumes) >= 21:
-            is_volume_spike, volume_ratio = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
+            is_volume_spike, volume_ratio_raw = detect_volume_spike(list(self.volumes), lookback=20, threshold=2.0)
+        
+        volume_ratio_stable = self._apply_ema('ema_volume_ratio', volume_ratio_raw)
         
         # Update coin-specific statistics for dynamic thresholds
         self.rsi_history.append(rsi_value)
-        self.volume_ratio_history.append(volume_ratio)
+        self.volume_ratio_history.append(volume_ratio_stable)
         self.hurst_history.append(hurst)
         
         # Get coin stats for dynamic threshold calculation
@@ -9209,7 +9341,8 @@ class LightweightCoinAnalyzer:
         coin_daily_trend, coin_daily_change = self.get_daily_trend()
         
         # Phase 177: Use real bid-ask spread, conservative fallback (0.10%) if not yet received
-        effective_spread = self.opportunity.bid_ask_spread_pct if self.opportunity.has_real_spread else 0.10
+        effective_spread_raw = self.opportunity.bid_ask_spread_pct if self.opportunity.has_real_spread else 0.10
+        effective_spread_stable = self._apply_ema('ema_spread_pct', effective_spread_raw)
         
         # Fetch MTF trend data for SMC (Phase 208) and FIB (Phase FIB)
         trend_data = mtf_confirmation.coin_trends.get(self.symbol, {}) if 'mtf_confirmation' in globals() else {}
@@ -9226,7 +9359,7 @@ class LightweightCoinAnalyzer:
                         cs_fib_context = build_fib_context(
                             signal_side=pre_side,
                             price=self.opportunity.price,
-                            atr=atr,
+                            atr=atr_stable,
                             adx=adx,
                             hurst=hurst,
                             trend_data=trend_data,
@@ -9235,14 +9368,18 @@ class LightweightCoinAnalyzer:
             except Exception as fib_err:
                 logger.debug(f"FIB context error in scanner: {fib_err}")
         
+        # Phase 262: Stable short-term OB flow
+        ob_trend_raw = self._get_imbalance_trend()
+        ob_trend_stable = self._apply_ema('ema_ob_trend', ob_trend_raw)
+        
         # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
             imbalance=imbalance,
             price=self.opportunity.price,
-            atr=atr,
-            spread_pct=effective_spread,
+            atr=atr_stable,
+            spread_pct=effective_spread_stable,
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             basis_pct=basis_pct,
@@ -9250,7 +9387,7 @@ class LightweightCoinAnalyzer:
             whale_zscore=whale_tracker.get_whale_zscore(self.symbol),  # Whale activity
             smc_data=trend_data.get('smc_1h'),  # Phase 208
             rsi=rsi_value,  # RSI for Layer 10
-            volume_ratio=volume_ratio,  # Volume spike for Layer 11
+            volume_ratio=volume_ratio_stable,  # Volume spike for Layer 11
             sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
             coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
             coin_daily_trend=coin_daily_trend,  # Coin's own daily trend (not BTC's)
@@ -9259,7 +9396,7 @@ class LightweightCoinAnalyzer:
             adx_trend=adx_trend,  # Trend direction: BULLISH/BEARISH/NEUTRAL
             is_volume_spike=is_volume_spike,  # Volume breakout detection
             market_regime=market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
-            ob_imbalance_trend=self._get_imbalance_trend(),  # Phase 156: Short-term OB flow
+            ob_imbalance_trend=ob_trend_stable,  # Phase 262: Short-term OB flow EMA
             funding_rate=funding_oi_tracker.funding_rates.get(self.symbol, 0.0),  # Phase 157
             coin_wr_penalty=trade_pattern_analyzer.get_coin_penalty(self.symbol),  # Phase 157
             side_wr_penalty=0,  # Phase 157: calculated inside generate_signal where signal_side is known
@@ -11793,7 +11930,7 @@ async def background_scanner_loop():
                                 'entry_tightness': global_paper_trader.entry_tightness,
                                 'max_positions': global_paper_trader.max_positions,
                             }
-                            optimization = parameter_optimizer.optimize(analysis, current_settings)
+                            optimization = await parameter_optimizer.optimize(analysis, current_settings)
                             
                             # Log AI analysis
                             total_pnl = analysis.get('total_pnl', 0)
@@ -18154,7 +18291,7 @@ class ParameterOptimizer:
         
         logger.info("🤖 ParameterOptimizer initialized (Phase 155: Gradient-based, disabled by default)")
     
-    def optimize(self, analysis: dict, current_settings: dict) -> dict:
+    async def optimize(self, analysis: dict, current_settings: dict) -> dict:
         """
         Korelasyon verilerine göre parametreleri target'a doğru kaydır.
         
@@ -18249,6 +18386,36 @@ class ParameterOptimizer:
         
         if changes:
             logger.info(f"🤖 OPTIMIZER: {len(changes)} gradient changes — {', '.join(changes[:3])}")
+            
+        # Phase 262: DB Persistence
+        params_to_save = []
+        for p_name, new_val in recommendations.items():
+            corr_data = correlations.get(p_name, {})
+            old_val = current_settings.get(p_name)
+            params_to_save.append({
+                'name': p_name,
+                'old_value': old_val,
+                'new_value': new_val,
+                'target_value': corr_data.get('target'),
+                'confidence': corr_data.get('confidence', 0)
+            })
+
+        try:
+            run_id = await sqlite_manager.save_optimizer_run(
+                optimizer_type='PARAM_OPT',
+                run_ts=int(turkey_time.timestamp()),
+                trade_count=trades_with_snapshot,
+                objective='gradient_corr',
+                score_before=total_pnl,
+                score_after=0.0,
+                improvement_pct=0.0,
+                applied=False,
+                params=params_to_save,
+                metadata={'correlations_count': len(correlations)}
+            )
+            result['run_id'] = run_id
+        except Exception as e:
+            logger.error(f"Failed to persist optimizer run: {e}")
         
         return result
     
@@ -19030,6 +19197,71 @@ class CoinPerformanceTracker:
             'best_performers': self.get_best_performers(10),
             'blocked_coins': [s for s in self.coin_stats.keys() if self.is_coin_blocked(s)]
         }
+
+# ============================================================================
+# PHASE 262: OPTIMISTIC ENTRY FORECAST (V1)
+# ============================================================================
+class EntryForecastModel:
+    """Predicts likelihood of reaching entry and calibrates pullback values based on UCB."""
+    def __init__(self):
+        self.enabled = ENTRY_FORECAST_ENABLED
+        self.ucb_explore = 0.15
+        
+    def build_entry_features(self, atr_pct: float, spread_pct: float, 
+                             vol_ratio: float, ob_trend: float, 
+                             score: float, hurst: float, adx: float) -> dict:
+        return {
+            'atr_pct': float(atr_pct or 0.0),
+            'spread_pct': float(spread_pct or 0.0),
+            'vol_ratio': float(vol_ratio or 1.0),
+            'ob_trend': float(ob_trend or 0.0),
+            'score': float(score or 50.0),
+            'hurst': float(hurst or 0.5),
+            'adx': float(adx or 20.0),
+            'composite_momentum': (float(score or 50) / 100.0) * (float(adx or 20) / 50.0),
+        }
+        
+    def predict_reversal_prob(self, features: dict) -> float:
+        """Returns heuristic probability [0.0 - 1.0] that price will retrace to limit entry."""
+        if not self.enabled:
+            return 0.5
+            
+        prob = 0.5
+        # High momentum / volume = runaway trend, low reversal prob
+        if features['composite_momentum'] > 0.6:
+            prob -= 0.15
+        if features['vol_ratio'] > 1.5:
+            prob -= 0.10
+            
+        # Regime impact
+        if features['hurst'] > 0.55:
+            prob -= 0.10  # Trending -> fewer deep pullbacks
+        elif features['hurst'] < 0.45:
+            prob += 0.20  # Ranging -> higher chance to hit limit entry
+            
+        if abs(features['ob_trend']) > 3.0:
+            prob -= 0.10  # Strong active flow -> pushes away from limit
+            
+        prob = max(0.1, min(0.9, prob))
+        return min(1.0, prob + self.ucb_explore)  # UCB optimistic bonus
+
+    def predict_expected_pullback_pct(self, features: dict, base_pullback: float) -> float:
+        """Modulates requested pullback based on forecast probability."""
+        if not self.enabled:
+            return base_pullback
+            
+        prob = self.predict_reversal_prob(features)
+        
+        # Low prob to hit limit -> shrink pullback to enter earlier
+        if prob < 0.4:
+            return max(base_pullback * 0.6, 0.002)  # Cap at min 0.2%
+        elif prob > 0.7:
+            # High prob -> demand slightly more value
+            return base_pullback * 1.15
+            
+        return base_pullback
+
+entry_forecast_model = EntryForecastModel()
 
 
 # Global CoinPerformanceTracker instance
@@ -21758,10 +21990,11 @@ class PaperTradingEngine:
                     blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
                     
                     # Clamp: blended entry must not exceed locked pullback entry
-                    locked_entry_frac = float(existing_pending.get('pullbackLocked', 0))
-                    # Defensive: real fraction is clamped ≤0.12; anything above is legacy percent
-                    if locked_entry_frac > 0.12:
-                        locked_entry_frac = locked_entry_frac / 100.0
+                    locked_entry_raw = float(existing_pending.get('pullbackLocked', 0))
+                    # Phase 262: Standardize unit parsing (internal fraction vs UI percentage)
+                    # Anything > 0.50 (i.e. 50%) is considered legacy percentage 
+                    locked_entry_frac = locked_entry_raw / 100.0 if locked_entry_raw > 0.50 else locked_entry_raw
+                    
                     if locked_entry_frac > 0:
                         signal_price = float(existing_pending.get('signalPrice', price))
                         if side == 'LONG':
@@ -21800,26 +22033,13 @@ class PaperTradingEngine:
                 )
                 return existing_pending
 
-            # Opposite direction: allow flip only if new signal is meaningfully stronger.
-            allow_flip = (
-                score_gap >= SIGNAL_MEMORY_OPPOSITE_FLIP_MIN_SCORE_GAP
-                or bool(signal.get('memoryFlipRecent', False) if signal else False)
+            # Phase 262: Enforce order-level cancellation for opposite pending side signals
+            self.pending_orders.remove(existing_pending)
+            self.pipeline_metrics['pending_flipped'] += 1
+            logger.info(
+                f"🔀 PENDING CANCEL: {trade_symbol} {existing_side}->{side} "
+                f"(Opposite direction signal overrides)"
             )
-            if allow_flip:
-                self.pending_orders.remove(existing_pending)
-                self.pipeline_metrics['pending_flipped'] += 1
-                logger.info(
-                    f"🔀 PENDING FLIP: {trade_symbol} {existing_side}->{side} "
-                    f"(score {old_score}->{new_score}, gap={score_gap})"
-                )
-            else:
-                self.set_execution_feedback(trade_symbol, "PENDING_OPPOSITE_WEAK")
-                logger.info(
-                    f"🚫 OPEN_POS SKIP: Opposite pending exists for {trade_symbol} "
-                    f"({existing_side}->{side}, score gap={score_gap})"
-                )
-                return None
-        
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
@@ -22100,24 +22320,83 @@ class PaperTradingEngine:
         _dyn_adj = _safe_float(_sig.get('pullbackDynAdj', 0), 0.0)
         _dyn_final = _safe_float(_sig.get('pullbackDynFinal', pullback_pct), pullback_pct)
         _dyn_band = str(_sig.get('pullbackDynRegimeBand', 'neutral') or 'neutral').lower()
+        
         # Clamp consistency
         if _dyn_floor <= 0:
             _dyn_floor = pullback_pct
         if _dyn_final <= 0:
             _dyn_final = pullback_pct
+            
+        # Phase 262: Optimistic Entry Forecast
+        if ENTRY_FORECAST_ENABLED and 'entry_forecast_model' in globals():
+            try:
+                features = entry_forecast_model.build_entry_features(
+                    atr_pct=(atr / price * 100) if price > 0 else 0,
+                    spread_pct=_safe_float(_sig.get('spreadPct', 0.0), 0.0),
+                    vol_ratio=_safe_float(_sig.get('volumeRatio', 1.0), 1.0),
+                    ob_trend=_safe_float(_sig.get('obImbalanceTrend', 0.0), 0.0),
+                    score=_safe_float(_sig.get('confidenceScore', 50.0), 50.0),
+                    hurst=_safe_float(_sig.get('hurst', 0.5), 0.5),
+                    adx=_safe_float(_sig.get('adx', 20.0), 20.0)
+                )
+                
+                # Modulate the final pullback requested
+                _dyn_final_forecast = entry_forecast_model.predict_expected_pullback_pct(features, _dyn_final)
+                
+                if _dyn_final_forecast != _dyn_final:
+                    prob = entry_forecast_model.predict_reversal_prob(features)
+                    logger.info(f"🔮 FORECAST: {trade_symbol} {side} prob={prob:.2f} | Pullback {_dyn_final:.4f}% -> {_dyn_final_forecast:.4f}%")
+                    _dyn_final = _dyn_final_forecast
+            except Exception as e:
+                logger.debug(f"Entry forecast error on {trade_symbol}: {e}")
+
         if _dyn_final < _dyn_floor:
             _dyn_final = _dyn_floor
+            
         if _dyn_floor != pullback_pct or _dyn_final != pullback_pct:
             logger.debug(
                 f"DYN_TELEM: {trade_symbol} floor={_dyn_floor:.4f} final={_dyn_final:.4f} "
                 f"base={_dyn_base:.4f} band={_dyn_band}"
             )
+            
+        # Phase 262: Apply forecast-calibrated _dyn_final to entry_price and pullback_pct
+        if _dyn_final != pullback_pct:
+            pullback_pct = _dyn_final
+            if side == 'LONG':
+                entry_price = price * (1.0 - (pullback_pct / 100.0))
+            else:
+                entry_price = price * (1.0 + (pullback_pct / 100.0))
+
+        # =========================================================================
+        # PHASE 262: PENDING ENTRY CORRIDOR / ANTI-CHASE LOGIC 
+        # =========================================================================
+        # If the price has already moved significantly in the trade direction since the signal,
+        # creating a pending order deep below current price means it would only fill on a major reversal,
+        # which invalidates the original signal pattern.
+        # Corridor limit: max 0.8 ATR favorable move allowed before chase is declared.
+        
+        signal_price = float(signal.get('price', signal.get('signalPrice', price))) if signal else price
+        
+        if side == 'LONG':
+            move_from_signal = price - signal_price
+        else:
+            move_from_signal = signal_price - price
+            
+        max_corridor_move = atr * 0.8  # Max 0.8 ATR favorable move
+        
+        if move_from_signal > max_corridor_move:
+            self.set_execution_feedback(trade_symbol, "ENTRY_CORRIDOR_EXCEEDED")
+            logger.info(
+                f"🚫 OPEN_POS SKIP: Anti-Chase Corridor exceeded for {trade_symbol} "
+                f"(moved {move_from_signal:.4f} > limit {max_corridor_move:.4f})"
+            )
+            return None
 
         pending_order = {
             "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
             "symbol": trade_symbol,
             "side": side,
-            "signalPrice": price,
+            "signalPrice": signal_price,
             "entryPrice": entry_price,
             "pullbackPct": pullback_pct,
             # Phase 239V2: Dynamic pullback lock + telemetry (from signal dict)
@@ -22129,6 +22408,7 @@ class PaperTradingEngine:
             "pullbackDynFinal": round(_dyn_final, 4),
             "pullbackDynFloor": round(_dyn_floor, 4),
             "pullbackDynRegimeBand": _dyn_band,
+            "forecastProb": round(prob, 3) if 'prob' in locals() else 0.5,
             "size": position_size,
             "sizeUsd": position_size_usd,
             "stopLoss": sl,
@@ -22211,11 +22491,21 @@ class PaperTradingEngine:
                     current_price = opp.get('price', 0)
                     break
             
+            signal_score = order.get('signalScore', 0)
+            is_confirmed = order.get('confirmed', False)
+            forecast_prob = order.get('forecastProb', 0.5)
+            
+            # Phase 262: Modulate fallback min score based on forecast (applied to ALL fallback paths)
+            fb_min_score = MARKET_FALLBACK_MIN_SCORE
+            if ENTRY_FORECAST_ENABLED:
+                if forecast_prob < 0.4:
+                    fb_min_score -= 10  # Runaway trend -> easier fallback
+                elif forecast_prob > 0.7:
+                    fb_min_score += 5   # Likely to hit limit -> harder fallback
+                    
             # Check expiration first (with high-score market fallback for confirmed signals)
             if current_time > expires_at:
-                signal_score = order.get('signalScore', 0)
-                is_confirmed = order.get('confirmed', False)
-                if is_confirmed and signal_score >= MARKET_FALLBACK_MIN_SCORE and current_price and current_price > 0:
+                if is_confirmed and signal_score >= fb_min_score and current_price and current_price > 0:
                     self.pipeline_metrics['market_fallback'] += 1
                     self.pipeline_metrics['fallback_on_expire'] += 1
                     self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
@@ -22443,7 +22733,7 @@ class PaperTradingEngine:
                     # Cancel: dropped too far below entry
                     if current_price < entry_price - cancel_distance:
                         signal_score = order.get('signalScore', 0)
-                        if signal_score >= MARKET_FALLBACK_MIN_SCORE:
+                        if signal_score >= fb_min_score:
                             self.pipeline_metrics['market_fallback'] += 1
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
@@ -22483,7 +22773,7 @@ class PaperTradingEngine:
                     # Cancel: rose too far above entry
                     if current_price > entry_price + cancel_distance:
                         signal_score = order.get('signalScore', 0)
-                        if signal_score >= MARKET_FALLBACK_MIN_SCORE:
+                        if signal_score >= fb_min_score:
                             self.pipeline_metrics['market_fallback'] += 1
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
@@ -22502,7 +22792,7 @@ class PaperTradingEngine:
                 if elapsed_ms > trail_timeout_ms:
                     # Fix 2: Strong signals get market fallback instead of timeout
                     signal_score = order.get('signalScore', 0)
-                    if signal_score >= MARKET_FALLBACK_MIN_SCORE:
+                    if signal_score >= fb_min_score:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
                         logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
@@ -23856,6 +24146,13 @@ class PaperTradingEngine:
             if pnl_percent > pos.get('mfe_pct', 0):
                 pos['mfe_pct'] = pnl_percent
                 pos['mfe_price'] = current_price
+                
+            # Phase 262: 5m Entry Quality MAE
+            if 'openTime' in pos:
+                age_sec = datetime.now().timestamp() - (pos['openTime'] / 1000)
+                if age_sec <= 300:
+                    if pnl_percent < pos.get('mae_5m_pct', 0):
+                        pos['mae_5m_pct'] = pnl_percent
             
             # Phase 217: Estimate funding fee cost
             open_time_ms = pos.get('openTime', 0)
@@ -26033,8 +26330,15 @@ async def optimizer_run_now():
                 'entry_tightness': global_paper_trader.entry_tightness,
                 'max_positions': global_paper_trader.max_positions,
             }
-            optimization = parameter_optimizer.optimize(analysis, current_settings)
+            optimization = await parameter_optimizer.optimize(analysis, current_settings)
             
+            if optimization.get('recommendations') and parameter_optimizer.enabled:
+                applied = parameter_optimizer.apply_recommendations(global_paper_trader, optimization['recommendations'])
+                if applied:      
+                    # Log the application of new settings
+                    logger.info(f"🤖 AI Optimizer applied new settings: {applied}")
+                    global_paper_trader.add_log(f"🤖 AI Optimizer yeni ayarları uyguladı: {applied}")
+
             return JSONResponse({
                 "success": True,
                 "analysis": analysis,
@@ -26168,10 +26472,29 @@ async def get_daily_performance():
 @app.get("/performance/optimizer-history")
 async def get_optimizer_history():
     """Get AI optimizer change history."""
-    history = parameter_optimizer.optimization_history[-20:]  # Last 20
+    # Phase 262: Read optimizer history from SQLite
+    history = await sqlite_manager.get_optimizer_history(limit=20, run_type='PARAM_OPT')
+    
+    # Format for UI compatibility
+    formatted_history = []
+    for run in history:
+        formatted = {
+            'timestamp': datetime.fromtimestamp(run['run_ts']).strftime('%d.%m.%Y %H:%M:%S'),
+            'total_pnl': run['score_before'],
+            'correlations_count': run.get('metadata', {}).get('correlations_count', 0),
+            'trades_with_snapshot': run['trade_count'],
+            'applied': run['applied'],
+            'recommendations': {},
+            'changes': []
+        }
+        for p in run.get('params', []):
+            formatted['recommendations'][p['param_name']] = p['new_value']
+            formatted['changes'].append(f"{p['param_name']}: {p['old_value']}→{p['new_value']}")
+        formatted_history.append(formatted)
+        
     return JSONResponse({
         "success": True,
-        "history": history
+        "history": formatted_history
     })
 
 @app.get("/performance/summary")

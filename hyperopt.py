@@ -171,8 +171,8 @@ class HHQHyperOptimizer:
         self.trades_since_optimize = 0
         self.n_trials = 100  # Optuna trials per optimization
         
-        # Load previous best params
-        self._load_best_params()
+        # Load previous best params (Phase 262: now done async in lifespan via load_initial_state)
+        # self._load_best_params()
         
         logger.info(f"HHQHyperOptimizer initialized (optuna={'✅' if OPTUNA_AVAILABLE else '❌'}, "
                     f"auto_every={self.auto_optimize_every})")
@@ -289,14 +289,19 @@ class HHQHyperOptimizer:
         trades_taken = 0
         pnls = []
         
+        import math
+        now_ms = time.time() * 1000
+        tau_days = 30.0
+        
         for trade in self.trade_data:
-            signal_score = trade.get('signalScore', 0)
-            zscore = trade.get('zscore', 0)
+            signal_score = trade.get('signalScore', trade.get('signal_score', 0))
+            zscore = trade.get('zscore', trade.get('z_score', 0))
             atr = trade.get('atr', 0)
-            entry_price = trade.get('entryPrice', 0)
-            exit_price = trade.get('exitPrice', 0)
+            entry_price = trade.get('entryPrice', trade.get('entry_price', 0))
+            exit_price = trade.get('exitPrice', trade.get('exit_price', 0))
             side = trade.get('side', 'LONG')
-            actual_pnl = trade.get('pnl', 0)
+            actual_pnl = trade.get('pnl', trade.get('pnl_percent', 0))
+            close_time = trade.get('closeTime', trade.get('close_time', now_ms))
             
             # Filter: would this trade pass with suggested params?
             if signal_score < params['min_confidence']:
@@ -337,14 +342,20 @@ class HHQHyperOptimizer:
             else:
                 # Use actual PnL if no ATR data
                 pnl_pct = actual_pnl
+                
+            # Phase 262: Time decay weighting
+            age_days = (now_ms - close_time) / (24 * 60 * 60 * 1000)
+            weight = math.exp(-age_days / tau_days) if age_days > 0 else 1.0
             
-            pnls.append(pnl_pct)
-            total_pnl += pnl_pct
+            weighted_pnl = pnl_pct * weight
             
-            if pnl_pct > 0:
-                winning_pnl += pnl_pct
+            pnls.append(weighted_pnl)
+            total_pnl += weighted_pnl
+            
+            if weighted_pnl > 0:
+                winning_pnl += weighted_pnl
             else:
-                losing_pnl += abs(pnl_pct)
+                losing_pnl += abs(weighted_pnl)
         
         if trades_taken < 10:
             return -100.0  # Penalty for too few trades
@@ -386,6 +397,14 @@ class HHQHyperOptimizer:
         
         if trades:
             self.trade_data = trades
+            
+        # Phase 262: DB fallback for dataset
+        if not self.trade_data:
+            from main import sqlite_manager
+            db_trades = await sqlite_manager.get_full_trade_history(limit=0)
+            if db_trades:
+                self.trade_data = db_trades
+                logger.info(f"🔬 Hyperopt: Loaded {len(db_trades)} trades from SQLite")
         
         if not self.trade_data or len(self.trade_data) < 20:
             return {'error': f'Not enough trades ({len(self.trade_data)}). Need at least 20.'}
@@ -426,7 +445,7 @@ class HHQHyperOptimizer:
             improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0
             
             # Save
-            self._save_best_params()
+            await self._save_best_params(default_score, improvement)
             
             result = {
                 'best_params': self.best_params,
@@ -455,9 +474,10 @@ class HHQHyperOptimizer:
         self.trade_data.append(trade)
         self.trades_since_optimize += 1
         
-        # Keep only last 500 trades
-        if len(self.trade_data) > 500:
-            self.trade_data = self.trade_data[-500:]
+        # Phase 262: Keep full history to utilize weighting correctly
+        # Instead of clipping at 500, we could allow more, but 2000 is a safe limit for RAM
+        if len(self.trade_data) > 2000:
+            self.trade_data = self.trade_data[-2000:]
     
     def should_auto_optimize(self) -> bool:
         """Check if auto-optimization should trigger."""
@@ -468,34 +488,50 @@ class HHQHyperOptimizer:
             and len(self.trade_data) >= 20
         )
     
-    def _save_best_params(self):
-        """Save best params to disk."""
+    async def _save_best_params(self, default_score: float = 0.0, improvement: float = 0.0):
+        """Save best params to SQLite."""
         try:
-            os.makedirs(self.data_dir, exist_ok=True)
-            filepath = os.path.join(self.data_dir, 'hyperopt_best_params.json')
-            with open(filepath, 'w') as f:
-                json.dump({
-                    'best_params': self.best_params,
-                    'best_score': self.best_score,
-                    'optimization_count': self.optimization_count,
-                    'timestamp': time.time(),
-                }, f, indent=2)
+            from main import sqlite_manager
+            params_list = []
+            for k, v in self.best_params.items():
+                params_list.append({
+                    'name': k,
+                    'new_value': v,
+                    'target_value': v,
+                })
+                
+            await sqlite_manager.save_optimizer_run(
+                optimizer_type='HYPEROPT',
+                run_ts=int(time.time()),
+                trade_count=len(self.trade_data),
+                objective=self.objective_type,
+                score_before=default_score,
+                score_after=self.best_score,
+                improvement_pct=improvement,
+                applied=True,
+                params=params_list,
+                metadata={'strategy_mode': self.strategy_mode, 'n_trials': self.n_trials}
+            )
         except Exception as e:
-            logger.warning(f"Hyperopt save error: {e}")
+            logger.warning(f"Hyperopt SQLite save error: {e}")
     
-    def _load_best_params(self):
-        """Load previous best params from disk."""
+    async def load_initial_state(self):
+        """Load initial state from DB."""
         try:
-            filepath = os.path.join(self.data_dir, 'hyperopt_best_params.json')
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-                self.best_params = data.get('best_params', {})
-                self.best_score = data.get('best_score', 0)
+            from main import sqlite_manager
+            opt_history = await sqlite_manager.get_optimizer_history(limit=50)
+            hyperopt_runs = [r for r in opt_history if r.get('optimizer_type') == 'HYPEROPT']
+            if hyperopt_runs:
+                last_run = hyperopt_runs[0]
+                self.best_score = last_run.get('score_after', 0)
+                self.best_params = {}
+                for p in last_run.get('params', []):
+                    self.best_params[p['param_name']] = p['new_value']
                 self.is_optimized = bool(self.best_params)
-                logger.info(f"Hyperopt: Loaded best params (score={self.best_score:.4f})")
+                logger.info(f"Hyperopt: Loaded best params from SQLite (score={self.best_score:.4f})")
         except Exception as e:
             logger.warning(f"Hyperopt load error: {e}")
+
     
     def get_status(self) -> dict:
         """Get optimizer status for monitoring."""
