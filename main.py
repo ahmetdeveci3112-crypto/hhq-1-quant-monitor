@@ -374,6 +374,35 @@ class SQLiteManager:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_ml_features_run ON ml_model_run_features(run_id)')
             await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ml_samples_trade_id ON ml_training_samples(trade_id) WHERE trade_id IS NOT NULL')
 
+            # Phase 266: Entry Forecast ML Events
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS entry_forecast_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_id TEXT UNIQUE NOT NULL,
+                  symbol TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  created_ts INTEGER NOT NULL,
+                  signal_price REAL,
+                  planned_entry_price REAL,
+                  pullback_pct_requested REAL,
+                  pullback_pct_applied REAL,
+                  forecast_prob REAL,
+                  forecast_uncertainty REAL,
+                  forecast_source TEXT,
+                  model_version TEXT,
+                  feature_json TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'PENDING',
+                  outcome_label INTEGER,
+                  outcome_reason TEXT,
+                  outcome_ts INTEGER,
+                  fill_price REAL,
+                  force_market INTEGER DEFAULT 0
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_efe_status_created ON entry_forecast_events(status, created_ts)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_efe_symbol_created ON entry_forecast_events(symbol, created_ts)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_efe_outcome ON entry_forecast_events(outcome_label, outcome_ts)')
+
             await db.commit()
             # Phase 261 Hotfix 4: Alter breakeven_states
             bk_migration_columns = [
@@ -1623,6 +1652,121 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Failed to backfill ML from trades: {e}")
         return {'inserted': inserted, 'skipped': skipped}
+
+    # ================================================================
+    # Phase 266: Entry Forecast ML Events
+    # ================================================================
+    async def save_entry_forecast_event(self, event_id: str, symbol: str, side: str,
+                                         created_ts: int, signal_price: float,
+                                         planned_entry_price: float,
+                                         pullback_pct_requested: float,
+                                         pullback_pct_applied: float,
+                                         forecast_prob: float, forecast_uncertainty: float,
+                                         forecast_source: str, model_version: str,
+                                         feature_json: str):
+        """Insert a new entry forecast event (idempotent on event_id)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    INSERT OR IGNORE INTO entry_forecast_events
+                    (event_id, symbol, side, created_ts, signal_price, planned_entry_price,
+                     pullback_pct_requested, pullback_pct_applied, forecast_prob,
+                     forecast_uncertainty, forecast_source, model_version, feature_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (event_id, symbol, side, created_ts, signal_price, planned_entry_price,
+                      pullback_pct_requested, pullback_pct_applied, forecast_prob,
+                      forecast_uncertainty, forecast_source, model_version, feature_json))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save entry forecast event: {e}")
+
+    async def finalize_entry_forecast_event(self, event_id: str, status: str,
+                                             outcome_label: int, outcome_reason: str,
+                                             outcome_ts: int, fill_price: float = None,
+                                             force_market: int = 0):
+        """Update a PENDING entry forecast event with its terminal outcome."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    UPDATE entry_forecast_events
+                    SET status = ?, outcome_label = ?, outcome_reason = ?,
+                        outcome_ts = ?, fill_price = ?, force_market = ?
+                    WHERE event_id = ? AND status = 'PENDING'
+                ''', (status, outcome_label, outcome_reason, outcome_ts,
+                      fill_price, force_market, event_id))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to finalize entry forecast event: {e}")
+
+    async def get_entry_forecast_training_rows(self, limit: int = 5000) -> list:
+        """Get labeled entry forecast events for model training."""
+        rows = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT * FROM entry_forecast_events
+                    WHERE outcome_label IS NOT NULL
+                    ORDER BY created_ts DESC LIMIT ?
+                ''', (limit,)) as cursor:
+                    raw = await cursor.fetchall()
+                for r in reversed(raw):
+                    rows.append(dict(r))
+        except Exception as e:
+            logger.error(f"Failed to get entry forecast training rows: {e}")
+        return rows
+
+    async def get_entry_forecast_labeled_count(self) -> int:
+        """Count labeled entry forecast events."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(
+                    'SELECT COUNT(*) FROM entry_forecast_events WHERE outcome_label IS NOT NULL'
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"Failed to count entry forecast labels: {e}")
+            return 0
+
+    async def save_entry_forecast_model_run(self, run_ts: int, sample_count: int,
+                                             accuracy: float, f1_score: float,
+                                             auc: float, brier: float,
+                                             model_version: str, metadata: dict = None) -> int:
+        """Persist an entry forecast model training run."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    INSERT INTO ml_model_runs
+                    (run_ts, sample_count, accuracy, f1_score, train_count, model_type, metadata_json)
+                    VALUES (?, ?, ?, ?, 0, ?, ?)
+                ''', (run_ts, sample_count, accuracy, f1_score, 'entry_forecast',
+                      json.dumps({**(metadata or {}), 'auc': auc, 'brier': brier, 'model_version': model_version})))
+                await db.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to save entry forecast model run: {e}")
+            return -1
+
+    async def get_latest_entry_forecast_model_run(self) -> dict:
+        """Get the most recent entry forecast model run."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute('''
+                    SELECT * FROM ml_model_runs
+                    WHERE model_type = 'entry_forecast'
+                    ORDER BY run_ts DESC LIMIT 1
+                ''') as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    return None
+                d = dict(row)
+                d['metadata'] = json.loads(d.get('metadata_json', '{}'))
+                return d
+        except Exception as e:
+            logger.error(f"Failed to get latest entry forecast model run: {e}")
+            return None
 
 # Global SQLite manager
 sqlite_manager = SQLiteManager()
@@ -3904,6 +4048,45 @@ async def lifespan(app: FastAPI):
     
     # Start position updater task (updates open positions every 2 seconds)
     position_updater_task = asyncio.create_task(position_price_update_loop())
+    
+    # Phase 266: Background entry forecast retrain loop
+    async def _entry_forecast_retrain_loop():
+        """Periodically retrain entry forecast model when enough labeled data exists."""
+        from entry_forecast_service import ENTRY_FORECAST_RETRAIN_EVERY_SEC, ENTRY_FORECAST_RETRAIN_MIN_SAMPLES
+        while True:
+            try:
+                await asyncio.sleep(ENTRY_FORECAST_RETRAIN_EVERY_SEC)
+                if not entry_forecast_service or not entry_forecast_service.enabled:
+                    continue
+                labeled_count = await sqlite_manager.get_entry_forecast_labeled_count()
+                if labeled_count < ENTRY_FORECAST_RETRAIN_MIN_SAMPLES:
+                    logger.debug(f"Entry forecast retrain skipped: {labeled_count}/{ENTRY_FORECAST_RETRAIN_MIN_SAMPLES} labeled samples")
+                    continue
+                rows = await sqlite_manager.get_entry_forecast_training_rows(limit=5000)
+                result = entry_forecast_service.fit(rows)
+                if 'error' not in result:
+                    await sqlite_manager.save_entry_forecast_model_run(
+                        run_ts=int(time.time()),
+                        sample_count=result.get('sample_count', len(rows)),
+                        accuracy=result.get('accuracy', 0),
+                        f1_score=result.get('f1', 0),
+                        auc=result.get('auc', 0),
+                        brier=result.get('brier', 0),
+                        model_version=result.get('model_version', 'unknown'),
+                        metadata=result
+                    )
+                    logger.info(f"✅ Entry forecast auto-retrain: {result}")
+                else:
+                    logger.warning(f"Entry forecast retrain error: {result['error']}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Entry forecast retrain loop error: {e}")
+                await asyncio.sleep(60)
+    
+    if entry_forecast_service:
+        safe_create_task(_entry_forecast_retrain_loop(), name="entry_forecast_retrain")
+        logger.info(f"🔮 Phase 266: Entry forecast retrain loop started (every {ENTRY_FORECAST_RETRAIN_EVERY_SEC}s, min {ENTRY_FORECAST_RETRAIN_MIN_SAMPLES} samples)")
     
     yield  # App is running
     
@@ -11546,8 +11729,10 @@ async def background_scanner_loop():
                     if price_shock_manager.shock_mode != 'NORMAL':
                         price_shock_manager.tighten_exposed_positions(global_paper_trader.positions)
                         cancelled = price_shock_manager.cancel_opposing_pending(global_paper_trader.pending_orders)
+                        _shock_ts = int(datetime.now().timestamp() * 1000)
                         for c in cancelled:
                             global_paper_trader.add_log(f"⚡ SHOCK_CANCEL: {c.get('side')} {c.get('symbol')} pending order cancelled ({price_shock_manager.shock_mode})")
+                            global_paper_trader._finalize_forecast_event(c.get('id', ''), 'CANCELLED', 0, 'shock_cancel', _shock_ts)
                 except Exception as e:
                     logger.debug(f"PriceShock check error: {e}")
                 
@@ -19606,6 +19791,14 @@ class EntryForecastModel:
 
 entry_forecast_model = EntryForecastModel()
 
+# Phase 266: Data-driven entry forecast service
+try:
+    from entry_forecast_service import EntryForecastService
+    entry_forecast_service = EntryForecastService()
+except Exception as _efs_err:
+    logger.warning(f"EntryForecastService import failed, using heuristic only: {_efs_err}")
+    entry_forecast_service = None
+
 class ExitForecastModel:
     """Predicts likelihood to hold vs aggressive exit."""
     def __init__(self):
@@ -22728,28 +22921,82 @@ class PaperTradingEngine:
         if _dyn_final <= 0:
             _dyn_final = pullback_pct
             
-        # Phase 262: Optimistic Entry Forecast
-        if ENTRY_FORECAST_ENABLED and 'entry_forecast_model' in globals():
+        # Phase 266: Data-driven Entry Forecast (with heuristic fallback)
+        _forecast_prob = 0.5
+        _forecast_uncertainty = 1.0
+        _forecast_source = 'none'
+        _forecast_model_version = 'none'
+        _forecast_features = {}
+        _pullback_pct_requested = _dyn_final  # snapshot before policy
+        
+        if ENTRY_FORECAST_ENABLED:
             try:
-                features = entry_forecast_model.build_entry_features(
-                    atr_pct=(atr / price * 100) if price > 0 else 0,
-                    spread_pct=_safe_float(_sig.get('spreadPct', 0.0), 0.0),
-                    vol_ratio=_safe_float(_sig.get('volumeRatio', 1.0), 1.0),
-                    ob_trend=_safe_float(_sig.get('obImbalanceTrend', 0.0), 0.0),
-                    score=_safe_float(_sig.get('confidenceScore', 50.0), 50.0),
-                    hurst=_safe_float(_sig.get('hurst', 0.5), 0.5),
-                    adx=_safe_float(_sig.get('adx', 20.0), 20.0)
-                )
+                # Build features dict for the ML service
+                _raw_feats = {
+                    'atr_pct': (atr / price * 100) if price > 0 else 0,
+                    'spread_pct': _safe_float(_sig.get('spreadPct', 0.0), 0.0),
+                    'vol_ratio': _safe_float(_sig.get('volumeRatio', 1.0), 1.0),
+                    'ob_trend': _safe_float(_sig.get('obImbalanceTrend', 0.0), 0.0),
+                    'score': _safe_float(_sig.get('confidenceScore', 50.0), 50.0),
+                    'hurst': _safe_float(_sig.get('hurst', 0.5), 0.5),
+                    'adx': _safe_float(_sig.get('adx', 20.0), 20.0),
+                    'regime_band': _dyn_band,
+                    'side': side,
+                    'zscore_abs': abs(_safe_float(_sig.get('zscore', 0.0), 0.0)),
+                    'eq_pass_count': int(_sig.get('entryExecPassed', 1) or 0),
+                    'exec_score': _safe_float(_sig.get('entryExecScore', 0.0), 0.0),
+                }
                 
-                # Modulate the final pullback requested
-                _dyn_final_forecast = entry_forecast_model.predict_expected_pullback_pct(features, _dyn_final)
-                
-                if _dyn_final_forecast != _dyn_final:
-                    prob = entry_forecast_model.predict_reversal_prob(features)
-                    logger.info(f"🔮 FORECAST: {trade_symbol} {side} prob={prob:.2f} | Pullback {_dyn_final:.4f}% -> {_dyn_final_forecast:.4f}%")
-                    _dyn_final = _dyn_final_forecast
+                if entry_forecast_service:
+                    _forecast_features = entry_forecast_service.build_features_dict(_raw_feats)
+                    pred = entry_forecast_service.predict_proba(_forecast_features)
+                    _forecast_prob = pred['prob']
+                    _forecast_uncertainty = pred['uncertainty']
+                    _forecast_source = pred['source']
+                    _forecast_model_version = pred['model_version']
+                    
+                    # Policy: adjust pullback if POLICY_APPLY is enabled
+                    _dyn_cap = _dyn_final * 1.5  # max 50% wider than current
+                    _dyn_final_forecast = entry_forecast_service.apply_policy(
+                        _dyn_final, _forecast_prob, _dyn_floor, _dyn_cap
+                    )
+                    
+                    if _dyn_final_forecast != _dyn_final:
+                        logger.info(
+                            f"🔮 FORECAST_MODEL_USED: {trade_symbol} {side} prob={_forecast_prob:.2f} "
+                            f"src={_forecast_source} | Pullback {_dyn_final:.4f}% -> {_dyn_final_forecast:.4f}%"
+                        )
+                        _dyn_final = _dyn_final_forecast
+                    else:
+                        logger.info(
+                            f"🔮 FORECAST_{'MODEL' if _forecast_source == 'model' else 'FALLBACK'}_USED: "
+                            f"{trade_symbol} {side} prob={_forecast_prob:.2f} src={_forecast_source} | "
+                            f"pullback={_dyn_final:.4f}% (unchanged, shadow={'no-policy' if not entry_forecast_service.policy_apply else 'neutral'})"
+                        )
+                else:
+                    # No service → use old heuristic directly
+                    features = entry_forecast_model.build_entry_features(
+                        atr_pct=(atr / price * 100) if price > 0 else 0,
+                        spread_pct=_safe_float(_sig.get('spreadPct', 0.0), 0.0),
+                        vol_ratio=_safe_float(_sig.get('volumeRatio', 1.0), 1.0),
+                        ob_trend=_safe_float(_sig.get('obImbalanceTrend', 0.0), 0.0),
+                        score=_safe_float(_sig.get('confidenceScore', 50.0), 50.0),
+                        hurst=_safe_float(_sig.get('hurst', 0.5), 0.5),
+                        adx=_safe_float(_sig.get('adx', 20.0), 20.0)
+                    )
+                    prob_h = entry_forecast_model.predict_reversal_prob(features)
+                    _forecast_prob = prob_h
+                    _forecast_source = 'fallback'
+                    _forecast_model_version = 'heuristic_v1'
+                    _forecast_features = features
+                    _dyn_final_forecast = entry_forecast_model.predict_expected_pullback_pct(features, _dyn_final)
+                    if _dyn_final_forecast != _dyn_final:
+                        logger.info(f"🔮 FORECAST_FALLBACK_USED: {trade_symbol} {side} prob={prob_h:.2f} | Pullback {_dyn_final:.4f}% -> {_dyn_final_forecast:.4f}%")
+                        _dyn_final = _dyn_final_forecast
             except Exception as e:
                 logger.debug(f"Entry forecast error on {trade_symbol}: {e}")
+        
+        prob = _forecast_prob  # expose for pending_order dict
 
         if _dyn_final < _dyn_floor:
             _dyn_final = _dyn_floor
@@ -22865,8 +23112,42 @@ class PaperTradingEngine:
         self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         
+        # Phase 266: Save entry forecast event to DB
+        try:
+            import json as _json
+            asyncio.create_task(sqlite_manager.save_entry_forecast_event(
+                event_id=pending_order['id'],
+                symbol=trade_symbol,
+                side=side,
+                created_ts=int(datetime.now().timestamp()),
+                signal_price=signal_price if 'signal_price' in dir() else price,
+                planned_entry_price=entry_price,
+                pullback_pct_requested=_pullback_pct_requested,
+                pullback_pct_applied=pullback_pct,
+                forecast_prob=_forecast_prob,
+                forecast_uncertainty=_forecast_uncertainty,
+                forecast_source=_forecast_source,
+                model_version=_forecast_model_version,
+                feature_json=_json.dumps(_forecast_features) if _forecast_features else '{}'
+            ))
+        except Exception as _efe_err:
+            logger.debug(f"Entry forecast event save error: {_efe_err}")
+        
         return pending_order
     
+    def _finalize_forecast_event(self, order_id: str, status: str, outcome_label: int,
+                                  reason: str, ts_ms: int, fill_price: float = None,
+                                  force_market: int = 0):
+        """Phase 266: Helper to finalize entry forecast event in background."""
+        try:
+            asyncio.create_task(sqlite_manager.finalize_entry_forecast_event(
+                event_id=order_id, status=status, outcome_label=outcome_label,
+                outcome_reason=reason, outcome_ts=int(ts_ms / 1000) if ts_ms > 1e9 else ts_ms,
+                fill_price=fill_price, force_market=force_market
+            ))
+        except Exception:
+            pass
+
     async def check_pending_orders(self, opportunities: list):
         """Check all pending orders against current prices and execute or expire them."""
         current_time = int(datetime.now().timestamp() * 1000)
@@ -22919,6 +23200,7 @@ class PaperTradingEngine:
                 self.set_execution_feedback(symbol, "PENDING_EXPIRED")
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
+                self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'timeout', current_time)
                 if PENDING_SM_V2_ENABLED:
                     transition_pending_state(order, 'EXPIRED', 'timeout', current_time)
                 continue
@@ -22946,6 +23228,7 @@ class PaperTradingEngine:
                         f"stale_thresh={stale_threshold_min}min+{stale_grace_min}min, reinforce={reinforced_count}, "
                         f"score {original_score}→{adjusted_score})"
                     )
+                    self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'stale_signal', current_time)
                     continue
             
             if not current_price or current_price <= 0:
@@ -22977,6 +23260,7 @@ class PaperTradingEngine:
                             self.set_execution_feedback(symbol, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
+                            self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
                             continue
                     else:  # SHORT
                         # SHORT için: Fiyat entry'den %3 daha yukarı çıktıysa → sinyal kaçırıldı
@@ -22987,6 +23271,7 @@ class PaperTradingEngine:
                             self.set_execution_feedback(symbol, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
+                            self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
                             continue
                     
                     # Beklemeye devam et
@@ -23147,6 +23432,7 @@ class PaperTradingEngine:
                         self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
+                        self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'trail_fail', current_time)
                         continue
                 else:  # SHORT
                     # Track peak price (like trail TP tracks peak for short)
@@ -23187,6 +23473,7 @@ class PaperTradingEngine:
                         self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
+                        self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'trail_fail', current_time)
                         continue
 
                 # Timeout check
@@ -23206,6 +23493,7 @@ class PaperTradingEngine:
                     self.set_execution_feedback(symbol, "TRAIL_ENTRY_TIMEOUT")
                     self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı, score={signal_score})")
                     logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s score={signal_score}")
+                    self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'trail_timeout', current_time)
                     continue
 
                 # Periodic log (every ~30s)
@@ -23241,6 +23529,7 @@ class PaperTradingEngine:
                 f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
                 f"| {rv['reason_summary']}"
             )
+            self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'recheck_fail', current_time)
             return True  # order removed
 
         if decision == 'WARN_WAIT' and not force_market:
@@ -23279,6 +23568,11 @@ class PaperTradingEngine:
         if existing_position:
             self.add_log(f"⚠️ {symbol}'de zaten pozisyon var, yeni order iptal edildi")
             logger.info(f"⚠️ SKIP ORDER: {symbol} already has open position")
+            # P1 fix: label as cancelled, not filled (no real position was created)
+            self._finalize_forecast_event(
+                order.get('id', ''), 'CANCELLED', 0, 'duplicate_position',
+                int(datetime.now().timestamp() * 1000), fill_price=fill_price
+            )
             return  # Don't create duplicate position
         
         
@@ -23688,6 +23982,17 @@ class PaperTradingEngine:
             logger.info(f"📂 Position saved to SQLite: {symbol} openTime={new_position.get('openTime')}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
+        
+        # Phase 266: Finalize entry forecast event (AFTER position actually created)
+        _efe_status = 'MARKET_FALLBACK' if force_market else 'FILLED'
+        _efe_label = 0 if force_market else 1
+        _efe_force = 1 if force_market else 0
+        self._finalize_forecast_event(
+            order.get('id', ''), _efe_status, _efe_label,
+            'market_fallback' if force_market else 'limit_fill',
+            int(datetime.now().timestamp() * 1000),
+            fill_price=fill_price, force_market=_efe_force
+        )
         
         # Calculate how much better than signal price we got
         signal_price = order.get('signalPrice', fill_price)
@@ -27468,6 +27773,7 @@ async def phase193_status():
             "ml_backfill_enabled": True,
             "migration_ok": has_ml_tables,
         },
+        "entry_forecast": _build_entry_forecast_telemetry(),
         "param_limits": PARAM_LIMITS
     })
 
@@ -27506,6 +27812,81 @@ async def phase193_freqai_backfill():
         "total_samples": len(freqai_model.training_data) if freqai_model else 0,
         "is_trained": freqai_model.is_trained if freqai_model else False,
         "status": freqai_model.get_status() if freqai_model else {}
+    })
+
+# ================================================================
+# Phase 266: Entry Forecast API
+# ================================================================
+
+def _build_entry_forecast_telemetry() -> dict:
+    """Build entry forecast telemetry for status response."""
+    if not entry_forecast_service:
+        return {'enabled': False}
+    return entry_forecast_service.get_status()
+
+@app.get("/phase193/entry-forecast/status")
+async def phase193_entry_forecast_status():
+    """Phase 266: Get entry forecast model status and metrics."""
+    if not entry_forecast_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    
+    status = entry_forecast_service.get_status()
+    labeled_count = await sqlite_manager.get_entry_forecast_labeled_count()
+    last_run = await sqlite_manager.get_latest_entry_forecast_model_run()
+    
+    # Recent forecast telemetry (24h)
+    try:
+        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+            ts_24h = int(time.time()) - 86400
+            async with db.execute('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome_label = 1 THEN 1 ELSE 0 END) as hits,
+                    AVG(forecast_prob) as avg_prob,
+                    SUM(CASE WHEN status = 'MARKET_FALLBACK' THEN 1 ELSE 0 END) as fallbacks
+                FROM entry_forecast_events
+                WHERE created_ts > ? AND outcome_label IS NOT NULL
+            ''', (ts_24h,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0] > 0:
+                    status['recent_hit_rate_24h'] = round(row[1] / row[0], 4) if row[0] > 0 else 0
+                    status['recent_avg_prob'] = round(row[2], 4) if row[2] else 0
+                    status['recent_market_fallback_rate'] = round(row[3] / row[0], 4) if row[0] > 0 else 0
+                    status['recent_total_24h'] = row[0]
+    except Exception as e:
+        logger.debug(f"Entry forecast telemetry error: {e}")
+    
+    status['labeled_samples'] = labeled_count
+    status['last_model_run'] = last_run
+    return JSONResponse(status)
+
+@app.post("/phase193/entry-forecast/retrain")
+async def phase193_entry_forecast_retrain():
+    """Phase 266: Manual entry forecast model retrain."""
+    if not entry_forecast_service:
+        return JSONResponse({'error': 'service not initialized'}, status_code=400)
+    
+    labeled_count = await sqlite_manager.get_entry_forecast_labeled_count()
+    rows = await sqlite_manager.get_entry_forecast_training_rows(limit=5000)
+    
+    result = entry_forecast_service.fit(rows)
+    
+    if 'error' not in result:
+        await sqlite_manager.save_entry_forecast_model_run(
+            run_ts=int(time.time()),
+            sample_count=result.get('sample_count', len(rows)),
+            accuracy=result.get('accuracy', 0),
+            f1_score=result.get('f1', 0),
+            auc=result.get('auc', 0),
+            brier=result.get('brier', 0),
+            model_version=result.get('model_version', 'unknown'),
+            metadata=result
+        )
+    
+    return JSONResponse({
+        'labeled_count': labeled_count,
+        'used_samples': len(rows),
+        'result': result
     })
 
 @app.post("/phase193/hyperopt/run")
