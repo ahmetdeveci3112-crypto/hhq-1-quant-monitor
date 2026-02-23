@@ -100,6 +100,8 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     } catch (err: any) {
       // Revert on error
       setGovToggles(prev);
+      const msg = err?.message || 'Toggle güncellenemedi';
+      alert(`ML Governance hata: ${msg}`);
       console.error('Governance toggle error:', err);
     } finally {
       setGovToggleLoading(null);

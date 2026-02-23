@@ -59,16 +59,25 @@ class MLGovernanceService:
     # Runtime toggle management + file persistence
     # ------------------------------------------------------------------
     def _load_toggles(self):
-        """Load persisted toggle settings from file (overrides env defaults)."""
+        """Load persisted toggle settings from file, but env vars win if explicitly set.
+        
+        Priority: env explicitly 'true' > file > env default ('false').
+        This ensures `fly secrets set` always wins over stale file values.
+        """
+        # Check if env vars are explicitly set to 'true' (not default)
+        env_promote_explicit = os.getenv('ML_GOVERNANCE_AUTO_PROMOTE', '').lower() == 'true'
+        env_rollback_explicit = os.getenv('ML_GOVERNANCE_AUTO_ROLLBACK', '').lower() == 'true'
+        
         try:
             if os.path.exists(self._settings_path):
                 with open(self._settings_path, 'r') as f:
                     data = json.load(f)
-                if isinstance(data.get('auto_promote'), bool):
+                # File values apply ONLY if env is not explicitly 'true'
+                if not env_promote_explicit and isinstance(data.get('auto_promote'), bool):
                     self.auto_promote = data['auto_promote']
-                if isinstance(data.get('auto_rollback'), bool):
+                if not env_rollback_explicit and isinstance(data.get('auto_rollback'), bool):
                     self.auto_rollback = data['auto_rollback']
-                logger.info(f"ML Governance toggles loaded from {self._settings_path}: "
+                logger.info(f"ML Governance toggles loaded (env_override: promote={env_promote_explicit}, rollback={env_rollback_explicit}): "
                             f"auto_promote={self.auto_promote}, auto_rollback={self.auto_rollback}")
         except Exception as e:
             logger.debug(f"ML Governance settings load error: {e}")
