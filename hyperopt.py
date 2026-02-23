@@ -295,7 +295,8 @@ class HHQHyperOptimizer:
         
         for trade in self.trade_data:
             signal_score = trade.get('signalScore', trade.get('signal_score', 0))
-            zscore = trade.get('zscore', trade.get('z_score', 0))
+            # Phase 263 fix: support frontend-style "zScore" key from SQLite hydration
+            zscore = trade.get('zscore', trade.get('zScore', trade.get('z_score', 0)))
             atr = trade.get('atr', 0)
             entry_price = trade.get('entryPrice', trade.get('entry_price', 0))
             exit_price = trade.get('exitPrice', trade.get('exit_price', 0))
