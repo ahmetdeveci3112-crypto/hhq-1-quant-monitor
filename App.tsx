@@ -1228,7 +1228,7 @@ export default function App() {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
-          signalCount={opportunities.filter(o => o.signalAction !== 'NONE' && o.signalScore >= (settings.minConfidenceScore || 40)).length}
+          signalCount={(persistentSignals || []).filter(s => s.signalAction !== 'NONE' && s.state === 'ACTIVE').length}
           aiTrackingCount={optimizerStats.trackingCount}
         />
 

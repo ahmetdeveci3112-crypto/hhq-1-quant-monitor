@@ -5135,6 +5135,7 @@ COUNTER_SIGNAL_CONFIRM_COUNT = 2          # Opposites needed to invalidate
 COUNTER_SIGNAL_CONFIRM_WINDOW_SEC = 30    # Window for counter confirmations
 MAX_REENTRY_PER_SIGNAL = 2                # Max re-entry attempts per signal
 MIN_REENTRY_COOLDOWN_SEC = 90             # Cooldown between re-entries
+PERSISTENT_SIGNAL_TTL_SEC = 3600          # Active signal max lifetime (60 minutes)
 
 # ============================================================================
 # ENTRY QUALITY GATE — Feature Flags
@@ -10110,23 +10111,7 @@ class UIStateCache:
     def get_state(self) -> dict:
         """Return complete UI state for WebSocket - instant, no API calls."""
         # Phase 259: Generate persistent signals array for UI
-        now_ts = datetime.now().timestamp()
-        persistent_signals = []
-        if 'active_signals' in globals():
-            for sym, sig in active_signals.items():
-                if sig.get('state') == 'ACTIVE':
-                    persistent_signals.append({
-                        "symbol": sym,
-                        "signalAction": sig.get('side', 'NONE'),
-                        "signalScore": sig.get('score', 0),
-                        "createdTs": sig.get('created_ts', 0),
-                        "lastRefreshTs": sig.get('last_refresh_ts', 0),
-                        "state": sig.get('state'),
-                        "counterCount": sig.get('counter_count', 0),
-                        "reentryCount": sig.get('reentry_count', 0),
-                        "lastCloseTs": sig.get('last_close_ts', 0),
-                        "ageSec": max(0, now_ts - sig.get('created_ts', now_ts))
-                    })
+        persistent_signals = get_persistent_active_signals_snapshot()
         
         # Phase 259: Update activeSignals count to use persistent array length
         stats_copy = self.stats.copy()
@@ -12431,6 +12416,42 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
 
     symbol = signal.get('symbol', global_paper_trader.symbol)
 
+    async def _cleanup_symbol_pending_orders(clean_symbol: str, reason: str):
+        """Remove stale pending entries for a symbol and best-effort cancel live open entry orders."""
+        try:
+            before = len(global_paper_trader.pending_orders)
+            global_paper_trader.pending_orders = [
+                o for o in global_paper_trader.pending_orders if o.get('symbol') != clean_symbol
+            ]
+            removed = before - len(global_paper_trader.pending_orders)
+            if removed > 0:
+                logger.warning(f"🧹 PENDING_CLEANUP: {clean_symbol} removed {removed} local pending ({reason})")
+        except Exception as e:
+            logger.debug(f"Pending cleanup local error {clean_symbol}: {e}")
+
+        # Live side safety: cancel stale non-reduceOnly open orders for this symbol.
+        try:
+            if live_binance_trader.enabled and live_binance_trader.exchange:
+                ccxt_symbol = f"{clean_symbol[:-4]}/USDT:USDT"
+                open_orders = await live_binance_trader.exchange.fetch_open_orders(ccxt_symbol)
+                cancelled = 0
+                for o in open_orders:
+                    try:
+                        is_reduce = bool(o.get('reduceOnly') or (o.get('info', {}).get('reduceOnly') == 'true'))
+                        status = (o.get('status') or '').lower()
+                        if status not in ('open', 'new'):
+                            continue
+                        if is_reduce:
+                            continue
+                        await live_binance_trader.exchange.cancel_order(o['id'], ccxt_symbol)
+                        cancelled += 1
+                    except Exception:
+                        continue
+                if cancelled > 0:
+                    logger.warning(f"🗑️ BINANCE_PENDING_CANCEL: {clean_symbol} cancelled {cancelled} open entry order(s) ({reason})")
+        except Exception as e:
+            logger.debug(f"Pending cleanup Binance error {clean_symbol}: {e}")
+
     def reject_feedback(reason: str):
         try:
             global_paper_trader.set_execution_feedback(symbol, reason)
@@ -12516,6 +12537,16 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     now_ts = time.time()
     
     if PERSISTENT_SIGNAL_MODE:
+        # TTL guard: active signal expires after 60 minutes unless refreshed.
+        stale_signal = active_signals.get(symbol)
+        if stale_signal and stale_signal.get('state') == 'ACTIVE':
+            last_refresh = float(stale_signal.get('last_refresh_ts', stale_signal.get('created_ts', now_ts)) or now_ts)
+            age = now_ts - last_refresh
+            if age > PERSISTENT_SIGNAL_TTL_SEC:
+                logger.info(f"⌛ SIGNAL_EXPIRED: {symbol} {stale_signal.get('side')} age={age:.0f}s > {PERSISTENT_SIGNAL_TTL_SEC}s")
+                active_signals.pop(symbol, None)
+                await _cleanup_symbol_pending_orders(symbol, "SIGNAL_TTL_EXPIRED")
+
         existing_signal = active_signals.get(symbol)
         
         if existing_signal:
@@ -12574,6 +12605,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                                 f"⚡ COUNTER_CONFIRMED: {symbol} {action} (score:{signal_score}) "
                                 f"→ exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f}"
                             )
+
+                    # Counter flip must invalidate stale entry intentions immediately.
+                    await _cleanup_symbol_pending_orders(symbol, f"COUNTER_FLIP_{existing_signal['side']}_TO_{action}")
                     
                     # Create new active signal (flip)
                     active_signals[symbol] = {
@@ -25640,6 +25674,54 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 # Signals persist until invalidated by confirmed counter-signal
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
 
+def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> list:
+    """
+    Build UI snapshot of ACTIVE signals and prune stale entries by TTL.
+
+    TTL is measured from last refresh when available; otherwise created time.
+    """
+    if now_ts is None:
+        now_ts = datetime.now().timestamp()
+
+    if 'active_signals' not in globals():
+        return []
+
+    persistent_signals = []
+    stale_symbols = []
+
+    for sym, sig in list(active_signals.items()):
+        if sig.get('state') != 'ACTIVE':
+            continue
+
+        anchor_ts = sig.get('last_refresh_ts') or sig.get('created_ts') or now_ts
+        age = max(0, now_ts - anchor_ts)
+        if age > PERSISTENT_SIGNAL_TTL_SEC:
+            stale_symbols.append(sym)
+            continue
+
+        persistent_signals.append({
+            "symbol": sym,
+            "signalAction": sig.get('side', 'NONE'),
+            "signalScore": sig.get('score', 0),
+            "createdTs": sig.get('created_ts', 0),
+            "lastRefreshTs": sig.get('last_refresh_ts', 0),
+            "state": sig.get('state'),
+            "counterCount": sig.get('counter_count', 0),
+            "reentryCount": sig.get('reentry_count', 0),
+            "lastCloseTs": sig.get('last_close_ts', 0),
+            "ageSec": age
+        })
+
+    for sym in stale_symbols:
+        sig = active_signals.get(sym)
+        if sig and sig.get('state') == 'ACTIVE':
+            logger.info(
+                f"⌛ SIGNAL_EXPIRED_SNAPSHOT: {sym} {sig.get('side')} > {PERSISTENT_SIGNAL_TTL_SEC}s (UI prune)"
+            )
+            active_signals.pop(sym, None)
+
+    return persistent_signals
+
 # Phase 205: Last closed candle's close price per symbol
 # Updated by scanner candle builder (5m) — used for exit decisions instead of tick price
 # This prevents false exits caused by intra-candle wicks/spikes
@@ -26807,23 +26889,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             trades = ui_state_cache.trades or global_paper_trader.trades
 
             # Phase 259: Generate persistent signals array for UI
-            now_ts = datetime.now().timestamp()
-            persistent_signals = []
-            if 'active_signals' in globals():
-                for sym, sig in active_signals.items():
-                    if sig.get('state') == 'ACTIVE':
-                        persistent_signals.append({
-                            "symbol": sym,
-                            "signalAction": sig.get('side', 'NONE'),
-                            "signalScore": sig.get('score', 0),
-                            "createdTs": sig.get('created_ts', 0),
-                            "lastRefreshTs": sig.get('last_refresh_ts', 0),
-                            "state": sig.get('state'),
-                            "counterCount": sig.get('counter_count', 0),
-                            "reentryCount": sig.get('reentry_count', 0),
-                            "lastCloseTs": sig.get('last_close_ts', 0),
-                            "ageSec": max(0, now_ts - sig.get('created_ts', now_ts))
-                        })
+            persistent_signals = get_persistent_active_signals_snapshot()
 
             return {
                 "type": "scanner_update",
