@@ -501,8 +501,6 @@ class HHQHyperOptimizer:
             
             improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0
             
-            # Save
-            await self._save_best_params(default_score, improvement, applied=False)
             self.last_optimize_time = int(time.time())
             
             result = {
@@ -525,15 +523,15 @@ class HHQHyperOptimizer:
             )
             
             # Phase 265 fix: Only auto-apply when explicitly requested.
-            # auto_apply_enabled only applies to the background auto-optimize path,
-            # NOT to user-triggered API calls (Dry Run sends apply=false).
+            actually_applied = False
             if apply or force_apply:
                 apply_res = await self.maybe_apply_to_runtime(force=force_apply, improvement_pct=improvement)
                 result['params_applied'] = apply_res['applied']
                 result['apply_reason'] = apply_res['reason']
-                # Update DB record with actual applied status
-                if apply_res['applied']:
-                    await self._save_best_params(default_score, improvement, applied=True)
+                actually_applied = apply_res['applied']
+            
+            # Save once with correct applied status (no double records)
+            await self._save_best_params(default_score, improvement, applied=actually_applied)
             
             return result
         

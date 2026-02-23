@@ -24983,7 +24983,7 @@ class PaperTradingEngine:
             if hhq_hyperoptimizer and hhq_hyperoptimizer.enabled:
                 hhq_hyperoptimizer.record_trade(trade)
                 if hhq_hyperoptimizer.should_auto_optimize():
-                    asyncio.create_task(hhq_hyperoptimizer.optimize())
+                    asyncio.create_task(hhq_hyperoptimizer.optimize(apply=hhq_hyperoptimizer.auto_apply_enabled))
         except Exception as e:
             logger.warning(f"⚠️ Phase 193 post-close hook error: {e}")
         
