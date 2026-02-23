@@ -28136,7 +28136,7 @@ async def api_pnl_attribution(window: str = '24h'):
         return JSONResponse({'enabled': False, 'error': 'service not initialized'})
     hours = _parse_window_hours(window)
     return JSONResponse(pnl_attribution_service.aggregate_by_window(
-        global_paper_trader.trade_history, hours
+        global_paper_trader.trades, hours
     ))
 
 @app.get("/api/pnl/attribution/by-symbol")
@@ -28146,7 +28146,7 @@ async def api_pnl_attribution_by_symbol(window: str = '7d'):
         return JSONResponse({'enabled': False, 'error': 'service not initialized'})
     hours = _parse_window_hours(window)
     return JSONResponse(pnl_attribution_service.aggregate_by_symbol(
-        global_paper_trader.trade_history, hours
+        global_paper_trader.trades, hours
     ))
 
 @app.get("/api/pnl/attribution/by-reason")
@@ -28156,7 +28156,7 @@ async def api_pnl_attribution_by_reason(window: str = '7d'):
         return JSONResponse({'enabled': False, 'error': 'service not initialized'})
     hours = _parse_window_hours(window)
     return JSONResponse(pnl_attribution_service.aggregate_by_reason(
-        global_paper_trader.trade_history, hours
+        global_paper_trader.trades, hours
     ))
 
 def _parse_window_hours(window: str) -> float:
