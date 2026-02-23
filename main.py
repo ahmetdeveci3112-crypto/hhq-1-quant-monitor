@@ -1480,12 +1480,13 @@ class SQLiteManager:
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
+                # Fix P1: Fetch latest `limit` samples by DESC, then reverse to chronological ASC
                 async with db.execute('''
-                    SELECT * FROM ml_training_samples ORDER BY ts ASC LIMIT ?
+                    SELECT * FROM ml_training_samples ORDER BY ts DESC LIMIT ?
                 ''', (limit,)) as cursor:
                     rows = await cursor.fetchall()
                     
-                for row in rows:
+                for row in reversed(rows):
                     samples.append({
                         'timestamp': row['ts'],
                         'target': row['target'],
@@ -3683,7 +3684,10 @@ async def lifespan(app: FastAPI):
         # =====================================================================
         if freqai_model:
             json_path = os.path.join(freqai_model.data_dir, 'freqai_training_data.json')
-            if os.path.exists(json_path):
+            migrated_flag = json_path + '.migrated'
+            
+            # Fix P3: Idempotent migration
+            if os.path.exists(json_path) and not os.path.exists(migrated_flag):
                 logger.info("📦 Phase 263: Migrating FreqAI JSON data to SQLite...")
                 try:
                     with open(json_path, 'r') as f:
@@ -3695,7 +3699,8 @@ async def lifespan(app: FastAPI):
                             features=s.get('features', {}),
                             symbol='UNKNOWN', side='UNKNOWN', pnl=0.0, close_reason='MIGRATED', trade_id=None
                         )
-                    os.rename(json_path, json_path + '.migrated')
+                    # Mark as migrated
+                    open(migrated_flag, 'a').close()
                     logger.info(f"✅ Migrated {len(legacy_samples)} freqai records to SQLite.")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to migrate FreqAI JSON: {e}")
@@ -3725,10 +3730,10 @@ async def lifespan(app: FastAPI):
                 # Now hydrate and optionally retrain to build the in-memory binary model
                 freqai_model.hydrate_training_data(samples, retrain=True)
                 
-                # Restore stats from DB if available (to overwrite baseline retrain metrics with historical continuity if preferred)
+                # Fix P2: Restore train stats without unconditionally bumping the count
                 last_run = await sqlite_manager.get_latest_ml_model_run()
                 if last_run and freqai_model.train_count <= 1:
-                    freqai_model.train_count = last_run['train_count'] + 1 # Continue numbering
+                    freqai_model.train_count = last_run['train_count'] # Inherit accurate count
                     
                 logger.info(f"🧠 Phase 263: FreqAI ML Hydrated (samples: {len(samples)})")
             except Exception as e:
