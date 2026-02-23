@@ -120,35 +120,35 @@ class HHQHyperOptimizer:
     
     HYPERPARAMETERS = [
         {'name': 'sl_atr',           'type': 'float', 'min': 1.0,  'max': 5.0,  'default': 2.0},
-        {'name': 'tp_atr',           'type': 'float', 'min': 1.5,  'max': 6.0,  'default': 3.0},
-        {'name': 'exit_tightness',   'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.2},
-        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.8},
-        {'name': 'z_score_threshold','type': 'float', 'min': 0.8,  'max': 3.0,  'default': 1.6},
+        {'name': 'tp_atr',           'type': 'float', 'min': 1.5,  'max': 8.0,  'default': 3.0},
+        {'name': 'exit_tightness',   'type': 'float', 'min': 0.3,  'max': 3.0,  'default': 1.2},
+        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 4.0,  'default': 1.8},
+        {'name': 'z_score_threshold','type': 'float', 'min': 0.8,  'max': 2.5,  'default': 1.6},
         {'name': 'min_confidence',   'type': 'int',   'min': 50,   'max': 95,   'default': 68},
-        {'name': 'trail_activation', 'type': 'float', 'min': 0.5,  'max': 3.0,  'default': 1.5},
-        {'name': 'trail_distance',   'type': 'float', 'min': 0.3,  'max': 2.0,  'default': 1.0},
+        {'name': 'trail_activation', 'type': 'float', 'min': 0.3,  'max': 4.0,  'default': 1.5},
+        {'name': 'trail_distance',   'type': 'float', 'min': 0.2,  'max': 3.0,  'default': 1.0},
     ]
     
     HYPERPARAMETERS_TREND = [
-        {'name': 'sl_atr',           'type': 'float', 'min': 1.5,  'max': 4.0,  'default': 2.0},
+        {'name': 'sl_atr',           'type': 'float', 'min': 1.0,  'max': 5.0,  'default': 2.0},
         {'name': 'tp_atr',           'type': 'float', 'min': 2.0,  'max': 8.0,  'default': 4.0},
-        {'name': 'exit_tightness',   'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.0},
-        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.5},
+        {'name': 'exit_tightness',   'type': 'float', 'min': 0.3,  'max': 3.0,  'default': 1.0},
+        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 4.0,  'default': 1.5},
         {'name': 'z_score_threshold','type': 'float', 'min': 0.8,  'max': 2.5,  'default': 1.2},
-        {'name': 'min_confidence',   'type': 'int',   'min': 50,   'max': 90,   'default': 65},
-        {'name': 'trail_activation', 'type': 'float', 'min': 1.0,  'max': 4.0,  'default': 2.0},
-        {'name': 'trail_distance',   'type': 'float', 'min': 0.5,  'max': 3.0,  'default': 1.0},
+        {'name': 'min_confidence',   'type': 'int',   'min': 50,   'max': 95,   'default': 65},
+        {'name': 'trail_activation', 'type': 'float', 'min': 0.3,  'max': 4.0,  'default': 2.0},
+        {'name': 'trail_distance',   'type': 'float', 'min': 0.2,  'max': 3.0,  'default': 1.0},
     ]
 
     HYPERPARAMETERS_MR = [
-        {'name': 'sl_atr',           'type': 'float', 'min': 0.8,  'max': 3.0,  'default': 1.5},
-        {'name': 'tp_atr',           'type': 'float', 'min': 1.0,  'max': 4.0,  'default': 2.0},
-        {'name': 'exit_tightness',   'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.5},
-        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.8},
-        {'name': 'z_score_threshold','type': 'float', 'min': 1.5,  'max': 3.5,  'default': 2.0},
-        {'name': 'min_confidence',   'type': 'int',   'min': 65,   'max': 95,   'default': 75},
-        {'name': 'trail_activation', 'type': 'float', 'min': 0.5,  'max': 2.0,  'default': 1.0},
-        {'name': 'trail_distance',   'type': 'float', 'min': 0.3,  'max': 1.5,  'default': 0.5},
+        {'name': 'sl_atr',           'type': 'float', 'min': 1.0,  'max': 5.0,  'default': 1.5},
+        {'name': 'tp_atr',           'type': 'float', 'min': 1.0,  'max': 8.0,  'default': 2.0},
+        {'name': 'exit_tightness',   'type': 'float', 'min': 0.3,  'max': 3.0,  'default': 1.5},
+        {'name': 'entry_tightness',  'type': 'float', 'min': 0.5,  'max': 4.0,  'default': 1.8},
+        {'name': 'z_score_threshold','type': 'float', 'min': 0.8,  'max': 2.5,  'default': 2.0},
+        {'name': 'min_confidence',   'type': 'int',   'min': 50,   'max': 95,   'default': 75},
+        {'name': 'trail_activation', 'type': 'float', 'min': 0.3,  'max': 4.0,  'default': 1.0},
+        {'name': 'trail_distance',   'type': 'float', 'min': 0.2,  'max': 3.0,  'default': 0.5},
     ]
     
     def __init__(self, data_dir: str = './data', strategy_mode: str = 'DEFAULT'):

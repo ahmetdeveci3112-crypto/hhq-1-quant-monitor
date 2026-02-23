@@ -460,7 +460,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     type="number"
                     step="0.5"
                     min="1"
-                    max="10"
+                    max="8"
                     value={localSettings.takeProfit}
                     onChange={e => setLocalSettings({ ...localSettings, takeProfit: parseFloat(e.target.value) })}
                     className="bg-transparent w-full text-white outline-none text-sm"
