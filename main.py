@@ -4097,6 +4097,22 @@ async def lifespan(app: FastAPI):
                         ),
                         name="save_ml_run"
                     )
+                    # Phase 267B: Register model with ML Governance
+                    if ml_governance_service and ml_governance_service.enabled:
+                        try:
+                            _reg = ml_governance_service.register_model(
+                                model_key='freqai',
+                                version=f"v{payload.get('train_count', 1)}",
+                                metrics={
+                                    'accuracy': payload.get('accuracy', 0),
+                                    'f1_score': payload.get('f1_score', 0),
+                                    'sample_count': payload.get('sample_count', 0),
+                                    'brier': payload.get('brier', 0),
+                                }
+                            )
+                            logger.info(f"🏆 ML Governance: FreqAI registered → {_reg}")
+                        except Exception as _gov_err:
+                            logger.debug(f"ML Governance register error: {_gov_err}")
                 freqai_model.on_model_trained = _on_model_trained
                 
                 # Now hydrate and optionally retrain to build the in-memory binary model
@@ -4185,6 +4201,23 @@ async def lifespan(app: FastAPI):
                         model_version=result.get('model_version', 'unknown'),
                         metadata=result
                     )
+                    # Phase 267B: Register model with ML Governance
+                    if ml_governance_service and ml_governance_service.enabled:
+                        try:
+                            _reg = ml_governance_service.register_model(
+                                model_key='entry_forecast',
+                                version=result.get('model_version', f"ef-{int(time.time())}"),
+                                metrics={
+                                    'accuracy': result.get('accuracy', 0),
+                                    'f1_score': result.get('f1', 0),
+                                    'auc': result.get('auc', 0),
+                                    'brier': result.get('brier', 0),
+                                    'sample_count': result.get('sample_count', len(rows)),
+                                }
+                            )
+                            logger.info(f"🏆 ML Governance: entry_forecast registered → {_reg}")
+                        except Exception as _gov_err:
+                            logger.debug(f"ML Governance register error: {_gov_err}")
                     logger.info(f"✅ Entry forecast auto-retrain: {result}")
                 else:
                     logger.warning(f"Entry forecast retrain error: {result['error']}")
@@ -28057,6 +28090,22 @@ async def phase193_entry_forecast_retrain():
             model_version=result.get('model_version', 'unknown'),
             metadata=result
         )
+        # Phase 267B: Register with ML Governance
+        if ml_governance_service and ml_governance_service.enabled:
+            try:
+                ml_governance_service.register_model(
+                    model_key='entry_forecast',
+                    version=result.get('model_version', f"ef-{int(time.time())}"),
+                    metrics={
+                        'accuracy': result.get('accuracy', 0),
+                        'f1_score': result.get('f1', 0),
+                        'auc': result.get('auc', 0),
+                        'brier': result.get('brier', 0),
+                        'sample_count': result.get('sample_count', len(rows)),
+                    }
+                )
+            except Exception:
+                pass
     
     return JSONResponse({
         'labeled_count': labeled_count,
