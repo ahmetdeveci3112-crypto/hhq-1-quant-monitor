@@ -24428,7 +24428,7 @@ class PaperTradingEngine:
     def close_via_engine(self, pos: Dict, exit_price: float, reason: str, source: str = 'INTERNAL'):
         """Phase 257: Bridge to exit_engine for unified exit gate.
         Routes through exit_engine for double-close prevention + priority + telemetry.
-        Falls back to direct close_position if exit_engine is unavailable.
+        Strictly enforces routing; if engine is unavailable, the close request is dropped.
         """
         try:
             if exit_engine:
