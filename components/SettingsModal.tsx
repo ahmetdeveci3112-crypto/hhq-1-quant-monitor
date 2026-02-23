@@ -183,16 +183,16 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </p>
                 <input
                   type="range"
-                  min="30"
-                  max="80"
+                  min="50"
+                  max="95"
                   step="5"
                   value={localSettings.minConfidenceScore || 55}
                   onChange={e => setLocalSettings({ ...localSettings, minConfidenceScore: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>30 (Çok fazla sinyal)</span>
-                  <span>80 (Çok az sinyal)</span>
+                  <span>50 (Çok fazla sinyal)</span>
+                  <span>95 (Çok az sinyal)</span>
                 </div>
               </div>
 
@@ -231,7 +231,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     <input
                       type="range"
                       min="60"
-                      max="100"
+                      max="95"
                       step="5"
                       value={localSettings.minScoreHigh || 70}
                       onChange={e => setLocalSettings({ ...localSettings, minScoreHigh: parseInt(e.target.value) })}
@@ -272,7 +272,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.5"
-                max="15.0"
+                max="4.0"
                 step="0.1"
                 value={localSettings.entryTightness}
                 onChange={e => setLocalSettings({ ...localSettings, entryTightness: parseFloat(e.target.value) })}
@@ -280,7 +280,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.5x (Dar = Hızlı Giriş)</span>
-                <span>15.0x (Geniş = Seçici Giriş)</span>
+                <span>4.0x (Geniş = Seçici Giriş)</span>
               </div>
             </div>
           </div>
@@ -309,7 +309,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <input
                 type="range"
                 min="0.3"
-                max="15.0"
+                max="3.0"
                 step="0.1"
                 value={localSettings.exitTightness}
                 onChange={e => setLocalSettings({ ...localSettings, exitTightness: parseFloat(e.target.value) })}
@@ -317,7 +317,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               />
               <div className="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.3x (Hızlı Çıkış = Sıkı SL/TP)</span>
-                <span>15.0x (Sabrılı = Geniş SL/TP)</span>
+                <span>3.0x (Sabrılı = Geniş SL/TP)</span>
               </div>
             </div>
           </div>
@@ -475,7 +475,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   <input
                     type="number"
                     min="1"
-                    max="10"
+                    max="15"
                     value={localSettings.maxPositions}
                     onChange={e => setLocalSettings({ ...localSettings, maxPositions: parseInt(e.target.value) })}
                     className="bg-transparent w-full text-white outline-none text-sm"

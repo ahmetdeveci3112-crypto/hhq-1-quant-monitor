@@ -18567,6 +18567,31 @@ class PerformanceAnalyzer:
 
 
 # ============================================================================
+# PHASE 264: CENTRAL PARAMETER LIMITS
+# ============================================================================
+
+PARAM_LIMITS = {
+    'entry_tightness':    {'min': 0.5, 'max': 4.0,  'step': 0.1},
+    'exit_tightness':     {'min': 0.3, 'max': 3.0,  'step': 0.1},
+    'z_score_threshold':  {'min': 0.8, 'max': 2.5,  'step': 0.1},
+    'min_confidence_score': {'min': 50, 'max': 95,  'step': 1},
+    'min_score_low':      {'min': 30,  'max': 60,   'step': 1},
+    'min_score_high':     {'min': 60,  'max': 95,   'step': 1},
+    'max_positions':      {'min': 2,   'max': 15,   'step': 1},
+    'sl_atr':             {'min': 1.0, 'max': 5.0,  'step': 0.1},
+    'tp_atr':             {'min': 1.0, 'max': 8.0,  'step': 0.1},
+    'trail_activation_atr': {'min': 0.3, 'max': 4.0, 'step': 0.1},
+    'trail_distance_atr': {'min': 0.2, 'max': 3.0,  'step': 0.1},
+}
+
+def _clamp_param(name: str, value):
+    """Clamp a parameter to its PARAM_LIMITS range."""
+    lim = PARAM_LIMITS.get(name)
+    if lim is None:
+        return value
+    return max(lim['min'], min(lim['max'], value))
+
+# ============================================================================
 # PHASE 155: AI OPTIMIZER - GRADIENT-BASED PARAMETER OPTIMIZER
 # ============================================================================
 
@@ -18588,13 +18613,11 @@ class ParameterOptimizer:
         self.optimization_history = []
         self.enabled = False  # Varsayılan KAPALI — sadece settings modal'dan açılır
         
-        # Güvenlik sınırları — sadece gerçekten optimize edilen parametreler
+        # Güvenlik sınırları — PARAM_LIMITS'ten besle (Phase 264)
         self.limits = {
-            'entry_tightness': (0.5, 4.0),
-            'z_score_threshold': (0.8, 2.5),
-            'min_score_low': (30, 60),
-            'min_score_high': (60, 95),
-            'max_positions': (2, 15),
+            k: (v['min'], v['max'])
+            for k, v in PARAM_LIMITS.items()
+            if k in ('entry_tightness', 'z_score_threshold', 'min_score_low', 'min_score_high', 'max_positions')
         }
         
         # Max step — bir döngüde maksimum değişim (ani sıçrama önleme)
@@ -27234,31 +27257,49 @@ async def paper_trading_update_settings(
         global_paper_trader.leverage = leverage
     if riskPerTrade:
         global_paper_trader.risk_per_trade = riskPerTrade
-    # Phase 18: Full trading parameters
+    # Phase 264: Server-side clamp all incoming values
+    clamped_fields = []
+    
     if slAtr is not None:
+        slAtr = _clamp_param('sl_atr', slAtr)
         global_paper_trader.sl_atr = slAtr
     if tpAtr is not None:
+        tpAtr = _clamp_param('tp_atr', tpAtr)
         global_paper_trader.tp_atr = tpAtr
     if trailActivationAtr is not None:
+        trailActivationAtr = _clamp_param('trail_activation_atr', trailActivationAtr)
         global_paper_trader.trail_activation_atr = trailActivationAtr
     if trailDistanceAtr is not None:
+        trailDistanceAtr = _clamp_param('trail_distance_atr', trailDistanceAtr)
         global_paper_trader.trail_distance_atr = trailDistanceAtr
     if maxPositions is not None:
+        maxPositions = int(_clamp_param('max_positions', maxPositions))
         global_paper_trader.max_positions = maxPositions
     # Algorithm sensitivity settings
     if zScoreThreshold is not None:
+        zScoreThreshold = _clamp_param('z_score_threshold', zScoreThreshold)
         global_paper_trader.z_score_threshold = zScoreThreshold
     if minConfidenceScore is not None:
+        minConfidenceScore = int(_clamp_param('min_confidence_score', minConfidenceScore))
         global_paper_trader.min_confidence_score = minConfidenceScore
     # Phase 50: Dynamic Min Score Range
     if minScoreLow is not None:
+        minScoreLow = int(_clamp_param('min_score_low', minScoreLow))
         global_paper_trader.min_score_low = minScoreLow
     if minScoreHigh is not None:
+        minScoreHigh = int(_clamp_param('min_score_high', minScoreHigh))
         global_paper_trader.min_score_high = minScoreHigh
+    # Phase 264: Ensure min_score_low <= min_score_high
+    if hasattr(global_paper_trader, 'min_score_low') and hasattr(global_paper_trader, 'min_score_high'):
+        if global_paper_trader.min_score_low > global_paper_trader.min_score_high:
+            global_paper_trader.min_score_low, global_paper_trader.min_score_high = global_paper_trader.min_score_high, global_paper_trader.min_score_low
+            logger.warning(f"SETTINGS_NORMALIZED: Swapped min_score_low/high → low={global_paper_trader.min_score_low}, high={global_paper_trader.min_score_high}")
     # Phase 36: Entry/Exit tightness settings
     if entryTightness is not None:
+        entryTightness = _clamp_param('entry_tightness', entryTightness)
         global_paper_trader.entry_tightness = entryTightness
     if exitTightness is not None:
+        exitTightness = _clamp_param('exit_tightness', exitTightness)
         global_paper_trader.exit_tightness = exitTightness
     if strategyMode is not None:
         old_mode = getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
@@ -27384,7 +27425,8 @@ async def paper_trading_update_settings(
         "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
         "killSwitchFullClose": daily_kill_switch.full_close_pct,
-        "updatedPositions": updated_positions
+        "updatedPositions": updated_positions,
+        "param_limits": PARAM_LIMITS
     })
 
 
@@ -27424,7 +27466,8 @@ async def phase193_status():
             "ml_samples_count": ml_samples_count,
             "ml_backfill_enabled": True,
             "migration_ok": has_ml_tables,
-        }
+        },
+        "param_limits": PARAM_LIMITS
     })
 
 @app.post("/phase193/stoploss-guard/settings")

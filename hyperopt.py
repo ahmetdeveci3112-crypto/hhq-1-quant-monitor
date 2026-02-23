@@ -232,14 +232,16 @@ class HHQHyperOptimizer:
             pass  # If check fails, proceed with apply
         
         try:
-            # Map hyperopt param names to trader attributes
+            # Map hyperopt param names to trader attributes (Phase 264: aligned with PARAM_LIMITS)
             param_map = {
-                'sl_atr': ('sl_atr', lambda v: int(round(max(0.5, min(5.0, v)) * 10))),  # stored as 10x
+                'sl_atr': ('sl_atr', lambda v: int(round(max(1.0, min(5.0, v)) * 10))),  # stored as 10x
                 'tp_atr': ('tp_atr', lambda v: int(round(max(1.0, min(8.0, v)) * 10))),
                 'exit_tightness': ('exit_tightness', lambda v: max(0.3, min(3.0, v))),
-                'entry_tightness': ('entry_tightness', lambda v: max(0.3, min(3.0, v))),
+                'entry_tightness': ('entry_tightness', lambda v: max(0.5, min(4.0, v))),
                 'trail_activation': ('trail_activation_atr', lambda v: max(0.3, min(4.0, v))),
                 'trail_distance': ('trail_distance_atr', lambda v: max(0.2, min(3.0, v))),
+                'z_score_threshold': ('z_score_threshold', lambda v: max(0.8, min(2.5, v))),
+                'min_confidence': ('min_confidence_score', lambda v: int(round(max(50, min(95, v))))),
             }
             
             applied = []
