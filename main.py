@@ -4084,6 +4084,7 @@ async def lifespan(app: FastAPI):
                 logger.error(f"Entry forecast retrain loop error: {e}")
                 await asyncio.sleep(60)
     
+    from entry_forecast_service import ENTRY_FORECAST_RETRAIN_EVERY_SEC, ENTRY_FORECAST_RETRAIN_MIN_SAMPLES
     if entry_forecast_service:
         safe_create_task(_entry_forecast_retrain_loop(), name="entry_forecast_retrain")
         logger.info(f"🔮 Phase 266: Entry forecast retrain loop started (every {ENTRY_FORECAST_RETRAIN_EVERY_SEC}s, min {ENTRY_FORECAST_RETRAIN_MIN_SAMPLES} samples)")
