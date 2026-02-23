@@ -3787,6 +3787,44 @@ async def lifespan(app: FastAPI):
                 logger.info(f"🔄 Phase 263: ML Backfill result: {backfill_result}")
                 
                 samples = await sqlite_manager.get_ml_training_samples(limit=5000)
+                
+                # Phase 263b: Self-healing fallback — if DB still < 30 samples,
+                # build in-memory samples directly from trades table
+                if len(samples) < 30:
+                    logger.warning(f"⚠️ Phase 263b: Only {len(samples)} ML samples in DB, generating in-memory fallback from trades...")
+                    try:
+                        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+                            db.row_factory = aiosqlite.Row
+                            async with db.execute('''
+                                SELECT id, symbol, side, entry_price, pnl, close_time, close_reason, 
+                                       leverage, signal_score, z_score, hurst, adx, entry_spread, atr
+                                FROM trades WHERE close_time IS NOT NULL AND close_time > 0
+                                ORDER BY close_time DESC LIMIT 5000
+                            ''') as cursor:
+                                trade_rows = await cursor.fetchall()
+                        
+                        for tr in reversed(trade_rows):
+                            entry_p = tr['entry_price'] or 0
+                            atr_v = tr['atr'] or 0
+                            samples.append({
+                                'timestamp': (tr['close_time'] / 1000) if (tr['close_time'] or 0) > 1e12 else (tr['close_time'] or 0),
+                                'target': 1 if (tr['pnl'] or 0) > 0 else 0,
+                                'features': {
+                                    'zscore': tr['z_score'] or 0,
+                                    'hurst': tr['hurst'] or 0.5,
+                                    'rsi': 50, 'adx': tr['adx'] or 25,
+                                    'volume_ratio': 1.0, 'bb_position': 0, 'macd_histogram': 0,
+                                    'stoch_rsi_k': 50, 'ema_cross_bullish': 0, 'vwap_zscore': 0,
+                                    'spread_pct': tr['entry_spread'] or 0,
+                                    'funding_rate': 0, 'imbalance': 0,
+                                    'signal_score': tr['signal_score'] or 0,
+                                    'leverage': tr['leverage'] or 10,
+                                    'atr_pct': round((atr_v / entry_p * 100) if entry_p > 0 else 0, 4),
+                                }
+                            })
+                        logger.info(f"✅ Phase 263b: Built {len(samples)} in-memory samples from trades fallback")
+                    except Exception as fallback_err:
+                        logger.error(f"Phase 263b fallback failed: {fallback_err}")
                 # First build callbacks to catch any hook triggers
                 def _on_trade_recorded_dummy(record):
                     pass # Processed in close_position explicitly
@@ -27359,12 +27397,34 @@ async def paper_trading_update_settings(
 @app.get("/phase193/status")
 async def phase193_status():
     """Get status of all Phase 193 modules."""
+    # Phase 263b: ML table migration validation
+    has_ml_tables = False
+    ml_samples_count = 0
+    try:
+        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+            async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ml_training_samples'") as cur:
+                has_ml_tables = (await cur.fetchone()) is not None
+            if has_ml_tables:
+                async with db.execute("SELECT COUNT(*) FROM ml_training_samples") as cur:
+                    ml_samples_count = (await cur.fetchone())[0]
+    except Exception:
+        pass
+    
+    freqai_status = freqai_model.get_status() if freqai_model else {"enabled": False, "error": "not installed"}
+    freqai_status['min_samples_for_train'] = 30
+    
     return JSONResponse({
         "stoploss_guard": stoploss_frequency_guard.get_status(),
-        "freqai": freqai_model.get_status() if freqai_model else {"enabled": False, "error": "not installed"},
+        "freqai": freqai_status,
         "hyperopt": hhq_hyperoptimizer.get_status() if hhq_hyperoptimizer else {"enabled": False, "error": "not installed"},
         "ws_manager": ccxt_ws_manager.get_status() if ccxt_ws_manager else {"enabled": False, "error": "not installed"},
         "pandas_ta": PANDAS_TA_AVAILABLE,
+        "ml_diagnostics": {
+            "has_ml_tables": has_ml_tables,
+            "ml_samples_count": ml_samples_count,
+            "ml_backfill_enabled": True,
+            "migration_ok": has_ml_tables,
+        }
     })
 
 @app.post("/phase193/stoploss-guard/settings")

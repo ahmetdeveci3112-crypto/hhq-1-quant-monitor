@@ -17,7 +17,7 @@ interface Props {
   onToggleOptimizer?: () => void;
   phase193Status?: {
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
-    freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string };
+    freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; min_samples_for_train?: number };
     hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string };
   } | null;
   onSLGuardSettings?: (s: any) => void;
@@ -109,21 +109,19 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'LEGACY' })}
-                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${
-                    localSettings.strategyMode === 'LEGACY'
-                      ? 'bg-slate-600/70 border-slate-400 text-white'
-                      : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
-                  }`}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${localSettings.strategyMode === 'LEGACY'
+                    ? 'bg-slate-600/70 border-slate-400 text-white'
+                    : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
+                    }`}
                 >
                   Legacy
                 </button>
                 <button
                   onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'SMART_V2' })}
-                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${
-                    localSettings.strategyMode === 'SMART_V2'
-                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300'
-                      : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
-                  }`}
+                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${localSettings.strategyMode === 'SMART_V2'
+                    ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300'
+                    : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
+                    }`}
                 >
                   SMART_V2
                 </button>
@@ -407,9 +405,9 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
               <div className="flex justify-between items-center mb-2">
                 <label className="text-sm text-slate-300">Kaldıraç Çarpanı</label>
                 <span className={`text-sm font-mono font-bold ${(localSettings.leverageMultiplier ?? 1.0) < 0.7 ? 'text-emerald-400' :
-                    (localSettings.leverageMultiplier ?? 1.0) <= 1.3 ? 'text-blue-400' :
-                      (localSettings.leverageMultiplier ?? 1.0) <= 2.0 ? 'text-amber-400' :
-                        'text-rose-400'
+                  (localSettings.leverageMultiplier ?? 1.0) <= 1.3 ? 'text-blue-400' :
+                    (localSettings.leverageMultiplier ?? 1.0) <= 2.0 ? 'text-amber-400' :
+                      'text-rose-400'
                   }`}>
                   {(localSettings.leverageMultiplier ?? 1.0).toFixed(1)}x
                 </span>
@@ -697,7 +695,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   >
                     🧠 Modeli Yeniden Eğit
                   </button>
-                  <p className="text-[9px] text-slate-600 mt-1 text-center">Son işlem verilerini kullanarak ML modelini günceller (en az 50 işlem gerekli)</p>
+                  <p className="text-[9px] text-slate-600 mt-1 text-center">Son işlem verilerini kullanarak ML modelini günceller (en az {phase193Status.freqai.min_samples_for_train || 30} işlem gerekli)</p>
                 </div>
 
                 {/* Hyperopt */}
