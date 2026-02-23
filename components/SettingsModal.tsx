@@ -817,6 +817,56 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   )}
                 </div>
+
+                {/* Phase 267B: ML Governance */}
+                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <Brain className="w-4 h-4 text-teal-400" />
+                      <span className="text-sm font-medium text-white">ML Model Governance</span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded font-bold bg-teal-500/20 text-teal-400">
+                        Champion/Challenger
+                      </span>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mb-3">
+                    🏆 Yeni eğitilen modelleri &quot;challenger&quot; olarak test eder, performansı yeterli ise otomatik promosyon yapar.
+                  </p>
+
+                  <div className="grid grid-cols-2 gap-2 mb-3">
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Champion</div>
+                      <div className="text-sm font-bold text-teal-400">🏆 Active</div>
+                      <div className="text-[8px] text-slate-600">Mevcut modeli kullanır</div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Challenger</div>
+                      <div className="text-sm font-bold text-slate-400">⏳ Bekleniyor</div>
+                      <div className="text-[8px] text-slate-600">Shadow modda test eder</div>
+                    </div>
+                  </div>
+                  <div className="bg-slate-900/50 rounded-lg p-2 space-y-1">
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Auto Promote</span>
+                      <span className="text-slate-300">Kapalı</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Auto Rollback</span>
+                      <span className="text-slate-300">Kapalı</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Min Örneklem</span>
+                      <span className="text-slate-300 font-mono">100</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Min İyileşme</span>
+                      <span className="text-slate-300 font-mono">%2.0</span>
+                    </div>
+                  </div>
+                  <p className="text-[9px] text-slate-600 mt-2 text-center">
+                    ML_GOVERNANCE_ENABLED env flag ile aktifleştirilir
+                  </p>
+                </div>
               </div>
             </div>
           )}

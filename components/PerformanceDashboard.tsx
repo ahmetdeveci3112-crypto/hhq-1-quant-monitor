@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, TrendingDown, BarChart3, Trophy, AlertTriangle, Bot, RefreshCw } from 'lucide-react';
+import { TrendingUp, TrendingDown, BarChart3, Trophy, AlertTriangle, Bot, RefreshCw, Layers } from 'lucide-react';
 import { translateReason } from '../utils/reasonUtils';
 
 interface DailyPnL {
@@ -31,6 +31,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     const [summary, setSummary] = useState<any>(null);
     const [dailyPnl, setDailyPnl] = useState<DailyPnL[]>([]);
     const [coinStats, setCoinStats] = useState<any>(null);
+    const [attribution, setAttribution] = useState<any>(null);
     const [loading, setLoading] = useState(true);
 
     const fetchData = async () => {
@@ -48,6 +49,12 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 setDailyPnl(data.dailyPnl || []);
             }
             if (coinsRes.ok) setCoinStats(await coinsRes.json());
+
+            // Phase 267C: PnL Attribution (non-blocking)
+            try {
+                const attrRes = await fetch(`${apiUrl}/api/pnl/attribution?window=7d`);
+                if (attrRes.ok) setAttribution(await attrRes.json());
+            } catch { /* attribution endpoint may not exist yet */ }
         } catch (error) {
             console.error('Performans verisi alınamadı:', error);
         } finally {
@@ -362,6 +369,111 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                     <p className="text-xs text-rose-400/60 mt-3">
                         Bu coinlerde margin kaybı %100+ veya win rate %20 altı. Yeni pozisyon açılmaz.
                     </p>
+                </div>
+            )}
+
+            {/* Phase 267C: PnL Attribution */}
+            {attribution && attribution.trade_count > 0 && (
+                <div className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-slate-700/50 rounded-2xl p-4 sm:p-6 backdrop-blur-sm">
+                    <div className="flex items-center gap-3 mb-4">
+                        <div className="p-2 bg-gradient-to-br from-teal-500/20 to-emerald-500/20 rounded-xl">
+                            <Layers className="w-5 h-5 text-teal-400" />
+                        </div>
+                        <div>
+                            <h3 className="text-lg font-bold text-white">PnL Attribution</h3>
+                            <p className="text-xs text-slate-500">Son 7 gün — Sinyal / Uygulama / Zamanlama ayrıştırması</p>
+                        </div>
+                        <span className="ml-auto text-xs bg-teal-500/10 text-teal-400 px-2 py-1 rounded-full border border-teal-500/20">
+                            {attribution.trade_count} işlem
+                        </span>
+                    </div>
+
+                    {/* Alpha Breakdown Bars */}
+                    <div className="space-y-2 mb-4">
+                        {[{ key: 'signal', label: 'Sinyal Alpha', val: attribution.totals?.signal, color: 'bg-emerald-500', icon: '📡' },
+                        { key: 'execution', label: 'Uygulama Alpha', val: attribution.totals?.execution, color: 'bg-amber-500', icon: '⚡' },
+                        { key: 'timing', label: 'Zamanlama Alpha', val: attribution.totals?.timing, color: 'bg-purple-500', icon: '⏱️' }
+                        ].map(item => {
+                            const maxAbs = Math.max(
+                                Math.abs(attribution.totals?.signal || 0),
+                                Math.abs(attribution.totals?.execution || 0),
+                                Math.abs(attribution.totals?.timing || 0),
+                                0.01
+                            );
+                            const pct = Math.min(Math.abs(item.val || 0) / maxAbs * 100, 100);
+                            const isPositive = (item.val || 0) >= 0;
+                            return (
+                                <div key={item.key} className="flex items-center gap-2">
+                                    <span className="text-[10px] text-slate-400 w-28 truncate">{item.icon} {item.label}</span>
+                                    <div className="flex-1 h-4 bg-slate-800 rounded-full relative overflow-hidden">
+                                        <div
+                                            className={`h-full rounded-full transition-all duration-500 ${isPositive ? item.color : 'bg-rose-500'}`}
+                                            style={{ width: `${Math.max(pct, 2)}%` }}
+                                        />
+                                    </div>
+                                    <span className={`text-xs font-mono w-16 text-right ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                        {isPositive ? '+' : ''}${(item.val || 0).toFixed(2)}
+                                    </span>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* Cost Breakdown + Distribution */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+                        <div className="bg-slate-800/60 rounded-lg p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Brüt PnL</div>
+                            <div className={`text-sm font-bold ${(attribution.totals?.gross || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                ${(attribution.totals?.gross || 0).toFixed(2)}
+                            </div>
+                        </div>
+                        <div className="bg-slate-800/60 rounded-lg p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Komisyon</div>
+                            <div className="text-sm font-bold text-amber-400">
+                                -${(attribution.totals?.fee || 0).toFixed(2)}
+                            </div>
+                        </div>
+                        <div className="bg-slate-800/60 rounded-lg p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Slippage</div>
+                            <div className="text-sm font-bold text-orange-400">
+                                -${(attribution.totals?.slippage || 0).toFixed(2)}
+                            </div>
+                        </div>
+                        <div className="bg-slate-800/60 rounded-lg p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Funding</div>
+                            <div className={`text-sm font-bold ${(attribution.totals?.funding || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                ${(attribution.totals?.funding || 0).toFixed(2)}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Top Positive & Negative */}
+                    <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-emerald-900/20 border border-emerald-800/30 rounded-lg p-2">
+                            <div className="text-[10px] text-emerald-400 font-semibold mb-1">🟢 En İyi İşlemler</div>
+                            {(attribution.top_positive || []).slice(0, 3).map((t: any, i: number) => (
+                                <div key={i} className="flex justify-between text-[10px]">
+                                    <span className="text-slate-300">{(t.symbol || '').replace('USDT', '')}</span>
+                                    <span className="text-emerald-400 font-mono">+${(t.pnl || 0).toFixed(2)}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="bg-rose-900/20 border border-rose-800/30 rounded-lg p-2">
+                            <div className="text-[10px] text-rose-400 font-semibold mb-1">🔴 En Kötü İşlemler</div>
+                            {(attribution.top_negative || []).slice(0, 3).map((t: any, i: number) => (
+                                <div key={i} className="flex justify-between text-[10px]">
+                                    <span className="text-slate-300">{(t.symbol || '').replace('USDT', '')}</span>
+                                    <span className="text-rose-400 font-mono">${(t.pnl || 0).toFixed(2)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {attribution.consistency_ok === false && (
+                        <div className="mt-2 text-[10px] text-amber-400 bg-amber-900/20 p-2 rounded">
+                            ⚠️ {attribution.inconsistent_count} işlemde ayrıştırma tutarsızlığı tespit edildi
+                        </div>
+                    )}
                 </div>
             )}
 
