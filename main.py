@@ -27219,7 +27219,8 @@ async def paper_trading_get_settings():
         "leverageMultiplier": getattr(global_paper_trader, 'leverage_multiplier', 1.0),
         # Execution diagnostics
         "lastOrderError": live_binance_trader.last_order_error,
-        "pipelineMetrics": global_paper_trader.pipeline_metrics
+        "pipelineMetrics": global_paper_trader.pipeline_metrics,
+        "param_limits": PARAM_LIMITS
     })
 
 @app.post("/paper-trading/settings")
