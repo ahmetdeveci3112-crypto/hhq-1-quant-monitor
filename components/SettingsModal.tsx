@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { X, Save, Zap, TrendingUp, Target, LogOut, Bot, ShieldAlert, Brain, FlaskConical } from 'lucide-react';
 import { SystemSettings } from '../types';
 
@@ -27,6 +27,7 @@ interface Props {
   onHyperoptSettings?: (s: any) => void;
   onForceApplyLast?: () => void;
   settingsSnapshot?: { zScoreThreshold?: number; minConfidenceScore?: number; entryTightness?: number; exitTightness?: number; stopLossAtr?: number; takeProfit?: number; trailActivationAtr?: number; trailDistanceAtr?: number };
+  apiUrl?: string;
 }
 
 const formatUnix = (ts?: number) => {
@@ -35,7 +36,7 @@ const formatUnix = (ts?: number) => {
   return d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString('tr-TR', { day: '2-digit', month: '2-digit' });
 };
 
-export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, onForceApplyLast, settingsSnapshot }) => {
+export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, onForceApplyLast, settingsSnapshot, apiUrl }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
 
   // Sync localSettings when settings prop changes (AI made changes)
@@ -47,6 +48,63 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
     onSave(localSettings);
     onClose();
   };
+
+  // ── ML Governance toggle state ──
+  const [govToggles, setGovToggles] = useState({
+    auto_promote: phase193Status?.ml_governance?.auto_promote ?? false,
+    auto_rollback: phase193Status?.ml_governance?.auto_rollback ?? false,
+  });
+  const [govToggleLoading, setGovToggleLoading] = useState<string | null>(null);
+
+  // Sync toggles when phase193Status updates
+  useEffect(() => {
+    if (phase193Status?.ml_governance) {
+      setGovToggles({
+        auto_promote: phase193Status.ml_governance.auto_promote,
+        auto_rollback: phase193Status.ml_governance.auto_rollback,
+      });
+    }
+  }, [phase193Status?.ml_governance?.auto_promote, phase193Status?.ml_governance?.auto_rollback]);
+
+  const handleGovernanceToggle = useCallback(async (field: 'auto_promote' | 'auto_rollback', newValue: boolean) => {
+    if (!apiUrl) return;
+
+    // Confirm dialog for auto_rollback activation
+    if (field === 'auto_rollback' && newValue) {
+      const ok = window.confirm(
+        'Auto Rollback aktif edilecek.\n\nYanlış tetiklerde model geri dönüşü olabilir.\nEmin misiniz?'
+      );
+      if (!ok) return;
+    }
+
+    // Optimistic update
+    const prev = { ...govToggles };
+    setGovToggles(s => ({ ...s, [field]: newValue }));
+    setGovToggleLoading(field);
+
+    try {
+      const res = await fetch(`${apiUrl}/api/ml/governance/toggles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: newValue }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || data.reason || 'Toggle failed');
+      }
+      // Sync with backend response
+      setGovToggles({
+        auto_promote: data.auto_promote,
+        auto_rollback: data.auto_rollback,
+      });
+    } catch (err: any) {
+      // Revert on error
+      setGovToggles(prev);
+      console.error('Governance toggle error:', err);
+    } finally {
+      setGovToggleLoading(null);
+    }
+  }, [apiUrl, govToggles]);
 
   // Sensitivity level helper
   const getSensitivityLevel = () => {
@@ -863,17 +921,33 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                               {gov?.enabled ? '✅ Aktif' : '⚫ Kapalı'}
                             </span>
                           </div>
-                          <div className="flex justify-between text-[10px]">
+                          <div className="flex justify-between items-center text-[10px]">
                             <span className="text-slate-500">Auto Promote</span>
-                            <span className={`${gov?.auto_promote ? 'text-emerald-400' : 'text-slate-300'}`}>
-                              {gov?.auto_promote ? 'Açık' : 'Kapalı'}
-                            </span>
+                            {gov?.enabled ? (
+                              <button
+                                onClick={() => handleGovernanceToggle('auto_promote', !govToggles.auto_promote)}
+                                disabled={govToggleLoading !== null}
+                                className={`relative w-8 h-4 rounded-full transition-colors duration-200 ${govToggles.auto_promote ? 'bg-emerald-600' : 'bg-slate-600'} ${govToggleLoading === 'auto_promote' ? 'opacity-50' : ''}`}
+                              >
+                                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform duration-200 ${govToggles.auto_promote ? 'translate-x-4' : ''}`} />
+                              </button>
+                            ) : (
+                              <span className="text-slate-400">Kapalı</span>
+                            )}
                           </div>
-                          <div className="flex justify-between text-[10px]">
+                          <div className="flex justify-between items-center text-[10px]">
                             <span className="text-slate-500">Auto Rollback</span>
-                            <span className={`${gov?.auto_rollback ? 'text-emerald-400' : 'text-slate-300'}`}>
-                              {gov?.auto_rollback ? 'Açık' : 'Kapalı'}
-                            </span>
+                            {gov?.enabled ? (
+                              <button
+                                onClick={() => handleGovernanceToggle('auto_rollback', !govToggles.auto_rollback)}
+                                disabled={govToggleLoading !== null}
+                                className={`relative w-8 h-4 rounded-full transition-colors duration-200 ${govToggles.auto_rollback ? 'bg-emerald-600' : 'bg-slate-600'} ${govToggleLoading === 'auto_rollback' ? 'opacity-50' : ''}`}
+                              >
+                                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform duration-200 ${govToggles.auto_rollback ? 'translate-x-4' : ''}`} />
+                              </button>
+                            ) : (
+                              <span className="text-slate-400">Kapalı</span>
+                            )}
                           </div>
                           <div className="flex justify-between text-[10px]">
                             <span className="text-slate-500">Toplam Olay</span>

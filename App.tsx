@@ -1166,6 +1166,7 @@ export default function App() {
           onHyperoptSettings={handleHyperoptSettings}
           onForceApplyLast={handleForceApplyLast}
           settingsSnapshot={settings}
+          apiUrl={BACKEND_API_URL}
         />
       )}
 

@@ -13,6 +13,7 @@ import os
 import json
 import time
 import logging
+import tempfile
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ class MLGovernanceService:
         self._registry: Dict[str, Dict] = {}  # model_key -> {champion: {...}, challenger: {...}}
         self._policies: Dict[str, Dict] = {}  # model_key -> policy dict
         self._event_count = 0
+        self._settings_path = os.path.join('data', 'ml_governance_settings.json')
+
+        # Load persisted toggles (overrides env defaults if file exists)
+        self._load_toggles()
 
         logger.info(
             f"MLGovernanceService initialized "
@@ -50,6 +55,93 @@ class MLGovernanceService:
             f"auto_promote={'✅' if self.auto_promote else '❌'}, "
             f"auto_rollback={'✅' if self.auto_rollback else '❌'})"
         )
+    # ------------------------------------------------------------------
+    # Runtime toggle management + file persistence
+    # ------------------------------------------------------------------
+    def _load_toggles(self):
+        """Load persisted toggle settings from file (overrides env defaults)."""
+        try:
+            if os.path.exists(self._settings_path):
+                with open(self._settings_path, 'r') as f:
+                    data = json.load(f)
+                if isinstance(data.get('auto_promote'), bool):
+                    self.auto_promote = data['auto_promote']
+                if isinstance(data.get('auto_rollback'), bool):
+                    self.auto_rollback = data['auto_rollback']
+                logger.info(f"ML Governance toggles loaded from {self._settings_path}: "
+                            f"auto_promote={self.auto_promote}, auto_rollback={self.auto_rollback}")
+        except Exception as e:
+            logger.debug(f"ML Governance settings load error: {e}")
+
+    def _save_toggles(self):
+        """Atomically persist toggle settings to file."""
+        try:
+            os.makedirs(os.path.dirname(self._settings_path), exist_ok=True)
+            data = {
+                'auto_promote': self.auto_promote,
+                'auto_rollback': self.auto_rollback,
+                'updated_ts': int(time.time()),
+            }
+            # Atomic write: temp file + rename
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self._settings_path), suffix='.tmp'
+            )
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp_path, self._settings_path)
+            except Exception:
+                os.unlink(tmp_path)
+                raise
+            logger.info(f"ML Governance toggles saved: {data}")
+        except Exception as e:
+            logger.warning(f"ML Governance settings save error: {e}")
+
+    def set_runtime_toggles(
+        self, auto_promote: Optional[bool] = None, auto_rollback: Optional[bool] = None
+    ) -> Dict:
+        """Update auto_promote / auto_rollback at runtime.
+        
+        Persists to file so settings survive restart.
+        Logs a governance event for auditability.
+        """
+        if not self.enabled:
+            return {
+                'success': False,
+                'reason': 'governance_disabled',
+                'auto_promote': self.auto_promote,
+                'auto_rollback': self.auto_rollback,
+            }
+
+        old_promote = self.auto_promote
+        old_rollback = self.auto_rollback
+
+        if auto_promote is not None:
+            self.auto_promote = bool(auto_promote)
+        if auto_rollback is not None:
+            self.auto_rollback = bool(auto_rollback)
+
+        # Persist to file
+        self._save_toggles()
+
+        # Audit event
+        self._log_event('__system__', 'toggle_update', {
+            'old': {'auto_promote': old_promote, 'auto_rollback': old_rollback},
+            'new': {'auto_promote': self.auto_promote, 'auto_rollback': self.auto_rollback},
+            'ts': int(time.time()),
+        })
+
+        logger.warning(
+            f"🔧 ML_GOV_TOGGLE: auto_promote={old_promote}→{self.auto_promote}, "
+            f"auto_rollback={old_rollback}→{self.auto_rollback}"
+        )
+
+        return {
+            'success': True,
+            'auto_promote': self.auto_promote,
+            'auto_rollback': self.auto_rollback,
+            'source': 'runtime',
+        }
 
     async def hydrate_registry(self):
         """Reload registry from DB on startup so rollback/promote work after restart."""

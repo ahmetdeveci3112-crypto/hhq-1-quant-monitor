@@ -28262,6 +28262,38 @@ async def api_ml_governance_policy(request: Request):
     )
     return JSONResponse({'success': True, 'policy': result})
 
+@app.post("/api/ml/governance/toggles")
+async def api_ml_governance_toggles(request: Request):
+    """Phase 267F: Runtime toggle for auto_promote / auto_rollback."""
+    if not ml_governance_service:
+        return JSONResponse({'error': 'service not initialized'}, status_code=400)
+    body = await request.json()
+    
+    # Input validation: only accept bool or null
+    ap = body.get('auto_promote')
+    ar = body.get('auto_rollback')
+    if ap is not None and not isinstance(ap, bool):
+        return JSONResponse({'error': 'auto_promote must be boolean or null'}, status_code=400)
+    if ar is not None and not isinstance(ar, bool):
+        return JSONResponse({'error': 'auto_rollback must be boolean or null'}, status_code=400)
+    
+    result = ml_governance_service.set_runtime_toggles(
+        auto_promote=ap,
+        auto_rollback=ar,
+    )
+    return JSONResponse(result)
+
+@app.get("/api/ml/governance/toggles")
+async def api_ml_governance_toggles_get():
+    """Phase 267F: Read current toggle state."""
+    if not ml_governance_service:
+        return JSONResponse({'enabled': False, 'error': 'service not initialized'})
+    return JSONResponse({
+        'enabled': ml_governance_service.enabled,
+        'auto_promote': ml_governance_service.auto_promote,
+        'auto_rollback': ml_governance_service.auto_rollback,
+    })
+
 # ================================================================
 # Phase 267C: PnL Attribution API
 # ================================================================
