@@ -278,6 +278,7 @@ export default function App() {
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
     hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
     ws_manager: { enabled: boolean; connected?: boolean };
+    ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
     pandas_ta: boolean;
   } | null>(null);
 

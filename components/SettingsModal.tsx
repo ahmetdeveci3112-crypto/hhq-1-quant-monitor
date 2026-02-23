@@ -19,6 +19,7 @@ interface Props {
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; min_samples_for_train?: number };
     hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
+    ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
   } | null;
   onSLGuardSettings?: (s: any) => void;
   onFreqAIRetrain?: () => void;
@@ -833,39 +834,60 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     🏆 Yeni eğitilen modelleri &quot;challenger&quot; olarak test eder, performansı yeterli ise otomatik promosyon yapar.
                   </p>
 
-                  <div className="grid grid-cols-2 gap-2 mb-3">
-                    <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">Champion</div>
-                      <div className="text-sm font-bold text-teal-400">🏆 Active</div>
-                      <div className="text-[8px] text-slate-600">Mevcut modeli kullanır</div>
-                    </div>
-                    <div className="bg-slate-900/50 rounded p-2 text-center">
-                      <div className="text-[10px] text-slate-500">Challenger</div>
-                      <div className="text-sm font-bold text-slate-400">⏳ Bekleniyor</div>
-                      <div className="text-[8px] text-slate-600">Shadow modda test eder</div>
-                    </div>
-                  </div>
-                  <div className="bg-slate-900/50 rounded-lg p-2 space-y-1">
-                    <div className="flex justify-between text-[10px]">
-                      <span className="text-slate-500">Auto Promote</span>
-                      <span className="text-slate-300">Kapalı</span>
-                    </div>
-                    <div className="flex justify-between text-[10px]">
-                      <span className="text-slate-500">Auto Rollback</span>
-                      <span className="text-slate-300">Kapalı</span>
-                    </div>
-                    <div className="flex justify-between text-[10px]">
-                      <span className="text-slate-500">Min Örneklem</span>
-                      <span className="text-slate-300 font-mono">100</span>
-                    </div>
-                    <div className="flex justify-between text-[10px]">
-                      <span className="text-slate-500">Min İyileşme</span>
-                      <span className="text-slate-300 font-mono">%2.0</span>
-                    </div>
-                  </div>
-                  <p className="text-[9px] text-slate-600 mt-2 text-center">
-                    ML_GOVERNANCE_ENABLED env flag ile aktifleştirilir
-                  </p>
+                  {(() => {
+                    const gov = phase193Status?.ml_governance;
+                    const hasChampion = gov?.models && Object.values(gov.models).some((m: any) => m.champion);
+                    const hasChallenger = gov?.models && Object.values(gov.models).some((m: any) => m.challenger);
+                    return (
+                      <>
+                        <div className="grid grid-cols-2 gap-2 mb-3">
+                          <div className="bg-slate-900/50 rounded p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Champion</div>
+                            <div className={`text-sm font-bold ${hasChampion ? 'text-teal-400' : 'text-slate-400'}`}>
+                              {hasChampion ? '🏆 Active' : '—'}
+                            </div>
+                            <div className="text-[8px] text-slate-600">Mevcut modeli kullanır</div>
+                          </div>
+                          <div className="bg-slate-900/50 rounded p-2 text-center">
+                            <div className="text-[10px] text-slate-500">Challenger</div>
+                            <div className={`text-sm font-bold ${hasChallenger ? 'text-amber-400' : 'text-slate-400'}`}>
+                              {hasChallenger ? '🧪 Test Ediliyor' : '⏳ Bekleniyor'}
+                            </div>
+                            <div className="text-[8px] text-slate-600">Shadow modda test eder</div>
+                          </div>
+                        </div>
+                        <div className="bg-slate-900/50 rounded-lg p-2 space-y-1">
+                          <div className="flex justify-between text-[10px]">
+                            <span className="text-slate-500">Durum</span>
+                            <span className={`font-bold ${gov?.enabled ? 'text-emerald-400' : 'text-slate-400'}`}>
+                              {gov?.enabled ? '✅ Aktif' : '⚫ Kapalı'}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-[10px]">
+                            <span className="text-slate-500">Auto Promote</span>
+                            <span className={`${gov?.auto_promote ? 'text-emerald-400' : 'text-slate-300'}`}>
+                              {gov?.auto_promote ? 'Açık' : 'Kapalı'}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-[10px]">
+                            <span className="text-slate-500">Auto Rollback</span>
+                            <span className={`${gov?.auto_rollback ? 'text-emerald-400' : 'text-slate-300'}`}>
+                              {gov?.auto_rollback ? 'Açık' : 'Kapalı'}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-[10px]">
+                            <span className="text-slate-500">Toplam Olay</span>
+                            <span className="text-slate-300 font-mono">{gov?.event_count ?? 0}</span>
+                          </div>
+                        </div>
+                        {!gov?.enabled && (
+                          <p className="text-[9px] text-slate-600 mt-2 text-center">
+                            ML_GOVERNANCE_ENABLED env flag ile aktifleştirilir
+                          </p>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
             </div>
