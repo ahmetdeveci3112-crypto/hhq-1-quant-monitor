@@ -3172,7 +3172,16 @@ class LiveBinanceTrader:
         
         for order in open_orders:
             order_type = (order.get('type') or '').lower()
-            is_reduce = order.get('reduceOnly') or (order.get('info', {}).get('reduceOnly') == 'true')
+            # Phase 270 P1 fix: Also check info.type / origType for Binance raw fields
+            if order_type not in conditional_types:
+                info = order.get('info', {})
+                alt_type = (info.get('origType') or info.get('type') or '').lower()
+                if alt_type in conditional_types:
+                    order_type = alt_type
+            # Phase 270 P1 fix: Strict reduceOnly parse — string 'false' must not be truthy
+            raw_reduce = order.get('reduceOnly')
+            info_reduce = order.get('info', {}).get('reduceOnly')
+            is_reduce = (raw_reduce is True) or (str(info_reduce).lower() == 'true')
             
             if not is_reduce:
                 continue  # Never cancel entry orders
@@ -25947,6 +25956,16 @@ class PaperTradingEngine:
                 async def _deferred_cleanup():
                     await asyncio.sleep(3)
                     try:
+                        # Phase 270 P1 fix: Flat-position guard before deferred cancel
+                        positions = await live_binance_trader.get_positions()
+                        is_flat = True
+                        for bp in positions:
+                            if bp.get('symbol') == symbol and float(bp.get('size', 0)) > 0.00001:
+                                is_flat = False
+                                break
+                        if not is_flat:
+                            logger.warning(f"⚠️ POST_CLOSE_CLEANUP_DEFERRED: {symbol} not flat, skipping{trace_str}")
+                            return
                         res = await live_binance_trader.cancel_reduce_only_conditionals(symbol, trace_id)
                         if res['cancelled'] > 0:
                             logger.warning(f"✅ POST_CLOSE_CLEANUP_DEFERRED: {symbol} cancelled={res['cancelled']}{trace_str}")
