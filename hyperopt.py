@@ -181,6 +181,10 @@ class HHQHyperOptimizer:
         self.last_apply_reason = ''
         self.last_apply_params: Dict[str, Any] = {}
         self.last_optimize_time = 0
+        # Phase 269 P2: Persistent run-level apply telemetry
+        self.last_run_apply_result = 'never'
+        self.last_run_apply_reason = ''
+        self.last_run_ts = 0
         
         # Phase 265 P3: Load persisted settings (overrides env defaults if file exists)
         self._load_settings()
@@ -535,6 +539,11 @@ class HHQHyperOptimizer:
                 result['run_apply_reason'] = apply_res['reason']
                 actually_applied = apply_res['applied']
             
+            # Phase 269 P2: Persist run-level telemetry on instance
+            self.last_run_apply_result = result['run_apply_result']
+            self.last_run_apply_reason = result['run_apply_reason']
+            self.last_run_ts = int(time.time())
+            
             # Phase 269: Always include instance-level telemetry for consistent UI state
             result['last_apply_result'] = self.last_apply_result
             result['last_apply_reason'] = self.last_apply_reason
@@ -671,6 +680,10 @@ class HHQHyperOptimizer:
             'last_apply_result': self.last_apply_result,
             'last_apply_reason': self.last_apply_reason,
             'last_apply_params_count': len(self.last_apply_params),
+            # Phase 269 P2: Persistent run-level telemetry
+            'run_apply_result': self.last_run_apply_result,
+            'run_apply_reason': self.last_run_apply_reason,
+            'run_apply_ts': self.last_run_ts,
         }
 
 
