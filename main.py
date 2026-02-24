@@ -2004,9 +2004,41 @@ class LiveBinanceTrader:
         self.last_positions = []
         self.last_sync_time = 0
         self.trading_mode = os.environ.get('TRADING_MODE', 'paper')  # paper, live
-         # Phase 146: Persistent trailing state for live positions
+        # Phase 146: Persistent trailing state for live positions
         # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
         self.trailing_state = {}
+        # Phase BBO: Execution BBO config (env-overridable)
+        self.bbo_max_age_ms = int(os.environ.get('EXEC_BBO_MAX_AGE_MS', '1500'))
+        self.bbo_retries = int(os.environ.get('EXEC_BBO_RETRIES', '3'))
+        self.bbo_retry_delay_ms = int(os.environ.get('EXEC_BBO_RETRY_DELAY_MS', '120'))
+        # NOTE: block_entry_on_invalid_bbo + allow_close_with_invalid_bbo removed
+        # OPEN always strict via _bbo_gate_decision; CLOSE always proceeds.
+        # Phase BBO-v2: Cache + reused session
+        self._bbo_cache: dict = {}  # symbol -> {snapshot, fetched_ms}
+        self._bbo_cache_ttl_ms = int(os.environ.get('EXEC_BBO_CACHE_TTL_MS', '400'))
+        self._http_session = None  # Reused aiohttp.ClientSession
+        # Execution gate config
+        self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '8.0'))
+        self.exec_min_top_book_usdt = float(os.environ.get('EXEC_MIN_TOP_BOOK_NOTIONAL_USDT', '200.0'))
+        self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.55'))
+        self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.35'))
+        self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.45'))
+        self.exec_risk_weight = float(os.environ.get('EXEC_RISK_WEIGHT', '0.20'))
+        self.exec_max_drift_bps = float(os.environ.get('EXEC_MAX_DRIFT_BPS', '15.0'))
+        self.exec_force_market_drift_hard = os.environ.get('EXEC_FORCE_MARKET_DRIFT_HARD_BLOCK', 'true').lower() == 'true'
+        # Diagnostic counters (reason-classified)
+        self._exec_diag = {
+            'bbo_zero_count': 0, 'bbo_invalid_by_reason': {},
+            'bbo_source_usage': {},
+            'invalid_block_count': 0, 'stale_block_count': 0,
+            'spread_block': 0, 'drift_block': 0,
+            'entry_score_block': 0,
+            'gate_allow': 0, 'gate_block_total': 0,
+            'close_allow_invalid_count': 0,
+        }
+        self._exec_diag_last_log_ms = 0
+        # Local book subscription prep
+        self._book_subscriptions = {}  # symbol -> {'subscribed_ms', 'last_update_ms'}
         logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
     
     async def initialize(self):
@@ -2554,6 +2586,535 @@ class LiveBinanceTrader:
             msg = repr(error)
         msg = (msg or "unknown_exchange_error").replace("\n", " ").strip()
         return msg[:220]
+    # =========================================================================
+    # Phase BBO-v2: Production-grade BBO infrastructure
+    # =========================================================================
+
+    @staticmethod
+    def _bbo_to_raw_symbol(symbol: str) -> str:
+        """Normalize any symbol format to raw Binance symbol (e.g. BTCUSDT)."""
+        raw = symbol.replace('/USDT:USDT', '').replace('/', '')
+        if not raw.endswith('USDT'):
+            raw = f"{raw}USDT"
+        return raw
+
+    @staticmethod
+    def _make_bbo_snapshot(*, bid: float, ask: float, source: str,
+                           ts_ms: int, reason: str = '') -> dict:
+        """Build a standardized BBO snapshot dict.
+        
+        raw_bid/raw_ask/raw_spread always reflect the exchange response,
+        even when valid=False. bid/ask/spread_pct are zeroed on invalid
+        to prevent downstream math errors.
+        """
+        valid = bid > 0 and ask > 0 and ask > bid
+        mid = (bid + ask) / 2.0 if valid else 0.0
+        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 0.0
+        now_ms = int(datetime.now().timestamp() * 1000)
+        age_ms = max(0, now_ms - ts_ms) if ts_ms > 0 else 0
+        return {
+            'valid': valid,
+            'bid': bid if valid else 0.0,
+            'ask': ask if valid else 0.0,
+            'mid': mid,
+            'spread_pct': spread_pct if valid else 0.0,
+            # Raw values for observability — never zeroed
+            'raw_bid': bid,
+            'raw_ask': ask,
+            'raw_spread': ((ask - bid) / ((bid + ask) / 2.0) * 100.0) if (bid + ask) > 0 else 0.0,
+            'source': source if valid else 'none',
+            'ts_ms': ts_ms,
+            'age_ms': age_ms,
+            'reason': '' if valid else (reason or f"invalid:bid={bid},ask={ask}"),
+        }
+
+    @staticmethod
+    def _is_bbo_fresh(snapshot: dict, max_age_ms: int) -> bool:
+        """Check if a BBO snapshot is both valid and within age limit."""
+        if not snapshot or not snapshot.get('valid'):
+            return False
+        now_ms = int(datetime.now().timestamp() * 1000)
+        age = max(0, now_ms - snapshot.get('ts_ms', 0))
+        return age <= max_age_ms
+
+    def _get_cached_bbo(self, symbol: str):
+        """Return cached BBO if fresh, else None."""
+        raw = self._bbo_to_raw_symbol(symbol)
+        entry = self._bbo_cache.get(raw)
+        if not entry:
+            return None
+        snapshot = entry.get('snapshot')
+        if not snapshot or not snapshot.get('valid'):
+            return None
+        # Check cache TTL
+        now_ms = int(datetime.now().timestamp() * 1000)
+        if (now_ms - entry.get('fetched_ms', 0)) > self._bbo_cache_ttl_ms:
+            return None
+        # Also ensure data age is within max_age
+        if not self._is_bbo_fresh(snapshot, self.bbo_max_age_ms):
+            return None
+        return snapshot
+
+    def _set_cached_bbo(self, symbol: str, snapshot: dict) -> None:
+        """Store a BBO snapshot in the cache."""
+        raw = self._bbo_to_raw_symbol(symbol)
+        self._bbo_cache[raw] = {
+            'snapshot': snapshot,
+            'fetched_ms': int(datetime.now().timestamp() * 1000),
+        }
+
+    async def _ensure_http_session(self):
+        """Lazily create or return reused aiohttp.ClientSession."""
+        import aiohttp
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+        return self._http_session
+
+    async def close_http_session(self):
+        """Close the reused HTTP session. Call on app shutdown."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+
+    async def _get_valid_bbo(self, symbol: str, *, max_age_ms: int = None,
+                              retries: int = None, retry_delay_ms: int = None) -> dict:
+        """Get validated Best Bid/Offer snapshot.
+        
+        Source priority: cache → REST bookTicker → fetch_order_book(top1).
+        Returns dict: valid, bid, ask, mid, spread_pct, source, ts_ms, age_ms, reason.
+        """
+        import aiohttp
+        max_age = max_age_ms if max_age_ms is not None else self.bbo_max_age_ms
+        max_retries = retries if retries is not None else self.bbo_retries
+        delay_ms = retry_delay_ms if retry_delay_ms is not None else self.bbo_retry_delay_ms
+        raw_symbol = self._bbo_to_raw_symbol(symbol)
+        reason = 'no_attempt'
+
+        # --- Source 0: Cache ---
+        cached = self._get_cached_bbo(symbol)
+        if cached:
+            # Return fresh cached copy with recalculated age
+            cached_copy = dict(cached)
+            cached_copy['source'] = 'cache'
+            now_ms = int(datetime.now().timestamp() * 1000)
+            cached_copy['age_ms'] = max(0, now_ms - cached_copy.get('ts_ms', 0))
+            return cached_copy
+
+        for attempt in range(max_retries):
+            # --- Source 1: REST bookTicker ---
+            try:
+                session = await self._ensure_http_session()
+                now_ms = int(datetime.now().timestamp() * 1000)
+                url = f'https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={raw_symbol}'
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        bid = float(data.get('bidPrice', 0) or 0)
+                        ask = float(data.get('askPrice', 0) or 0)
+                        server_time = int(data.get('time', 0) or 0)
+
+                        snap = self._make_bbo_snapshot(
+                            bid=bid, ask=ask, source='bookTicker_rest',
+                            ts_ms=server_time or now_ms,
+                            reason='' if (bid > 0 and ask > 0 and ask > bid) else f"bookTicker_bad:bid={bid},ask={ask}",
+                        )
+                        if snap['valid'] and self._is_bbo_fresh(snap, max_age):
+                            self._set_cached_bbo(symbol, snap)
+                            return snap
+                        # Data returned but stale or invalid
+                        if not snap['valid']:
+                            reason = snap['reason']
+                        else:
+                            reason = f"bookTicker_stale:age={snap['age_ms']}ms>max={max_age}ms"
+                    else:
+                        reason = f"bookTicker_http:{resp.status}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                reason = f"bookTicker_error:{str(e)[:80]}"
+
+            # --- Source 2: fetch_order_book top-of-book ---
+            try:
+                if self.exchange:
+                    ccxt_sym = f"{raw_symbol[:-4]}/USDT:USDT" if raw_symbol.endswith('USDT') else raw_symbol
+                    now_ms = int(datetime.now().timestamp() * 1000)
+                    ob = await self.exchange.fetch_order_book(ccxt_sym, 1)
+                    bids = ob.get('bids', [])
+                    asks = ob.get('asks', [])
+                    if bids and asks:
+                        bid = float(bids[0][0])
+                        ask = float(asks[0][0])
+                        snap = self._make_bbo_snapshot(
+                            bid=bid, ask=ask, source='orderBook_top1',
+                            ts_ms=now_ms,
+                        )
+                        if snap['valid']:
+                            self._set_cached_bbo(symbol, snap)
+                            return snap
+                        reason = snap['reason']
+                    else:
+                        reason = "orderBook_empty"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                reason = f"orderBook_error:{str(e)[:80]}"
+
+            # Retry delay (except on last attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay_ms / 1000.0)
+
+        logger.warning(f"⚠️ BBO_INVALID: {raw_symbol} | {reason}")
+        return self._make_bbo_snapshot(bid=0, ask=0, source='none', ts_ms=0, reason=reason)
+
+    async def _fetch_order_fee(self, ccxt_symbol: str, order: dict) -> tuple:
+        """Get accurate fee from order or trade-level fallback.
+        
+        Returns (fee_cost: float, fee_source: str, fee_note: str).
+        fee_source: 'order' | 'trades' | 'unknown'
+        """
+        # Try order.fee first
+        fee_info = order.get('fee') or {}
+        fee_cost = float(fee_info.get('cost') or 0)
+        if fee_cost > 0:
+            return fee_cost, 'order', ''
+
+        # Fallback: fetch trades for this order
+        order_id = order.get('id')
+        if order_id and self.exchange:
+            try:
+                # CCXT may need orderId as str or int depending on exchange version
+                params = {'orderId': str(order_id)}
+                trades = await self.exchange.fetch_my_trades(ccxt_symbol, params=params)
+                if trades:
+                    total_fee = 0.0
+                    for t in trades:
+                        t_fee = (t.get('fee') or {}).get('cost')
+                        if t_fee is not None:
+                            total_fee += float(t_fee)
+                    if total_fee > 0:
+                        return total_fee, 'trades', f'{len(trades)}_fills'
+                return 0.0, 'unknown', 'trades_returned_zero_fee'
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                note = f"fetch_trades_err:{str(e)[:60]}"
+                logger.debug(f"Fee fallback fetch_my_trades error: {e}")
+                return 0.0, 'unknown', note
+
+        return 0.0, 'unknown', 'no_order_id'
+
+    # --- Telemetry formatters (parse-friendly: field_name=value) ---
+
+    @staticmethod
+    def _fmt_price(val):
+        """Format price — NA for invalid values."""
+        return f"${val:.6f}" if val and val > 0 else "NA"
+
+    @staticmethod
+    def _fmt_pct(val):
+        """Format percentage — NA for None/invalid."""
+        return f"{val:.3f}%" if val is not None else "NA"
+
+    @staticmethod
+    def _fmt_slip(val):
+        """Format slippage — NA when no reference."""
+        return f"{val:+.4f}%" if val is not None else "NA"
+
+    @staticmethod
+    def _fmt_fee(val, source='unknown'):
+        """Format fee — include source."""
+        if val is not None and val > 0:
+            return f"${val:.4f}[{source}]"
+        return f"NA[{source}]"
+
+    def _build_exec_quality_log(self, side: str, symbol: str, order_type: str,
+                                 bbo: dict, avg_fill: float, slippage_pct,
+                                 fee_cost: float, fee_source: str,
+                                 latency_ms: float, trace_id: str = None,
+                                 decision: str = '', decision_reason: str = '',
+                                 entry_ctx: dict = None) -> str:
+        """Build a standardized, parse-friendly EXEC_QUALITY log line."""
+        bbo_valid = bbo.get('valid', False)
+        is_close = order_type in ('CLOSE', 'REDUCE_ONLY', 'TP', 'SL', 'MANUAL_EXIT')
+        trade_type = 'CLOSING' if is_close else 'OPENING'
+        parts = [
+            f"\U0001f4ca EXEC_QUALITY{'_CLOSE' if is_close else ''}: {side} {symbol} {order_type}",
+            f"trade_type={trade_type}",
+            f"bid={self._fmt_price(bbo.get('bid'))} ask={self._fmt_price(bbo.get('ask'))}",
+            f"spread_pct={self._fmt_pct(bbo.get('spread_pct') if bbo_valid else None)}",
+            f"fill=${avg_fill:.6f} slip_pct={self._fmt_slip(slippage_pct)}",
+            f"fee={self._fmt_fee(fee_cost, fee_source)}",
+            f"latency_ms={latency_ms:.0f}",
+            f"bbo_valid={bbo_valid} bbo_src={bbo.get('source', 'none')} bbo_age_ms={bbo.get('age_ms', 0)}",
+        ]
+        # Raw values for forensics
+        parts.append(f"raw_bid={bbo.get('raw_bid', 0):.8g} raw_ask={bbo.get('raw_ask', 0):.8g}")
+        if decision:
+            parts.append(f"decision={decision}")
+        if decision_reason:
+            parts.append(f"decision_reason={decision_reason}")
+        if not bbo_valid:
+            parts.append(f"bbo_reason={bbo.get('reason', 'unknown')}")
+        # Entry context (scoring, spread_bps, etc.)
+        if entry_ctx:
+            ctx_parts = []
+            for k in ('entry_exec_score', 'signal_score', 'micro_score', 'risk_penalty',
+                       'spread_bps', 'top_book_notional', 'entry_mode', 'drift_bps'):
+                v = entry_ctx.get(k)
+                if v is not None:
+                    ctx_parts.append(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}")
+            if ctx_parts:
+                parts.append(' '.join(ctx_parts))
+        if trace_id:
+            parts.append(f"trace={trace_id}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _bbo_gate_decision(bbo: dict, is_opening_trade: bool) -> tuple:
+        """Single decision matrix for BBO gating.
+        
+        Rules:
+        - OPENING trade + invalid BBO  => ('block', 'BLOCK_OPEN_INVALID_BBO')
+        - OPENING trade + stale BBO    => ('block', 'BLOCK_OPEN_STALE_BBO')
+        - OPENING trade + valid BBO    => ('allow', 'ALLOW_OPEN_NORMAL')
+        - CLOSING trade + invalid BBO  => ('allow', 'ALLOW_CLOSE_INVALID_BBO')  <- ALWAYS
+        - CLOSING trade + valid BBO    => ('allow', 'ALLOW_CLOSE_NORMAL')
+        
+        Returns: (decision: 'allow'|'block', reason: str)
+        """
+        bbo_valid = bbo.get('valid', False)
+        bbo_reason = bbo.get('reason', '')
+        
+        if not is_opening_trade:
+            # CLOSE path: NEVER block. Risk reduction > data quality.
+            if bbo_valid:
+                return 'allow', 'ALLOW_CLOSE_NORMAL'
+            else:
+                return 'allow', 'ALLOW_CLOSE_INVALID_BBO'
+        
+        # OPEN path: strict gating
+        if not bbo_valid:
+            # Distinguish stale data from truly invalid data
+            if 'stale' in bbo_reason.lower():
+                return 'block', 'BLOCK_OPEN_STALE_BBO'
+            return 'block', 'BLOCK_OPEN_INVALID_BBO'
+        
+        return 'allow', 'ALLOW_OPEN_NORMAL'
+
+    @staticmethod
+    def should_refresh_bbo(symbol: str, active_symbols: set, pending_symbols: set) -> bool:
+        """Determine if a symbol warrants aggressive BBO refresh."""
+        raw = symbol.replace('/USDT:USDT', '').replace('/', '')
+        if not raw.endswith('USDT'):
+            raw = f"{raw}USDT"
+        return raw in active_symbols or raw in pending_symbols
+
+    # --- Execution Gate Helpers ---
+
+    async def validate_bbo(self, symbol, depth=None):
+        """Validate BBO for entry gating. Returns enriched dict.
+        
+        Keys: valid, reason, spread_bps, age_ms, top_book_notional,
+              bbo (raw snapshot), raw_bid, raw_ask, raw_spread, bbo_src.
+        Never raises exceptions.
+        """
+        try:
+            bbo = await self._get_valid_bbo(symbol)
+        except Exception as e:
+            return {
+                'valid': False, 'reason': f'bbo_fetch_error:{str(e)[:60]}',
+                'spread_bps': None, 'age_ms': None, 'top_book_notional': None,
+                'bbo': self._make_bbo_snapshot(bid=0, ask=0, source='none', ts_ms=0, reason=str(e)[:80]),
+                'raw_bid': 0.0, 'raw_ask': 0.0, 'raw_spread': 0.0, 'bbo_src': 'error',
+            }
+
+        raw_bid = bbo.get('raw_bid', bbo.get('bid', 0))
+        raw_ask = bbo.get('raw_ask', bbo.get('ask', 0))
+        raw_spread = bbo.get('raw_spread', 0)
+        age_ms = bbo.get('age_ms', 0)
+        spread_bps = (bbo.get('spread_pct', 0) * 100.0) if bbo.get('valid') else None
+
+        # Top-book notional from depth if provided
+        top_book_notional = None
+        if depth:
+            try:
+                bids = depth.get('bids', [])
+                asks = depth.get('asks', [])
+                bid_top = bids[0][0] * bids[0][1] if bids else 0
+                ask_top = asks[0][0] * asks[0][1] if asks else 0
+                top_book_notional = min(bid_top, ask_top) if (bid_top > 0 and ask_top > 0) else max(bid_top, ask_top)
+            except Exception:
+                top_book_notional = None
+
+        # Granular reason — stale check FIRST (bbo.reason takes priority)
+        if not bbo.get('valid'):
+            if 'stale' in bbo.get('reason', '').lower():
+                reason = 'stale_bbo'
+            elif raw_bid <= 0 and raw_ask <= 0:
+                reason = 'missing'
+            elif raw_bid <= 0:
+                reason = 'bid_le_zero'
+            elif raw_ask <= 0:
+                reason = 'ask_le_zero'
+            elif raw_ask < raw_bid:
+                reason = 'ask_lt_bid'
+            else:
+                reason = bbo.get('reason', 'unknown')
+        elif spread_bps is not None and spread_bps > self.exec_max_spread_bps:
+            reason = 'spread_too_wide'
+        elif top_book_notional is not None and top_book_notional < self.exec_min_top_book_usdt:
+            reason = 'book_thin'
+        else:
+            reason = 'ok'
+
+        valid = bbo.get('valid', False) and reason == 'ok'
+
+        # Update diag counters
+        src = bbo.get('source', 'none')
+        self._exec_diag['bbo_source_usage'][src] = self._exec_diag['bbo_source_usage'].get(src, 0) + 1
+        if not valid:
+            self._exec_diag['bbo_invalid_by_reason'][reason] = self._exec_diag['bbo_invalid_by_reason'].get(reason, 0) + 1
+            if raw_bid == 0 and raw_ask == 0:
+                self._exec_diag['bbo_zero_count'] += 1
+
+        return {
+            'valid': valid, 'reason': reason,
+            'spread_bps': spread_bps, 'age_ms': age_ms,
+            'top_book_notional': top_book_notional,
+            'bbo': bbo, 'raw_bid': raw_bid, 'raw_ask': raw_ask,
+            'raw_spread': raw_spread, 'bbo_src': src,
+        }
+
+    def compute_entry_exec_score(self, signal_score_raw, bbo_result, recent_rejects=0):
+        """Compute weighted entry execution score [0..1].
+        
+        Components:
+        - signal: normalized signal confidence [0..1] (raw is 0-150)
+        - micro:  spread tightness + age freshness + book depth [0..1]
+        - risk:   recent rejects penalty [0..1]
+        
+        Returns dict: final, signal, micro, risk, reason.
+        """
+        # Signal component: 0-150 range → 0-1
+        sig = max(0.0, min(1.0, float(signal_score_raw or 0) / 150.0))
+
+        # Micro component
+        spread_bps = bbo_result.get('spread_bps')
+        age_ms = bbo_result.get('age_ms') or 0
+        top_notional = bbo_result.get('top_book_notional')
+
+        spread_q = max(0.0, 1.0 - (spread_bps / self.exec_max_spread_bps)) if spread_bps is not None and self.exec_max_spread_bps > 0 else 0.5
+        age_q = max(0.0, 1.0 - (age_ms / float(self.bbo_max_age_ms))) if self.bbo_max_age_ms > 0 else 0.5
+        if top_notional is not None and self.exec_min_top_book_usdt > 0:
+            book_q = min(1.0, top_notional / self.exec_min_top_book_usdt)
+        else:
+            book_q = 0.5  # neutral if unknown
+        micro = (spread_q * 0.4 + age_q * 0.3 + book_q * 0.3)
+
+        # Risk penalty
+        risk = min(0.5, float(recent_rejects) * 0.1)
+
+        # Weighted final
+        final = (self.exec_signal_weight * sig
+                 + self.exec_micro_weight * micro
+                 - self.exec_risk_weight * risk)
+        final = max(0.0, min(1.0, final))
+
+        reason = 'ENTRY_SCORE_OK' if final >= self.exec_entry_score_min else 'ENTRY_SCORE_LOW'
+
+        return {
+            'final': round(final, 4),
+            'signal': round(sig, 4),
+            'micro': round(micro, 4),
+            'risk': round(risk, 4),
+            'reason': reason,
+        }
+
+    def _check_pre_trade_drift(self, expected_price, current_mid):
+        """Check price drift between signal and current mid.
+        
+        Returns (drift_bps: float, blocked: bool, reason: str).
+        """
+        if not expected_price or expected_price <= 0 or not current_mid or current_mid <= 0:
+            return 0.0, False, 'no_reference'
+        drift_bps = abs(current_mid - expected_price) / expected_price * 10000.0
+        blocked = drift_bps > self.exec_max_drift_bps
+        reason = 'BLOCK_OPEN_DRIFT' if blocked else 'drift_ok'
+        if blocked:
+            self._exec_diag['drift_block'] += 1
+        return round(drift_bps, 2), blocked, reason
+
+    @staticmethod
+    def apply_risk_caps(volatility_pct, spread_pct, volume_24h, balance):
+        """Merkezi leverage + size cap hesaplayıcı.
+        Returns dict: lev_cap, size_cap_pct, reasons list.
+        """
+        reasons = []
+        # Leverage cap table
+        if volatility_pct >= 30:
+            lev_cap = 3
+        elif volatility_pct >= 20:
+            lev_cap = 5
+        elif volatility_pct >= 12:
+            lev_cap = 8
+        else:
+            lev_cap = 75
+        if spread_pct >= 0.20 or volume_24h < 1_000_000:
+            lev_cap = min(lev_cap, 5)
+            reasons.append(f"ILLIQ_CAP(sp={spread_pct:.2f}%,vol24h={volume_24h/1e6:.1f}M)")
+        if volatility_pct >= 12:
+            reasons.append(f"VOL_CAP(vol={volatility_pct:.0f}%,cap={lev_cap}x)")
+        # Size cap as fraction of balance
+        size_cap_pct = 0.15
+        if volatility_pct >= 20:
+            size_cap_pct = 0.07
+            reasons.append("SIZE_CAP_VOL20")
+        if volume_24h < 1_000_000:
+            size_cap_pct = min(size_cap_pct, 0.05)
+            reasons.append("SIZE_CAP_LOWVOL")
+        return {
+            'lev_cap': lev_cap,
+            'size_cap_pct': size_cap_pct,
+            'size_cap_usd': balance * size_cap_pct if balance else 0,
+            'reasons': reasons,
+        }
+
+    def _log_diag_summary(self):
+        """Periodic diagnostic summary — call from tick loops, max once per 60s."""
+        now_ms = int(datetime.now().timestamp() * 1000)
+        if now_ms - self._exec_diag_last_log_ms < 60_000:
+            return
+        self._exec_diag_last_log_ms = now_ms
+        d = self._exec_diag
+        logger.info(
+            f"\U0001f4ca EXEC_DIAG: zero={d['bbo_zero_count']} "
+            f"invalid_blk={d['invalid_block_count']} stale_blk={d['stale_block_count']} "
+            f"spread_blk={d['spread_block']} drift_blk={d['drift_block']} "
+            f"score_blk={d['entry_score_block']} "
+            f"gate_allow={d['gate_allow']} gate_block={d['gate_block_total']} "
+            f"close_invalid_allow={d['close_allow_invalid_count']} "
+            f"src={d['bbo_source_usage']} reasons={d['bbo_invalid_by_reason']}"
+        )
+
+    def _subscribe_book(self, symbol):
+        """Register intent for local order book data. Stub for future WS impl."""
+        raw = self._bbo_to_raw_symbol(symbol)
+        if raw not in self._book_subscriptions:
+            self._book_subscriptions[raw] = {
+                'subscribed_ms': int(datetime.now().timestamp() * 1000),
+                'last_update_ms': 0,
+            }
+            logger.debug(f"BOOK_SUB: {raw} registered")
+
+    def _unsubscribe_book(self, symbol):
+        """Remove local order book subscription. Stub for future WS impl."""
+        raw = self._bbo_to_raw_symbol(symbol)
+        if raw in self._book_subscriptions:
+            del self._book_subscriptions[raw]
+            logger.debug(f"BOOK_UNSUB: {raw} removed")
+
 
     def _normalize_order_amount(self, ccxt_symbol: str, price: float, target_usd: float, market: dict) -> tuple:
         """
@@ -2618,13 +3179,38 @@ class LiveBinanceTrader:
                 logger.error(f"❌ Aborting market order {symbol}: leverage set to {leverage}x failed")
                 return None
             
-            # Phase 186: Capture pre-order book state
+            # Capture pre-order BBO via validate_bbo
+            vbbo = await self.validate_bbo(symbol)
+            bbo = vbbo['bbo']
+            best_bid = bbo['bid']
+            best_ask = bbo['ask']
+            spread_pct = bbo['spread_pct']
+            bbo_valid = bbo['valid']
+            
+            # Decision matrix: OPEN path
+            decision, decision_reason = self._bbo_gate_decision(bbo, is_opening_trade=True)
+            if decision == 'block':
+                self.last_order_error = f"{decision_reason}:{bbo['reason']}"
+                # Reason-based counter
+                if decision_reason == 'BLOCK_OPEN_STALE_BBO':
+                    self._exec_diag['stale_block_count'] += 1
+                else:
+                    self._exec_diag['invalid_block_count'] += 1
+                self._exec_diag['gate_block_total'] += 1
+                logger.warning(f"\U0001f6ab BBO_GATE: {side} {symbol} MARKET | decision={decision} reason={decision_reason}")
+                return None
+            # Spread gate
+            if not vbbo['valid'] and vbbo['reason'] in ('spread_too_wide', 'book_thin'):
+                self.last_order_error = f"BLOCK_OPEN_SPREAD:{vbbo['reason']}"
+                self._exec_diag['spread_block'] += 1
+                self._exec_diag['gate_block_total'] += 1
+                logger.warning(f"\U0001f6ab BBO_GATE: {side} {symbol} MARKET | spread_bps={vbbo['spread_bps']} reason={vbbo['reason']}")
+                return None
+            self._exec_diag['gate_allow'] += 1
+            
+            # Still need last price for amount calculation
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             price = ticker['last']
-            best_bid = ticker.get('bid', price)
-            best_ask = ticker.get('ask', price)
-            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
-            spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
 
             # Amount precision + min lot + min notional normalization
             markets = await self.exchange.load_markets()
@@ -2662,16 +3248,19 @@ class LiveBinanceTrader:
             
             fill_time = datetime.now().timestamp()
             avg_fill = float(order.get('average') or price)
-            fee_info = order.get('fee') or {}
-            fee_cost = float(fee_info.get('cost') or 0)
             
-            # Phase 186: Calculate slippage
-            if side == 'LONG':
-                reference = best_ask if best_ask else price
-                slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else 0
-            else:
-                reference = best_bid if best_bid else price
-                slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else 0
+            # Fee with fallback (3-tuple)
+            fee_cost, fee_source, _fee_note = await self._fetch_order_fee(ccxt_symbol, order)
+            
+            # Calculate slippage only with valid BBO
+            slippage_pct = None
+            if bbo_valid:
+                if side == 'LONG':
+                    reference = best_ask
+                    slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else None
+                else:
+                    reference = best_bid
+                    slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else None
             
             latency_ms = (fill_time - send_time) * 1000
             
@@ -2679,20 +3268,26 @@ class LiveBinanceTrader:
             logger.info(f"   💵 Size: ${size_usd:.2f} | Effective: ${effective_notional:.2f} | Amount: {amount:.6f}")
             logger.info(f"   📊 Leverage: {leverage}x | Price: ${price:.4f}")
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
-            logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} MARKET | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms")
+            logger.warning(self._build_exec_quality_log(
+                side, symbol, 'MARKET', bbo, avg_fill, slippage_pct,
+                fee_cost, fee_source, latency_ms,
+                decision=decision, decision_reason=decision_reason,
+            ))
             
             return {
                 'id': order.get('id'),
                 'symbol': symbol,
                 'side': side,
                 'amount': amount,
-                'price': avg_fill,  # Use actual fill price
+                'price': avg_fill,
                 'cost': effective_notional,
                 'status': order.get('status', 'filled'),
                 'timestamp': int(datetime.now().timestamp() * 1000),
-                'slippage_pct': slippage_pct,
+                'slippage_pct': slippage_pct if slippage_pct is not None else 0,
                 'spread_pct': spread_pct,
                 'fee': fee_cost,
+                'fee_source': fee_source,
+                'bbo_valid': bbo_valid,
             }
             
         except Exception as e:
@@ -2721,13 +3316,38 @@ class LiveBinanceTrader:
                 logger.error(f"❌ Aborting limit entry {symbol}: leverage set to {leverage}x failed")
                 return None
             
-            # Fetch ticker for pricing
+            # BBO for limit pricing via validate_bbo
+            vbbo = await self.validate_bbo(symbol)
+            bbo = vbbo['bbo']
+            best_bid = bbo['bid']
+            best_ask = bbo['ask']
+            spread_pct = bbo['spread_pct']
+            bbo_valid = bbo['valid']
+            
+            # Decision matrix: OPEN path
+            decision, decision_reason = self._bbo_gate_decision(bbo, is_opening_trade=True)
+            if decision == 'block':
+                self.last_order_error = f"{decision_reason}:{bbo['reason']}"
+                # Reason-based counter
+                if decision_reason == 'BLOCK_OPEN_STALE_BBO':
+                    self._exec_diag['stale_block_count'] += 1
+                else:
+                    self._exec_diag['invalid_block_count'] += 1
+                self._exec_diag['gate_block_total'] += 1
+                logger.warning(f"\U0001f6ab BBO_GATE: {side} {symbol} LIMIT | decision={decision} reason={decision_reason}")
+                return None
+            # Spread gate
+            if not vbbo['valid'] and vbbo['reason'] in ('spread_too_wide', 'book_thin'):
+                self.last_order_error = f"BLOCK_OPEN_SPREAD:{vbbo['reason']}"
+                self._exec_diag['spread_block'] += 1
+                self._exec_diag['gate_block_total'] += 1
+                logger.warning(f"\U0001f6ab BBO_GATE: {side} {symbol} LIMIT | spread_bps={vbbo['spread_bps']} reason={vbbo['reason']}")
+                return None
+            self._exec_diag['gate_allow'] += 1
+            
+            # Still need last price for amount calculation
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             price = ticker['last']
-            best_bid = ticker.get('bid', price)
-            best_ask = ticker.get('ask', price)
-            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else price
-            spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
             
             # ===== Phase 201: Order Book Depth Check =====
             try:
@@ -2781,6 +3401,12 @@ class LiveBinanceTrader:
             else:
                 limit_price = best_bid - (tick_size * 2)  # 2 ticks below bid
             
+            # Phase BBO: Guard against negative/zero limit price (especially SHORT with invalid BBO)
+            if limit_price <= 0:
+                self.last_order_error = f"invalid_limit_price:{limit_price}"
+                logger.error(f"❌ LIMIT ENTRY FAILED: {side} {symbol} | limit_price={limit_price} <= 0")
+                return None
+            
             limit_price = float(self.exchange.price_to_precision(ccxt_symbol, limit_price))
             amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
             
@@ -2813,15 +3439,21 @@ class LiveBinanceTrader:
             
             if status == 'closed' and remaining <= 0:
                 # Fully filled via limit! Best case — reduced slippage
-                fee_info = order_check.get('fee') or {}
-                fee_cost = float(fee_info.get('cost') or 0)
+                # Fee with fallback (3-tuple)
+                fee_cost, fee_source, _fee_note = await self._fetch_order_fee(ccxt_symbol, order_check)
                 
-                if side == 'LONG':
-                    slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else 0
-                else:
-                    slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
+                slippage_pct = None
+                if bbo_valid:
+                    if side == 'LONG':
+                        slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else None
+                    else:
+                        slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else None
                 
-                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT_FILLED | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                logger.warning(self._build_exec_quality_log(
+                    side, symbol, 'LIMIT_FILLED', bbo, avg_fill, slippage_pct,
+                    fee_cost, fee_source, latency_ms,
+                    decision=decision, decision_reason=decision_reason,
+                ))
                 
                 return {
                     'id': order_id,
@@ -2832,9 +3464,11 @@ class LiveBinanceTrader:
                     'cost': effective_notional,
                     'status': 'filled',
                     'timestamp': int(datetime.now().timestamp() * 1000),
-                    'slippage_pct': slippage_pct,
+                    'slippage_pct': slippage_pct if slippage_pct is not None else 0,
                     'spread_pct': spread_pct,
                     'fee': fee_cost,
+                    'fee_source': fee_source,
+                    'bbo_valid': bbo_valid,
                     'entry_method': 'LIMIT',
                 }
             
@@ -2879,24 +3513,31 @@ class LiveBinanceTrader:
                             return None  # Total failure
                         # If partially filled via limit, continue with what we have
                 
-                if side == 'LONG':
-                    slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else 0
-                else:
-                    slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else 0
+                slippage_pct = None
+                if bbo_valid:
+                    if side == 'LONG':
+                        slippage_pct = (avg_fill - best_ask) / best_ask * 100 if best_ask > 0 else None
+                    else:
+                        slippage_pct = (best_bid - avg_fill) / best_bid * 100 if best_bid > 0 else None
                 
-                logger.warning(f"📊 EXEC_QUALITY: {side} {symbol} LIMIT→MKT | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | {latency_ms:.0f}ms")
+                logger.warning(self._build_exec_quality_log(
+                    side, symbol, 'LIMIT_TO_MKT', bbo, avg_fill, slippage_pct,
+                    0.0, 'unknown', latency_ms,
+                    decision=decision, decision_reason=decision_reason,
+                ))
                 
                 return {
                     'id': order_id,
                     'symbol': symbol,
                     'side': side,
-                    'amount': filled + remaining,  # Total intended
+                    'amount': filled + remaining,
                     'price': avg_fill,
                     'cost': effective_notional,
                     'status': 'filled',
                     'timestamp': int(datetime.now().timestamp() * 1000),
-                    'slippage_pct': slippage_pct,
+                    'slippage_pct': slippage_pct if slippage_pct is not None else 0,
                     'spread_pct': spread_pct,
+                    'bbo_valid': bbo_valid,
                     'entry_method': 'LIMIT_MKT_FALLBACK',
                 }
                 
@@ -2916,15 +3557,16 @@ class LiveBinanceTrader:
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         
         try:
-            # Phase 186: Capture pre-close book state
-            try:
-                ticker = await self.exchange.fetch_ticker(ccxt_symbol)
-                best_bid = ticker.get('bid', 0)
-                best_ask = ticker.get('ask', 0)
-                mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else ticker.get('last', 0)
-                spread_pct = ((best_ask - best_bid) / mid_price * 100) if mid_price > 0 and best_bid and best_ask else 0
-            except:
-                best_bid = best_ask = mid_price = spread_pct = 0
+            # Capture pre-close BBO
+            bbo = await self._get_valid_bbo(symbol)
+            bbo_valid = bbo['valid']
+            
+            # Decision matrix: CLOSE path — NEVER block. Risk reduction > data quality.
+            decision, decision_reason = self._bbo_gate_decision(bbo, is_opening_trade=False)
+            # decision is always 'allow' for closing trades — log + count for audit
+            if not bbo_valid:
+                self._exec_diag['close_allow_invalid_count'] += 1
+                logger.info(f"\u2139\ufe0f BBO_GATE: {side} {symbol} CLOSE | decision={decision} reason={decision_reason} bbo_reason={bbo['reason']}")
             
             send_time = datetime.now().timestamp()
             
@@ -2939,22 +3581,28 @@ class LiveBinanceTrader:
             
             fill_time = datetime.now().timestamp()
             avg_fill = float(order.get('average') or 0)
-            fee_info = order.get('fee') or {}
-            fee_cost = float(fee_info.get('cost') or 0)
             latency_ms = (fill_time - send_time) * 1000
             
-            # Slippage: for CLOSE, selling LONG hits bid, buying SHORT hits ask
-            if side == 'LONG':
-                reference = best_bid if best_bid else avg_fill
-                slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else 0
-            else:
-                reference = best_ask if best_ask else avg_fill
-                slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else 0
+            # Fee with fallback (3-tuple)
+            fee_cost, fee_source, _fee_note = await self._fetch_order_fee(ccxt_symbol, order)
             
-            trace_str = f" [trace: {trace_id}]" if trace_id else ""
-            logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}{trace_str}")
-            logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
-            logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms{trace_str}")
+            # Slippage: only with valid BBO
+            slippage_pct = None
+            if bbo_valid:
+                if side == 'LONG':
+                    reference = bbo['bid']
+                    slippage_pct = (reference - avg_fill) / reference * 100 if reference > 0 else None
+                else:
+                    reference = bbo['ask']
+                    slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else None
+            
+            logger.info(f"\U0001f4e4 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}" + (f" [trace: {trace_id}]" if trace_id else ""))
+            logger.info(f"   \U0001f194 Order ID: {order.get('id', 'N/A')}")
+            logger.warning(self._build_exec_quality_log(
+                side, symbol, 'CLOSE', bbo, avg_fill, slippage_pct,
+                fee_cost, fee_source, latency_ms, trace_id,
+                decision=decision, decision_reason=decision_reason,
+            ))
             
             # Phase 270: Fire-and-forget post-close conditional order cleanup
             asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
@@ -2966,8 +3614,10 @@ class LiveBinanceTrader:
                 'amount': amount,
                 'status': order.get('status', 'filled'),
                 'timestamp': int(datetime.now().timestamp() * 1000),
-                'slippage_pct': slippage_pct,
+                'slippage_pct': slippage_pct if slippage_pct is not None else 0,
                 'fee': fee_cost,
+                'fee_source': fee_source,
+                'bbo_valid': bbo_valid,
             }
             
         except Exception as e:
@@ -12723,6 +13373,9 @@ async def background_scanner_loop():
                 
                 await global_paper_trader.check_pending_orders(opportunities)
                 
+                # Periodic execution diagnostics (60s throttle built-in)
+                if live_binance_trader.enabled:
+                    live_binance_trader._log_diag_summary()
                 # Phase 237D: Evaluate reject attribution with current prices
                 if REJECT_ATTRIBUTION_ENABLED:
                     try:
@@ -13932,10 +14585,10 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
             legacy_micro_soft_pass = (
                 strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
-                and signal_score >= 90
-                and eq_count >= 1
-                and signal_spread <= 0.12
-                and total_depth >= 1_200
+                and signal_score >= 105   # Phase RSP: was 90
+                and eq_count >= 2         # Phase RSP: was 1
+                and signal_spread <= 0.08 # Phase RSP: was 0.12
+                and total_depth >= 2_500  # Phase RSP: was 1_200
             )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
@@ -21641,7 +22294,7 @@ class SignalGenerator:
                 eq_min_volume_ratio = max(0.35, EQ_MIN_VOLUME_RATIO * 0.35)
                 eq_min_imbalance = max(12.0, EQ_MIN_IMBALANCE * 0.5)
                 eq_min_ob_trend = max(0.15, EQ_MIN_OB_TREND * 0.5)
-                eq_min_volume_24h = max(350_000.0, EQ_MIN_VOLUME_24H * 0.3)
+                eq_min_volume_24h = max(1_000_000.0, EQ_MIN_VOLUME_24H * 0.3)  # Phase RSP: floor raised to 1M
                 eq_max_spread = max(0.35, EQ_MAX_SPREAD)
 
             # Koşul A: Volume başlangıcı
@@ -21669,7 +22322,7 @@ class SignalGenerator:
             # Gate kararı:
             # - Adaptive modes (LEGACY + SMART_V2): 1/3 ile soft-pass, 0/3 ise yüksek skorda kontrollü geçiş
             # - Other modes: 2/3 şartını korur
-            eq_required = 2 if not adaptive_mode else 1
+            eq_required = 2  # Phase RSP: always require 2/3, adaptive does NOT lower
             eq_hard_mode = (ENTRY_QUALITY_MODE == 'hard') and not adaptive_mode
             eq_penalty = 15 if not adaptive_mode else 8
 
@@ -21889,6 +22542,24 @@ class SignalGenerator:
 
         # Ensure leverage bounds (3-75x)
         final_leverage = max(3, min(75, final_leverage))
+
+        # Phase RSP: Volatility hard cap table
+        if volatility_pct >= 30:
+            vol_lev_cap = 3
+        elif volatility_pct >= 20:
+            vol_lev_cap = 5
+        elif volatility_pct >= 12:
+            vol_lev_cap = 8
+        else:
+            vol_lev_cap = 75  # no cap
+        # Illiquid / wide-spread cap
+        if spread_pct >= 0.20 or volume_24h < 1_000_000:
+            vol_lev_cap = min(vol_lev_cap, 5)
+        old_lev_before_vol_cap = final_leverage
+        final_leverage = min(final_leverage, vol_lev_cap)
+        if final_leverage < old_lev_before_vol_cap:
+            reasons.append(f"VOL_LEV_CAP({old_lev_before_vol_cap}→{final_leverage}x,vol={volatility_pct:.0f}%)")
+
         if volatile_soft_risk_cap:
             old_leverage = final_leverage
             final_leverage = min(final_leverage, VOLATILE_VETO_SOFTPASS_LEVERAGE_CAP)
@@ -22649,7 +23320,10 @@ class PaperTradingEngine:
         
         # Save to SQLite (async, non-blocking)
         try:
-            safe_create_task(sqlite_manager.add_log(timestamp, message, ts))
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                safe_create_task(sqlite_manager.add_log(timestamp, message, ts))
+            # else: no running loop (e.g. during import/test), skip async log
         except Exception:
             pass  # Ignore if event loop not running
 
@@ -23324,8 +23998,31 @@ class PaperTradingEngine:
         # Apply MTF size modifier (bonus: 1.1 = +10%, penalty: 0.8 = -20%)
         mtf_size_modifier = signal.get('mtf_size_modifier', 1.0) if signal else 1.0
         position_size_usd = position_size_usd * mtf_size_modifier
+
+        # Phase RSP: Notional size cap — max % of balance per position
+        raw_size_usd = position_size_usd
+        max_size_usd = self.balance * 0.15  # default: max 15% of balance
+        _vol_pct = (atr / price * 100) if price > 0 else 2.0
+        if _vol_pct >= 20:
+            max_size_usd = self.balance * 0.07
+        if volume_24h < 1_000_000:
+            max_size_usd = min(max_size_usd, self.balance * 0.05)
+        size_cap_reason = ''
+        if position_size_usd > max_size_usd:
+            position_size_usd = max_size_usd
+            size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
+            reasons.append(size_cap_reason)
         
         position_size = position_size_usd / entry_price
+
+        # Phase RSP: Mandatory entry telemetry
+        logger.info(
+            f"RISK_TEL: {trade_symbol} {signal_side} "
+            f"rpt_raw={dynamic_risk:.4f} rpt_session={session_risk:.4f} "
+            f"lev_raw={raw_leverage} lev_eff={adjusted_leverage} lev_cap={_lev_cap_reason} "
+            f"size_raw=${raw_size_usd:.0f} size_eff=${position_size_usd:.0f} {size_cap_reason} "
+            f"bal=${self.balance:.0f} vol={_vol_pct:.1f}% vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%"
+        )
         
         # Create pending order
         # Signal Confirmation: Phase 224B adaptive delay — ATR/spread/skora göre 1-8dk
@@ -24051,9 +24748,55 @@ class PaperTradingEngine:
             )
             return False  # order stays, not executed
 
-        # PASS — execute
+        # PASS — but apply entry score + drift guard before executing
         self.pipeline_metrics.setdefault('recheck_pass', 0)
         self.pipeline_metrics['recheck_pass'] += 1
+
+        # ===== Entry Score Gate =====
+        is_live = live_binance_trader.enabled and live_binance_trader.trading_mode == 'live'
+        if is_live:
+            try:
+                vbbo = await live_binance_trader.validate_bbo(symbol)
+                signal_score_raw = float(order.get('signalScore', 0) or 0)
+                recent_rej = self.pipeline_metrics.get('spread_rejected', 0) + self.pipeline_metrics.get('drift_rejected', 0)
+                escore = live_binance_trader.compute_entry_exec_score(signal_score_raw, vbbo, recent_rejects=min(recent_rej, 5))
+                order['entryExecScore'] = escore['final']
+
+                if escore['final'] < live_binance_trader.exec_entry_score_min:
+                    live_binance_trader._exec_diag['entry_score_block'] += 1
+                    live_binance_trader._exec_diag['gate_block_total'] += 1
+                    # WAIT 30s — don't drop, signal may recover
+                    order['confirmAfter'] = max(
+                        int(order.get('confirmAfter', current_time)),
+                        current_time + 30_000
+                    )
+                    logger.info(
+                        f"\U0001f6ab ENTRY_SCORE_LOW: {side} {symbol} score={escore['final']:.3f} "
+                        f"< min={live_binance_trader.exec_entry_score_min} | sig={escore['signal']:.2f} micro={escore['micro']:.2f} risk={escore['risk']:.2f}"
+                    )
+                    self.set_execution_feedback(symbol, f"ENTRY_SCORE_LOW:{escore['final']:.3f}")
+                    return False  # order stays, wait
+
+                # ===== Drift Guard =====
+                expected_price = float(order.get('entryPrice', 0) or fill_price)
+                current_mid = vbbo['bbo'].get('mid', 0) if vbbo.get('valid') else 0
+                drift_bps, drift_blocked, drift_reason = live_binance_trader._check_pre_trade_drift(expected_price, current_mid)
+                order['driftBps'] = drift_bps
+
+                if drift_blocked:
+                    if force_market and not live_binance_trader.exec_force_market_drift_hard:
+                        # Soft: log but don't block on force_market
+                        logger.info(f"\u26a0\ufe0f DRIFT_SOFT: {side} {symbol} drift={drift_bps:.1f}bps > max but force_market=True, proceeding")
+                    else:
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps")
+                        logger.warning(f"\U0001f6ab BLOCK_OPEN_DRIFT: {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps")
+                        return False  # order stays, wait for price to converge
+
+                live_binance_trader._exec_diag['gate_allow'] += 1
+            except Exception as egate_err:
+                logger.debug(f"Entry gate check error (non-blocking): {egate_err}")
+
         # force_market is passed through as-is; recheck does NOT downgrade it.
         await self.execute_pending_order(order, fill_price, force_market=force_market)
         return True
@@ -24291,50 +25034,71 @@ class PaperTradingEngine:
         # =====================================================================
         if is_live_mode and not force_market:
             try:
-                # Phase 186 Feature C: Pre-trade spread filter
-                ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
+                # Phase BBO: Reason-first pre-trade validation via validate_bbo
                 try:
-                    pre_ticker = await live_binance_trader.exchange.fetch_ticker(ccxt_sym)
-                    pre_bid = pre_ticker.get('bid', 0)
-                    pre_ask = pre_ticker.get('ask', 0)
-                    pre_mid = (pre_bid + pre_ask) / 2 if pre_bid and pre_ask else 0
-                    pre_spread = ((pre_ask - pre_bid) / pre_mid * 100) if pre_mid > 0 else 0
+                    pre_vbbo = await live_binance_trader.validate_bbo(symbol)
+                    pre_bbo = pre_vbbo['bbo']
+                    pre_bid = pre_bbo['bid']
+                    pre_ask = pre_bbo['ask']
+                    pre_spread = pre_bbo['spread_pct']
                     
-                    ENTRY_SPREAD_LIMIT = 0.3  # Max 0.3% spread for entry
-                    if pre_spread > ENTRY_SPREAD_LIMIT:
-                        logger.warning(f"🚫 SPREAD_FILTER: Rejecting {side} {symbol} entry — spread={pre_spread:.3f}% > {ENTRY_SPREAD_LIMIT}% (bid=${pre_bid:.6f} ask=${pre_ask:.6f})")
-                        self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped (spread {pre_spread:.2f}% too wide)")
+                    reason = pre_vbbo.get('reason', 'unknown')
+                    is_valid = bool(pre_vbbo.get('valid'))
+
+                    if not is_valid:
+                        if reason == 'stale_bbo':
+                            live_binance_trader._exec_diag['stale_block_count'] += 1
+                            live_binance_trader._exec_diag['gate_block_total'] += 1
+                            self.pipeline_metrics['spread_rejected'] += 1
+                            self.set_execution_feedback(symbol, f"BLOCK_OPEN_STALE_BBO:{reason}")
+                            logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_STALE_BBO | reason={reason}")
+                            self.add_log(f"🚫 BBO VETO: {symbol} stale BBO")
+                            if order not in self.pending_orders:
+                                self.pending_orders.append(order)
+                            return
+
+                        if reason in ('spread_too_wide', 'book_thin'):
+                            live_binance_trader._exec_diag['spread_block'] += 1
+                            live_binance_trader._exec_diag['gate_block_total'] += 1
+                            self.pipeline_metrics['spread_rejected'] += 1
+                            self.set_execution_feedback(symbol, f"BLOCK_OPEN_SPREAD:{reason}")
+                            logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_SPREAD | reason={reason} spread_bps={pre_vbbo.get('spread_bps')}")
+                            self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped ({reason})")
+                            if order not in self.pending_orders:
+                                self.pending_orders.append(order)
+                            return
+
+                        # Default invalid (missing, bid_le_zero, ask_lt_bid, etc.)
+                        live_binance_trader._exec_diag['invalid_block_count'] += 1
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['spread_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"SPREAD_FILTER:{pre_spread:.2f}%")
-                        # Return order to pending for retry
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{reason}")
+                        logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_INVALID_BBO | reason={reason}")
+                        self.add_log(f"🚫 BBO VETO: {symbol} entry skipped ({reason})")
                         if order not in self.pending_orders:
                             self.pending_orders.append(order)
                         return
                 except Exception as sf_err:
-                    logger.debug(f"Spread filter check error: {sf_err}")
-                    # Continue with entry if spread check fails
+                    logger.debug(f"Pre-trade BBO check error: {sf_err}")
+                    # Continue with entry if BBO check fails entirely
                 
-                # ===== Phase 201: Pre-Entry Price Drift Check =====
-                # Compare signal price vs current price — reject if drifted too much
+                # ===== Pre-Entry Price Drift Check via _check_pre_trade_drift =====
                 try:
                     signal_price = order.get('signalPrice', 0)
-                    # Use pre_ticker from spread filter if available, otherwise fetch fresh
                     try:
-                        current_price = pre_ticker.get('last', fill_price)
+                        current_mid = pre_bbo['mid'] if pre_bbo.get('valid') and pre_bbo.get('mid', 0) > 0 else fill_price
                     except NameError:
-                        current_price = fill_price
-                    if signal_price > 0 and current_price > 0:
-                        MAX_PRICE_DRIFT_PCT = 1.5  # Max 1.5% drift since signal
-                        price_drift_pct = abs(current_price - signal_price) / signal_price * 100
-                        if price_drift_pct > MAX_PRICE_DRIFT_PCT:
-                            logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} REJECTED — price drifted {price_drift_pct:.2f}% since signal (signal=${signal_price:.6f} → now=${current_price:.6f})")
-                            self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} price drifted {price_drift_pct:.1f}% since signal")
-                            self.pipeline_metrics['drift_rejected'] += 1
-                            self.set_execution_feedback(symbol, f"SLIPPAGE_GUARD:{price_drift_pct:.2f}%")
-                            # Don't retry — signal is stale
-                            return
-                        else:
-                            logger.debug(f"✅ DRIFT_CHECK: {symbol} drift={price_drift_pct:.2f}% OK (max {MAX_PRICE_DRIFT_PCT}%)")
+                        current_mid = fill_price
+                    drift_bps, drift_blocked, drift_reason = live_binance_trader._check_pre_trade_drift(signal_price, current_mid)
+                    if drift_blocked:
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
+                        logger.warning(f"🚫 BLOCK_OPEN_DRIFT: {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps")
+                        self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} drift {drift_bps:.0f}bps")
+                        self.pipeline_metrics['drift_rejected'] += 1
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps")
+                        return
+                    elif drift_bps > 0:
+                        logger.debug(f"✅ DRIFT_CHECK: {symbol} drift={drift_bps:.1f}bps OK")
                 except Exception as drift_err:
                     logger.debug(f"Price drift check error: {drift_err}")
                 
@@ -24411,9 +25175,33 @@ class PaperTradingEngine:
                 self.set_execution_feedback(symbol, "BINANCE_ORDER_ERROR")
                 return  # Don't create position if there was an error
         elif force_market and is_live_mode:
-            # Force market: bypass spread/drift guards, send direct market order
+            # Force market: BBO + drift guard still enforced for safety
             try:
-                logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (MARKET, no spread/drift check)...")
+                # Pre-trade BBO + drift check even on force_market
+                try:
+                    fm_vbbo = await live_binance_trader.validate_bbo(symbol)
+                    if not fm_vbbo['valid']:
+                        live_binance_trader._exec_diag['invalid_block_count'] += 1
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
+                        self.pipeline_metrics['spread_rejected'] += 1
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{fm_vbbo['reason']}")
+                        logger.warning(f"🚫 FORCE_MARKET BBO_VETO: {side} {symbol} | reason={fm_vbbo['reason']}")
+                        self.add_log(f"🚫 FORCE MARKET BBO VETO: {symbol} ({fm_vbbo['reason']})")
+                        return
+                    fm_mid = fm_vbbo['bbo'].get('mid', 0) if fm_vbbo.get('valid') else 0
+                    fm_drift_bps, fm_drift_blocked, _ = live_binance_trader._check_pre_trade_drift(
+                        order.get('signalPrice', fill_price), fm_mid)
+                    if fm_drift_blocked:
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
+                        self.pipeline_metrics['drift_rejected'] += 1
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{fm_drift_bps:.1f}bps")
+                        logger.warning(f"🚫 FORCE_MARKET DRIFT_BLOCK: {side} {symbol} drift={fm_drift_bps:.1f}bps")
+                        self.add_log(f"🚫 FORCE MARKET DRIFT: {symbol} {fm_drift_bps:.0f}bps")
+                        return
+                except Exception as fm_gate_err:
+                    logger.debug(f"Force market gate check error (non-blocking): {fm_gate_err}")
+
+                logger.info(f"🔥 FORCE MARKET ORDER: Sending {side} {symbol} to Binance (MARKET, BBO+drift passed)...")
                 self.pipeline_metrics['order_attempted'] += 1
                 result = await live_binance_trader.place_market_order(
                     symbol=symbol,
@@ -24942,7 +25730,10 @@ class PaperTradingEngine:
                     # Phase 17: Load settings
                     self.symbol = data.get('symbol', 'SOLUSDT')
                     self.leverage = data.get('leverage', 10)
-                    self.risk_per_trade = data.get('risk_per_trade', 0.02)
+                    _r = data.get('risk_per_trade', 0.02)
+                    if _r > 1.0:  # legacy state had percent (2.0 = 2%), normalize to ratio
+                        _r = _r / 100.0
+                    self.risk_per_trade = max(0.002, min(0.05, _r))
                     # Phase 18: Load full trading parameters
                     self.sl_atr = data.get('sl_atr', 15)  # Default: 15 (1.5x ATR)
                     self.tp_atr = data.get('tp_atr', 30)  # Default: 30 (3.0x ATR)
@@ -28118,8 +28909,14 @@ async def paper_trading_update_settings(
 
     if leverage:
         global_paper_trader.leverage = leverage
-    if riskPerTrade:
-        global_paper_trader.risk_per_trade = riskPerTrade
+    if riskPerTrade is not None:
+        r = float(riskPerTrade)
+        # UI sends percent (2 = 2%), normalize to ratio
+        if r > 1.0:
+            r = r / 100.0
+        # Safety clamp: 0.2% - 5%
+        r = max(0.002, min(0.05, r))
+        global_paper_trader.risk_per_trade = r
     # Phase 264: Server-side clamp all incoming values
     clamped_fields = []
     
