@@ -17075,18 +17075,22 @@ class TimeBasedPositionManager:
                             else:
                                 _favorable = _tp1_hit_price - current_price
                             
-                            _atr_threshold = 0.4 * atr
+                            # Phase 271B fix: safe_atr guards against atr=0
+                            _safe_atr = atr if atr and atr > 0 else max(current_price * 0.01, 1e-8)
+                            _atr_threshold = 0.4 * _safe_atr
+                            _move_atr = _favorable / _safe_atr
                             _should_activate = (_elapsed >= 90 and _favorable >= _atr_threshold)
                             _is_timeout = (_elapsed >= 1200)  # 20 min
                             
                             if _should_activate or _is_timeout:
-                                trail_dist = pos.get('trailDistance', atr * 1.5)
+                                trail_dist = pos.get('trailDistance', _safe_atr * 1.5)
                                 if _is_timeout and not _should_activate:
-                                    # Timeout: use tighter trail distance
-                                    trail_dist = pos.get('trailDistance', atr * 1.0)
-                                    logger.warning(f"⏰ TP1_TRAIL_ARM_TIMEOUT: {symbol} {side} elapsed={_elapsed:.0f}s | fallback tight trail")
+                                    # Phase 271B fix: Actually tighten — 75% of current or 0.5×ATR
+                                    _old_dist = trail_dist
+                                    trail_dist = max(0.5 * _safe_atr, trail_dist * 0.75)
+                                    logger.warning(f"⏰ TP1_TRAIL_ARM_TIMEOUT: {symbol} {side} elapsed={_elapsed:.0f}s | dist ${_old_dist:.6f}→${trail_dist:.6f} (shrink)")
                                 else:
-                                    logger.warning(f"✅ TP1_TRAIL_ACTIVATED_DELAYED: {symbol} {side} elapsed={_elapsed:.0f}s move_atr={_favorable/atr:.2f}")
+                                    logger.warning(f"✅ TP1_TRAIL_ACTIVATED_DELAYED: {symbol} {side} elapsed={_elapsed:.0f}s move_atr={_move_atr:.2f}")
                                 
                                 if side == 'LONG':
                                     new_trail_stop = current_price - trail_dist
@@ -17100,6 +17104,9 @@ class TimeBasedPositionManager:
                                 pos['isTrailingActive'] = True
                                 pos['trailActiveSince'] = datetime.now().timestamp()
                                 pos['tp1_trail_armed'] = False
+                                # Phase 271B fix: Refresh stale local variable to prevent
+                                # downstream exit blocks from running in the same tick
+                                is_trailing_active = True
                 
                 # Phase 190: REMOVED duplicate breakeven (Phase 137)
                 # BreakevenStopManager handles this better with limit orders + fee buffer
