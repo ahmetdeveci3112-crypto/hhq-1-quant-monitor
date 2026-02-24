@@ -6072,6 +6072,13 @@ TP_LADDER_RUNTIME_ADJUST_ENABLED = True  # Allow small runtime adjustments
 TP_LADDER_VERSION = "v1_adaptive"       # Version tag for telemetry
 
 # ============================================================================
+# Phase 271: TREND RUNNER TUNING — Feature Flag
+# When ON: trend_mode positions get 30/30/40 TP ratios, delayed TP1 trail,
+# and ET floor 1.15.  When OFF: zero behavior change.
+# ============================================================================
+TREND_RUNNER_TUNING_ENABLED = False
+
+# ============================================================================
 # Phase 252: PERSISTENT SIGNAL LIFECYCLE — Feature Flags
 # ============================================================================
 PERSISTENT_SIGNAL_MODE = True             # Master switch for signal lifecycle
@@ -16909,6 +16916,13 @@ class TimeBasedPositionManager:
                             {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
                             {'pct': tp3_price_pct, 'close_pct': 0.30, 'key': 'tp3'},
                         ]
+                        # Phase 271A: Trend mode → runner-heavy 30/30/40 profile
+                        if TREND_RUNNER_TUNING_ENABLED and pos.get('trend_mode'):
+                            tp_levels = [
+                                {'pct': tp1_price_pct, 'close_pct': 0.30, 'key': 'tp1'},
+                                {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
+                                {'pct': tp3_price_pct, 'close_pct': 0.40, 'key': 'tp3'},
+                            ]
                     
                     # Current profit percentage
                     if entry_price > 0:
@@ -16982,20 +16996,29 @@ class TimeBasedPositionManager:
                                 # Kalan pozisyonu trail ile koru, SL'i entry+fee'ye taşı
                                 # =====================================================
                                 if level['key'] == 'tp1':
-                                    # 1) Force-activate trailing stop for remaining position
-                                    trail_dist = pos.get('trailDistance', atr * 1.5)
-                                    if side == 'LONG':
-                                        new_trail_stop = current_price - trail_dist
-                                        # Trail stop should be at least at entry
-                                        new_trail_stop = max(new_trail_stop, entry_price)
-                                        pos['trailingStop'] = new_trail_stop
-                                    else:  # SHORT
-                                        new_trail_stop = current_price + trail_dist
-                                        new_trail_stop = min(new_trail_stop, entry_price)
-                                        pos['trailingStop'] = new_trail_stop
-                                    pos['isTrailingActive'] = True
-                                    pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                                    logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
+                                    # Phase 271B: Delayed trail for trend_mode positions
+                                    if TREND_RUNNER_TUNING_ENABLED and pos.get('trend_mode'):
+                                        # Arm trail delay — don't activate yet
+                                        pos['tp1_hit_time'] = datetime.now().timestamp()
+                                        pos['tp1_hit_price'] = current_price
+                                        pos['tp1_trail_armed'] = True
+                                        logger.warning(f"⏳ TP1_TRAIL_ARMED: {symbol} {side} price=${current_price:.6f} | trail deferred (90s + 0.4ATR)")
+                                        # NOTE: breakeven SL still applied below for protection
+                                    else:
+                                        # Original behavior: immediate trail activation
+                                        # 1) Force-activate trailing stop for remaining position
+                                        trail_dist = pos.get('trailDistance', atr * 1.5)
+                                        if side == 'LONG':
+                                            new_trail_stop = current_price - trail_dist
+                                            new_trail_stop = max(new_trail_stop, entry_price)
+                                            pos['trailingStop'] = new_trail_stop
+                                        else:  # SHORT
+                                            new_trail_stop = current_price + trail_dist
+                                            new_trail_stop = min(new_trail_stop, entry_price)
+                                            pos['trailingStop'] = new_trail_stop
+                                        pos['isTrailingActive'] = True
+                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
+                                        logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
                                     
                                     # 2) Move SL to breakeven (entry + fee buffer)
                                     fee_buffers = {
@@ -17036,6 +17059,47 @@ class TimeBasedPositionManager:
                                 
                                 # Phase 220b: Update local contracts for next TP level calculation
                                 contracts = pos['contracts']
+                        
+                        # =============================================================
+                        # Phase 271B: TP1 TRAIL DELAYED ACTIVATION CHECK
+                        # If tp1_trail_armed, check 90s elapsed + 0.4 ATR favorable move
+                        # =============================================================
+                        if TREND_RUNNER_TUNING_ENABLED and pos.get('tp1_trail_armed') and not pos.get('isTrailingActive'):
+                            _now_ts = datetime.now().timestamp()
+                            _tp1_hit_time = pos.get('tp1_hit_time', _now_ts)
+                            _tp1_hit_price = pos.get('tp1_hit_price', current_price)
+                            _elapsed = _now_ts - _tp1_hit_time
+                            
+                            if side == 'LONG':
+                                _favorable = current_price - _tp1_hit_price
+                            else:
+                                _favorable = _tp1_hit_price - current_price
+                            
+                            _atr_threshold = 0.4 * atr
+                            _should_activate = (_elapsed >= 90 and _favorable >= _atr_threshold)
+                            _is_timeout = (_elapsed >= 1200)  # 20 min
+                            
+                            if _should_activate or _is_timeout:
+                                trail_dist = pos.get('trailDistance', atr * 1.5)
+                                if _is_timeout and not _should_activate:
+                                    # Timeout: use tighter trail distance
+                                    trail_dist = pos.get('trailDistance', atr * 1.0)
+                                    logger.warning(f"⏰ TP1_TRAIL_ARM_TIMEOUT: {symbol} {side} elapsed={_elapsed:.0f}s | fallback tight trail")
+                                else:
+                                    logger.warning(f"✅ TP1_TRAIL_ACTIVATED_DELAYED: {symbol} {side} elapsed={_elapsed:.0f}s move_atr={_favorable/atr:.2f}")
+                                
+                                if side == 'LONG':
+                                    new_trail_stop = current_price - trail_dist
+                                    new_trail_stop = max(new_trail_stop, entry_price)
+                                    pos['trailingStop'] = new_trail_stop
+                                else:
+                                    new_trail_stop = current_price + trail_dist
+                                    new_trail_stop = min(new_trail_stop, entry_price)
+                                    pos['trailingStop'] = new_trail_stop
+                                
+                                pos['isTrailingActive'] = True
+                                pos['trailActiveSince'] = datetime.now().timestamp()
+                                pos['tp1_trail_armed'] = False
                 
                 # Phase 190: REMOVED duplicate breakeven (Phase 137)
                 # BreakevenStopManager handles this better with limit orders + fee buffer
@@ -22743,6 +22807,18 @@ class PaperTradingEngine:
                 effective_et = max(effective_et, base_et * 1.15) # Phase 244: 1.25→1.15
             elif side == 'SHORT' and is_btc_bearish:
                 effective_et = max(effective_et, base_et * 1.15) # Phase 244: 1.25→1.15
+            
+            # Phase 271C: Trend-aligned hard floor for trend_mode positions
+            if TREND_RUNNER_TUNING_ENABLED and pos.get('trend_mode'):
+                _trend_aligned = (
+                    (side == 'LONG' and is_btc_bullish) or
+                    (side == 'SHORT' and is_btc_bearish)
+                )
+                if _trend_aligned:
+                    _old_et = effective_et
+                    effective_et = max(effective_et, 1.15)
+                    if effective_et != _old_et:
+                        logger.debug(f"EXIT_TIGHTNESS_TREND_FLOOR: {pos.get('symbol', '?')} et {_old_et:.2f}->{effective_et:.2f}")
                 
         except Exception as e:
             pass # Failsafe
