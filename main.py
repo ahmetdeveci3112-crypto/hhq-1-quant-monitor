@@ -12366,13 +12366,25 @@ async def background_scanner_loop():
                             
                             now_ts = datetime.now().timestamp()
                             if sl_breached:
-                                # Phase 231c: Trail hit → immediate close (no confirmation delay)
-                                # Trail is profit protection — delay loses money
+                                # Phase 268: Trail confirmation (was immediate exit)
                                 if pos.get('isTrailingActive', False):
-                                    reason = 'TRAIL_EXIT'
-                                    logger.info(f"🔴 TRAIL EXIT (immediate): {pos_symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
-                                    exit_engine.request_exit(pos, current_price, reason)
-                                    continue
+                                    # Trail maturity check
+                                    trail_active_since = pos.get('trailActiveSince', 0)
+                                    trail_age = now_ts - trail_active_since if trail_active_since > 0 else 999
+                                    if trail_age < MIN_TRAIL_ACTIVE_SEC:
+                                        continue  # trail too fresh, skip exit
+                                    # Trail breach confirmation: need 2+ ticks AND 5s
+                                    if pos.get('trailBreachCount', 0) == 0:
+                                        pos['trailBreachStartTime'] = now_ts
+                                    pos['trailBreachCount'] = pos.get('trailBreachCount', 0) + 1
+                                    trail_breach_dur = now_ts - pos.get('trailBreachStartTime', now_ts)
+                                    if pos['trailBreachCount'] >= 2 and trail_breach_dur >= 5:
+                                        reason = 'TRAIL_EXIT'
+                                        logger.info(f"🔴 TRAIL EXIT (confirmed): {pos_symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f} | {pos['trailBreachCount']} ticks / {trail_breach_dur:.0f}s")
+                                        exit_engine.request_exit(pos, current_price, reason)
+                                        continue
+                                    else:
+                                        continue  # wait for more confirmation
                                 
                                 # Start timer on first breach (SL only, not trail)
                                 if pos['slConfirmCount'] == 0:
@@ -12546,6 +12558,7 @@ async def background_scanner_loop():
                                         pos['trailingStop'] = new_trailing
                                         if not trail_already_active:
                                             pos['isTrailingActive'] = True
+                                            pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                                             # Breakeven SL on first activation
                                             pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
                                             logger.info(f"📊 TRAIL_DYN: {pos_symbol} LONG trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
@@ -12563,6 +12576,7 @@ async def background_scanner_loop():
                                         pos['trailingStop'] = new_trailing
                                         if not trail_already_active:
                                             pos['isTrailingActive'] = True
+                                            pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                                             pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
                                             logger.info(f"📊 TRAIL_DYN: {pos_symbol} SHORT trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                                     
@@ -12889,12 +12903,25 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         now_ts = datetime.now().timestamp()
         if sl_breached:
-            # Phase 231c: Trail hit → immediate close (no confirmation delay)
+            # Phase 268: Trail confirmation (was immediate exit)
             if pos.get('isTrailingActive', False):
-                reason = 'TRAIL_EXIT'
-                logger.info(f"🔴 TRAIL EXIT (immediate, WS): {symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f}")
-                exit_engine.request_exit(pos, current_price, reason)
-                continue
+                # Trail maturity check
+                trail_active_since = pos.get('trailActiveSince', 0)
+                trail_age = now_ts - trail_active_since if trail_active_since > 0 else 999
+                if trail_age < MIN_TRAIL_ACTIVE_SEC:
+                    continue  # trail too fresh, skip exit
+                # Trail breach confirmation: need 2+ ticks AND 5s
+                if pos.get('trailBreachCount', 0) == 0:
+                    pos['trailBreachStartTime'] = now_ts
+                pos['trailBreachCount'] = pos.get('trailBreachCount', 0) + 1
+                trail_breach_dur = now_ts - pos.get('trailBreachStartTime', now_ts)
+                if pos['trailBreachCount'] >= 2 and trail_breach_dur >= 5:
+                    reason = 'TRAIL_EXIT'
+                    logger.info(f"🔴 TRAIL EXIT (confirmed, WS): {symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f} | {pos['trailBreachCount']} ticks / {trail_breach_dur:.0f}s")
+                    exit_engine.request_exit(pos, current_price, reason)
+                    continue
+                else:
+                    continue  # wait for more confirmation
             
             if pos['slConfirmCount'] == 0:
                 pos['slBreachStartTime'] = now_ts
@@ -12918,15 +12945,17 @@ async def on_position_price_update(symbol: str, ticker: dict):
             pos['slConfirmCount'] = 0
             pos['slBreachStartTime'] = 0
         
-        # TP Hit Check (anında — kar için onay gerekmez)
+        # TP Hit Check (Phase 268: use conservative exit price)
         # Phase 205: Use candle close for TP decision
         if pos['side'] == 'LONG' and candle_close_price >= tp:
-            exit_engine.request_exit(pos, current_price, 'TP_HIT')
-            logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
+            tp_exit_price = min(candle_close_price, current_price)  # Phase 268: conservative
+            exit_engine.request_exit(pos, tp_exit_price, 'TP_HIT')
+            logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${tp_exit_price:.6f} (candle ${candle_close_price:.6f}, tick ${current_price:.6f})")
             continue
         elif pos['side'] == 'SHORT' and candle_close_price <= tp:
-            exit_engine.request_exit(pos, current_price, 'TP_HIT')
-            logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${current_price:.6f} (candle close ${candle_close_price:.6f})")
+            tp_exit_price = max(candle_close_price, current_price)  # Phase 268: conservative
+            exit_engine.request_exit(pos, tp_exit_price, 'TP_HIT')
+            logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${tp_exit_price:.6f} (candle ${candle_close_price:.6f}, tick ${current_price:.6f})")
             continue
         
         # ---- Phase 214: FAILED CONTINUATION DETECTOR (WS) ----
@@ -13009,6 +13038,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     pos['trailingStop'] = new_trailing
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
+                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                         pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
                         logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} LONG trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
         elif pos['side'] == 'SHORT':
@@ -13023,6 +13053,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     pos['trailingStop'] = new_trailing
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
+                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                         pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
                         logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} SHORT trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
 
