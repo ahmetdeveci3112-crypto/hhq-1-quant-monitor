@@ -185,6 +185,10 @@ class MLGovernanceService:
                         reg['history'].append(entry)
                         if entry['role'] == 'champion' and entry['status'] == 'active':
                             reg['champion'] = entry
+                        elif entry['role'] == 'champion' and entry['status'] == 'frozen':
+                            # Phase 268: frozen champion still counts — never leave champion=None
+                            if reg['champion'] is None:
+                                reg['champion'] = entry
                         elif entry['role'] == 'challenger' and entry['status'] == 'active':
                             reg['challenger'] = entry
                         count += 1

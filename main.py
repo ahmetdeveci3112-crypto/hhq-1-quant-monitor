@@ -4912,6 +4912,7 @@ async def binance_position_sync_loop():
                                     # Phase 231h: Only price_move check + breakeven on activation
                                     if (sync_price_move >= 0.75 or sync_roi >= 5.0) and not pos.get('isTrailingActive', False):
                                         pos['isTrailingActive'] = True
+                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         # Breakeven on BOTH stopLoss AND trailingStop
                                         if pos['side'] == 'LONG':
                                             _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
@@ -13285,6 +13286,7 @@ async def position_price_update_loop():
                                     pos['trailingStop'] = new_trailing
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
+                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
                         elif pos['side'] == 'SHORT':
                             fast_should_activate = (
@@ -13298,6 +13300,7 @@ async def position_price_update_loop():
                                     pos['trailingStop'] = new_trailing
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
+                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
                                 
                     except Exception as pos_error:
@@ -25249,6 +25252,8 @@ class PaperTradingEngine:
                     if not pos['isTrailingActive']:
                         self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
+                    if not pos.get('trailActiveSince'):
+                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                 
                 if pos['isTrailingActive']:
                     new_sl = current_price - dynamic_trail
@@ -25288,6 +25293,8 @@ class PaperTradingEngine:
                     if not pos['isTrailingActive']:
                         self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
+                    if not pos.get('trailActiveSince'):
+                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
                     
                 if pos['isTrailingActive']:
                     new_sl = current_price + dynamic_trail
