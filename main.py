@@ -4266,8 +4266,8 @@ async def lifespan(app: FastAPI):
                 if not ml_governance_service or not ml_governance_service.enabled or not ml_governance_service.auto_rollback:
                     continue
                 
-                # Build recent metrics from last 50 trades
-                recent_trades = global_paper_trader.trades[-50:] if hasattr(global_paper_trader, 'trades') else []
+                # Build recent metrics from last 200 trades (Phase 268 fix: was 50, needs >=min_samples)
+                recent_trades = global_paper_trader.trades[-200:] if hasattr(global_paper_trader, 'trades') else []
                 if len(recent_trades) < 10:
                     continue
                 
@@ -12440,12 +12440,15 @@ async def background_scanner_loop():
                                         exit_engine.request_exit(pos, current_price, reason)
                                         continue
                             else:
-                                # Price recovered - reset counter (spike bypassed!)
+                                # Price recovered - reset counters (spike bypassed!)
                                 if pos['slConfirmCount'] > 0:
                                     bypass_duration = now_ts - pos['slBreachStartTime']
                                     logger.info(f"⚡ Spike bypassed for {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
                                 pos['slConfirmCount'] = 0
                                 pos['slBreachStartTime'] = 0
+                                # Phase 268 fix: reset trail breach counters too
+                                pos['trailBreachCount'] = 0
+                                pos['trailBreachStartTime'] = 0
                             
                             # =========================================================
                             # Phase 183: TP_HIT → Limit Order (saves slippage)
@@ -12951,6 +12954,9 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 logger.info(f"⚡ Spike bypassed (WS): {symbol} | {pos['slConfirmCount']} ticks / {bypass_duration:.0f}s")
             pos['slConfirmCount'] = 0
             pos['slBreachStartTime'] = 0
+            # Phase 268 fix: reset trail breach counters too
+            pos['trailBreachCount'] = 0
+            pos['trailBreachStartTime'] = 0
         
         # TP Hit Check (Phase 268: use conservative exit price)
         # Phase 205: Use candle close for TP decision
@@ -16882,6 +16888,7 @@ class TimeBasedPositionManager:
                                         new_trail_stop = min(new_trail_stop, entry_price)
                                         pos['trailingStop'] = new_trail_stop
                                     pos['isTrailingActive'] = True
+                                    pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                     logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
                                     
                                     # 2) Move SL to breakeven (entry + fee buffer)
@@ -16967,6 +16974,7 @@ class TimeBasedPositionManager:
                         # Activate trail if pullback exceeds threshold
                         if profit_pullback >= pullback_threshold:
                             pos['isTrailingActive'] = True
+                            pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                             pos['trailingStop'] = current_price
                             actions["trail_activated"].append(f"{symbol} (pullback ${profit_pullback:.2f})")
                             logger.info(f"📊 EARLY TRAIL: {symbol} activated - pullback ${profit_pullback:.2f} >= threshold ${pullback_threshold:.2f} (spread: {spread_level})")
@@ -24948,6 +24956,7 @@ class PaperTradingEngine:
                 if not pos.get('breakeven_mode', False):
                     pos['breakeven_mode'] = True
                     pos['isTrailingActive'] = True
+                    pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                     # Set tight trailing to try to close at breakeven or minimal loss
                     if pos['side'] == 'LONG':
                         pos['trailingStop'] = current_price - (atr_estimate * 0.3)
@@ -24962,6 +24971,7 @@ class PaperTradingEngine:
                 if not pos.get('recovery_mode', False):
                     pos['recovery_mode'] = True
                     pos['isTrailingActive'] = True
+                    pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                     # Set emergency stop loss to prevent further losses
                     if pos['side'] == 'LONG':
                         # Set SL at current price minus small buffer (accept the loss)

@@ -163,7 +163,7 @@ class MLGovernanceService:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(
                     "SELECT model_key, version, role, status, created_ts, metric_json, artifact_path, promoted_from, notes "
-                    "FROM ml_model_registry WHERE status IN ('active', 'retired') ORDER BY created_ts ASC"
+                    "FROM ml_model_registry WHERE status IN ('active', 'retired', 'frozen') ORDER BY created_ts ASC"
                 ) as cursor:
                     rows = await cursor.fetchall()
                     for row in rows:
