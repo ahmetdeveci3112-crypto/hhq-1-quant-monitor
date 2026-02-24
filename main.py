@@ -6062,6 +6062,14 @@ EXIT_FORECAST_MIN_HOLD_PROB = 0.62
 EXIT_FORECAST_MAX_DELAY_SEC = 45
 
 # =========================================================================
+# PHASE 268: EXIT ARCHITECTURE CONSTANTS (centralized)
+# =========================================================================
+MIN_POSITION_MATURITY_SEC = 300   # 5min hold guard (was 60s scattered)
+MIN_TRAIL_ACTIVE_SEC = 120        # trail must be active 2min before exit
+FC_MIN_AGE_SEC = 480              # FC checks skip first 8min
+FC_SINGLE_LOOP_OWNER = 'WS'      # FC only fires in WS loop
+
+# =========================================================================
 # PHASE 245: TRADE COST ESTIMATOR + TICK-SIZE UTILITIES
 # Central cost model feeding all entry/exit parameters
 # =========================================================================
@@ -8476,6 +8484,19 @@ def check_failed_continuation(pos: dict, candle_close_price: float) -> str:
     entry_price = pos.get('entryPrice', 0)
     if entry_price <= 0:
         return ''
+    
+    # Phase 268: FC age guard — skip if position is younger than FC_MIN_AGE_SEC
+    open_time = pos.get('openTime', 0)
+    if open_time > 0:
+        age_sec = datetime.now().timestamp() - (open_time / 1000)
+        if age_sec < FC_MIN_AGE_SEC:
+            return ''
+    
+    # Phase 268: FC candle-dedup — don't count same 5-min window twice
+    now_5m = int(datetime.now().timestamp()) // 300
+    if now_5m == pos.get('_fc_last_eval_5m', 0):
+        return ''  # already evaluated this candle window
+    pos['_fc_last_eval_5m'] = now_5m
     
     side = pos.get('side', 'LONG')
     pos_atr = pos.get('atr', entry_price * 0.02)
@@ -12237,12 +12258,11 @@ async def background_scanner_loop():
                                 exit_engine.request_exit(pos, current_price, reason)
                                 continue
                             
-                            # Phase 210: Flash Trade Guard — minimum 60s hold time
-                            MIN_HOLD_SECONDS_WS = 60
+                            # Phase 268: Flash Trade Guard — centralized hold guard
                             open_time_ms_ws = pos.get('openTime', 0)
                             if open_time_ms_ws > 0:
                                 hold_duration_ws = datetime.now().timestamp() - (open_time_ms_ws / 1000)
-                                if hold_duration_ws < MIN_HOLD_SECONDS_WS:
+                                if hold_duration_ws < MIN_POSITION_MATURITY_SEC:
                                     continue  # Skip all exit checks — too early
                             
                             # Phase 205: Use candle close price for exit DECISIONS (SL/TP/trail)
@@ -12451,22 +12471,12 @@ async def background_scanner_loop():
                                     continue
                             
                             # ===================================================================
-                            # Phase 214: FAILED CONTINUATION DETECTOR
-                            # N kez kâra geçip entry'ye geri dönen pozisyonları breakeven'da kapat
+                            # Phase 214/268: FAILED CONTINUATION DETECTOR
+                            # Phase 268: FC disabled in Scanner loop — now single-loop (WS only)
                             # ===================================================================
-                            fc_result = check_failed_continuation(pos, candle_close_price)
-                            if fc_result == 'FAILED_CONTINUATION':
-                                fc_count = pos.get('fc_failed_count', 0)
-                                logger.warning(f"📊 FAILED_CONTINUATION: {pos_symbol} {pos['side']} — {fc_count} başarısız deneme, breakeven kapatılıyor")
-                                # Breakeven close: dynamic buffer (Phase 238A)
-                                _be_spread = pos.get('spreadPct', 0.05)
-                                _be_buf = compute_breakeven_buffer_pct(spread_pct=_be_spread, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
-                                be_exit_price = entry_price * (1 + _be_buf) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf)
-                                pos['beBufferPct'] = round(_be_buf * 100, 4)
-                                pos['beBufferSource'] = 'dynamic'
-                                logger.info(f"BE_BUFFER: {pos_symbol} {pos['side']} reason=FC spread={_be_spread}% → buffer={_be_buf*100:.3f}%")
-                                exit_engine.request_exit(pos, be_exit_price, 'FAILED_CONTINUATION')
-                                continue
+                            # fc_result = check_failed_continuation(pos, candle_close_price)
+                            # if fc_result == 'FAILED_CONTINUATION':
+                            #     ... disabled in favor of WS-only FC
                             
                             # Update trailing stop if in profit
                             trail_activation = pos.get('trailActivation', entry_price)
@@ -13152,29 +13162,19 @@ async def position_price_update_loop():
                         # Actual SL/TP/Trail exit triggering is now handled exclusively by the WS loop.
                         # =====================================================================
                         
-                        # Phase 261: Flash Trade Guard — minimum 60s hold time for fast loop fallbacks
-                        MIN_HOLD_SECONDS_FAST = 60
+                        # Phase 268: Flash Trade Guard — centralized hold guard
                         open_time_ms_fast = pos.get('openTime', 0)
                         if open_time_ms_fast > 0:
                             hold_duration_fast = datetime.now().timestamp() - (open_time_ms_fast / 1000)
-                            if hold_duration_fast < MIN_HOLD_SECONDS_FAST:
+                            if hold_duration_fast < MIN_POSITION_MATURITY_SEC:
                                 continue  # Skip fast loop exit checks — too early
                         
-                        # ---- Phase 214: FAILED CONTINUATION DETECTOR (backup) ----
-                        # Phase 214 fix: Use candle close price, not tick price
-                        fc_candle_close_bu = last_candle_close.get(symbol, current_price)
-                        fc_result_bu = check_failed_continuation(pos, fc_candle_close_bu)
-                        if fc_result_bu == 'FAILED_CONTINUATION':
-                            fc_count_bu = pos.get('fc_failed_count', 0)
-                            logger.warning(f"📊 FAILED_CONTINUATION (backup): {symbol} {pos['side']} — {fc_count_bu} başarısız deneme")
-                            _be_spread_bu = pos.get('spreadPct', 0.05)
-                            _be_buf_bu = compute_breakeven_buffer_pct(spread_pct=_be_spread_bu, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
-                            be_exit_bu = entry_price * (1 + _be_buf_bu) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf_bu)
-                            pos['beBufferPct'] = round(_be_buf_bu * 100, 4)
-                            pos['beBufferSource'] = 'dynamic'
-                            logger.info(f"BE_BUFFER: {symbol} {pos['side']} reason=FC(backup) spread={_be_spread_bu}% → buffer={_be_buf_bu*100:.3f}%")
-                            exit_engine.request_exit(pos, be_exit_bu, 'FAILED_CONTINUATION')
-                            continue
+                        # ---- Phase 214/268: FAILED CONTINUATION DETECTOR (backup) ----
+                        # Phase 268: FC disabled in Fast loop — now single-loop (WS only)
+                        # fc_candle_close_bu = last_candle_close.get(symbol, current_price)
+                        # fc_result_bu = check_failed_continuation(pos, fc_candle_close_bu)
+                        # if fc_result_bu == 'FAILED_CONTINUATION':
+                        #     ... disabled in favor of WS-only FC
                         
                         # Update trailing stop if in profit
                         trail_activation = pos.get('trailActivation', entry_price)
@@ -25097,12 +25097,11 @@ class PaperTradingEngine:
             # if self.check_emergency_sl(pos, current_price):
             #     continue
             
-            # Phase 210: Flash Trade Guard — minimum 60s hold time
-            MIN_HOLD_SECONDS_PT = 60
+            # Phase 268: Flash Trade Guard — centralized hold guard
             open_time_ms_pt = pos.get('openTime', 0)
             if open_time_ms_pt > 0:
                 hold_duration_pt = datetime.now().timestamp() - (open_time_ms_pt / 1000)
-                if hold_duration_pt < MIN_HOLD_SECONDS_PT:
+                if hold_duration_pt < MIN_POSITION_MATURITY_SEC:
                     continue  # Skip remaining exit checks — too early
                 
             # Calc PnL
