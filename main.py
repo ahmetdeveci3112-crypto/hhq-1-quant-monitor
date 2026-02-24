@@ -2956,6 +2956,9 @@ class LiveBinanceTrader:
             logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
             logger.warning(f"📊 EXEC_QUALITY_CLOSE: {side} {symbol} | bid=${(best_bid or 0.0):.6f} ask=${(best_ask or 0.0):.6f} spread={spread_pct:.3f}% | fill=${avg_fill:.6f} slip={slippage_pct:+.4f}% | fee=${fee_cost:.4f} | {latency_ms:.0f}ms{trace_str}")
             
+            # Phase 270: Fire-and-forget post-close conditional order cleanup
+            asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+            
             return {
                 'id': order.get('id'),
                 'symbol': symbol,
@@ -3139,6 +3142,97 @@ class LiveBinanceTrader:
         except Exception as e:
             logger.error(f"❌ SET_STOP_LOSS FAILED: {side} {symbol} @ ${stop_price} | Error: {e}")
             return None
+    
+    # ================================================================
+    # Phase 270: POST-CLOSE CONDITIONAL ORDER CLEANUP
+    # Deterministic cleanup of reduceOnly stop/TP orders after position close.
+    # ================================================================
+    
+    async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
+        """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
+        Only targets STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT types.
+        Never cancels entry (non-reduceOnly) orders.
+        Idempotent: safe to call multiple times.
+        """
+        result = {'cancelled': 0, 'errors': 0, 'order_ids': []}
+        if not self.enabled or not self.exchange:
+            return result
+        
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        trace_str = f" [trace={trace_id}]" if trace_id else ""
+        
+        try:
+            open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
+        except Exception as fetch_err:
+            logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fetch_open_orders failed for {symbol}: {fetch_err}{trace_str}")
+            result['errors'] = 1
+            return result
+        
+        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market'}
+        
+        for order in open_orders:
+            order_type = (order.get('type') or '').lower()
+            is_reduce = order.get('reduceOnly') or (order.get('info', {}).get('reduceOnly') == 'true')
+            
+            if not is_reduce:
+                continue  # Never cancel entry orders
+            if order_type not in conditional_types:
+                continue  # Only conditional stop/TP orders
+            
+            try:
+                await self.exchange.cancel_order(order['id'], ccxt_symbol)
+                result['cancelled'] += 1
+                result['order_ids'].append(order['id'])
+                logger.info(f"🗑️ POST_CLOSE_CLEANUP: Cancelled {order_type} order {order['id']} for {symbol}{trace_str}")
+            except Exception as cancel_err:
+                err_str = str(cancel_err)
+                # -2011 = Unknown order / already cancelled — benign
+                if '-2011' in err_str or 'Unknown order' in err_str:
+                    logger.info(f"ℹ️ POST_CLOSE_CLEANUP: Order {order['id']} already gone for {symbol}{trace_str}")
+                else:
+                    result['errors'] += 1
+                    logger.warning(f"⚠️ POST_CLOSE_CLEANUP: Cancel failed for {order['id']} {symbol}: {cancel_err}{trace_str}")
+        
+        return result
+    
+    async def _post_close_cleanup(self, symbol: str, trace_id: str = None):
+        """Phase 270: Retry-based post-close cleanup with flat-position guard.
+        Called as fire-and-forget from close_position success path.
+        3 attempts with backoff [0.2s, 0.5s, 1.0s].
+        """
+        trace_str = f" [trace={trace_id}]" if trace_id else ""
+        backoffs = [0.2, 0.5, 1.0]
+        
+        for attempt, delay in enumerate(backoffs, 1):
+            try:
+                await asyncio.sleep(delay)
+                
+                # Flat-position guard: only clean up if position is truly closed
+                positions = await self.get_positions()
+                is_flat = True
+                for pos in positions:
+                    if pos.get('symbol') == symbol and float(pos.get('size', 0)) > 0.00001:
+                        is_flat = False
+                        break
+                
+                if not is_flat:
+                    logger.warning(f"⚠️ POST_CLOSE_CLEANUP_CANCELLED: {symbol} still has open position, skipping{trace_str}")
+                    return
+                
+                logger.info(f"🧹 POST_CLOSE_CLEANUP_START: {symbol} attempt {attempt}/{len(backoffs)}{trace_str}")
+                res = await self.cancel_reduce_only_conditionals(symbol, trace_id)
+                
+                if res['cancelled'] > 0 or res['errors'] == 0:
+                    logger.warning(f"✅ POST_CLOSE_CLEANUP_DONE: {symbol} cancelled={res['cancelled']} errors={res['errors']}{trace_str}")
+                    return
+                
+                # If only errors (e.g. rate limit), retry
+                logger.warning(f"⚠️ POST_CLOSE_CLEANUP: {symbol} attempt {attempt} had errors={res['errors']}, retrying...{trace_str}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ POST_CLOSE_CLEANUP: {symbol} attempt {attempt} exception: {e}{trace_str}")
+        
+        logger.error(f"❌ POST_CLOSE_CLEANUP_FAILED: {symbol} exhausted {len(backoffs)} attempts{trace_str}")
     
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Phase 179: Cancel an open order."""
@@ -25847,6 +25941,18 @@ class PaperTradingEngine:
                     pending_close_reasons[symbol]['close_order_id'] = close_order_id
                 if close_order_id:
                     safe_create_task(sqlite_manager.update_close_order_id(symbol, close_order_id))
+                
+                # Phase 270: Deferred cleanup fallback (+3s)
+                # close_position already fires immediate cleanup; this is a safety net
+                async def _deferred_cleanup():
+                    await asyncio.sleep(3)
+                    try:
+                        res = await live_binance_trader.cancel_reduce_only_conditionals(symbol, trace_id)
+                        if res['cancelled'] > 0:
+                            logger.warning(f"✅ POST_CLOSE_CLEANUP_DEFERRED: {symbol} cancelled={res['cancelled']}{trace_str}")
+                    except Exception as dc_err:
+                        logger.warning(f"⚠️ POST_CLOSE_CLEANUP_DEFERRED failed: {symbol}: {dc_err}")
+                safe_create_task(_deferred_cleanup())
             else:
                 logger.error(f"❌ BINANCE CLOSE FAILED for {symbol}")
         except Exception as e:
