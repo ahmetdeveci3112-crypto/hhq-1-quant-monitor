@@ -3586,6 +3586,16 @@ class LiveBinanceTrader:
             # Fee with fallback (3-tuple)
             fee_cost, fee_source, _fee_note = await self._fetch_order_fee(ccxt_symbol, order)
             
+            # Backfill BBO from fill price if bid/ask are zero (telemetry fix)
+            if not bbo_valid and avg_fill > 0:
+                bbo = dict(bbo)  # shallow copy
+                bbo['bid'] = bbo.get('bid') or avg_fill
+                bbo['ask'] = bbo.get('ask') or avg_fill
+                bbo['mid'] = avg_fill
+                bbo['raw_bid'] = bbo.get('raw_bid') or avg_fill
+                bbo['raw_ask'] = bbo.get('raw_ask') or avg_fill
+                bbo['source'] = bbo.get('source', 'none') + '_fill_backfill'
+
             # Slippage: only with valid BBO
             slippage_pct = None
             if bbo_valid:
