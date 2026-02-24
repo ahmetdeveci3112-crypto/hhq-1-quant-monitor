@@ -276,7 +276,7 @@ export default function App() {
   const [phase193Status, setPhase193Status] = useState<{
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
-    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
+    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string };
     ws_manager: { enabled: boolean; connected?: boolean };
     ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
     pandas_ta: boolean;
@@ -840,7 +840,6 @@ export default function App() {
     }
   }, [addLog]);
 
-  // Phase 193/265: Hyperopt run (parametrized)
   const handleHyperoptRun = useCallback(async (nTrials: number = 100, apply: boolean = false, forceApply: boolean = false) => {
     try {
       const label = forceApply ? 'Force Apply' : apply ? 'Optimize + Uygula' : 'Dry Run';
@@ -852,9 +851,38 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        const applyMsg = data.params_applied ? '✅ Parametreler uygulandı' : `⏭️ Apply: ${data.apply_reason || 'skipped'}`;
+        // Phase 269: Semantic log messages
+        const applyMsg = data.params_applied
+          ? '✅ Parametreler uygulandı'
+          : (apply || forceApply)
+            ? `⏭️ Apply atlandı: ${data.apply_reason || 'unknown'}`
+            : '🧪 Dry Run (apply istenmedi)';
         addLog(`✅ Hyperopt tamamlandı: score=${data.best_score?.toFixed(4) || '?'} | ${applyMsg}`);
-        setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, is_optimized: true, ...data } } : prev);
+        // Phase 269: Merge response (includes get_status() fields + run-level telemetry)
+        setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+
+        // Phase 269: Refresh runtime settings after successful apply
+        if (data.params_applied) {
+          try {
+            const settingsRes = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
+            if (settingsRes.ok) {
+              const s = await settingsRes.json();
+              setSettings(prev => ({
+                ...prev,
+                leverage: s.leverage ?? prev.leverage,
+                stopLossAtr: s.slAtr ?? prev.stopLossAtr,
+                takeProfit: s.tpAtr ?? prev.takeProfit,
+                trailActivationAtr: s.trailActivationAtr ?? prev.trailActivationAtr,
+                trailDistanceAtr: s.trailDistanceAtr ?? prev.trailDistanceAtr,
+                zScoreThreshold: s.zScoreThreshold ?? prev.zScoreThreshold,
+                minConfidenceScore: s.minConfidenceScore ?? prev.minConfidenceScore,
+                entryTightness: s.entryTightness ?? prev.entryTightness,
+                exitTightness: s.exitTightness ?? prev.exitTightness,
+              }));
+              addLog('🔄 Runtime ayarları hyperopt sonrası güncellendi');
+            }
+          } catch { /* settings refresh best-effort */ }
+        }
       }
     } catch (err) {
       addLog('❌ Hyperopt çalıştırma hatası');
@@ -879,7 +907,6 @@ export default function App() {
     }
   }, [addLog]);
 
-  // Phase 265 P2: Force apply last best params (no re-optimization)
   const handleForceApplyLast = useCallback(async () => {
     try {
       addLog('⚡ Son en iyi parametreleri zorla uyguluyor...');
@@ -889,6 +916,29 @@ export default function App() {
         const msg = data.applied ? '✅ Parametreler uygulandı' : `⏭️ Apply başarısız: ${data.reason}`;
         addLog(`⚡ Force Apply: ${msg}`);
         setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+
+        // Phase 269: Refresh runtime settings after successful force-apply
+        if (data.applied) {
+          try {
+            const settingsRes = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
+            if (settingsRes.ok) {
+              const s = await settingsRes.json();
+              setSettings(prev => ({
+                ...prev,
+                leverage: s.leverage ?? prev.leverage,
+                stopLossAtr: s.slAtr ?? prev.stopLossAtr,
+                takeProfit: s.tpAtr ?? prev.takeProfit,
+                trailActivationAtr: s.trailActivationAtr ?? prev.trailActivationAtr,
+                trailDistanceAtr: s.trailDistanceAtr ?? prev.trailDistanceAtr,
+                zScoreThreshold: s.zScoreThreshold ?? prev.zScoreThreshold,
+                minConfidenceScore: s.minConfidenceScore ?? prev.minConfidenceScore,
+                entryTightness: s.entryTightness ?? prev.entryTightness,
+                exitTightness: s.exitTightness ?? prev.exitTightness,
+              }));
+              addLog('🔄 Runtime ayarları force-apply sonrası güncellendi');
+            }
+          } catch { /* best-effort */ }
+        }
       } else {
         const err = await res.json();
         addLog(`❌ Force Apply: ${err.error || 'Hata'}`);

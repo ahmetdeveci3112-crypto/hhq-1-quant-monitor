@@ -18,7 +18,7 @@ interface Props {
   phase193Status?: {
     stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; min_samples_for_train?: number };
-    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number };
+    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string };
     ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
   } | null;
   onSLGuardSettings?: (s: any) => void;
@@ -833,6 +833,21 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                       <div className="flex justify-between text-[10px]">
                         <span className="text-slate-500">Sebep</span>
                         <span className="text-slate-400">{phase193Status.hyperopt.last_apply_reason}</span>
+                      </div>
+                    )}
+                    {/* Phase 269: Stale reason warning */}
+                    {phase193Status.hyperopt.auto_apply_enabled && phase193Status.hyperopt.last_apply_reason === 'auto_apply_disabled' && (
+                      <div className="text-[9px] text-slate-600 italic mt-0.5">
+                        Bu sebep geçmiş koşuya ait; yeni policy aktif.
+                      </div>
+                    )}
+                    {/* Phase 269: Bu Koşu Apply result */}
+                    {phase193Status.hyperopt.run_apply_result && (
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-slate-500">Bu Koşu</span>
+                        <span className={`font-bold ${phase193Status.hyperopt.run_apply_result === 'applied' ? 'text-emerald-400' : phase193Status.hyperopt.run_apply_result === 'not_requested' ? 'text-slate-500' : 'text-amber-400'}`}>
+                          {phase193Status.hyperopt.run_apply_result}{phase193Status.hyperopt.run_apply_reason && phase193Status.hyperopt.run_apply_reason !== phase193Status.hyperopt.run_apply_result ? ` (${phase193Status.hyperopt.run_apply_reason})` : ''}
+                        </span>
                       </div>
                     )}
                     <div className="flex justify-between text-[10px]">

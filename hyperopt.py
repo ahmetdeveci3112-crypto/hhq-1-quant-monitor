@@ -514,6 +514,9 @@ class HHQHyperOptimizer:
                 'last_optimize_time': self.last_optimize_time,
                 'params_applied': False,
                 'apply_reason': 'not_requested',
+                # Phase 269: Run-level apply fields (ephemeral)
+                'run_apply_result': 'not_requested',
+                'run_apply_reason': 'not_requested',
             }
             
             logger.info(
@@ -528,7 +531,16 @@ class HHQHyperOptimizer:
                 apply_res = await self.maybe_apply_to_runtime(force=force_apply, improvement_pct=improvement)
                 result['params_applied'] = apply_res['applied']
                 result['apply_reason'] = apply_res['reason']
+                result['run_apply_result'] = 'applied' if apply_res['applied'] else 'skipped'
+                result['run_apply_reason'] = apply_res['reason']
                 actually_applied = apply_res['applied']
+            
+            # Phase 269: Always include instance-level telemetry for consistent UI state
+            result['last_apply_result'] = self.last_apply_result
+            result['last_apply_reason'] = self.last_apply_reason
+            result['last_apply_time'] = self.last_apply_time
+            result['auto_apply_enabled'] = self.auto_apply_enabled
+            result['trade_data_count'] = len(self.trade_data)
             
             # Save once with correct applied status (no double records)
             await self._save_best_params(default_score, improvement, applied=actually_applied)

@@ -28418,6 +28418,13 @@ async def phase193_hyperopt_run(request: Request):
     
     result = await hhq_hyperoptimizer.optimize(n_trials=n_trials, apply=apply, force_apply=force_apply)
     
+    # Phase 269: Merge full status so frontend always gets consistent telemetry
+    if 'error' not in result:
+        status = hhq_hyperoptimizer.get_status()
+        for k, v in status.items():
+            if k not in result:  # optimize() fields take priority
+                result[k] = v
+    
     return JSONResponse(result)
 
 @app.post("/phase193/hyperopt/settings")
@@ -28445,7 +28452,10 @@ async def phase193_hyperopt_settings(request: Request):
     # Phase 265 P3: Persist settings to disk
     await hhq_hyperoptimizer.save_settings()
     
-    return JSONResponse(hhq_hyperoptimizer.get_status())
+    # Phase 269: Include updated_ts and current telemetry
+    status = hhq_hyperoptimizer.get_status()
+    status['updated_ts'] = int(time.time())
+    return JSONResponse(status)
 
 @app.post("/phase193/hyperopt/force-apply-last")
 async def phase193_hyperopt_force_apply_last():
