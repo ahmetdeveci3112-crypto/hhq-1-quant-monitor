@@ -463,18 +463,24 @@ class MLGovernanceService:
             return {'should_rollback': False, 'reason': 'no_recent_metrics'}
 
         policy = self.get_policy(model_key)
+        
+        # Phase 268: Require minimum samples before rollback decision
+        sample_count = recent_metrics.get('sample_count', 0)
+        if sample_count < policy['min_samples']:
+            return {'should_rollback': False, 'reason': f'insufficient_samples ({sample_count}/{policy["min_samples"]})'}
+        
         train_metrics = champion.get('metrics', {})
 
-        # Check brier degradation
-        train_brier = train_metrics.get('brier', 0.5)
-        recent_brier = recent_metrics.get('brier', 0.5)
-        brier_delta = recent_brier - train_brier
-
-        if brier_delta > policy['max_brier_increase'] * 2:
-            return {
-                'should_rollback': True,
-                'reason': f"brier_spike ({brier_delta:+.4f} > {policy['max_brier_increase'] * 2})",
-            }
+        # Check brier degradation (skip if either side has no calibrated brier)
+        train_brier = train_metrics.get('brier')
+        recent_brier = recent_metrics.get('brier')
+        if train_brier is not None and recent_brier is not None:
+            brier_delta = recent_brier - train_brier
+            if brier_delta > policy['max_brier_increase'] * 2:
+                return {
+                    'should_rollback': True,
+                    'reason': f"brier_spike ({brier_delta:+.4f} > {policy['max_brier_increase'] * 2})",
+                }
 
         # Check PnL drawdown
         recent_pnl = recent_metrics.get('pnl', 0)
@@ -506,18 +512,16 @@ class MLGovernanceService:
         ]
 
         if not prev_champions:
-            # No previous champion — disable current
-            champion['status'] = 'disabled'
-            champion['role'] = 'disabled'
-            reg['champion'] = None
+            # Phase 268: Champion freeze — don't null the champion, just freeze it
+            champion['status'] = 'frozen'
             self._persist_registry_entry(champion)
-            self._log_event(model_key, 'rollback', {
-                'disabled': champion['version'],
-                'restored': None,
+            self._log_event(model_key, 'rollback_freeze', {
+                'frozen': champion['version'],
+                'reason': 'no_prior_champion',
                 'notes': notes,
             })
-            logger.warning(f"⚠️ ML_ROLLBACK: {model_key} {champion['version']} disabled (no prior)")
-            return {'success': True, 'disabled': champion['version'], 'restored': None}
+            logger.warning(f"⚠️ ML_ROLLBACK_FREEZE: {model_key} {champion['version']} frozen (no prior champion to restore)")
+            return {'success': True, 'frozen': champion['version'], 'restored': None}
 
         # Restore most recent previous champion
         prev = prev_champions[-1]

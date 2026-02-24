@@ -4107,7 +4107,7 @@ async def lifespan(app: FastAPI):
                                     'accuracy': payload.get('accuracy', 0),
                                     'f1_score': payload.get('f1_score', 0),
                                     'sample_count': payload.get('sample_count', 0),
-                                    'brier': payload.get('brier', 0),
+                                    'brier': payload.get('brier') or None,  # Phase 268: 0→None (avoid false rollback)
                                 }
                             )
                             logger.info(f"🏆 ML Governance: FreqAI registered → {_reg}")
@@ -4285,16 +4285,23 @@ async def lifespan(app: FastAPI):
                     if not champion:
                         continue
                     
-                    # P1 fix: compute brier delta relative to THIS model's training brier
-                    train_brier = champion.get('metrics', {}).get('brier', 0.5)
-                    recent_brier = 1.0 - win_rate  # proxy
-                    
-                    model_metrics = {
-                        'brier': recent_brier,
-                        'pnl': pnl_pct,  # now proper percentage of margin
-                        'win_rate': win_rate,
-                        'sample_count': total,
-                    }
+                    # Phase 268: Skip brier comparison if no calibrated baseline
+                    train_brier = champion.get('metrics', {}).get('brier')
+                    if train_brier is not None and train_brier != 0:
+                        recent_brier = 1.0 - win_rate  # proxy
+                        model_metrics = {
+                            'brier': recent_brier,
+                            'pnl': pnl_pct,
+                            'win_rate': win_rate,
+                            'sample_count': total,
+                        }
+                    else:
+                        # No calibrated brier — skip brier comparison entirely
+                        model_metrics = {
+                            'pnl': pnl_pct,
+                            'win_rate': win_rate,
+                            'sample_count': total,
+                        }
                     
                     check = ml_governance_service.check_rollback(model_key, model_metrics)
                     if check.get('should_rollback'):
@@ -26685,16 +26692,23 @@ class ExitDecisionEngine:
                 })
                 return None
 
-        # Phase 261: Symbol-level exit lock (exit_inflight)
-        # Lock check comes AFTER defer logic
+        # Phase 268: Priority arbitration — upgrade lock if new reason is higher priority
         if symbol in self.exit_inflight:
             existing = self.exit_inflight[symbol]
-            logger.warning(
-                f"⏭️ EXIT_SKIP (LOCKED): {symbol} already inflight "
-                f"({existing['reason']}) since {existing['started_at']}. Ignoring {reason} from {source}."
-            )
-            self._stats['skipped'] += 1
-            return None
+            new_priority = self._get_priority(reason_norm)
+            old_priority = self._get_priority(existing.get('reason', ''))
+            if new_priority > old_priority:
+                logger.info(f"🔺 EXIT_UPGRADE: {symbol} {existing['reason']}→{reason_norm} (pri {old_priority}→{new_priority})")
+                del self.exit_inflight[symbol]
+                self._stats['upgraded'] = self._stats.get('upgraded', 0) + 1
+            else:
+                logger.warning(
+                    f"⏭️ EXIT_SKIP (LOCKED): {symbol} already inflight "
+                    f"({existing['reason']} pri={old_priority}) since {existing['started_at']}. "
+                    f"Ignoring {reason} (pri={new_priority}) from {source}."
+                )
+                self._stats['skipped'] += 1
+                return None
         
         # Mark as pending
         trace_id = f"EXIT_{symbol}_{int(time.time()*1000)}"
