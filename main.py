@@ -15231,7 +15231,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         ev = global_paper_trader.calculate_signal_ev(signal)
         signal['ev'] = round(ev, 4)
         # Cost-aware EV filter: ev_net must exceed minimum buffer
-        ev_min_buffer = 0.10  # Codex: reject if net EV < 0.10
+        ev_min_buffer = 0.02  # Was 0.10 — too strict, blocked score<82 entirely
         if ev <= -0.5:
             signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
@@ -16378,7 +16378,7 @@ class BTCCorrelationFilter:
                 self.emergency_mode == "BEARISH"
                 or self.flash_crash_active
                 or self.btc_change_1h <= -2.5
-                or self.btc_change_4h <= -4.5
+                or self.btc_change_4h <= -5.0  # User: only block on extreme (was -4.5)
                 or self.btc_change_1d <= -6.0
             )
             if is_extreme_bear and not self.btc_momentum_improving:
@@ -16396,7 +16396,7 @@ class BTCCorrelationFilter:
                 self.emergency_mode == "BULLISH"
                 or self.flash_pump_active
                 or self.btc_change_1h >= 2.5
-                or self.btc_change_4h >= 4.5
+                or self.btc_change_4h >= 5.0  # User: only block on extreme (was 4.5)
                 or self.btc_change_1d >= 6.0
             )
             if is_extreme_bull and not self.btc_momentum_weakening:
@@ -16438,8 +16438,8 @@ class BTCCorrelationFilter:
             penalty = -0.2  # Günlük aynı yöndeyse daha büyük bonus (was -0.15)
             reason = "✅ BTC trend aligned with signal"
         
-        # Yüksek penalty ise reddet (orta seviye terslikte artık penalty+risk cap ile izin ver)
-        allowed = penalty < 0.55
+        # Yüksek penalty ise reddet — sadece extreme durumda blokaj (was 0.55)
+        allowed = penalty < 0.80
         
         return (allowed, penalty, reason)
     
