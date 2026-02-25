@@ -6758,6 +6758,8 @@ EQ_MIN_VOLUME_RATIO = 1.25      # Koşul A: min volume ratio
 EQ_MIN_IMBALANCE = 4.0          # Koşul B: min OB imbalance
 EQ_MIN_OB_TREND = 2.0           # Koşul B: min ob_imbalance_trend
 EQ_MIN_VOLUME_24H = 1_500_000   # Koşul C: min 24h volume ($)
+EQ_MIN_VOLUME_4H = float(os.getenv("EQ_MIN_VOLUME_4H", "300000.0"))
+EQ_ADAPTIVE_MIN_IMBALANCE_FLOOR = float(os.getenv("EQ_ADAPTIVE_MIN_IMBALANCE_FLOOR", "2.0"))
 EQ_MAX_SPREAD = 0.20            # Koşul C: max spread (%)
 EQ_MIN_DEPTH_USD = 120_000      # Legacy max cap for execution depth threshold
 EQ_MIN_DEPTH_USD_BASE = 20_000  # Dynamic min floor
@@ -10299,6 +10301,7 @@ class CoinOpportunity:
         self.has_real_spread: bool = False
         self.imbalance: float = 0.0
         self.volume_24h: float = 0.0
+        self.volume_4h: float = 0.0
         self.price_change_24h: float = 0.0
         self.last_signal_time: Optional[float] = None
         self.atr: float = 0.0
@@ -10352,6 +10355,7 @@ class CoinOpportunity:
             "volatilityPct": round(self.spread_pct, 4),  # ATR-based volatility
             "imbalance": round(self.imbalance, 2),
             "volume24h": self.volume_24h,
+            "volume4h": self.volume_4h,
             "priceChange24h": round(self.price_change_24h, 2),
             "lastSignalTime": self.last_signal_time,
             "atr": self.atr,
@@ -10916,6 +10920,7 @@ class LightweightCoinAnalyzer:
             coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
             coin_daily_trend=coin_daily_trend,  # Coin's own daily trend (not BTC's)
             volume_24h=self.opportunity.volume_24h,  # Phase 123: Pass 24h volume
+            volume_4h=self.opportunity.volume_4h,    # Cond C hybrid volume
             adx=adx,  # ADX value for trend strength
             adx_trend=adx_trend,  # Trend direction: BULLISH/BEARISH/NEUTRAL
             is_volume_spike=is_volume_spike,  # Volume breakout detection
@@ -11072,8 +11077,24 @@ class BinanceWebSocketManager:
                 # İlk pakette delta güvenilir değil; nötr başlat
                 volume_delta = 0.0
             elif volume_delta < 0:
-                # Binance 24h window reset olabilir
-                volume_delta = raw_base_volume
+                # Binance 24h window reset olabilir.
+                # Do not backfill raw cumulative value as delta (would fake huge 4h flow).
+                volume_delta = 0.0
+                
+            vol_4h_buckets = existing.get('_vol_4h_buckets', {})
+            now = datetime.now().timestamp()
+            current_minute = int(now / 60)
+            
+            # Add volume delta (in USDT) to current minute bucket
+            if volume_delta > 0:
+                vol_usdt_delta = volume_delta * float(ticker.get('c', 0))
+                vol_4h_buckets[current_minute] = vol_4h_buckets.get(current_minute, 0.0) + vol_usdt_delta
+                
+            # Clean up older buckets (keep 240 minutes = 4 hours)
+            cutoff_minute = current_minute - 240
+            keys_to_remove = [k for k in vol_4h_buckets.keys() if k < cutoff_minute]
+            for k in keys_to_remove:
+                del vol_4h_buckets[k]
             
             self.tickers[symbol] = {
                 'last': float(ticker.get('c', 0)),  # Close price
@@ -11090,6 +11111,7 @@ class BinanceWebSocketManager:
                 'imbalance': existing.get('imbalance', 0),  # Preserved from bookTicker
                 'timestamp': int(ticker.get('E', 0)),  # Event time
                 '_baseVolumeRaw': raw_base_volume,  # Internal state for delta calc
+                '_vol_4h_buckets': vol_4h_buckets,  # Rolling 4h volume
             }
         
         # Phase 178: SMT Divergence moved to update_btc_eth_state() for candle-based data
@@ -12211,6 +12233,8 @@ class MultiCoinScanner:
                 
                 analyzer.update_price(price, high, low, volume)
                 analyzer.opportunity.volume_24h = ticker.get('quoteVolume', 0)
+                vol_4h_buckets = ticker.get('_vol_4h_buckets', {})
+                analyzer.opportunity.volume_4h = sum(vol_4h_buckets.values())
                 analyzer.opportunity.price_change_24h = ticker.get('percentage', 0)
                 
                 # P2 fix: Reset spread flag each scan — prevents stale data on REST fail
@@ -12246,6 +12270,7 @@ class MultiCoinScanner:
                     # Phase 230B: Propagate coin data for BTC filter multi-factor override
                     signal['priceChange24h'] = analyzer.opportunity.price_change_24h
                     signal['volume24h'] = analyzer.opportunity.volume_24h
+                    signal['volume4h'] = analyzer.opportunity.volume_4h
                     signal['zscore'] = analyzer.opportunity.zscore
                     signals.append(signal)
                 
@@ -21430,6 +21455,7 @@ class SignalGenerator:
         coin_stats: Optional[Dict] = None,  # Coin-specific stats for dynamic thresholds
         coin_daily_trend: str = "NEUTRAL",  # Coin's own daily trend
         volume_24h: float = 0.0,  # Phase 123: 24h Volume for liquidity check
+        volume_4h: float = 0.0,   # Cond C hybrid volume
         adx: float = 25.0,  # ADX value for trend strength
         adx_trend: str = "NEUTRAL",  # Trend direction: BULLISH/BEARISH/NEUTRAL
         is_volume_spike: bool = False,  # Volume breakout detection
@@ -22301,10 +22327,15 @@ class SignalGenerator:
             if adaptive_mode:
                 # LEGACY + SMART_V2: kontrollü gevşeme (mikrocap gürültüsünü tamamen açmadan)
                 eq_min_volume_ratio = max(0.35, EQ_MIN_VOLUME_RATIO * 0.35)
-                eq_min_imbalance = max(12.0, EQ_MIN_IMBALANCE * 0.5)
+                eq_min_imbalance = max(EQ_ADAPTIVE_MIN_IMBALANCE_FLOOR, EQ_MIN_IMBALANCE * 0.5)
                 eq_min_ob_trend = max(0.15, EQ_MIN_OB_TREND * 0.5)
                 eq_min_volume_24h = max(1_000_000.0, EQ_MIN_VOLUME_24H * 0.3)  # Phase RSP: floor raised to 1M
+                # 4h threshold also relaxed proportionally if needed, or kept strict
+                eq_min_volume_4h_adaptive = max(200_000.0, EQ_MIN_VOLUME_4H * 0.3) 
+                eq_min_volume_4h = eq_min_volume_4h_adaptive
                 eq_max_spread = max(0.35, EQ_MAX_SPREAD)
+            else:
+                eq_min_volume_4h = EQ_MIN_VOLUME_4H
 
             # Koşul A: Volume başlangıcı
             cond_a = volume_ratio >= eq_min_volume_ratio or is_volume_spike
@@ -22322,11 +22353,11 @@ class SignalGenerator:
                 eq_pass_count += 1
                 eq_reasons.append(f"B:OB(imb={imbalance:.0f},tr={ob_imbalance_trend:.1f})")
 
-            # Koşul C: Likidite yeterli
-            cond_c = volume_24h >= eq_min_volume_24h and spread_pct <= eq_max_spread
+            # Koşul C: Likidite yeterli (24h veya 4h) + spread uygun
+            cond_c = (volume_24h >= eq_min_volume_24h or volume_4h >= eq_min_volume_4h) and spread_pct <= eq_max_spread
             if cond_c:
                 eq_pass_count += 1
-                eq_reasons.append(f"C:Liq(${volume_24h/1e6:.1f}M,sp={spread_pct:.2f}%)")
+                eq_reasons.append(f"C:Liq(${(volume_24h/1e6):.1f}M/24h,${(volume_4h/1e3):.0f}k/4h,sp={spread_pct:.2f}%)")
 
             # Gate kararı:
             # - Adaptive modes (LEGACY + SMART_V2): 1/3 ile soft-pass, 0/3 ise yüksek skorda kontrollü geçiş
@@ -22340,7 +22371,7 @@ class SignalGenerator:
                 fail_detail = f"EQ_GATE_FAIL({eq_pass_count}/3: {','.join(eq_reasons) or 'none'})"
                 adaptive_hard_reject = adaptive_mode and eq_pass_count == 0 and score < 95
                 if eq_hard_mode or adaptive_hard_reject:
-                    logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.2f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M sp={spread_pct:.2f}%")
+                    logger.info(f"🚫 {fail_detail}: {symbol} {signal_side} score={score} | vol={volume_ratio:.2f}x imb={imbalance:.0f} ob_tr={ob_imbalance_trend:.1f} vol24h=${volume_24h/1e6:.1f}M vol4h=${volume_4h/1e3:.0f}k sp={spread_pct:.2f}% eq_min_vol24=${eq_min_volume_24h/1e6:.1f}M eq_min_vol4=${eq_min_volume_4h/1e3:.0f}k eq_min_imb={eq_min_imbalance:.1f}")
                     return None
                 else:  # soft mode
                     score -= eq_penalty
