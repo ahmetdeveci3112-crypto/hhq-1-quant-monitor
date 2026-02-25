@@ -322,15 +322,27 @@ class PnLAttributionService:
     def _parse_attribution(self, trade: Dict) -> Dict:
         """Parse attribution_json from trade dict with fallback."""
         attr_str = trade.get('attribution_json', '{}')
+        attr = {}
         if isinstance(attr_str, str):
             try:
-                return json.loads(attr_str)
+                parsed = json.loads(attr_str)
+                if isinstance(parsed, dict):
+                    attr = parsed
             except (json.JSONDecodeError, TypeError):
                 pass
         elif isinstance(attr_str, dict):
-            return attr_str
-        # Fallback: compute from trade fields
-        return {
+            attr = attr_str
+
+        # If attribution_json has real values, use it.
+        metric_keys = ('gross', 'fee', 'slippage', 'funding', 'signal', 'execution', 'timing')
+        if isinstance(attr, dict) and any(abs(float(attr.get(k, 0) or 0)) > 1e-12 for k in metric_keys):
+            out = {k: float(attr.get(k, 0) or 0) for k in metric_keys}
+            out['net'] = float(attr.get('net', trade.get('pnl', 0)) or 0)
+            out['consistent'] = bool(attr.get('consistent', True))
+            return out
+
+        # Fallback-1: stored decomposition columns on trade row.
+        from_columns = {
             'gross': float(trade.get('pnl_gross', 0) or 0),
             'fee': float(trade.get('fee_cost', 0) or 0),
             'slippage': float(trade.get('slippage_cost', 0) or 0),
@@ -341,6 +353,43 @@ class PnLAttributionService:
             'net': float(trade.get('pnl', 0) or 0),
             'consistent': True,
         }
+        if any(abs(from_columns[k]) > 1e-12 for k in metric_keys):
+            return from_columns
+
+        # Fallback-2: on-the-fly decomposition for legacy trades that have no attribution persisted.
+        try:
+            normalized = dict(trade)
+            if 'entry_slippage' not in normalized:
+                normalized['entry_slippage'] = trade.get('entrySlippage', 0)
+            if 'exit_slippage' not in normalized:
+                normalized['exit_slippage'] = trade.get('exitSlippage', 0)
+            if 'accumulated_funding' not in normalized:
+                normalized['accumulated_funding'] = trade.get('funding_cost', trade.get('accumulatedFunding', 0))
+            if 'signalPrice' not in normalized:
+                normalized['signalPrice'] = trade.get('originalEntryPrice', trade.get('entryPrice', 0))
+            if 'takeProfit' not in normalized:
+                normalized['takeProfit'] = trade.get('takeProfit', trade.get('take_profit', 0))
+            if 'stopLoss' not in normalized:
+                normalized['stopLoss'] = trade.get('stopLoss', trade.get('stop_loss', 0))
+
+            decomp = self.decompose_trade(normalized)
+            decomp_attr = json.loads(decomp.get('attribution_json', '{}'))
+            if isinstance(decomp_attr, dict):
+                return {
+                    'gross': float(decomp_attr.get('gross', 0) or 0),
+                    'fee': float(decomp_attr.get('fee', 0) or 0),
+                    'slippage': float(decomp_attr.get('slippage', 0) or 0),
+                    'funding': float(decomp_attr.get('funding', 0) or 0),
+                    'signal': float(decomp_attr.get('signal', 0) or 0),
+                    'execution': float(decomp_attr.get('execution', 0) or 0),
+                    'timing': float(decomp_attr.get('timing', 0) or 0),
+                    'net': float(decomp_attr.get('net', trade.get('pnl', 0)) or 0),
+                    'consistent': bool(decomp_attr.get('consistent', True)),
+                }
+        except Exception:
+            pass
+
+        return from_columns
 
     def get_status(self) -> Dict:
         """Status for /phase193/status."""
