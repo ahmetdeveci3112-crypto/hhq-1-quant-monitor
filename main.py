@@ -14768,13 +14768,23 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 is_aligned = True
         
         if is_opposing:
-            if abs(obi_value) > EQ_OBI_OPPOSE_VETO:  # Phase EQG: 0.6 → 0.35
+            # Adaptive OBI threshold: volume-based
+            _vol24h = float(signal.get('volume24h', 0) or 0)
+            if _vol24h > 50_000_000:
+                _adaptive_obi_veto = 0.45  # High vol: OBI reliable, tighter
+            elif _vol24h > 10_000_000:
+                _adaptive_obi_veto = 0.55  # Normal
+            elif _vol24h > 5_000_000:
+                _adaptive_obi_veto = 0.65  # Lower vol
+            else:
+                _adaptive_obi_veto = 0.80  # Low vol: OBI may be noise, relaxed
+            if abs(obi_value) > _adaptive_obi_veto:
                 # Strong opposing pressure → VETO
                 signal_log_data['reject_reason'] = f'OBI_VETO:opposing_{obi_value:.3f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
                 reject_feedback(f"OBI_VETO:{obi_value:+.3f}")
-                logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} > {EQ_OBI_OPPOSE_VETO} | Opposing pressure → BLOCKED")
+                logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} > {_adaptive_obi_veto:.2f} (vol24h=${_vol24h/1e6:.1f}M) | Opposing pressure → BLOCKED")
                 return
             else:
                 # Moderate opposing pressure → Soft penalty (-15)
@@ -18041,7 +18051,7 @@ class PortfolioRecoveryManager:
         self.min_positive_pct = 0.03           # Phase 200: Margin Balance'ın %3'ü (dinamik, min $5)
         self.min_trailing_pct = 5.0            # Phase 200: 5.0% minimum trailing distance (was 1.5%)
         self.max_trailing_pct = 10.0           # 10.0% maximum trailing distance
-        self.cooldown_hours = 6               # Hours to wait after recovery close
+        self.cooldown_hours = 2               # Hours to wait after recovery close (adaptive, see start_cooldown)
         
         logger.info(f"🔄 PortfolioRecoveryManager initialized: min_positive=%3 of balance, trail=5-10%")
     
@@ -18150,10 +18160,23 @@ class PortfolioRecoveryManager:
         return self.should_trigger_close
     
     def start_cooldown(self):
-        """Start cooldown period after recovery close."""
-        self.cooldown_until = datetime.now() + timedelta(hours=self.cooldown_hours)
+        """Start cooldown period after recovery close — regime-adaptive."""
+        # Adaptive cooldown: use market regime
+        try:
+            regime_profile = market_regime_manager.get_profile()
+            regime_name = regime_profile.get('regime', 'UNKNOWN')
+            if regime_name in ('TRENDING_UP', 'BULLISH'):
+                adaptive_hours = 1    # Trending up: quick recovery, don't miss
+            elif regime_name in ('RANGING', 'NEUTRAL', 'UNKNOWN'):
+                adaptive_hours = 2    # Normal
+            else:  # TRENDING_DOWN, BEARISH, VOLATILE
+                adaptive_hours = 4    # Risky market: longer cooldown
+            logger.info(f"⏸️ ADAPTIVE_COOLDOWN: regime={regime_name} → {adaptive_hours}h (was default {self.cooldown_hours}h)")
+        except Exception:
+            adaptive_hours = self.cooldown_hours
+        self.cooldown_until = datetime.now() + timedelta(hours=adaptive_hours)
         self.reset_state()
-        logger.info(f"⏸️ RECOVERY COOLDOWN: Started {self.cooldown_hours}h cooldown until {self.cooldown_until}")
+        logger.info(f"⏸️ RECOVERY COOLDOWN: Started {adaptive_hours}h cooldown until {self.cooldown_until}")
     
     def is_in_cooldown(self) -> bool:
         """Check if new positions should be blocked."""
@@ -18827,15 +18850,20 @@ class DoubleTrendConfirmation:
     
     def register_pending_order(self, order_id: str, signal: dict, price_at_signal: float):
         """Pending order oluşturulduğunda kaydet."""
+        _price = price_at_signal if price_at_signal > 0 else 1.0
         self.pending_confirmations[order_id] = {
             'signal': signal,
             'price_at_signal': price_at_signal,
             'timestamp': datetime.now().timestamp(),
             'side': signal.get('side', 'LONG'),
             'zscore': signal.get('zscore', 0),
-            'symbol': signal.get('symbol', '')
+            'symbol': signal.get('symbol', ''),
+            # Adaptive confirmation data
+            'atr': float(signal.get('atr', _price * 0.01) or _price * 0.01),
+            'hurst': float(signal.get('hurst', 0.5) or 0.5),
+            'spreadPct': float(signal.get('spreadPct', 0.05) or 0.05),
         }
-        logger.info(f"🔄 Registered for double confirmation: {signal.get('symbol')} {signal.get('side')}")
+        logger.info(f"🔄 Registered for double confirmation: {signal.get('symbol')} {signal.get('side')} (atr={signal.get('atr')}, hurst={signal.get('hurst')})")
     
     def check_confirmation(self, order_id: str, current_price: float, current_zscore: float, 
                           btc_trend: str = None) -> dict:
@@ -18865,23 +18893,35 @@ class DoubleTrendConfirmation:
             'btc_aligned': True  # Default True if no BTC check
         }
         
-        # CHECK 1: Fiyat hala sinyal yönünde mi?
+        # CHECK 1: Fiyat hala sinyal yönünde mi? — ATR-bazlı adaptif tolerans
+        _atr = data.get('atr', signal_price * 0.01)
+        _atr_pct = (_atr / signal_price * 100) if signal_price > 0 else 2.0
+        _price_tolerance_pct = max(0.3, min(3.0, _atr_pct * 0.5))  # ATR'nin yarısı
         if side == 'LONG':
-            # LONG için: fiyat düşmemeli (pullback sonrası yükseliyor olmalı)
-            price_ok = current_price >= signal_price * 0.995  # %0.5 tolerans
+            price_ok = current_price >= signal_price * (1 - _price_tolerance_pct / 100)
             checks['price_direction'] = price_ok
         else:
-            # SHORT için: fiyat yükselmemeli (pullback sonrası düşüyor olmalı)
-            price_ok = current_price <= signal_price * 1.005  # %0.5 tolerans
+            price_ok = current_price <= signal_price * (1 + _price_tolerance_pct / 100)
             checks['price_direction'] = price_ok
         
-        # CHECK 2: Z-Score hala threshold üstünde mi?
-        zscore_threshold = 0.8  # Daha düşük threshold (relaxed)
-        if side == 'LONG':
-            zscore_ok = current_zscore < -zscore_threshold  # Negative for oversold
+        # CHECK 2: Z-Score — Hurst + spread bazlı adaptif eşik
+        _hurst = data.get('hurst', 0.5)
+        _spread_pct = data.get('spreadPct', 0.05)
+        if _hurst < 0.4:
+            zscore_threshold = 0.2   # Mean-reverting: z-score hızla döner
+        elif _hurst < 0.5:
+            zscore_threshold = 0.4   # Nötr
         else:
-            zscore_ok = current_zscore > zscore_threshold  # Positive for overbought
+            zscore_threshold = 0.6   # Trending: z-score daha stabil
+        # Spread yüksekse daha toleranslı ol
+        if _spread_pct > 0.1:
+            zscore_threshold *= 0.7
+        if side == 'LONG':
+            zscore_ok = current_zscore < -zscore_threshold
+        else:
+            zscore_ok = current_zscore > zscore_threshold
         checks['zscore_valid'] = zscore_ok
+        logger.debug(f"🔄 ADAPTIVE_CONFIRM: {symbol} {side} | tol={_price_tolerance_pct:.2f}%(ATR={_atr_pct:.2f}%) | z_th={zscore_threshold:.2f}(H={_hurst:.2f},sp={_spread_pct:.3f})")
         
         # CHECK 3: BTC trend hala uyumlu mu?
         if btc_trend:
