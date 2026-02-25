@@ -24042,6 +24042,9 @@ class PaperTradingEngine:
         # Phase RSP: Notional size cap — max % of balance per position
         raw_size_usd = position_size_usd
         max_size_usd = self.balance * 0.15  # default: max 15% of balance
+        reasons = []  # Phase RSP fix: was undefined in open_position scope
+        volume_24h = float(signal.get('volume24h', 0) if signal else 0)  # Phase RSP fix: extract from signal
+        spread_pct = float(signal.get('spreadPct', 0.05) if signal else 0.05)  # Phase RSP fix: extract from signal
         _vol_pct = (atr / price * 100) if price > 0 else 2.0
         if _vol_pct >= 20:
             max_size_usd = self.balance * 0.07
@@ -24057,7 +24060,7 @@ class PaperTradingEngine:
 
         # Phase RSP: Mandatory entry telemetry
         logger.info(
-            f"RISK_TEL: {trade_symbol} {signal_side} "
+            f"RISK_TEL: {trade_symbol} {side} "
             f"rpt_raw={dynamic_risk:.4f} rpt_session={session_risk:.4f} "
             f"lev_raw={raw_leverage} lev_eff={adjusted_leverage} lev_cap={_lev_cap_reason} "
             f"size_raw=${raw_size_usd:.0f} size_eff=${position_size_usd:.0f} {size_cap_reason} "
