@@ -15840,7 +15840,11 @@ class BTCCorrelationFilter:
         # Phase 230B: Coin Strength Override tracking
         self.last_override = False          # Set per should_allow_signal call
         
-        logger.info("📊 BTCCorrelationFilter initialized with MTF Recovery + Coin Strength Override")
+        # Weighted MTF attributes
+        self._wtf_score = 0.0
+        self._tf_scores = {'30m': 0.0, '1h': 0.0, '4h': 0.0, '1d': 0.0}
+        
+        logger.info("📊 BTCCorrelationFilter initialized with Weighted MTF Trend")
     
     async def update_btc_state(self, exchange) -> dict:
         """BTC durumunu güncelle."""
@@ -16012,35 +16016,61 @@ class BTCCorrelationFilter:
                     self.btc_trend_daily = "NEUTRAL"
             
             # =================================================================
-            # Phase 60b: IMPROVED STRONG_BEARISH Detection
-            # 1H eşiği gevşetildi (-0.5% → -1.5%), 30m flash crash eklendi
+            # WEIGHTED MULTI-TIMEFRAME BTC TREND
+            # Her TF normalize edilip ağırlıklı ortalama alınır
+            # 1D ağırlığı en yüksek, düşük TF'lere doğru azalır
+            # Flash crash/pump safety override korunur
             # =================================================================
             
-            # STRONG_BULLISH: 1H ve 4H ikisi de pozitif
-            if self.btc_change_1h > 1.5 and self.btc_change_4h > 2.0:
+            def _normalize_change(change_pct: float, scale: float) -> float:
+                """Change'i -1..+1 aralığına normalize et. Scale: o TF için 'güçlü' değer."""
+                return max(-1.0, min(1.0, change_pct / scale))
+            
+            # TF normalize scales: o TF'de "güçlü hareket" sayılan % değeri
+            _tf_scores = {
+                '30m': _normalize_change(self.btc_change_30m, 1.5),  # ±1.5% = tam skor
+                '1h':  _normalize_change(self.btc_change_1h, 2.0),   # ±2.0%
+                '4h':  _normalize_change(self.btc_change_4h, 4.0),   # ±4.0%
+                '1d':  _normalize_change(self.btc_change_1d, 6.0),   # ±6.0%
+            }
+            
+            # Ağırlıklar: günlük dominant, kısa vadeye doğru azalır
+            _weights = {'30m': 0.10, '1h': 0.20, '4h': 0.30, '1d': 0.40}
+            _weighted_score = sum(_tf_scores[tf] * _weights[tf] for tf in _weights)
+            
+            # Flash crash/pump safety override — bunlar her zaman öncelikli
+            if self.flash_crash_active or self.btc_change_30m < -1.5:
+                self.btc_trend = "STRONG_BEARISH"
+                self.btc_momentum = -1.0
+            elif self.flash_pump_active or self.btc_change_30m > 1.5:
                 self.btc_trend = "STRONG_BULLISH"
                 self.btc_momentum = 1.0
-            elif self.btc_change_1h > 0.5:
+            # Ağırlıklı skora göre trend belirleme
+            elif _weighted_score > 0.5:
+                self.btc_trend = "STRONG_BULLISH"
+                self.btc_momentum = 1.0
+            elif _weighted_score > 0.15:
                 self.btc_trend = "BULLISH"
                 self.btc_momentum = 0.5
-            # FLASH CRASH: 30m'de %2+ düşüş = anlık STRONG_BEARISH
-            elif self.flash_crash_active or self.btc_change_30m < -1.5:
+            elif _weighted_score < -0.5:
                 self.btc_trend = "STRONG_BEARISH"
                 self.btc_momentum = -1.0
-            # STRONG_BEARISH: 1H < -1.5% VEYA 4H < -3.0% (gevşetildi)
-            elif self.btc_change_1h < -1.5 or self.btc_change_4h < -3.0:
-                self.btc_trend = "STRONG_BEARISH"
-                self.btc_momentum = -1.0
-            # BEARISH: 1H < -0.5% VEYA 4H < -1.5% (gevşetildi)
-            elif self.btc_change_1h < -0.5 or self.btc_change_4h < -1.5:
+            elif _weighted_score < -0.15:
                 self.btc_trend = "BEARISH"
                 self.btc_momentum = -0.5
-            elif self.btc_change_1h < -0.2:
-                self.btc_trend = "BEARISH"
-                self.btc_momentum = -0.3
             else:
                 self.btc_trend = "NEUTRAL"
                 self.btc_momentum = 0.0
+            
+            self._wtf_score = round(_weighted_score, 3)
+            self._tf_scores = {k: round(v, 3) for k, v in _tf_scores.items()}
+            logger.info(
+                f"📊 WTF_TREND: {self.btc_trend} | score={_weighted_score:+.3f} | "
+                f"30m={_tf_scores['30m']:+.3f}({self.btc_change_30m:+.2f}%) "
+                f"1h={_tf_scores['1h']:+.3f}({self.btc_change_1h:+.2f}%) "
+                f"4h={_tf_scores['4h']:+.3f}({self.btc_change_4h:+.2f}%) "
+                f"1d={_tf_scores['1d']:+.3f}({self.btc_change_1d:+.2f}%)"
+            )
             
             # =================================================================
             # Phase 60c: ETH TREND TRACKING
@@ -16559,6 +16589,8 @@ class BTCCorrelationFilter:
             "change_1h": round(self.btc_change_1h, 2),
             "change_4h": round(self.btc_change_4h, 2),
             "change_1d": round(self.btc_change_1d, 2),
+            "wtf_score": self._wtf_score,
+            "tf_scores": self._tf_scores,
             "flash_crash_active": self.flash_crash_active,
             "emergency_mode": self.emergency_mode,
             "emergency_reason": self.emergency_reason,
