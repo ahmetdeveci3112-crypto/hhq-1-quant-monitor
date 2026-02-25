@@ -32,6 +32,53 @@ const getRejectReasonKey = (reason?: string | null): string => {
     return key.toUpperCase();
 };
 
+// Turkish rejection labels (same as ActiveSignalsPanel)
+const REJECT_TR_OD: Record<string, { label: string; tooltip: string }> = {
+    'RECOVERY_COOLDOWN': { label: 'Toparlanma Bekleme', tooltip: 'Portföy toparlanma modunda' },
+    'SHOCK_BLOCK': { label: 'Şok Koruma', tooltip: 'Piyasada ani hareket algılandı' },
+    'PROT_BLOCK': { label: 'Koruma Kilidi', tooltip: 'Koruma kilidi aktif' },
+    'EXISTING_POSITION': { label: 'Mevcut Pozisyon', tooltip: 'Bu coin\'de zaten pozisyon var' },
+    'COUNTER_FLIP_EXISTING_POS': { label: 'Ters Sinyal', tooltip: 'Mevcut pozisyona ters sinyal' },
+    'COUNTER_PENDING': { label: 'Ters Bekleyen', tooltip: 'Ters yönde bekleyen emir var' },
+    'REENTRY_LIMIT': { label: 'Tekrar Giriş Limiti', tooltip: 'Limit doldu' },
+    'REENTRY_COOLDOWN': { label: 'Bekleme Süresi', tooltip: '5 dk içinde tekrar giriş yasak' },
+    'MAX_POSITIONS': { label: 'Pozisyon Limiti', tooltip: 'Max pozisyon doldu' },
+    'DIRECTION_EXPOSURE': { label: 'Yön Limiti', tooltip: 'Aynı yönde bakiye limiti' },
+    'BLACKLISTED': { label: 'Kara Liste', tooltip: 'Coin kara listede' },
+    'BTC_FILTER': { label: 'BTC Filtresi', tooltip: 'BTC trendi ters' },
+    'THIN_BOOK': { label: 'İnce Defter', tooltip: 'Emir defteri sığ' },
+    'OBI_VETO': { label: 'Emir Defteri Ters', tooltip: 'OBI sinyal yönüne karşı' },
+    'OBI_NEUTRAL_LOW_VOL': { label: 'Düşük Hacim', tooltip: 'OBI nötr, hacim düşük' },
+    'REGIME_BLOCKED': { label: 'Rejim Engeli', tooltip: 'Piyasa rejimi ters' },
+    'MA_ALIGNMENT_VETO': { label: 'MA Uyumsuz', tooltip: 'Hareketli ortalamalar ters' },
+    'MTF_REJECTED': { label: 'Çoklu TF Ret', tooltip: 'Çoklu zaman dilimi uyumsuz' },
+    'NEGATIVE_EV': { label: 'Negatif Beklenti', tooltip: 'Beklenen değer negatif' },
+    'LOW_NET_EDGE': { label: 'Düşük Net Kenar', tooltip: 'Komisyon sonrası kazanç düşük' },
+    'MAX_EXPOSURE': { label: 'Maks. Maruziyet', tooltip: 'Limit doldu' },
+    'MIN_NOTIONAL': { label: 'Küçük Pozisyon', tooltip: 'Pozisyon boyutu yetersiz' },
+    'ENTRY_CORRIDOR_EXCEEDED': { label: 'Koridor Aşıldı', tooltip: 'Fiyat koridorun dışında' },
+    'PENDING_EXPIRED': { label: 'Süre Doldu', tooltip: 'Bekleyen emir iptal edildi' },
+    'STALE_SIGNAL': { label: 'Bayat Sinyal', tooltip: 'Skor eşiğin altına düştü' },
+    'SIGNAL_MISSED': { label: 'Fırsat Kaçtı', tooltip: 'Fiyat uzaklaştı' },
+    'ENTRY_RECHECK_FAIL': { label: 'Tekrar Kontrol Red', tooltip: 'Koşullar değişti' },
+    'ENTRY_SCORE_LOW': { label: 'Düşük İcra Skoru', tooltip: 'BBO/spread yetersiz' },
+    'BLOCK_OPEN_DRIFT': { label: 'Fiyat Kayması', tooltip: 'Fiyat çok kaydı' },
+    'BLOCK_OPEN_SPREAD': { label: 'Yüksek Makas', tooltip: 'Spread çok yüksek' },
+    'SLIPPAGE_REJECT': { label: 'Kayma Ret', tooltip: 'Dolum fiyatı beklentiden farklı' },
+    'BINANCE_ORDER_FAILED': { label: 'Borsa Hatası', tooltip: 'Binance emri başarısız' },
+};
+
+const getRejectTrOD = (reason?: string | null): { label: string; tooltip: string } => {
+    if (!reason) return { label: '', tooltip: '' };
+    const key = String(reason).split(':')[0].toUpperCase();
+    const detail = String(reason).includes(':') ? String(reason).split(':').slice(1).join(':') : '';
+    const entry = REJECT_TR_OD[key];
+    if (entry) {
+        return { label: entry.label, tooltip: `${entry.tooltip}${detail ? ` (${detail})` : ''}` };
+    }
+    return { label: key, tooltip: `Ret: ${reason}` };
+};
+
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const isLong = coin.signalAction === 'LONG';
     const isShort = coin.signalAction === 'SHORT';
@@ -161,14 +208,17 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                             OB{(coin.obImbalanceTrend || 0) > 0 ? '↑' : '↓'}
                         </span>
                     )}
-                    {coin.executionRejectReason && (
-                        <span
-                            className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                            title={`İşleme Alınmadı: ${coin.executionRejectReason}`}
-                        >
-                            RET:{getRejectReasonKey(coin.executionRejectReason)}
-                        </span>
-                    )}
+                    {coin.executionRejectReason && (() => {
+                        const rTr = getRejectTrOD(coin.executionRejectReason);
+                        return (
+                            <span
+                                className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
+                                title={`❌ ${rTr.tooltip}`}
+                            >
+                                {rTr.label}
+                            </span>
+                        );
+                    })()}
                     {coin.squeezeFiring && (
                         <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-fuchsia-500/20 text-fuchsia-400"
                             title="TTM Squeeze 🗜️ Patlamaya Hazır!">

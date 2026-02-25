@@ -78,6 +78,73 @@ const getRejectReasonKey = (reason?: string | null): string => {
     return key.toUpperCase();
 };
 
+// Turkish rejection label + tooltip map
+const REJECT_TR: Record<string, { label: string; tooltip: string }> = {
+    // Sinyal Filtreleme
+    'RECOVERY_COOLDOWN': { label: 'Toparlanma Bekleme', tooltip: 'Portföy toparlanma modunda — 6 saat yeni işlem yapılmıyor' },
+    'SHOCK_BLOCK': { label: 'Şok Koruma', tooltip: 'Piyasada ani düşüş/yükseliş (flash crash/pump) algılandı' },
+    'PROT_BLOCK': { label: 'Koruma Kilidi', tooltip: 'Aşırı kayıp sonrası koruma kilidi aktif' },
+    'EXISTING_POSITION': { label: 'Mevcut Pozisyon', tooltip: 'Bu coin\'de zaten açık pozisyon var' },
+    'COUNTER_FLIP_EXISTING_POS': { label: 'Ters Sinyal', tooltip: 'Mevcut pozisyona ters yönde sinyal geldi, pozisyon korunuyor' },
+    'COUNTER_PENDING': { label: 'Ters Bekleyen', tooltip: 'Ters yönde bekleyen emir mevcut' },
+    'REENTRY_LIMIT': { label: 'Tekrar Giriş Limiti', tooltip: 'Aynı sinyale maksimum 2 kez giriş yapılabilir. Limit doldu' },
+    'REENTRY_COOLDOWN': { label: 'Bekleme Süresi', tooltip: 'Aynı coin\'e 5 dk içinde tekrar giriş yapılamıyor' },
+    'MAX_POSITIONS': { label: 'Pozisyon Limiti', tooltip: 'Maksimum açık pozisyon sayısına ulaşıldı' },
+    'DIRECTION_EXPOSURE': { label: 'Yön Limiti', tooltip: 'Aynı yönde (LONG/SHORT) bakiyenin %40\'ından fazla riske edilemez' },
+    'BLACKLISTED': { label: 'Kara Liste', tooltip: 'Bu coin sürekli zarar ettiği için otomatik kara listeye alındı' },
+    'BTC_FILTER': { label: 'BTC Filtresi', tooltip: 'BTC trendi sinyal yönüne ters — yüksek risk' },
+    'THIN_BOOK': { label: 'İnce Emir Defteri', tooltip: 'Emir defterinde yeterli derinlik yok, kayma riski yüksek' },
+    'OBI_VETO': { label: 'Emir Defteri Ters', tooltip: 'Emir defteri dengesizliği (OBI) sinyal yönüne karşı güçlü' },
+    'OBI_NEUTRAL_LOW_VOL': { label: 'Düşük Hacim+OBI', tooltip: 'Emir defteri nötr ama hacim çok düşük — güvenilir giriş zor' },
+    'REGIME_BLOCKED': { label: 'Rejim Engeli', tooltip: 'Piyasa rejimi düşüş trendinde — yeni girişler engelli' },
+    'MA_ALIGNMENT_VETO': { label: 'MA Uyumsuz', tooltip: 'Hareketli ortalamalar sinyal yönüne ters dizilmiş' },
+    'MTF_REJECTED': { label: 'Çoklu TF Ret', tooltip: 'Çoklu zaman dilimi (15dk/1sa/4sa/1gün) analizi uyumsuz' },
+    'NEGATIVE_EV': { label: 'Negatif Beklenti', tooltip: 'Beklenen değer çok negatif — bu sinyal masraf karşılamaz' },
+    'LOW_NET_EDGE': { label: 'Düşük Net Kenar', tooltip: 'Komisyon+kayma düşüldükten sonra beklenen kazanç çok düşük' },
+    // Pozisyon Açma
+    'MAX_EXPOSURE': { label: 'Maks. Maruziyet', tooltip: 'Toplam açık pozisyon + bekleyen emir limiti doldu' },
+    'DIRECTION_LIMIT_LONG': { label: 'LONG Limiti', tooltip: 'Aynı yönde çok fazla LONG pozisyon açık' },
+    'DIRECTION_LIMIT_SHORT': { label: 'SHORT Limiti', tooltip: 'Aynı yönde çok fazla SHORT pozisyon açık' },
+    'RISK_BLOCK': { label: 'Risk Kontrolü', tooltip: 'Risk yönetimi sistemi bu işlemi uygun görmedi' },
+    'SCALE_LIMIT': { label: 'Ölçekleme Limiti', tooltip: 'Aynı coin\'de ek pozisyon açma limiti doldu' },
+    'HEDGING_DISABLED': { label: 'Hedge Kapalı', tooltip: 'Karşı yönde pozisyon açma (hedging) devre dışı' },
+    'MIN_NOTIONAL': { label: 'Küçük Pozisyon', tooltip: 'Pozisyon boyutu çok küçük — komisyon maliyeti kazancı aşar' },
+    'ENTRY_CORRIDOR_EXCEEDED': { label: 'Koridor Aşıldı', tooltip: 'Fiyat, giriş koridorunun dışına çıktı' },
+    // Bekleyen Emirler
+    'PENDING_EXPIRED': { label: 'Süre Doldu', tooltip: 'Bekleyen emir 30 dakika içinde gerçekleşmedi, iptal edildi' },
+    'STALE_SIGNAL': { label: 'Bayat Sinyal', tooltip: 'Sinyal skoru zamanla düştü ve minimum eşiğin altına indi' },
+    'SIGNAL_MISSED': { label: 'Fırsat Kaçtı', tooltip: 'Fiyat giriş seviyesinden uzaklaştı, sinyal artık geçerli değil' },
+    'TRAIL_ENTRY_FAIL': { label: 'Takip Başarısız', tooltip: 'Takip girişi fiyat hedefine ulaşamadı' },
+    'TRAIL_ENTRY_TIMEOUT': { label: 'Takip Zaman Aşımı', tooltip: 'Takip girişi süre içinde tamamlanamadı' },
+    'ENTRY_RECHECK_FAIL': { label: 'Tekrar Kontrol Red', tooltip: 'Giriş öncesi tekrar kontrol başarısız — koşullar değişti' },
+    'PENDING_REINFORCED': { label: 'Güçlendirme', tooltip: 'Sinyal tekrar doğrulandı, bekleme süresi kısaltıldı' },
+    // Binance Execution
+    'ENTRY_SCORE_LOW': { label: 'Düşük İcra Skoru', tooltip: 'Emir defteri kalitesi (BBO, spread) giriş için yetersiz' },
+    'BLOCK_OPEN_DRIFT': { label: 'Fiyat Kayması', tooltip: 'Fiyat sinyal anından çok uzaklaştı, giriş riskli' },
+    'BLOCK_OPEN_STALE_BBO': { label: 'Eski BBO Verisi', tooltip: 'Emir defteri verisi 1.5 saniyeden eski — güvenilir değil' },
+    'BLOCK_OPEN_SPREAD': { label: 'Yüksek Makas', tooltip: 'Alış-satış farkı (spread) çok yüksek' },
+    'BLOCK_OPEN_INVALID_BBO': { label: 'Geçersiz BBO', tooltip: 'Emir defteri verisi geçersiz veya eksik' },
+    'SLIPPAGE_REJECT': { label: 'Kayma Ret', tooltip: 'Emir dolum fiyatı beklentiden çok farklı' },
+    'BINANCE_ORDER_FAILED': { label: 'Borsa Hatası', tooltip: 'Binance emri başarısız oldu' },
+    'BINANCE_ORDER_ERROR': { label: 'Borsa Hatası', tooltip: 'Binance emir gönderiminde hata oluştu' },
+    'MARKET_FALLBACK_FAILED': { label: 'Piyasa Emri Başarısız', tooltip: 'Piyasa emri yedek planı da başarısız oldu' },
+    'MARKET_FALLBACK_ERROR': { label: 'Piyasa Emri Hatası', tooltip: 'Piyasa emri yedek planında hata oluştu' },
+};
+
+const getRejectTr = (reason?: string | null): { label: string; tooltip: string } => {
+    if (!reason) return { label: '', tooltip: '' };
+    const key = String(reason).split(':')[0].toUpperCase();
+    const detail = String(reason).includes(':') ? String(reason).split(':').slice(1).join(':') : '';
+    const entry = REJECT_TR[key];
+    if (entry) {
+        return {
+            label: entry.label,
+            tooltip: `${entry.tooltip}${detail ? `\nDetay: ${detail}` : ''}`
+        };
+    }
+    return { label: key, tooltip: `Ret sebebi: ${reason}` };
+};
+
 const getDynamicTrailEntryThreshold = (
     atrPct: number,
     spreadPct: number,
@@ -172,7 +239,8 @@ const getQualityTooltip = (signal: CoinOpportunity): string => {
         lines.push(`BTC override: aktif | lev cap ${levCap} | boyut cap ${sizeCap}`);
     }
     if (signal.executionRejectReason) {
-        lines.push(`Son red: ${signal.executionRejectReason}`);
+        const rejectTr = getRejectTr(signal.executionRejectReason);
+        lines.push(`Son red: ${rejectTr.label} — ${rejectTr.tooltip}`);
     }
 
     return lines.join('\n');
@@ -322,14 +390,14 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
 
     // Execution reject badge
     if (signal.executionRejectReason) {
-        const rejectKey = getRejectReasonKey(signal.executionRejectReason);
+        const rejectTr = getRejectTr(signal.executionRejectReason);
         badges.push(
             <span
                 key="rej"
                 className="text-[9px] px-1 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                title={withDetails(`İşleme Alınmadı: ${signal.executionRejectReason}`)}
+                title={`❌ ${rejectTr.tooltip}`}
             >
-                RET:{rejectKey}
+                {rejectTr.label}
             </span>
         );
     }
