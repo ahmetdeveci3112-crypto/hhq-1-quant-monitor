@@ -30,6 +30,8 @@ REASON_BUCKETS = {
     'KILL_SWITCH_HARD': 'KILL_SWITCH',
     'RECOVERY_TP': 'RECOVERY',
     'PARTIAL_TP': 'RECOVERY',
+    'TRAILING': 'TRAIL',
+    'CLOSED': 'EXTERNAL',
     'EXTERNAL': 'EXTERNAL',
     'MANUAL': 'EXTERNAL',
     'BINANCE_SYNC': 'EXTERNAL',
@@ -66,7 +68,14 @@ class PnLAttributionService:
             side = trade.get('side', 'LONG')
             leverage = max(1, int(trade.get('leverage', 10) or 10))
             signal_price = float(trade.get('originalEntryPrice', trade.get('signalPrice', entry_price)) or entry_price)
-            notional = abs(exit_price * size)
+
+            # Binance-synced trades have sizeUsd but no size — derive it
+            if size == 0 and entry_price > 0:
+                size_usd = float(trade.get('sizeUsd', 0) or 0)
+                if size_usd > 0:
+                    size = size_usd / entry_price
+
+            notional = abs(exit_price * size) if size > 0 else float(trade.get('sizeUsd', 0) or 0)
 
             # Direction multiplier
             direction = 1.0 if side == 'LONG' else -1.0
@@ -74,14 +83,18 @@ class PnLAttributionService:
             # ==========================================================
             # Component 1: Gross PnL (raw price move × size)
             # ==========================================================
-            pnl_gross = (exit_price - entry_price) * size * direction
+            if size > 0 and entry_price > 0 and exit_price > 0:
+                pnl_gross = (exit_price - entry_price) * size * direction
+            else:
+                # Fallback: use trade's stored PnL as gross
+                pnl_gross = float(trade.get('pnl', 0) or 0)
 
             # ==========================================================
             # Component 2: Fee cost
             # ==========================================================
             # Round-trip fee: Binance ~0.04% per side with BNB discount
             fee_rate = 0.0008  # 0.08% round-trip
-            fee_cost = notional * fee_rate
+            fee_cost = notional * fee_rate if notional > 0 else abs(pnl_gross) * fee_rate
 
             # ==========================================================
             # Component 3: Slippage cost
@@ -89,7 +102,7 @@ class PnLAttributionService:
             entry_slip = abs(float(trade.get('entry_slippage', 0) or 0)) / 100.0
             # Exit slippage estimated from bid-ask spread if available
             exit_slip = abs(float(trade.get('exit_slippage', 0) or 0)) / 100.0
-            slippage_cost = notional * (entry_slip + exit_slip)
+            slippage_cost = notional * (entry_slip + exit_slip) if notional > 0 else 0.0
 
             # ==========================================================
             # Component 4: Funding cost
@@ -106,7 +119,7 @@ class PnLAttributionService:
             # Distance between signal price and actual fill
             # Positive = better than signal (e.g., limit fill improvement)
             # ==========================================================
-            if signal_price > 0 and entry_price > 0:
+            if signal_price > 0 and entry_price > 0 and size > 0:
                 timing_alpha = (signal_price - entry_price) * size * direction
             else:
                 timing_alpha = 0.0
@@ -128,7 +141,10 @@ class PnLAttributionService:
             else:
                 ideal_exit = exit_price  # Use actual exit as "ideal"
 
-            signal_alpha = (ideal_exit - signal_price) * size * direction if signal_price > 0 else pnl_net
+            if signal_price > 0 and size > 0:
+                signal_alpha = (ideal_exit - signal_price) * size * direction
+            else:
+                signal_alpha = pnl_net
 
             # ==========================================================
             # Component 7: Execution alpha (residual)
@@ -356,9 +372,10 @@ class PnLAttributionService:
         if any(abs(from_columns[k]) > 1e-12 for k in metric_keys):
             return from_columns
 
-        # Fallback-2: on-the-fly decomposition for legacy trades that have no attribution persisted.
+        # Fallback-2: on-the-fly decomposition for legacy/Binance trades.
         try:
             normalized = dict(trade)
+            # Normalize field names for decompose_trade compatibility
             if 'entry_slippage' not in normalized:
                 normalized['entry_slippage'] = trade.get('entrySlippage', 0)
             if 'exit_slippage' not in normalized:
@@ -371,10 +388,15 @@ class PnLAttributionService:
                 normalized['takeProfit'] = trade.get('takeProfit', trade.get('take_profit', 0))
             if 'stopLoss' not in normalized:
                 normalized['stopLoss'] = trade.get('stopLoss', trade.get('stop_loss', 0))
+            # Ensure size is derivable (Binance trades have sizeUsd but no size)
+            if not float(normalized.get('size', 0) or 0) and float(normalized.get('sizeUsd', 0) or 0) > 0:
+                ep = float(normalized.get('entryPrice', 0) or 0)
+                if ep > 0:
+                    normalized['size'] = float(normalized['sizeUsd']) / ep
 
             decomp = self.decompose_trade(normalized)
             decomp_attr = json.loads(decomp.get('attribution_json', '{}'))
-            if isinstance(decomp_attr, dict):
+            if isinstance(decomp_attr, dict) and any(abs(float(decomp_attr.get(k, 0) or 0)) > 1e-12 for k in metric_keys):
                 return {
                     'gross': float(decomp_attr.get('gross', 0) or 0),
                     'fee': float(decomp_attr.get('fee', 0) or 0),
