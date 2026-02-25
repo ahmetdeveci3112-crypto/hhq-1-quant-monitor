@@ -6744,7 +6744,7 @@ PERSISTENT_SIGNAL_MODE = True             # Master switch for signal lifecycle
 COUNTER_SIGNAL_CONFIRM_COUNT = 2          # Opposites needed to invalidate
 COUNTER_SIGNAL_CONFIRM_WINDOW_SEC = 30    # Window for counter confirmations
 MAX_REENTRY_PER_SIGNAL = 2                # Max re-entry attempts per signal
-MIN_REENTRY_COOLDOWN_SEC = 90             # Cooldown between re-entries
+MIN_REENTRY_COOLDOWN_SEC = 300            # Cooldown between re-entries (5min, was 90s)
 PERSISTENT_SIGNAL_TTL_SEC = 3600          # Active signal max lifetime (60 minutes)
 
 # ============================================================================
@@ -15230,14 +15230,20 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     try:
         ev = global_paper_trader.calculate_signal_ev(signal)
         signal['ev'] = round(ev, 4)
+        # Cost-aware EV filter: ev_net must exceed minimum buffer
+        ev_min_buffer = 0.10  # Codex: reject if net EV < 0.10
         if ev <= -0.5:
             signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
             reject_feedback(f"NEGATIVE_EV:{ev:.4f}")
-            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV={ev:.4f} <= -0.5 | score={signal.get('confidenceScore', 0)}")
+            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV_net={ev:.4f} <= -0.5 | score={signal.get('confidenceScore', 0)}")
             return
-        elif ev < 0:
-            logger.info(f"⚠️ EV_WARNING: {action} {symbol} | EV={ev:.4f} (weak but passing)")
+        elif ev < ev_min_buffer:
+            signal_log_data['reject_reason'] = f'LOW_NET_EDGE:{ev:.4f}'
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback(f"LOW_NET_EDGE:{ev:.4f}")
+            logger.info(f"📉 LOW_NET_EDGE: {action} {symbol} | EV_net={ev:.4f} < {ev_min_buffer} | score={signal.get('confidenceScore', 0)}")
+            return
     except Exception as ev_err:
         logger.debug(f"EV filter error: {ev_err}")
     
@@ -23007,14 +23013,14 @@ class PaperTradingEngine:
         self.sl_multiplier = 2.0  # ATR multiplier for SL (used in sync loop)
         self.tp_multiplier = 3.0  # ATR multiplier for TP (used in sync loop)
         # Phase 22: Multi-position config
-        self.max_positions = 50  # Allow up to 50 positions
+        self.max_positions = 8  # Cost-aware: was 50, reduced for $100 balance
         self.allow_hedging = True  # Allow LONG + SHORT simultaneously
         # Algorithm sensitivity settings (can be adjusted via API)
         self.z_score_threshold = 1.6  # Min Z-Score for signal
         # Phase 50: Dynamic Min Score Range
         self.min_score_low = 60   # Minimum possible score (aggressive mode)
         self.min_score_high = 90  # Maximum possible score (defensive mode)
-        self.min_confidence_score = 68  # Current effective min score (dynamically calculated)
+        self.min_confidence_score = 74  # Cost-aware: was 68, kademeli artış (hedef 76-78)
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
         self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
@@ -23274,10 +23280,10 @@ class PaperTradingEngine:
     # =========================================================================
     def calculate_signal_ev(self, signal: dict) -> float:
         """
-        Phase 224B: Expected Value hesaplama.
-        EV = p(win) * avg_win - (1-p) * |avg_loss|
+        Phase 224B: Expected Value hesaplama (cost-aware).
+        EV_net = p(win) * avg_win - (1-p) * |avg_loss| - est_fee - est_slippage
         Skor bandına göre historik win rate kullanır.
-        Returns: EV value (positive = profitable, negative = avoid)
+        Returns: Net EV value after costs (positive = profitable, negative = avoid)
         """
         score = signal.get('confidenceScore', 0)
         
@@ -23290,15 +23296,20 @@ class PaperTradingEngine:
         
         if total < 5:
             # Yetersiz veri → EV tahmini: score'u PnL ölçeğine dönüştür
-            # avg_win/avg_loss tipik ~0.01-0.05 USDT/margin aralığında
-            return (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
+            ev_raw = (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
+        else:
+            p_win = hist['wins'] / total
+            avg_win = hist.get('avg_win', 0)
+            avg_loss = abs(hist.get('avg_loss', 0))
+            ev_raw = p_win * avg_win - (1 - p_win) * avg_loss
         
-        p_win = hist['wins'] / total
-        avg_win = hist.get('avg_win', 0)
-        avg_loss = abs(hist.get('avg_loss', 0))
+        # Cost-aware: deduct estimated fee + slippage
+        est_fee_pct = 0.0008  # 0.08% round-trip commission
+        est_slip_pct = min(0.002, float(signal.get('spreadPct', 0.05) or 0.05) / 100.0)  # spread-based slippage
+        est_cost = est_fee_pct + est_slip_pct
+        ev_net = ev_raw - est_cost
         
-        ev = p_win * avg_win - (1 - p_win) * avg_loss
-        return ev
+        return ev_net
     
     def update_score_band_stats(self, signal_score: int, pnl: float):
         """Phase 224B: Trade kapanınca skor bandı istatistiğini güncelle."""
@@ -24055,6 +24066,21 @@ class PaperTradingEngine:
             position_size_usd = max_size_usd
             size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
             reasons.append(size_cap_reason)
+        
+        # Cost-aware minimum notional gate
+        # Fee becomes meaningless below a dynamic floor.
+        # min_notional = max(5, fee_floor_usd / expected_edge_pct)
+        _fee_rate_rt = 0.0008  # 0.08% round-trip
+        _expected_edge_pct = max(0.005, (atr / price * 0.3) if price > 0 else 0.01)  # ~30% of ATR as edge estimate
+        _fee_floor_usd = _fee_rate_rt * position_size_usd  # fee at this size
+        _dynamic_min_notional = max(5.0, _fee_floor_usd / _expected_edge_pct if _expected_edge_pct > 0 else 5.0)
+        if position_size_usd < _dynamic_min_notional:
+            logger.info(
+                f"🚫 MIN_NOTIONAL: {trade_symbol} {side} size=${position_size_usd:.2f} "
+                f"< min=${_dynamic_min_notional:.2f} (fee=${_fee_floor_usd:.4f} edge={_expected_edge_pct:.4f})"
+            )
+            self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL")
+            return None
         
         position_size = position_size_usd / entry_price
 
