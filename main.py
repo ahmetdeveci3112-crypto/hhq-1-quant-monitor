@@ -14479,6 +14479,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # =====================================================
     # BTC TREND FILTER (Cloud Scanner)
     # =====================================================
+    # Preserve original raw score before any penalties
+    signal['_rawConfidenceScore'] = signal.get('confidenceScore', 60)
     try:
         btc_allowed, btc_penalty, btc_reason = btc_filter.should_allow_signal(
             symbol, action,
@@ -15240,19 +15242,21 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     try:
         ev = global_paper_trader.calculate_signal_ev(signal)
         signal['ev'] = round(ev, 4)
+        _raw_sc = signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0))
+        _pen_sc = signal.get('confidenceScore', 0)
         # Cost-aware EV filter: ev_net must exceed minimum buffer
         ev_min_buffer = 0.02  # Was 0.10 — too strict, blocked score<82 entirely
         if ev <= -0.5:
             signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
             reject_feedback(f"NEGATIVE_EV:{ev:.4f}")
-            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV_net={ev:.4f} <= -0.5 | score={signal.get('confidenceScore', 0)}")
+            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV_net={ev:.4f} <= -0.5 | rawScore={_raw_sc} penScore={_pen_sc}")
             return
         elif ev < ev_min_buffer:
             signal_log_data['reject_reason'] = f'LOW_NET_EDGE:{ev:.4f}'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
             reject_feedback(f"LOW_NET_EDGE:{ev:.4f}")
-            logger.info(f"📉 LOW_NET_EDGE: {action} {symbol} | EV_net={ev:.4f} < {ev_min_buffer} | score={signal.get('confidenceScore', 0)}")
+            logger.info(f"📉 LOW_NET_EDGE: {action} {symbol} | EV_net={ev:.4f} < {ev_min_buffer} | rawScore={_raw_sc} penScore={_pen_sc}")
             return
     except Exception as ev_err:
         logger.debug(f"EV filter error: {ev_err}")
@@ -23325,7 +23329,7 @@ class PaperTradingEngine:
         Skor bandına göre historik win rate kullanır.
         Returns: Net EV value after costs (positive = profitable, negative = avoid)
         """
-        score = signal.get('confidenceScore', 0)
+        score = signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0))  # Use raw pre-penalty score
         
         # Skor bandı: 50-60, 60-70, 70-80, 80-90, 90-100
         band = min(90, max(50, (score // 10) * 10))
