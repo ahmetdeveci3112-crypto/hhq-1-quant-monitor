@@ -14491,11 +14491,87 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         )
         
         if not btc_allowed:
-            signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
-            reject_feedback(f"BTC_FILTER:{btc_reason}")
-            logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason}")
-            return
+            # Composite check: if coin is strongly aligned, override BTC block
+            _coin_chg = float(signal.get('priceChange24h', 0) or 0)
+            _btc_wtf = getattr(btc_filter, '_wtf_score', 0.0)
+            _coin_norm = max(-1.0, min(1.0, _coin_chg / 5.0))
+            _composite = 0.60 * _coin_norm + 0.40 * _btc_wtf
+            
+            # If composite strongly supports the signal, allow with high penalty instead of blocking
+            _signal_aligned = (action == "LONG" and _composite > 0.3) or (action == "SHORT" and _composite < -0.3)
+            if _signal_aligned:
+                btc_allowed = True
+                btc_penalty = 0.50  # High penalty but not blocked
+                btc_reason = f"COMPOSITE_OVERRIDE({_composite:+.2f})"
+                logger.info(
+                    f"🔄 COMPOSITE OVERRIDE: {action} {symbol} | coin={_coin_chg:+.1f}% btc_wtf={_btc_wtf:+.3f} "
+                    f"composite={_composite:+.3f} → allowed with 50% penalty"
+                )
+            else:
+                signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                reject_feedback(f"BTC_FILTER:{btc_reason}")
+                logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason} (composite={_composite:+.3f})")
+                return
+        
+        # =====================================================================
+        # COIN-BTC COMPOSITE REGIME
+        # Coin'in kendi performansı + BTC weighted trend = composite skor
+        # Bu skor BTC penalty'yi ayarlar: coin güçlüyse penalty düşer
+        # =====================================================================
+        _coin_change_pct = float(signal.get('priceChange24h', 0) or 0)
+        _btc_wtf_score = getattr(btc_filter, '_wtf_score', 0.0)
+        _coin_norm = max(-1.0, min(1.0, _coin_change_pct / 5.0))  # ±5% = full score
+        _composite_score = 0.60 * _coin_norm + 0.40 * _btc_wtf_score
+        
+        # Determine composite regime label
+        if _composite_score > 0.5:
+            _composite_regime = "STRONG_BULLISH"
+        elif _composite_score > 0.15:
+            _composite_regime = "BULLISH"
+        elif _composite_score < -0.5:
+            _composite_regime = "STRONG_BEARISH"
+        elif _composite_score < -0.15:
+            _composite_regime = "BEARISH"
+        else:
+            _composite_regime = "NEUTRAL"
+        
+        signal['compositeScore'] = round(_composite_score, 3)
+        signal['compositeRegime'] = _composite_regime
+        
+        # Adjust BTC penalty based on composite alignment
+        _signal_direction = 1.0 if action == "LONG" else -1.0
+        _alignment = _composite_score * _signal_direction  # Positive = aligned
+        
+        if btc_penalty > 0 and _alignment > 0.2:
+            # Coin is aligned with signal despite BTC penalty → reduce penalty
+            _old_penalty = btc_penalty
+            reduction = min(0.6, _alignment)  # Max 60% reduction
+            btc_penalty = max(0.05, btc_penalty * (1 - reduction))
+            logger.info(
+                f"🎯 COMPOSITE ADJ: {action} {symbol} | coin={_coin_change_pct:+.1f}% "
+                f"composite={_composite_score:+.3f}({_composite_regime}) | "
+                f"penalty {_old_penalty:.2f}→{btc_penalty:.2f} (aligned, reduced {reduction*100:.0f}%)"
+            )
+        elif btc_penalty > 0 and _alignment < -0.2:
+            # Coin is against signal + BTC penalty → increase penalty
+            _old_penalty = btc_penalty
+            increase = min(0.3, abs(_alignment) * 0.5)
+            btc_penalty = min(0.80, btc_penalty * (1 + increase))
+            logger.info(
+                f"⚠️ COMPOSITE ADJ: {action} {symbol} | coin={_coin_change_pct:+.1f}% "
+                f"composite={_composite_score:+.3f}({_composite_regime}) | "
+                f"penalty {_old_penalty:.2f}→{btc_penalty:.2f} (opposing, increased {increase*100:.0f}%)"
+            )
+        elif btc_penalty < 0:
+            # Bonus case: if composite strongly aligned, boost bonus
+            if _alignment > 0.3:
+                _old_bonus = btc_penalty
+                btc_penalty = btc_penalty * (1 + min(0.5, _alignment))
+                logger.info(
+                    f"🚀 COMPOSITE BOOST: {action} {symbol} | composite={_composite_score:+.3f} | "
+                    f"bonus {_old_bonus:.2f}→{btc_penalty:.2f}"
+                )
         
         # Phase 230B: Override risk caps (leverage 3x, size 50%)
         if btc_filter.last_override:
