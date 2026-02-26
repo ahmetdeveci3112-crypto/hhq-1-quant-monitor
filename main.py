@@ -29793,25 +29793,56 @@ async def paper_trading_market_order(request: Request):
         
         size_usd = size * price
         
-        # Create position
+        # ── BINANCE REAL ORDER ──
+        if live_binance_trader.enabled:
+            binance_order = await live_binance_trader.place_market_order(
+                symbol=symbol,
+                side=side,
+                size_usd=size_usd,
+                leverage=leverage
+            )
+            if not binance_order:
+                err_reason = getattr(live_binance_trader, 'last_order_error', 'unknown')
+                logger.error(f"❌ Market Order FAILED: {side} {symbol} | reason={err_reason}")
+                return JSONResponse({"success": False, "error": f"Binance emir başarısız: {err_reason}"}, status_code=500)
+            # Use Binance fill data for accuracy
+            fill_price = float(binance_order.get('average') or binance_order.get('price') or price)
+            filled_amount = float(binance_order.get('filled') or binance_order.get('amount') or size)
+            filled_usd = filled_amount * fill_price
+            logger.info(f"✅ BINANCE MARKET ORDER OK: {side} {symbol} fill={fill_price} amt={filled_amount} usd={filled_usd:.2f}")
+        else:
+            fill_price = price
+            filled_amount = size
+            filled_usd = size_usd
+        
+        # SL/TP recalculate from fill price
+        if side == 'LONG':
+            sl = fill_price - sl_distance
+            tp = fill_price + tp_distance
+        else:
+            sl = fill_price + sl_distance
+            tp = fill_price - tp_distance
+        
+        # Create position for paper tracker (tracking/UI)
         position = {
             "id": f"manual_{int(datetime.now().timestamp() * 1000)}",
             "symbol": symbol,
             "side": side,
-            "entryPrice": price,
-            "currentPrice": price,
-            "size": size,
-            "sizeUsd": size_usd,
+            "entryPrice": fill_price,
+            "currentPrice": fill_price,
+            "size": filled_amount,
+            "sizeUsd": filled_usd,
             "stopLoss": sl,
             "takeProfit": tp,
             "trailingStop": 0,
-            "trailActivation": price + (atr * global_paper_trader.trail_activation_atr) if side == 'LONG' else price - (atr * global_paper_trader.trail_activation_atr),
+            "trailActivation": fill_price + (atr * global_paper_trader.trail_activation_atr) if side == 'LONG' else fill_price - (atr * global_paper_trader.trail_activation_atr),
             "trailDistance": atr * global_paper_trader.trail_distance_atr,
             "isTrailingActive": False,
             "unrealizedPnl": 0,
             "unrealizedPnlPercent": 0,
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": leverage,
+            "isLive": live_binance_trader.enabled,
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
@@ -29819,7 +29850,7 @@ async def paper_trading_market_order(request: Request):
             # Runtime trail telemetry (updated every tick)
             "effectiveExitTightness": global_paper_trader.exit_tightness,
             "runtimeTrailDistance": atr * global_paper_trader.trail_distance_atr,
-            "runtimeTrailDistancePct": round((atr * global_paper_trader.trail_distance_atr / price * 100), 4) if price > 0 else 0.0,
+            "runtimeTrailDistancePct": round((atr * global_paper_trader.trail_distance_atr / fill_price * 100), 4) if fill_price > 0 else 0.0,
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -29827,10 +29858,16 @@ async def paper_trading_market_order(request: Request):
         }
         
         global_paper_trader.positions.append(position)
-        global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${price:.4f} | {leverage}x | SL: ${sl:.4f} | TP: ${tp:.4f}")
+        global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${fill_price:.4f} | {leverage}x | SL: ${sl:.4f} | TP: ${tp:.4f}")
         global_paper_trader.save_state()
         
-        logger.info(f"✅ Market Order: {side} {symbol} @ {price} | finalLev={leverage}x")
+        # Save to SQLite
+        try:
+            asyncio.create_task(sqlite_manager.save_open_position(position))
+        except Exception as db_err:
+            logger.warning(f"⚠️ Failed to save manual position to SQLite: {db_err}")
+        
+        logger.info(f"✅ Market Order: {side} {symbol} @ {fill_price} | finalLev={leverage}x")
         return JSONResponse({"success": True, "position": position})
         
     except Exception as e:
@@ -29848,26 +29885,44 @@ async def paper_trading_close(position_id: str):
             logger.warning(f"Close position failed: position {position_id} not found. Active positions: {[p['id'] for p in global_paper_trader.positions]}")
             return JSONResponse({"success": False, "message": f"Pozisyon bulunamadı: {position_id}"}, status_code=404)
         
-        # Get current price - priority: 1) stored currentPrice 2) scanner opportunities 3) entryPrice fallback
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', 'LONG')
+        amount = abs(float(pos.get('size', 0) or pos.get('contracts', 0) or 0))
+        
+        # ── BINANCE REAL CLOSE ──
+        if live_binance_trader.enabled and pos.get('isLive', True):
+            if amount > 0:
+                binance_close = await live_binance_trader.close_position(
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    trace_id=f"manual_close_{position_id}"
+                )
+                if binance_close:
+                    fill_price = float(binance_close.get('average') or binance_close.get('price') or 0)
+                    logger.info(f"✅ BINANCE CLOSE OK: {side} {symbol} amt={amount} fill={fill_price}")
+                else:
+                    logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} amt={amount} — proceeding with paper close")
+            else:
+                logger.warning(f"⚠️ Position {position_id} has 0 size, skipping Binance close")
+        
+        # Get current price
         current_price = pos.get('currentPrice', 0)
         
         if not current_price or current_price <= 0:
-            # Try to get from scanner opportunities
-            symbol = pos.get('symbol', '')
             for opp in multi_coin_scanner.current_opportunities:
                 if opp.get('symbol') == symbol:
                     current_price = opp.get('price', 0)
                     break
         
         if not current_price or current_price <= 0:
-            # Final fallback to entry price
             current_price = pos.get('entryPrice', 0)
             logger.warning(f"Using entry price for close (no live price): {position_id}")
         
         if current_price <= 0:
             return JSONResponse({"success": False, "message": "Güncel fiyat alınamadı"}, status_code=500)
         
-        # Close the position
+        # Close the position in paper trader
         success = global_paper_trader.close_position_by_id(position_id, current_price)
         if success:
             return JSONResponse({"success": True, "message": f"Pozisyon kapatıldı @ ${current_price:.6f}"})
