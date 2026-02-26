@@ -14451,23 +14451,27 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         return
     
     # Phase 219: USDT-based directional exposure limit — early reject
+    # Only apply when there are already positions in the same direction.
+    # With 0 same-direction positions there is no directional overexposure risk.
     MAX_DIRECTION_EXPOSURE_PCT = 0.40
     signal_side = 'LONG' if action in ('BUY', 'LONG') else 'SHORT'
-    same_dir_margin = sum(
-        p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-        for p in global_paper_trader.positions if p.get('side') == signal_side
-    )
-    same_dir_margin += sum(
-        p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-        for p in global_paper_trader.pending_orders if p.get('side') == signal_side
-    )
-    max_dir_exposure = global_paper_trader.balance * MAX_DIRECTION_EXPOSURE_PCT
-    if same_dir_margin >= max_dir_exposure:
-        signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-        reject_feedback("DIRECTION_EXPOSURE")
-        logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
-        return
+    same_dir_positions = [p for p in global_paper_trader.positions if p.get('side') == signal_side]
+    if len(same_dir_positions) > 0:
+        same_dir_margin = sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in same_dir_positions
+        )
+        same_dir_margin += sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in global_paper_trader.pending_orders if p.get('side') == signal_side
+        )
+        max_dir_exposure = global_paper_trader.balance * MAX_DIRECTION_EXPOSURE_PCT
+        if same_dir_margin >= max_dir_exposure:
+            signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
+            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            reject_feedback("DIRECTION_EXPOSURE")
+            logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
+            return
     
     # Check blacklist
     if global_paper_trader.is_coin_blacklisted(symbol):
