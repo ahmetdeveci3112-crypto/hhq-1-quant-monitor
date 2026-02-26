@@ -23448,16 +23448,22 @@ class PaperTradingEngine:
         hist = self.score_band_stats.get(band_key, {})
         total = hist.get('wins', 0) + hist.get('losses', 0)
         
-        if total < 5:
+        # Require 30+ trades per band for reliable historical data (was 5, caused poisoned data)
+        if total < 30:
             # Yetersiz veri → EV tahmini: score'u PnL ölçeğine dönüştür
             ev_raw = (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
-            ev_source = "FALLBACK"
+            ev_source = f"FALLBACK(n={total})"
         else:
             p_win = hist['wins'] / total
             avg_win = hist.get('avg_win', 0)
             avg_loss = abs(hist.get('avg_loss', 0))
             ev_raw = p_win * avg_win - (1 - p_win) * avg_loss
             ev_source = f"HIST(W={hist['wins']},L={hist['losses']},pW={p_win:.2f})"
+            
+            # Sanity check: if win rate > 50% but EV negative → exit quality issue, use fallback
+            if p_win > 0.50 and ev_raw < 0:
+                ev_raw = (score - 60) * 0.005
+                ev_source += "→FALLBACK(pW>0.5,EV<0)"
         
         # Cost-aware: deduct estimated fee + slippage
         est_fee_pct = 0.0008  # 0.08% round-trip commission
