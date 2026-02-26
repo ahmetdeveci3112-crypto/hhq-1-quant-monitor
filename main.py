@@ -12523,7 +12523,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     filtered_opportunities.append(opp)
         
         # Update opportunities and stats
-        ui_state_cache.opportunities = filtered_opportunities
+        # Bug Fix: Cap WS payload to top 150 to prevent 3MB JSON blocking event loop & crashing UI
+        filtered_opportunities.sort(key=lambda x: float(x.get('signalScore') or 0), reverse=True)
+        ui_state_cache.opportunities = filtered_opportunities[:150]
         
         # Phase 263: Keep UI counters consistent with Active Signals tab.
         # Long/Short/Active should come from persistent active signals, not opportunities.
