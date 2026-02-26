@@ -23451,17 +23451,27 @@ class PaperTradingEngine:
         if total < 5:
             # Yetersiz veri → EV tahmini: score'u PnL ölçeğine dönüştür
             ev_raw = (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
+            ev_source = "FALLBACK"
         else:
             p_win = hist['wins'] / total
             avg_win = hist.get('avg_win', 0)
             avg_loss = abs(hist.get('avg_loss', 0))
             ev_raw = p_win * avg_win - (1 - p_win) * avg_loss
+            ev_source = f"HIST(W={hist['wins']},L={hist['losses']},pW={p_win:.2f})"
         
         # Cost-aware: deduct estimated fee + slippage
         est_fee_pct = 0.0008  # 0.08% round-trip commission
         est_slip_pct = min(0.002, float(signal.get('spreadPct', 0.05) or 0.05) / 100.0)  # spread-based slippage
         est_cost = est_fee_pct + est_slip_pct
         ev_net = ev_raw - est_cost
+        
+        # Diagnostic logging
+        symbol = signal.get('symbol', signal.get('s', '?'))
+        logger.info(
+            f"📊 EV_CALC: {symbol} | score={score} band={band_key} {ev_source} | "
+            f"ev_raw={ev_raw:.4f} cost={est_cost:.4f} ev_net={ev_net:.4f} | "
+            f"_raw={signal.get('_rawConfidenceScore', 'MISSING')} conf={signal.get('confidenceScore', 'MISSING')}"
+        )
         
         return ev_net
     
