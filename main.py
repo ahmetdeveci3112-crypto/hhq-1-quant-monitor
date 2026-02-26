@@ -23888,35 +23888,36 @@ class PaperTradingEngine:
             return None  # Silently skip to avoid log spam
         
         # Phase 217: Direction exposure limit — max %70 aynı yönde (count-based)
-        long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
-        short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
-        max_same_direction = max(3, self.max_positions * 70 // 100)
-        if side == 'LONG' and long_count >= max_same_direction:
-            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
-            logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık (max {max_same_direction})")
-            return None
-        if side == 'SHORT' and short_count >= max_same_direction:
-            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
-            logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
-            return None
-        
-        # Phase 219: USDT-based directional exposure limit — max %40 of balance per direction
-        # Prevents overexposure to one direction. Uses margin (sizeUsd/leverage) as actual capital at risk.
-        MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
-        same_dir_margin = sum(
-            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-            for p in self.positions if p.get('side') == side
-        )
-        # Also count pending orders for same direction
-        same_dir_margin += sum(
-            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-            for p in self.pending_orders if p.get('side') == side
-        )
-        max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
-        if same_dir_margin >= max_dir_exposure:
-            self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
-            logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
-            return None
+        # Only apply when there are existing positions; with 0 positions there's no overexposure risk.
+        if len(self.positions) > 0:
+            long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
+            short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
+            max_same_direction = max(3, self.max_positions * 70 // 100)
+            if side == 'LONG' and long_count >= max_same_direction:
+                self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
+                logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık (max {max_same_direction})")
+                return None
+            if side == 'SHORT' and short_count >= max_same_direction:
+                self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
+                logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
+                return None
+            
+            # Phase 219: USDT-based directional exposure limit — max %40 of balance per direction
+            MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
+            same_dir_margin = sum(
+                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+                for p in self.positions if p.get('side') == side
+            )
+            # Also count pending orders for same direction
+            same_dir_margin += sum(
+                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+                for p in self.pending_orders if p.get('side') == side
+            )
+            max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
+            if same_dir_margin >= max_dir_exposure:
+                self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
+                logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
+                return None
         
         # =========================================================================
         # PHASE 267A: PORTFOLIO VaR + CORRELATION RISK GATE
