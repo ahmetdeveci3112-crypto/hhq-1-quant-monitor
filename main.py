@@ -15312,30 +15312,22 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.debug(f"Flip penalty error: {flip_err}")
     
     # =====================================================
-    # Phase 224B: EV-BASED SIGNAL FILTER
-    # Reject signals with negative expected value
+    # Phase 224B: EV TELEMETRY (was: hard filter, now: log-only)
+    # Calculate EV for monitoring but DO NOT block signals
+    # The score/TREND_GATE/VOLATILE_VETO filters already ensure quality
     # =====================================================
     try:
         ev = global_paper_trader.calculate_signal_ev(signal)
         signal['ev'] = round(ev, 4)
         _raw_sc = signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0))
         _pen_sc = signal.get('confidenceScore', 0)
-        # Cost-aware EV filter: ev_net must exceed minimum buffer
-        ev_min_buffer = 0.02  # Was 0.10 — too strict, blocked score<82 entirely
-        if ev <= -0.5:
-            signal_log_data['reject_reason'] = f'NEGATIVE_EV:{ev:.4f}'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
-            reject_feedback(f"NEGATIVE_EV:{ev:.4f}")
-            logger.info(f"📉 EV_REJECT: {action} {symbol} | EV_net={ev:.4f} <= -0.5 | rawScore={_raw_sc} penScore={_pen_sc}")
-            return
-        elif ev < ev_min_buffer:
-            signal_log_data['reject_reason'] = f'LOW_NET_EDGE:{ev:.4f}'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
-            reject_feedback(f"LOW_NET_EDGE:{ev:.4f}")
-            logger.info(f"📉 LOW_NET_EDGE: {action} {symbol} | EV_net={ev:.4f} < {ev_min_buffer} | rawScore={_raw_sc} penScore={_pen_sc}")
-            return
+        # Log EV for monitoring — no blocking
+        if ev < 0:
+            logger.info(f"📊 EV_WARN: {action} {symbol} | EV_net={ev:.4f} (negative) | rawScore={_raw_sc} penScore={_pen_sc}")
+        else:
+            logger.info(f"📊 EV_OK: {action} {symbol} | EV_net={ev:.4f} | rawScore={_raw_sc} penScore={_pen_sc}")
     except Exception as ev_err:
-        logger.debug(f"EV filter error: {ev_err}")
+        logger.debug(f"EV calc error: {ev_err}")
     
     # Execute trade
     try:
