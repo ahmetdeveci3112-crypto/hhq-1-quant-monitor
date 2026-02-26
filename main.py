@@ -14674,17 +14674,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
             signal_spread = float(signal.get('spreadPct', 0.2) or 0.2)
             signal_volume_ratio = float(signal.get('volumeRatio', 1.0) or 1.0)
-            # Legacy mode must stay tradable on mid-cap / thinner books.
-            # SMART_V2 keeps stricter thresholding; LEGACY gets controlled relax.
-            depth_mode_scale = 1.0
-            if strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
-                if signal_score >= 110:
-                    depth_mode_scale = 0.22
-                elif signal_score >= 95:
-                    depth_mode_scale = 0.26
-                else:
-                    depth_mode_scale = 0.30
-            dynamic_depth_threshold *= (memory_scale * depth_mode_scale)
+            # Apply memory relaxation from signal memory (0.6–1.0)
+            # NOTE: depth_mode_scale REMOVED — score is already factored inside
+            # get_dynamic_depth_threshold() via score_factor. Double-counting
+            # was collapsing the threshold to $3-5K, defeating the floor.
+            dynamic_depth_threshold *= memory_scale
+            # Enforce a hard floor AFTER scaling so threshold never drops
+            # below a level where slippage becomes dangerous
+            dynamic_depth_threshold = max(8_000, dynamic_depth_threshold)
             near_threshold_soft_pass = (
                 reinforce_count >= 2
                 and signal_score >= 95
@@ -14702,7 +14699,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_score >= 105   # Phase RSP: was 90
                 and eq_count >= 2         # Phase RSP: was 1
                 and signal_spread <= 0.08 # Phase RSP: was 0.12
-                and total_depth >= 2_500  # Phase RSP: was 1_200
+                and total_depth >= 5_000  # was 2_500 — $2.5K too low for safe execution
             )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
