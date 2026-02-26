@@ -43,6 +43,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 LIVE_START_BALANCE_USD = float(os.getenv("LIVE_START_BALANCE_USD", "100"))
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse boolean env vars consistently."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
 # Phase 193: pandas-ta for enhanced technical indicators
 try:
     import pandas_ta as pta
@@ -6796,11 +6804,16 @@ MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE = 12
 MTF_COUNTERTREND_SOFTPASS_SIZE_MULT = 0.65
 
 # Volatile regime: strict by default, but allow near-threshold high-quality soft pass
-VOLATILE_VETO_SOFTPASS_ENABLED = True
+TREND_PENALTY_MODE = _env_bool("TREND_PENALTY_MODE", True)
+VOL_SOFTPASS_ENABLED = _env_bool("VOL_SOFTPASS_ENABLED", True)
+VOLATILE_VETO_SOFTPASS_ENABLED = VOL_SOFTPASS_ENABLED
 VOLATILE_VETO_SOFTPASS_MAX_GAP = 8
 VOLATILE_VETO_SOFTPASS_PENALTY_BASE = 4
 VOLATILE_VETO_SOFTPASS_LEVERAGE_CAP = 14
 VOLATILE_VETO_SOFTPASS_SIZE_MULT = 0.75
+
+# Phase 270 follow-up: Preserve EV score-band history across restarts unless explicitly reset.
+EV_STATS_RESET_ON_BOOT = _env_bool("EV_STATS_RESET_ON_BOOT", False)
 
 # Thin-book guard soft-pass (controlled relax for high-quality SMART_V2 setups)
 THIN_BOOK_SMART_SOFTPASS_ENABLED = True
@@ -12536,7 +12549,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
         
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
-            "analyzedCoins": len(filtered_opportunities),
+            "analyzedCoins": len(ui_state_cache.opportunities),
             "longSignals": long_count,
             "shortSignals": short_count,
             "activeSignals": len(persistent_signals),
@@ -14150,7 +14163,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 cancelled = 0
                 for o in open_orders:
                     try:
-                        is_reduce = bool(o.get('reduceOnly') or (o.get('info', {}).get('reduceOnly') == 'true'))
+                        raw_reduce = o.get('reduceOnly')
+                        info_reduce = o.get('info', {}).get('reduceOnly')
+                        is_reduce = (
+                            (raw_reduce is True)
+                            or (str(info_reduce).strip().lower() == 'true')
+                        )
                         status = (o.get('status') or '').lower()
                         if status not in ('open', 'new'):
                             continue
@@ -14457,14 +14475,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     MAX_DIRECTION_EXPOSURE_PCT = 0.40
     signal_side = 'LONG' if action in ('BUY', 'LONG') else 'SHORT'
     same_dir_positions = [p for p in global_paper_trader.positions if p.get('side') == signal_side]
-    if len(same_dir_positions) > 0:
+    same_dir_pending = [p for p in global_paper_trader.pending_orders if p.get('side') == signal_side]
+    if len(same_dir_positions) + len(same_dir_pending) > 0:
         same_dir_margin = sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in same_dir_positions
         )
         same_dir_margin += sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-            for p in global_paper_trader.pending_orders if p.get('side') == signal_side
+            for p in same_dir_pending
         )
         max_dir_exposure = global_paper_trader.balance * MAX_DIRECTION_EXPOSURE_PCT
         if same_dir_margin >= max_dir_exposure:
@@ -15337,6 +15356,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.debug(f"EV calc error: {ev_err}")
     
     # Execute trade
+    global_paper_trader.pipeline_metrics.setdefault('signal_accepted', 0)
+    global_paper_trader.pipeline_metrics.setdefault('open_attempted', 0)
+    global_paper_trader.pipeline_metrics.setdefault('open_created', 0)
+    global_paper_trader.pipeline_metrics.setdefault('open_rejected', 0)
+    global_paper_trader.pipeline_metrics.setdefault('open_reject_reasons', {})
+    global_paper_trader.pipeline_metrics['signal_accepted'] += 1
+    global_paper_trader.pipeline_metrics['open_attempted'] += 1
     try:
         pos = await global_paper_trader.open_position(
             side=action,
@@ -15346,8 +15372,23 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             symbol=symbol
         )
         if pos:
+            global_paper_trader.pipeline_metrics['open_created'] += 1
             trends = mtf_result.get('trends', {})
             logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
+        else:
+            feedback = global_paper_trader.get_execution_feedback(symbol) or {}
+            reject_reason = str(feedback.get('reason') or 'UNKNOWN')
+            reject_key = reject_reason.split(':', 1)[0]
+            reject_map = global_paper_trader.pipeline_metrics.get('open_reject_reasons')
+            if not isinstance(reject_map, dict):
+                reject_map = {}
+            reject_map[reject_key] = int(reject_map.get(reject_key, 0) or 0) + 1
+            global_paper_trader.pipeline_metrics['open_reject_reasons'] = reject_map
+            global_paper_trader.pipeline_metrics['open_rejected'] += 1
+            logger.warning(f"🚫 OPEN_POS_REJECT: {symbol} {action} reason={reject_reason}")
+            if not signal_log_data.get('reject_reason'):
+                signal_log_data['reject_reason'] = f"OPEN_POS:{reject_reason}"
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
@@ -21799,19 +21840,33 @@ class SignalGenerator:
             safe_adx_local = float(adx) if adx is not None else 20.0
             
             if signal_side == "LONG" and not trend_dir['allow_long']:
-                logger.info(
-                    f"⚠️ TREND_PENALTY: {symbol} LONG | trend={trend_dir['direction']} "
-                    f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
-                )
-                score -= 15
-                reasons.append("TREND_AGAINST(-15)")
+                if TREND_PENALTY_MODE:
+                    logger.info(
+                        f"⚠️ TREND_PENALTY: {symbol} LONG | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
+                    )
+                    score -= 15
+                    reasons.append("TREND_AGAINST(-15)")
+                else:
+                    logger.info(
+                        f"🚫 TREND_GATE: {symbol} LONG blocked | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} Z={zscore:.2f}"
+                    )
+                    return None
             elif signal_side == "SHORT" and not trend_dir['allow_short']:
-                logger.info(
-                    f"⚠️ TREND_PENALTY: {symbol} SHORT | trend={trend_dir['direction']} "
-                    f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
-                )
-                score -= 15
-                reasons.append("TREND_AGAINST(-15)")
+                if TREND_PENALTY_MODE:
+                    logger.info(
+                        f"⚠️ TREND_PENALTY: {symbol} SHORT | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
+                    )
+                    score -= 15
+                    reasons.append("TREND_AGAINST(-15)")
+                else:
+                    logger.info(
+                        f"🚫 TREND_GATE: {symbol} SHORT blocked | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} Z={zscore:.2f}"
+                    )
+                    return None
             
             # Phase 247: Pro-trend score bonus
             if trend_dir['direction'] == 'BULLISH' and signal_side == 'LONG':
@@ -22377,7 +22432,7 @@ class SignalGenerator:
             if score < min_score_required:
                 gap = int(min_score_required - score)
                 soft_pass_ok = (
-                    VOLATILE_VETO_SOFTPASS_ENABLED
+                    VOL_SOFTPASS_ENABLED
                     and gap <= VOLATILE_VETO_SOFTPASS_MAX_GAP
                     and (is_volume_spike or volume_ratio >= 0.7)
                     and spread_pct <= max(0.40, EQ_MAX_SPREAD + 0.10)
@@ -23211,6 +23266,8 @@ class PaperTradingEngine:
             'thin_book_soft_override': 0, 'thin_book_super_override': 0,
             'order_attempted': 0, 'order_success': 0, 'order_failed': 0,
             'market_fallback_failed': 0,
+            'signal_accepted': 0, 'open_attempted': 0, 'open_created': 0,
+            'open_rejected': 0, 'open_reject_reasons': {},
             # Phase 237: Signal quality counters
             'soft_pass_count': 0, 'hard_reject_count': 0,
             'tradeability_reject_count': 0, 'false_negative_count': 0,
@@ -23892,37 +23949,37 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
             return None  # Silently skip to avoid log spam
         
-        # Phase 217: Direction exposure limit — max %70 aynı yönde (count-based)
-        # Only apply when there are existing positions; with 0 positions there's no overexposure risk.
-        if len(self.positions) > 0:
-            long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
-            short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
-            max_same_direction = max(3, self.max_positions * 70 // 100)
-            if side == 'LONG' and long_count >= max_same_direction:
-                self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
-                logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık (max {max_same_direction})")
-                return None
-            if side == 'SHORT' and short_count >= max_same_direction:
-                self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
-                logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık (max {max_same_direction})")
-                return None
-            
-            # Phase 219: USDT-based directional exposure limit — max %40 of balance per direction
-            MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
-            same_dir_margin = sum(
-                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-                for p in self.positions if p.get('side') == side
-            )
-            # Also count pending orders for same direction
-            same_dir_margin += sum(
-                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-                for p in self.pending_orders if p.get('side') == side
-            )
-            max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
-            if same_dir_margin >= max_dir_exposure:
-                self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
-                logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
-                return None
+        # Phase 217/219: Direction exposure limits — include BOTH positions and pending orders.
+        long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
+        long_count += sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
+        short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
+        short_count += sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
+        max_same_direction = max(3, self.max_positions * 70 // 100)
+        if side == 'LONG' and long_count >= max_same_direction:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
+            logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık+pending (max {max_same_direction})")
+            return None
+        if side == 'SHORT' and short_count >= max_same_direction:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
+            logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık+pending (max {max_same_direction})")
+            return None
+
+        # USDT-based directional exposure limit — max %40 of balance per direction.
+        # Pending-only states must also be guarded (previously bypassed).
+        MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
+        same_dir_margin = sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in self.positions if p.get('side') == side
+        )
+        same_dir_margin += sum(
+            p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+            for p in self.pending_orders if p.get('side') == side
+        )
+        max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
+        if same_dir_margin >= max_dir_exposure:
+            self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
+            logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
+            return None
         
         # =========================================================================
         # PHASE 267A: PORTFOLIO VaR + CORRELATION RISK GATE
@@ -26176,8 +26233,11 @@ class PaperTradingEngine:
                     # Phase 59: Load coin performance stats from trade history
                     coin_performance_tracker.load_from_trade_history(self.trades)
                     # Phase 224B: Load EV signal filter state
-                    # Bug Fix #2: Start with a clean slate for score_band_stats (reset to empty)
-                    self.score_band_stats = {}
+                    if EV_STATS_RESET_ON_BOOT:
+                        self.score_band_stats = {}
+                    else:
+                        loaded_stats = data.get('score_band_stats', {})
+                        self.score_band_stats = loaded_stats if isinstance(loaded_stats, dict) else {}
                     self.last_signal_per_coin = data.get('last_signal_per_coin', {})
                     self.signal_memory = data.get('signal_memory', {})
                     # Pipeline metrics persistence
@@ -27529,8 +27589,18 @@ class BinanceStreamer:
         
         # Whale Hunter (legacy stub — original class removed)
         class _WhaleStub:
-            def __init__(self, **kw): pass
-            def detect(self, *a, **kw): return None
+            def __init__(self, **kw):
+                pass
+
+            def detect(self, *a, **kw):
+                return None
+
+            def process_trade(self, *a, **kw):
+                return None
+
+            def get_zscore(self):
+                return 0.0
+
         self.whale_detector = _WhaleStub(threshold_usd=100000.0)
         
         # SMC Analyzer (Phase 10)
@@ -27591,12 +27661,13 @@ class BinanceStreamer:
                         data = json.loads(msg)
                         # Process AggTrade
                         # e: event type, E: event time, p: price, q: quantity, m: is_buyer_maker
-                        self.whale_detector.process_trade(
-                            price=float(data['p']),
-                            quantity=float(data['q']),
-                            is_buyer_maker=data['m'],
-                            timestamp=data['E']
-                        )
+                        if hasattr(self.whale_detector, 'process_trade'):
+                            self.whale_detector.process_trade(
+                                price=float(data['p']),
+                                quantity=float(data['q']),
+                                is_buyer_maker=data['m'],
+                                timestamp=data['E']
+                            )
             except Exception as e:
                 logger.error(f"AggTrade Stream Error: {e}")
                 await asyncio.sleep(5)
@@ -30045,6 +30116,7 @@ async def paper_trading_close(position_id: str):
         symbol = pos.get('symbol', '')
         side = pos.get('side', 'LONG')
         amount = abs(float(pos.get('size', 0) or pos.get('contracts', 0) or 0))
+        fill_price = 0.0
         
         # ── BINANCE REAL CLOSE ──
         if live_binance_trader.enabled and pos.get('isLive', True):
@@ -30059,7 +30131,8 @@ async def paper_trading_close(position_id: str):
                     fill_price = float(binance_close.get('average') or binance_close.get('price') or 0)
                     logger.info(f"✅ BINANCE CLOSE OK: {side} {symbol} amt={amount} fill={fill_price}")
                 else:
-                    logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} amt={amount} — proceeding with paper close")
+                    logger.error(f"❌ BINANCE CLOSE FAILED: {side} {symbol} amt={amount} — aborting manual close to prevent state desync")
+                    return JSONResponse({"success": False, "message": "Binance close başarısız, lokal kapatma durduruldu"}, status_code=502)
             else:
                 logger.warning(f"⚠️ Position {position_id} has 0 size, skipping Binance close")
         
@@ -30079,10 +30152,11 @@ async def paper_trading_close(position_id: str):
         if current_price <= 0:
             return JSONResponse({"success": False, "message": "Güncel fiyat alınamadı"}, status_code=500)
         
+        close_price = fill_price if fill_price > 0 else current_price
         # Close the position in paper trader
-        success = global_paper_trader.close_position_by_id(position_id, current_price)
+        success = global_paper_trader.close_position_by_id(position_id, close_price)
         if success:
-            return JSONResponse({"success": True, "message": f"Pozisyon kapatıldı @ ${current_price:.6f}"})
+            return JSONResponse({"success": True, "message": f"Pozisyon kapatıldı @ ${close_price:.6f}"})
         else:
             logger.error(f"close_position_by_id returned False for {position_id}")
             return JSONResponse({"success": False, "message": "Pozisyon kapatılamadı"}, status_code=500)
@@ -30483,7 +30557,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                     # Generate signal if conditions met
                     signal = None
                     try:
-                        whale_z = streamer.whale_detector.get_zscore()
+                        whale_detector = getattr(streamer, 'whale_detector', None)
+                        if whale_detector and hasattr(whale_detector, 'get_zscore'):
+                            whale_z = float(whale_detector.get_zscore() or 0.0)
+                        else:
+                            whale_z = 0.0
                         
                         # Check Breakout (Phase 11)
                         open_price = ticker.get('open', price)
