@@ -2175,7 +2175,7 @@ class LiveBinanceTrader:
                         
                         # Read openTime from SQLite (single source of truth)
                         try:
-                            db_ot = await db_manager.get_position_open_time(symbol)
+                            db_ot = await sqlite_manager.get_position_open_time(symbol)
                             open_time_val = db_ot if db_ot else int(p.get('updateTime', datetime.now().timestamp() * 1000))
                         except:
                             open_time_val = int(p.get('updateTime', datetime.now().timestamp() * 1000))
@@ -2282,7 +2282,7 @@ class LiveBinanceTrader:
                     
                     # Read from SQLite positions table (single source of truth)
                     try:
-                        db_open_time = await db_manager.get_position_open_time(symbol)
+                        db_open_time = await sqlite_manager.get_position_open_time(symbol)
                         if db_open_time:
                             open_time = db_open_time
                     except Exception as e:
@@ -2365,7 +2365,7 @@ class LiveBinanceTrader:
                         fb_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                     
                     # Phase 231h → 238A: Dynamic breakeven prices
-                    _fb_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FB')
+                    _fb_buf = compute_breakeven_buffer_pct(spread_pct=p.get('spreadPct', 0.05), spread_level=p.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FB')
                     be_long = entry_price * (1 + _fb_buf)
                     be_short = entry_price * (1 - _fb_buf)
                     
@@ -26245,7 +26245,7 @@ class PaperTradingEngine:
         # Phase 238B: LEV_PIPE log
         _lev_cap_reason2 = signal.get('leverageCapReason', 'none')
         if raw_leverage != adjusted_leverage:
-            logger.info(f"LEV_PIPE: {symbol} raw={raw_leverage} → effective={adjusted_leverage} cap={_lev_cap_reason2}")
+            logger.info(f"LEV_PIPE: {signal.get('symbol', '')} raw={raw_leverage} → effective={adjusted_leverage} cap={_lev_cap_reason2}")
         signal['signalLeverageRaw'] = raw_leverage
         signal['signalLeverageEffective'] = adjusted_leverage
         
@@ -26326,7 +26326,7 @@ class PaperTradingEngine:
         
         # Save to SQLite for persistent openTime tracking
         try:
-            asyncio.create_task(db_manager.save_open_position(new_position))
+            asyncio.create_task(sqlite_manager.save_open_position(new_position))
         except Exception as e:
             logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
         
@@ -26683,7 +26683,7 @@ class PaperTradingEngine:
         try:
             pos_id = pos.get('id', '')
             pos_symbol = pos.get('symbol', '')
-            asyncio.create_task(db_manager.close_position_in_db(pos_id, pos_symbol))
+            asyncio.create_task(sqlite_manager.close_position_in_db(pos_id, pos_symbol))
         except Exception as e:
             logger.warning(f"⚠️ Failed to close position in SQLite: {e}")
         
@@ -27370,8 +27370,11 @@ class BinanceStreamer:
         self.atr_history: deque = deque(maxlen=200) # Store ATR values for VR calculation
         self.ws_connected: bool = False
         
-        # Whale Hunter
-        self.whale_detector = WhaleDetector(threshold_usd=100000.0) # $100k Threshold
+        # Whale Hunter (legacy stub — original class removed)
+        class _WhaleStub:
+            def __init__(self, **kw): pass
+            def detect(self, *a, **kw): return None
+        self.whale_detector = _WhaleStub(threshold_usd=100000.0)
         
         # SMC Analyzer (Phase 10)
         self.smc_analyzer = SmartMoneyAnalyzer()
