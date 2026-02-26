@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+import uuid
 import websockets
 from collections import deque
 from datetime import datetime, timedelta
@@ -8486,9 +8487,9 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int) -> dic
     hard_reject = False
 
     if not opportunity:
-        # No live data — execute (conservative: better fill than miss)
+        # No live data should not auto-pass entry; wait for next fresh snapshot.
         return {
-            'decision': 'PASS', 'allow_market': False, 'recheck_score': 50.0,
+            'decision': 'WARN_WAIT', 'allow_market': False, 'recheck_score': 35.0,
             'reasons': ['NO_LIVE_DATA'], 'reason_summary': 'NO_LIVE_DATA',
         }
 
@@ -24000,6 +24001,74 @@ class PaperTradingEngine:
                             blended = max(blended, locked_limit)
                     
                     existing_pending['entryPrice'] = blended
+
+                    # Keep dependent risk levels coherent after entry repricing.
+                    try:
+                        _entry_for_levels = float(existing_pending.get('entryPrice', blended))
+                        _atr_for_levels = float(existing_pending.get('atr', atr if atr > 0 else (_entry_for_levels * 0.01)))
+                        if _atr_for_levels <= 0:
+                            _atr_for_levels = _entry_for_levels * 0.01
+                        _trend_mode = bool(existing_pending.get('trend_mode', False))
+                        if _trend_mode:
+                            _tm_sl_mult = 1.33
+                            _tm_tp_mult = 1.67
+                            _tm_trail_act_mult = 1.67
+                            _tm_trail_dist_mult = 1.50
+                        else:
+                            _tm_sl_mult = 1.0
+                            _tm_tp_mult = 1.0
+                            _tm_trail_act_mult = 1.0
+                            _tm_trail_dist_mult = 1.0
+
+                        _effective_et = _clamp(
+                            float(existing_pending.get('effectiveExitTightness', self.exit_tightness)),
+                            0.3,
+                            15.0
+                        )
+                        _dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(_atr_for_levels, _entry_for_levels)
+                        _adj_sl_atr = (self.sl_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
+                        _adj_tp_atr = (self.tp_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
+                        _base_trail_activation_atr = float(existing_pending.get('dynamic_trail_activation', self.trail_activation_atr))
+                        _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
+                        _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
+                        _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
+
+                        if side == 'LONG':
+                            _sl = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_sl_atr))
+                            _tp = _entry_for_levels + (_atr_for_levels * _adj_tp_atr)
+                            _trail_activation = _entry_for_levels + (_atr_for_levels * _adj_trail_activation_atr)
+                        else:
+                            _sl = _entry_for_levels + (_atr_for_levels * _adj_sl_atr)
+                            _tp = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_tp_atr))
+                            _trail_activation = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_trail_activation_atr))
+
+                        try:
+                            _ord_spread = float(existing_pending.get('spreadPct', 0.05))
+                            _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
+                            _cost = estimate_trade_cost(_ord_spread, _ord_lev)
+                            _min_tp_distance = _entry_for_levels * (_cost['min_profitable_move'] * 3 / 100)
+                            if abs(_tp - _entry_for_levels) < _min_tp_distance:
+                                if side == 'LONG':
+                                    _tp = _entry_for_levels + _min_tp_distance
+                                else:
+                                    _tp = max(_entry_for_levels * 0.01, _entry_for_levels - _min_tp_distance)
+                        except Exception:
+                            pass
+
+                        try:
+                            _tick = get_tick_size(trade_symbol)
+                            _sl = snap_to_tick(_sl, _tick, 'down' if side == 'LONG' else 'up')
+                            _tp = snap_to_tick(_tp, _tick, 'up' if side == 'LONG' else 'down')
+                            _trail_activation = snap_to_tick(_trail_activation, _tick, 'up' if side == 'LONG' else 'down')
+                        except Exception:
+                            pass
+
+                        existing_pending['stopLoss'] = _sl
+                        existing_pending['takeProfit'] = _tp
+                        existing_pending['trailActivation'] = _trail_activation
+                        existing_pending['trailDistance'] = max(_atr_for_levels * _adj_trail_distance_atr, 1e-8)
+                    except Exception as _recalc_err:
+                        logger.debug(f"Pending reinforce level recalc error ({trade_symbol}): {_recalc_err}")
                 except Exception:
                     pass
 
@@ -24257,6 +24326,30 @@ class PaperTradingEngine:
             )
             self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL")
             return None
+
+        # Final risk gate with realized notional after all sizing/caps.
+        if portfolio_risk_service and (portfolio_risk_service.var_enabled or portfolio_risk_service.corr_enabled):
+            _risk_check_final = portfolio_risk_service.check_entry_risk(
+                self.positions,
+                self.balance,
+                trade_symbol,
+                abs(position_size_usd),
+                side
+            )
+            if _risk_check_final.get('decision') == 'HARD_REJECT':
+                self.set_execution_feedback(trade_symbol, _risk_check_final.get('reason_code', 'RISK_BLOCK_FINAL')[:40])
+                self.pipeline_metrics.setdefault('risk_var_block', 0)
+                self.pipeline_metrics.setdefault('risk_corr_block', 0)
+                if 'RISK_VAR' in _risk_check_final.get('reason_code', ''):
+                    self.pipeline_metrics['risk_var_block'] += 1
+                else:
+                    self.pipeline_metrics['risk_corr_block'] += 1
+                logger.info(
+                    f"🛡️ RISK_BLOCK_FINAL: {side} {trade_symbol} "
+                    f"{_risk_check_final.get('reason_code', 'RISK_BLOCK_FINAL')} "
+                    f"notional=${position_size_usd:.2f}"
+                )
+                return None
         
         position_size = position_size_usd / entry_price
 
@@ -24321,7 +24414,7 @@ class PaperTradingEngine:
             'min_score_high': self.min_score_high,
             'max_positions': self.max_positions,
             'strategy_mode': self.strategy_mode,
-            'market_regime': market_regime_detector.current_regime if 'market_regime_detector' in dir() or True else 'UNKNOWN',
+            'market_regime': 'UNKNOWN',
         }
         try:
             settings_snapshot['market_regime'] = market_regime_detector.current_regime
@@ -24471,7 +24564,16 @@ class PaperTradingEngine:
         # which invalidates the original signal pattern.
         # Corridor limit: max 0.8 ATR favorable move allowed before chase is declared.
         
-        signal_price = float(signal.get('price', signal.get('signalPrice', price))) if signal else price
+        if signal:
+            signal_price = float(
+                signal.get('signalPrice')
+                or signal.get('priceAtSignal')
+                or signal.get('entryAnchorPrice')
+                or signal.get('price')
+                or price
+            )
+        else:
+            signal_price = price
         
         if side == 'LONG':
             move_from_signal = price - signal_price
@@ -24488,8 +24590,9 @@ class PaperTradingEngine:
             )
             return None
 
+        _pending_id = f"PO_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}_{side}_{trade_symbol}"
         pending_order = {
-            "id": f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}",
+            "id": _pending_id,
             "symbol": trade_symbol,
             "side": side,
             "signalPrice": signal_price,
@@ -24541,7 +24644,7 @@ class PaperTradingEngine:
             "effectiveExitTightness": effective_exit_tightness,
             "trend_mode": is_trend_mode,
             "settingsSnapshot": settings_snapshot,
-            "is_canary": canary_mode.should_use_canary(f"PO_{int(datetime.now().timestamp())}_{side}_{trade_symbol}"),
+            "is_canary": canary_mode.should_use_canary(_pending_id),
             # Phase 237C: State machine fields
             "state": "CREATED" if PENDING_SM_V2_ENABLED else "LEGACY",
             "stateChangedAt": int(datetime.now().timestamp() * 1000),
@@ -24568,7 +24671,7 @@ class PaperTradingEngine:
                 symbol=trade_symbol,
                 side=side,
                 created_ts=int(datetime.now().timestamp()),
-                signal_price=signal_price if 'signal_price' in dir() else price,
+                signal_price=signal_price,
                 planned_entry_price=entry_price,
                 pullback_pct_requested=_pullback_pct_requested,
                 pullback_pct_applied=pullback_pct,
@@ -24640,7 +24743,15 @@ class PaperTradingEngine:
                     self.pipeline_metrics['fallback_on_expire'] += 1
                     self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
                     logger.info(f"🔥 MARKET FALLBACK(EXPIRE): {side} {symbol} score={signal_score} age_expired → market fill")
-                    await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                    _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                    if not _executed:
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
+                        self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+                        self.pipeline_metrics['fallback_gate_blocked'] += 1
+                        self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                        logger.info(f"🚫 MARKET FALLBACK BLOCKED(EXPIRE): {side} {symbol} | removing stale pending")
+                        self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
                     continue
                 if order in self.pending_orders:
                     self.pending_orders.remove(order)
@@ -24872,7 +24983,15 @@ class PaperTradingEngine:
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
                             logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} dropped too far → market fill")
-                            await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                            _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                            if not _executed:
+                                if order in self.pending_orders:
+                                    self.pending_orders.remove(order)
+                                self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+                                self.pipeline_metrics['fallback_gate_blocked'] += 1
+                                self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                                logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
+                                self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
@@ -24913,7 +25032,15 @@ class PaperTradingEngine:
                             self.pipeline_metrics['fallback_on_fail'] += 1
                             self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail fail, filling at market")
                             logger.info(f"🔥 MARKET FALLBACK(FAIL): {side} {symbol} score={signal_score} rose too far → market fill")
-                            await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                            _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                            if not _executed:
+                                if order in self.pending_orders:
+                                    self.pending_orders.remove(order)
+                                self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+                                self.pipeline_metrics['fallback_gate_blocked'] += 1
+                                self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                                logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
+                                self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
@@ -24932,7 +25059,15 @@ class PaperTradingEngine:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → trail timeout, filling at market")
                         logger.info(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} trail_timeout={elapsed_secs:.0f}s → market fill")
-                        await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                        _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                        if not _executed:
+                            if order in self.pending_orders:
+                                self.pending_orders.remove(order)
+                            self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+                            self.pipeline_metrics['fallback_gate_blocked'] += 1
+                            self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                            logger.info(f"🚫 MARKET FALLBACK BLOCKED(TIMEOUT): {side} {symbol} | removing pending")
+                            self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
                         continue
                     # Normal timeout
                     if order in self.pending_orders:
@@ -24962,9 +25097,11 @@ class PaperTradingEngine:
         rv = revalidate_pending_entry(order, _opp, current_time)
 
         decision = rv['decision']
+        allow_market = bool(rv.get('allow_market', False))
         order['recheckScore'] = rv['recheck_score']
         order['recheckReasons'] = rv['reasons']
         order['recheckDecision'] = decision
+        order['allowMarket'] = allow_market
         order['recheckLastAt'] = current_time
 
         if decision == 'FAIL_DROP':
@@ -24979,6 +25116,15 @@ class PaperTradingEngine:
             )
             self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'recheck_fail', current_time)
             return True  # order removed
+
+        if force_market and not allow_market:
+            self.pipeline_metrics.setdefault('recheck_market_block', 0)
+            self.pipeline_metrics['recheck_market_block'] += 1
+            logger.info(
+                f"🚫 ENTRY_RECHECK_MARKET_BLOCK: {symbol} {side} score={rv['recheck_score']:.0f} "
+                f"| {rv['reason_summary']}"
+            )
+            return False  # caller decides whether to keep/drop
 
         if decision == 'WARN_WAIT' and not force_market:
             self.pipeline_metrics.setdefault('recheck_warn', 0)
@@ -25008,19 +25154,25 @@ class PaperTradingEngine:
                 order['entryExecScore'] = escore['final']
 
                 if escore['final'] < live_binance_trader.exec_entry_score_min:
-                    live_binance_trader._exec_diag['entry_score_block'] += 1
-                    live_binance_trader._exec_diag['gate_block_total'] += 1
-                    # WAIT 30s — don't drop, signal may recover
-                    order['confirmAfter'] = max(
-                        int(order.get('confirmAfter', current_time)),
-                        current_time + 30_000
-                    )
-                    logger.info(
-                        f"\U0001f6ab ENTRY_SCORE_LOW: {side} {symbol} score={escore['final']:.3f} "
-                        f"< min={live_binance_trader.exec_entry_score_min} | sig={escore['signal']:.2f} micro={escore['micro']:.2f} risk={escore['risk']:.2f}"
-                    )
-                    self.set_execution_feedback(symbol, f"ENTRY_SCORE_LOW:{escore['final']:.3f}")
-                    return False  # order stays, wait
+                    if force_market and allow_market:
+                        logger.info(
+                            f"⚡ ENTRY_SCORE_BYPASS(force_market): {side} {symbol} score={escore['final']:.3f} "
+                            f"< min={live_binance_trader.exec_entry_score_min}"
+                        )
+                    else:
+                        live_binance_trader._exec_diag['entry_score_block'] += 1
+                        live_binance_trader._exec_diag['gate_block_total'] += 1
+                        # WAIT 30s — don't drop, signal may recover
+                        order['confirmAfter'] = max(
+                            int(order.get('confirmAfter', current_time)),
+                            current_time + 30_000
+                        )
+                        logger.info(
+                            f"\U0001f6ab ENTRY_SCORE_LOW: {side} {symbol} score={escore['final']:.3f} "
+                            f"< min={live_binance_trader.exec_entry_score_min} | sig={escore['signal']:.2f} micro={escore['micro']:.2f} risk={escore['risk']:.2f}"
+                        )
+                        self.set_execution_feedback(symbol, f"ENTRY_SCORE_LOW:{escore['final']:.3f}")
+                        return False  # order stays, wait
 
                 # ===== Drift Guard =====
                 expected_price = float(order.get('entryPrice', 0) or fill_price)
@@ -30661,7 +30813,14 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     except Exception as pt_err:
                                         logger.error(f"Paper Trading Error: {pt_err}")
                                     
-                                    manager.last_signals[symbol] = signal
+                                    try:
+                                        if 'global_paper_trader' in globals() and global_paper_trader:
+                                            global_paper_trader.last_signal_per_coin[active_symbol] = {
+                                                'side': signal.get('action', 'NONE'),
+                                                'time': datetime.now().timestamp()
+                                            }
+                                    except Exception as _sig_cache_err:
+                                        logger.debug(f"Signal cache update error: {_sig_cache_err}")
                                     logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
 
                     except Exception as e:
