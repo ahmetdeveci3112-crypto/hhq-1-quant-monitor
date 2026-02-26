@@ -21512,13 +21512,13 @@ def determine_trend_direction(
     
     # Gate logic based on ADX (trend strength) + vote consensus
     if safe_adx > 30:
-        # Strong trend: 3+ votes sufficient to block counter-trend
-        if bearish_votes >= 3:
+        # Strong trend: 4+ votes to block counter-trend (was 3, too strict for mean-reversion)
+        if bearish_votes >= 4:
             allow_long = False
-            notes.append('GATE:NO_LONG(ADX>30,3+bear)')
-        if bullish_votes >= 3:
+            notes.append('GATE:NO_LONG(ADX>30,4+bear)')
+        if bullish_votes >= 4:
             allow_short = False
-            notes.append('GATE:NO_SHORT(ADX>30,3+bull)')
+            notes.append('GATE:NO_SHORT(ADX>30,4+bull)')
     elif safe_adx > 25:
         # Moderate trend: 4+ votes needed to block
         if bearish_votes >= 4:
@@ -22374,6 +22374,7 @@ class SignalGenerator:
             else:
                 volatile_boost = int(min_score_required * 0.15)  # %15 artış (trende karşı, strict)
             min_score_required += volatile_boost
+            min_score_required = min(95, min_score_required)  # Cap: max score is 100, keep achievable
             reasons.append(f"VOL_STRICT(+{volatile_boost})")
             if score < min_score_required:
                 gap = int(min_score_required - score)
@@ -22441,6 +22442,7 @@ class SignalGenerator:
                 cost_score_bump = int((_cost_info['total_pct'] - 0.15) * 50)  # +2.5 per 0.05% extra
                 cost_score_bump = min(cost_score_bump, 10)  # Cap at +10
                 min_score_required += cost_score_bump
+                min_score_required = min(95, min_score_required)  # Final cap
                 reasons.append(f"COST_BUMP(+{cost_score_bump})")
         except Exception:
             pass
