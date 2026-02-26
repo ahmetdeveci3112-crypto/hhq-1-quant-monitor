@@ -14079,7 +14079,7 @@ async def position_price_update_loop():
                                 new_trailing = current_price - dynamic_trail_distance
                                 # Phase 231h: Clamp — trail stop never below breakeven
                                 new_trailing = max(new_trailing, be_long)
-                                if new_trailing > trailing_stop:
+                                if new_trailing > pos.get('trailingStop', 0.0):
                                     pos['trailingStop'] = new_trailing
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
@@ -14093,7 +14093,7 @@ async def position_price_update_loop():
                             if fast_should_activate or fast_trail_already_active:
                                 new_trailing = current_price + dynamic_trail_distance
                                 new_trailing = min(new_trailing, be_short)
-                                if new_trailing < trailing_stop:
+                                if new_trailing < pos.get('trailingStop', float('inf')):
                                     pos['trailingStop'] = new_trailing
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
@@ -15181,6 +15181,9 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.info(f"⚠️ MTF PENALTY: {action} {symbol} (skor: {mtf_score}) - pozisyon -%{int((1-score_modifier)*100)} küçük")
     
     # Add MTF size modifier to signal for position sizing
+    # Bug Fix #1: If MTF_SOFT_OVERRIDE was used, ensure size modifier isn't 0.0
+    if signal.get('mtf_override', False):
+        score_modifier = max(0.5, score_modifier)
     signal['mtf_size_modifier'] = score_modifier
     
     # Phase 202: Pass trend_mode and strong_trend data to signal
@@ -15331,15 +15334,16 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Execute trade
     try:
-        await global_paper_trader.open_position(
+        pos = await global_paper_trader.open_position(
             side=action,
             price=price,
             atr=atr,
             signal=signal,
             symbol=symbol
         )
-        trends = mtf_result.get('trends', {})
-        logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
+        if pos:
+            trends = mtf_result.get('trends', {})
+            logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
@@ -21792,20 +21796,18 @@ class SignalGenerator:
             
             if signal_side == "LONG" and not trend_dir['allow_long']:
                 logger.info(
-                    f"🚫 TREND_GATE: {symbol} LONG engellendi | "
-                    f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
-                    f"ADX={safe_adx_local:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
-                    f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
+                    f"⚠️ TREND_PENALTY: {symbol} LONG | trend={trend_dir['direction']} "
+                    f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
                 )
-                return None
-            if signal_side == "SHORT" and not trend_dir['allow_short']:
+                score -= 15
+                reasons.append("TREND_AGAINST(-15)")
+            elif signal_side == "SHORT" and not trend_dir['allow_short']:
                 logger.info(
-                    f"🚫 TREND_GATE: {symbol} SHORT engellendi | "
-                    f"trend={trend_dir['direction']} str={trend_dir['strength']}/5 "
-                    f"ADX={safe_adx_local:.0f} votes=[B:{trend_dir['bullish_votes']} R:{trend_dir['bearish_votes']}] "
-                    f"Z={zscore:.2f} | {','.join(trend_dir['notes'])}"
+                    f"⚠️ TREND_PENALTY: {symbol} SHORT | trend={trend_dir['direction']} "
+                    f"ADX={safe_adx_local:.0f} Z={zscore:.2f} -> -15 points"
                 )
-                return None
+                score -= 15
+                reasons.append("TREND_AGAINST(-15)")
             
             # Phase 247: Pro-trend score bonus
             if trend_dir['direction'] == 'BULLISH' and signal_side == 'LONG':
@@ -22373,8 +22375,8 @@ class SignalGenerator:
                 soft_pass_ok = (
                     VOLATILE_VETO_SOFTPASS_ENABLED
                     and gap <= VOLATILE_VETO_SOFTPASS_MAX_GAP
-                    and (is_volume_spike or volume_ratio >= 0.9)
-                    and spread_pct <= max(0.30, EQ_MAX_SPREAD + 0.05)
+                    and (is_volume_spike or volume_ratio >= 0.7)
+                    and spread_pct <= max(0.40, EQ_MAX_SPREAD + 0.10)
                 )
                 if soft_pass_ok:
                     penalty = min(8, VOLATILE_VETO_SOFTPASS_PENALTY_BASE + max(0, gap))
@@ -24212,6 +24214,14 @@ class PaperTradingEngine:
         mtf_size_modifier = signal.get('mtf_size_modifier', 1.0) if signal else 1.0
         position_size_usd = position_size_usd * mtf_size_modifier
 
+        # Bug Fix #3 & #4: Size reduction capping
+        # Calculate theoretical full base size to cap the reduction limit
+        full_size_usd = risk_amount * adjusted_leverage
+        if full_size_usd > 0:
+            min_allowed = full_size_usd * 0.4  # Max 60% reduction across all variables
+            max_allowed = full_size_usd * 1.5  # Max 50% increase
+            position_size_usd = max(min_allowed, min(max_allowed, position_size_usd))
+
         # Phase RSP: Notional size cap — max % of balance per position
         raw_size_usd = position_size_usd
         max_size_usd = self.balance * 0.15  # default: max 15% of balance
@@ -25110,7 +25120,7 @@ class PaperTradingEngine:
         # Phase 245 Component 2: TP must be at least 3× trade cost away from fill
         try:
             _ord_spread = float(order.get('spreadPct', 0.05))
-            _cost = estimate_trade_cost(_ord_spread, adjusted_leverage)
+            _cost = estimate_trade_cost(_ord_spread, order.get('leverage', 10))
             _min_tp_distance = fill_price * (_cost['min_profitable_move'] * 3 / 100)
             _current_tp_distance = abs(tp - fill_price)
             if _current_tp_distance < _min_tp_distance:
@@ -25503,7 +25513,7 @@ class PaperTradingEngine:
         
         # Save to SQLite for persistent openTime tracking
         try:
-            await db_manager.save_open_position(new_position)
+            await sqlite_manager.save_open_position(new_position)
             logger.info(f"📂 Position saved to SQLite: {symbol} openTime={new_position.get('openTime')}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
@@ -26010,7 +26020,8 @@ class PaperTradingEngine:
                     # Phase 59: Load coin performance stats from trade history
                     coin_performance_tracker.load_from_trade_history(self.trades)
                     # Phase 224B: Load EV signal filter state
-                    self.score_band_stats = data.get('score_band_stats', {})
+                    # Bug Fix #2: Start with a clean slate for score_band_stats (reset to empty)
+                    self.score_band_stats = {}
                     self.last_signal_per_coin = data.get('last_signal_per_coin', {})
                     self.signal_memory = data.get('signal_memory', {})
                     # Pipeline metrics persistence
@@ -26229,7 +26240,7 @@ class PaperTradingEngine:
         if signal.get('overrideLeverageCap'):
             cap = signal['overrideLeverageCap']
             if adjusted_leverage > cap:
-                logger.info(f"💪 OVERRIDE LEV CAP: {symbol} {adjusted_leverage}x → {cap}x")
+                logger.info(f"💪 OVERRIDE LEV CAP: {signal.get('symbol', 'UNKNOWN')} {adjusted_leverage}x → {cap}x")
                 adjusted_leverage = cap
         
         # Phase 238B: LEV_PIPE log
