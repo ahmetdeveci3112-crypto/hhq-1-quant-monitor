@@ -8489,7 +8489,7 @@ def compute_dynamic_min_pullback_pct(
 # ============================================================================
 # Phase 239V2: Pending Revalidation Gate (fill öncesi son kontrol)
 # ============================================================================
-def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int) -> dict:
+def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_market: bool = False) -> dict:
     """Revalidate pending order conditions just before execution.
 
     Returns dict with UNIFIED decision model:
@@ -8608,15 +8608,23 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int) -> dic
         reasons.append(f"AGE_STALE({age_min:.0f}m)")
 
     # ── Unified decision ──────────────────────────────────────
-    if hard_reject or score < 40:
+    if hard_reject:
         decision = 'FAIL_DROP'
-        allow_market = False
     elif score >= 65:
         decision = 'PASS'
-        allow_market = score >= 80 and order_signal_score >= 95
-    else:
+    elif score >= 40:
         decision = 'WARN_WAIT'
-        allow_market = False
+    else:
+        # Very low score should not be dropped immediately unless stale.
+        # Keep it waiting for a short period to avoid fallback starvation.
+        decision = 'FAIL_DROP' if age_min >= 30 else 'WARN_WAIT'
+
+    allow_market = (
+        not hard_reject and (
+            (score >= 70 and order_signal_score >= 85) or
+            (force_market and score >= 50 and order_signal_score >= 75)
+        )
+    )
 
     reason_summary = ', '.join(reasons[:4])
     logger.info(
@@ -8628,6 +8636,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int) -> dic
     return {
         'decision': decision,
         'allow_market': allow_market,
+        'hard_reject': hard_reject,
         'recheck_score': round(score, 1),
         'reasons': reasons,
         'reason_summary': reason_summary,
@@ -15388,7 +15397,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.warning(f"🚫 OPEN_POS_REJECT: {symbol} {action} reason={reject_reason}")
             if not signal_log_data.get('reject_reason'):
                 signal_log_data['reject_reason'] = f"OPEN_POS:{reject_reason}"
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                # Keep a single signal row in DB (accepted/rejected at signal gate).
+                # Open-position stage rejections are tracked in pipeline metrics/logs.
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
 
@@ -23908,6 +23918,127 @@ class PaperTradingEngine:
             "win_loss_ratio": round(avg_win / avg_loss if avg_loss > 0 else 0, 2),
             "kelly_fraction": round(self.calculate_kelly_fraction() * 100, 2)
         }
+
+    def _reinforce_pending_order(self, existing_pending: dict, side: str, price: float, atr: float, signal: dict, trade_symbol: str):
+        """Refresh an already-open pending order for the same symbol/side."""
+        now_ms = int(datetime.now().timestamp() * 1000)
+        old_score = int(existing_pending.get('signalScore', 0) or 0)
+        new_score = int(signal.get('confidenceScore', 0) if signal else 0)
+        score_gap = new_score - old_score
+        reinforce_count = int(existing_pending.get('reinforcedCount', 0) or 0) + 1
+
+        existing_pending['reinforcedCount'] = reinforce_count
+        existing_pending['signalScore'] = max(old_score, new_score)
+        existing_pending['lastReinforceAt'] = now_ms
+        existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
+        existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
+        existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
+
+        try:
+            new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
+            old_entry = float(existing_pending.get('entryPrice', new_entry))
+            blend_alpha = 0.35 if score_gap >= 0 else 0.20
+            blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
+
+            locked_entry_raw = float(existing_pending.get('pullbackLocked', 0))
+            locked_entry_frac = locked_entry_raw / 100.0 if locked_entry_raw > 0.50 else locked_entry_raw
+            if locked_entry_frac > 0:
+                signal_price = float(existing_pending.get('signalPrice', price))
+                if side == 'LONG':
+                    blended = min(blended, signal_price * (1 - locked_entry_frac))
+                else:
+                    blended = max(blended, signal_price * (1 + locked_entry_frac))
+
+            existing_pending['entryPrice'] = blended
+
+            try:
+                _entry_for_levels = float(existing_pending.get('entryPrice', blended))
+                _atr_for_levels = float(existing_pending.get('atr', atr if atr > 0 else (_entry_for_levels * 0.01)))
+                if _atr_for_levels <= 0:
+                    _atr_for_levels = _entry_for_levels * 0.01
+                _trend_mode = bool(existing_pending.get('trend_mode', False))
+                if _trend_mode:
+                    _tm_sl_mult = 1.33
+                    _tm_tp_mult = 1.67
+                    _tm_trail_act_mult = 1.67
+                    _tm_trail_dist_mult = 1.50
+                else:
+                    _tm_sl_mult = 1.0
+                    _tm_tp_mult = 1.0
+                    _tm_trail_act_mult = 1.0
+                    _tm_trail_dist_mult = 1.0
+
+                _effective_et = _clamp(
+                    float(existing_pending.get('effectiveExitTightness', self.exit_tightness)),
+                    0.3,
+                    15.0
+                )
+                _dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(_atr_for_levels, _entry_for_levels)
+                _adj_sl_atr = (self.sl_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
+                _adj_tp_atr = (self.tp_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
+                _base_trail_activation_atr = float(existing_pending.get('dynamic_trail_activation', self.trail_activation_atr))
+                _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
+                _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
+                _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
+
+                if side == 'LONG':
+                    _sl = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_sl_atr))
+                    _tp = _entry_for_levels + (_atr_for_levels * _adj_tp_atr)
+                    _trail_activation = _entry_for_levels + (_atr_for_levels * _adj_trail_activation_atr)
+                else:
+                    _sl = _entry_for_levels + (_atr_for_levels * _adj_sl_atr)
+                    _tp = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_tp_atr))
+                    _trail_activation = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_trail_activation_atr))
+
+                try:
+                    _ord_spread = float(existing_pending.get('spreadPct', 0.05))
+                    _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
+                    _cost = estimate_trade_cost(_ord_spread, _ord_lev)
+                    _min_tp_distance = _entry_for_levels * (_cost['min_profitable_move'] * 3 / 100)
+                    if abs(_tp - _entry_for_levels) < _min_tp_distance:
+                        if side == 'LONG':
+                            _tp = _entry_for_levels + _min_tp_distance
+                        else:
+                            _tp = max(_entry_for_levels * 0.01, _entry_for_levels - _min_tp_distance)
+                except Exception:
+                    pass
+
+                try:
+                    _tick = get_tick_size(trade_symbol)
+                    _sl = snap_to_tick(_sl, _tick, 'down' if side == 'LONG' else 'up')
+                    _tp = snap_to_tick(_tp, _tick, 'up' if side == 'LONG' else 'down')
+                    _trail_activation = snap_to_tick(_trail_activation, _tick, 'up' if side == 'LONG' else 'down')
+                except Exception:
+                    pass
+
+                existing_pending['stopLoss'] = _sl
+                existing_pending['takeProfit'] = _tp
+                existing_pending['trailActivation'] = _trail_activation
+                existing_pending['trailDistance'] = max(_atr_for_levels * _adj_trail_distance_atr, 1e-8)
+            except Exception as _recalc_err:
+                logger.debug(f"Pending reinforce level recalc error ({trade_symbol}): {_recalc_err}")
+        except Exception:
+            pass
+
+        extend_sec = max(180, int(signal.get('memoryExtensionSec', 0) if signal else 0))
+        existing_pending['expiresAt'] = max(
+            int(existing_pending.get('expiresAt', now_ms)),
+            now_ms + (extend_sec * 1000)
+        )
+        confirm_after = int(existing_pending.get('confirmAfter', now_ms))
+        if confirm_after > now_ms:
+            remaining = confirm_after - now_ms
+            speedup = 0.80 if reinforce_count <= 1 else 0.65
+            existing_pending['confirmAfter'] = now_ms + int(remaining * speedup)
+
+        self.pipeline_metrics.setdefault('pending_reinforced', 0)
+        self.pipeline_metrics['pending_reinforced'] += 1
+        self.set_execution_feedback(trade_symbol, f"PENDING_REINFORCED({reinforce_count})")
+        logger.info(
+            f"🔁 PENDING REINFORCE: {trade_symbol} {side} score {old_score}->{existing_pending['signalScore']} "
+            f"reinforce={reinforce_count} entry={existing_pending.get('entryPrice', 0):.6f}"
+        )
+        return existing_pending
     
     # =========================================================================
     # ASYNC OPEN_POSITION FOR AUTO-TRADING
@@ -23924,17 +24055,36 @@ class PaperTradingEngine:
             signal: Signal dict with optional parameters
             symbol: Symbol to trade (defaults to self.symbol)
         """
+        # Use provided symbol or default
+        trade_symbol = symbol if symbol else self.symbol
+
         if not self.enabled:
+            self.set_execution_feedback(trade_symbol, "AUTO_DISABLED")
             self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
             return None
         
         # Phase 191: Paper pozisyon açmayı engelle — sadece live
         if not live_binance_trader.enabled:
-            logger.debug(f"📄 Paper trade skipped: {side} {symbol if symbol else self.symbol} (live only mode)")
+            self.set_execution_feedback(trade_symbol, "LIVE_DISABLED")
+            logger.debug(f"📄 Paper trade skipped: {side} {trade_symbol} (live only mode)")
             return None
-        
-        # Use provided symbol or default
-        trade_symbol = symbol if symbol else self.symbol
+
+        # Handle existing pending for this symbol before exposure/direction gates.
+        existing_pending = next((p for p in self.pending_orders if p.get('symbol') == trade_symbol), None)
+        if existing_pending:
+            existing_side = existing_pending.get('side')
+            if existing_side == side:
+                return self._reinforce_pending_order(existing_pending, side, price, atr, signal, trade_symbol)
+            try:
+                self.pending_orders.remove(existing_pending)
+                self.pipeline_metrics.setdefault('pending_flipped', 0)
+                self.pipeline_metrics['pending_flipped'] += 1
+                logger.info(
+                    f"🔀 PENDING CANCEL: {trade_symbol} {existing_side}->{side} "
+                    f"(Opposite direction signal overrides)"
+                )
+            except Exception:
+                pass
         
         # BLACKLIST CHECK: Skip coins that consistently cause losses
         if self.is_coin_blacklisted(trade_symbol):
@@ -24028,152 +24178,8 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Scale-in limit reached for {trade_symbol} {side}")
             return None  # Silently skip scale-in limit
         
-        # Check for existing pending order for same symbol
-        existing_pending = next((p for p in self.pending_orders if p.get('symbol') == trade_symbol), None)
-        if existing_pending:
-            now_ms = int(datetime.now().timestamp() * 1000)
-            existing_side = existing_pending.get('side')
-            new_score = int(signal.get('confidenceScore', 0) if signal else 0)
-            old_score = int(existing_pending.get('signalScore', 0) or 0)
-            score_gap = new_score - old_score
-
-            if existing_side == side:
-                # Same direction: reinforce pending instead of dropping new signal.
-                reinforce_count = int(existing_pending.get('reinforcedCount', 0) or 0) + 1
-                existing_pending['reinforcedCount'] = reinforce_count
-                existing_pending['signalScore'] = max(old_score, new_score)
-                existing_pending['lastReinforceAt'] = now_ms
-                existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
-                existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
-                existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
-
-                # Blend entry with latest signal entry (small shift to avoid hard jumps).
-                # Phase 239 fix: guard with pullbackLocked so entry never drifts past locked boundary.
-                try:
-                    new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
-                    old_entry = float(existing_pending.get('entryPrice', new_entry))
-                    blend_alpha = 0.35 if score_gap >= 0 else 0.20
-                    blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
-                    
-                    # Clamp: blended entry must not exceed locked pullback entry
-                    locked_entry_raw = float(existing_pending.get('pullbackLocked', 0))
-                    # Phase 262: Standardize unit parsing (internal fraction vs UI percentage)
-                    # Anything > 0.50 (i.e. 50%) is considered legacy percentage 
-                    locked_entry_frac = locked_entry_raw / 100.0 if locked_entry_raw > 0.50 else locked_entry_raw
-                    
-                    if locked_entry_frac > 0:
-                        signal_price = float(existing_pending.get('signalPrice', price))
-                        if side == 'LONG':
-                            # LONG: locked entry = signalPrice * (1 - fraction)
-                            locked_limit = signal_price * (1 - locked_entry_frac)
-                            blended = min(blended, locked_limit)
-                        else:
-                            # SHORT: locked entry = signalPrice * (1 + fraction)
-                            locked_limit = signal_price * (1 + locked_entry_frac)
-                            blended = max(blended, locked_limit)
-                    
-                    existing_pending['entryPrice'] = blended
-
-                    # Keep dependent risk levels coherent after entry repricing.
-                    try:
-                        _entry_for_levels = float(existing_pending.get('entryPrice', blended))
-                        _atr_for_levels = float(existing_pending.get('atr', atr if atr > 0 else (_entry_for_levels * 0.01)))
-                        if _atr_for_levels <= 0:
-                            _atr_for_levels = _entry_for_levels * 0.01
-                        _trend_mode = bool(existing_pending.get('trend_mode', False))
-                        if _trend_mode:
-                            _tm_sl_mult = 1.33
-                            _tm_tp_mult = 1.67
-                            _tm_trail_act_mult = 1.67
-                            _tm_trail_dist_mult = 1.50
-                        else:
-                            _tm_sl_mult = 1.0
-                            _tm_tp_mult = 1.0
-                            _tm_trail_act_mult = 1.0
-                            _tm_trail_dist_mult = 1.0
-
-                        _effective_et = _clamp(
-                            float(existing_pending.get('effectiveExitTightness', self.exit_tightness)),
-                            0.3,
-                            15.0
-                        )
-                        _dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(_atr_for_levels, _entry_for_levels)
-                        _adj_sl_atr = (self.sl_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
-                        _adj_tp_atr = (self.tp_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
-                        _base_trail_activation_atr = float(existing_pending.get('dynamic_trail_activation', self.trail_activation_atr))
-                        _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
-                        _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
-                        _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
-
-                        if side == 'LONG':
-                            _sl = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_sl_atr))
-                            _tp = _entry_for_levels + (_atr_for_levels * _adj_tp_atr)
-                            _trail_activation = _entry_for_levels + (_atr_for_levels * _adj_trail_activation_atr)
-                        else:
-                            _sl = _entry_for_levels + (_atr_for_levels * _adj_sl_atr)
-                            _tp = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_tp_atr))
-                            _trail_activation = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_trail_activation_atr))
-
-                        try:
-                            _ord_spread = float(existing_pending.get('spreadPct', 0.05))
-                            _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
-                            _cost = estimate_trade_cost(_ord_spread, _ord_lev)
-                            _min_tp_distance = _entry_for_levels * (_cost['min_profitable_move'] * 3 / 100)
-                            if abs(_tp - _entry_for_levels) < _min_tp_distance:
-                                if side == 'LONG':
-                                    _tp = _entry_for_levels + _min_tp_distance
-                                else:
-                                    _tp = max(_entry_for_levels * 0.01, _entry_for_levels - _min_tp_distance)
-                        except Exception:
-                            pass
-
-                        try:
-                            _tick = get_tick_size(trade_symbol)
-                            _sl = snap_to_tick(_sl, _tick, 'down' if side == 'LONG' else 'up')
-                            _tp = snap_to_tick(_tp, _tick, 'up' if side == 'LONG' else 'down')
-                            _trail_activation = snap_to_tick(_trail_activation, _tick, 'up' if side == 'LONG' else 'down')
-                        except Exception:
-                            pass
-
-                        existing_pending['stopLoss'] = _sl
-                        existing_pending['takeProfit'] = _tp
-                        existing_pending['trailActivation'] = _trail_activation
-                        existing_pending['trailDistance'] = max(_atr_for_levels * _adj_trail_distance_atr, 1e-8)
-                    except Exception as _recalc_err:
-                        logger.debug(f"Pending reinforce level recalc error ({trade_symbol}): {_recalc_err}")
-                except Exception:
-                    pass
-
-                # Extend lifetime + speed up confirmation when reinforcement is strong.
-                extend_sec = max(
-                    180,
-                    int(signal.get('memoryExtensionSec', 0) if signal else 0)
-                )
-                existing_pending['expiresAt'] = max(
-                    int(existing_pending.get('expiresAt', now_ms)),
-                    now_ms + (extend_sec * 1000)
-                )
-                confirm_after = int(existing_pending.get('confirmAfter', now_ms))
-                if confirm_after > now_ms:
-                    remaining = confirm_after - now_ms
-                    speedup = 0.80 if reinforce_count <= 1 else 0.65
-                    existing_pending['confirmAfter'] = now_ms + int(remaining * speedup)
-
-                self.pipeline_metrics['pending_reinforced'] += 1
-                self.set_execution_feedback(trade_symbol, f"PENDING_REINFORCED({reinforce_count})")
-                logger.info(
-                    f"🔁 PENDING REINFORCE: {trade_symbol} {side} score {old_score}->{existing_pending['signalScore']} "
-                    f"reinforce={reinforce_count} entry={existing_pending.get('entryPrice', 0):.6f}"
-                )
-                return existing_pending
-
-            # Phase 262: Enforce order-level cancellation for opposite pending side signals
-            self.pending_orders.remove(existing_pending)
-            self.pipeline_metrics['pending_flipped'] += 1
-            logger.info(
-                f"🔀 PENDING CANCEL: {trade_symbol} {existing_side}->{side} "
-                f"(Opposite direction signal overrides)"
-            )
+        # Existing pending lifecycle (reinforce/cancel) is handled at function entry
+        # before capacity/direction gates to avoid pending-backlog deadlocks.
         # Check if we already have opposite position in same coin (hedging check)
         same_coin_opposite = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') != side]
         if same_coin_opposite and not self.allow_hedging:
@@ -24392,12 +24398,23 @@ class PaperTradingEngine:
         _fee_floor_usd = _fee_rate_rt * position_size_usd  # fee at this size
         _dynamic_min_notional = max(5.0, _fee_floor_usd / _expected_edge_pct if _expected_edge_pct > 0 else 5.0)
         if position_size_usd < _dynamic_min_notional:
-            logger.info(
-                f"🚫 MIN_NOTIONAL: {trade_symbol} {side} size=${position_size_usd:.2f} "
-                f"< min=${_dynamic_min_notional:.2f} (fee=${_fee_floor_usd:.4f} edge={_expected_edge_pct:.4f})"
-            )
-            self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL")
-            return None
+            # If sizing is slightly below floor, upscale to minimum notional when safe.
+            # This reduces avoidable rejects during low-balance/high-fragmentation regimes.
+            if _dynamic_min_notional <= max_size_usd and _dynamic_min_notional <= (self.balance * 0.20):
+                old_size = position_size_usd
+                position_size_usd = _dynamic_min_notional
+                reasons.append(f"MIN_NOTIONAL_UPSIZE({old_size:.2f}->{position_size_usd:.2f})")
+                logger.info(
+                    f"🛠️ MIN_NOTIONAL_UPSIZE: {trade_symbol} {side} ${old_size:.2f} -> "
+                    f"${position_size_usd:.2f} (min={_dynamic_min_notional:.2f})"
+                )
+            else:
+                logger.info(
+                    f"🚫 MIN_NOTIONAL: {trade_symbol} {side} size=${position_size_usd:.2f} "
+                    f"< min=${_dynamic_min_notional:.2f} (fee=${_fee_floor_usd:.4f} edge={_expected_edge_pct:.4f})"
+                )
+                self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL")
+                return None
 
         # Final risk gate with realized notional after all sizing/caps.
         if portfolio_risk_service and (portfolio_risk_service.var_enabled or portfolio_risk_service.corr_enabled):
@@ -25171,7 +25188,7 @@ class PaperTradingEngine:
         symbol = order.get('symbol', '')
         side = order.get('side', '')
         _opp = next((o for o in opportunities if o.get('symbol') == symbol), None)
-        rv = revalidate_pending_entry(order, _opp, current_time)
+        rv = revalidate_pending_entry(order, _opp, current_time, force_market=force_market)
 
         decision = rv['decision']
         allow_market = bool(rv.get('allow_market', False))
@@ -25182,17 +25199,25 @@ class PaperTradingEngine:
         order['recheckLastAt'] = current_time
 
         if decision == 'FAIL_DROP':
-            if order in self.pending_orders:
-                self.pending_orders.remove(order)
-            self.pipeline_metrics.setdefault('recheck_fail', 0)
-            self.pipeline_metrics['recheck_fail'] += 1
-            self.set_execution_feedback(symbol, "ENTRY_RECHECK_FAIL")
-            self.add_log(
-                f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
-                f"| {rv['reason_summary']}"
-            )
-            self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'recheck_fail', current_time)
-            return True  # order removed
+            # If fallback is explicitly requested and gate still allows market,
+            # do not drop pending immediately.
+            if force_market and allow_market and not rv.get('hard_reject', False):
+                logger.info(
+                    f"⚡ ENTRY_RECHECK_FORCE_PASS: {symbol} {side} score={rv['recheck_score']:.0f} "
+                    f"| {rv['reason_summary']}"
+                )
+            else:
+                if order in self.pending_orders:
+                    self.pending_orders.remove(order)
+                self.pipeline_metrics.setdefault('recheck_fail', 0)
+                self.pipeline_metrics['recheck_fail'] += 1
+                self.set_execution_feedback(symbol, "ENTRY_RECHECK_FAIL")
+                self.add_log(
+                    f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
+                    f"| {rv['reason_summary']}"
+                )
+                self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'recheck_fail', current_time)
+                return True  # order removed
 
         if force_market and not allow_market:
             self.pipeline_metrics.setdefault('recheck_market_block', 0)
