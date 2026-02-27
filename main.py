@@ -3041,8 +3041,14 @@ class LiveBinanceTrader:
             'reason': reason,
         }
 
-    def _check_pre_trade_drift(self, expected_price, current_mid):
+    def _check_pre_trade_drift(self, expected_price, current_mid, *, info_only: bool = False):
         """Check price drift between signal and current mid.
+        
+        Args:
+            info_only: If True, only compute drift — do NOT increment
+                       drift_block counter.  Used for diagnostic logging
+                       in execute_pending_order where blocking already
+                       happened upstream in _gate_and_execute.
         
         Returns (drift_bps: float, blocked: bool, reason: str).
         """
@@ -3051,7 +3057,7 @@ class LiveBinanceTrader:
         drift_bps = abs(current_mid - expected_price) / expected_price * 10000.0
         blocked = drift_bps > self.exec_max_drift_bps
         reason = 'BLOCK_OPEN_DRIFT' if blocked else 'drift_ok'
-        if blocked:
+        if blocked and not info_only:
             self._exec_diag['drift_block'] += 1
         return round(drift_bps, 2), blocked, reason
 
@@ -14480,7 +14486,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Phase 219: USDT-based directional exposure limit — early reject
     # Apply only when there is at least one live position in the same direction.
     # Pending exposure is down-weighted to avoid pending-backlog deadlock.
-    MAX_DIRECTION_EXPOSURE_PCT = 0.40
+    # P1-FIX: Use centralized env config (same as open_position gate)
+    _DIRECTION_EXPOSURE_PCT = float(os.environ.get('DIRECTION_EXPOSURE_PCT', '0.70'))
     PENDING_EXPOSURE_WEIGHT = 0.35
     signal_side = 'LONG' if action in ('BUY', 'LONG') else 'SHORT'
     same_dir_positions = [p for p in global_paper_trader.positions if p.get('side') == signal_side]
@@ -14494,12 +14501,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in same_dir_pending
         )
-        max_dir_exposure = global_paper_trader.balance * MAX_DIRECTION_EXPOSURE_PCT
+        max_dir_exposure = global_paper_trader.balance * _DIRECTION_EXPOSURE_PCT
         if same_dir_margin >= max_dir_exposure:
             signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
             safe_create_task(sqlite_manager.save_signal(signal_log_data))
             reject_feedback("DIRECTION_EXPOSURE")
-            logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
+            logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
             return
     
     # Check blacklist
@@ -24129,9 +24136,9 @@ class PaperTradingEngine:
             )
             return None
 
-        # USDT-based directional exposure limit — max %40 of balance per direction.
-        # Pending-only states must also be guarded (previously bypassed).
-        MAX_DIRECTION_EXPOSURE_PCT = 0.70  # 70% of wallet balance per direction (was 40%, too strict for small balances)
+        # USDT-based directional exposure limit per direction.
+        # P1-FIX: Use centralized env config (same as signal pipeline gate)
+        _DIRECTION_EXPOSURE_PCT = float(os.environ.get('DIRECTION_EXPOSURE_PCT', '0.70'))
         same_dir_margin = sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in self.positions if p.get('side') == side
@@ -24140,10 +24147,10 @@ class PaperTradingEngine:
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in self.pending_orders if p.get('side') == side
         )
-        max_dir_exposure = self.balance * MAX_DIRECTION_EXPOSURE_PCT
+        max_dir_exposure = self.balance * _DIRECTION_EXPOSURE_PCT
         if same_dir_margin >= max_dir_exposure:
             self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
-            logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({MAX_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
+            logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
             return None
         
         # =========================================================================
@@ -24477,15 +24484,20 @@ class PaperTradingEngine:
             base_wait_min += 2
         
         signal_confirmation_delay_seconds = base_wait_min * 60
+        _confirm_base_sec = signal_confirmation_delay_seconds  # P3: telemetry
         
         # Phase 224D: Regime-based confirmation multiplier
         try:
             regime_profile = market_regime_manager.get_profile()
             confirm_mult = regime_profile.get('confirmation_mult', 1.0)
             signal_confirmation_delay_seconds = int(signal_confirmation_delay_seconds * confirm_mult)
-            signal_confirmation_delay_seconds = max(60, min(600, signal_confirmation_delay_seconds))  # 1-10dk cap
+            # P3-FIX: Halved clamp range to match halved base times (was 60..600)
+            _confirm_clamp_min = int(os.environ.get('CONFIRM_DELAY_MIN_SEC', '30'))
+            _confirm_clamp_max = int(os.environ.get('CONFIRM_DELAY_MAX_SEC', '300'))
+            signal_confirmation_delay_seconds = max(_confirm_clamp_min, min(_confirm_clamp_max, signal_confirmation_delay_seconds))
         except Exception:
             pass
+        _confirm_after_regime_sec = signal_confirmation_delay_seconds  # P3: telemetry
 
         reinforce_count = int(signal.get('signalReinforceCount', 0) if signal else 0)
         if reinforce_count >= 2:
@@ -24751,6 +24763,11 @@ class PaperTradingEngine:
         self.clear_execution_feedback(trade_symbol)
         self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
+        # P3: Confirmation delay telemetry — 3-step breakdown for observability
+        try:
+            logger.info(f"⏱️ CONFIRM_DELAY: {trade_symbol} base={_confirm_base_sec}s regime={_confirm_after_regime_sec}s final={signal_confirmation_delay_seconds}s")
+        except NameError:
+            pass  # telemetry vars not set if regime check was skipped
         
         # Phase 266: Save entry forecast event to DB
         try:
@@ -25609,7 +25626,7 @@ class PaperTradingEngine:
                         current_mid = pre_bbo['mid'] if pre_bbo.get('valid') and pre_bbo.get('mid', 0) > 0 else fill_price
                     except NameError:
                         current_mid = fill_price
-                    drift_bps, _, _ = live_binance_trader._check_pre_trade_drift(signal_price, current_mid)
+                    drift_bps, _, _ = live_binance_trader._check_pre_trade_drift(signal_price, current_mid, info_only=True)
                     if drift_bps > live_binance_trader.exec_max_drift_bps:
                         logger.info(f"⚠️ DRIFT_INFO(exec): {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps (not blocking, checked in gate)")
                 except Exception as drift_err:
