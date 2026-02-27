@@ -2017,7 +2017,7 @@ class LiveBinanceTrader:
         # Key: symbol, Value: {isActive: bool, trailingStop: float, peakPrice: float}
         self.trailing_state = {}
         # Phase BBO: Execution BBO config (env-overridable)
-        self.bbo_max_age_ms = int(os.environ.get('EXEC_BBO_MAX_AGE_MS', '1500'))
+        self.bbo_max_age_ms = int(os.environ.get('EXEC_BBO_MAX_AGE_MS', '3000'))
         self.bbo_retries = int(os.environ.get('EXEC_BBO_RETRIES', '3'))
         self.bbo_retry_delay_ms = int(os.environ.get('EXEC_BBO_RETRY_DELAY_MS', '120'))
         # NOTE: block_entry_on_invalid_bbo + allow_close_with_invalid_bbo removed
@@ -2027,13 +2027,13 @@ class LiveBinanceTrader:
         self._bbo_cache_ttl_ms = int(os.environ.get('EXEC_BBO_CACHE_TTL_MS', '400'))
         self._http_session = None  # Reused aiohttp.ClientSession
         # Execution gate config
-        self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '8.0'))
-        self.exec_min_top_book_usdt = float(os.environ.get('EXEC_MIN_TOP_BOOK_NOTIONAL_USDT', '200.0'))
-        self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.55'))
-        self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.35'))
-        self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.45'))
+        self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '15.0'))
+        self.exec_min_top_book_usdt = float(os.environ.get('EXEC_MIN_TOP_BOOK_NOTIONAL_USDT', '100.0'))
+        self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.40'))
+        self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.25'))
+        self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.55'))
         self.exec_risk_weight = float(os.environ.get('EXEC_RISK_WEIGHT', '0.20'))
-        self.exec_max_drift_bps = float(os.environ.get('EXEC_MAX_DRIFT_BPS', '15.0'))
+        self.exec_max_drift_bps = float(os.environ.get('EXEC_MAX_DRIFT_BPS', '25.0'))
         self.exec_force_market_drift_hard = os.environ.get('EXEC_FORCE_MARKET_DRIFT_HARD_BLOCK', 'true').lower() == 'true'
         # Diagnostic counters (reason-classified)
         self._exec_diag = {
@@ -3007,7 +3007,7 @@ class LiveBinanceTrader:
         Returns dict: final, signal, micro, risk, reason.
         """
         # Signal component: 0-150 range → 0-1
-        sig = max(0.0, min(1.0, float(signal_score_raw or 0) / 150.0))
+        sig = max(0.0, min(1.0, float(signal_score_raw or 0) / 120.0))
 
         # Micro component
         spread_bps = bbo_result.get('spread_bps')
@@ -24131,7 +24131,7 @@ class PaperTradingEngine:
 
         # USDT-based directional exposure limit — max %40 of balance per direction.
         # Pending-only states must also be guarded (previously bypassed).
-        MAX_DIRECTION_EXPOSURE_PCT = 0.40  # 40% of wallet balance per direction
+        MAX_DIRECTION_EXPOSURE_PCT = 0.70  # 70% of wallet balance per direction (was 40%, too strict for small balances)
         same_dir_margin = sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in self.positions if p.get('side') == side
@@ -24456,25 +24456,25 @@ class PaperTradingEngine:
         atr_pct_confirm = (atr / price * 100) if price > 0 else 2.0
         conf_score = signal.get('confidenceScore', 0) if signal else 0
         
-        # Base wait: ATR-based
+        # Base wait: ATR-based (halved from original 2/4/6 to reduce total pipeline delay)
         if atr_pct_confirm > 5.0:
-            base_wait_min = 2       # Yüksek volatilite → kısa bekle
+            base_wait_min = 1       # Yüksek volatilite → çok kısa bekle
         elif atr_pct_confirm > 2.0:
-            base_wait_min = 4       # Normal
+            base_wait_min = 2       # Normal
         else:
-            base_wait_min = 6       # Düşük volatilite → uzun bekle
+            base_wait_min = 3       # Düşük volatilite → kısa bekle
         
         # Score adjustment: yüksek skor → daha az bekleme
         if conf_score >= 85:
             base_wait_min = max(1, base_wait_min - 2)
         elif conf_score >= 70:
-            base_wait_min = max(2, base_wait_min - 1)
+            base_wait_min = max(1, base_wait_min - 1)
         
-        # Spread adjustment: yüksek spread → daha uzun bekle
+        # Spread adjustment: yüksek spread → daha uzun bekle (halved)
         if spread_level in ('High', 'Very High'):
-            base_wait_min += 2
+            base_wait_min += 1
         elif spread_level in ('Extreme', 'Ultra'):
-            base_wait_min += 4
+            base_wait_min += 2
         
         signal_confirmation_delay_seconds = base_wait_min * 60
         
@@ -24669,7 +24669,7 @@ class PaperTradingEngine:
         else:
             move_from_signal = signal_price - price
             
-        max_corridor_move = atr * 0.8  # Max 0.8 ATR favorable move
+        max_corridor_move = atr * 1.5  # Max 1.5 ATR favorable move (was 0.8, too tight for momentum)
         
         if move_from_signal > max_corridor_move:
             self.set_execution_feedback(trade_symbol, "ENTRY_CORRIDOR_EXCEEDED")
@@ -25599,24 +25599,19 @@ class PaperTradingEngine:
                     logger.debug(f"Pre-trade BBO check error: {sf_err}")
                     # Continue with entry if BBO check fails entirely
                 
-                # ===== Pre-Entry Price Drift Check via _check_pre_trade_drift =====
+                # ===== Pre-Entry Price Drift Check — REMOVED DUPLICATE =====
+                # Drift is already checked in _gate_and_execute() before reaching here.
+                # Double-checking caused valid trades to be blocked when price moved
+                # between the two checks. Now only logging for diagnostics.
                 try:
                     signal_price = order.get('signalPrice', 0)
                     try:
                         current_mid = pre_bbo['mid'] if pre_bbo.get('valid') and pre_bbo.get('mid', 0) > 0 else fill_price
                     except NameError:
                         current_mid = fill_price
-                    drift_bps, drift_blocked, drift_reason = live_binance_trader._check_pre_trade_drift(signal_price, current_mid)
-                    if drift_blocked:
-                        live_binance_trader._exec_diag['gate_block_total'] += 1
-                        logger.warning(f"🚫 BLOCK_OPEN_DRIFT: {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps")
-                        self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} drift {drift_bps:.0f}bps")
-                        self.pipeline_metrics['drift_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps")
-                        _requeue_pending(30_000, f"drift_block:{drift_bps:.1f}bps")
-                        return
-                    elif drift_bps > 0:
-                        logger.debug(f"✅ DRIFT_CHECK: {symbol} drift={drift_bps:.1f}bps OK")
+                    drift_bps, _, _ = live_binance_trader._check_pre_trade_drift(signal_price, current_mid)
+                    if drift_bps > live_binance_trader.exec_max_drift_bps:
+                        logger.info(f"⚠️ DRIFT_INFO(exec): {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps (not blocking, checked in gate)")
                 except Exception as drift_err:
                     logger.debug(f"Price drift check error: {drift_err}")
                 
@@ -25635,7 +25630,7 @@ class PaperTradingEngine:
                     self.pipeline_metrics['order_success'] += 1
                     # ===== Phase 201: Post-Fill Max Slippage Rejection =====
                     fill_slippage = abs(result.get('slippage_pct', 0))
-                    MAX_FILL_SLIPPAGE_PCT = 0.5  # Max 0.5% fill slippage
+                    MAX_FILL_SLIPPAGE_PCT = 1.5  # Max 1.5% fill slippage (was 0.5%, closing at 0.5% caused guaranteed loss)
                     if fill_slippage > MAX_FILL_SLIPPAGE_PCT:
                         logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} fill slippage {fill_slippage:.3f}% > max {MAX_FILL_SLIPPAGE_PCT}% — CLOSING immediately")
                         self.add_log(f"🚫 SLIPPAGE REJECT: {symbol} closed (fill slip {fill_slippage:.2f}%)")
