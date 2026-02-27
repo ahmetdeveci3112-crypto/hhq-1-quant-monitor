@@ -3815,6 +3815,12 @@ class LiveBinanceTrader:
     # Phase 270: POST-CLOSE CONDITIONAL ORDER CLEANUP
     # Deterministic cleanup of reduceOnly stop/TP orders after position close.
     # ================================================================
+    @staticmethod
+    def _order_is_reduce_only(order: dict) -> bool:
+        """Strict reduceOnly parse for CCXT + Binance raw fields."""
+        raw_reduce = order.get('reduceOnly')
+        info_reduce = (order.get('info') or {}).get('reduceOnly')
+        return (raw_reduce is True) or (str(info_reduce).strip().lower() == 'true')
     
     async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
         """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
@@ -3847,9 +3853,7 @@ class LiveBinanceTrader:
                 if alt_type in conditional_types:
                     order_type = alt_type
             # Phase 270 P1 fix: Strict reduceOnly parse — string 'false' must not be truthy
-            raw_reduce = order.get('reduceOnly')
-            info_reduce = order.get('info', {}).get('reduceOnly')
-            is_reduce = (raw_reduce is True) or (str(info_reduce).lower() == 'true')
+            is_reduce = self._order_is_reduce_only(order)
             
             if not is_reduce:
                 continue  # Never cancel entry orders
@@ -5228,7 +5232,7 @@ async def binance_position_sync_loop():
                     engine_symbols = {p.get('symbol') for p in global_paper_trader.positions}
                     orphan_cancelled = 0
                     for o in open_orders:
-                        is_reduce = o.get('reduceOnly') or (o.get('info', {}).get('reduceOnly') == 'true')
+                        is_reduce = live_binance_trader._order_is_reduce_only(o)
                         if is_reduce:
                             # Normalize symbol: CCXT uses "SOL/USDT:USDT" format
                             raw_sym = o.get('symbol', '')
@@ -14163,12 +14167,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 cancelled = 0
                 for o in open_orders:
                     try:
-                        raw_reduce = o.get('reduceOnly')
-                        info_reduce = o.get('info', {}).get('reduceOnly')
-                        is_reduce = (
-                            (raw_reduce is True)
-                            or (str(info_reduce).strip().lower() == 'true')
-                        )
+                        is_reduce = live_binance_trader._order_is_reduce_only(o)
                         status = (o.get('status') or '').lower()
                         if status not in ('open', 'new'):
                             continue
@@ -14470,18 +14469,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         return
     
     # Phase 219: USDT-based directional exposure limit — early reject
-    # Only apply when there are already positions in the same direction.
-    # With 0 same-direction positions there is no directional overexposure risk.
+    # Apply only when there is at least one live position in the same direction.
+    # Pending exposure is down-weighted to avoid pending-backlog deadlock.
     MAX_DIRECTION_EXPOSURE_PCT = 0.40
+    PENDING_EXPOSURE_WEIGHT = 0.35
     signal_side = 'LONG' if action in ('BUY', 'LONG') else 'SHORT'
     same_dir_positions = [p for p in global_paper_trader.positions if p.get('side') == signal_side]
     same_dir_pending = [p for p in global_paper_trader.pending_orders if p.get('side') == signal_side]
-    if len(same_dir_positions) + len(same_dir_pending) > 0:
+    if len(same_dir_positions) > 0:
         same_dir_margin = sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in same_dir_positions
         )
-        same_dir_margin += sum(
+        same_dir_margin += PENDING_EXPOSURE_WEIGHT * sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in same_dir_pending
         )
@@ -23942,26 +23942,41 @@ class PaperTradingEngine:
             logger.debug(f"Skipping {trade_symbol} - blacklisted")
             return None
         
-        # Check position + pending order limits
-        total_exposure = len(self.positions) + len(self.pending_orders)
-        if total_exposure >= self.max_positions:
+        # Check position + pending order limits (pending down-weighted to avoid deadlock).
+        pending_weight = 0.35
+        pos_count = len(self.positions)
+        pending_count = len(self.pending_orders)
+        effective_exposure = pos_count + int(pending_count * pending_weight)
+        if effective_exposure >= self.max_positions:
             self.set_execution_feedback(trade_symbol, "MAX_EXPOSURE")
-            logger.info(f"🚫 OPEN_POS SKIP: Max exposure reached ({total_exposure}/{self.max_positions})")
+            logger.info(
+                f"🚫 OPEN_POS SKIP: Max exposure reached "
+                f"(effective={effective_exposure}/{self.max_positions}, "
+                f"positions={pos_count}, pending={pending_count}, pending_w={pending_weight:.2f})"
+            )
             return None  # Silently skip to avoid log spam
         
-        # Phase 217/219: Direction exposure limits — include BOTH positions and pending orders.
-        long_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
-        long_count += sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
-        short_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
-        short_count += sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
+        # Phase 217/219: Direction exposure limits — pending orders are partially counted.
+        long_pos_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
+        long_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
+        short_pos_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
+        short_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
+        long_count = long_pos_count + int(long_pending_count * pending_weight)
+        short_count = short_pos_count + int(short_pending_count * pending_weight)
         max_same_direction = max(3, self.max_positions * 70 // 100)
         if side == 'LONG' and long_count >= max_same_direction:
             self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
-            logger.info(f"🚫 DIRECTION LIMIT: {long_count} LONG açık+pending (max {max_same_direction})")
+            logger.info(
+                f"🚫 DIRECTION LIMIT: LONG effective={long_count} (max {max_same_direction}) "
+                f"| positions={long_pos_count}, pending={long_pending_count}, pending_w={pending_weight:.2f}"
+            )
             return None
         if side == 'SHORT' and short_count >= max_same_direction:
             self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
-            logger.info(f"🚫 DIRECTION LIMIT: {short_count} SHORT açık+pending (max {max_same_direction})")
+            logger.info(
+                f"🚫 DIRECTION LIMIT: SHORT effective={short_count} (max {max_same_direction}) "
+                f"| positions={short_pos_count}, pending={short_pending_count}, pending_w={pending_weight:.2f}"
+            )
             return None
 
         # USDT-based directional exposure limit — max %40 of balance per direction.
@@ -23971,7 +23986,7 @@ class PaperTradingEngine:
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in self.positions if p.get('side') == side
         )
-        same_dir_margin += sum(
+        same_dir_margin += pending_weight * sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
             for p in self.pending_orders if p.get('side') == side
         )
@@ -24820,6 +24835,11 @@ class PaperTradingEngine:
                 if PENDING_SM_V2_ENABLED:
                     transition_pending_state(order, 'EXPIRED', 'timeout', current_time)
                 continue
+
+            # Recheck backoff: after WARN_WAIT we pause revalidation attempts for this pending order.
+            recheck_next_at = int(order.get('recheckNextAt', 0) or 0)
+            if recheck_next_at > current_time:
+                continue
             
             # Phase 224B: Stale Signal Penalty — skor zamanla düşer
             created_at = order.get('createdAt', current_time)
@@ -25186,9 +25206,14 @@ class PaperTradingEngine:
         if decision == 'WARN_WAIT' and not force_market:
             self.pipeline_metrics.setdefault('recheck_warn', 0)
             self.pipeline_metrics['recheck_warn'] += 1
+            wait_until = current_time + 30_000
+            order['recheckNextAt'] = max(
+                int(order.get('recheckNextAt', 0) or 0),
+                wait_until
+            )
             order['confirmAfter'] = max(
                 int(order.get('confirmAfter', current_time)),
-                current_time + 30_000
+                wait_until
             )
             logger.info(
                 f"⚠️ ENTRY_RECHECK_WAIT: {symbol} {side} score={rv['recheck_score']:.0f} "
@@ -25197,8 +25222,6 @@ class PaperTradingEngine:
             return False  # order stays, not executed
 
         # PASS — but apply entry score + drift guard before executing
-        self.pipeline_metrics.setdefault('recheck_pass', 0)
-        self.pipeline_metrics['recheck_pass'] += 1
 
         # ===== Entry Score Gate =====
         is_live = live_binance_trader.enabled and live_binance_trader.trading_mode == 'live'
@@ -25251,6 +25274,11 @@ class PaperTradingEngine:
             except Exception as egate_err:
                 logger.debug(f"Entry gate check error (non-blocking): {egate_err}")
 
+        # Recheck PASS is counted only when order passes live gates and reaches execution attempt.
+        self.pipeline_metrics.setdefault('recheck_pass', 0)
+        self.pipeline_metrics['recheck_pass'] += 1
+        order['recheckNextAt'] = 0
+
         # force_market is passed through as-is; recheck does NOT downgrade it.
         await self.execute_pending_order(order, fill_price, force_market=force_market)
         return True
@@ -25263,6 +25291,19 @@ class PaperTradingEngine:
         # Remove from pending
         if order in self.pending_orders:
             self.pending_orders.remove(order)
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+        def _requeue_pending(wait_ms: int, reason: str):
+            next_ms = now_ms + max(1_000, int(wait_ms))
+            order['recheckNextAt'] = max(int(order.get('recheckNextAt', 0) or 0), next_ms)
+            order['confirmAfter'] = max(int(order.get('confirmAfter', now_ms) or now_ms), next_ms)
+            if order not in self.pending_orders:
+                self.pending_orders.append(order)
+            logger.info(
+                f"⏳ PENDING_REQUEUE: {order.get('side','')} {order.get('symbol','')} "
+                f"reason={reason} wait_ms={wait_ms}"
+            )
         
         # Phase 55: Check if already have position in this coin
         symbol = order.get('symbol', '')
@@ -25507,8 +25548,7 @@ class PaperTradingEngine:
                             self.set_execution_feedback(symbol, f"BLOCK_OPEN_STALE_BBO:{reason}")
                             logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_STALE_BBO | reason={reason}")
                             self.add_log(f"🚫 BBO VETO: {symbol} stale BBO")
-                            if order not in self.pending_orders:
-                                self.pending_orders.append(order)
+                            _requeue_pending(30_000, f"stale_bbo:{reason}")
                             return
 
                         if reason in ('spread_too_wide', 'book_thin'):
@@ -25518,8 +25558,7 @@ class PaperTradingEngine:
                             self.set_execution_feedback(symbol, f"BLOCK_OPEN_SPREAD:{reason}")
                             logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_SPREAD | reason={reason} spread_bps={pre_vbbo.get('spread_bps')}")
                             self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped ({reason})")
-                            if order not in self.pending_orders:
-                                self.pending_orders.append(order)
+                            _requeue_pending(30_000, f"bbo_spread:{reason}")
                             return
 
                         # Default invalid (missing, bid_le_zero, ask_lt_bid, etc.)
@@ -25529,8 +25568,7 @@ class PaperTradingEngine:
                         self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{reason}")
                         logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_INVALID_BBO | reason={reason}")
                         self.add_log(f"🚫 BBO VETO: {symbol} entry skipped ({reason})")
-                        if order not in self.pending_orders:
-                            self.pending_orders.append(order)
+                        _requeue_pending(30_000, f"invalid_bbo:{reason}")
                         return
                 except Exception as sf_err:
                     logger.debug(f"Pre-trade BBO check error: {sf_err}")
@@ -25550,6 +25588,7 @@ class PaperTradingEngine:
                         self.add_log(f"🚫 SLIPPAGE GUARD: {symbol} drift {drift_bps:.0f}bps")
                         self.pipeline_metrics['drift_rejected'] += 1
                         self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps")
+                        _requeue_pending(30_000, f"drift_block:{drift_bps:.1f}bps")
                         return
                     elif drift_bps > 0:
                         logger.debug(f"✅ DRIFT_CHECK: {symbol} drift={drift_bps:.1f}bps OK")
@@ -25641,6 +25680,7 @@ class PaperTradingEngine:
                         self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{fm_vbbo['reason']}")
                         logger.warning(f"🚫 FORCE_MARKET BBO_VETO: {side} {symbol} | reason={fm_vbbo['reason']}")
                         self.add_log(f"🚫 FORCE MARKET BBO VETO: {symbol} ({fm_vbbo['reason']})")
+                        _requeue_pending(30_000, f"force_invalid_bbo:{fm_vbbo['reason']}")
                         return
                     fm_mid = fm_vbbo['bbo'].get('mid', 0) if fm_vbbo.get('valid') else 0
                     fm_drift_bps, fm_drift_blocked, _ = live_binance_trader._check_pre_trade_drift(
@@ -25651,6 +25691,7 @@ class PaperTradingEngine:
                         self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{fm_drift_bps:.1f}bps")
                         logger.warning(f"🚫 FORCE_MARKET DRIFT_BLOCK: {side} {symbol} drift={fm_drift_bps:.1f}bps")
                         self.add_log(f"🚫 FORCE MARKET DRIFT: {symbol} {fm_drift_bps:.0f}bps")
+                        _requeue_pending(30_000, f"force_drift_block:{fm_drift_bps:.1f}bps")
                         return
                 except Exception as fm_gate_err:
                     logger.debug(f"Force market gate check error (non-blocking): {fm_gate_err}")
@@ -28631,6 +28672,23 @@ async def paper_trading_status():
     """Get current paper trading status - used for initial UI sync."""
     today_pnl_data = global_paper_trader.get_today_pnl()
     stats_with_today = {**global_paper_trader.stats, **today_pnl_data}
+    pending_orders = [
+        {
+            "id": o.get("id"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "state": o.get("state"),
+            "confirmed": bool(o.get("confirmed", False)),
+            "signalScore": o.get("signalScore", 0),
+            "entryPrice": o.get("entryPrice", 0),
+            "createdAt": o.get("createdAt", 0),
+            "confirmAfter": o.get("confirmAfter", 0),
+            "recheckNextAt": o.get("recheckNextAt", 0),
+            "recheckDecision": o.get("recheckDecision"),
+            "expiresAt": o.get("expiresAt", 0),
+        }
+        for o in global_paper_trader.pending_orders
+    ]
     
     # Phase 239: Data quality metrics
     try:
@@ -28650,6 +28708,7 @@ async def paper_trading_status():
         "liveEnabled": live_binance_trader.enabled,
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
         "pendingOrdersCount": len(global_paper_trader.pending_orders),
+        "pendingOrders": pending_orders,
         "lastOrderError": live_binance_trader.last_order_error,
         # Phase 237D: Reject attribution summary
         "falseNegativeSummary": get_reject_attribution_summary() if REJECT_ATTRIBUTION_ENABLED else {},
@@ -29303,6 +29362,23 @@ async def scanner_status():
 @app.get("/paper-trading/settings")
 async def paper_trading_get_settings():
     """Get current cloud trading settings."""
+    pending_orders = [
+        {
+            "id": o.get("id"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "state": o.get("state"),
+            "confirmed": bool(o.get("confirmed", False)),
+            "signalScore": o.get("signalScore", 0),
+            "entryPrice": o.get("entryPrice", 0),
+            "createdAt": o.get("createdAt", 0),
+            "confirmAfter": o.get("confirmAfter", 0),
+            "recheckNextAt": o.get("recheckNextAt", 0),
+            "recheckDecision": o.get("recheckDecision"),
+            "expiresAt": o.get("expiresAt", 0),
+        }
+        for o in global_paper_trader.pending_orders
+    ]
     return JSONResponse({
         "symbol": global_paper_trader.symbol,
         "leverage": global_paper_trader.leverage,
@@ -29345,7 +29421,9 @@ async def paper_trading_get_settings():
         # Execution diagnostics
         "lastOrderError": live_binance_trader.last_order_error,
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
-        "param_limits": PARAM_LIMITS
+        "param_limits": PARAM_LIMITS,
+        "pendingOrdersCount": len(global_paper_trader.pending_orders),
+        "pendingOrders": pending_orders
     })
 
 @app.post("/paper-trading/settings")

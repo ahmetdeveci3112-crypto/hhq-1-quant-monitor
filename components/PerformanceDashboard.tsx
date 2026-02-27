@@ -26,6 +26,37 @@ interface Props {
 
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
+const toNum = (v: any, fallback = 0): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+};
+
+const normalizeAttributionPayload = (raw: any) => {
+    const totalsRaw = raw?.totals || {};
+    const totals = {
+        gross: toNum(totalsRaw.gross ?? totalsRaw.pnl_gross ?? totalsRaw.gross_pnl),
+        fee: toNum(totalsRaw.fee ?? totalsRaw.fee_cost ?? totalsRaw.commission),
+        slippage: toNum(totalsRaw.slippage ?? totalsRaw.slippage_cost),
+        funding: toNum(totalsRaw.funding ?? totalsRaw.funding_cost),
+        signal: toNum(totalsRaw.signal ?? totalsRaw.signal_alpha ?? totalsRaw.pnl_signal_alpha),
+        execution: toNum(totalsRaw.execution ?? totalsRaw.execution_alpha ?? totalsRaw.pnl_execution_alpha),
+        timing: toNum(totalsRaw.timing ?? totalsRaw.timing_alpha ?? totalsRaw.pnl_timing_alpha),
+        net: toNum(totalsRaw.net ?? totalsRaw.pnl_net),
+    };
+    const topPositive = Array.isArray(raw?.top_positive) ? raw.top_positive : [];
+    const topNegative = Array.isArray(raw?.top_negative) ? raw.top_negative : [];
+    const tradeCount = Math.max(0, toNum(raw?.trade_count ?? raw?.trades ?? raw?.count, 0));
+    const hasAnyTotals = Object.values(totals).some((v) => Math.abs(v) > 0.000001);
+    return {
+        ...raw,
+        totals,
+        top_positive: topPositive,
+        top_negative: topNegative,
+        trade_count: tradeCount,
+        has_data: tradeCount > 0 || hasAnyTotals || topPositive.length > 0 || topNegative.length > 0,
+    };
+};
+
 
 export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     const [summary, setSummary] = useState<any>(null);
@@ -53,7 +84,10 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
             // Phase 267C: PnL Attribution (non-blocking)
             try {
                 const attrRes = await fetch(`${apiUrl}/api/pnl/attribution?window=7d`);
-                if (attrRes.ok) setAttribution(await attrRes.json());
+                if (attrRes.ok) {
+                    const raw = await attrRes.json();
+                    setAttribution(normalizeAttributionPayload(raw));
+                }
             } catch { /* attribution endpoint may not exist yet */ }
         } catch (error) {
             console.error('Performans verisi alınamadı:', error);
@@ -77,6 +111,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     }
 
     const maxPnl = Math.max(...dailyPnl.map(d => Math.abs(d.pnl)), 1);
+    const showAttribution = Boolean(attribution && (attribution.has_data || attribution.trade_count > 0));
 
     return (
         <div className="space-y-6">
@@ -373,7 +408,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
             )}
 
             {/* Phase 267C: PnL Attribution */}
-            {attribution && attribution.trade_count > 0 && (
+            {showAttribution && (
                 <div className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-slate-700/50 rounded-2xl p-4 sm:p-6 backdrop-blur-sm">
                     <div className="flex items-center gap-3 mb-4">
                         <div className="p-2 bg-gradient-to-br from-teal-500/20 to-emerald-500/20 rounded-xl">
