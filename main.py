@@ -24485,15 +24485,19 @@ class PaperTradingEngine:
         
         signal_confirmation_delay_seconds = base_wait_min * 60
         _confirm_base_sec = signal_confirmation_delay_seconds  # P3: telemetry
-        
+
+        # Env-backed clamp — single source for entire confirmation flow
+        _confirm_clamp_min = int(os.environ.get('CONFIRM_DELAY_MIN_SEC', '30'))
+        _confirm_clamp_max = int(os.environ.get('CONFIRM_DELAY_MAX_SEC', '300'))
+        if _confirm_clamp_min > _confirm_clamp_max:
+            logger.warning(f"⚠️ CONFIRM_DELAY clamp swapped: min({_confirm_clamp_min}) > max({_confirm_clamp_max})")
+            _confirm_clamp_min, _confirm_clamp_max = _confirm_clamp_max, _confirm_clamp_min
+
         # Phase 224D: Regime-based confirmation multiplier
         try:
             regime_profile = market_regime_manager.get_profile()
             confirm_mult = regime_profile.get('confirmation_mult', 1.0)
             signal_confirmation_delay_seconds = int(signal_confirmation_delay_seconds * confirm_mult)
-            # P3-FIX: Halved clamp range to match halved base times (was 60..600)
-            _confirm_clamp_min = int(os.environ.get('CONFIRM_DELAY_MIN_SEC', '30'))
-            _confirm_clamp_max = int(os.environ.get('CONFIRM_DELAY_MAX_SEC', '300'))
             signal_confirmation_delay_seconds = max(_confirm_clamp_min, min(_confirm_clamp_max, signal_confirmation_delay_seconds))
         except Exception:
             pass
@@ -24501,7 +24505,10 @@ class PaperTradingEngine:
 
         reinforce_count = int(signal.get('signalReinforceCount', 0) if signal else 0)
         if reinforce_count >= 2:
-            signal_confirmation_delay_seconds = max(30, int(signal_confirmation_delay_seconds * 0.75))
+            signal_confirmation_delay_seconds = max(_confirm_clamp_min, int(signal_confirmation_delay_seconds * 0.75))
+
+        # Final clamp — guarantee bounds after all adjustments
+        signal_confirmation_delay_seconds = max(_confirm_clamp_min, min(_confirm_clamp_max, signal_confirmation_delay_seconds))
 
         memory_extend_sec = int(signal.get('memoryExtensionSec', 0) if signal else 0)
         memory_extend_sec = max(0, min(SIGNAL_MEMORY_PENDING_EXTEND_MAX_SECONDS, memory_extend_sec))
@@ -24765,7 +24772,7 @@ class PaperTradingEngine:
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         # P3: Confirmation delay telemetry — 3-step breakdown for observability
         try:
-            logger.info(f"⏱️ CONFIRM_DELAY: {trade_symbol} base={_confirm_base_sec}s regime={_confirm_after_regime_sec}s final={signal_confirmation_delay_seconds}s")
+            logger.info(f"⏱️ CONFIRM_DELAY: {trade_symbol} base={_confirm_base_sec}s regime={_confirm_after_regime_sec}s final={signal_confirmation_delay_seconds}s clamp=[{_confirm_clamp_min},{_confirm_clamp_max}]")
         except NameError:
             pass  # telemetry vars not set if regime check was skipped
         
