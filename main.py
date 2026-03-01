@@ -30880,21 +30880,14 @@ async def get_performance_summary():
     recent_wins = len([t for t in recent_trades if t.get('pnl', 0) > 0])
     recent_wr = (recent_wins / len(recent_trades) * 100) if recent_trades else 0
     
-    # Close reason breakdown
+    # Close reason breakdown — EX-1: prefer closeReasonNormalized, fallback to legacy normalize
     reason_stats = {}
     for t in trades:
-        reason = t.get('reason', t.get('closeReason', 'UNKNOWN'))
-        # Normalize reason
-        if 'SL' in str(reason).upper() or 'STOP' in str(reason).upper():
-            reason = 'SL_HIT'
-        elif 'TP' in str(reason).upper() or 'TAKE' in str(reason).upper():
-            reason = 'TP_HIT'
-        elif 'TRAIL' in str(reason).upper():
-            reason = 'TRAILING'
-        elif 'BREAKEVEN' in str(reason).upper():
-            reason = 'BREAKEVEN'
-        elif 'TIME' in str(reason).upper():
-            reason = 'TIME_EXIT'
+        reason = t.get('closeReasonNormalized')
+        if not reason:
+            # Legacy fallback for trades without the normalized field
+            raw = t.get('reason', t.get('closeReason', 'UNKNOWN'))
+            reason = global_paper_trader._normalize_close_reason(raw) if hasattr(global_paper_trader, '_normalize_close_reason') else raw
         
         if reason not in reason_stats:
             reason_stats[reason] = {'count': 0, 'pnl': 0}
@@ -31045,7 +31038,9 @@ async def scanner_status():
         "cacheAgeSec": cache_age,
         "autoRestarted": auto_restarted,
         "staleRestarted": stale_restarted,
-        "staleThresholdSec": SCANNER_STALE_CACHE_SEC
+        "staleThresholdSec": SCANNER_STALE_CACHE_SEC,
+        # UF-1: Prefilter metrics from scanner stats
+        **multi_coin_scanner.get_scanner_stats()
     })
 
 # Phase 17: Settings endpoints
@@ -31660,9 +31655,11 @@ async def phase193_hyperopt_run(request: Request):
         hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))
     
     # DQ-1: Hard-block manual optimize if coverage < threshold
+    _dq_resp = {}
     try:
         _dq = await sqlite_manager.get_trade_data_quality_24h()
         _dq_cov = _dq.get('trade_metadata_coverage_pct_24h', 100)
+        _dq_resp['coverage_pct'] = _dq_cov
         if _dq_cov < DQ_OPTIMIZE_MIN_COVERAGE:
             logger.warning(f"⚠️ DATA_QUALITY_BLOCK: manual optimize blocked — coverage={_dq_cov:.1f}%")
             return JSONResponse({
@@ -31673,19 +31670,12 @@ async def phase193_hyperopt_run(request: Request):
         # also gate auto-apply on coverage
         if apply and _dq_cov < DQ_AUTO_APPLY_MIN_COVERAGE:
             apply = False
+            _dq_resp['apply_blocked_reason'] = f"coverage {_dq_cov:.1f}% < min {DQ_AUTO_APPLY_MIN_COVERAGE}%"
             logger.warning(f"⚠️ DATA_QUALITY_BLOCK: apply disabled for this run — coverage={_dq_cov:.1f}%")
     except Exception as _dq_err:
         logger.debug(f"DQ-1 manual optimize coverage check error: {_dq_err}")
     
     result = await hhq_hyperoptimizer.optimize(n_trials=n_trials, apply=apply, force_apply=force_apply)
-    
-    # DQ-1: Coverage info in response
-    _dq_resp = {}
-    try:
-        _dq = await sqlite_manager.get_trade_data_quality_24h()
-        _dq_resp['coverage_pct'] = _dq.get('trade_metadata_coverage_pct_24h', 100)
-    except Exception:
-        pass
     
     # Phase 269: Merge full status so frontend always gets consistent telemetry
     if 'error' not in result:
