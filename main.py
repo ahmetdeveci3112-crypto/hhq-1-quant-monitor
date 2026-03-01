@@ -13128,6 +13128,7 @@ class MultiCoinScanner:
         
         # Patch C: Dynamic universe prefilter — score, sort, slice
         _pre_total = len(tickers)
+        _prefilter_start = time.time()
         if UNIVERSE_PREFILTER_ENABLED and _pre_total > 0:
             _scored_candidates = []
             _vol_filtered = 0
@@ -13155,15 +13156,37 @@ class MultiCoinScanner:
             # Sort by quality descending, then slice
             _scored_candidates.sort(key=lambda x: x[2], reverse=True)
             _max = min(UNIVERSE_MAX_COINS, len(_scored_candidates))
+            _sliced_count = len(_scored_candidates) - _max if len(_scored_candidates) > _max else 0
             _sliced = _scored_candidates[:_max]
             tickers = {s: t for s, t, _ in _sliced}
             _depth_filtered = _pre_total - _vol_filtered - _spread_filtered - len(_scored_candidates)
+            _prefilter_ms = (time.time() - _prefilter_start) * 1000
+            # UF-1: Store cycle metrics for observability
+            self._prefilter_metrics = {
+                'scan_ts': int(time.time()),
+                'scan_ms': round(_prefilter_ms, 1),
+                'pre_total': _pre_total,
+                'vol_filtered': _vol_filtered,
+                'spread_filtered': _spread_filtered,
+                'sliced': _sliced_count,
+                'final': len(tickers),
+            }
             logger.info(
-                f"🔬 UNIVERSE_PREFILTER: {_pre_total}→{len(tickers)} coins | "
+                f"🔬 UNIVERSE_PREFILTER_CYCLE: {_pre_total}→{len(tickers)} coins | "
                 f"vol_filtered={_vol_filtered} spread_filtered={_spread_filtered} "
-                f"sliced={len(_scored_candidates)-_max if len(_scored_candidates)>_max else 0} | "
-                f"max_coins={UNIVERSE_MAX_COINS}"
+                f"sliced={_sliced_count} | "
+                f"scan_ms={_prefilter_ms:.1f} max_coins={UNIVERSE_MAX_COINS}"
             )
+        else:
+            self._prefilter_metrics = {
+                'scan_ts': int(time.time()),
+                'scan_ms': 0,
+                'pre_total': _pre_total,
+                'vol_filtered': 0,
+                'spread_filtered': 0,
+                'sliced': 0,
+                'final': _pre_total,
+            }
         
         # Yield control to event loop every N coins to prevent blocking API requests
         # Lower value = more responsive API but slightly slower scan
@@ -13263,7 +13286,8 @@ class MultiCoinScanner:
             "longSignals": long_count,
             "shortSignals": short_count,
             "activeSignals": len(self.active_signals),
-            "lastUpdate": datetime.now().timestamp()
+            "lastUpdate": datetime.now().timestamp(),
+            "prefilterMetrics": getattr(self, '_prefilter_metrics', {}),
         }
     
     async def preload_all_coins(self, top_n: int = 50):
