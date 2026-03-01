@@ -8024,6 +8024,13 @@ UNIVERSE_MIN_VOLUME_USD = float(os.environ.get('UNIVERSE_MIN_VOLUME_USD', '50000
 UNIVERSE_MAX_SPREAD_PCT = float(os.environ.get('UNIVERSE_MAX_SPREAD_PCT', '0.8'))     # max bid-ask spread %
 UNIVERSE_PREFILTER_ENABLED = os.environ.get('UNIVERSE_PREFILTER_ENABLED', 'true').lower() == 'true'
 
+# Patch D: EV Gate thresholds
+EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'false').lower() == 'true'
+EV_SOFT_THRESHOLD = float(os.environ.get('EV_SOFT_THRESHOLD', '-0.002'))   # below this → soft penalty
+EV_HARD_THRESHOLD = float(os.environ.get('EV_HARD_THRESHOLD', '-0.01'))    # below this → hard block
+EV_HARD_BLOCK_ENABLED = os.environ.get('EV_HARD_BLOCK_ENABLED', 'false').lower() == 'true'
+EV_SOFT_PENALTY_FACTOR = float(os.environ.get('EV_SOFT_PENALTY_FACTOR', '0.7'))  # multiply score/size by this
+
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
     price: float, base_leverage: int,
@@ -16198,6 +16205,33 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.info(f"📊 EV_OK: {action} {symbol} | EV_net={ev:.4f} | rawScore={_raw_sc} penScore={_pen_sc}")
     except Exception as ev_err:
         logger.debug(f"EV calc error: {ev_err}")
+    
+    # Patch D: EV Gate — soft penalty / hard block
+    if EV_GATE_ENABLED:
+        _ev_val = signal.get('ev', 0)
+        if _ev_val < EV_HARD_THRESHOLD and EV_HARD_BLOCK_ENABLED:
+            logger.warning(
+                f"🚫 EV_GATE_HARD_BLOCK: {action} {symbol} | EV={_ev_val:.4f} "
+                f"< hard={EV_HARD_THRESHOLD} → REJECTED"
+            )
+            global_paper_trader.pipeline_metrics.setdefault('ev_hard_block', 0)
+            global_paper_trader.pipeline_metrics['ev_hard_block'] += 1
+            global_paper_trader.pipeline_metrics.setdefault('open_reject_reasons', {})
+            global_paper_trader.pipeline_metrics['open_reject_reasons']['EV_HARD_BLOCK'] = \
+                global_paper_trader.pipeline_metrics['open_reject_reasons'].get('EV_HARD_BLOCK', 0) + 1
+            return  # reject signal entirely
+        elif _ev_val < EV_SOFT_THRESHOLD:
+            _old_score = signal.get('confidenceScore', 0)
+            _new_score = _old_score * EV_SOFT_PENALTY_FACTOR
+            signal['confidenceScore'] = _new_score
+            signal['_ev_soft_applied'] = True
+            logger.info(
+                f"⚠️ EV_GATE_SOFT: {action} {symbol} | EV={_ev_val:.4f} "
+                f"< soft={EV_SOFT_THRESHOLD} → score {_old_score:.0f}→{_new_score:.0f} "
+                f"(×{EV_SOFT_PENALTY_FACTOR})"
+            )
+            global_paper_trader.pipeline_metrics.setdefault('ev_soft_penalty', 0)
+            global_paper_trader.pipeline_metrics['ev_soft_penalty'] += 1
     
     # Execute trade
     global_paper_trader.pipeline_metrics.setdefault('signal_accepted', 0)
