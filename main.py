@@ -4075,6 +4075,7 @@ class LiveBinanceTrader:
         Only targets STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT types.
         Never cancels entry (non-reduceOnly) orders.
         Idempotent: safe to call multiple times.
+        Falls back to fetch_open_orders() (all symbols) if symbol-specific fetch fails/empty.
         """
         result = {'cancelled': 0, 'errors': 0, 'order_ids': []}
         if not self.enabled or not self.exchange:
@@ -4082,13 +4083,32 @@ class LiveBinanceTrader:
         
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         trace_str = f" [trace={trace_id}]" if trace_id else ""
+        norm_symbol = symbol  # e.g. "ADAUSDT"
         
+        # Try symbol-specific fetch first
+        open_orders = []
+        used_fallback = False
         try:
             open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
         except Exception as fetch_err:
-            logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fetch_open_orders failed for {symbol}: {fetch_err}{trace_str}")
-            result['errors'] = 1
-            return result
+            logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fetch_open_orders({ccxt_symbol}) failed: {fetch_err}{trace_str}")
+        
+        # Fallback: fetch ALL open orders, filter by symbol
+        if not open_orders:
+            try:
+                all_orders = await self.exchange.fetch_open_orders()
+                for o in all_orders:
+                    raw_sym = o.get('symbol', '')
+                    o_norm = raw_sym.replace('/', '').replace(':USDT', '')
+                    if o_norm == norm_symbol:
+                        open_orders.append(o)
+                if open_orders:
+                    used_fallback = True
+                    logger.info(f"🔄 POST_CLOSE_CLEANUP_FALLBACK_ALL_ORDERS: {symbol} found {len(open_orders)} orders via global fetch{trace_str}")
+            except Exception as fallback_err:
+                logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fallback fetch_open_orders() failed: {fallback_err}{trace_str}")
+                result['errors'] = 1
+                return result
         
         conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market', 'trailing_stop_market'}
         
@@ -4108,11 +4128,13 @@ class LiveBinanceTrader:
             if order_type not in conditional_types:
                 continue  # Only conditional stop/TP orders
             
+            # Use order's own symbol for cancel (safer than constructed ccxt_symbol)
+            cancel_symbol = order.get('symbol', ccxt_symbol)
             try:
-                await self.exchange.cancel_order(order['id'], ccxt_symbol)
+                await self.exchange.cancel_order(order['id'], cancel_symbol)
                 result['cancelled'] += 1
                 result['order_ids'].append(order['id'])
-                logger.info(f"🗑️ POST_CLOSE_CLEANUP: Cancelled {order_type} order {order['id']} for {symbol}{trace_str}")
+                logger.info(f"🗑️ POST_CLOSE_CLEANUP: Cancelled {order_type} order {order['id']} for {symbol}{' (fallback)' if used_fallback else ''}{trace_str}")
             except Exception as cancel_err:
                 err_str = str(cancel_err)
                 # -2011 = Unknown order / already cancelled — benign
@@ -4123,14 +4145,15 @@ class LiveBinanceTrader:
                     logger.warning(f"⚠️ POST_CLOSE_CLEANUP: Cancel failed for {order['id']} {symbol}: {cancel_err}{trace_str}")
         
         return result
+
     
     async def _post_close_cleanup(self, symbol: str, trace_id: str = None):
         """Phase 270: Retry-based post-close cleanup with flat-position guard.
         Called as fire-and-forget from close_position success path.
-        3 attempts with backoff [0.2s, 0.5s, 1.0s].
+        5 attempts with backoff [0.2, 0.5, 1.0, 3.0, 8.0].
         """
         trace_str = f" [trace={trace_id}]" if trace_id else ""
-        backoffs = [0.2, 0.5, 1.0]
+        backoffs = [0.2, 0.5, 1.0, 3.0, 8.0]
         
         for attempt, delay in enumerate(backoffs, 1):
             try:
@@ -4145,8 +4168,13 @@ class LiveBinanceTrader:
                         break
                 
                 if not is_flat:
-                    logger.warning(f"⚠️ POST_CLOSE_CLEANUP_CANCELLED: {symbol} still has open position, skipping{trace_str}")
-                    return
+                    is_last = (attempt == len(backoffs))
+                    if is_last:
+                        # Final attempt: force cleanup anyway — Binance API may be stale
+                        logger.warning(f"⚠️ POST_CLOSE_WAIT_NOT_FLAT: {symbol} attempt={attempt}/{len(backoffs)} FINAL — forcing cleanup{trace_str}")
+                    else:
+                        logger.info(f"⏳ POST_CLOSE_WAIT_NOT_FLAT: {symbol} attempt={attempt}/{len(backoffs)} — retrying...{trace_str}")
+                        continue
                 
                 logger.info(f"🧹 POST_CLOSE_CLEANUP_START: {symbol} attempt {attempt}/{len(backoffs)}{trace_str}")
                 res = await self.cancel_reduce_only_conditionals(symbol, trace_id)
@@ -4162,6 +4190,7 @@ class LiveBinanceTrader:
                 logger.warning(f"⚠️ POST_CLOSE_CLEANUP: {symbol} attempt {attempt} exception: {e}{trace_str}")
         
         logger.error(f"❌ POST_CLOSE_CLEANUP_FAILED: {symbol} exhausted {len(backoffs)} attempts{trace_str}")
+
     
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Phase 179: Cancel an open order."""
@@ -28452,10 +28481,22 @@ class PaperTradingEngine:
                 if trace_id and 'exit_engine' in globals() and exit_engine:
                     exit_engine.clear_lock(pos_id or symbol, trace_id)
                 # Still clean up conditional orders (SL/TP on exchange)
+                # Immediate attempt
                 try:
                     asyncio.ensure_future(
                         live_binance_trader._post_close_cleanup(symbol, trace_id)
                     )
+                except Exception:
+                    pass
+                # +3s deferred second attempt (idempotent safety net)
+                async def _manual_deferred_cleanup():
+                    await asyncio.sleep(3)
+                    try:
+                        await live_binance_trader._post_close_cleanup(symbol, trace_id)
+                    except Exception:
+                        pass
+                try:
+                    safe_create_task(_manual_deferred_cleanup())
                 except Exception:
                     pass
             else:
@@ -28540,24 +28581,12 @@ class PaperTradingEngine:
                     )
                 )
                 
-                # Phase 270: Deferred cleanup fallback (+3s)
-                # close_position already fires immediate cleanup; this is a safety net
+                # Phase 270 P1 fix: Deferred cleanup — delegate to _post_close_cleanup
+                # which has its own retry chain + flat guard
                 async def _deferred_cleanup():
                     await asyncio.sleep(3)
                     try:
-                        # Phase 270 P1 fix: Flat-position guard before deferred cancel
-                        positions = await live_binance_trader.get_positions()
-                        is_flat = True
-                        for bp in positions:
-                            if bp.get('symbol') == symbol and float(bp.get('size', 0)) > 0.00001:
-                                is_flat = False
-                                break
-                        if not is_flat:
-                            logger.warning(f"⚠️ POST_CLOSE_CLEANUP_DEFERRED: {symbol} not flat, skipping{trace_str}")
-                            return
-                        res = await live_binance_trader.cancel_reduce_only_conditionals(symbol, trace_id)
-                        if res['cancelled'] > 0:
-                            logger.warning(f"✅ POST_CLOSE_CLEANUP_DEFERRED: {symbol} cancelled={res['cancelled']}{trace_str}")
+                        await live_binance_trader._post_close_cleanup(symbol, trace_id)
                     except Exception as dc_err:
                         logger.warning(f"⚠️ POST_CLOSE_CLEANUP_DEFERRED failed: {symbol}: {dc_err}")
                 safe_create_task(_deferred_cleanup())
