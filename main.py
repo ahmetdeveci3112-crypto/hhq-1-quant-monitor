@@ -6002,6 +6002,11 @@ async def binance_position_sync_loop():
                             'fc_was_in_profit': False,
                             'fc_failed_count': 0,
                             'fc_max_profit_pct': 0.0,
+                            # RCA-FUN Patch 1: Spread metadata from sync
+                            'spreadLevel': bp.get('spread_level', 'Normal'),
+                            'spread_level': bp.get('spread_level', 'Normal'),
+                            'spreadPct': sync_spread_pct,
+                            'atr_pct': bp.get('atr_pct', volatility_pct),
                         }
                         
                         # RHP-1A: Hydrate signal scores from DB (restart continuity)
@@ -8136,6 +8141,14 @@ FALLBACK_EDGE_COST_MULT = float(os.environ.get('FALLBACK_EDGE_COST_MULT', '1.25'
 # DQ-1: Metadata Coverage Guard
 DQ_AUTO_APPLY_MIN_COVERAGE = float(os.environ.get('DQ_AUTO_APPLY_MIN_COVERAGE', '70'))   # below → auto-apply disabled
 DQ_OPTIMIZE_MIN_COVERAGE = float(os.environ.get('DQ_OPTIMIZE_MIN_COVERAGE', '50'))       # below → optimize hard-blocked
+
+# RCA-FUN Patch 3: Leverage-aware recovery arm
+RECOVERY_ARM_V2_ENABLED = os.environ.get('RECOVERY_ARM_V2_ENABLED', 'false').lower() == 'true'
+RECOVERY_ARM_V2_ROI_FLOOR = float(os.environ.get('RECOVERY_ARM_V2_ROI_FLOOR', '-20.0'))  # -20% ROI floor
+
+# RCA-FUN Patch 4: Drawdown reclaim breakeven
+DRAWDOWN_RECLAIM_BE_ENABLED = os.environ.get('DRAWDOWN_RECLAIM_BE_ENABLED', 'false').lower() == 'true'
+DRAWDOWN_RECLAIM_MIN_DD_PCT = float(os.environ.get('DRAWDOWN_RECLAIM_MIN_DD_PCT', '1.5'))  # min drawdown to qualify
 
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
@@ -19619,6 +19632,83 @@ class BreakevenStopManager:
                         # Too young — skip breakeven (let trade develop)
                         continue
                     
+                    # ──────────────────────────────────────────────────────────
+                    # RCA-FUN Patch 4: Drawdown Reclaim BE
+                    # If position hit deep drawdown and recovered near entry → close
+                    # ──────────────────────────────────────────────────────────
+                    _max_dd_pct = float(pos.get('_max_drawdown_pct', 0))
+                    # Track current drawdown (price-based)
+                    if side == 'LONG':
+                        _cur_dd = ((entry_price - current_price) / entry_price * 100) if entry_price > 0 else 0
+                    else:
+                        _cur_dd = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                    _cur_dd = max(0, _cur_dd)  # only positive values (0 = no drawdown)
+                    _max_dd_pct = max(_max_dd_pct, _cur_dd)
+                    pos['_max_drawdown_pct'] = _max_dd_pct
+                    
+                    _reclaim_armed = pos.get('_reclaim_armed', False)
+                    _reclaim_fired = pos.get('_reclaim_fired_ts', 0)
+                    
+                    if _max_dd_pct >= DRAWDOWN_RECLAIM_MIN_DD_PCT and not _reclaim_fired:
+                        # Cost buffer: max(roundtrip_cost_buffer, 2*tick)
+                        _rc_buf = compute_breakeven_buffer_pct(
+                            spread_pct=pos.get('spreadPct', 0.05),
+                            spread_level=pos.get('spreadLevel', 'Normal'),
+                            is_live=pos.get('isLive', False),
+                            reason='RECLAIM_BE'
+                        )
+                        _rc_tick = get_tick_size(symbol)
+                        _rc_tick_buf = (_rc_tick * 2 / entry_price) if entry_price > 0 else 0
+                        _rc_final_buf = max(_rc_buf, _rc_tick_buf)
+                        
+                        # Reclaim zone: profit within [-0.5%, +cost_buffer_pct*100]
+                        _rc_roi_floor = -0.5  # small loss tolerance
+                        _rc_roi_ceil = _rc_final_buf * 100 * 2  # 2x buffer as ceiling
+                        
+                        if profit_pct >= _rc_roi_floor and profit_pct < activation_threshold * 0.3:
+                            if not _reclaim_armed:
+                                pos['_reclaim_armed'] = True
+                                logger.info(
+                                    f"🔄 RECLAIM_BE_ARMED: {symbol} {side} maxDD={_max_dd_pct:.2f}% "
+                                    f"current_ROI={profit_pct:.2f}% buf={_rc_final_buf*100:.3f}%"
+                                )
+                            
+                            if DRAWDOWN_RECLAIM_BE_ENABLED:
+                                # Execute reclaim close
+                                if side == 'LONG':
+                                    _rc_price = snap_to_tick(entry_price + max(entry_price * _rc_final_buf, _rc_tick * 2), _rc_tick, 'up')
+                                else:
+                                    _rc_price = snap_to_tick(entry_price - max(entry_price * _rc_final_buf, _rc_tick * 2), _rc_tick, 'down')
+                                
+                                logger.warning(
+                                    f"🔄 RECLAIM_BE_CLOSE: {symbol} {side} maxDD={_max_dd_pct:.2f}% → recovered "
+                                    f"ROI={profit_pct:.2f}% | limit @ ${_rc_price:.6f} (buf={_rc_final_buf*100:.3f}%)"
+                                )
+                                
+                                _rc_result = await live_trader.close_position_limit(
+                                    symbol, side, abs(contracts), _rc_price
+                                )
+                                pos['_reclaim_fired_ts'] = time.time()
+                                
+                                # Set close reason
+                                pending_close_reasons[symbol] = {
+                                    'reason': 'RECLAIM_BE',
+                                    'details': {
+                                        'max_drawdown_pct': _max_dd_pct,
+                                        'recovery_roi_pct': profit_pct,
+                                        'limit_price': _rc_price,
+                                    },
+                                    'timestamp': int(time.time())
+                                }
+                                actions["breakeven_activated"].append(f"{symbol}:RECLAIM")
+                                continue  # Skip normal BE for this cycle
+                            else:
+                                # Shadow mode: log would-close
+                                logger.debug(
+                                    f"🔄 RECLAIM_BE_SHADOW: {symbol} {side} maxDD={_max_dd_pct:.2f}% "
+                                    f"ROI={profit_pct:.2f}% → would close (flag disabled)"
+                                )
+                    
                     if profit_pct >= activation_threshold:
                         # Phase 258: Calculate limit price with tick-safe buffer + orderbook snap
                         fee_buffer = self.fee_buffers.get(spread_level, 0.0015)
@@ -19676,6 +19766,13 @@ class BreakevenStopManager:
                         
                         if not limit_result:
                             logger.error(f"❌ BREAKEVEN LIMIT ORDER FAILED: {symbol} - will retry next cycle")
+                    # RCA-FUN Patch 2: Non-activation telemetry
+                    else:
+                        if profit_pct > 0 and profit_pct >= activation_threshold * 0.4:
+                            logger.debug(
+                                f"🔒 BE_NOT_ARMED: {symbol} {side} ROI={profit_pct:.2f}% < threshold={activation_threshold:.2f}% "
+                                f"({profit_pct/activation_threshold*100:.0f}% of needed) spread={spread_level} lev={leverage}"
+                            )
                 else:
                     # Phase 261 Hotfix: Zombie State Prevention (-2022/immediate-close fix)
                     # If a state was loaded from SQLite but the position was already closed, 
@@ -19927,7 +20024,24 @@ class LossRecoveryTrailManager:
                     pnl_pct = (entry_price - current_price) / entry_price * 100
                 
                 # Get dynamic loss threshold based on spread level
-                loss_threshold = self.loss_thresholds.get(spread_level, -5.0)
+                _price_floor = self.loss_thresholds.get(spread_level, -5.0)
+                leverage = pos.get('leverage', 10)
+                
+                # RCA-FUN Patch 3: Leverage-aware hybrid threshold
+                _roi_floor_price = RECOVERY_ARM_V2_ROI_FLOOR / max(leverage, 1)  # e.g. -20/8 = -2.5%
+                _v2_threshold = max(_price_floor, _roi_floor_price)  # less negative = tighter
+                
+                if RECOVERY_ARM_V2_ENABLED:
+                    loss_threshold = _v2_threshold
+                else:
+                    loss_threshold = _price_floor
+                    # Shadow telemetry: would V2 have armed?
+                    if pnl_pct < 0 and pnl_pct < _v2_threshold and pnl_pct > _price_floor:
+                        logger.debug(
+                            f"🔄 RECOVERY_ARM_V2_SHADOW: {symbol} {side} loss={pnl_pct:.2f}% "
+                            f"v2_threshold={_v2_threshold:.2f}% v1_threshold={_price_floor:.2f}% lev={leverage}x "
+                            f"→ V2 would arm, V1 skips"
+                        )
                 
                 # State key
                 state_key = f"{symbol}_{side}"
@@ -19945,6 +20059,14 @@ class LossRecoveryTrailManager:
                     }
                     if state_key not in [a for a in actions["recovery_tracking"]]:
                         actions["recovery_tracking"].append(symbol)
+                # RCA-FUN Patch 2: Non-activation telemetry for recovery
+                elif pnl_pct < 0 and pnl_pct > loss_threshold * 0.5 and not state.get('peak_loss'):
+                    leverage = pos.get('leverage', 10)
+                    roi_pct = pnl_pct * leverage
+                    logger.debug(
+                        f"🔄 RECOVERY_NOT_ARMED: {symbol} {side} price_loss={pnl_pct:.2f}% > threshold={loss_threshold:.2f}% "
+                        f"ROI={roi_pct:.1f}% lev={leverage}x spread={spread_level}"
+                    )
                 
                 # === PHASE 2: Track recovery and activate trail ===
                 elif state.get('peak_loss', 0) < loss_threshold:
@@ -28430,6 +28552,8 @@ class PaperTradingEngine:
             return 'RECOVERY_EXIT'
         if 'REVERSAL' in r or 'FAILED_CONT' in r:
             return 'SIGNAL_REVERSAL'
+        if 'RECLAIM' in r and 'BE' in r:
+            return 'RECLAIM_BE'
         if 'PORTFOLIO' in r or 'DRAWDOWN' in r:
             return 'PORTFOLIO_DD'
         if 'MANUAL' in r:
