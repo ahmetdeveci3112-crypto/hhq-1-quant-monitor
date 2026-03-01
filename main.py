@@ -3793,9 +3793,10 @@ class LiveBinanceTrader:
             # Full market fallback on any error
             return await self.place_market_order(symbol, side, size_usd, leverage)
     
-    async def close_position(self, symbol: str, side: str, amount: float, trace_id: str = None) -> dict:
+    async def close_position(self, symbol: str, side: str, amount: float, trace_id: str = None, close_scope: str = "FULL") -> dict:
         """Pozisyon kapat (reduceOnly=True) — Market order. Phase 186: with exec logging.
-        Phase 261: Added trace_id for full layer telemetry."""
+        Phase 261: Added trace_id for full layer telemetry.
+        Patch A: close_scope='FULL'|'PARTIAL' — only FULL triggers _post_close_cleanup."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, close rejected")
             return None
@@ -3812,7 +3813,7 @@ class LiveBinanceTrader:
             # decision is always 'allow' for closing trades — log + count for audit
             if not bbo_valid:
                 self._exec_diag['close_allow_invalid_count'] += 1
-                logger.info(f"\u2139\ufe0f BBO_GATE: {side} {symbol} CLOSE | decision={decision} reason={decision_reason} bbo_reason={bbo['reason']}")
+                logger.info(f"ℹ️ BBO_GATE: {side} {symbol} CLOSE | decision={decision} reason={decision_reason} bbo_reason={bbo['reason']}")
             
             send_time = datetime.now().timestamp()
             
@@ -3851,16 +3852,19 @@ class LiveBinanceTrader:
                     reference = bbo['ask']
                     slippage_pct = (avg_fill - reference) / reference * 100 if reference > 0 else None
             
-            logger.info(f"\U0001f4e4 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f}" + (f" [trace: {trace_id}]" if trace_id else ""))
-            logger.info(f"   \U0001f194 Order ID: {order.get('id', 'N/A')}")
+            logger.info(f"📤 BINANCE CLOSE: {side} {symbol} | Amount: {amount:.6f} | scope={close_scope}" + (f" [trace: {trace_id}]" if trace_id else ""))
+            logger.info(f"   🆔 Order ID: {order.get('id', 'N/A')}")
             logger.warning(self._build_exec_quality_log(
                 side, symbol, 'CLOSE', bbo, avg_fill, slippage_pct,
                 fee_cost, fee_source, latency_ms, trace_id,
                 decision=decision, decision_reason=decision_reason,
             ))
             
-            # Phase 270: Fire-and-forget post-close conditional order cleanup
-            asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+            # Patch A: Only fire cleanup on FULL close (not partial)
+            if close_scope == "FULL":
+                asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+            else:
+                logger.info(f"ℹ️ PARTIAL_CLOSE_NO_CLEANUP: {symbol} scope={close_scope} — skipping conditional cleanup")
             
             return {
                 'id': order.get('id'),
@@ -18355,7 +18359,7 @@ class PositionBasedKillSwitch:
         # LIVE positions: Execute actual Binance partial close
         if pos.get('isLive', False) and reduction_size > 0:
             try:
-                result = await live_binance_trader.close_position(symbol, side, reduction_size)
+                result = await live_binance_trader.close_position(symbol, side, reduction_size, close_scope="PARTIAL")
                 if result:
                     # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                     pos['_partial_close_ts'] = datetime.now().timestamp()
@@ -18601,7 +18605,7 @@ class TimeBasedPositionManager:
                                 if pos.get('isLive', False) and close_contracts > 0:
                                     live_success = False
                                     try:
-                                        result = await live_binance_trader.close_position(symbol, side, close_contracts)
+                                        result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
                                         if result:
                                             live_success = True
                                             # Phase 188: Set cooldown to prevent Binance sync from restoring old size
@@ -18878,7 +18882,7 @@ class TimeBasedPositionManager:
                                 # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False):
                                     try:
-                                        result = await live_binance_trader.close_position(symbol, side, reduction_amount)
+                                        result = await live_binance_trader.close_position(symbol, side, reduction_amount, close_scope="PARTIAL")
                                         if result:
                                             close_oid = str(result.get('id', ''))
                                             logger.warning(f"📊 TIME REDUCE LIVE ✅: {symbol} closed {reduction_pct*100:.0f}% on Binance ({reduction_amount:.4f} contracts) | Order: {close_oid[:12]}")
