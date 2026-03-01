@@ -3153,6 +3153,17 @@ class LiveBinanceTrader:
 
     # --- Execution Gate Helpers ---
 
+    async def _fetch_entry_depth(self, symbol: str) -> dict:
+        """Patch B: Fetch top-5 order book for depth-parity gate.
+        Returns depth dict with bids/asks or None on failure.
+        Never raises — returns None on any error."""
+        try:
+            ccxt_sym = f"{symbol[:-4]}/USDT:USDT"
+            ob = await self.exchange.fetch_order_book(ccxt_sym, 5)
+            return ob if ob else None
+        except Exception:
+            return None
+
     async def validate_bbo(self, symbol, depth=None):
         """Validate BBO for entry gating. Returns enriched dict.
         
@@ -3425,8 +3436,10 @@ class LiveBinanceTrader:
                 logger.error(f"❌ Aborting market order {symbol}: leverage set to {leverage}x failed")
                 return None
             
-            # Capture pre-order BBO via validate_bbo
-            vbbo = await self.validate_bbo(symbol)
+            # Patch B: Fetch depth for book_q parity
+            _entry_depth = await self._fetch_entry_depth(symbol)
+            # Capture pre-order BBO via validate_bbo (with depth)
+            vbbo = await self.validate_bbo(symbol, depth=_entry_depth)
             bbo = vbbo['bbo']
             best_bid = bbo['bid']
             best_ask = bbo['ask']
@@ -3562,8 +3575,10 @@ class LiveBinanceTrader:
                 logger.error(f"❌ Aborting limit entry {symbol}: leverage set to {leverage}x failed")
                 return None
             
-            # BBO for limit pricing via validate_bbo
-            vbbo = await self.validate_bbo(symbol)
+            # Patch B: Fetch depth for book_q parity
+            _entry_depth = await self._fetch_entry_depth(symbol)
+            # BBO for limit pricing via validate_bbo (with depth)
+            vbbo = await self.validate_bbo(symbol, depth=_entry_depth)
             bbo = vbbo['bbo']
             best_bid = bbo['bid']
             best_ask = bbo['ask']
@@ -26270,7 +26285,9 @@ class PaperTradingEngine:
         is_live = live_binance_trader.enabled and live_binance_trader.trading_mode == 'live'
         if is_live:
             try:
-                vbbo = await live_binance_trader.validate_bbo(symbol)
+                # Patch B: Fetch depth for book_q parity
+                _gate_depth = await live_binance_trader._fetch_entry_depth(symbol)
+                vbbo = await live_binance_trader.validate_bbo(symbol, depth=_gate_depth)
                 # RHP-1B: Policy-driven exec score source
                 _pen = float(order.get('signalScore', 0) or 0)
                 _raw = float(order.get('signalScoreRaw', _pen) or _pen)
