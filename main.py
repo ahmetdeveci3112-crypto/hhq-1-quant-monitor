@@ -3892,6 +3892,7 @@ class LiveBinanceTrader:
                 
                 if not found_pos or remaining_amt <= 0.00001:  # Epsilon
                     logger.warning(f"✅ REDUCE_ONLY_FIX: {side} {symbol} is already flat (rem={remaining_amt}). Graceful success.")
+                    asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
                     return {
                         'id': 'already_closed_fallback',
                         'symbol': symbol,
@@ -3917,6 +3918,7 @@ class LiveBinanceTrader:
                         params={'reduceOnly': True}
                     )
                     logger.info(f"✅ CLOSE RETRY SUCCESS: {side} {symbol} | Order: {order.get('id', 'N/A')}")
+                    asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
                     return {
                         'id': order.get('id'),
                         'symbol': symbol,
@@ -4054,10 +4056,19 @@ class LiveBinanceTrader:
     # ================================================================
     @staticmethod
     def _order_is_reduce_only(order: dict) -> bool:
-        """Strict reduceOnly parse for CCXT + Binance raw fields."""
+        """Strict exit-order parse for CCXT + Binance raw fields.
+        Accepts both reduceOnly and closePosition=true (Binance close-all conditionals).
+        """
         raw_reduce = order.get('reduceOnly')
         info_reduce = (order.get('info') or {}).get('reduceOnly')
-        return (raw_reduce is True) or (str(info_reduce).strip().lower() == 'true')
+        raw_close_position = order.get('closePosition')
+        info_close_position = (order.get('info') or {}).get('closePosition')
+        return (
+            (raw_reduce is True)
+            or (str(info_reduce).strip().lower() == 'true')
+            or (raw_close_position is True)
+            or (str(info_close_position).strip().lower() == 'true')
+        )
     
     async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
         """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
@@ -4079,7 +4090,7 @@ class LiveBinanceTrader:
             result['errors'] = 1
             return result
         
-        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market'}
+        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market', 'trailing_stop_market'}
         
         for order in open_orders:
             order_type = (order.get('type') or '').lower()
@@ -12937,6 +12948,13 @@ async def _refresh_binance_trade_cache_async(trigger: str = "periodic"):
             timeout=UI_TRADE_FETCH_TIMEOUT_SEC
         )
         if not binance_trades:
+            # Even when Binance income API has no fresh rows yet, keep UI history hot from local SQLite.
+            try:
+                sqlite_trades = await sqlite_manager.get_full_trade_history(limit=0)
+                if sqlite_trades:
+                    ui_state_cache.trades = sqlite_trades
+            except Exception as load_err:
+                logger.debug(f"BINANCE_FETCH_ASYNC: SQLite fallback load failed: {load_err}")
             ui_state_cache.last_binance_trade_fetch = fetch_started
             return
 
@@ -13160,6 +13178,12 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 ui_state_cache.balance = balance_data.get('walletBalance', 0)
                 ui_state_cache.live_balance = balance_data
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                # Keep trade history live from engine memory; Binance income sync remains enrichment/backfill.
+                ui_state_cache.trades = sorted(
+                    global_paper_trader.trades,
+                    key=lambda t: t.get('closeTime', t.get('close_time', 0)),
+                    reverse=True
+                )
                 ui_state_cache.trading_mode = "live"
                 logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
                 cached_pnl = getattr(live_binance_trader, 'cached_pnl', None)
@@ -28100,7 +28124,7 @@ class PaperTradingEngine:
                 # Still clean up conditional orders (SL/TP on exchange)
                 try:
                     asyncio.ensure_future(
-                        live_binance_trader.cancel_reduce_only_conditionals(symbol, trace_id)
+                        live_binance_trader._post_close_cleanup(symbol, trace_id)
                     )
                 except Exception:
                     pass
