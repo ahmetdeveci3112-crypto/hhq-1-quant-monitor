@@ -7958,6 +7958,152 @@ def compute_leverage_distance_factor(leverage: float) -> float:
     raw = math.pow(max(1.0, leverage) / 10.0, 0.35)
     return _clamp(raw, 0.85, 1.35)
 
+# ================================================================
+# Batch 2: UNIFIED LEVERAGE + SIZING HELPERS
+# PARITY_MODE: helpers compute shadow values, old path applies.
+# ================================================================
+
+PARITY_MODE = os.environ.get('PARITY_MODE', 'true').lower() == 'true'
+
+def compute_effective_leverage(
+    atr_pct: float, spread_pct: float, volume_24h: float,
+    price: float, base_leverage: int,
+    session_mult: float = 1.0, balance_mult: float = 1.0,
+    user_mult: float = 1.0, strategy_mult: float = 1.0,
+    override_cap: int = 0, volatile_soft_cap: int = 0,
+) -> dict:
+    """Batch 2: Single-authority leverage computation.
+    Returns dict with 'leverage', 'factors', 'cap_reason'.
+    """
+    factors = {}
+
+    # 1. Volatility factor
+    if atr_pct <= 10.0:
+        vol_f = 1.0
+    elif atr_pct <= 20.0:
+        vol_f = 0.8
+    elif atr_pct <= 30.0:
+        vol_f = 0.6
+    elif atr_pct <= 50.0:
+        vol_f = 0.4
+    else:
+        vol_f = 0.3
+    factors['vol'] = round(vol_f, 2)
+
+    # 2. Price factor (log-based)
+    if price > 0:
+        log_price = math.log10(max(price, 0.0001))
+        price_f = _clamp(0.95 + log_price * 0.03, 0.85, 1.0)
+    else:
+        price_f = 1.0
+    factors['price'] = round(price_f, 2)
+
+    # 3. Spread factor
+    if spread_pct > 0:
+        spread_f = _clamp(1.0 - spread_pct * 1.5, 0.65, 1.0)
+    else:
+        spread_f = 1.0
+    factors['spread'] = round(spread_f, 2)
+
+    factors['session'] = round(session_mult, 2)
+    factors['balance'] = round(balance_mult, 2)
+    factors['user'] = round(user_mult, 2)
+    factors['strategy'] = round(strategy_mult, 2)
+
+    raw = base_leverage * vol_f * price_f * spread_f * session_mult * balance_mult * user_mult * strategy_mult
+    leverage = max(3, int(round(raw)))
+
+    cap_reasons = []
+
+    # Volatility hard cap
+    if atr_pct >= 30:
+        vol_cap = 3
+    elif atr_pct >= 20:
+        vol_cap = 5
+    elif atr_pct >= 12:
+        vol_cap = 8
+    else:
+        vol_cap = 75
+    if spread_pct >= 0.20 or volume_24h < 1_000_000:
+        vol_cap = min(vol_cap, 5)
+    if leverage > vol_cap:
+        cap_reasons.append(f"VOL_CAP({leverage}→{vol_cap})")
+        leverage = vol_cap
+
+    # Volatile soft cap
+    if volatile_soft_cap > 0 and leverage > volatile_soft_cap:
+        cap_reasons.append(f"VOLATILE_SOFT({leverage}→{volatile_soft_cap})")
+        leverage = volatile_soft_cap
+
+    # Override cap (BTC counter-trend etc)
+    if override_cap > 0 and leverage > override_cap:
+        cap_reasons.append(f"OVERRIDE({leverage}→{override_cap})")
+        leverage = override_cap
+
+    leverage = max(3, min(75, leverage))
+
+    return {
+        'leverage': leverage,
+        'raw': round(raw, 1),
+        'factors': factors,
+        'cap_reason': ','.join(cap_reasons) if cap_reasons else 'none',
+    }
+
+
+def compute_position_size_usd(
+    balance: float, leverage: float, session_risk: float,
+    size_mult: float, atr_pct: float, spread_pct: float,
+    volume_24h: float, mtf_size_mod: float = 1.0,
+    min_pct: float = 0.02, max_pct: float = 0.10,
+) -> dict:
+    """Batch 2: Single-authority position sizing with risk+portfolio band.
+    Returns dict with 'size_usd', 'risk_score', 'target_pct', 'cap_reasons'.
+    """
+    # Risk score 0..1 — how risky is this market
+    atr_risk = _clamp(atr_pct / 20.0, 0.0, 1.0)
+    spread_risk = _clamp(spread_pct / 0.5, 0.0, 1.0)
+    volume_risk = _clamp(1.0 - min(volume_24h / 10_000_000, 1.0), 0.0, 1.0)
+    risk_score = atr_risk * 0.3 + spread_risk * 0.3 + volume_risk * 0.4
+
+    # Target pct of balance
+    target_pct = max_pct - risk_score * (max_pct - min_pct)
+    target_pct = _clamp(target_pct, min_pct, max_pct)
+
+    # Base size
+    size_usd = balance * target_pct * leverage * session_risk * size_mult * mtf_size_mod
+
+    cap_reasons = []
+
+    # Reduction cap (max 60% reduction from base)
+    base_full = balance * target_pct * leverage
+    if base_full > 0:
+        min_allowed = base_full * 0.4
+        max_allowed = base_full * 1.5
+        if size_usd < min_allowed:
+            cap_reasons.append(f"MIN_FLOOR({size_usd:.0f}→{min_allowed:.0f})")
+            size_usd = min_allowed
+        elif size_usd > max_allowed:
+            cap_reasons.append(f"MAX_CEIL({size_usd:.0f}→{max_allowed:.0f})")
+            size_usd = max_allowed
+
+    # Volume/volatility/balance cap
+    max_size = balance * 0.15
+    if atr_pct >= 20:
+        max_size = balance * 0.07
+    if volume_24h < 1_000_000:
+        max_size = min(max_size, balance * 0.05)
+    if size_usd > max_size:
+        cap_reasons.append(f"SIZE_CAP({size_usd:.0f}→{max_size:.0f})")
+        size_usd = max_size
+
+    return {
+        'size_usd': round(size_usd, 2),
+        'risk_score': round(risk_score, 3),
+        'target_pct': round(target_pct, 4),
+        'cap_reasons': ','.join(cap_reasons) if cap_reasons else 'none',
+    }
+
+
 def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
     """
     Map BTC counter-trend penalty to risk caps.
@@ -24923,6 +25069,32 @@ class PaperTradingEngine:
             signal['signalLeverageRaw'] = raw_leverage
             signal['signalLeverageEffective'] = adjusted_leverage
         
+        # Batch 2: Shadow leverage computation
+        # NOTE: adjusted_leverage is already fully baked (session/balance/user/strategy applied).
+        # We pass it as base with mults=1.0 so the helper only adds its own cap logic.
+        try:
+            _shadow_vol_pct = (atr / price * 100) if price > 0 else 10.0
+            _shadow_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
+            _shadow_vol24h = float(signal.get('volume24h', 0)) if signal else 0
+            _shadow_override = signal.get('overrideLeverageCap', 0) if signal else 0
+            _shadow_volatile_cap = signal.get('volatile_veto_softpass_lev_cap', 0) if signal else 0
+            _shadow_lev = compute_effective_leverage(
+                atr_pct=_shadow_vol_pct, spread_pct=_shadow_spread,
+                volume_24h=_shadow_vol24h, price=price,
+                base_leverage=adjusted_leverage,
+                session_mult=1.0, balance_mult=1.0,
+                user_mult=1.0, strategy_mult=1.0,
+                override_cap=_shadow_override, volatile_soft_cap=_shadow_volatile_cap,
+            )
+            _lev_new = _shadow_lev['leverage']
+            _lev_delta = abs(_lev_new - adjusted_leverage) / max(adjusted_leverage, 1) * 100
+            if _lev_delta > 15:
+                logger.warning(f"LEV_PIPE_V2_REGRESSION: {trade_symbol} old={adjusted_leverage} new={_lev_new} delta={_lev_delta:.1f}% factors={_shadow_lev['factors']} cap={_shadow_lev['cap_reason']}")
+            else:
+                logger.info(f"LEV_PIPE_V2_SHADOW: {trade_symbol} old={adjusted_leverage} new={_lev_new} delta={_lev_delta:.1f}% factors={_shadow_lev['factors']} cap={_shadow_lev['cap_reason']}")
+        except Exception as _lev_shadow_err:
+            logger.debug(f"LEV_PIPE_V2_SHADOW error: {_lev_shadow_err}")
+        
         # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
         dynamic_risk = self.get_dynamic_risk_per_trade()
         session_risk = session_manager.adjust_risk(dynamic_risk)
@@ -25052,6 +25224,24 @@ class PaperTradingEngine:
             position_size_usd = max_size_usd
             size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
             reasons.append(size_cap_reason)
+        
+        # Batch 2: Shadow sizing computation
+        try:
+            _shadow_size = compute_position_size_usd(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=size_mult,
+                atr_pct=_vol_pct, spread_pct=spread_pct,
+                volume_24h=volume_24h,
+                mtf_size_mod=mtf_size_modifier if 'mtf_size_modifier' in dir() else 1.0,
+            )
+            _size_new = _shadow_size['size_usd']
+            _size_delta = abs(_size_new - position_size_usd) / max(position_size_usd, 1) * 100
+            if _size_delta > 15:
+                logger.warning(f"SIZE_PIPE_V2_REGRESSION: {trade_symbol} old=${position_size_usd:.2f} new=${_size_new:.2f} delta={_size_delta:.1f}% risk_score={_shadow_size['risk_score']} target_pct={_shadow_size['target_pct']} caps={_shadow_size['cap_reasons']}")
+            else:
+                logger.info(f"SIZE_PIPE_V2_SHADOW: {trade_symbol} old=${position_size_usd:.2f} new=${_size_new:.2f} delta={_size_delta:.1f}% risk_score={_shadow_size['risk_score']} target_pct={_shadow_size['target_pct']} caps={_shadow_size['cap_reasons']}")
+        except Exception as _size_shadow_err:
+            logger.debug(f"SIZE_PIPE_V2_SHADOW error: {_size_shadow_err}")
         
         # OVP-1: Hoist _pending_id for canary decision (before min-notional)
         _pending_id = f"PO_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}_{side}_{trade_symbol}"
@@ -27378,6 +27568,28 @@ class PaperTradingEngine:
         signal['signalLeverageRaw'] = raw_leverage
         signal['signalLeverageEffective'] = adjusted_leverage
         
+        # Batch 2: Shadow leverage (manual path)
+        # NOTE: adjusted_leverage is already fully baked. Pass as base with mults=1.0.
+        try:
+            _m_vol_pct = (float(signal.get('atr', 0)) / current_price * 100) if current_price > 0 else 10.0
+            _m_spread = float(signal.get('spreadPct', 0.05))
+            _m_vol24h = float(signal.get('volume24h', 0))
+            _m_shadow_lev = compute_effective_leverage(
+                atr_pct=_m_vol_pct, spread_pct=_m_spread,
+                volume_24h=_m_vol24h, price=current_price,
+                base_leverage=adjusted_leverage,
+                session_mult=1.0, balance_mult=1.0, user_mult=1.0,
+                override_cap=signal.get('overrideLeverageCap', 0),
+            )
+            _m_lev_new = _m_shadow_lev['leverage']
+            _m_lev_delta = abs(_m_lev_new - adjusted_leverage) / max(adjusted_leverage, 1) * 100
+            if _m_lev_delta > 15:
+                logger.warning(f"LEV_PIPE_V2_REGRESSION: {signal.get('symbol','')} old={adjusted_leverage} new={_m_lev_new} delta={_m_lev_delta:.1f}% path=manual")
+            else:
+                logger.info(f"LEV_PIPE_V2_SHADOW: {signal.get('symbol','')} old={adjusted_leverage} new={_m_lev_new} delta={_m_lev_delta:.1f}% path=manual")
+        except Exception:
+            pass
+        
         # Get size multiplier from signal and BalanceProtector
         signal_size_mult = signal.get('sizeMultiplier', 1.0)
         balance_size_mult = balance_protector.calculate_position_size_multiplier(self.balance)
@@ -27396,6 +27608,22 @@ class PaperTradingEngine:
         risk_amount = self.balance * session_risk * final_size_mult
         position_size_usd = risk_amount * adjusted_leverage
         position_size = position_size_usd / current_price
+        
+        # Batch 2: Shadow sizing (manual path)
+        try:
+            _m_vol_pct2 = (float(signal.get('atr', 0)) / current_price * 100) if current_price > 0 else 2.0
+            _m_shadow_size = compute_position_size_usd(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=final_size_mult,
+                atr_pct=_m_vol_pct2, spread_pct=float(signal.get('spreadPct', 0.05)),
+                volume_24h=float(signal.get('volume24h', 0)),
+            )
+            _m_size_new = _m_shadow_size['size_usd']
+            _m_size_delta = abs(_m_size_new - position_size_usd) / max(position_size_usd, 1) * 100
+            _m_s_tag = 'SIZE_PIPE_V2_REGRESSION' if _m_size_delta > 15 else 'SIZE_PIPE_V2_SHADOW'
+            logger.info(f"{_m_s_tag}: {signal.get('symbol','')} old=${position_size_usd:.2f} new=${_m_size_new:.2f} delta={_m_size_delta:.1f}% path=manual")
+        except Exception:
+            pass
         
         # Log session info
         session_info = session_manager.get_session_info()
