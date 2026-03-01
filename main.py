@@ -8133,6 +8133,10 @@ FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'shadow').lo
 FALLBACK_MIN_NET_EDGE = float(os.environ.get('FALLBACK_MIN_NET_EDGE', '0.0008'))       # absolute minimum edge
 FALLBACK_EDGE_COST_MULT = float(os.environ.get('FALLBACK_EDGE_COST_MULT', '1.25'))     # required_edge = max(MIN, MULT*cost)
 
+# DQ-1: Metadata Coverage Guard
+DQ_AUTO_APPLY_MIN_COVERAGE = float(os.environ.get('DQ_AUTO_APPLY_MIN_COVERAGE', '70'))   # below → auto-apply disabled
+DQ_OPTIMIZE_MIN_COVERAGE = float(os.environ.get('DQ_OPTIMIZE_MIN_COVERAGE', '50'))       # below → optimize hard-blocked
+
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
     price: float, base_leverage: int,
@@ -28347,6 +28351,49 @@ class PaperTradingEngine:
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
                         self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
 
+    @staticmethod
+    def _normalize_close_reason(reason: str) -> str:
+        """EX-1: Map raw close reason to a fixed enum for clean PnL attribution.
+        Returns one of: SL_HIT, TP_HIT, TRAIL_EXIT, EMERGENCY_SL, MANUAL_CLOSE,
+        TIMEOUT_EXIT, KILL_SWITCH, ADVERSE_EXIT, RECOVERY_EXIT, SIGNAL_REVERSAL,
+        PORTFOLIO_DD, CANCELLED, OTHER.
+        """
+        r = reason.upper() if reason else 'OTHER'
+        if 'EMERGENCY' in r:
+            return 'EMERGENCY_SL'
+        if r.startswith('SL') or 'STOP_LOSS' in r or r == 'SL_HIT':
+            return 'SL_HIT'
+        if r.startswith('TP') or 'TAKE_PROFIT' in r or r == 'TP_HIT':
+            return 'TP_HIT'
+        if 'TRAIL' in r and ('EXIT' in r or 'STOP' in r):
+            return 'TRAIL_EXIT'
+        if 'KILL' in r:
+            return 'KILL_SWITCH'
+        if 'TIME' in r and ('REDUCE' in r or 'FORCE' in r or 'GRADUAL' in r or 'TIMEOUT' in r):
+            return 'TIMEOUT_EXIT'
+        if 'ADVERSE' in r:
+            return 'ADVERSE_EXIT'
+        if 'RECOVERY' in r:
+            return 'RECOVERY_EXIT'
+        if 'REVERSAL' in r or 'FAILED_CONT' in r:
+            return 'SIGNAL_REVERSAL'
+        if 'PORTFOLIO' in r or 'DRAWDOWN' in r:
+            return 'PORTFOLIO_DD'
+        if 'MANUAL' in r:
+            return 'MANUAL_CLOSE'
+        if 'CANCEL' in r or 'EXPIRED' in r:
+            return 'CANCELLED'
+        if 'SLIPPAGE_EXIT' in r:
+            # Inherit from wrapped reason
+            inner = r.replace('SLIPPAGE_EXIT(', '').rstrip(')')
+            if 'TP' in inner:
+                return 'TP_HIT'
+            if 'SL' in inner or 'TRAIL' in inner or 'EMERGENCY' in inner:
+                return 'SL_HIT'
+        if r in ('CLOSED', 'POSITION CLOSED ON BINANCE', 'HISTORICAL (FROM BINANCE)', 'SYNCED FROM BINANCE'):
+            return 'OTHER'
+        return 'OTHER'
+
     def _format_detailed_reason(self, reason: str, pos: Dict, exit_price: float, pnl_percent: float) -> str:
         """
         Phase 138: Format detailed close reason for trade history.
@@ -28527,6 +28574,7 @@ class PaperTradingEngine:
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
+            "closeReasonNormalized": self._normalize_close_reason(reason),
             "leverage": pos.get('leverage', 10),
             "isLive": pos.get('isLive', False),
             "is_canary": pos.get('is_canary', False),  # OVP-1: canary flag for metric reporter
@@ -28652,7 +28700,25 @@ class PaperTradingEngine:
             if hhq_hyperoptimizer and hhq_hyperoptimizer.enabled:
                 hhq_hyperoptimizer.record_trade(trade)
                 if hhq_hyperoptimizer.should_auto_optimize():
-                    asyncio.create_task(hhq_hyperoptimizer.optimize(apply=hhq_hyperoptimizer.auto_apply_enabled))
+                    # DQ-1: Gate auto-apply on data quality (async wrapper for sync context)
+                    async def _dq_gated_optimize():
+                        _dq_apply = hhq_hyperoptimizer.auto_apply_enabled
+                        if _dq_apply:
+                            try:
+                                _dq = await sqlite_manager.get_trade_data_quality_24h()
+                                _dq_cov = _dq.get('trade_metadata_coverage_pct_24h', 100)
+                                if _dq_cov < DQ_AUTO_APPLY_MIN_COVERAGE:
+                                    _dq_apply = False
+                                    self.pipeline_metrics.setdefault('dq_auto_apply_blocked', 0)
+                                    self.pipeline_metrics['dq_auto_apply_blocked'] += 1
+                                    logger.warning(
+                                        f"⚠️ DATA_QUALITY_BLOCK: auto_apply disabled — "
+                                        f"coverage={_dq_cov:.1f}% < min={DQ_AUTO_APPLY_MIN_COVERAGE}%"
+                                    )
+                            except Exception as _dq_err:
+                                logger.debug(f"DQ-1 coverage check error (non-blocking): {_dq_err}")
+                        await hhq_hyperoptimizer.optimize(apply=_dq_apply)
+                    asyncio.create_task(_dq_gated_optimize())
         except Exception as e:
             logger.warning(f"⚠️ Phase 193 post-close hook error: {e}")
         
@@ -31593,7 +31659,33 @@ async def phase193_hyperopt_run(request: Request):
     if not hhq_hyperoptimizer.trade_data and 'global_paper_trader' in globals():
         hhq_hyperoptimizer.trade_data = list(getattr(global_paper_trader, 'trades', []))
     
+    # DQ-1: Hard-block manual optimize if coverage < threshold
+    try:
+        _dq = await sqlite_manager.get_trade_data_quality_24h()
+        _dq_cov = _dq.get('trade_metadata_coverage_pct_24h', 100)
+        if _dq_cov < DQ_OPTIMIZE_MIN_COVERAGE:
+            logger.warning(f"⚠️ DATA_QUALITY_BLOCK: manual optimize blocked — coverage={_dq_cov:.1f}%")
+            return JSONResponse({
+                "error": "DATA_QUALITY_BLOCK",
+                "block_reason": f"coverage {_dq_cov:.1f}% < min {DQ_OPTIMIZE_MIN_COVERAGE}%",
+                "coverage_pct": _dq_cov
+            }, status_code=400)
+        # also gate auto-apply on coverage
+        if apply and _dq_cov < DQ_AUTO_APPLY_MIN_COVERAGE:
+            apply = False
+            logger.warning(f"⚠️ DATA_QUALITY_BLOCK: apply disabled for this run — coverage={_dq_cov:.1f}%")
+    except Exception as _dq_err:
+        logger.debug(f"DQ-1 manual optimize coverage check error: {_dq_err}")
+    
     result = await hhq_hyperoptimizer.optimize(n_trials=n_trials, apply=apply, force_apply=force_apply)
+    
+    # DQ-1: Coverage info in response
+    _dq_resp = {}
+    try:
+        _dq = await sqlite_manager.get_trade_data_quality_24h()
+        _dq_resp['coverage_pct'] = _dq.get('trade_metadata_coverage_pct_24h', 100)
+    except Exception:
+        pass
     
     # Phase 269: Merge full status so frontend always gets consistent telemetry
     if 'error' not in result:
@@ -31601,6 +31693,7 @@ async def phase193_hyperopt_run(request: Request):
         for k, v in status.items():
             if k not in result:  # optimize() fields take priority
                 result[k] = v
+    result.update(_dq_resp)  # DQ-1: include coverage info
     
     return JSONResponse(result)
 
@@ -31642,6 +31735,21 @@ async def phase193_hyperopt_force_apply_last():
     
     if not hhq_hyperoptimizer.best_params:
         return JSONResponse({"error": "No best params available. Run optimize first."}, status_code=400)
+    
+    # DQ-1: Coverage guard — block force-apply if coverage < threshold
+    try:
+        _dq = await sqlite_manager.get_trade_data_quality_24h()
+        _dq_cov = _dq.get('trade_metadata_coverage_pct_24h', 100)
+        if _dq_cov < DQ_AUTO_APPLY_MIN_COVERAGE:
+            logger.warning(f"⚠️ DATA_QUALITY_BLOCK: force-apply-last blocked — coverage={_dq_cov:.1f}%")
+            return JSONResponse({
+                "applied": False,
+                "reason": "DATA_QUALITY_BLOCK",
+                "block_reason": f"coverage {_dq_cov:.1f}% < min {DQ_AUTO_APPLY_MIN_COVERAGE}%",
+                "coverage_pct": _dq_cov
+            }, status_code=400)
+    except Exception as _dq_err:
+        logger.debug(f"DQ-1 force-apply coverage check error: {_dq_err}")
     
     apply_res = await hhq_hyperoptimizer.maybe_apply_to_runtime(force=True)
     
