@@ -193,6 +193,7 @@ const fmtNum = (value: number | null | undefined, digits: number = 2, fallback: 
 
 // Phase 239V2: Shared helper for consistent pullback value extraction
 const getPullbackValues = (signal: CoinOpportunity, entryPrice: number): { finalPb: number; floorPb: number | null } => {
+    // P0: zero-division guard
     const calcFallback = signal.price > 0 ? Math.abs((entryPrice - signal.price) / signal.price * 100) : 0;
     // Explicit numeric guard: skip pullbackDynFinal=0 (legacy/missing telemetry)
     const dynFinal = (typeof signal.pullbackDynFinal === 'number' && signal.pullbackDynFinal > 0)
@@ -418,20 +419,29 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         if (sig.price !== undefined && !sig.state) return sig;
 
         // Find matching live opportunity for real-time telemetry
-        const liveOpp = opportunities.find(o => o.symbol === sig.symbol) || {};
+        const liveOpp = opportunities.find(o => o.symbol === sig.symbol) || {} as any;
+
+        // P0: Price fallback chain — liveOpp > persistent snapshot > 0
+        const resolvedPrice = liveOpp.price || sig.lastPrice || sig.price || 0;
 
         // Merge: Persistent state is king, liveOpp provides telemetry (prices, indicators)
         return {
             ...liveOpp, // Base telemetry
             ...sig,     // Override with persistent state (symbol, signalAction, signalScore, etc.)
             // Ensure essential UI fields have a fallback if liveOpp doesn't exist
-            price: liveOpp.price || 0,
+            price: resolvedPrice,
             spreadPct: liveOpp.spreadPct ?? 0.05,
             volumeRatio: liveOpp.volumeRatio ?? 1.0,
             zscore: liveOpp.zscore ?? 0,
             hurst: liveOpp.hurst ?? 0,
-            leverage: liveOpp.leverage || 10,
-            lastSignalTime: sig.lastRefreshTs || liveOpp.lastSignalTime || (Date.now() / 1000)
+            leverage: liveOpp.leverage || sig.leverage || 10,
+            lastSignalTime: sig.lastRefreshTs || liveOpp.lastSignalTime || (Date.now() / 1000),
+            // P0: Carry enriched snapshot fields through
+            entryPriceBackend: liveOpp.entryPriceBackend || sig.entryPriceBackend || 0,
+            strategyMode: liveOpp.strategyMode || sig.strategyMode || '',
+            entryQualityPass: liveOpp.entryQualityPass ?? sig.entryQualityPass ?? false,
+            entryQualityReasons: liveOpp.entryQualityReasons || sig.entryQualityReasons || [],
+            executionRejectReason: liveOpp.executionRejectReason || sig.executionRejectReason || '',
         } as CoinOpportunity;
     });
 
@@ -465,6 +475,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
 
     const handleMarketOrder = async (signal: CoinOpportunity) => {
         if (!onMarketOrder) return;
+        // P0: Block market order if price is invalid
+        if (!signal.price || signal.price <= 0) return;
         setLoadingSymbol(signal.symbol);
         try {
             await onMarketOrder(signal.symbol, signal.signalAction as 'LONG' | 'SHORT', signal.price, signal.leverage || 10);
@@ -602,11 +614,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     {onMarketOrder && (
                         <button
                             onClick={() => handleMarketOrder(signal)}
-                            disabled={isLoading}
+                            disabled={isLoading || !signal.price || signal.price <= 0}
                             className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold ${isLong ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'
-                                } ${isLoading ? 'opacity-50' : ''}`}
+                                } ${(isLoading || !signal.price || signal.price <= 0) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            title={!signal.price || signal.price <= 0 ? 'Fiyat bekleniyor' : ''}
                         >
-                            {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
+                            {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : !signal.price || signal.price <= 0 ? <>⏳Bekleniyor</> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
                         </button>
                     )}
                 </div>
@@ -835,11 +848,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             {onMarketOrder && (
                                                 <button
                                                     onClick={() => handleMarketOrder(signal)}
-                                                    disabled={isLoading}
+                                                    disabled={isLoading || !signal.price || signal.price <= 0}
                                                     className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold ${isLong ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'
-                                                        } ${isLoading ? 'opacity-50' : ''}`}
+                                                        } ${(isLoading || !signal.price || signal.price <= 0) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                    title={!signal.price || signal.price <= 0 ? 'Fiyat bekleniyor' : ''}
                                                 >
-                                                    {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
+                                                    {isLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : !signal.price || signal.price <= 0 ? <>⏳Bekleniyor</> : <><ShoppingCart className="w-3 h-3" />Piyasa</>}
                                                 </button>
                                             )}
                                         </td>

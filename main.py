@@ -13526,7 +13526,15 @@ async def update_ui_cache(opportunities: list, stats: dict):
         # Update opportunities and stats
         # Bug Fix: Cap WS payload to top 150 to prevent 3MB JSON blocking event loop & crashing UI
         filtered_opportunities.sort(key=lambda x: float(x.get('signalScore') or 0), reverse=True)
-        ui_state_cache.opportunities = filtered_opportunities[:150]
+        # P0: Active signal symbol union — ensure active signal coins always get liveOpp telemetry
+        _top150 = filtered_opportunities[:150]
+        _top150_symbols = {o.get('symbol') for o in _top150}
+        _active_signal_symbols = set(active_signals.keys()) if 'active_signals' in globals() else set()
+        for opp in filtered_opportunities[150:]:
+            if opp.get('symbol') in _active_signal_symbols and opp.get('symbol') not in _top150_symbols:
+                _top150.append(opp)
+                _top150_symbols.add(opp.get('symbol'))
+        ui_state_cache.opportunities = _top150
         
         # Phase 263: Keep UI counters consistent with Active Signals tab.
         # Long/Short/Active should come from persistent active signals, not opportunities.
@@ -15156,6 +15164,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if action == 'NONE':
         return
 
+    # P0: Invalid price gate — reject before any active_signals write
+    if not price or price <= 0:
+        symbol = signal.get('symbol', global_paper_trader.symbol)
+        logger.warning(f"🚫 INVALID_SIGNAL_PRICE: {symbol} {action} price={price} — rejected")
+        return
+
     symbol = signal.get('symbol', global_paper_trader.symbol)
 
     async def _cleanup_symbol_pending_orders(clean_symbol: str, reason: str):
@@ -15199,6 +15213,10 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             global_paper_trader.set_execution_feedback(symbol, reason)
         except Exception:
             pass
+        # P0: Store reject reason on persistent signal for UI snapshot
+        _sig = active_signals.get(symbol)
+        if _sig:
+            _sig['execution_reject_reason'] = reason
     
     # ================================================================
     # Phase 142: Block signals during recovery cooldown
@@ -15299,6 +15317,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 existing_signal['state'] = 'ACTIVE'
                 existing_signal['counter_count'] = 0  # Reset counter
                 existing_signal['counter_first_ts'] = 0
+                # P0: Enrich snapshot on refresh
+                existing_signal['last_price'] = price
+                existing_signal['leverage'] = signal.get('leverage', existing_signal.get('leverage', 10))
+                existing_signal['strategy_mode'] = signal.get('strategyMode', signal.get('activeStrategy', existing_signal.get('strategy_mode', '')))
+                existing_signal['entry_quality_pass'] = signal.get('entryQualityPass', existing_signal.get('entry_quality_pass'))
+                existing_signal['entry_quality_reasons'] = signal.get('entryQualityReasons', existing_signal.get('entry_quality_reasons', []))
+                existing_signal['entry_price_backend'] = signal.get('entryPriceBackend', existing_signal.get('entry_price_backend', 0))
                 logger.info(
                     f"🔄 SIGNAL_REFRESH: {symbol} {action} score={existing_signal['score']:.0f} "
                     f"age={now_ts - existing_signal['created_ts']:.0f}s"
@@ -15363,6 +15388,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         'counter_first_ts': 0,
                         'reentry_count': 0,
                         'last_close_ts': existing_signal.get('last_close_ts', 0),
+                        # P0: Snapshot enrichment
+                        'last_price': price,
+                        'entry_price_backend': signal.get('entryPriceBackend', 0),
+                        'leverage': signal.get('leverage', 10),
+                        'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                        'entry_quality_pass': signal.get('entryQualityPass', False),
+                        'entry_quality_reasons': signal.get('entryQualityReasons', []),
+                        'execution_reject_reason': '',
                     }
                     
                     if existing_position:
@@ -15408,6 +15441,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 'counter_first_ts': 0,
                 'reentry_count': 0,
                 'last_close_ts': 0,
+                # P0: Snapshot enrichment
+                'last_price': price,
+                'entry_price_backend': signal.get('entryPriceBackend', 0),
+                'leverage': signal.get('leverage', 10),
+                'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                'entry_quality_pass': signal.get('entryQualityPass', False),
+                'entry_quality_reasons': signal.get('entryQualityReasons', []),
+                'execution_reject_reason': '',
             }
             logger.info(f"📡 SIGNAL_NEW: {symbol} {action} registered, score={signal.get('confidenceScore', 0):.0f}")
         
@@ -30351,7 +30392,15 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
             "counterCount": sig.get('counter_count', 0),
             "reentryCount": sig.get('reentry_count', 0),
             "lastCloseTs": sig.get('last_close_ts', 0),
-            "ageSec": age
+            "ageSec": age,
+            # P0: Enriched snapshot fields
+            "lastPrice": sig.get('last_price', 0),
+            "entryPriceBackend": sig.get('entry_price_backend', 0),
+            "leverage": sig.get('leverage', 10),
+            "strategyMode": sig.get('strategy_mode', ''),
+            "entryQualityPass": sig.get('entry_quality_pass', False),
+            "entryQualityReasons": sig.get('entry_quality_reasons', []),
+            "executionRejectReason": sig.get('execution_reject_reason', ''),
         })
 
     for sym in stale_symbols:
