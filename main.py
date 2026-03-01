@@ -8018,6 +8018,12 @@ PARITY_MODE = os.environ.get('PARITY_MODE', 'true').lower() == 'true'
 LEV_APPLY_MODE = os.environ.get('LEV_APPLY_MODE', 'parity').lower()   # 'parity' | 'shadow'
 SIZE_APPLY_MODE = os.environ.get('SIZE_APPLY_MODE', 'parity').lower()  # 'parity' | 'shadow'
 
+# Patch C: Universe prefilter thresholds
+UNIVERSE_MAX_COINS = int(os.environ.get('UNIVERSE_MAX_COINS', '150'))
+UNIVERSE_MIN_VOLUME_USD = float(os.environ.get('UNIVERSE_MIN_VOLUME_USD', '500000'))   # min 24h quote volume
+UNIVERSE_MAX_SPREAD_PCT = float(os.environ.get('UNIVERSE_MAX_SPREAD_PCT', '0.8'))     # max bid-ask spread %
+UNIVERSE_PREFILTER_ENABLED = os.environ.get('UNIVERSE_PREFILTER_ENABLED', 'true').lower() == 'true'
+
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
     price: float, base_leverage: int,
@@ -13011,6 +13017,45 @@ class MultiCoinScanner:
         opportunities = []
         signals = []
         
+        # Patch C: Dynamic universe prefilter — score, sort, slice
+        _pre_total = len(tickers)
+        if UNIVERSE_PREFILTER_ENABLED and _pre_total > 0:
+            _scored_candidates = []
+            _vol_filtered = 0
+            _spread_filtered = 0
+            for _sym, _tk in tickers.items():
+                _qvol = _tk.get('quoteVolume', 0) or 0
+                # Volume gate
+                if _qvol < UNIVERSE_MIN_VOLUME_USD:
+                    _vol_filtered += 1
+                    continue
+                # Spread gate (from book ticker)
+                _bk = book_cache.get(_sym, {})
+                _b = _bk.get('bid', 0)
+                _a = _bk.get('ask', 0)
+                _spread_pct = 0
+                if _b > 0 and _a > 0 and _a > _b:
+                    _spread_pct = ((_a - _b) / ((_a + _b) / 2)) * 100
+                    if _spread_pct > UNIVERSE_MAX_SPREAD_PCT:
+                        _spread_filtered += 1
+                        continue
+                # Quality score: log(volume) * (1 - spread_pct)  (higher = better)
+                import math
+                _quality = math.log10(max(_qvol, 1)) * (1.0 - min(_spread_pct / 2.0, 0.5))
+                _scored_candidates.append((_sym, _tk, _quality))
+            # Sort by quality descending, then slice
+            _scored_candidates.sort(key=lambda x: x[2], reverse=True)
+            _max = min(UNIVERSE_MAX_COINS, len(_scored_candidates))
+            _sliced = _scored_candidates[:_max]
+            tickers = {s: t for s, t, _ in _sliced}
+            _depth_filtered = _pre_total - _vol_filtered - _spread_filtered - len(_scored_candidates)
+            logger.info(
+                f"🔬 UNIVERSE_PREFILTER: {_pre_total}→{len(tickers)} coins | "
+                f"vol_filtered={_vol_filtered} spread_filtered={_spread_filtered} "
+                f"sliced={len(_scored_candidates)-_max if len(_scored_candidates)>_max else 0} | "
+                f"max_coins={UNIVERSE_MAX_COINS}"
+            )
+        
         # Yield control to event loop every N coins to prevent blocking API requests
         # Lower value = more responsive API but slightly slower scan
         yield_every = 10  # Yield frequently to keep API responsive
@@ -13186,7 +13231,7 @@ class MultiCoinScanner:
             self.exchange = None
 
 # Global MultiCoinScanner instance (no limit - scans ALL perpetuals)
-multi_coin_scanner = MultiCoinScanner(max_coins=999)
+multi_coin_scanner = MultiCoinScanner(max_coins=UNIVERSE_MAX_COINS)
 
 
 # ============================================================================
