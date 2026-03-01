@@ -31028,19 +31028,18 @@ async def scanner_status():
 
     effective_running = multi_coin_scanner.running or task_alive
 
+    # UF-1: get_scanner_stats() provides totalCoins, analyzedCoins, prefilterMetrics etc.
+    scanner_stats = multi_coin_scanner.get_scanner_stats()
     return JSONResponse({
         "running": effective_running,
         "runningFlag": multi_coin_scanner.running,
-        "totalCoins": len(multi_coin_scanner.coins),
-        "analyzedCoins": len(multi_coin_scanner.analyzers),
         "taskAlive": task_alive,
         "cacheInitialized": ui_state_cache._initialized,
         "cacheAgeSec": cache_age,
         "autoRestarted": auto_restarted,
         "staleRestarted": stale_restarted,
         "staleThresholdSec": SCANNER_STALE_CACHE_SEC,
-        # UF-1: Prefilter metrics from scanner stats
-        **multi_coin_scanner.get_scanner_stats()
+        **scanner_stats
     })
 
 # Phase 17: Settings endpoints
