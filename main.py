@@ -13131,13 +13131,21 @@ class MultiCoinScanner:
         signals = []
         
         # Patch C: Dynamic universe prefilter — score, sort, slice
+        # Defensive stablecoin/fiat blocklist (second-pass safety net)
+        _STABLE_FIAT_BASES = {'USDC', 'BUSD', 'TUSD', 'USDP', 'DAI', 'FDUSD', 'USDE', 'EUR', 'GBP'}
+        _STABLE_FIAT_SYMBOLS = {'USDCUSDT', 'BUSDUSDT', 'TUSDUSDT', 'USDPUSDT', 'DAIUSDT', 'FDUSDUSDT', 'USDEUSDT', 'EURUSDT', 'GBPUSDT'}
         _pre_total = len(tickers)
         _prefilter_start = time.time()
         if UNIVERSE_PREFILTER_ENABLED and _pre_total > 0:
             _scored_candidates = []
             _vol_filtered = 0
             _spread_filtered = 0
+            _stable_filtered = 0
             for _sym, _tk in tickers.items():
+                # Defensive stablecoin/fiat guard (catches leakers from external data)
+                if _sym in _STABLE_FIAT_SYMBOLS or (_sym.endswith('USDT') and _sym[:-4] in _STABLE_FIAT_BASES):
+                    _stable_filtered += 1
+                    continue
                 _qvol = _tk.get('quoteVolume', 0) or 0
                 # Volume gate
                 if _qvol < UNIVERSE_MIN_VOLUME_USD:
@@ -13159,17 +13167,20 @@ class MultiCoinScanner:
                 _scored_candidates.append((_sym, _tk, _quality))
             # Sort by quality descending, then slice
             _scored_candidates.sort(key=lambda x: x[2], reverse=True)
-            _max = min(UNIVERSE_MAX_COINS, len(_scored_candidates))
+            # ALL mode: UNIVERSE_MAX_COINS <= 0 means no cap
+            _max = len(_scored_candidates) if UNIVERSE_MAX_COINS <= 0 else min(UNIVERSE_MAX_COINS, len(_scored_candidates))
             _sliced_count = len(_scored_candidates) - _max if len(_scored_candidates) > _max else 0
             _sliced = _scored_candidates[:_max]
             tickers = {s: t for s, t, _ in _sliced}
-            _depth_filtered = _pre_total - _vol_filtered - _spread_filtered - len(_scored_candidates)
+            _depth_filtered = _pre_total - _stable_filtered - _vol_filtered - _spread_filtered - len(_scored_candidates)
             _prefilter_ms = (time.time() - _prefilter_start) * 1000
+            _max_label = 'ALL' if UNIVERSE_MAX_COINS <= 0 else str(UNIVERSE_MAX_COINS)
             # UF-1: Store cycle metrics for observability
             self._prefilter_metrics = {
                 'scan_ts': int(time.time()),
                 'scan_ms': round(_prefilter_ms, 1),
                 'pre_total': _pre_total,
+                'stable_filtered': _stable_filtered,
                 'vol_filtered': _vol_filtered,
                 'spread_filtered': _spread_filtered,
                 'sliced': _sliced_count,
@@ -13177,15 +13188,16 @@ class MultiCoinScanner:
             }
             logger.info(
                 f"🔬 UNIVERSE_PREFILTER_CYCLE: {_pre_total}→{len(tickers)} coins | "
-                f"vol_filtered={_vol_filtered} spread_filtered={_spread_filtered} "
+                f"stable_filtered={_stable_filtered} vol_filtered={_vol_filtered} spread_filtered={_spread_filtered} "
                 f"sliced={_sliced_count} | "
-                f"scan_ms={_prefilter_ms:.1f} max_coins={UNIVERSE_MAX_COINS}"
+                f"scan_ms={_prefilter_ms:.1f} max_coins={_max_label}"
             )
         else:
             self._prefilter_metrics = {
                 'scan_ts': int(time.time()),
                 'scan_ms': 0,
                 'pre_total': _pre_total,
+                'stable_filtered': 0,
                 'vol_filtered': 0,
                 'spread_filtered': 0,
                 'sliced': 0,
