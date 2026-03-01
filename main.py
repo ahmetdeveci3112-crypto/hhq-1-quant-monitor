@@ -3911,7 +3911,10 @@ class LiveBinanceTrader:
                 
                 if not found_pos or remaining_amt <= 0.00001:  # Epsilon
                     logger.warning(f"✅ REDUCE_ONLY_FIX: {side} {symbol} is already flat (rem={remaining_amt}). Graceful success.")
-                    asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                    if close_scope == "FULL":
+                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                    else:
+                        logger.info(f"ℹ️ PARTIAL_CLOSE_RETRY_NO_CLEANUP: {symbol} scope={close_scope} — already flat, skipping cleanup")
                     return {
                         'id': 'already_closed_fallback',
                         'symbol': symbol,
@@ -3937,7 +3940,10 @@ class LiveBinanceTrader:
                         params={'reduceOnly': True}
                     )
                     logger.info(f"✅ CLOSE RETRY SUCCESS: {side} {symbol} | Order: {order.get('id', 'N/A')}")
-                    asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                    if close_scope == "FULL":
+                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                    else:
+                        logger.info(f"ℹ️ PARTIAL_CLOSE_RETRY_NO_CLEANUP: {symbol} scope={close_scope} — retry succeeded, skipping cleanup")
                     return {
                         'id': order.get('id'),
                         'symbol': symbol,
@@ -4174,6 +4180,86 @@ class LiveBinanceTrader:
                     result['errors'] += 1
                     logger.warning(f"⚠️ POST_CLOSE_CLEANUP: Cancel failed for {order['id']} {symbol}: {cancel_err}{trace_str}")
         
+        return result
+
+    async def sweep_orphan_conditionals(self) -> dict:
+        """Orphan sweeper: cancel reduce-only conditional orders for symbols with no open position.
+        Safe to call at startup and periodically (e.g., every 5 min).
+        Only targets: STOP_MARKET, TAKE_PROFIT_MARKET, STOP, TAKE_PROFIT, TRAILING_STOP_MARKET.
+        Only cancels if reduceOnly=true or closePosition=true AND symbol has zero position.
+        """
+        result = {'scanned': 0, 'orphans': 0, 'cancelled': 0, 'errors': 0, 'symbols': []}
+        if not self.enabled or not self.exchange:
+            return result
+
+        try:
+            # 1) Get all open positions (non-zero)
+            positions = await self.get_positions()
+            active_symbols = set()
+            for p in positions:
+                amt = abs(float(p.get('size', 0) or 0))
+                if amt > 0.00001:
+                    active_symbols.add(p.get('symbol', ''))
+
+            # 2) Get all open orders
+            all_orders = await self.exchange.fetch_open_orders()
+            result['scanned'] = len(all_orders)
+
+            conditional_types = {'stop_market', 'take_profit_market', 'stop', 'take_profit', 'trailing_stop_market'}
+
+            for order in all_orders:
+                order_type = (order.get('type') or '').lower()
+                if order_type not in conditional_types:
+                    continue
+
+                # Check reduce-only
+                _info = order.get('info', {})
+                _is_reduce = (
+                    order.get('reduceOnly', False)
+                    or str(_info.get('reduceOnly', 'false')).lower() == 'true'
+                    or str(_info.get('closePosition', 'false')).lower() == 'true'
+                )
+                if not _is_reduce:
+                    continue
+
+                # Extract symbol
+                order_symbol = order.get('symbol', '')  # ccxt format: BTC/USDT:USDT
+                # Convert to internal format
+                raw_sym = _info.get('symbol', '')  # Binance raw: BTCUSDT
+                if not raw_sym and '/' in order_symbol:
+                    raw_sym = order_symbol.split('/')[0] + 'USDT'
+
+                if raw_sym in active_symbols:
+                    continue  # position still exists, not orphan
+
+                # Orphan found — cancel
+                result['orphans'] += 1
+                try:
+                    cancel_sym = order_symbol if '/' in order_symbol else f"{raw_sym[:-4]}/USDT:USDT"
+                    await self.exchange.cancel_order(order['id'], cancel_sym)
+                    result['cancelled'] += 1
+                    if raw_sym not in result['symbols']:
+                        result['symbols'].append(raw_sym)
+                    logger.warning(
+                        f"🧹 ORPHAN_SWEEP_CANCELLED: {raw_sym} order={order['id']} "
+                        f"type={order_type} — no open position"
+                    )
+                except Exception as cancel_err:
+                    err_str = str(cancel_err)
+                    if '-2011' in err_str or 'Unknown order' in err_str:
+                        logger.info(f"ℹ️ ORPHAN_SWEEP: order {order['id']} already gone for {raw_sym}")
+                    else:
+                        result['errors'] += 1
+                        logger.warning(f"⚠️ ORPHAN_SWEEP_FAILED: {raw_sym} order={order['id']}: {cancel_err}")
+
+        except Exception as e:
+            logger.error(f"❌ ORPHAN_SWEEP_ERROR: {e}")
+            result['errors'] += 1
+
+        logger.info(
+            f"🧹 ORPHAN_SWEEP_DONE: scanned={result['scanned']} orphans={result['orphans']} "
+            f"cancelled={result['cancelled']} errors={result['errors']} symbols={result['symbols'][:10]}"
+        )
         return result
 
     
@@ -13615,6 +13701,16 @@ async def background_scanner_loop():
         
         multi_coin_scanner.running = True
         
+        # Orphan sweeper: run once at startup to clean stale conditionals
+        try:
+            if live_binance_trader.enabled:
+                logger.info("🧹 ORPHAN_SWEEP: Running startup sweep...")
+                await live_binance_trader.sweep_orphan_conditionals()
+        except Exception as sweep_err:
+            logger.warning(f"⚠️ ORPHAN_SWEEP startup error: {sweep_err}")
+        _last_orphan_sweep = datetime.now().timestamp()
+        _orphan_sweep_interval = 300  # 5 minutes
+        
         # Track last coin refresh time (refresh every 30 minutes)
         last_coin_refresh = datetime.now().timestamp()
         coin_refresh_interval = 1800  # 30 minutes
@@ -13670,6 +13766,16 @@ async def background_scanner_loop():
                     if new_count > old_count:
                         logger.info(f"🆕 New coins detected: {new_count - old_count} added (total: {new_count})")
                     last_coin_refresh = now
+                
+                # Orphan sweeper: run every 5 minutes
+                _now_sweep = datetime.now().timestamp()
+                if _now_sweep - _last_orphan_sweep > _orphan_sweep_interval:
+                    try:
+                        if live_binance_trader.enabled:
+                            await live_binance_trader.sweep_orphan_conditionals()
+                    except Exception as sweep_err:
+                        logger.warning(f"⚠️ ORPHAN_SWEEP periodic error: {sweep_err}")
+                    _last_orphan_sweep = _now_sweep
                 
                 # Scan all coins (guard against hanging network calls).
                 try:
