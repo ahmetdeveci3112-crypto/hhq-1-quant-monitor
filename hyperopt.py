@@ -227,6 +227,7 @@ class HHQHyperOptimizer:
         """Phase 246C: Apply best_params to runtime trading parameters.
         
         Only applies if improvement > 5% over defaults.
+        Uses snapshot/rollback for exception safety.
         Returns True if params were applied.
         """
         if not self.best_params or not self.is_optimized:
@@ -246,26 +247,31 @@ class HHQHyperOptimizer:
         except Exception:
             pass  # If check fails, proceed with apply
         
+        # Map hyperopt param names to trader attributes (Phase 264: aligned with PARAM_LIMITS)
+        param_map = {
+            'sl_atr': ('sl_atr', lambda v: int(round(max(1.0, min(5.0, v)) * 10))),  # stored as 10x
+            'tp_atr': ('tp_atr', lambda v: int(round(max(1.0, min(8.0, v)) * 10))),
+            'exit_tightness': ('exit_tightness', lambda v: max(0.3, min(3.0, v))),
+            'entry_tightness': ('entry_tightness', lambda v: max(0.5, min(4.0, v))),
+            'trail_activation': ('trail_activation_atr', lambda v: max(0.3, min(4.0, v))),
+            'trail_distance': ('trail_distance_atr', lambda v: max(0.2, min(3.0, v))),
+            'z_score_threshold': ('z_score_threshold', lambda v: max(0.8, min(2.5, v))),
+            'min_confidence': ('min_confidence_score', lambda v: int(round(max(50, min(95, v))))),
+        }
+        
+        # P1-05: Snapshot all current values for rollback
+        snapshot = {}
+        for param_name, (attr_name, _) in param_map.items():
+            if param_name in self.best_params and hasattr(trader, attr_name):
+                snapshot[attr_name] = getattr(trader, attr_name)
+        
+        applied = []
         try:
-            # Map hyperopt param names to trader attributes (Phase 264: aligned with PARAM_LIMITS)
-            param_map = {
-                'sl_atr': ('sl_atr', lambda v: int(round(max(1.0, min(5.0, v)) * 10))),  # stored as 10x
-                'tp_atr': ('tp_atr', lambda v: int(round(max(1.0, min(8.0, v)) * 10))),
-                'exit_tightness': ('exit_tightness', lambda v: max(0.3, min(3.0, v))),
-                'entry_tightness': ('entry_tightness', lambda v: max(0.5, min(4.0, v))),
-                'trail_activation': ('trail_activation_atr', lambda v: max(0.3, min(4.0, v))),
-                'trail_distance': ('trail_distance_atr', lambda v: max(0.2, min(3.0, v))),
-                'z_score_threshold': ('z_score_threshold', lambda v: max(0.8, min(2.5, v))),
-                'min_confidence': ('min_confidence_score', lambda v: int(round(max(50, min(95, v))))),
-            }
-            
-            applied = []
             for param_name, (attr_name, clamp_fn) in param_map.items():
                 if param_name in self.best_params and hasattr(trader, attr_name):
-                    old_val = getattr(trader, attr_name)
                     new_val = clamp_fn(self.best_params[param_name])
                     setattr(trader, attr_name, new_val)
-                    applied.append(f"{attr_name}: {old_val}->{new_val}")
+                    applied.append(f"{attr_name}: {snapshot.get(attr_name)}->{new_val}")
             
             if applied:
                 logger.info(f"✅ HYPEROPT APPLIED: {', '.join(applied)}")
@@ -273,7 +279,13 @@ class HHQHyperOptimizer:
             return False
             
         except Exception as e:
-            logger.warning(f"Hyperopt apply error: {e}")
+            # P1-05: Rollback to snapshot on any failure
+            for attr_name, old_val in snapshot.items():
+                try:
+                    setattr(trader, attr_name, old_val)
+                except Exception:
+                    pass
+            logger.error(f"❌ Hyperopt apply ROLLBACK: {e} | restored={list(snapshot.keys())}")
             return False
 
     def _can_apply(self, improvement_pct: float = 0.0):
@@ -307,6 +319,36 @@ class HHQHyperOptimizer:
         
         applied = self.apply_to_trader(trader)
         if applied:
+            # P2-06: Resync open positions with new params
+            try:
+                resync_count = 0
+                from main import compute_sl_tp_levels, apply_sl_floor
+                for pos in list(getattr(trader, 'positions', [])):
+                    _atr = pos.get('atr', 0)
+                    _entry = pos.get('entryPrice', 0)
+                    if _atr <= 0 or _entry <= 0:
+                        continue
+                    _spread = pos.get('spreadPct', pos.get('entry_spread', 0.05))
+                    levels = compute_sl_tp_levels(
+                        entry_price=_entry, atr=_atr, side=pos.get('side', 'LONG'),
+                        leverage=pos.get('leverage', 10), symbol=pos.get('symbol', ''),
+                        adjusted_sl_atr=getattr(trader, 'sl_atr', 20) / 10.0,
+                        adjusted_tp_atr=getattr(trader, 'tp_atr', 30) / 10.0,
+                        adjusted_trail_act_atr=getattr(trader, 'trail_activation_atr', 1.5),
+                        adjusted_trail_dist_atr=getattr(trader, 'trail_distance_atr', 1.0),
+                        spread_pct=_spread,
+                    )
+                    # SL via authority helper (monotonic guarantee)
+                    apply_sl_floor(pos, levels['sl'], 'HYPEROPT_RESYNC')
+                    # TP/trail direct set (safe — no monotonic constraint)
+                    pos['takeProfit'] = levels['tp']
+                    pos['trailActivation'] = levels['trail_activation']
+                    pos['trailDistance'] = levels['trail_distance']
+                    resync_count += 1
+                if resync_count:
+                    logger.info(f"🔄 HYPEROPT RESYNC: {resync_count} open positions updated")
+            except Exception as e:
+                logger.warning(f"⚠️ Hyperopt resync error: {e}")
             self.last_apply_time = int(time.time())
             self.last_apply_result = 'applied'
             self.last_apply_reason = 'ok' if not force else 'forced'
@@ -351,18 +393,23 @@ class HHQHyperOptimizer:
         tau_days = 30.0
         
         for trade in self.trade_data:
-            signal_score = trade.get('signalScore', trade.get('signal_score', 0))
+            # P2-08: Use raw score for min_confidence gate replay (matches runtime gate)
+            signal_score_raw = trade.get('signalScoreRaw',
+                trade.get('signalScore', trade.get('signal_score', 0)))
             # Phase 263 fix: support frontend-style "zScore" key from SQLite hydration
             zscore = trade.get('zscore', trade.get('zScore', trade.get('z_score', 0)))
             atr = trade.get('atr', 0)
             entry_price = trade.get('entryPrice', trade.get('entry_price', 0))
             exit_price = trade.get('exitPrice', trade.get('exit_price', 0))
             side = trade.get('side', 'LONG')
-            actual_pnl = trade.get('pnl', trade.get('pnl_percent', 0))
             close_time = trade.get('closeTime', trade.get('close_time', now_ms))
             
+            # P1-04: Strict trade validation gate — skip incomplete trades
+            if entry_price <= 0 or exit_price <= 0:
+                continue
+            
             # Filter: would this trade pass with suggested params?
-            if signal_score < params['min_confidence']:
+            if signal_score_raw < params['min_confidence']:
                 continue
             if abs(zscore) < params['z_score_threshold']:
                 continue
@@ -370,9 +417,26 @@ class HHQHyperOptimizer:
             trades_taken += 1
             
             # Simulate SL/TP with suggested ATR multipliers
-            if atr > 0 and entry_price > 0:
+            if atr > 0:
                 sl_distance = atr * params['sl_atr']
                 tp_distance = atr * params['tp_atr']
+                
+                # P1-06: Leverage floor parity (matches main.py compute_sl_tp_levels)
+                leverage = trade.get('leverage', 10)
+                safe_lev = max(int(leverage), 1)
+                sl_dist_lev = entry_price * (30.0 / safe_lev / 100)   # ~30% ROI loss
+                tp_dist_lev = entry_price * (5.0 / safe_lev / 100)    # ~5% ROI gain
+                sl_distance = max(sl_distance, sl_dist_lev)
+                tp_distance = max(tp_distance, tp_dist_lev)
+                
+                # P1-06: Cost floor for TP (matches main.py estimate_trade_cost logic)
+                spread_pct = float(trade.get('entry_spread', trade.get('entrySpread', 0.05)) or 0.05)
+                fee_pct = 0.08
+                slip_pct = max(0.02, spread_pct * 0.5)
+                cost_total_pct = fee_pct + slip_pct + 0.005  # ~4h hold funding estimate
+                cost_roi_pct = cost_total_pct * safe_lev
+                tp_dist_cost = entry_price * (cost_roi_pct * 3 / safe_lev / 100)
+                tp_distance = max(tp_distance, tp_dist_cost)
                 
                 if side == 'LONG':
                     sl_price = entry_price - sl_distance
@@ -398,8 +462,11 @@ class HHQHyperOptimizer:
                 
                 pnl_pct = (simulated_pnl / entry_price) * 100
             else:
-                # Use actual PnL if no ATR data
-                pnl_pct = actual_pnl
+                # P1-04: No ATR — compute pnl_pct from price delta (not raw USD pnl)
+                if side == 'LONG':
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - exit_price) / entry_price) * 100
                 
             # Phase 262: Time decay weighting
             age_days = (now_ms - close_time) / (24 * 60 * 60 * 1000)
@@ -561,12 +628,29 @@ class HHQHyperOptimizer:
             return {'error': str(e)}
     
     def record_trade(self, trade: Dict):
-        """Record a closed trade for future optimization."""
+        """Record a closed trade for future optimization.
+        P1-03: Two-tier dedup guard prevents double-counting."""
+        # P1-03: Dedup — primary key: trade id
+        trade_id = trade.get('id', '')
+        if trade_id:
+            if any(t.get('id') == trade_id for t in self.trade_data[-50:]):
+                return
+        else:
+            # Fallback dedup: (symbol, closeTime) composite
+            t_sym = trade.get('symbol', '')
+            t_ct = trade.get('closeTime', trade.get('close_time', 0))
+            if t_sym and t_ct:
+                if any(
+                    t.get('symbol') == t_sym and
+                    (t.get('closeTime', t.get('close_time', 0)) == t_ct)
+                    for t in self.trade_data[-50:]
+                ):
+                    return
+        
         self.trade_data.append(trade)
         self.trades_since_optimize += 1
         
         # Phase 262: Keep full history to utilize weighting correctly
-        # Instead of clipping at 500, we could allow more, but 2000 is a safe limit for RAM
         if len(self.trade_data) > 2000:
             self.trade_data = self.trade_data[-2000:]
     

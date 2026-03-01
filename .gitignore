@@ -38,3 +38,5 @@ venv/
 verify_*.py
 main_v2.py
 *.db
+.venv/
+venv/

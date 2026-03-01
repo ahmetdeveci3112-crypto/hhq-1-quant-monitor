@@ -127,6 +127,7 @@ class SQLiteManager:
                     close_reason TEXT,
                     leverage INTEGER DEFAULT 10,
                     signal_score INTEGER DEFAULT 0,
+                    signal_score_raw INTEGER DEFAULT 0,
                     mtf_score INTEGER DEFAULT 0,
                     z_score REAL DEFAULT 0,
                     spread_level TEXT DEFAULT 'unknown',
@@ -219,6 +220,7 @@ class SQLiteManager:
                     leverage INTEGER,
                     open_time INTEGER NOT NULL,
                     signal_score INTEGER,
+                    signal_score_raw INTEGER DEFAULT 0,
                     zscore REAL,
                     hurst REAL,
                     atr REAL,
@@ -235,6 +237,12 @@ class SQLiteManager:
                 logger.info("📂 Added close_time column to positions table")
             except:
                 pass  # Column already exists
+            
+            # RHP-1A: signal_score_raw for restart continuity
+            try:
+                await db.execute('ALTER TABLE positions ADD COLUMN signal_score_raw INTEGER DEFAULT 0')
+            except:
+                pass
             
             # Binance trade history - her realized PnL income kaydı
             await db.execute('''
@@ -277,6 +285,23 @@ class SQLiteManager:
                     mae_pct REAL DEFAULT 0,
                     mfe_pct REAL DEFAULT 0,
                     decision_trace TEXT DEFAULT '[]',
+                    stop_loss REAL DEFAULT 0,
+                    take_profit REAL DEFAULT 0,
+                    atr REAL DEFAULT 0,
+                    trailing_stop REAL DEFAULT 0,
+                    trail_activation REAL DEFAULT 0,
+                    settings_snapshot TEXT DEFAULT '{}',
+                    entry_method TEXT DEFAULT 'MARKET',
+                    entry_slippage REAL DEFAULT 0,
+                    exit_slippage REAL DEFAULT 0,
+                    entry_spread REAL DEFAULT 0,
+                    signal_score INTEGER DEFAULT 0,
+                    spread_level TEXT DEFAULT 'unknown',
+                    binance_fill_price REAL DEFAULT 0,
+                    hurst REAL DEFAULT 0.5,
+                    trade_id TEXT,
+                    entry_order_id TEXT,
+                    close_order_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -496,23 +521,24 @@ class SQLiteManager:
                 pass
             
             # Phase 186: Comprehensive trade data persistence — all missing columns
-            migration_columns = [
-                ('stop_loss', 'REAL DEFAULT 0'),
-                ('take_profit', 'REAL DEFAULT 0'),
-                ('atr', 'REAL DEFAULT 0'),
-                ('trailing_stop', 'REAL DEFAULT 0'),
-                ('trail_activation', 'REAL DEFAULT 0'),
-                ('is_trailing_active', 'INTEGER DEFAULT 0'),
-                ('margin', 'REAL DEFAULT 0'),
-                ('roi', 'REAL DEFAULT 0'),
-                ('is_live', 'INTEGER DEFAULT 0'),
-                ('entry_method', 'TEXT DEFAULT "MARKET"'),
-                ('entry_slippage', 'REAL DEFAULT 0'),
-                ('entry_spread', 'REAL DEFAULT 0'),
-                ('binance_fill_price', 'REAL DEFAULT 0'),
-                ('binance_order_id', 'TEXT'),
-                ('hurst', 'REAL DEFAULT 0.5'),
-                ('adx', 'REAL DEFAULT 0'),
+                migration_columns = [
+                    ('stop_loss', 'REAL DEFAULT 0'),
+                    ('take_profit', 'REAL DEFAULT 0'),
+                    ('atr', 'REAL DEFAULT 0'),
+                    ('trailing_stop', 'REAL DEFAULT 0'),
+                    ('trail_activation', 'REAL DEFAULT 0'),
+                    ('is_trailing_active', 'INTEGER DEFAULT 0'),
+                    ('margin', 'REAL DEFAULT 0'),
+                    ('roi', 'REAL DEFAULT 0'),
+                    ('is_live', 'INTEGER DEFAULT 0'),
+                    ('entry_method', 'TEXT DEFAULT "MARKET"'),
+                    ('entry_slippage', 'REAL DEFAULT 0'),
+                    ('exit_slippage', 'REAL DEFAULT 0'),
+                    ('entry_spread', 'REAL DEFAULT 0'),
+                    ('binance_fill_price', 'REAL DEFAULT 0'),
+                    ('binance_order_id', 'TEXT'),
+                    ('hurst', 'REAL DEFAULT 0.5'),
+                    ('adx', 'REAL DEFAULT 0'),
                 ('pullback_pct', 'REAL DEFAULT 0'),
                 # Phase 232: Close metrics snapshot
                 ('close_metrics_json', 'TEXT DEFAULT "{}"'),
@@ -525,6 +551,8 @@ class SQLiteManager:
                 ('pnl_execution_alpha', 'REAL DEFAULT 0'),
                 ('pnl_timing_alpha', 'REAL DEFAULT 0'),
                 ('attribution_json', 'TEXT DEFAULT "{}"'),
+                # P2-08: Raw signal score for hyperopt parity
+                ('signal_score_raw', 'INTEGER DEFAULT 0'),
             ]
             for col_name, col_type in migration_columns:
                 try:
@@ -533,20 +561,21 @@ class SQLiteManager:
                     pass  # Column already exists
             
             # Phase 187: position_closes needs settings data too
-            pc_migration_columns = [
-                ('stop_loss', 'REAL DEFAULT 0'),
-                ('take_profit', 'REAL DEFAULT 0'),
-                ('atr', 'REAL DEFAULT 0'),
-                ('trailing_stop', 'REAL DEFAULT 0'),
-                ('trail_activation', 'REAL DEFAULT 0'),
-                ('settings_snapshot', 'TEXT DEFAULT "{}"'),
-                ('entry_method', 'TEXT DEFAULT "MARKET"'),
-                ('entry_slippage', 'REAL DEFAULT 0'),
-                ('entry_spread', 'REAL DEFAULT 0'),
-                ('signal_score', 'INTEGER DEFAULT 0'),
-                ('spread_level', 'TEXT DEFAULT "unknown"'),
-                ('binance_fill_price', 'REAL DEFAULT 0'),
-                ('hurst', 'REAL DEFAULT 0.5'),
+                pc_migration_columns = [
+                    ('stop_loss', 'REAL DEFAULT 0'),
+                    ('take_profit', 'REAL DEFAULT 0'),
+                    ('atr', 'REAL DEFAULT 0'),
+                    ('trailing_stop', 'REAL DEFAULT 0'),
+                    ('trail_activation', 'REAL DEFAULT 0'),
+                    ('settings_snapshot', 'TEXT DEFAULT "{}"'),
+                    ('entry_method', 'TEXT DEFAULT "MARKET"'),
+                    ('entry_slippage', 'REAL DEFAULT 0'),
+                    ('exit_slippage', 'REAL DEFAULT 0'),
+                    ('entry_spread', 'REAL DEFAULT 0'),
+                    ('signal_score', 'INTEGER DEFAULT 0'),
+                    ('spread_level', 'TEXT DEFAULT "unknown"'),
+                    ('binance_fill_price', 'REAL DEFAULT 0'),
+                    ('hurst', 'REAL DEFAULT 0.5'),
                 ('trade_id', 'TEXT'),
                 # Phase 224A: Diagnostics columns
                 ('mae_pct', 'REAL DEFAULT 0'),
@@ -620,12 +649,12 @@ class SQLiteManager:
             await db.execute('''
                 INSERT INTO trades 
                 (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, 
-                 open_time, close_time, close_reason, leverage, signal_score, mtf_score, z_score, 
+                 open_time, close_time, close_reason, leverage, signal_score, signal_score_raw, mtf_score, z_score, 
                  spread_level, settings_snapshot,
                  stop_loss, take_profit, atr, trailing_stop, trail_activation, is_trailing_active,
-                 margin, roi, is_live, entry_method, entry_slippage, entry_spread, 
+                 margin, roi, is_live, entry_method, entry_slippage, exit_slippage, entry_spread, 
                  binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   symbol = COALESCE(excluded.symbol, trades.symbol),
                   side = COALESCE(excluded.side, trades.side),
@@ -640,6 +669,7 @@ class SQLiteManager:
                   close_reason = CASE WHEN excluded.close_reason IS NOT NULL AND excluded.close_reason != 'Closed' AND excluded.close_reason != 'Synced from Binance' THEN excluded.close_reason ELSE COALESCE(trades.close_reason, excluded.close_reason) END,
                   leverage = CASE WHEN excluded.leverage > 0 AND excluded.leverage != 10 THEN excluded.leverage WHEN trades.leverage > 0 THEN trades.leverage ELSE excluded.leverage END,
                   signal_score = CASE WHEN excluded.signal_score > 0 THEN excluded.signal_score ELSE trades.signal_score END,
+                  signal_score_raw = CASE WHEN excluded.signal_score_raw > 0 THEN excluded.signal_score_raw ELSE trades.signal_score_raw END,
                   mtf_score = CASE WHEN excluded.mtf_score > 0 THEN excluded.mtf_score ELSE trades.mtf_score END,
                   z_score = CASE WHEN excluded.z_score != 0 THEN excluded.z_score ELSE trades.z_score END,
                   spread_level = CASE WHEN excluded.spread_level IS NOT NULL AND excluded.spread_level != 'unknown' THEN excluded.spread_level ELSE COALESCE(trades.spread_level, excluded.spread_level) END,
@@ -655,6 +685,7 @@ class SQLiteManager:
                   is_live = CASE WHEN excluded.is_live > 0 THEN excluded.is_live ELSE trades.is_live END,
                   entry_method = CASE WHEN excluded.entry_method IS NOT NULL AND excluded.entry_method != 'MARKET' THEN excluded.entry_method ELSE COALESCE(trades.entry_method, excluded.entry_method) END,
                   entry_slippage = CASE WHEN excluded.entry_slippage != 0 THEN excluded.entry_slippage ELSE trades.entry_slippage END,
+                  exit_slippage = CASE WHEN excluded.exit_slippage != 0 THEN excluded.exit_slippage ELSE trades.exit_slippage END,
                   entry_spread = CASE WHEN excluded.entry_spread != 0 THEN excluded.entry_spread ELSE trades.entry_spread END,
                   binance_fill_price = CASE WHEN excluded.binance_fill_price > 0 THEN excluded.binance_fill_price ELSE trades.binance_fill_price END,
                   binance_order_id = CASE WHEN excluded.binance_order_id IS NOT NULL AND excluded.binance_order_id != '' THEN excluded.binance_order_id ELSE COALESCE(trades.binance_order_id, excluded.binance_order_id) END,
@@ -677,6 +708,7 @@ class SQLiteManager:
                 trade.get('reason', trade.get('closeReason')),
                 trade.get('leverage', 10),
                 trade.get('signalScore', 0),
+                trade.get('signalScoreRaw', trade.get('signalScore', 0)),
                 trade.get('mtfScore', 0),
                 trade.get('zScore', 0),
                 trade.get('spreadLevel', 'unknown'),
@@ -693,6 +725,7 @@ class SQLiteManager:
                 1 if trade.get('isLive', False) else 0,
                 trade.get('entry_method', 'MARKET'),
                 trade.get('entry_slippage', 0),
+                trade.get('exit_slippage', 0),
                 trade.get('entry_spread', 0),
                 trade.get('binance_fill_price', 0),
                 trade.get('binance_order_id', ''),
@@ -787,10 +820,13 @@ class SQLiteManager:
                             'isTrailingActive': bool(d.get('is_trailing_active', 0)),
                             'spreadLevel': d.get('spread_level', 'unknown'),
                             'signalScore': d.get('signal_score', 0) or 0,
+                            'signalScoreRaw': d.get('signal_score_raw', d.get('signal_score', 0)) or 0,
                             'mtfScore': d.get('mtf_score', 0) or 0,
                             'zScore': d.get('z_score', 0) or 0,
+                            'zscore': d.get('z_score', 0) or 0,  # RHP-1D: lowercase alias for hyperopt compat
                             'entryMethod': d.get('entry_method', 'MARKET'),
                             'entrySlippage': d.get('entry_slippage', 0) or 0,
+                            'exitSlippage': d.get('exit_slippage', 0) or 0,
                             'entrySpread': d.get('entry_spread', 0) or 0,
                             'binanceFillPrice': d.get('binance_fill_price', 0) or 0,
                             'isLive': bool(d.get('is_live', 0)),
@@ -888,6 +924,25 @@ class SQLiteManager:
             ))
             await db.commit()
     
+    async def update_signal_outcome(self, symbol: str, timestamp: int, reject_reason: str = '', position_id: str = ''):
+        """FIX #6 (Joint Audit): Finalize signal log with execution outcome.
+        Updates the most recent signal row for this symbol near this timestamp.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    UPDATE signals 
+                    SET reject_reason = ?, accepted = CASE WHEN ? != '' THEN 0 ELSE accepted END
+                    WHERE rowid = (
+                        SELECT rowid FROM signals 
+                        WHERE symbol = ? AND timestamp >= ? - 5000 AND timestamp <= ? + 5000
+                        ORDER BY timestamp DESC LIMIT 1
+                    )
+                ''', (reject_reason or f'FILLED:{position_id}', reject_reason, symbol, timestamp, timestamp))
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"update_signal_outcome error: {e}")
+    
     async def save_open_position(self, pos: dict):
         """Save an open position to database."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -895,8 +950,8 @@ class SQLiteManager:
                 INSERT OR REPLACE INTO positions (
                     id, symbol, side, entry_price, size, size_usd,
                     stop_loss, take_profit, leverage, open_time,
-                    signal_score, zscore, hurst, atr, htf_trend, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_score, signal_score_raw, zscore, hurst, atr, htf_trend, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pos.get('id'),
                 pos.get('symbol'),
@@ -909,6 +964,7 @@ class SQLiteManager:
                 pos.get('leverage', 10),
                 pos.get('openTime', 0),
                 pos.get('signalScore', 0),
+                pos.get('signalScoreRaw', pos.get('signalScore', 0)),
                 pos.get('zscore', 0),
                 pos.get('hurst', 0),
                 pos.get('atr', 0),
@@ -960,6 +1016,28 @@ class SQLiteManager:
             logger.warning(f"⚠️ get_all_open_times error: {e}")
             return {}
     
+    async def get_position_metadata(self, symbol: str, side: str = None) -> dict:
+        """RHP-1A: Get metadata for an active position (restart continuity). OVP-1: hedge-safe with side."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                if side:
+                    cursor = await db.execute(
+                        "SELECT open_time, signal_score, signal_score_raw FROM positions "
+                        "WHERE symbol=? AND side=? AND status='OPEN' ORDER BY open_time DESC LIMIT 1",
+                        (symbol, side)
+                    )
+                else:
+                    cursor = await db.execute(
+                        "SELECT open_time, signal_score, signal_score_raw FROM positions "
+                        "WHERE symbol=? AND status='OPEN' ORDER BY open_time DESC LIMIT 1",
+                        (symbol,)
+                    )
+                row = await cursor.fetchone()
+                if row:
+                    return {'open_time': row[0], 'signal_score': row[1] or 0, 'signal_score_raw': row[2] or 0}
+        except Exception as e:
+            logger.warning(f"get_position_metadata error: {e}")
+        return None
 
 
     async def lookup_position_close_metadata(self, symbol: str, close_time: int, window_ms: int = 3600000) -> dict:
@@ -1103,6 +1181,142 @@ class SQLiteManager:
                     VALUES (?, ?, CURRENT_TIMESTAMP)
                 ''', (key, json.dumps(value)))
             await db.commit()
+
+    async def trade_event_exists(
+        self,
+        symbol: str,
+        close_time_ms: int,
+        pnl: float = None,
+        window_ms: int = 120000,
+        pnl_tol: float = 0.05,
+    ) -> bool:
+        """Check whether a near-identical trade event already exists in trades table."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                if pnl is None:
+                    async with db.execute(
+                        '''
+                        SELECT 1 FROM trades
+                        WHERE symbol = ?
+                          AND close_time > 0
+                          AND ABS(close_time - ?) <= ?
+                        LIMIT 1
+                        ''',
+                        (symbol, int(close_time_ms), int(window_ms)),
+                    ) as cursor:
+                        return await cursor.fetchone() is not None
+                async with db.execute(
+                    '''
+                    SELECT 1 FROM trades
+                    WHERE symbol = ?
+                      AND close_time > 0
+                      AND ABS(close_time - ?) <= ?
+                      AND ABS(COALESCE(pnl, 0) - ?) <= ?
+                    LIMIT 1
+                    ''',
+                    (symbol, int(close_time_ms), int(window_ms), float(pnl), float(pnl_tol)),
+                ) as cursor:
+                    return await cursor.fetchone() is not None
+        except Exception as e:
+            logger.debug(f"trade_event_exists error: {e}")
+            return False
+
+    async def update_trade_exit_execution(
+        self,
+        trade_id: str,
+        symbol: str,
+        exit_slippage: float = 0.0,
+        close_time_ms: int = 0,
+    ) -> int:
+        """Backfill exit execution metrics to the just-closed trade record and refresh attribution."""
+        try:
+            target_id = trade_id
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                # Fallback: if trade_id missing or not found, pick latest live trade for symbol near close time.
+                if not target_id:
+                    target_id = ''
+                async with db.execute('SELECT id FROM trades WHERE id = ? LIMIT 1', (target_id,)) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    close_ref = int(close_time_ms or int(datetime.now().timestamp() * 1000))
+                    async with db.execute(
+                        '''
+                        SELECT id FROM trades
+                        WHERE symbol = ?
+                          AND is_live = 1
+                          AND close_time > 0
+                          AND ABS(close_time - ?) <= 600000
+                        ORDER BY ABS(close_time - ?) ASC
+                        LIMIT 1
+                        ''',
+                        (symbol, close_ref, close_ref),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if not row:
+                        return 0
+                    target_id = row['id']
+
+                await db.execute(
+                    '''
+                    UPDATE trades
+                    SET exit_slippage = ?
+                    WHERE id = ?
+                    ''',
+                    (float(exit_slippage or 0), target_id),
+                )
+                # Keep position_closes in sync for enrichment/debug screens.
+                await db.execute(
+                    '''
+                    UPDATE position_closes
+                    SET exit_slippage = ?
+                    WHERE trade_id = ?
+                    ''',
+                    (float(exit_slippage or 0), target_id),
+                )
+
+                # Recompute attribution with fresh exit_slippage if enabled.
+                try:
+                    svc = globals().get('pnl_attribution_service')
+                    if svc and getattr(svc, 'enabled', False):
+                        async with db.execute('SELECT * FROM trades WHERE id = ? LIMIT 1', (target_id,)) as cursor:
+                            trow = await cursor.fetchone()
+                        if trow:
+                            trade = dict(trow)
+                            attr = svc.decompose_trade(trade)
+                            await db.execute(
+                                '''
+                                UPDATE trades SET
+                                  pnl_gross = ?,
+                                  fee_cost = ?,
+                                  slippage_cost = ?,
+                                  funding_cost = ?,
+                                  pnl_signal_alpha = ?,
+                                  pnl_execution_alpha = ?,
+                                  pnl_timing_alpha = ?,
+                                  attribution_json = ?
+                                WHERE id = ?
+                                ''',
+                                (
+                                    attr.get('pnl_gross', 0),
+                                    attr.get('fee_cost', 0),
+                                    attr.get('slippage_cost', 0),
+                                    attr.get('funding_cost', 0),
+                                    attr.get('pnl_signal_alpha', 0),
+                                    attr.get('pnl_execution_alpha', 0),
+                                    attr.get('pnl_timing_alpha', 0),
+                                    attr.get('attribution_json', '{}'),
+                                    target_id,
+                                ),
+                            )
+                except Exception as attr_err:
+                    logger.debug(f"update_trade_exit_execution attribution refresh error: {attr_err}")
+
+                await db.commit()
+                return 1
+        except Exception as e:
+            logger.debug(f"update_trade_exit_execution error: {e}")
+            return 0
     
     async def save_position_close(self, close_data: dict):
         """Phase 187: Save position close with ALL trade data + settings."""
@@ -1112,11 +1326,11 @@ class SQLiteManager:
                     symbol, side, reason, original_reason, entry_price, exit_price,
                     pnl, leverage, size_usd, margin, roi, timestamp,
                     stop_loss, take_profit, atr, trailing_stop, trail_activation,
-                    settings_snapshot, entry_method, entry_slippage, entry_spread,
+                    settings_snapshot, entry_method, entry_slippage, exit_slippage, entry_spread,
                     signal_score, spread_level, binance_fill_price, hurst, trade_id,
                     mae_pct, mfe_pct, decision_trace,
                     entry_order_id, close_order_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 close_data.get('symbol'),
                 close_data.get('side'),
@@ -1139,6 +1353,7 @@ class SQLiteManager:
                 json.dumps(close_data.get('settingsSnapshot', {})),
                 close_data.get('entry_method', 'MARKET'),
                 close_data.get('entry_slippage', 0),
+                close_data.get('exit_slippage', 0),
                 close_data.get('entry_spread', 0),
                 close_data.get('signalScore', 0),
                 close_data.get('spreadLevel', 'unknown'),
@@ -1691,6 +1906,9 @@ class SQLiteManager:
                         'signal_score': row['signal_score'] or 0,
                         'leverage': row['leverage'] or 10,
                         'atr_pct': round(atr_pct, 4),
+                        # P1-01: Feature contamination flag (7/16 features are hardcoded constants)
+                        '_backfilled': True,
+                        '_feature_quality': 'partial',  # 9/16 real, 7/16 constant
                     }
                     
                     target = 1 if pnl > 0 else 0
@@ -2030,6 +2248,11 @@ class LiveBinanceTrader:
         self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '15.0'))
         self.exec_min_top_book_usdt = float(os.environ.get('EXEC_MIN_TOP_BOOK_NOTIONAL_USDT', '100.0'))
         self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.40'))
+        # RHP-1B: Entry exec score source policy
+        self.exec_score_source = os.environ.get('ENTRY_EXEC_SCORE_SOURCE', 'penalized')  # penalized|raw|min
+        if self.exec_score_source not in ('penalized', 'raw', 'min'):
+            logger.warning(f"⚠️ Invalid ENTRY_EXEC_SCORE_SOURCE='{self.exec_score_source}', falling back to 'penalized'")
+            self.exec_score_source = 'penalized'
         self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.25'))
         self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.55'))
         self.exec_risk_weight = float(os.environ.get('EXEC_RISK_WEIGHT', '0.20'))
@@ -2336,13 +2559,21 @@ class LiveBinanceTrader:
                     adjusted_trail_distance = trail_distance_atr * exit_tightness * dyn_mult
                     
                     # Calculate TP/SL based on side
+                    # Phase 275: Leverage-aware SL/TP
+                    _ws_leverage = calculated_leverage if calculated_leverage > 0 else 10
+                    _ws_sl_dist_lev = entry_price * (30.0 / max(_ws_leverage, 1) / 100)
+                    _ws_tp_dist_lev = entry_price * (5.0 / max(_ws_leverage, 1) / 100)
+                    _ws_sl_dist_atr = estimated_atr * adjusted_sl_atr
+                    _ws_tp_dist_atr = estimated_atr * adjusted_tp_atr
+                    _ws_eff_sl = max(_ws_sl_dist_atr, _ws_sl_dist_lev)
+                    _ws_eff_tp = max(_ws_tp_dist_atr, _ws_tp_dist_lev)
                     if side == 'LONG':
-                        sl = entry_price - (estimated_atr * adjusted_sl_atr)
-                        tp = entry_price + (estimated_atr * adjusted_tp_atr)
+                        sl = entry_price - _ws_eff_sl
+                        tp = entry_price + _ws_eff_tp
                         trail_activation = entry_price + (estimated_atr * adjusted_trail_activation)
                     else:  # SHORT
-                        sl = entry_price + (estimated_atr * adjusted_sl_atr)
-                        tp = entry_price - (estimated_atr * adjusted_tp_atr)
+                        sl = entry_price + _ws_eff_sl
+                        tp = entry_price - _ws_eff_tp
                         trail_activation = entry_price - (estimated_atr * adjusted_trail_activation)
                     
                     trailing_stop = sl  # Initial trailing stop = SL
@@ -4014,6 +4245,7 @@ class LiveBinanceTrader:
                 
                 # Phase 232b-P1: Write to GLOBAL pending_close_reasons WITH trade_data
                 pending_close_reasons[symbol] = {
+                    "position_id": pos_snapshot.get('id', ''),  # hedging-safe traceability
                     "reason": reason,
                     "original_reason": reason,
                     "timestamp": now_ms,
@@ -4473,6 +4705,19 @@ class LiveBinanceTrader:
                 
                 if trade_id in existing_ids:
                     continue  # Already in trade history
+                # Phase 275: DB-level dedupe by (symbol, close_time±120s, pnl±0.05)
+                try:
+                    if await sqlite_manager.trade_event_exists(
+                        symbol=symbol,
+                        close_time_ms=timestamp,
+                        pnl=pnl,
+                        window_ms=120000,
+                        pnl_tol=0.05,
+                    ):
+                        logger.debug(f"Phase275 sync dedupe: skip {symbol} @{timestamp} pnl={pnl:.4f}")
+                        continue
+                except Exception:
+                    pass
                 
                 # Skip very small PnL (likely partial fills or dust)
                 if abs(pnl) < 0.01:
@@ -4507,6 +4752,8 @@ class LiveBinanceTrader:
                     if pc_data:
                         if pc_data.get('signal_score', 0) > 0:
                             trade['signalScore'] = pc_data['signal_score']
+                            # RHP-1C: Write-through raw score (fallback to penalized if raw unavailable)
+                            trade['signalScoreRaw'] = pc_data.get('signal_score_raw', pc_data['signal_score'])
                         if pc_data.get('spread_level') and pc_data['spread_level'] != 'unknown':
                             trade['spreadLevel'] = pc_data['spread_level']
                         if pc_data.get('entry_price', 0) > 0:
@@ -4804,11 +5051,17 @@ async def lifespan(app: FastAPI):
                     with open(json_path, 'r') as f:
                         legacy_samples = json.load(f)
                     for s in legacy_samples:
+                        # P2-04: Deterministic trade_id for dedup guard
+                        import hashlib
+                        _legacy_hash = hashlib.md5(
+                            f"{s.get('timestamp',0)}_{s.get('target',0)}_{json.dumps(s.get('features',{}), sort_keys=True)}".encode()
+                        ).hexdigest()[:16]
                         await sqlite_manager.save_ml_training_sample(
                             ts=int(s.get('timestamp', time.time())),
                             target=s.get('target', 0),
                             features=s.get('features', {}),
-                            symbol='UNKNOWN', side='UNKNOWN', pnl=0.0, close_reason='MIGRATED', trade_id=None
+                            symbol='UNKNOWN', side='UNKNOWN', pnl=0.0, close_reason='MIGRATED',
+                            trade_id=f'legacy_{_legacy_hash}'
                         )
                     # Mark as migrated
                     open(migrated_flag, 'a').close()
@@ -4855,6 +5108,9 @@ async def lifespan(app: FastAPI):
                                     'signal_score': tr['signal_score'] or 0,
                                     'leverage': tr['leverage'] or 10,
                                     'atr_pct': round((atr_v / entry_p * 100) if entry_p > 0 else 0, 4),
+                                    # P1-01: Feature contamination flag
+                                    '_backfilled': True,
+                                    '_feature_quality': 'partial',
                                 }
                             })
                         logger.info(f"✅ Phase 263b: Built {len(samples)} in-memory samples from trades fallback")
@@ -5199,8 +5455,7 @@ async def binance_position_sync_loop():
                         # Only fix if the values are suspiciously far (>50% from entry)
                         sl_dist_pct = abs(entry - old_sl) / entry * 100 if entry > 0 else 0
                         if sl_dist_pct > 50:  # SL is more than 50% away — clearly wrong
-                            pos['stopLoss'] = new_sl
-                            pos['trailingStop'] = new_sl
+                            apply_sl_floor(pos, new_sl, 'WS_TRAIL_FIX')
                             pos['takeProfit'] = new_tp
                             
                             # Recalc trail activation/distance
@@ -5525,18 +5780,28 @@ async def binance_position_sync_loop():
                         # to avoid instant TP trigger on sync
                         # Phase 210: Minimum trail activation distance = 0.5 ATR
                         min_trail_distance = atr * 0.5
-                        
+                        # Phase 275: Leverage-aware SL/TP in sync loop
+                        _sync_leverage = bp.get('leverage', 10)
+                        _sl_roi_target = 30.0  # Max 30% ROI loss
+                        _tp_roi_target = 5.0   # Min 5% ROI gain
+                        _sl_dist_from_lev = entry_price * (_sl_roi_target / max(_sync_leverage, 1) / 100)
+                        _tp_dist_from_lev = entry_price * (_tp_roi_target / max(_sync_leverage, 1) / 100)
+                        _sl_dist_from_atr = atr * global_paper_trader.sl_atr / 10
+                        _tp_dist_from_atr = atr * global_paper_trader.tp_atr / 10
+                        _eff_sl_dist = max(_sl_dist_from_atr, _sl_dist_from_lev)
+                        _eff_tp_dist = max(_tp_dist_from_atr, _tp_dist_from_lev)
+
                         if bp['side'] == 'LONG':
                             # For LONG: if mark > entry, position is profitable
                             if mark_price > entry_price:
                                 # Phase 243: Protect 50% of unrealized profit instead of breakeven
                                 profit_distance = mark_price - entry_price
                                 stop_loss = entry_price + (profit_distance * 0.5)  # Lock 50% profit
-                                take_profit = mark_price + (atr * global_paper_trader.tp_atr / 10)
+                                take_profit = mark_price + _eff_tp_dist
                                 trail_activation = entry_price + min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
-                                stop_loss = entry_price - (atr * global_paper_trader.sl_atr / 10)
-                                take_profit = entry_price + (atr * global_paper_trader.tp_atr / 10)
+                                stop_loss = entry_price - _eff_sl_dist
+                                take_profit = entry_price + _eff_tp_dist
                                 trail_activation = entry_price + (atr * trail_activation_atr)  # Phase 151: Dynamic
                         else:
                             # For SHORT: if mark < entry, position is profitable
@@ -5544,11 +5809,11 @@ async def binance_position_sync_loop():
                                 # Phase 243: Protect 50% of unrealized profit instead of breakeven
                                 profit_distance = entry_price - mark_price
                                 stop_loss = entry_price - (profit_distance * 0.5)  # Lock 50% profit
-                                take_profit = mark_price - (atr * global_paper_trader.tp_atr / 10)
+                                take_profit = mark_price - _eff_tp_dist
                                 trail_activation = entry_price - min_trail_distance  # Phase 210: Min 0.5 ATR from entry
                             else:
-                                stop_loss = entry_price + (atr * global_paper_trader.sl_atr / 10)
-                                take_profit = entry_price - (atr * global_paper_trader.tp_atr / 10)
+                                stop_loss = entry_price + _eff_sl_dist
+                                take_profit = entry_price - _eff_tp_dist
                                 trail_activation = entry_price - (atr * trail_activation_atr)  # Phase 151: Dynamic
                         
                         new_pos = {
@@ -5582,6 +5847,17 @@ async def binance_position_sync_loop():
                             'fc_failed_count': 0,
                             'fc_max_profit_pct': 0.0,
                         }
+                        
+                        # RHP-1A: Hydrate signal scores from DB (restart continuity)
+                        try:
+                            _pos_meta = await sqlite_manager.get_position_metadata(symbol, side=bp.get('side'))
+                            if _pos_meta:
+                                new_pos['signalScore'] = _pos_meta.get('signal_score', 0)
+                                new_pos['signalScoreRaw'] = _pos_meta.get('signal_score_raw', 0)
+                                if _pos_meta.get('open_time', 0) > 0:
+                                    new_pos['openTime'] = _pos_meta['open_time']
+                        except Exception:
+                            pass
                         
                         global_paper_trader.positions.append(new_pos)
                         logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} | Vol:{volatility_pct:.1f}% Trail:{trail_activation_atr}x/{trail_distance_atr}x")
@@ -5698,13 +5974,11 @@ async def binance_position_sync_loop():
                                         if pos['side'] == 'LONG':
                                             _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
                                             be_price = entry_price * (1 + _sync_buf)
-                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), be_price)
-                                            pos['trailingStop'] = max(pos.get('trailingStop', 0), be_price)
+                                            apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
                                         else:
                                             _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
                                             be_price = entry_price * (1 - _sync_buf)
-                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_price)
-                                            pos['trailingStop'] = min(pos.get('trailingStop', float('inf')), be_price)
+                                            apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
                                         logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL+Trail→breakeven")
                                 break
                 
@@ -5825,11 +6099,14 @@ async def binance_position_sync_loop():
                     
                     global_paper_trader.trades.append(trade)
                     
-                    # Save to SQLite
-                    try:
-                        safe_create_task(sqlite_manager.save_trade(trade))
-                    except Exception as e:
-                        logger.debug(f"SQLite save error: {e}")
+                    # Phase 275: Skip duplicate SQLite save if engine already saved this position
+                    if not engine_triggered:
+                        try:
+                            safe_create_task(sqlite_manager.save_trade(trade))
+                        except Exception as e:
+                            logger.debug(f"SQLite save error: {e}")
+                    else:
+                        logger.debug(f"Phase275: Skip duplicate save for {symbol} — engine already saved")
                     
                     # Update stats only for external closes (engine already updated stats)
                     if not engine_triggered:
@@ -6873,9 +7150,77 @@ FC_MIN_AGE_SEC = 480              # FC checks skip first 8min
 FC_SINGLE_LOOP_OWNER = 'WS'      # FC only fires in WS loop
 
 # =========================================================================
-# PHASE 245: TRADE COST ESTIMATOR + TICK-SIZE UTILITIES
-# Central cost model feeding all entry/exit parameters
+# FIX #7 (Joint Audit): SINGLE SL WRITE HELPER — MONOTONIC GUARANTEE
+# All runtime SL updates MUST go through this helper.
+# Excluded: initial position creation (from zero), optimizer restore (intentional rollback).
+# Authority: trailingStop. Mirror: stopLoss (UI/backward compat).
 # =========================================================================
+def apply_sl_floor(pos: dict, candidate_sl: float, source: str) -> bool:
+    """Apply SL update with monotonic guarantee.
+    
+    LONG: SL can only move UP   → final = max(current_stop, current_trail, candidate)
+    SHORT: SL can only move DOWN → final = min(current_stop, current_trail, candidate)
+    
+    Both stopLoss and trailingStop are set to final (mirror invariant).
+    Returns True if SL actually moved, False if candidate was rejected/unchanged.
+    
+    Works on every runtime update regardless of isTrailingActive status.
+    Initial position creation is excluded by design (caller doesn't use this).
+    """
+    side = pos.get('side', 'LONG')
+    old_stop = pos.get('stopLoss', 0)
+    old_trail = pos.get('trailingStop', old_stop)
+    symbol = pos.get('symbol', '?')
+    
+    if candidate_sl <= 0:
+        return False
+    
+    if side == 'LONG':
+        final = max(old_stop, old_trail, candidate_sl)
+    else:  # SHORT
+        # For SHORT: lower SL is tighter (better)
+        # Use inf defaults for min() when values are 0 (unset)
+        _old_stop_eff = old_stop if old_stop > 0 else float('inf')
+        _old_trail_eff = old_trail if old_trail > 0 else float('inf')
+        final = min(_old_stop_eff, _old_trail_eff, candidate_sl)
+        if final == float('inf'):
+            final = candidate_sl  # All were unset
+    
+    moved = False
+    if side == 'LONG':
+        moved = final > old_stop or final > old_trail
+    else:
+        moved = final < old_stop or final < old_trail
+    
+    # Apply — both fields always in sync (mirror invariant)
+    pos['stopLoss'] = final
+    pos['trailingStop'] = final
+    
+    # Telemetry
+    if moved:
+        logger.debug(
+            f"SL_UPDATE source={source} | {symbol} {side} | "
+            f"old_stop=${old_stop:.6f} old_trail=${old_trail:.6f} | "
+            f"candidate=${candidate_sl:.6f} → final=${final:.6f}"
+        )
+    
+    # Regression detection (should never happen with this helper)
+    regression = False
+    if side == 'LONG' and final < old_trail and old_trail > 0:
+        regression = True
+    elif side == 'SHORT' and final > old_trail and old_trail > 0 and old_trail != float('inf'):
+        regression = True
+    
+    if regression:
+        logger.error(
+            f"🚨 SL_REGRESSION source={source} | {symbol} {side} | "
+            f"old_trail=${old_trail:.6f} → final=${final:.6f} | "
+            f"THIS SHOULD NEVER HAPPEN"
+        )
+    
+    return moved
+
+
 
 def estimate_trade_cost(
     spread_pct: float = 0.05,
@@ -6956,6 +7301,126 @@ def ensure_tick_safe_buffer(entry_price: float, buffer_pct: float, tick_size: fl
     # Snap to tick grid
     effective = snap_to_tick(effective, tick_size, direction='up')
     return effective
+
+def compute_sl_tp_levels(
+    entry_price: float,
+    atr: float,
+    side: str,
+    leverage: int,
+    symbol: str,
+    adjusted_sl_atr: float,
+    adjusted_tp_atr: float,
+    adjusted_trail_act_atr: float,
+    adjusted_trail_dist_atr: float,
+    spread_pct: float = 0.05,
+    canary_sl_mult: float = 1.0,
+    canary_tp_mult: float = 1.0,
+    canary_trail_mult: float = 1.0,
+) -> dict:
+    """Canonical SL/TP/trail computation. All entry paths use this.
+    
+    Enforces:
+    1. Leverage floor (SL: ~30% ROI loss, TP: ~5% ROI gain)
+    2. Cost floor (TP >= 3× round-trip cost)
+    3. Canary multipliers (applied to distances before side/clamp/snap)
+    4. Side-aware application (LONG/SHORT)
+    5. Floor clamp (price > 0.01 * entry)
+    6. Tick-size snap (micro-price safe)
+    
+    Returns: {
+        'sl', 'tp', 'trail_activation', 'trail_distance',
+        'meta': {
+            'sl_source': 'ATR' | 'LEV_FLOOR',
+            'tp_source': 'ATR' | 'LEV_FLOOR' | 'COST_FLOOR',
+            'sl_dist_atr', 'sl_dist_lev', 'sl_dist_final',
+            'tp_dist_atr', 'tp_dist_lev', 'tp_dist_cost', 'tp_dist_final',
+            'cost_roi_pct', 'tick_size',
+        }
+    }
+    """
+    safe_lev = max(1, int(leverage))
+    
+    # ── Step 1: Raw distances ──
+    sl_dist_atr = atr * adjusted_sl_atr
+    tp_dist_atr = atr * adjusted_tp_atr
+    
+    # ── Step 2: Leverage floors ──
+    sl_dist_lev = entry_price * (30.0 / safe_lev / 100)   # ~30% ROI loss
+    tp_dist_lev = entry_price * (5.0 / safe_lev / 100)    # ~5% ROI gain
+    
+    # ── Step 3: Cost floor (TP only) ──
+    tp_dist_cost = 0.0
+    cost_roi_pct = 0.0
+    try:
+        _cost = estimate_trade_cost(spread_pct, safe_lev)
+        cost_roi_pct = _cost['roi_pct']
+        # TP must cover >= 3× round-trip cost in price terms
+        tp_dist_cost = entry_price * (cost_roi_pct * 3 / safe_lev / 100)
+    except Exception:
+        pass
+    
+    # ── Step 4: Effective distances (max of all floors) ──
+    sl_dist = max(sl_dist_atr, sl_dist_lev)
+    tp_dist = max(tp_dist_atr, tp_dist_lev, tp_dist_cost)
+    
+    # ── Step 5: Canary multipliers (distance-level, before side logic) ──
+    sl_dist *= canary_sl_mult
+    tp_dist *= canary_tp_mult
+    
+    # Re-enforce floors after canary (canary_mult < 1 must not breach safety floors)
+    sl_dist = max(sl_dist, sl_dist_lev)
+    tp_dist = max(tp_dist, tp_dist_lev, tp_dist_cost)
+    
+    # Track which floor won (after canary + re-enforce = final distances)
+    sl_source = 'ATR' if sl_dist > sl_dist_lev else 'LEV_FLOOR'
+    if tp_dist_cost > 0 and tp_dist <= tp_dist_cost:
+        tp_source = 'COST_FLOOR'
+    elif tp_dist <= tp_dist_lev and tp_dist_lev > 0:
+        tp_source = 'LEV_FLOOR'
+    else:
+        tp_source = 'ATR'
+    
+    # ── Step 6: Side-aware price application + floor clamp ──
+    if side == 'LONG':
+        sl = max(entry_price * 0.01, entry_price - sl_dist)
+        tp = entry_price + tp_dist
+        trail_activation = entry_price + (atr * adjusted_trail_act_atr * canary_trail_mult)
+    else:
+        sl = entry_price + sl_dist
+        tp = max(entry_price * 0.01, entry_price - tp_dist)
+        trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_act_atr * canary_trail_mult))
+    
+    trail_distance = atr * adjusted_trail_dist_atr * canary_trail_mult
+    
+    # ── Step 7: Tick-size snap ──
+    tick = 0.0001
+    try:
+        tick = get_tick_size(symbol)
+        sl = snap_to_tick(sl, tick, 'down' if side == 'LONG' else 'up')
+        tp = snap_to_tick(tp, tick, 'up' if side == 'LONG' else 'down')
+        trail_activation = snap_to_tick(trail_activation, tick, 'up' if side == 'LONG' else 'down')
+    except Exception:
+        pass
+    
+    return {
+        'sl': sl,
+        'tp': tp,
+        'trail_activation': trail_activation,
+        'trail_distance': trail_distance,
+        'meta': {
+            'sl_source': sl_source,
+            'tp_source': tp_source,
+            'sl_dist_atr': round(sl_dist_atr, 8),
+            'sl_dist_lev': round(sl_dist_lev, 8),
+            'sl_dist_final': round(sl_dist, 8),
+            'tp_dist_atr': round(tp_dist_atr, 8),
+            'tp_dist_lev': round(tp_dist_lev, 8),
+            'tp_dist_cost': round(tp_dist_cost, 8),
+            'tp_dist_final': round(tp_dist, 8),
+            'cost_roi_pct': round(cost_roi_pct, 4),
+            'tick_size': tick,
+        }
+    }
 
 
 # =========================================================================
@@ -9265,16 +9730,24 @@ def update_runtime_trail_telemetry(
 
 def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: float) -> bool:
     """
-    Phase 217: Unified trail-based Emergency SL check — single source of truth.
-    Checks if current price exceeds the trailing stop by >1% of entry price.
+    Phase 275: Unified trail-based leverage-aware Emergency SL check.
+    Checks if current price exceeds trailing stop by a dynamic margin:
+      - Base ROI threshold mapped to price distance by leverage
+      - Never tighter than 1.5x current SL distance (avoid premature trigger)
     Returns True if emergency breach detected.
     """
     entry_price = pos.get('entryPrice', 0)
     if entry_price <= 0 or trailing_stop <= 0:
         return False
     
-    EMERGENCY_MARGIN_PCT = 1.0  # %1 of entry price
-    emergency_margin = entry_price * (EMERGENCY_MARGIN_PCT / 100)
+    leverage = max(1.0, float(pos.get('leverage', 1) or 1))
+    base_roi_threshold = 12.0  # emergency at ~12% ROI loss
+    margin_pct_from_lev = base_roi_threshold / leverage
+    sl_distance_pct = abs(entry_price - trailing_stop) / entry_price * 100
+    emergency_margin_pct = max(margin_pct_from_lev, sl_distance_pct * 1.5)
+    # Upper cap: never wider than ~25% ROI converted to price%
+    emergency_margin_pct = min(emergency_margin_pct, 25.0 / leverage)
+    emergency_margin = entry_price * (emergency_margin_pct / 100)
     side = pos.get('side', 'LONG')
     
     if side == 'LONG' and current_price <= (trailing_stop - emergency_margin):
@@ -9448,11 +9921,12 @@ def _apply_tightening(pos: dict, factor: float):
         if side == 'LONG':
             sl_distance = entry - orig_sl
             new_sl = entry - (sl_distance * factor)
-            # Orijinal SL'den hesapla — factor değiştikçe SL de ayarlansın
+            # FIX #7: Intentional factor-based tighten from original_sl — bypass apply_sl_floor
             pos['stopLoss'] = new_sl
         else:  # SHORT
             sl_distance = orig_sl - entry
             new_sl = entry + (sl_distance * factor)
+            # FIX #7: Intentional factor-based tighten from original_sl — bypass apply_sl_floor
             pos['stopLoss'] = new_sl
     
     # Trail distance sıkılaştır
@@ -9578,6 +10052,7 @@ async def apply_mtf_position_guard(positions: list, exchange):
                 # Nötr — orijinal değerlere dön ve flag temizle
                 if pos.get('_mtf_originals_saved', False):
                     if not pos.get('isTrailingActive', False):
+                        # FIX #7: Intentional rollback to original values — bypass apply_sl_floor
                         pos['stopLoss'] = pos.get('original_sl', pos['stopLoss'])
                     pos['trailDistance'] = pos.get('original_trail_distance', pos.get('trailDistance', 0))
                     pos['trailActivation'] = pos.get('original_trail_activation', pos.get('trailActivation', entry))
@@ -11895,6 +12370,19 @@ class MultiCoinScanner:
     
     async def fetch_all_futures_symbols(self) -> list:
         """Fetch all USDT perpetual contracts from Binance Futures."""
+        blocked_bases = {'USDC', 'BUSD', 'TUSD', 'USDP', 'DAI', 'FDUSD', 'USDE', 'EUR', 'GBP'}
+        blocked_symbols = {
+            'USDCUSDT', 'BUSDUSDT', 'TUSDUSDT', 'USDPUSDT', 'DAIUSDT', 'FDUSDUSDT', 'USDEUSDT',
+            'EURUSDT', 'GBPUSDT',
+        }
+
+        def _is_blocked(sym: str) -> bool:
+            s = (sym or '').upper()
+            if s in blocked_symbols:
+                return True
+            if s.endswith('USDT'):
+                return s[:-4] in blocked_bases
+            return False
         
         # Method 1: Try direct Binance API (most reliable, bypasses CCXT issues)
         try:
@@ -11908,7 +12396,8 @@ class MultiCoinScanner:
                             if (s.get('symbol', '').endswith('USDT') and 
                                 s.get('contractType') == 'PERPETUAL' and 
                                 s.get('status') == 'TRADING'):
-                                symbols.append(s['symbol'])
+                                if not _is_blocked(s['symbol']):
+                                    symbols.append(s['symbol'])
                         
                         if len(symbols) > 100:  # Sanity check
                             symbols = sorted(list(set(symbols)))
@@ -11949,7 +12438,9 @@ class MultiCoinScanner:
                     ':USDT' in symbol):
                     base = market.get('base', '')
                     if base:
-                        symbols.append(f"{base}USDT")
+                        c = f"{base}USDT"
+                        if not _is_blocked(c):
+                            symbols.append(c)
             
             symbols = sorted(list(set(symbols)))
             
@@ -11990,7 +12481,8 @@ class MultiCoinScanner:
             'WLDUSDT', 'LQTYUSDT', 'OXTUSDT', 'AMBUSDT', 'PHBUSDT',
             'COMBOUSDT', 'MAVUSDT', 'XVSUSDT', 'EDUUSDT', 'IDUSDT'
         ]
-        logger.info(f"Using fallback list of {len(self.coins)} coins")
+        self.coins = [s for s in self.coins if not _is_blocked(s)]
+        logger.info(f"Using fallback list of {len(self.coins)} coins (stablecoin-filtered)")
         return self.coins
     
     def get_or_create_analyzer(self, symbol: str) -> LightweightCoinAnalyzer:
@@ -13116,7 +13608,7 @@ async def background_scanner_loop():
                                     trailing_stop = max(trailing_stop, sl)
                                 else:
                                     trailing_stop = min(trailing_stop, sl)
-                                pos['trailingStop'] = trailing_stop
+                                apply_sl_floor(pos, trailing_stop, 'BE_CLAMP')
                             
                             # =========================================================
                             # Phase 202: STEPPED SL LOCK for Trend Mode positions
@@ -13157,13 +13649,13 @@ async def background_scanner_loop():
                                     if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
                                         old_sl = trailing_stop
                                         trailing_stop = stepped_sl
-                                        pos['trailingStop'] = stepped_sl
+                                        apply_sl_floor(pos, stepped_sl, 'STEPPED_SL')
                                         if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
                                             logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
                                     elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
                                         old_sl = trailing_stop
                                         trailing_stop = stepped_sl
-                                        pos['trailingStop'] = stepped_sl
+                                        apply_sl_floor(pos, stepped_sl, 'STEPPED_SL')
                                         if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
                                             logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
                             
@@ -13395,12 +13887,12 @@ async def background_scanner_loop():
                                     # Phase 231h: Clamp — trail stop never below breakeven
                                     new_trailing = max(new_trailing, be_long)
                                     if new_trailing > trailing_stop:
-                                        pos['trailingStop'] = new_trailing
+                                        apply_sl_floor(pos, new_trailing, 'TRAIL_DYN')
                                         if not trail_already_active:
                                             pos['isTrailingActive'] = True
                                             pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
-                                            # Breakeven SL on first activation
-                                            pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
+                                            # Second floor call for breakeven clamp — helper picks max(trail, be)
+                                            apply_sl_floor(pos, be_long, 'TRAIL_DYN_BE')
                                             logger.info(f"📊 TRAIL_DYN: {pos_symbol} LONG trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                             elif pos['side'] == 'SHORT':
                                 trail_already_active = pos.get('isTrailingActive', False)
@@ -13413,11 +13905,11 @@ async def background_scanner_loop():
                                     # Phase 231h: Clamp — trail stop never above breakeven
                                     new_trailing = min(new_trailing, be_short)
                                     if new_trailing < trailing_stop:
-                                        pos['trailingStop'] = new_trailing
+                                        apply_sl_floor(pos, new_trailing, 'TRAIL_DYN')
                                         if not trail_already_active:
                                             pos['isTrailingActive'] = True
                                             pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
-                                            pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
+                                            apply_sl_floor(pos, be_short, 'TRAIL_DYN_BE')
                                             logger.info(f"📊 TRAIL_DYN: {pos_symbol} SHORT trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                                     
                     except Exception as pos_error:
@@ -13712,13 +14204,13 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
                     old_sl = trailing_stop
                     trailing_stop = stepped_sl
-                    pos['trailingStop'] = stepped_sl
+                    apply_sl_floor(pos, stepped_sl, 'STEPPED_SL_WS')
                     if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
                         logger.info(f"🔒 STEPPED_SL(WS): {symbol} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
                 elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
                     old_sl = trailing_stop
                     trailing_stop = stepped_sl
-                    pos['trailingStop'] = stepped_sl
+                    apply_sl_floor(pos, stepped_sl, 'STEPPED_SL_WS')
                     if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
                         logger.info(f"🔒 STEPPED_SL(WS): {symbol} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
         
@@ -13881,11 +14373,11 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 # Phase 231h: Clamp — trail stop never below breakeven
                 new_trailing = max(new_trailing, be_long)
                 if new_trailing > trailing_stop:
-                    pos['trailingStop'] = new_trailing
+                    apply_sl_floor(pos, new_trailing, 'TRAIL_DYN_WS')
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
                         pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
-                        pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
+                        apply_sl_floor(pos, be_long, 'TRAIL_DYN_WS_BE')
                         logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} LONG trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
         elif pos['side'] == 'SHORT':
             ws_should_activate = (
@@ -13896,11 +14388,11 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 new_trailing = candle_close_price + dynamic_trail_distance
                 new_trailing = min(new_trailing, be_short)
                 if new_trailing < trailing_stop:
-                    pos['trailingStop'] = new_trailing
+                    apply_sl_floor(pos, new_trailing, 'TRAIL_DYN_WS')
                     if not ws_trail_already_active:
                         pos['isTrailingActive'] = True
                         pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
-                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
+                        apply_sl_floor(pos, be_short, 'TRAIL_DYN_WS_BE')
                         logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} SHORT trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
 
 
@@ -14115,11 +14607,11 @@ async def position_price_update_loop():
                                 # Phase 231h: Clamp — trail stop never below breakeven
                                 new_trailing = max(new_trailing, be_long)
                                 if new_trailing > pos.get('trailingStop', 0.0):
-                                    pos['trailingStop'] = new_trailing
+                                    apply_sl_floor(pos, new_trailing, 'TRAIL_DYN_FAST')
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                                        pos['stopLoss'] = max(pos.get('stopLoss', 0), be_long)
+                                        apply_sl_floor(pos, be_long, 'TRAIL_DYN_FAST_BE')
                         elif pos['side'] == 'SHORT':
                             fast_should_activate = (
                                 fast_price_move >= fast_min_price_move or
@@ -14129,11 +14621,11 @@ async def position_price_update_loop():
                                 new_trailing = current_price + dynamic_trail_distance
                                 new_trailing = min(new_trailing, be_short)
                                 if new_trailing < pos.get('trailingStop', float('inf')):
-                                    pos['trailingStop'] = new_trailing
+                                    apply_sl_floor(pos, new_trailing, 'TRAIL_DYN_FAST')
                                     if not fast_trail_already_active:
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), be_short)
+                                        apply_sl_floor(pos, be_short, 'TRAIL_DYN_FAST_BE')
                                 
                     except Exception as pos_error:
                         logger.debug(f"Position update error for {symbol}: {pos_error}")
@@ -15379,6 +15871,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     global_paper_trader.pipeline_metrics.setdefault('open_reject_reasons', {})
     global_paper_trader.pipeline_metrics['signal_accepted'] += 1
     global_paper_trader.pipeline_metrics['open_attempted'] += 1
+    pos = None  # FIX #6 Rev: prevent UnboundLocalError if try raises
     try:
         pos = await global_paper_trader.open_position(
             side=action,
@@ -15408,6 +15901,18 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 # Open-position stage rejections are tracked in pipeline metrics/logs.
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
+        signal_log_data['reject_reason'] = f"OPEN_POS:EXCEPTION:{type(e).__name__}"
+    
+    # FIX #6 (Joint Audit): Finalize signal log with execution outcome
+    _sig_ts = signal_log_data.get('timestamp', 0)
+    if pos:
+        safe_create_task(sqlite_manager.update_signal_outcome(
+            symbol, _sig_ts, position_id=pos.get('id', '')
+        ))
+    elif signal_log_data.get('reject_reason'):
+        safe_create_task(sqlite_manager.update_signal_outcome(
+            symbol, _sig_ts, reject_reason=signal_log_data['reject_reason']
+        ))
 
 
 # ============================================================================
@@ -17884,11 +18389,11 @@ class TimeBasedPositionManager:
                                         if side == 'LONG':
                                             new_trail_stop = current_price - trail_dist
                                             new_trail_stop = max(new_trail_stop, entry_price)
-                                            pos['trailingStop'] = new_trail_stop
+                                            apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL')
                                         else:  # SHORT
                                             new_trail_stop = current_price + trail_dist
                                             new_trail_stop = min(new_trail_stop, entry_price)
-                                            pos['trailingStop'] = new_trail_stop
+                                            apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL')
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
@@ -17905,12 +18410,10 @@ class TimeBasedPositionManager:
                                     safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, side)
                                     if side == 'LONG':
                                         breakeven_sl = snap_to_tick(entry_price + safe_delta, _tick, 'up')
-                                        if breakeven_sl > pos.get('stopLoss', 0):
-                                            pos['stopLoss'] = breakeven_sl
+                                        apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
                                     else:  # SHORT
                                         breakeven_sl = snap_to_tick(entry_price - safe_delta, _tick, 'down')
-                                        if breakeven_sl < pos.get('stopLoss', float('inf')):
-                                            pos['stopLoss'] = breakeven_sl
+                                        apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
                                     pos['breakeven_activated'] = True
                                     logger.warning(f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → breakeven ${breakeven_sl:.6f} (delta=${safe_delta:.6f}, tick={_tick})")
                                     
@@ -17968,11 +18471,11 @@ class TimeBasedPositionManager:
                                 if side == 'LONG':
                                     new_trail_stop = current_price - trail_dist
                                     new_trail_stop = max(new_trail_stop, entry_price)
-                                    pos['trailingStop'] = new_trail_stop
+                                    apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 else:
                                     new_trail_stop = current_price + trail_dist
                                     new_trail_stop = min(new_trail_stop, entry_price)
-                                    pos['trailingStop'] = new_trail_stop
+                                    apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 
                                 pos['isTrailingActive'] = True
                                 pos['trailActiveSince'] = datetime.now().timestamp()
@@ -18025,7 +18528,7 @@ class TimeBasedPositionManager:
                         if profit_pullback >= pullback_threshold:
                             pos['isTrailingActive'] = True
                             pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                            pos['trailingStop'] = current_price
+                            apply_sl_floor(pos, current_price, 'EARLY_TRAIL')
                             actions["trail_activated"].append(f"{symbol} (pullback ${profit_pullback:.2f})")
                             logger.info(f"📊 EARLY TRAIL: {symbol} activated - pullback ${profit_pullback:.2f} >= threshold ${pullback_threshold:.2f} (spread: {spread_level})")
                 
@@ -18493,16 +18996,17 @@ class BreakevenStopManager:
                 actions["checked"] += 1
                 
                 # Calculate profit percentage
+                leverage = pos.get('leverage', 10)
                 if side == 'LONG':
-                    profit_pct = (current_price - entry_price) / entry_price * 100
+                    profit_pct = (current_price - entry_price) / entry_price * 100 * leverage  # Phase 275: ROI%
                 else:  # SHORT
-                    profit_pct = (entry_price - current_price) / entry_price * 100
+                    profit_pct = (entry_price - current_price) / entry_price * 100 * leverage  # Phase 275: ROI%
                 
                 # Phase 182: ATR-based dynamic activation threshold
                 atr = float(pos.get('atr', entry_price * 0.02))  # Default 2% if no ATR
                 atr_pct = (atr / entry_price) * 100 if entry_price > 0 else 2.0
                 config = self.activation_config.get(spread_level, {'floor': 2.0, 'atr_mult': 2.0})
-                activation_threshold = max(config['floor'], atr_pct * config['atr_mult'])
+                activation_threshold = max(config['floor'], atr_pct * config['atr_mult']) * leverage  # Phase 275: leverage-aware
                 
                 # Phase 182: Minimum hold time guard (30 min)
                 open_time = int(pos.get('openTime') or 0)
@@ -18670,6 +19174,7 @@ class BreakevenStopManager:
                             roi_val = (real_pnl / margin_val * 100) if margin_val > 0 else 0
                             
                             pending_close_reasons[symbol] = {
+                                "position_id": pos.get('id', ''),  # hedging-safe traceability
                                 "reason": f"BREAKEVEN_CLOSE: {spread_level} spread, limit filled @ ${fill_price}",
                                 "original_reason": "BREAKEVEN_CLOSE",
                                 "pnl": round(real_pnl, 4),
@@ -18914,6 +19419,7 @@ class LossRecoveryTrailManager:
                                 roi_val = (actual_pnl / margin_val * 100) if margin_val > 0 else 0
                                 
                                 pending_close_reasons[symbol] = {
+                                    "position_id": pos.get('id', ''),  # hedging-safe traceability
                                     "reason": f"RECOVERY_TRAIL_CLOSE: peak_loss={peak_loss:.1f}%, recovered to {peak_recovery_pnl:.1f}%, gave back {giveback_ratio*100:.0f}%",
                                     "original_reason": "RECOVERY_TRAIL_CLOSE",
                                     "pnl": round(actual_pnl, 4),
@@ -19502,12 +20008,27 @@ class CanaryMode:
         self.canary_results = []     # Canary pozisyon PnL'leri
         self.control_results = []    # Normal pozisyon PnL'leri
         self.enabled = False         # Başlangıçta kapalı
+        # OVP-1: Canary constraints
+        self.max_size_usd = float(os.environ.get('CANARY_MAX_SIZE_USD', '50'))
+        self.symbol_whitelist = [s.strip() for s in os.environ.get('CANARY_SYMBOL_WHITELIST', '').split(',') if s.strip()]
+        self.force_market_allowed = os.environ.get('CANARY_FORCE_MARKET', 'false').lower() == 'true'
+        self.max_concurrent = int(os.environ.get('CANARY_MAX_CONCURRENT', '2'))
+        self._trader_ref = None  # Set by PaperTradingEngine.__init__
         logger.info(f"🐤 CanaryMode initialized (pct={canary_pct*100:.0f}%)")
     
-    def should_use_canary(self, pos_id: str) -> bool:
+    def should_use_canary(self, pos_id: str, symbol: str = None) -> bool:
         """Deterministik: pos_id hash'inin son 2 hanesi < canary_pct * 100."""
         if not self.enabled or not self.canary_params:
             return False
+        # OVP-1: Symbol whitelist gate
+        if self.symbol_whitelist and symbol and symbol not in self.symbol_whitelist:
+            return False
+        # OVP-1: Max concurrent gate
+        if self._trader_ref:
+            active = sum(1 for p in getattr(self._trader_ref, 'positions', []) if p.get('is_canary'))
+            active += sum(1 for o in getattr(self._trader_ref, 'pending_orders', []) if o.get('is_canary'))
+            if active >= self.max_concurrent:
+                return False
         import hashlib
         h = int(hashlib.md5(pos_id.encode()).hexdigest(), 16)
         return (h % 100) < int(self.canary_pct * 100)
@@ -19548,6 +20069,119 @@ class CanaryMode:
 
 # Global instance
 canary_mode = CanaryMode()
+
+# CEDG-1: Environment-driven canary activation
+if os.environ.get('CANARY_ENABLED', 'false').lower() == 'true':
+    canary_mode.enabled = True
+    canary_mode.canary_params = {
+        'sl_mult': float(os.environ.get('CANARY_SL_MULT', '1.0')),
+        'tp_mult': float(os.environ.get('CANARY_TP_MULT', '1.0')),
+        'trail_mult': float(os.environ.get('CANARY_TRAIL_MULT', '1.0')),
+    }
+    logger.info(
+        f"🐤 CANARY ACTIVATED: enabled={canary_mode.enabled} "
+        f"pct={canary_mode.canary_pct*100:.0f}% "
+        f"max_size=${canary_mode.max_size_usd} "
+        f"whitelist={canary_mode.symbol_whitelist or 'ALL'} "
+        f"force_market={canary_mode.force_market_allowed} "
+        f"max_concurrent={canary_mode.max_concurrent} "
+        f"params={canary_mode.canary_params}"
+    )
+else:
+    logger.info("🐤 CANARY DISABLED (set CANARY_ENABLED=true to activate)")
+
+
+class CanaryMetricReporter:
+    """OVP-1: Hourly trade quality metrics — canary-filtered."""
+    
+    def __init__(self):
+        self.canary_trades = []
+        self.control_trades = []
+        self.last_report_time = 0
+        self.report_interval = 3600
+        self.rollback_triggered = False
+        self.rollback_reason = None
+    
+    def record_trade(self, trade: dict):
+        is_canary = trade.get('is_canary', False)
+        entry = {
+            'symbol': trade.get('symbol'),
+            'entry_price': trade.get('entryPrice', 0),
+            'exit_price': trade.get('exitPrice', 0),
+            'entry_method': trade.get('entry_method', 'MARKET'),
+            'entry_slippage': trade.get('entry_slippage', 0),
+            'close_reason': trade.get('reason', ''),
+            'pnl': trade.get('pnl', 0),
+            'roi': trade.get('roi', 0),
+            'open_time': trade.get('openTime', 0),
+            'close_time': trade.get('closeTime', 0),
+            'binance_fill_price': trade.get('binance_fill_price', 0),
+        }
+        if is_canary:
+            self.canary_trades.append(entry)
+            if len(self.canary_trades) > 100:
+                self.canary_trades = self.canary_trades[-100:]
+        else:
+            self.control_trades.append(entry)
+            if len(self.control_trades) > 100:
+                self.control_trades = self.control_trades[-100:]
+    
+    def _compute_subset(self, trades: list) -> dict:
+        n = len(trades)
+        if n == 0:
+            return {'n': 0}
+        drifts = []
+        for t in trades:
+            ep, fp = t.get('entry_price', 0), t.get('binance_fill_price', 0)
+            if ep > 0 and fp > 0:
+                drifts.append(abs(fp - ep) / ep * 10000)
+        quick = sum(1 for t in trades if 0 < (t.get('close_time', 0) - t.get('open_time', 0)) / 1000 < 90)
+        tp_neg = sum(1 for t in trades if 'TP_HIT' in str(t.get('close_reason', '')) and (t.get('roi', 0) or 0) < 0)
+        esl = sum(1 for t in trades if 'EMERGENCY_SL' in str(t.get('close_reason', '')))
+        mf = sum(1 for t in trades if t.get('entry_method') == 'MARKET_FALLBACK')
+        return {
+            'n': n,
+            'entry_drift_bps': round(sum(drifts) / len(drifts), 2) if drifts else 0,
+            'quick_exit_lt90s_rate': round(quick / n, 4),
+            'tp_hit_roi_negative': tp_neg,
+            'emergency_sl_count': esl,
+            'market_fallback_rate': round(mf / n, 4),
+        }
+    
+    def check_rollback(self) -> tuple:
+        """Rollback uses ONLY canary trades."""
+        m = self._compute_subset(self.canary_trades)
+        n = m.get('n', 0)
+        if n < 5:
+            return (False, 'insufficient_canary_data')
+        if m.get('emergency_sl_count', 0) >= 1:
+            return (True, f"CANARY EMERGENCY_SL ({m['emergency_sl_count']}x)")
+        if n <= 20 and m.get('quick_exit_lt90s_rate', 0) > 0.20:
+            return (True, f"CANARY quick_exit={m['quick_exit_lt90s_rate']:.0%}>20%")
+        if m.get('tp_hit_roi_negative', 0) >= 2:
+            return (True, f"CANARY TP+neg_ROI x{m['tp_hit_roi_negative']}")
+        return (False, 'ok')
+    
+    def maybe_report(self) -> dict:
+        now = time.time()
+        if now - self.last_report_time < self.report_interval:
+            return None
+        self.last_report_time = now
+        canary_m = self._compute_subset(self.canary_trades)
+        control_m = self._compute_subset(self.control_trades)
+        should_rb, rb_reason = self.check_rollback()
+        report = {'canary': canary_m, 'control': control_m,
+                  'rollback_triggered': should_rb, 'rollback_reason': rb_reason}
+        if should_rb and not self.rollback_triggered:
+            self.rollback_triggered = True
+            self.rollback_reason = rb_reason
+            logger.error(f"🚨 CANARY ROLLBACK: {rb_reason}")
+        else:
+            logger.info(f"📊 CANARY HOURLY: canary={canary_m} control={control_m}")
+        return report
+
+
+canary_metric_reporter = CanaryMetricReporter()
 
 # ============================================================================
 # PHASE 225: PRICE SHOCK MANAGER
@@ -19850,6 +20484,7 @@ class PriceShockManager:
                 new_sl = entry + (sl_distance * self.sl_tighten_factor)
                 new_trailing = entry + (trail_distance * self.sl_tighten_factor) if trail_distance > 0 else new_sl
             
+            # FIX #7: Intentional non-monotonic tighten — bypass apply_sl_floor
             pos['stopLoss'] = new_sl
             pos['trailingStop'] = new_trailing
             
@@ -19884,6 +20519,7 @@ class PriceShockManager:
                             restore_sl = min(snapshot['sl'], current_sl)  # Keep the lower (more protective)
                             restore_trail = min(snapshot['trailing'], current_trailing)
                         
+                        # FIX #7: Intentional rollback to pre-shock values — bypass apply_sl_floor
                         pos['stopLoss'] = restore_sl
                         pos['trailingStop'] = restore_trail
                         restored_count += 1
@@ -23215,6 +23851,8 @@ class PaperTradingEngine:
                 state_file = "paper_trading_state.json"
                 logger.info("📁 Using local storage: paper_trading_state.json")
         self.state_file = state_file
+        # OVP-1: Wire canary trader ref for max_concurrent gate
+        canary_mode._trader_ref = self
         self.balance = 10000.0
         self.initial_balance = 10000.0
         self.positions = []
@@ -23299,7 +23937,12 @@ class PaperTradingEngine:
         # =========================================================================
         # COIN BLACKLIST SYSTEM
         # Automatically blocks coins that consistently cause losses
+        # Phase 275: STATIC_BLACKLIST — stablecoins and non-tradeable pairs
         # =========================================================================
+        self.STATIC_BLACKLIST = {
+            'USDCUSDT', 'BUSDUSDT', 'TUSDUSDT', 'USDPUSDT', 'DAIUSDT',
+            'FDUSDUSDT', 'USDEUSDT', 'EURUSDT', 'GBPUSDT',
+        }
         self.coin_blacklist = {}  # symbol -> {until: timestamp, reason: str, losses: int}
         self.coin_stats = {}  # symbol -> {wins: int, losses: int, consecutive_losses: int, last_trade_time: float}
         self.blacklist_threshold = 2  # Consecutive losses to trigger blacklist
@@ -23657,6 +24300,10 @@ class PaperTradingEngine:
     
     def is_coin_blacklisted(self, symbol: str) -> bool:
         """Check if a coin is currently blacklisted."""
+        symbol = (symbol or '').upper()
+        # Phase 275: Static blacklist — stablecoins, fiat pairs
+        if symbol in self.STATIC_BLACKLIST:
+            return True
         if symbol not in self.coin_blacklist:
             return False
         
@@ -23936,6 +24583,10 @@ class PaperTradingEngine:
 
         existing_pending['reinforcedCount'] = reinforce_count
         existing_pending['signalScore'] = max(old_score, new_score)
+        # P2-08: Propagate raw score (max of old and new raw)
+        old_raw = int(existing_pending.get('signalScoreRaw', old_score) or 0)
+        new_raw = int(signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)) if signal else 0)
+        existing_pending['signalScoreRaw'] = max(old_raw, new_raw)
         existing_pending['lastReinforceAt'] = now_ms
         existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
         existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
@@ -23988,40 +24639,21 @@ class PaperTradingEngine:
                 _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
                 _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
 
-                if side == 'LONG':
-                    _sl = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_sl_atr))
-                    _tp = _entry_for_levels + (_atr_for_levels * _adj_tp_atr)
-                    _trail_activation = _entry_for_levels + (_atr_for_levels * _adj_trail_activation_atr)
-                else:
-                    _sl = _entry_for_levels + (_atr_for_levels * _adj_sl_atr)
-                    _tp = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_tp_atr))
-                    _trail_activation = max(_entry_for_levels * 0.01, _entry_for_levels - (_atr_for_levels * _adj_trail_activation_atr))
+                _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
+                _ord_spread = float(existing_pending.get('spreadPct', 0.05))
+                _pv_levels = compute_sl_tp_levels(
+                    entry_price=_entry_for_levels, atr=_atr_for_levels, side=side,
+                    leverage=_ord_lev, symbol=trade_symbol,
+                    adjusted_sl_atr=_adj_sl_atr, adjusted_tp_atr=_adj_tp_atr,
+                    adjusted_trail_act_atr=_adj_trail_activation_atr,
+                    adjusted_trail_dist_atr=_adj_trail_distance_atr,
+                    spread_pct=_ord_spread,
+                )
 
-                try:
-                    _ord_spread = float(existing_pending.get('spreadPct', 0.05))
-                    _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
-                    _cost = estimate_trade_cost(_ord_spread, _ord_lev)
-                    _min_tp_distance = _entry_for_levels * (_cost['min_profitable_move'] * 3 / 100)
-                    if abs(_tp - _entry_for_levels) < _min_tp_distance:
-                        if side == 'LONG':
-                            _tp = _entry_for_levels + _min_tp_distance
-                        else:
-                            _tp = max(_entry_for_levels * 0.01, _entry_for_levels - _min_tp_distance)
-                except Exception:
-                    pass
-
-                try:
-                    _tick = get_tick_size(trade_symbol)
-                    _sl = snap_to_tick(_sl, _tick, 'down' if side == 'LONG' else 'up')
-                    _tp = snap_to_tick(_tp, _tick, 'up' if side == 'LONG' else 'down')
-                    _trail_activation = snap_to_tick(_trail_activation, _tick, 'up' if side == 'LONG' else 'down')
-                except Exception:
-                    pass
-
-                existing_pending['stopLoss'] = _sl
-                existing_pending['takeProfit'] = _tp
-                existing_pending['trailActivation'] = _trail_activation
-                existing_pending['trailDistance'] = max(_atr_for_levels * _adj_trail_distance_atr, 1e-8)
+                existing_pending['stopLoss'] = _pv_levels['sl']
+                existing_pending['takeProfit'] = _pv_levels['tp']
+                existing_pending['trailActivation'] = _pv_levels['trail_activation']
+                existing_pending['trailDistance'] = _pv_levels['trail_distance']
             except Exception as _recalc_err:
                 logger.debug(f"Pending reinforce level recalc error ({trade_symbol}): {_recalc_err}")
         except Exception:
@@ -24329,40 +24961,21 @@ class PaperTradingEngine:
         except Exception as rp_err:
             logger.debug(f"Regime profile params error: {rp_err}")
         
-        if side == 'LONG':
-            sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
-            tp = entry_price + (atr * adjusted_tp_atr)
-            trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
-        else:
-            sl = entry_price + (atr * adjusted_sl_atr)
-            tp = max(entry_price * 0.01, entry_price - (atr * adjusted_tp_atr))
-            trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_activation_atr))
+        # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
+        _sig_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
+        _levels = compute_sl_tp_levels(
+            entry_price=entry_price, atr=atr, side=side,
+            leverage=adjusted_leverage, symbol=trade_symbol,
+            adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+            adjusted_trail_act_atr=adjusted_trail_activation_atr,
+            adjusted_trail_dist_atr=adjusted_trail_distance_atr,
+            spread_pct=_sig_spread,
+        )
+        sl = _levels['sl']
+        tp = _levels['tp']
+        trail_activation = _levels['trail_activation']
         
-        # Phase 245 Component 2: TP must be at least 3× trade cost away from entry
-        try:
-            _sig_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
-            _cost = estimate_trade_cost(_sig_spread, adjusted_leverage)
-            _min_tp_distance = entry_price * (_cost['min_profitable_move'] * 3 / 100)
-            _current_tp_distance = abs(tp - entry_price)
-            if _current_tp_distance < _min_tp_distance:
-                if side == 'LONG':
-                    tp = entry_price + _min_tp_distance
-                else:
-                    tp = max(entry_price * 0.01, entry_price - _min_tp_distance)
-                logger.info(f"💰 TP_COST_FLOOR: {trade_symbol} TP widened to cover 3× cost (min_dist={_min_tp_distance:.6f})")
-        except Exception:
-            pass
-        
-        # Phase 245 Component 7: Snap SL/TP/trail to tick grid for micro-price coins
-        try:
-            _tick = get_tick_size(trade_symbol)
-            sl = snap_to_tick(sl, _tick, 'down' if side == 'LONG' else 'up')
-            tp = snap_to_tick(tp, _tick, 'up' if side == 'LONG' else 'down')
-            trail_activation = snap_to_tick(trail_activation, _tick, 'up' if side == 'LONG' else 'down')
-        except Exception:
-            pass
-        
-        trail_distance = atr * adjusted_trail_distance_atr
+        trail_distance = _levels['trail_distance']
         
         # Position sizing
         risk_amount = self.balance * session_risk * size_mult
@@ -24396,6 +25009,17 @@ class PaperTradingEngine:
             position_size_usd = max_size_usd
             size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
             reasons.append(size_cap_reason)
+        
+        # OVP-1: Hoist _pending_id for canary decision (before min-notional)
+        _pending_id = f"PO_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}_{side}_{trade_symbol}"
+        _is_canary = canary_mode.should_use_canary(_pending_id, symbol=trade_symbol)
+        
+        # OVP-1: Canary size cap (before min-notional check)
+        if _is_canary and canary_mode.enabled and canary_mode.max_size_usd > 0:
+            if position_size_usd > canary_mode.max_size_usd:
+                position_size_usd = canary_mode.max_size_usd
+                position_size = position_size_usd / entry_price if entry_price > 0 else position_size
+                logger.info(f"🐤 CANARY SIZE CAP: {trade_symbol} capped to ${canary_mode.max_size_usd}")
         
         # Cost-aware minimum notional gate
         # Fee becomes meaningless below a dynamic floor.
@@ -24698,7 +25322,7 @@ class PaperTradingEngine:
             )
             return None
 
-        _pending_id = f"PO_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}_{side}_{trade_symbol}"
+        # OVP-1: _pending_id already generated above (before sizing)
         pending_order = {
             "id": _pending_id,
             "symbol": trade_symbol,
@@ -24725,6 +25349,7 @@ class PaperTradingEngine:
             "leverage": adjusted_leverage,
             "spreadLevel": spread_level,
             "signalScore": signal.get('confidenceScore', 0) if signal else 0,
+            "signalScoreRaw": signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)) if signal else 0,
             "mtfScore": signal.get('mtf_score', 0) if signal else 0,
             "zScore": signal.get('zscore', 0) if signal else 0,
             "createdAt": int(datetime.now().timestamp() * 1000),
@@ -24752,7 +25377,7 @@ class PaperTradingEngine:
             "effectiveExitTightness": effective_exit_tightness,
             "trend_mode": is_trend_mode,
             "settingsSnapshot": settings_snapshot,
-            "is_canary": canary_mode.should_use_canary(_pending_id),
+            "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
             # Phase 237C: State machine fields
             "state": "CREATED" if PENDING_SM_V2_ENABLED else "LEGACY",
             "stateChangedAt": int(datetime.now().timestamp() * 1000),
@@ -24768,6 +25393,9 @@ class PaperTradingEngine:
         self.pending_orders.append(pending_order)
         self.pipeline_metrics['pending_created'] += 1
         self.clear_execution_feedback(trade_symbol)
+        # CEDG-1: Preflight canary log
+        if _is_canary:
+            logger.info(f"🐤 CANARY PREFLIGHT: {side} {trade_symbol} id={_pending_id} is_canary=True")
         self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
         logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         # P3: Confirmation delay telemetry — 3-step breakdown for observability
@@ -25211,6 +25839,19 @@ class PaperTradingEngine:
         """
         symbol = order.get('symbol', '')
         side = order.get('side', '')
+        
+        # OVP-1: Canary force-market restriction (centralized guard)
+        if force_market and order.get('is_canary') and canary_mode.enabled:
+            if not canary_mode.force_market_allowed:
+                if order in self.pending_orders:
+                    self.pending_orders.remove(order)
+                self.pipeline_metrics.setdefault('canary_market_block', 0)
+                self.pipeline_metrics['canary_market_block'] += 1
+                self.set_execution_feedback(symbol, "CANARY_MARKET_BLOCK")
+                self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'canary_no_market_fallback', current_time)
+                logger.info(f"🐤 CANARY: force-market blocked for {symbol}, order expired")
+                return True  # order removed
+        
         _opp = next((o for o in opportunities if o.get('symbol') == symbol), None)
         rv = revalidate_pending_entry(order, _opp, current_time, force_market=force_market)
 
@@ -25277,10 +25918,23 @@ class PaperTradingEngine:
         if is_live:
             try:
                 vbbo = await live_binance_trader.validate_bbo(symbol)
-                signal_score_raw = float(order.get('signalScore', 0) or 0)
+                # RHP-1B: Policy-driven exec score source
+                _pen = float(order.get('signalScore', 0) or 0)
+                _raw = float(order.get('signalScoreRaw', _pen) or _pen)
+                _src = live_binance_trader.exec_score_source
+                if _src == 'raw':
+                    signal_score_input = _raw
+                elif _src == 'min':
+                    signal_score_input = min(_pen, _raw)
+                else:
+                    signal_score_input = _pen
                 recent_rej = self.pipeline_metrics.get('spread_rejected', 0) + self.pipeline_metrics.get('drift_rejected', 0)
-                escore = live_binance_trader.compute_entry_exec_score(signal_score_raw, vbbo, recent_rejects=min(recent_rej, 5))
+                escore = live_binance_trader.compute_entry_exec_score(signal_score_input, vbbo, recent_rejects=min(recent_rej, 5))
                 order['entryExecScore'] = escore['final']
+                # RHP-1B: Telemetry
+                order['entryExecScoreInputRaw'] = _raw
+                order['entryExecScoreInputPen'] = _pen
+                order['entryExecScoreSource'] = _src
 
                 if escore['final'] < live_binance_trader.exec_entry_score_min:
                     if force_market and allow_market:
@@ -25411,65 +26065,32 @@ class PaperTradingEngine:
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
-        if side == 'LONG':
-            sl = max(fill_price * 0.01, fill_price - (atr * adjusted_sl_atr))
-            tp = fill_price + (atr * adjusted_tp_atr)
-            trail_activation = fill_price + (atr * adjusted_trail_activation_atr)
-        else:
-            sl = fill_price + (atr * adjusted_sl_atr)
-            tp = max(fill_price * 0.01, fill_price - (atr * adjusted_tp_atr))
-            trail_activation = max(fill_price * 0.01, fill_price - (atr * adjusted_trail_activation_atr))
-        
-        # Phase 245 Component 2: TP must be at least 3× trade cost away from fill
-        try:
-            _ord_spread = float(order.get('spreadPct', 0.05))
-            _cost = estimate_trade_cost(_ord_spread, order.get('leverage', 10))
-            _min_tp_distance = fill_price * (_cost['min_profitable_move'] * 3 / 100)
-            _current_tp_distance = abs(tp - fill_price)
-            if _current_tp_distance < _min_tp_distance:
-                if side == 'LONG':
-                    tp = fill_price + _min_tp_distance
-                else:
-                    tp = max(fill_price * 0.01, fill_price - _min_tp_distance)
-                logger.info(f"💰 TP_COST_FLOOR: {symbol} TP widened to cover 3× cost (WS path)")
-        except Exception:
-            pass
-        
-        # Phase 245 Component 7: Snap SL/TP/trail to tick grid
-        try:
-            _tick = get_tick_size(symbol)
-            sl = snap_to_tick(sl, _tick, 'down' if side == 'LONG' else 'up')
-            tp = snap_to_tick(tp, _tick, 'up' if side == 'LONG' else 'down')
-            trail_activation = snap_to_tick(trail_activation, _tick, 'up' if side == 'LONG' else 'down')
-        except Exception:
-            pass
-        
-        trail_distance = atr * adjusted_trail_distance_atr
-        
-        # Phase 224D3: Apply CanaryMode parameter overrides for canary positions
+        # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
+        _ord_spread = float(order.get('spreadPct', 0.05))
+        _canary_sl_m = 1.0
+        _canary_tp_m = 1.0
+        _canary_trail_m = 1.0
         try:
             if order.get('is_canary', False) and canary_mode.enabled:
-                base_params = {'sl': sl, 'tp': tp, 'trail_activation': trail_activation, 'trail_distance': trail_distance}
-                canary_result = canary_mode.get_params(order.get('id', ''), base_params)
-                # Apply canary multipliers if present
-                if 'tp_mult' in canary_mode.canary_params:
-                    tp_m = canary_mode.canary_params['tp_mult']
-                    if side == 'LONG':
-                        tp = fill_price + (tp - fill_price) * tp_m
-                    else:
-                        tp = fill_price - (fill_price - tp) * tp_m
-                if 'sl_mult' in canary_mode.canary_params:
-                    sl_m = canary_mode.canary_params['sl_mult']
-                    if side == 'LONG':
-                        sl = fill_price - (fill_price - sl) * sl_m
-                    else:
-                        sl = fill_price + (sl - fill_price) * sl_m
-                if 'trail_mult' in canary_mode.canary_params:
-                    tr_m = canary_mode.canary_params['trail_mult']
-                    trail_distance *= tr_m
-                logger.info(f"🐤 CANARY: {symbol} {side} | overrides applied: {canary_mode.canary_params}")
+                _canary_sl_m = canary_mode.canary_params.get('sl_mult', 1.0)
+                _canary_tp_m = canary_mode.canary_params.get('tp_mult', 1.0)
+                _canary_trail_m = canary_mode.canary_params.get('trail_mult', 1.0)
+                logger.info(f"🐤 CANARY: {symbol} {side} | sl_m={_canary_sl_m} tp_m={_canary_tp_m} trail_m={_canary_trail_m}")
         except Exception as canary_err:
             logger.debug(f"CanaryMode params error: {canary_err}")
+        _levels = compute_sl_tp_levels(
+            entry_price=fill_price, atr=atr, side=side,
+            leverage=max(1, int(order.get('leverage', 10) or 10)), symbol=symbol,
+            adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+            adjusted_trail_act_atr=adjusted_trail_activation_atr,
+            adjusted_trail_dist_atr=adjusted_trail_distance_atr,
+            spread_pct=_ord_spread,
+            canary_sl_mult=_canary_sl_m, canary_tp_mult=_canary_tp_m, canary_trail_mult=_canary_trail_m,
+        )
+        sl = _levels['sl']
+        tp = _levels['tp']
+        trail_activation = _levels['trail_activation']
+        trail_distance = _levels['trail_distance']
         
         # Create actual position
         new_position = {
@@ -25506,6 +26127,7 @@ class PaperTradingEngine:
             "recheckReasons": order.get('recheckReasons', []),
             # Phase 49: Carry forward analysis data from pending order
             "signalScore": order.get('signalScore', 0),
+            "signalScoreRaw": order.get('signalScoreRaw', order.get('signalScore', 0)),
             "mtfScore": order.get('mtfScore', 0),
             "zScore": order.get('zScore', 0),
             "strategyMode": order.get('strategyMode', STRATEGY_MODE_LEGACY),
@@ -25681,18 +26303,21 @@ class PaperTradingEngine:
                     # Phase 186: Update entryPrice + SL/TP if actual fill differs
                     if abs(actual_fill - fill_price) / fill_price > 0.001:
                         new_position['entryPrice'] = actual_fill
-                        # Recalculate SL/TP with actual fill
-                        if side == 'LONG':
-                            new_position['stopLoss'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_sl_atr))
-                            new_position['takeProfit'] = actual_fill + (atr * adjusted_tp_atr)
-                            new_position['trailActivation'] = actual_fill + (atr * adjusted_trail_activation_atr)
-                            new_position['trailingStop'] = new_position['stopLoss']
-                        else:
-                            new_position['stopLoss'] = actual_fill + (atr * adjusted_sl_atr)
-                            new_position['takeProfit'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_tp_atr))
-                            new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
-                            new_position['trailingStop'] = new_position['stopLoss']
-                        logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${new_position['stopLoss']:.6f} TP=${new_position['takeProfit']:.6f}")
+                        # Recalculate SL/TP with actual fill via unified helper
+                        _recalc = compute_sl_tp_levels(
+                            entry_price=actual_fill, atr=atr, side=side,
+                            leverage=max(1, int(order.get('leverage', 10) or 10)), symbol=symbol,
+                            adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+                            adjusted_trail_act_atr=adjusted_trail_activation_atr,
+                            adjusted_trail_dist_atr=adjusted_trail_distance_atr,
+                            spread_pct=float(order.get('spreadPct', 0.05)),
+                        )
+                        new_position['stopLoss'] = _recalc['sl']
+                        new_position['takeProfit'] = _recalc['tp']
+                        new_position['trailActivation'] = _recalc['trail_activation']
+                        new_position['trailingStop'] = _recalc['sl']
+                        new_position['trailDistance'] = _recalc['trail_distance']
+                        logger.info(f"📐 SL/TP RECALC: {symbol} fill=${actual_fill:.6f} vs expected=${fill_price:.6f} → SL=${_recalc['sl']:.6f} TP=${_recalc['tp']:.6f} src={_recalc['meta']['sl_source']}/{_recalc['meta']['tp_source']}")
                 else:
                     self.pipeline_metrics['order_failed'] += 1
                     order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
@@ -25758,19 +26383,23 @@ class PaperTradingEngine:
                     new_position['entry_slippage'] = result.get('slippage_pct', 0)
                     new_position['entry_spread'] = result.get('spread_pct', 0)
                     logger.info(f"✅ FORCE MARKET SUCCESS: {result.get('id')} | slippage={abs(result.get('slippage_pct', 0)):.3f}%")
-                    # Recalculate SL/TP with actual fill
+                    # Recalculate SL/TP with actual fill via unified helper
                     if abs(actual_fill - fill_price) / fill_price > 0.001:
                         new_position['entryPrice'] = actual_fill
-                        if side == 'LONG':
-                            new_position['stopLoss'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_sl_atr))
-                            new_position['takeProfit'] = actual_fill + (atr * adjusted_tp_atr)
-                            new_position['trailActivation'] = actual_fill + (atr * adjusted_trail_activation_atr)
-                            new_position['trailingStop'] = new_position['stopLoss']
-                        else:
-                            new_position['stopLoss'] = actual_fill + (atr * adjusted_sl_atr)
-                            new_position['takeProfit'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_tp_atr))
-                            new_position['trailActivation'] = max(actual_fill * 0.01, actual_fill - (atr * adjusted_trail_activation_atr))
-                            new_position['trailingStop'] = new_position['stopLoss']
+                        _fm_recalc = compute_sl_tp_levels(
+                            entry_price=actual_fill, atr=atr, side=side,
+                            leverage=max(1, int(order.get('leverage', 10) or 10)), symbol=symbol,
+                            adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+                            adjusted_trail_act_atr=adjusted_trail_activation_atr,
+                            adjusted_trail_dist_atr=adjusted_trail_distance_atr,
+                            spread_pct=float(order.get('spreadPct', 0.05)),
+                        )
+                        new_position['stopLoss'] = _fm_recalc['sl']
+                        new_position['takeProfit'] = _fm_recalc['tp']
+                        new_position['trailActivation'] = _fm_recalc['trail_activation']
+                        new_position['trailingStop'] = _fm_recalc['sl']
+                        new_position['trailDistance'] = _fm_recalc['trail_distance']
+                        logger.info(f"📐 FORCE_MARKET SL/TP RECALC: {symbol} fill=${actual_fill:.6f} | SL=${_fm_recalc['sl']:.6f} TP=${_fm_recalc['tp']:.6f} src={_fm_recalc['meta']['sl_source']}/{_fm_recalc['meta']['tp_source']}")
                 else:
                     self.pipeline_metrics['order_failed'] += 1
                     self.pipeline_metrics['market_fallback_failed'] += 1
@@ -25805,9 +26434,151 @@ class PaperTradingEngine:
         if not live_binance_trader.enabled:
             self.balance -= initial_margin
         
-        self.positions.append(new_position)
-        self.pipeline_metrics['filled'] += 1
-        self.clear_execution_feedback(symbol)
+        # =====================================================================
+        # FIX #1 (Joint Audit) — Rev 2 (Codex review fixes):
+        # MANDATORY EXCHANGE STOP_MARKET BEFORE POSITION GOES ACTIVE
+        #
+        # Flow: Place SL → confirm → THEN append to self.positions.
+        #   - SL success → append (position now protected on exchange)
+        #   - SL fail → close on Binance, do NOT append (no orphan risk)
+        #   - SL price/amount invalid → close on Binance, do NOT append
+        #   - Paper mode → append immediately (no exchange SL needed)
+        #
+        # Codex P1 fixes:
+        #   1. Removed "degraded" mode — no SL = no active position
+        #   2. No premature self.positions.remove() — never appended until confirmed
+        #   3. self.positions.append moved AFTER SL success → no race window
+        # =====================================================================
+        if is_live_mode and new_position.get('isLive', False):
+            _sl_price = new_position.get('stopLoss', 0)
+            _sl_amount = new_position.get('contracts', new_position.get('size', 0))
+            _sl_side = new_position.get('side', 'LONG')
+            
+            # Gate: SL price and amount MUST be valid — no degraded mode
+            if _sl_price <= 0 or _sl_amount <= 0:
+                logger.error(
+                    f"🚨 SL_ORDER_ABORT: {symbol} {_sl_side} | "
+                    f"sl_price={_sl_price} amount={_sl_amount} | "
+                    f"INVALID — closing position on exchange"
+                )
+                self.pipeline_metrics.setdefault('sl_order_failed', 0)
+                self.pipeline_metrics['sl_order_failed'] += 1
+                try:
+                    # Fetch actual position size from Binance when local amount invalid
+                    _abort_amount = abs(_sl_amount) if _sl_amount > 0 else 0
+                    if _abort_amount <= 0:
+                        try:
+                            _binance_positions = await live_binance_trader.get_positions(fast=True)
+                            for _bp in _binance_positions:
+                                if _bp.get('symbol') == symbol:
+                                    _abort_amount = abs(float(_bp.get('contracts', _bp.get('size', 0))))
+                                    break
+                        except Exception:
+                            pass
+                    if _abort_amount > 0:
+                        await live_binance_trader.close_position(
+                            symbol=symbol, side=_sl_side, amount=_abort_amount
+                        )
+                    else:
+                        logger.error(
+                            f"❌ SL_ABORT: {symbol} cannot determine position size — "
+                            f"MANUAL CLOSE REQUIRED"
+                        )
+                    logger.warning(
+                        f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {_sl_side} | "
+                        f"reason=INVALID_SL_PARAMS"
+                    )
+                except Exception as _abort_err:
+                    logger.error(
+                        f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {_sl_side} | "
+                        f"MANUAL INTERVENTION REQUIRED | error={_abort_err}"
+                    )
+                self.add_log(
+                    f"🚨 GÜVENLİK: {symbol} SL parametreleri geçersiz — "
+                    f"pozisyon açılmadı"
+                )
+                self.set_execution_feedback(symbol, "SL_ABORT_INVALID_PARAMS")
+                return  # Position never enters self.positions
+            
+            # Place STOP_MARKET on exchange
+            logger.info(
+                f"🔒 SL_ORDER_PLACE_ATTEMPT: {symbol} {_sl_side} | "
+                f"stopPrice=${_sl_price:.6f} | amount={_sl_amount} | "
+                f"leverage={new_position.get('leverage', 10)}x"
+            )
+            
+            _sl_placement_ok = False
+            try:
+                _sl_result = await live_binance_trader.set_stop_loss(
+                    symbol=symbol,
+                    side=_sl_side,
+                    amount=abs(_sl_amount),
+                    stop_price=_sl_price
+                )
+                
+                if _sl_result and _sl_result.get('id'):
+                    # SUCCESS — record order ID and proceed to append
+                    new_position['exchange_sl_order_id'] = _sl_result['id']
+                    new_position['exchange_sl_price'] = _sl_result.get('stopPrice', _sl_price)
+                    self.pipeline_metrics.setdefault('sl_order_placed', 0)
+                    self.pipeline_metrics['sl_order_placed'] += 1
+                    _sl_placement_ok = True
+                    logger.warning(
+                        f"🔒 SL_ORDER_PLACE_SUCCESS: {symbol} {_sl_side} | "
+                        f"order_id={_sl_result['id']} | stopPrice=${_sl_price:.6f} | "
+                        f"stopLoss(engine)=${new_position['stopLoss']:.6f}"
+                    )
+                else:
+                    logger.error(
+                        f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {_sl_side} | "
+                        f"stopPrice=${_sl_price:.6f} | result={_sl_result}"
+                    )
+            except Exception as _sl_err:
+                logger.error(
+                    f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {_sl_side} | "
+                    f"stopPrice=${_sl_price:.6f} | error={_sl_err}"
+                )
+            
+            if not _sl_placement_ok:
+                # FAIL — close on Binance, do NOT append to positions
+                self.pipeline_metrics.setdefault('sl_order_failed', 0)
+                self.pipeline_metrics['sl_order_failed'] += 1
+                
+                _enforcement_close_ok = False
+                try:
+                    _close_result = await live_binance_trader.close_position(
+                        symbol=symbol,
+                        side=_sl_side,
+                        amount=abs(_sl_amount)
+                    )
+                    _enforcement_close_ok = bool(_close_result)
+                    logger.warning(
+                        f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {_sl_side} | "
+                        f"reason=SL_PLACEMENT_FAILED | amount={_sl_amount} | "
+                        f"close_ok={_enforcement_close_ok}"
+                    )
+                except Exception as _close_err:
+                    logger.error(
+                        f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {_sl_side} | "
+                        f"MANUAL INTERVENTION REQUIRED | error={_close_err}"
+                    )
+                
+                self.add_log(
+                    f"🚨 GÜVENLİK: {symbol} SL emri gönderilemedi — "
+                    f"pozisyon güvenlik için kapatıldı"
+                )
+                self.set_execution_feedback(symbol, "SL_ENFORCEMENT_CLOSE")
+                return  # Position never enters self.positions
+            
+            # SL confirmed — NOW safe to add position to active list
+            self.positions.append(new_position)
+            self.pipeline_metrics['filled'] += 1
+            self.clear_execution_feedback(symbol)
+        else:
+            # Paper mode — no exchange SL needed, append immediately
+            self.positions.append(new_position)
+            self.pipeline_metrics['filled'] += 1
+            self.clear_execution_feedback(symbol)
         
         # Save to SQLite for persistent openTime tracking
         try:
@@ -25873,61 +26644,64 @@ class PaperTradingEngine:
     def update_progressive_sl(self, pos: dict, current_price: float, atr: float):
         """Move SL progressively as position goes into profit.
         
-        Thresholds are multiplied by exit_tightness:
-        - Lower exit_tightness (0.3-0.5) = earlier SL moves
-        - Higher exit_tightness (1.5-2.0) = later SL moves
+        Phase 275: Leverage-aware ROI thresholds.
+        Thresholds are in ROI% (leverage-scaled) so they work consistently
+        regardless of leverage level.
         """
         entry = pos['entryPrice']
+        leverage = pos.get('leverage', 10)
         
         # Apply exit_tightness to thresholds - lower = earlier activation
         t = self.get_effective_exit_tightness(pos)
         
         if pos['side'] == 'LONG':
             profit_atr = (current_price - entry) / atr if atr > 0 else 0
+            # Phase 275: ROI-based thresholds (leverage-aware)
+            price_move_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0
+            profit_roi = price_move_pct * leverage
             
-            # Thresholds scaled by exit_tightness
-            if profit_atr >= 2.5 * t:
+            # ROI thresholds scaled by exit_tightness
+            if profit_roi >= 15.0 * t:
                 new_sl = entry + (2.0 * atr)  # Lock in 2 ATR profit
-            elif profit_atr >= 2.0 * t:
+            elif profit_roi >= 10.0 * t:
                 new_sl = entry + (1.5 * atr)  # Lock in 1.5 ATR profit
-            elif profit_atr >= 1.5 * t:
+            elif profit_roi >= 7.0 * t:
                 new_sl = entry + (1.0 * atr)  # Lock in 1 ATR profit
-            elif profit_atr >= 1.0 * t:
+            elif profit_roi >= 4.0 * t:
                 new_sl = entry + (0.5 * atr)  # Lock in 0.5 ATR profit
-            elif profit_atr >= 0.25 * t:
-                new_sl = entry  # Breakeven (daha erken koruma)
+            elif profit_roi >= 2.0 * t:
+                new_sl = entry  # Breakeven
             else:
                 return False  # No change
                 
-            if new_sl > pos['stopLoss']:
-                old_sl = pos['stopLoss']
-                pos['stopLoss'] = new_sl
-                pos['trailingStop'] = new_sl  # Also update trailing stop
-                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
+            old_sl = pos['stopLoss']
+            if apply_sl_floor(pos, new_sl, 'PROGRESSIVE_SL'):
+                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${pos['stopLoss']:.6f} (ROI={profit_roi:.1f}%, {leverage}x)")
                 return True
                 
         elif pos['side'] == 'SHORT':
             profit_atr = (entry - current_price) / atr if atr > 0 else 0
+            # Phase 275: ROI-based thresholds (leverage-aware)
+            price_move_pct = ((entry - current_price) / entry * 100) if entry > 0 else 0
+            profit_roi = price_move_pct * leverage
             
-            # Thresholds scaled by exit_tightness
-            if profit_atr >= 2.5 * t:
+            # ROI thresholds scaled by exit_tightness
+            if profit_roi >= 15.0 * t:
                 new_sl = entry - (2.0 * atr)
-            elif profit_atr >= 2.0 * t:
+            elif profit_roi >= 10.0 * t:
                 new_sl = entry - (1.5 * atr)
-            elif profit_atr >= 1.5 * t:
+            elif profit_roi >= 7.0 * t:
                 new_sl = entry - (1.0 * atr)
-            elif profit_atr >= 1.0 * t:
+            elif profit_roi >= 4.0 * t:
                 new_sl = entry - (0.5 * atr)
-            elif profit_atr >= 0.25 * t:
-                new_sl = entry  # Breakeven (daha erken koruma)
+            elif profit_roi >= 2.0 * t:
+                new_sl = entry  # Breakeven
             else:
                 return False
                 
-            if new_sl < pos['stopLoss']:
-                old_sl = pos['stopLoss']
-                pos['stopLoss'] = new_sl
-                pos['trailingStop'] = new_sl  # Also update trailing stop
-                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${new_sl:.6f} (+{profit_atr:.1f} ATR)")
+            old_sl = pos['stopLoss']
+            if apply_sl_floor(pos, new_sl, 'PROGRESSIVE_SL'):
+                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${pos['stopLoss']:.6f} (ROI={profit_roi:.1f}%, {leverage}x)")
                 return True
         
         return False
@@ -26050,34 +26824,40 @@ class PaperTradingEngine:
     def check_emergency_sl(self, pos: dict, current_price: float) -> bool:
         """Hard limit for maximum loss per position.
         
-        Dynamic threshold: max(base_emergency_pct, actual_sl_distance * 1.5) * exit_tightness
-        This ensures Emergency SL never triggers BEFORE normal SL on high-vol coins.
-        exit_tightness scales the threshold: higher = more patient, lower = quicker exit.
+        Phase 275: Leverage-aware emergency SL.
+        Threshold = 50% ROI loss / leverage = price movement threshold.
+        SL is the LAST resort — other layers protect first.
         """
         entry = pos['entryPrice']
+        leverage = pos.get('leverage', 10)
         
         if pos['side'] == 'LONG':
             loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
         else:
             loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
         
-        # Dynamic emergency threshold: never tighter than the position's own SL
+        # Phase 275: Emergency threshold as ROI → price%
+        # 50% ROI loss / leverage = price threshold
+        emergency_roi_threshold = 50.0
+        effective_emergency_pct = emergency_roi_threshold / max(leverage, 1)
+        
+        # Still never tighter than position's own SL distance
         sl_price = pos.get('stopLoss', 0)
         if sl_price > 0 and entry > 0:
             actual_sl_distance_pct = abs(entry - sl_price) / entry * 100
-            effective_emergency_pct = max(self.emergency_sl_pct, actual_sl_distance_pct * 1.5)
-        else:
-            effective_emergency_pct = self.emergency_sl_pct
+            effective_emergency_pct = max(effective_emergency_pct, actual_sl_distance_pct * 1.5)
         
         # Apply exit_tightness: higher = wider emergency threshold (more patient)
         et = self.get_effective_exit_tightness(pos)
         effective_emergency_pct = effective_emergency_pct * et
         
-        # Cap at 10% * exit_tightness to prevent runaway losses
-        effective_emergency_pct = min(effective_emergency_pct, 10.0 * et)
+        # Phase 275: Cap at leverage-aware max (60% ROI / leverage)
+        max_cap_roi = 60.0
+        effective_emergency_pct = min(effective_emergency_pct, max_cap_roi / max(leverage, 1) * et)
             
         if loss_pct >= effective_emergency_pct:
-            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} kayıp (eşik: %{effective_emergency_pct:.1f}, x{et:.1f})")
+            loss_roi = loss_pct * leverage
+            self.add_log(f"🆘 ACİL ÇIKIŞ: %{loss_pct:.1f} fiyat (ROI={loss_roi:.1f}%) (eşik: %{effective_emergency_pct:.1f}, lev={leverage}x, x{et:.1f})")
             self.close_via_engine(pos, current_price, 'EMERGENCY_SL', 'EMERGENCY')
             return True
         return False
@@ -26139,8 +26919,11 @@ class PaperTradingEngine:
             return False
         
         entry = pos['entryPrice']
-        # exit_tightness ile pullback genişlet: yüksek = daha geniş tolerans
-        pullback_pct = pos.get('pullbackPct', 1.0) * et
+        leverage = pos.get('leverage', 10)
+        # Phase 275: Leverage-aware pullback — scale by leverage for ROI-based tolerance
+        # Raw pullbackPct is price-based, divide by leverage for meaningful ROI comparison
+        raw_pullback_pct = pos.get('pullbackPct', 1.0) * et
+        pullback_pct = max(raw_pullback_pct, 5.0 / max(leverage, 1))  # At least 5% ROI / leverage as price%
         
         if pos['side'] == 'LONG':
             # Terste mi? (fiyat entry'nin altında)
@@ -26248,9 +27031,9 @@ class PaperTradingEngine:
                     self.save_state()
                 return True
                 
-        # Reset prevention flag if we recovered
-        elif peak_drawdown_pct < limit * 0.5:
-            self._trailing_dd_locked_today = False
+        # FIX #5 (Joint Audit): Removed early unlock (`limit*0.5` recovery check).
+        # Once locked, stays locked until next day reset (26606) to prevent
+        # intraday ping-pong: close → stabilize → unlock → reopen → close again.
             
         return False
         
@@ -26482,10 +27265,10 @@ class PaperTradingEngine:
                     pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                     # Set tight trailing to try to close at breakeven or minimal loss
                     if pos['side'] == 'LONG':
-                        pos['trailingStop'] = current_price - (atr_estimate * 0.3)
+                        apply_sl_floor(pos, current_price - (atr_estimate * 0.3), 'RECOVERY_TRAIL')
                         pos['trailDistance'] = atr_estimate * 0.3
                     else:
-                        pos['trailingStop'] = current_price + (atr_estimate * 0.3)
+                        apply_sl_floor(pos, current_price + (atr_estimate * 0.3), 'RECOVERY_TRAIL')
                         pos['trailDistance'] = atr_estimate * 0.3
                     self.add_log(f"🛡️ BREAKEVEN MODE: {pos['side']} %{pnl_pct:.1f} - Sıkı trailing aktif")
             
@@ -26499,10 +27282,10 @@ class PaperTradingEngine:
                     if pos['side'] == 'LONG':
                         # Set SL at current price minus small buffer (accept the loss)
                         emergency_sl = current_price - (atr_estimate * 0.5)
-                        pos['stopLoss'] = max(pos.get('stopLoss', 0), emergency_sl)
+                        apply_sl_floor(pos, emergency_sl, 'EMERGENCY_SL')
                     else:
                         emergency_sl = current_price + (atr_estimate * 0.5)
-                        pos['stopLoss'] = min(pos.get('stopLoss', float('inf')), emergency_sl)
+                        apply_sl_floor(pos, emergency_sl, 'EMERGENCY_SL')
                     self.add_log(f"🆘 RECOVERY MODE: {pos['side']} %{pnl_pct:.1f} - Emergency SL aktif @ {pos['stopLoss']:.6f}")
 
         # If hedging is disabled, check for opposite direction (Check again as some might have closed above)
@@ -26777,9 +27560,7 @@ class PaperTradingEngine:
                 
                 if pos['isTrailingActive']:
                     new_sl = current_price - dynamic_trail
-                    if new_sl > pos['trailingStop']:
-                        pos['trailingStop'] = new_sl
-                        pos['stopLoss'] = new_sl
+                    apply_sl_floor(pos, new_sl, 'TRAILING')
                 
                 # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
@@ -26818,9 +27599,7 @@ class PaperTradingEngine:
                     
                 if pos['isTrailingActive']:
                     new_sl = current_price + dynamic_trail
-                    if new_sl < pos['trailingStop']:
-                        pos['trailingStop'] = new_sl
-                        pos['stopLoss'] = new_sl
+                    apply_sl_floor(pos, new_sl, 'TRAILING')
                 
                 # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
@@ -27030,7 +27809,9 @@ class PaperTradingEngine:
             "reason": reason,
             "leverage": pos.get('leverage', 10),
             "isLive": pos.get('isLive', False),
+            "is_canary": pos.get('is_canary', False),  # OVP-1: canary flag for metric reporter
             "signalScore": pos.get('signalScore', 0),
+            "signalScoreRaw": pos.get('signalScoreRaw', pos.get('signalScore', 0)),
             "mtfScore": pos.get('mtfScore', 0),
             "zScore": pos.get('zScore', 0),
             "zscore": pos.get('zScore', 0),  # Phase 246: lowercase alias for hyperopt compatibility
@@ -27048,6 +27829,7 @@ class PaperTradingEngine:
             # Phase 186: Execution quality + complete position data
             "entry_method": pos.get('entry_method', 'MARKET'),
             "entry_slippage": pos.get('entry_slippage', 0),
+            "exit_slippage": pos.get('exit_slippage', 0),
             "entry_spread": pos.get('entry_spread', 0),
             "binance_fill_price": pos.get('binance_fill_price', 0),
             "binance_order_id": pos.get('binance_order_id', ''),
@@ -27169,6 +27951,7 @@ class PaperTradingEngine:
             detailed_reason = self._format_detailed_reason(reason, pos, exit_price, roi)
             
             pending_close_reasons[symbol] = {
+                "position_id": pos.get('id', ''),  # hedging-safe traceability
                 "reason": detailed_reason,
                 "original_reason": reason,
                 "pnl": pnl,
@@ -27203,6 +27986,7 @@ class PaperTradingEngine:
                     'settingsSnapshot': pos.get('settingsSnapshot', {}),
                     'entry_method': pos.get('entry_method', 'MARKET'),
                     'entry_slippage': pos.get('entry_slippage', 0),
+                    'exit_slippage': pos.get('exit_slippage', 0),
                     'entry_spread': pos.get('entry_spread', 0),
                     'signalScore': pos.get('signalScore', 0),
                     'spreadLevel': pos.get('spreadLevel', 'unknown'),
@@ -27243,7 +28027,7 @@ class PaperTradingEngine:
             
             # Phase 261: Clear exit lock immediately for paper trades
             if trace_id and 'exit_engine' in globals() and exit_engine:
-                exit_engine.clear_lock(symbol, trace_id)
+                exit_engine.clear_lock(pos_id or symbol, trace_id)
         
         # Update Stats (for both LIVE and PAPER)
         self.stats['totalTrades'] += 1
@@ -27279,6 +28063,12 @@ class PaperTradingEngine:
         # Phase 224D3: Record result in CanaryMode (use stored flag)
         try:
             canary_mode.record_result(pos.get('id', ''), pnl, is_canary=pos.get('is_canary', False))
+            # OVP-1: Canary metric reporter + auto-rollback
+            canary_metric_reporter.record_trade(trade)
+            _cmr = canary_metric_reporter.maybe_report()
+            if _cmr and _cmr.get('rollback_triggered'):
+                canary_mode.enabled = False
+                logger.error(f"🛑 CANARY AUTO-DISABLED: {_cmr['rollback_reason']}")
         except Exception as cm_err:
             logger.debug(f"CanaryMode error: {cm_err}")
         
@@ -27291,6 +28081,7 @@ class PaperTradingEngine:
         
         # =====================================================================
         # LIVE TRADING: Schedule close on Binance (fire-and-forget)
+        # FIX #3 (Joint Audit): Skip Binance close if already closed by manual endpoint
         # =====================================================================
         if live_binance_trader.enabled and pos.get('isLive', False):
             symbol = pos.get('symbol', '')
@@ -27298,16 +28089,32 @@ class PaperTradingEngine:
             # Phase 141: Use contracts with size fallback for consistency with Binance API
             amount = pos.get('contracts', pos.get('size', 0))
             
-            logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
-            
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(self._close_on_binance(symbol, side, amount, trace_id))
-                else:
-                    loop.run_until_complete(self._close_on_binance(symbol, side, amount, trace_id))
-            except RuntimeError:
-                asyncio.run(self._close_on_binance(symbol, side, amount, trace_id))
+            if pos.get('_already_closed_on_exchange', False):
+                logger.info(
+                    f"🔒 LIVE CLOSE SKIP: {side} {symbol} already closed on exchange "
+                    f"(manual close path) — skipping _close_on_binance"
+                )
+                # Release exit lock immediately (since _close_on_binance won't run)
+                if trace_id and 'exit_engine' in globals() and exit_engine:
+                    exit_engine.clear_lock(pos_id or symbol, trace_id)
+                # Still clean up conditional orders (SL/TP on exchange)
+                try:
+                    asyncio.ensure_future(
+                        live_binance_trader.cancel_reduce_only_conditionals(symbol, trace_id)
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.info(f"🔴 LIVE CLOSE: Scheduling {side} {symbol} close on Binance...")
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
+                    else:
+                        loop.run_until_complete(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
+                except RuntimeError:
+                    asyncio.run(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
             
             # Phase 157: Schedule Binance trade history fetch after close
             ui_state_cache.trigger_trade_fetch(delay_seconds=3)
@@ -27338,10 +28145,11 @@ class PaperTradingEngine:
         except Exception as e:
             logger.debug(f"Coin performance record error: {e}")
     
-    async def _close_on_binance(self, symbol: str, side: str, amount: float, trace_id: str = None):
+    async def _close_on_binance(self, symbol: str, side: str, amount: float, trace_id: str = None, trade_id: str = None, lock_key: str = None):
         """Helper to close position on Binance asynchronously.
         Phase 87: Now fetches actual Binance position size to prevent partial closes.
         Phase 261: Clears exit_inflight lock when done.
+        lock_key: position_id for lock release (falls back to symbol).
         """
         try:
             # Phase 87: Get ACTUAL position size from Binance (not paper trader)
@@ -27359,6 +28167,7 @@ class PaperTradingEngine:
             result = await live_binance_trader.close_position(symbol, side, actual_amount, trace_id=trace_id)
             if result:
                 close_order_id = str(result.get('id', ''))
+                close_slippage = float(result.get('slippage_pct', 0) or 0)
                 trace_str = f" [trace={trace_id}]" if trace_id else ""
                 logger.info(f"✅ BINANCE CLOSE SUCCESS: {symbol} | Size: {actual_amount:.4f} | OrderID: {close_order_id[:12]}{trace_str}")
                 
@@ -27367,6 +28176,15 @@ class PaperTradingEngine:
                     pending_close_reasons[symbol]['close_order_id'] = close_order_id
                 if close_order_id:
                     safe_create_task(sqlite_manager.update_close_order_id(symbol, close_order_id))
+                # Phase 275: Backfill exit execution metrics (exit_slippage + refreshed attribution)
+                safe_create_task(
+                    sqlite_manager.update_trade_exit_execution(
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        exit_slippage=close_slippage,
+                        close_time_ms=int(datetime.now().timestamp() * 1000),
+                    )
+                )
                 
                 # Phase 270: Deferred cleanup fallback (+3s)
                 # close_position already fires immediate cleanup; this is a safety net
@@ -27394,9 +28212,9 @@ class PaperTradingEngine:
         except Exception as e:
             logger.error(f"❌ LIVE CLOSE ERROR: {e}")
         finally:
-            # Phase 261: Safely release the inflight lock
+            # Phase 261: Safely release the inflight lock (using position_id)
             if trace_id and 'exit_engine' in globals() and exit_engine:
-                exit_engine.clear_lock(symbol, trace_id)
+                exit_engine.clear_lock(lock_key or symbol, trace_id)
 
 
 
@@ -28183,16 +29001,19 @@ class ExitDecisionEngine:
     
     All close paths call request_exit() instead of close_position() directly.
     Provides:
-    - exit_pending guard (double-close prevention per symbol)
+    - exit_pending guard (double-close prevention per position_id)
     - priority-based exit override (EMERGENCY > TRAIL > TP > TIME)
     - close_reason normalization & source tracking
     - telemetry logging for exit decisions
+    - 60s stale lock timeout
+    - re-entrant trace_id bypass (manual pre-lock)
     """
     EXIT_PRIORITY = {
         'EMERGENCY_SL': 100,
         'KILL_SWITCH': 95,
         'RECOVERY_CLOSE_ALL': 93,
         'RECOVERY_EXIT': 90,
+        'SL_HIT': 88,            # FIX #4 (Joint Audit): SL must outrank PROTECTION_LOCK and below
         'PROTECTION_LOCK': 85,
         'FAILED_CONTINUATION': 70,
         'TRAIL_EXIT': 60,
@@ -28200,12 +29021,13 @@ class ExitDecisionEngine:
         'TIME_GRADUAL': 40,
         'TIME_EXIT': 35,
     }
+    STALE_LOCK_TIMEOUT = 60  # seconds
     
     def __init__(self, paper_trader):
         self.paper_trader = paper_trader
-        self.exit_inflight = {}   # Phase 261: symbol -> {started_at, reason, source, trace_id}
+        self.exit_inflight = {}   # position_id -> {started_at, reason, source, trace_id, symbol}
         self._exit_log = []       # last N exit decisions for telemetry
-        self._stats = {'total': 0, 'skipped': 0, 'upgraded': 0}
+        self._stats = {'total': 0, 'skipped': 0, 'upgraded': 0, 'stale_cleared': 0}
 
     def _normalize_reason(self, reason: str) -> tuple:
         reason_upper = reason.upper()
@@ -28232,6 +29054,7 @@ class ExitDecisionEngine:
         Returns: trade dict or None if skipped
         """
         symbol = pos.get('symbol', '')
+        lock_key = pos.get('id', symbol)  # position_id for hedging-safe locking
         reason_norm, reason_class = self._normalize_reason(reason)
         now = time.time()
         age_sec = now - (pos.get('openTime', now * 1000) / 1000)
@@ -28265,32 +29088,53 @@ class ExitDecisionEngine:
                 })
                 return None
 
-        # Phase 268: Priority arbitration — upgrade lock if new reason is higher priority
-        if symbol in self.exit_inflight:
-            existing = self.exit_inflight[symbol]
-            new_priority = self._get_priority(reason_norm)
-            old_priority = self._get_priority(existing.get('reason', ''))
-            if new_priority > old_priority:
-                logger.info(f"🔺 EXIT_UPGRADE: {symbol} {existing['reason']}→{reason_norm} (pri {old_priority}→{new_priority})")
-                del self.exit_inflight[symbol]
-                self._stats['upgraded'] = self._stats.get('upgraded', 0) + 1
-            else:
-                logger.warning(
-                    f"⏭️ EXIT_SKIP (LOCKED): {symbol} already inflight "
-                    f"({existing['reason']} pri={old_priority}) since {existing['started_at']}. "
-                    f"Ignoring {reason} (pri={new_priority}) from {source}."
+        # Stale lock detection — auto-clear locks older than STALE_LOCK_TIMEOUT
+        if lock_key in self.exit_inflight:
+            lock_age = now - self.exit_inflight[lock_key].get('started_at', now)
+            if lock_age > self.STALE_LOCK_TIMEOUT:
+                stale_info = self.exit_inflight[lock_key]
+                logger.error(
+                    f"🔓 STALE_LOCK_CLEARED: {lock_key} ({symbol}) age={lock_age:.0f}s "
+                    f"reason={stale_info.get('reason')} trace={stale_info.get('trace_id')}"
                 )
-                self._stats['skipped'] += 1
-                return None
+                del self.exit_inflight[lock_key]
+                self._stats['stale_cleared'] = self._stats.get('stale_cleared', 0) + 1
+
+        # Priority arbitration — upgrade lock if new reason is higher priority
+        if lock_key in self.exit_inflight:
+            existing = self.exit_inflight[lock_key]
+            # Re-entrant bypass: same trace_id means manual pre-lock calling through engine
+            if existing.get('trace_id') and existing['trace_id'] == pos.get('_pre_lock_trace_id'):
+                logger.info(f"🔁 EXIT_REENTRANT: {symbol} trace_id={existing['trace_id']} — pre-lock bypass")
+                # Fall through to execute close (lock already held by same flow)
+            else:
+                new_priority = self._get_priority(reason_norm)
+                old_priority = self._get_priority(existing.get('reason', ''))
+                if new_priority > old_priority:
+                    logger.info(f"🔺 EXIT_UPGRADE: {symbol} {existing['reason']}→{reason_norm} (pri {old_priority}→{new_priority})")
+                    del self.exit_inflight[lock_key]
+                    self._stats['upgraded'] = self._stats.get('upgraded', 0) + 1
+                else:
+                    logger.warning(
+                        f"⏭️ EXIT_SKIP (LOCKED): {symbol} ({lock_key}) already inflight "
+                        f"({existing['reason']} pri={old_priority}) since {existing['started_at']:.0f}. "
+                        f"Ignoring {reason} (pri={new_priority}) from {source}."
+                    )
+                    self._stats['skipped'] += 1
+                    return None
         
-        # Mark as pending
-        trace_id = f"EXIT_{symbol}_{int(time.time()*1000)}"
-        self.exit_inflight[symbol] = {
-            'started_at': time.time(),
-            'reason': reason,
-            'source': source,
-            'trace_id': trace_id
-        }
+        # Mark as pending (skip if re-entrant — lock already held)
+        if lock_key not in self.exit_inflight:
+            trace_id = f"EXIT_{lock_key}_{int(time.time()*1000)}"
+            self.exit_inflight[lock_key] = {
+                'started_at': time.time(),
+                'reason': reason,
+                'source': source,
+                'trace_id': trace_id,
+                'symbol': symbol
+            }
+        else:
+            trace_id = self.exit_inflight[lock_key].get('trace_id', f"EXIT_{lock_key}_{int(time.time()*1000)}")
         
         # Pass forecast params to trade record
         pos['exitForecastHoldProb'] = hold_prob
@@ -28301,14 +29145,14 @@ class ExitDecisionEngine:
         self._stats['total'] += 1
         try:
             logger.info(
-                f"🚪 [LOCK_ACQUIRED] EXIT_ENGINE: {symbol} | trace_id={trace_id} "
+                f"🚪 [LOCK_ACQUIRED] EXIT_ENGINE: {symbol} ({lock_key}) | trace_id={trace_id} "
                 f"reason={reason} price={exit_price:.6f} source={source}"
             )
             # Pass trace_id down to paper_trader
             result = self.paper_trader.close_position(pos, exit_price, reason, trace_id=trace_id, source=source)
         except Exception as e:
             logger.error(f"❌ EXIT_ENGINE error: {symbol} {reason} - {e}")
-            self.clear_lock(symbol, trace_id)
+            self.clear_lock(lock_key, trace_id)
             result = None
         
         # Track last 50 exits for telemetry
@@ -28324,16 +29168,32 @@ class ExitDecisionEngine:
         
         return result
 
-    def clear_lock(self, symbol: str, trace_id: str = None):
-        """Phase 261: Safely clear the inflight lock, optionally verifying trace_id."""
-        if symbol in self.exit_inflight:
-            if trace_id is None or self.exit_inflight[symbol].get('trace_id') == trace_id:
-                del self.exit_inflight[symbol]
-                logger.info(f"🔓 [LOCK_RELEASED] {symbol} | trace_id={trace_id}")
+    def clear_lock(self, lock_key: str, trace_id: str = None):
+        """Phase 261: Safely clear the inflight lock, optionally verifying trace_id.
+        Args: lock_key = position_id (or symbol fallback)
+        """
+        if lock_key in self.exit_inflight:
+            if trace_id is None or self.exit_inflight[lock_key].get('trace_id') == trace_id:
+                del self.exit_inflight[lock_key]
+                logger.info(f"🔓 [LOCK_RELEASED] {lock_key} | trace_id={trace_id}")
 
-    def is_exit_pending(self, symbol: str) -> bool:
-        """Check if a symbol has an exit already in progress."""
-        return symbol in self.exit_inflight
+    def is_exit_pending(self, lock_key: str) -> bool:
+        """Check if a position_id (or symbol) has an exit already in progress.
+        Also clears stale locks to prevent perpetual 409 on manual endpoint.
+        """
+        if lock_key in self.exit_inflight:
+            lock_age = time.time() - self.exit_inflight[lock_key].get('started_at', time.time())
+            if lock_age > self.STALE_LOCK_TIMEOUT:
+                stale_info = self.exit_inflight[lock_key]
+                logger.error(
+                    f"🔓 STALE_LOCK_CLEARED (is_exit_pending): {lock_key} age={lock_age:.0f}s "
+                    f"reason={stale_info.get('reason')} trace={stale_info.get('trace_id')}"
+                )
+                del self.exit_inflight[lock_key]
+                self._stats['stale_cleared'] = self._stats.get('stale_cleared', 0) + 1
+                return False
+            return True
+        return False
     
     def _get_priority(self, reason: str) -> int:
         reason_upper = reason.upper()
@@ -29626,31 +30486,29 @@ async def paper_trading_update_settings(
             atr = pos.get('atr', entry_price * 0.02)
             side = pos.get('side', '')
             
-            # Recalculate TP/SL with new exit_tightness
+            # Recalculate TP/SL with new exit_tightness via unified helper
             adjusted_sl_atr = (global_paper_trader.sl_atr / 10) * global_paper_trader.exit_tightness
             adjusted_tp_atr = (global_paper_trader.tp_atr / 10) * global_paper_trader.exit_tightness
             adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
             adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
             
-            if side == 'LONG':
-                new_sl = max(entry_price * 0.01, entry_price - (atr * adjusted_sl_atr))
-                new_tp = entry_price + (atr * adjusted_tp_atr)
-                new_trail_activation = entry_price + (atr * adjusted_trail_activation_atr)
-            else:  # SHORT
-                new_sl = entry_price + (atr * adjusted_sl_atr)
-                new_tp = max(entry_price * 0.01, entry_price - (atr * adjusted_tp_atr))
-                new_trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_activation_atr))
-            
-            new_trail_distance = atr * adjusted_trail_distance_atr
+            _s_symbol = pos.get('symbol', '')
+            _s_levels = compute_sl_tp_levels(
+                entry_price=entry_price, atr=atr, side=side,
+                leverage=pos.get('leverage', 10), symbol=_s_symbol,
+                adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+                adjusted_trail_act_atr=adjusted_trail_activation_atr,
+                adjusted_trail_dist_atr=adjusted_trail_distance_atr,
+                spread_pct=float(pos.get('spreadPct', 0.05)),
+            )
             
             # Only update if not already in trailing mode (to preserve trailing stop progress)
             if not pos.get('isTrailingActive', False):
-                pos['stopLoss'] = new_sl
-                pos['trailingStop'] = new_sl
+                apply_sl_floor(pos, _s_levels['sl'], 'SETTINGS_RESYNC')
             
-            pos['takeProfit'] = new_tp
-            pos['trailActivation'] = new_trail_activation
-            pos['trailDistance'] = new_trail_distance
+            pos['takeProfit'] = _s_levels['tp']
+            pos['trailActivation'] = _s_levels['trail_activation']
+            pos['trailDistance'] = _s_levels['trail_distance']
             
             updated_positions += 1
             
@@ -30079,7 +30937,7 @@ async def paper_trading_market_order(request: Request):
     """Open a market order from a signal card (manual entry)."""
     try:
         data = await request.json()
-        symbol = data.get('symbol')
+        symbol = (data.get('symbol') or '').upper()
         side = data.get('side')  # LONG or SHORT
         price = float(data.get('price', 0))
         # Fix P0: Use signal leverage from UI (already includes multiplier)
@@ -30087,6 +30945,9 @@ async def paper_trading_market_order(request: Request):
         
         if not symbol or not side or price <= 0:
             return JSONResponse({"success": False, "error": "Missing symbol, side, or price"}, status_code=400)
+        # Phase 275: Block static blacklisted pairs (stablecoins/fiat-pegged)
+        if global_paper_trader.is_coin_blacklisted(symbol):
+            return JSONResponse({"success": False, "error": f"{symbol} is blacklisted for trading"}, status_code=400)
         
         # Check if we have room for more positions
         if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
@@ -30124,18 +30985,24 @@ async def paper_trading_market_order(request: Request):
             if not set_ok:
                 return JSONResponse({"success": False, "error": f"Binance leverage set failed for {symbol} → {leverage}x"}, status_code=500)
         
-        # SL/TP based on ATR
-        sl_distance = atr * (global_paper_trader.sl_atr / 10)
-        tp_distance = atr * (global_paper_trader.tp_atr / 10)
+        # SL/TP via unified helper (gains leverage floor + cost floor + tick snap)
+        _mo_adj_sl_atr = global_paper_trader.sl_atr / 10
+        _mo_adj_tp_atr = global_paper_trader.tp_atr / 10
+        _mo_adj_trail_act = global_paper_trader.trail_activation_atr
+        _mo_adj_trail_dist = global_paper_trader.trail_distance_atr
+        _mo_levels = compute_sl_tp_levels(
+            entry_price=price, atr=atr, side=side,
+            leverage=leverage, symbol=symbol,
+            adjusted_sl_atr=_mo_adj_sl_atr, adjusted_tp_atr=_mo_adj_tp_atr,
+            adjusted_trail_act_atr=_mo_adj_trail_act,
+            adjusted_trail_dist_atr=_mo_adj_trail_dist,
+            spread_pct=0.05,
+        )
+        sl = _mo_levels['sl']
+        tp = _mo_levels['tp']
+        sl_distance = abs(price - sl)
         
-        if side == 'LONG':
-            sl = price - sl_distance
-            tp = price + tp_distance
-        else:
-            sl = price + sl_distance
-            tp = price - tp_distance
-        
-        # Position size
+        # Position size (using helper-derived SL distance)
         if sl_distance > 0:
             size = risk_amount / sl_distance
         else:
@@ -30165,13 +31032,18 @@ async def paper_trading_market_order(request: Request):
             filled_amount = size
             filled_usd = size_usd
         
-        # SL/TP recalculate from fill price
-        if side == 'LONG':
-            sl = fill_price - sl_distance
-            tp = fill_price + tp_distance
-        else:
-            sl = fill_price + sl_distance
-            tp = fill_price - tp_distance
+        # Re-compute SL/TP from fill price via helper (ensures cost floor + tick snap parity)
+        _mo_levels = compute_sl_tp_levels(
+            entry_price=fill_price, atr=atr, side=side,
+            leverage=leverage, symbol=symbol,
+            adjusted_sl_atr=_mo_adj_sl_atr, adjusted_tp_atr=_mo_adj_tp_atr,
+            adjusted_trail_act_atr=_mo_adj_trail_act,
+            adjusted_trail_dist_atr=_mo_adj_trail_dist,
+            spread_pct=0.05,
+        )
+        sl = _mo_levels['sl']
+        tp = _mo_levels['tp']
+        sl_distance = abs(fill_price - sl)
         
         # Create position for paper tracker (tracking/UI)
         position = {
@@ -30185,8 +31057,8 @@ async def paper_trading_market_order(request: Request):
             "stopLoss": sl,
             "takeProfit": tp,
             "trailingStop": 0,
-            "trailActivation": fill_price + (atr * global_paper_trader.trail_activation_atr) if side == 'LONG' else fill_price - (atr * global_paper_trader.trail_activation_atr),
-            "trailDistance": atr * global_paper_trader.trail_distance_atr,
+            "trailActivation": _mo_levels['trail_activation'],
+            "trailDistance": _mo_levels['trail_distance'],
             "isTrailingActive": False,
             "unrealizedPnl": 0,
             "unrealizedPnlPercent": 0,
@@ -30199,8 +31071,8 @@ async def paper_trading_market_order(request: Request):
             "fc_max_profit_pct": 0.0,
             # Runtime trail telemetry (updated every tick)
             "effectiveExitTightness": global_paper_trader.exit_tightness,
-            "runtimeTrailDistance": atr * global_paper_trader.trail_distance_atr,
-            "runtimeTrailDistancePct": round((atr * global_paper_trader.trail_distance_atr / fill_price * 100), 4) if fill_price > 0 else 0.0,
+            "runtimeTrailDistance": _mo_levels['trail_distance'],
+            "runtimeTrailDistancePct": round((_mo_levels['trail_distance'] / fill_price * 100), 4) if fill_price > 0 else 0.0,
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -30228,6 +31100,8 @@ async def paper_trading_market_order(request: Request):
 @app.post("/paper-trading/close/{position_id}")
 async def paper_trading_close(position_id: str):
     """Close a specific position with real-time price."""
+    trace_id = f"manual_close_{position_id}"
+    lock_acquired = False
     try:
         # Find position by ID
         pos = next((p for p in global_paper_trader.positions if p['id'] == position_id), None)
@@ -30240,6 +31114,24 @@ async def paper_trading_close(position_id: str):
         amount = abs(float(pos.get('size', 0) or pos.get('contracts', 0) or 0))
         fill_price = 0.0
         
+        # ── PRE-LOCK: Acquire engine lock BEFORE Binance close ──
+        # Prevents scanner/WS from closing the same position concurrently
+        if exit_engine.is_exit_pending(position_id):
+            logger.warning(f"⏭️ MANUAL_CLOSE_SKIP: {symbol} ({position_id}) already inflight")
+            return JSONResponse({"success": False, "message": "Bu pozisyon zaten kapatılıyor"}, status_code=409)
+        
+        exit_engine.exit_inflight[position_id] = {
+            'started_at': time.time(),
+            'reason': 'MANUAL',
+            'source': 'USER',
+            'trace_id': trace_id,
+            'symbol': symbol
+        }
+        lock_acquired = True
+        # Set re-entrant marker so close_position_by_id → request_exit doesn't self-deadlock
+        pos['_pre_lock_trace_id'] = trace_id
+        logger.info(f"🔒 MANUAL_PRE_LOCK: {symbol} ({position_id}) trace_id={trace_id}")
+        
         # ── BINANCE REAL CLOSE ──
         if live_binance_trader.enabled and pos.get('isLive', True):
             if amount > 0:
@@ -30247,7 +31139,7 @@ async def paper_trading_close(position_id: str):
                     symbol=symbol,
                     side=side,
                     amount=amount,
-                    trace_id=f"manual_close_{position_id}"
+                    trace_id=trace_id
                 )
                 if binance_close:
                     fill_price = float(binance_close.get('average') or binance_close.get('price') or 0)
@@ -30275,9 +31167,16 @@ async def paper_trading_close(position_id: str):
             return JSONResponse({"success": False, "message": "Güncel fiyat alınamadı"}, status_code=500)
         
         close_price = fill_price if fill_price > 0 else current_price
-        # Close the position in paper trader
+        # FIX #3 (Joint Audit): Prevent double Binance close
+        # Mark position as already closed on exchange so close_position
+        # won't schedule a second _close_on_binance call
+        if fill_price > 0 and live_binance_trader.enabled:
+            pos['_already_closed_on_exchange'] = True
+            logger.info(f"🔒 MANUAL_CLOSE: {symbol} marked _already_closed_on_exchange")
+        # Close the position in paper trader (re-entrant: request_exit sees _pre_lock_trace_id)
         success = global_paper_trader.close_position_by_id(position_id, close_price)
         if success:
+            lock_acquired = False  # Lock will be released by close_position flow
             return JSONResponse({"success": True, "message": f"Pozisyon kapatıldı @ ${close_price:.6f}"})
         else:
             logger.error(f"close_position_by_id returned False for {position_id}")
@@ -30286,6 +31185,11 @@ async def paper_trading_close(position_id: str):
     except Exception as e:
         logger.error(f"Error closing position {position_id}: {e}")
         return JSONResponse({"success": False, "message": f"Hata: {str(e)}"}, status_code=500)
+    finally:
+        # Release pre-lock if close_position flow didn't consume it
+        if lock_acquired and exit_engine:
+            exit_engine.clear_lock(position_id, trace_id)
+            logger.warning(f"🔓 MANUAL_PRE_LOCK_CLEANUP: {position_id} released (close flow didn't consume)")
 
 
 # ============================================================================
