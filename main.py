@@ -7949,6 +7949,14 @@ def get_dynamic_depth_threshold(
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
+def compute_leverage_distance_factor(leverage: float) -> float:
+    """P0: Bounded leverage factor for trail/pullback distances.
+    Higher leverage → wider distances (prevents tiny-move false triggers).
+    lev_factor = clamp((lev/10)^0.35, 0.85, 1.35)
+    10x→1.0, 5x→0.87, 20x→1.27, 50x→1.35 (capped)
+    """
+    raw = math.pow(max(1.0, leverage) / 10.0, 0.35)
+    return _clamp(raw, 0.85, 1.35)
 
 def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
     """
@@ -9187,6 +9195,9 @@ def get_hybrid_entry_profile(
         confluence_mult *= 0.92
 
     pullback_pct = base_pullback_pct * tightness_mult * quality_mult * micro_mult * trend_mult * confluence_mult
+    # P0: Leverage-aware pullback — high leverage widens pullback to avoid premature fills
+    lev_factor = compute_leverage_distance_factor(safe_lev)
+    pullback_pct *= lev_factor
     pullback_pct = _clamp(pullback_pct, 0.15, 12.0)
 
     # Trail-entry activation thresholds (pct)
@@ -9220,11 +9231,12 @@ def get_hybrid_runtime_trail_distance(
     roi_pct: float,
     exit_tightness: float,
     hurst: float = 0.5,
-    adx: float = 20.0
+    adx: float = 20.0,
+    leverage: float = 10.0
 ) -> float:
     """
     Dynamic trailing distance for open positions.
-    Uses volatility + liquidity + trend + ROI, and includes exit_tightness multiplier.
+    Uses volatility + liquidity + trend + ROI + leverage, and includes exit_tightness multiplier.
     """
     base = max(0.0, float(base_trail_distance))
     if base <= 0:
@@ -9262,6 +9274,10 @@ def get_hybrid_runtime_trail_distance(
     trend_mult = 1.0 + (trend_strength * 0.20)
 
     dynamic_distance = base * volatility_mult * tightness_mult * micro_mult * trend_mult
+
+    # P0: Leverage-aware distance — high leverage widens to avoid tiny-move false trails
+    lev_factor = compute_leverage_distance_factor(leverage)
+    dynamic_distance *= lev_factor
 
     # Phase 248: Relaxed profit tightening — let trends run longer
     if roi_pct >= 40:
@@ -13869,6 +13885,7 @@ async def background_scanner_loop():
                                 exit_tightness=effective_et,
                                 hurst=pos.get('hurst', 0.5),
                                 adx=pos.get('adx', 20.0),
+                                leverage=float(pos.get('leverage', 10)),
                             )
                             
                             # Phase 231d: Dynamic trail activation threshold (ATR + spread + volume)
@@ -14365,6 +14382,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             exit_tightness=effective_et,
             hurst=pos.get('hurst', 0.5),
             adx=pos.get('adx', 20.0),
+            leverage=float(pos.get('leverage', 10)),
         )
         threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
@@ -14600,6 +14618,7 @@ async def position_price_update_loop():
                             exit_tightness=effective_et,
                             hurst=pos.get('hurst', 0.5),
                             adx=pos.get('adx', 20.0),
+                            leverage=float(pos.get('leverage', 10)),
                         )
                         threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
@@ -25675,6 +25694,7 @@ class PaperTradingEngine:
                         exit_tightness=self.entry_tightness,
                         hurst=order_hurst,
                         adx=order_adx,
+                        leverage=float(order.get('leverage', self.leverage)),
                     )
 
                     order['trailEntryDistance'] = trail_entry_dist
@@ -27577,14 +27597,13 @@ class PaperTradingEngine:
                 # LONG: ROI must be >= threshold (positive ROI)
                 if roi_pct >= activation_threshold:
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                        self.add_log(f"🔄 TRAIL_LEGACY_SYNC: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                     if not pos.get('trailActiveSince'):
-                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
+                        pos['trailActiveSince'] = datetime.now().timestamp()
                 
-                if pos['isTrailingActive']:
-                    new_sl = current_price - dynamic_trail
-                    apply_sl_floor(pos, new_sl, 'TRAILING')
+                # P0: Legacy trail SL update DEACTIVATED — TRAIL_DYN pipeline is sole authority
+                # (was: apply_sl_floor(pos, new_sl, 'TRAILING'))
                 
                 # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
@@ -27616,14 +27635,13 @@ class PaperTradingEngine:
                 # SHORT: ROI must be >= threshold (positive ROI means price went down)
                 if roi_pct >= activation_threshold:
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAIL AKTİF: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                        self.add_log(f"🔄 TRAIL_LEGACY_SYNC: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                     if not pos.get('trailActiveSince'):
-                        pos['trailActiveSince'] = datetime.now().timestamp()  # Phase 268
+                        pos['trailActiveSince'] = datetime.now().timestamp()
                     
-                if pos['isTrailingActive']:
-                    new_sl = current_price + dynamic_trail
-                    apply_sl_floor(pos, new_sl, 'TRAILING')
+                # P0: Legacy trail SL update DEACTIVATED — TRAIL_DYN pipeline is sole authority
+                # (was: apply_sl_floor(pos, new_sl, 'TRAILING'))
                 
                 # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
                 if 'slConfirmCount' not in pos:
