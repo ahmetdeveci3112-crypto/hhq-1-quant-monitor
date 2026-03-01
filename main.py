@@ -4024,9 +4024,20 @@ class LiveBinanceTrader:
                 open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
                 for order in open_orders:
                     order_type = (order.get('type') or '').lower()
-                    if 'stop' in order_type:
+                    if 'stop' not in order_type:
+                        continue
+                    # Patch E: Only cancel protective (reduce-only) conditional orders
+                    _info = order.get('info', {})
+                    _is_reduce = (
+                        order.get('reduceOnly', False)
+                        or str(_info.get('reduceOnly', 'false')).lower() == 'true'
+                        or str(_info.get('closePosition', 'false')).lower() == 'true'
+                    )
+                    if _is_reduce:
                         await self.exchange.cancel_order(order['id'], ccxt_symbol)
                         logger.info(f"🗑️ Cancelled old SL order {order['id']} for {symbol}")
+                    else:
+                        logger.info(f"ℹ️ SET_SL_CANCEL_SKIPPED: {symbol} order={order['id']} type={order_type} — not reduceOnly")
             except Exception as cancel_err:
                 logger.warning(f"⚠️ Could not cancel old SL orders for {symbol}: {cancel_err}")
             
