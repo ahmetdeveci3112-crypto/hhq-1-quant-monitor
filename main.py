@@ -8128,6 +8128,11 @@ EV_HARD_THRESHOLD = float(os.environ.get('EV_HARD_THRESHOLD', '-0.01'))    # bel
 EV_HARD_BLOCK_ENABLED = os.environ.get('EV_HARD_BLOCK_ENABLED', 'false').lower() == 'true'
 EV_SOFT_PENALTY_FACTOR = float(os.environ.get('EV_SOFT_PENALTY_FACTOR', '0.7'))  # multiply score/size by this
 
+# MF-1: Market Fallback Edge Gate
+FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'shadow').lower()  # 'shadow' | 'enforce'
+FALLBACK_MIN_NET_EDGE = float(os.environ.get('FALLBACK_MIN_NET_EDGE', '0.0008'))       # absolute minimum edge
+FALLBACK_EDGE_COST_MULT = float(os.environ.get('FALLBACK_EDGE_COST_MULT', '1.25'))     # required_edge = max(MIN, MULT*cost)
+
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
     price: float, base_leverage: int,
@@ -26415,6 +26420,59 @@ class PaperTradingEngine:
                 self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'canary_no_market_fallback', current_time)
                 logger.info(f"🐤 CANARY: force-market blocked for {symbol}, order expired")
                 return True  # order removed
+        
+        # MF-1: Market Fallback Edge Gate — net edge/cost check before proceeding
+        if force_market and FALLBACK_EDGE_GATE_MODE != 'off':
+            try:
+                _signal_score = float(order.get('signalScore', 0) or 0)
+                _spread_pct = float(order.get('spreadPct', 0.05) or 0.05)
+                # Estimated cost: round-trip fee + spread-based slippage
+                _est_fee = 0.0008  # 0.08% round-trip
+                _est_slip = min(0.002, _spread_pct / 100.0)
+                _est_cost = _est_fee + _est_slip
+                # Edge estimate: same fallback formula as EV calc
+                _est_edge = (_signal_score - 60) * 0.005 if _signal_score > 0 else 0
+                _net_edge = _est_edge - _est_cost
+                _required_edge = max(FALLBACK_MIN_NET_EDGE, FALLBACK_EDGE_COST_MULT * _est_cost)
+                _edge_pass = _net_edge >= _required_edge
+
+                logger.info(
+                    f"📊 FALLBACK_EDGE_CHECK: {side} {symbol} | score={_signal_score:.0f} "
+                    f"edge={_est_edge:.4f} cost={_est_cost:.4f} net={_net_edge:.4f} "
+                    f"req={_required_edge:.4f} → {'PASS' if _edge_pass else 'BLOCK'}"
+                )
+
+                if not _edge_pass:
+                    _block_reason = 'LOW_NET_EDGE_FALLBACK' if _net_edge >= 0 else 'FALLBACK_COST_BLOCK'
+                    if FALLBACK_EDGE_GATE_MODE == 'enforce':
+                        # Hard block: remove order and reject
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
+                        self.pipeline_metrics.setdefault('fallback_edge_blocked', 0)
+                        self.pipeline_metrics['fallback_edge_blocked'] += 1
+                        self.pipeline_metrics.setdefault('open_reject_reasons', {})
+                        self.pipeline_metrics['open_reject_reasons'][_block_reason] = \
+                            self.pipeline_metrics['open_reject_reasons'].get(_block_reason, 0) + 1
+                        self.set_execution_feedback(symbol, _block_reason)
+                        self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _block_reason.lower(), current_time)
+                        logger.warning(
+                            f"🚫 FALLBACK_EDGE_BLOCKED: {side} {symbol} | reason={_block_reason} "
+                            f"net_edge={_net_edge:.4f} < req={_required_edge:.4f}"
+                        )
+                        return True  # order removed
+                    else:
+                        # Shadow mode: log only, proceed
+                        self.pipeline_metrics.setdefault('fallback_edge_shadow_would_block', 0)
+                        self.pipeline_metrics['fallback_edge_shadow_would_block'] += 1
+                        logger.info(
+                            f"👁️ FALLBACK_EDGE_SHADOW: {side} {symbol} | WOULD_BLOCK reason={_block_reason} "
+                            f"net_edge={_net_edge:.4f} < req={_required_edge:.4f} (shadow mode, proceeding)"
+                        )
+            except Exception as _edge_err:
+                # Cannot compute edge → log and proceed (don't block on error)
+                self.pipeline_metrics.setdefault('fallback_edge_unavailable', 0)
+                self.pipeline_metrics['fallback_edge_unavailable'] += 1
+                logger.info(f"ℹ️ FALLBACK_EDGE_UNAVAILABLE: {symbol} — {_edge_err}")
         
         _opp = next((o for o in opportunities if o.get('symbol') == symbol), None)
         rv = revalidate_pending_entry(order, _opp, current_time, force_market=force_market)
