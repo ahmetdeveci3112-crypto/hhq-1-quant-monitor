@@ -7990,9 +7990,14 @@ def compute_leverage_distance_factor(leverage: float) -> float:
 # ================================================================
 # Batch 2: UNIFIED LEVERAGE + SIZING HELPERS
 # PARITY_MODE: helpers compute shadow values, old path applies.
+# Batch 2B: APPLY_MODE controls whether helpers replace inline computation.
+#   'parity' = helper result replaces inline (behavior-preserving)
+#   'shadow' = helper result logged only, old inline applied
 # ================================================================
 
 PARITY_MODE = os.environ.get('PARITY_MODE', 'true').lower() == 'true'
+LEV_APPLY_MODE = os.environ.get('LEV_APPLY_MODE', 'parity').lower()   # 'parity' | 'shadow'
+SIZE_APPLY_MODE = os.environ.get('SIZE_APPLY_MODE', 'parity').lower()  # 'parity' | 'shadow'
 
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
@@ -25147,7 +25152,7 @@ class PaperTradingEngine:
             signal['signalLeverageRaw'] = raw_leverage
             signal['signalLeverageEffective'] = adjusted_leverage
         
-        # Batch 2 Rev3: Dual shadow leverage — PARITY (regression-gated) + V2 (info-only)
+        # Batch 2B: Dual shadow leverage — PARITY (apply or shadow) + V2 (info-only)
         try:
             _shadow_vol_pct = (atr / price * 100) if price > 0 else 10.0
             _shadow_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
@@ -25167,6 +25172,14 @@ class PaperTradingEngine:
                 logger.warning(f"LEV_PIPE_PARITY_REGRESSION: {trade_symbol} old={adjusted_leverage} new={_parity_lev['leverage']} delta={_p_delta:.1f}% cap={_parity_lev['cap_reason']}")
             else:
                 logger.info(f"LEV_PIPE_PARITY_SHADOW: {trade_symbol} old={adjusted_leverage} new={_parity_lev['leverage']} delta={_p_delta:.1f}% cap={_parity_lev['cap_reason']}")
+            # Batch 2B: Apply parity result if mode=parity and no regression
+            if LEV_APPLY_MODE == 'parity':
+                if _p_delta <= 15:
+                    _old_lev = adjusted_leverage
+                    adjusted_leverage = _parity_lev['leverage']
+                    logger.info(f"LEV_PIPE_PARITY_APPLIED: {trade_symbol} {_old_lev}→{adjusted_leverage} cap={_parity_lev['cap_reason']}")
+                else:
+                    logger.info(f"LEV_PIPE_PARITY_FALLBACK: {trade_symbol} keeping old={adjusted_leverage} (regression delta={_p_delta:.1f}%)")
             # V2: raw mode — info only, no regression tag
             _v2_lev = compute_effective_leverage(
                 atr_pct=_shadow_vol_pct, spread_pct=_shadow_spread,
@@ -25309,7 +25322,7 @@ class PaperTradingEngine:
             size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
             reasons.append(size_cap_reason)
         
-        # Batch 2 Rev3: Dual shadow sizing — PARITY (regression-gated) + V2 (info-only)
+        # Batch 2B: Dual shadow sizing — PARITY (apply or shadow) + V2 (info-only)
         try:
             _mtf_mod = mtf_size_modifier if 'mtf_size_modifier' in dir() else 1.0
             # PARITY: legacy_parity mode — replicates old inline formula
@@ -25325,6 +25338,14 @@ class PaperTradingEngine:
                 logger.warning(f"SIZE_PIPE_PARITY_REGRESSION: {trade_symbol} old=${position_size_usd:.2f} parity=${_parity_size['size_usd']:.2f} delta={_ps_delta:.1f}% caps={_parity_size['cap_reasons']}")
             else:
                 logger.info(f"SIZE_PIPE_PARITY_SHADOW: {trade_symbol} old=${position_size_usd:.2f} parity=${_parity_size['size_usd']:.2f} delta={_ps_delta:.1f}% caps={_parity_size['cap_reasons']}")
+            # Batch 2B: Apply parity result if mode=parity and no regression
+            if SIZE_APPLY_MODE == 'parity':
+                if _ps_delta <= 15:
+                    _old_size = position_size_usd
+                    position_size_usd = _parity_size['size_usd']
+                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {trade_symbol} ${_old_size:.2f}→${position_size_usd:.2f} caps={_parity_size['cap_reasons']}")
+                else:
+                    logger.info(f"SIZE_PIPE_PARITY_FALLBACK: {trade_symbol} keeping old=${position_size_usd:.2f} (regression delta={_ps_delta:.1f}%)")
             # V2: v2_band mode — info only
             _v2_size = compute_position_size_usd(
                 balance=self.balance, leverage=adjusted_leverage,
@@ -27662,7 +27683,7 @@ class PaperTradingEngine:
         signal['signalLeverageRaw'] = raw_leverage
         signal['signalLeverageEffective'] = adjusted_leverage
         
-        # Batch 2 Rev3: Dual shadow leverage (manual) — PARITY + V2
+        # Batch 2B: Dual shadow leverage (manual) — PARITY (apply) + V2
         try:
             _m_vol_pct = (float(signal.get('atr', 0)) / current_price * 100) if current_price > 0 else 10.0
             _m_spread = float(signal.get('spreadPct', 0.05))
@@ -27680,6 +27701,14 @@ class PaperTradingEngine:
                 logger.warning(f"LEV_PIPE_PARITY_REGRESSION: {signal.get('symbol','')} old={adjusted_leverage} new={_mp_lev['leverage']} delta={_mp_delta:.1f}% path=manual")
             else:
                 logger.info(f"LEV_PIPE_PARITY_SHADOW: {signal.get('symbol','')} old={adjusted_leverage} new={_mp_lev['leverage']} delta={_mp_delta:.1f}% path=manual")
+            # Batch 2B: Apply parity
+            if LEV_APPLY_MODE == 'parity':
+                if _mp_delta <= 15:
+                    _old_lev = adjusted_leverage
+                    adjusted_leverage = _mp_lev['leverage']
+                    logger.info(f"LEV_PIPE_PARITY_APPLIED: {signal.get('symbol','')} {_old_lev}→{adjusted_leverage} path=manual")
+                else:
+                    logger.info(f"LEV_PIPE_PARITY_FALLBACK: {signal.get('symbol','')} keeping old={adjusted_leverage} path=manual")
             # V2 info
             _mv2_lev = compute_effective_leverage(
                 atr_pct=_m_vol_pct, spread_pct=_m_spread,
@@ -27710,7 +27739,7 @@ class PaperTradingEngine:
         position_size_usd = risk_amount * adjusted_leverage
         position_size = position_size_usd / current_price
         
-        # Batch 2 Rev3: Dual shadow sizing (manual) — PARITY + V2
+        # Batch 2B: Dual shadow sizing (manual) — PARITY (apply) + V2
         try:
             _m_vol_pct2 = (float(signal.get('atr', 0)) / current_price * 100) if current_price > 0 else 2.0
             _m_sp = float(signal.get('spreadPct', 0.05))
@@ -27727,6 +27756,15 @@ class PaperTradingEngine:
                 logger.warning(f"SIZE_PIPE_PARITY_REGRESSION: {signal.get('symbol','')} old=${position_size_usd:.2f} parity=${_mp_size['size_usd']:.2f} delta={_mps_delta:.1f}% path=manual")
             else:
                 logger.info(f"SIZE_PIPE_PARITY_SHADOW: {signal.get('symbol','')} old=${position_size_usd:.2f} parity=${_mp_size['size_usd']:.2f} delta={_mps_delta:.1f}% path=manual")
+            # Batch 2B: Apply parity
+            if SIZE_APPLY_MODE == 'parity':
+                if _mps_delta <= 15:
+                    _old_size = position_size_usd
+                    position_size_usd = _mp_size['size_usd']
+                    position_size = position_size_usd / current_price  # recalc
+                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {signal.get('symbol','')} ${_old_size:.2f}→${position_size_usd:.2f} path=manual")
+                else:
+                    logger.info(f"SIZE_PIPE_PARITY_FALLBACK: {signal.get('symbol','')} keeping old=${position_size_usd:.2f} path=manual")
             # V2 info
             _mv2_size = compute_position_size_usd(
                 balance=self.balance, leverage=adjusted_leverage,
