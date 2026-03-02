@@ -7491,6 +7491,35 @@ def estimate_trade_cost(
         'min_profitable_move': round(total_cost_pct * 2, 4),  # Min price move to profit
     }
 
+def check_tp_cost_floor(pos: dict, current_price: float) -> dict:
+    """RMP-1: Validate that TP exit at current_price produces net-positive ROI after costs.
+
+    Returns: {'pass': bool, 'net_roi_pct': float, 'cost_roi_pct': float, 'actual_roi_pct': float}
+    """
+    entry = float(pos.get('entryPrice', 0) or 0)
+    if entry <= 0 or current_price <= 0:
+        return {'pass': True, 'net_roi_pct': 0, 'cost_roi_pct': 0, 'actual_roi_pct': 0}
+
+    leverage = max(1, int(pos.get('leverage', 10) or 10))
+    spread_pct = float(pos.get('spreadPct', 0.05) or 0.05)
+    cost = estimate_trade_cost(spread_pct, leverage)
+    cost_roi = cost['roi_pct']  # e.g. 1.3% for 10x
+
+    # Actual ROI at current close price
+    if pos.get('side') == 'LONG':
+        price_delta_pct = (current_price - entry) / entry * 100
+    else:
+        price_delta_pct = (entry - current_price) / entry * 100
+    actual_roi = price_delta_pct * leverage
+    net_roi = actual_roi - cost_roi
+
+    return {
+        'pass': net_roi > 0,
+        'net_roi_pct': round(net_roi, 2),
+        'cost_roi_pct': round(cost_roi, 2),
+        'actual_roi_pct': round(actual_roi, 2),
+    }
+
 def get_tick_size(symbol: str) -> float:
     """Get Binance tick size for a symbol from CCXT markets cache.
     
@@ -8216,6 +8245,25 @@ EV_SOFT_PENALTY_FACTOR = float(os.environ.get('EV_SOFT_PENALTY_FACTOR', '0.7')) 
 FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'shadow').lower()  # 'shadow' | 'enforce'
 FALLBACK_MIN_NET_EDGE = float(os.environ.get('FALLBACK_MIN_NET_EDGE', '0.0008'))       # absolute minimum edge
 FALLBACK_EDGE_COST_MULT = float(os.environ.get('FALLBACK_EDGE_COST_MULT', '1.25'))     # required_edge = max(MIN, MULT*cost)
+# RMP-1: Edge gate hard blocks (apply even in shadow — data quality guard)
+FALLBACK_EDGE_SPREAD_HARD_BLOCK_BPS = float(os.environ.get('FALLBACK_EDGE_SPREAD_HARD_BLOCK_BPS', '25.0'))
+FALLBACK_EDGE_DEPTH_HARD_BLOCK_USD = float(os.environ.get('FALLBACK_EDGE_DEPTH_HARD_BLOCK_USD', '5000'))
+
+# RMP-1: TP Cost-Floor Guard
+TP_COST_FLOOR_MODE = os.environ.get('TP_COST_FLOOR_MODE', 'shadow').lower()  # shadow|enforce|off
+TP_COST_FLOOR_MAX_DELAY_SEC = float(os.environ.get('TP_COST_FLOOR_MAX_DELAY_SEC', '45'))  # max TP hold after first hit
+
+# RMP-1: Portfolio Cluster Cap
+RMP_CLUSTER_CAP_MODE = os.environ.get('RMP_CLUSTER_CAP_MODE', 'shadow').lower()  # shadow|enforce|off
+RMP_CLUSTER_CAP_PCT = float(os.environ.get('RMP_CLUSTER_CAP_PCT', '0.40'))  # 40% of balance per cluster+direction
+COIN_CLUSTER_MAP = {
+    'BTCUSDT': 'major', 'ETHUSDT': 'major', 'BNBUSDT': 'major', 'SOLUSDT': 'major',
+    'XRPUSDT': 'large', 'ADAUSDT': 'large', 'AVAXUSDT': 'large', 'DOTUSDT': 'large',
+    'LINKUSDT': 'large', 'MATICUSDT': 'large', 'NEARUSDT': 'large',
+    'DOGEUSDT': 'meme', 'SHIBUSDT': 'meme', 'PEPEUSDT': 'meme', 'FLOKIUSDT': 'meme',
+    'WIFUSDT': 'meme', 'BONKUSDT': 'meme', 'BOMEUSDT': 'meme', 'MEMEUSDT': 'meme',
+    # Unlisted coins default to 'alt'
+}
 
 # DQ-1: Metadata Coverage Guard
 DQ_AUTO_APPLY_MIN_COVERAGE = float(os.environ.get('DQ_AUTO_APPLY_MIN_COVERAGE', '70'))   # below → auto-apply disabled
@@ -14572,6 +14620,47 @@ async def background_scanner_loop():
                                 tp_hit = True
                             
                             if tp_hit and not pos.get('pending_limit_close'):
+                                # RMP-1: TP Cost-Floor Guard — check net ROI before TP fire
+                                _tp_cf = check_tp_cost_floor(pos, candle_close_price)
+                                _tp_cf_snap = (
+                                    f"symbol={pos_symbol} side={pos['side']} "
+                                    f"net_roi={_tp_cf['net_roi_pct']:.2f}% cost={_tp_cf['cost_roi_pct']:.2f}% "
+                                    f"actual_roi={_tp_cf['actual_roi_pct']:.2f}% "
+                                    f"spread={pos.get('spreadPct', 0):.3f} lev={pos.get('leverage', 10)}"
+                                )
+                                if not _tp_cf['pass'] and TP_COST_FLOOR_MODE != 'off':
+                                    # Track first-hit timestamp for max delay
+                                    if 'tp_cost_floor_first_hit_ts' not in pos:
+                                        pos['tp_cost_floor_first_hit_ts'] = datetime.now().timestamp()
+                                    _delay_elapsed = datetime.now().timestamp() - pos['tp_cost_floor_first_hit_ts']
+
+                                    if _delay_elapsed >= TP_COST_FLOOR_MAX_DELAY_SEC:
+                                        # Max delay exceeded → forced controlled close
+                                        logger.warning(
+                                            f"⏰ TP_COST_FLOOR_TIMEOUT: {_tp_cf_snap} "
+                                            f"delay={_delay_elapsed:.0f}s >= max={TP_COST_FLOOR_MAX_DELAY_SEC:.0f}s → FORCED_CLOSE"
+                                        )
+                                        pos.pop('tp_cost_floor_first_hit_ts', None)
+                                        exit_engine.request_exit(pos, candle_close_price, 'TP_HIT')
+                                        continue
+                                    elif TP_COST_FLOOR_MODE == 'enforce':
+                                        logger.info(
+                                            f"🛡️ TP_COST_FLOOR_BLOCK: {_tp_cf_snap} "
+                                            f"delay={_delay_elapsed:.0f}s (waiting)"
+                                        )
+                                        continue  # skip TP, let price improve
+                                    else:
+                                        logger.info(
+                                            f"👁️ TP_COST_FLOOR_SHADOW: {_tp_cf_snap} "
+                                            f"delay={_delay_elapsed:.0f}s (would block)"
+                                        )
+                                        # Shadow: fall through to normal TP fire
+                                else:
+                                    # Clear delay tracker on pass
+                                    pos.pop('tp_cost_floor_first_hit_ts', None)
+                                    if _tp_cf['net_roi_pct'] > 0:
+                                        logger.debug(f"✅ TP_COST_FLOOR_PASS: {_tp_cf_snap}")
+
                                 if pos.get('isLive', False) and live_binance_trader.enabled:
                                     try:
                                         contracts = abs(pos.get('contracts', pos.get('size', 0)))
@@ -15832,6 +15921,44 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
             return
     
+    # RMP-1: Portfolio Cluster Cap — limit same-direction margin per correlated cluster
+    if RMP_CLUSTER_CAP_MODE != 'off':
+        _cluster = COIN_CLUSTER_MAP.get(symbol, 'alt')
+        _cluster_positions = [
+            p for p in global_paper_trader.positions
+            if p.get('side') == signal_side and COIN_CLUSTER_MAP.get(p.get('symbol', ''), 'alt') == _cluster
+        ]
+        _cluster_margin = sum(
+            float(p.get('sizeUsd', 0) or 0) / max(1, int(p.get('leverage', 10) or 10))
+            for p in _cluster_positions
+        )
+        # Estimate new position margin
+        _new_margin = float(signal.get('sizeUsd', 0) or signal.get('notional', 0) or 0) / max(1, int(signal.get('leverage', 10) or 10))
+        if _new_margin <= 0:
+            _new_margin = global_paper_trader.balance * 0.02  # fallback ~2% of balance
+        _cluster_cap = global_paper_trader.balance * RMP_CLUSTER_CAP_PCT
+        _cluster_total = _cluster_margin + _new_margin
+
+        if _cluster_total > _cluster_cap:
+            _cl_snap = (
+                f"symbol={symbol} side={signal_side} cluster={_cluster} "
+                f"existing=${_cluster_margin:.2f} new=${_new_margin:.2f} "
+                f"total=${_cluster_total:.2f} cap=${_cluster_cap:.2f} "
+                f"positions={len(_cluster_positions)}"
+            )
+            if RMP_CLUSTER_CAP_MODE == 'enforce':
+                signal_log_data['reject_reason'] = 'CLUSTER_CAP'
+                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                reject_feedback("CLUSTER_CAP")
+                logger.warning(f"🚫 CLUSTER_CAP_BLOCK: {_cl_snap}")
+                return
+            else:
+                logger.info(f"👁️ CLUSTER_CAP_SHADOW: {_cl_snap} (would block)")
+        else:
+            logger.debug(
+                f"📊 CLUSTER_EXPOSURE: {symbol} cluster={_cluster} {signal_side} "
+                f"margin=${_cluster_margin:.2f}+${_new_margin:.2f}=${_cluster_total:.2f} cap=${_cluster_cap:.2f}"
+            )
     # Check blacklist
     if global_paper_trader.is_coin_blacklisted(symbol):
         signal_log_data['reject_reason'] = 'BLACKLISTED'
@@ -25752,6 +25879,34 @@ class PaperTradingEngine:
             logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
             return None
         
+        # RMP-1: Cluster cap (live trader parity)
+        if RMP_CLUSTER_CAP_MODE != 'off':
+            _cluster = COIN_CLUSTER_MAP.get(trade_symbol, 'alt')
+            _cluster_margin = sum(
+                float(p.get('sizeUsd', 0) or 0) / max(1, int(p.get('leverage', 10) or 10))
+                for p in self.positions
+                if p.get('side') == side and COIN_CLUSTER_MAP.get(p.get('symbol', ''), 'alt') == _cluster
+            )
+            _new_margin = float(signal.get('sizeUsd', 0) or signal.get('notional', 0) or 0) / max(1, int(signal.get('leverage', 10) or 10))
+            if _new_margin <= 0:
+                _new_margin = self.balance * 0.02
+            _cluster_cap = self.balance * RMP_CLUSTER_CAP_PCT
+            if _cluster_margin + _new_margin > _cluster_cap:
+                if RMP_CLUSTER_CAP_MODE == 'enforce':
+                    self.set_execution_feedback(trade_symbol, "CLUSTER_CAP")
+                    logger.warning(
+                        f"🚫 CLUSTER_CAP_BLOCK: {trade_symbol} {side} cluster={_cluster} "
+                        f"margin=${_cluster_margin:.2f}+${_new_margin:.2f}=${_cluster_margin+_new_margin:.2f} "
+                        f"cap=${_cluster_cap:.2f}"
+                    )
+                    return None
+                else:
+                    logger.info(
+                        f"👁️ CLUSTER_CAP_SHADOW: {trade_symbol} {side} cluster={_cluster} "
+                        f"margin=${_cluster_margin:.2f}+${_new_margin:.2f}=${_cluster_margin+_new_margin:.2f} "
+                        f"cap=${_cluster_cap:.2f} (would block)"
+                    )
+
         # =========================================================================
         # PHASE 267A: PORTFOLIO VaR + CORRELATION RISK GATE
         # =========================================================================
@@ -27009,58 +27164,91 @@ class PaperTradingEngine:
                 logger.info(f"🐤 CANARY: force-market blocked for {symbol}, order expired")
                 return True  # order removed
         
-        # MF-1: Market Fallback Edge Gate — net edge/cost check before proceeding
+        # RMP-1: Market Fallback Edge Gate — precedence: data→spread/depth→edge→min-notional
         if force_market and FALLBACK_EDGE_GATE_MODE != 'off':
             try:
                 _signal_score = float(order.get('signalScore', 0) or 0)
                 _spread_pct = float(order.get('spreadPct', 0.05) or 0.05)
-                # Estimated cost: round-trip fee + spread-based slippage
+                _spread_bps = _spread_pct * 100  # convert to bps
+                _depth_est = float(order.get('depthUsd', 0) or order.get('volume24h', 0) or 0) * 0.01
+                _margin_usd = float(order.get('marginUsd', 0) or order.get('sizeUsd', 0) or 0) / max(1, int(order.get('leverage', 10) or 10))
+                _leverage = int(order.get('leverage', 10) or 10)
+
+                # ── Step 1: Data validity ──
+                _data_valid = _signal_score > 0 and _spread_pct > 0
+
+                # ── Step 2: Spread/depth hard block (even in shadow — data quality) ──
+                _hard_block = False
+                _hard_reason = ''
+                if _data_valid:
+                    if _spread_bps > FALLBACK_EDGE_SPREAD_HARD_BLOCK_BPS:
+                        _hard_block = True
+                        _hard_reason = 'SPREAD_HARD_BLOCK'
+                    elif _depth_est > 0 and _depth_est < FALLBACK_EDGE_DEPTH_HARD_BLOCK_USD:
+                        _hard_block = True
+                        _hard_reason = 'DEPTH_HARD_BLOCK'
+
+                if _hard_block:
+                    # Hard block applies in ALL modes (shadow or enforce)
+                    if order in self.pending_orders:
+                        self.pending_orders.remove(order)
+                    self.pipeline_metrics.setdefault('edge_gate_block', 0)
+                    self.pipeline_metrics['edge_gate_block'] += 1
+                    self.pipeline_metrics.setdefault('open_reject_reasons', {})
+                    self.pipeline_metrics['open_reject_reasons'][_hard_reason] = \
+                        self.pipeline_metrics['open_reject_reasons'].get(_hard_reason, 0) + 1
+                    self.set_execution_feedback(symbol, _hard_reason)
+                    self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _hard_reason.lower(), current_time)
+                    logger.warning(
+                        f"🚫 EDGE_GATE_BLOCK: {side} {symbol} | reason={_hard_reason} "
+                        f"spread={_spread_bps:.1f}bps depth=${_depth_est:.0f} "
+                        f"marginUsd=${_margin_usd:.2f} lev={_leverage}"
+                    )
+                    return True  # order removed
+
+                # ── Step 3: Edge net check ──
                 _est_fee = 0.0008  # 0.08% round-trip
                 _est_slip = min(0.002, _spread_pct / 100.0)
                 _est_cost = _est_fee + _est_slip
-                # Edge estimate: same fallback formula as EV calc
                 _est_edge = (_signal_score - 60) * 0.005 if _signal_score > 0 else 0
                 _net_edge = _est_edge - _est_cost
                 _required_edge = max(FALLBACK_MIN_NET_EDGE, FALLBACK_EDGE_COST_MULT * _est_cost)
                 _edge_pass = _net_edge >= _required_edge
 
-                logger.info(
-                    f"📊 FALLBACK_EDGE_CHECK: {side} {symbol} | score={_signal_score:.0f} "
-                    f"edge={_est_edge:.4f} cost={_est_cost:.4f} net={_net_edge:.4f} "
-                    f"req={_required_edge:.4f} → {'PASS' if _edge_pass else 'BLOCK'}"
+                # Decision snapshot (all paths)
+                _snap = (
+                    f"symbol={symbol} side={side} spread={_spread_bps:.1f}bps "
+                    f"depth=${_depth_est:.0f} edge_net={_net_edge:.4f} cost_est={_est_cost:.4f} "
+                    f"marginUsd=${_margin_usd:.2f} lev={_leverage}"
                 )
 
-                if not _edge_pass:
-                    _block_reason = 'LOW_NET_EDGE_FALLBACK' if _net_edge >= 0 else 'FALLBACK_COST_BLOCK'
+                if _edge_pass:
+                    self.pipeline_metrics.setdefault('edge_gate_allow', 0)
+                    self.pipeline_metrics['edge_gate_allow'] += 1
+                    logger.info(f"✅ EDGE_GATE_ALLOW: {_snap} req={_required_edge:.4f}")
+                elif not _edge_pass:
+                    _block_reason = 'LOW_NET_EDGE' if _net_edge >= 0 else 'COST_EXCEEDS_EDGE'
                     if FALLBACK_EDGE_GATE_MODE == 'enforce':
-                        # Hard block: remove order and reject
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
-                        self.pipeline_metrics.setdefault('fallback_edge_blocked', 0)
-                        self.pipeline_metrics['fallback_edge_blocked'] += 1
+                        self.pipeline_metrics.setdefault('edge_gate_block', 0)
+                        self.pipeline_metrics['edge_gate_block'] += 1
                         self.pipeline_metrics.setdefault('open_reject_reasons', {})
                         self.pipeline_metrics['open_reject_reasons'][_block_reason] = \
                             self.pipeline_metrics['open_reject_reasons'].get(_block_reason, 0) + 1
                         self.set_execution_feedback(symbol, _block_reason)
                         self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _block_reason.lower(), current_time)
-                        logger.warning(
-                            f"🚫 FALLBACK_EDGE_BLOCKED: {side} {symbol} | reason={_block_reason} "
-                            f"net_edge={_net_edge:.4f} < req={_required_edge:.4f}"
-                        )
+                        logger.warning(f"🚫 EDGE_GATE_BLOCK: {_snap} reason={_block_reason} req={_required_edge:.4f}")
                         return True  # order removed
                     else:
-                        # Shadow mode: log only, proceed
-                        self.pipeline_metrics.setdefault('fallback_edge_shadow_would_block', 0)
-                        self.pipeline_metrics['fallback_edge_shadow_would_block'] += 1
-                        logger.info(
-                            f"👁️ FALLBACK_EDGE_SHADOW: {side} {symbol} | WOULD_BLOCK reason={_block_reason} "
-                            f"net_edge={_net_edge:.4f} < req={_required_edge:.4f} (shadow mode, proceeding)"
-                        )
+                        self.pipeline_metrics.setdefault('edge_gate_shadow_miss', 0)
+                        self.pipeline_metrics['edge_gate_shadow_miss'] += 1
+                        logger.info(f"👁️ EDGE_GATE_SHADOW_MISS: {_snap} reason={_block_reason} req={_required_edge:.4f}")
             except Exception as _edge_err:
-                # Cannot compute edge → log and proceed (don't block on error)
-                self.pipeline_metrics.setdefault('fallback_edge_unavailable', 0)
-                self.pipeline_metrics['fallback_edge_unavailable'] += 1
-                logger.info(f"ℹ️ FALLBACK_EDGE_UNAVAILABLE: {symbol} — {_edge_err}")
+                self.pipeline_metrics.setdefault('edge_gate_unavailable', 0)
+                self.pipeline_metrics['edge_gate_unavailable'] += 1
+                logger.info(f"ℹ️ EDGE_GATE_UNAVAILABLE: {symbol} — {_edge_err}")
+
         
         _opp = next((o for o in opportunities if o.get('symbol') == symbol), None)
         rv = revalidate_pending_entry(order, _opp, current_time, force_market=force_market)
@@ -28989,8 +29177,28 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price >= pos['takeProfit']:
-                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
-                        self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
+                        # RMP-1: TP Cost-Floor Guard
+                        _tp_cf = check_tp_cost_floor(pos, current_price)
+                        _tp_cf_snap = (f"symbol={pos.get('symbol')} side=LONG net_roi={_tp_cf['net_roi_pct']:.2f}% "
+                                       f"cost={_tp_cf['cost_roi_pct']:.2f}% spread={pos.get('spreadPct', 0):.3f} lev={pos.get('leverage', 10)}")
+                        _tp_fire = True
+                        if not _tp_cf['pass'] and TP_COST_FLOOR_MODE != 'off':
+                            if 'tp_cost_floor_first_hit_ts' not in pos:
+                                pos['tp_cost_floor_first_hit_ts'] = datetime.now().timestamp()
+                            _delay = datetime.now().timestamp() - pos['tp_cost_floor_first_hit_ts']
+                            if _delay >= TP_COST_FLOOR_MAX_DELAY_SEC:
+                                logger.warning(f"⏰ TP_COST_FLOOR_TIMEOUT: {_tp_cf_snap} delay={_delay:.0f}s → FORCED_CLOSE")
+                                pos.pop('tp_cost_floor_first_hit_ts', None)
+                            elif TP_COST_FLOOR_MODE == 'enforce':
+                                logger.info(f"🛡️ TP_COST_FLOOR_BLOCK: {_tp_cf_snap} delay={_delay:.0f}s")
+                                _tp_fire = False
+                            else:
+                                logger.info(f"👁️ TP_COST_FLOOR_SHADOW: {_tp_cf_snap} delay={_delay:.0f}s")
+                        else:
+                            pos.pop('tp_cost_floor_first_hit_ts', None)
+                        if _tp_fire:
+                            pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
+                            self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
                     
             elif pos['side'] == 'SHORT':
                 # SHORT: ROI must be >= threshold (positive ROI means price went down)
@@ -29027,8 +29235,28 @@ class PaperTradingEngine:
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
                     if current_price <= pos['takeProfit']:
-                        pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
-                        self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
+                        # RMP-1: TP Cost-Floor Guard
+                        _tp_cf = check_tp_cost_floor(pos, current_price)
+                        _tp_cf_snap = (f"symbol={pos.get('symbol')} side=SHORT net_roi={_tp_cf['net_roi_pct']:.2f}% "
+                                       f"cost={_tp_cf['cost_roi_pct']:.2f}% spread={pos.get('spreadPct', 0):.3f} lev={pos.get('leverage', 10)}")
+                        _tp_fire = True
+                        if not _tp_cf['pass'] and TP_COST_FLOOR_MODE != 'off':
+                            if 'tp_cost_floor_first_hit_ts' not in pos:
+                                pos['tp_cost_floor_first_hit_ts'] = datetime.now().timestamp()
+                            _delay = datetime.now().timestamp() - pos['tp_cost_floor_first_hit_ts']
+                            if _delay >= TP_COST_FLOOR_MAX_DELAY_SEC:
+                                logger.warning(f"⏰ TP_COST_FLOOR_TIMEOUT: {_tp_cf_snap} delay={_delay:.0f}s → FORCED_CLOSE")
+                                pos.pop('tp_cost_floor_first_hit_ts', None)
+                            elif TP_COST_FLOOR_MODE == 'enforce':
+                                logger.info(f"🛡️ TP_COST_FLOOR_BLOCK: {_tp_cf_snap} delay={_delay:.0f}s")
+                                _tp_fire = False
+                            else:
+                                logger.info(f"👁️ TP_COST_FLOOR_SHADOW: {_tp_cf_snap} delay={_delay:.0f}s")
+                        else:
+                            pos.pop('tp_cost_floor_first_hit_ts', None)
+                        if _tp_fire:
+                            pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'TP_HIT', 'roi': round(roi_pct, 1)})
+                            self.close_via_engine(pos, current_price, 'TP_HIT', 'TP_MGR')
 
     @staticmethod
     def _normalize_close_reason(reason: str) -> str:
