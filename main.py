@@ -32120,6 +32120,12 @@ async def optimizer_status():
         "trackingList": tracking_list,
         "recentAnalyses": post_trade_tracker.analysis_results[-10:],
         "marketRegime": market_regime_detector.get_status(),
+        "dcaConfig": {
+            "enabled": DUAL_REGIME_GATE_ENABLED,
+            "shadow": DUAL_REGIME_SHADOW,
+            "conflictMode": DUAL_REGIME_CONFLICT_MODE,
+            "minConf": DUAL_REGIME_MIN_CONF,
+        },
         "scoreAnalysis": score_component_analyzer.get_status()
     })
 

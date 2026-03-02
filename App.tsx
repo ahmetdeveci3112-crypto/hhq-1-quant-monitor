@@ -289,6 +289,12 @@ export default function App() {
     priceCount: number;
     params: { min_score_adjustment: number; trail_distance_mult: number; description: string };
   } | null>(null);
+  const [dcaConfig, setDcaConfig] = useState<{
+    enabled: boolean;
+    shadow: boolean;
+    conflictMode: string;
+    minConf: number;
+  } | null>(null);
 
   // UI Tab State
   const [activeTab, setActiveTab] = useState('portfolio');
@@ -772,6 +778,9 @@ export default function App() {
           });
           if (data.marketRegime) {
             setMarketRegime(data.marketRegime);
+          }
+          if (data.dcaConfig) {
+            setDcaConfig(data.dcaConfig);
           }
         }
       } catch (err) {
@@ -1898,6 +1907,7 @@ export default function App() {
                   analyses={optimizerStats.recentAnalyses ?? []}
                   onToggle={toggleOptimizer}
                   marketRegime={marketRegime || undefined}
+                  dcaConfig={dcaConfig || undefined}
                 />
               </div>
 
