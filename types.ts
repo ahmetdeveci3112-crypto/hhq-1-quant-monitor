@@ -62,6 +62,7 @@ export interface Position {
   size: number;           // Position size in base currency (internal usage)
   contracts?: number;     // Phase 141: Binance-compatible field (same as size)
   sizeUsd: number;        // Position size in USD
+  marginUsd?: number;     // P1: Explicit margin (authoritative)
   stopLoss: number;
   takeProfit: number;
   trailingStop: number;
@@ -125,6 +126,8 @@ export interface Trade {
   exitPrice: number;
   size: number;
   sizeUsd: number;
+  marginUsd?: number;     // P1: Explicit margin (authoritative)
+  leverage?: number;
   pnl: number;
   pnlPercent: number;
   openTime: number;

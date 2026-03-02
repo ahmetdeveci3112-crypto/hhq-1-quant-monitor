@@ -1,6 +1,7 @@
 import React from 'react';
 import { Wallet, TrendingUp, TrendingDown, Eye, EyeOff } from 'lucide-react';
 import { Position } from '../types';
+import { getPositionMargin } from '../utils';
 
 interface WalletPanelProps {
     walletBalance: number;
@@ -41,7 +42,7 @@ export const WalletPanel: React.FC<WalletPanelProps> = ({
 
     // Total Used Margin - use margin field from backend if available
     const usedMargin = positions.reduce((sum, p) => {
-        const margin = (p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10);
+        const margin = getPositionMargin(p);
         return sum + margin;
     }, 0);
 
@@ -132,7 +133,7 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
     const isLong = position.side === 'LONG';
     const pnl = position.unrealizedPnl || 0;
     // Use margin field from backend if available
-    const margin = (position as any).margin || (position as any).initialMargin || (position.sizeUsd || 0) / (position.leverage || 10);
+    const margin = getPositionMargin(position);
     const roi = margin > 0 ? (pnl / margin) * 100 : 0;
     const sizeCoins = position.size || 0;
     const symbol = position.symbol.replace('USDT', '');
@@ -151,7 +152,7 @@ export const PositionCardBinance: React.FC<PositionCardBinanceProps> = ({
                         }}
                     />
                     <span className="font-bold text-white">{position.symbol}</span>
-                        <span className="text-xs text-slate-500">Vadeli</span>
+                    <span className="text-xs text-slate-500">Vadeli</span>
                     <span className={`text-xs px-1.5 py-0.5 rounded ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
                         Çapraz {position.leverage || 10}X
                     </span>

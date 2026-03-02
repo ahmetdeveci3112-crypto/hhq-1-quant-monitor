@@ -11,7 +11,7 @@ import {
   MarketRegime, Portfolio, SystemSettings, Position, Trade, EquityPoint, PortfolioStats,
   BackendSignal, CoinOpportunity, ScannerStats
 } from './types';
-import { formatPrice, formatCurrency } from './utils';
+import { formatPrice, formatCurrency, getPositionMargin } from './utils';
 import { translateReason, getCanonicalReason } from './utils/reasonUtils';
 import { SettingsModal } from './components/SettingsModal';
 import { PnLPanel } from './components/PnLPanel';
@@ -64,7 +64,7 @@ const getReasonTooltip = (trade: any): string => {
   const isTrailing = trade.isTrailingActive || false;
   const leverage = trade.leverage || 10;
   const atr = trade.atr || 0;
-  const margin = trade.margin || (trade.sizeUsd || 100) / leverage;
+  const margin = getPositionMargin(trade);
   const pnlPct = margin > 0 ? (trade.pnl / margin) * 100 : 0;
 
   const lines: string[] = [];
@@ -1389,13 +1389,13 @@ export default function App() {
                     <div>
                       <div className="text-xs text-slate-500 uppercase">Kullanılabilir</div>
                       <div className="text-base font-semibold text-cyan-400 font-mono">
-                        {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
+                        {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0)))}
                       </div>
                     </div>
                     <div>
                       <div className="text-xs text-slate-500 uppercase">Kullanılan Marjin</div>
                       <div className="text-base font-semibold text-amber-400 font-mono">
-                        {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                        {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0))}
                       </div>
                     </div>
                     <div>
@@ -1450,13 +1450,13 @@ export default function App() {
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılabilir</div>
                         <div className="text-base font-semibold text-cyan-400 font-mono">
-                          {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0)))}
+                          {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0)))}
                         </div>
                       </div>
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılan Marjin</div>
                         <div className="text-base font-semibold text-amber-400 font-mono">
-                          {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + ((p as any).margin || (p as any).initialMargin || (p.sizeUsd || 0) / (p.leverage || 10)), 0))}
+                          {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0))}
                         </div>
                       </div>
                       <div>
@@ -1493,7 +1493,7 @@ export default function App() {
                     const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                     const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
                     const markFlash = positionPriceFlash[pos.symbol];
-                    const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
+                    const margin = getPositionMargin(pos);
                     const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                     const isLong = pos.side === 'LONG';
 
@@ -1604,7 +1604,7 @@ export default function App() {
                         const opportunity = opportunities.find(o => o.symbol === pos.symbol);
                         const currentPrice = (pos as any).markPrice || (pos as any).currentPrice || opportunity?.price || pos.entryPrice;
                         const markFlash = positionPriceFlash[pos.symbol];
-                        const margin = (pos as any).initialMargin || (pos.sizeUsd || 0) / (pos.leverage || 10);
+                        const margin = getPositionMargin(pos);
                         const roi = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
                         const isLong = pos.side === 'LONG';
 

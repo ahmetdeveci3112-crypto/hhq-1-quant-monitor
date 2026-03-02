@@ -244,6 +244,18 @@ class SQLiteManager:
             except:
                 pass
             
+            # P0-2: margin_usd column for positions
+            try:
+                await db.execute('ALTER TABLE positions ADD COLUMN margin_usd REAL DEFAULT 0')
+            except:
+                pass  # Already exists
+            
+            # P0-2: margin_usd column for trades
+            try:
+                await db.execute('ALTER TABLE trades ADD COLUMN margin_usd REAL DEFAULT 0')
+            except:
+                pass  # Already exists
+            
             # Binance trade history - her realized PnL income kaydı
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS binance_trades (
@@ -653,8 +665,9 @@ class SQLiteManager:
                  spread_level, settings_snapshot,
                  stop_loss, take_profit, atr, trailing_stop, trail_activation, is_trailing_active,
                  margin, roi, is_live, entry_method, entry_slippage, exit_slippage, entry_spread, 
-                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json,
+                 margin_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   symbol = COALESCE(excluded.symbol, trades.symbol),
                   side = COALESCE(excluded.side, trades.side),
@@ -692,7 +705,8 @@ class SQLiteManager:
                   hurst = CASE WHEN excluded.hurst != 0.5 AND excluded.hurst > 0 THEN excluded.hurst WHEN trades.hurst != 0.5 AND trades.hurst > 0 THEN trades.hurst ELSE excluded.hurst END,
                   adx = CASE WHEN excluded.adx > 0 THEN excluded.adx ELSE trades.adx END,
                   pullback_pct = CASE WHEN excluded.pullback_pct > 0 THEN excluded.pullback_pct ELSE trades.pullback_pct END,
-                  close_metrics_json = CASE WHEN excluded.close_metrics_json IS NOT NULL AND excluded.close_metrics_json != '{}' THEN excluded.close_metrics_json ELSE COALESCE(trades.close_metrics_json, excluded.close_metrics_json) END
+                  close_metrics_json = CASE WHEN excluded.close_metrics_json IS NOT NULL AND excluded.close_metrics_json != '{}' THEN excluded.close_metrics_json ELSE COALESCE(trades.close_metrics_json, excluded.close_metrics_json) END,
+                  margin_usd = CASE WHEN excluded.margin_usd > 0 THEN excluded.margin_usd ELSE trades.margin_usd END
             ''', (
                 trade.get('id'),
                 trade.get('symbol'),
@@ -720,7 +734,7 @@ class SQLiteManager:
                 trade.get('trailingStop', 0),
                 trade.get('trailActivation', 0),
                 1 if trade.get('isTrailingActive', False) else 0,
-                trade.get('margin', 0),
+                trade.get('margin', trade.get('marginUsd', 0)),
                 trade.get('roi', 0),
                 1 if trade.get('isLive', False) else 0,
                 trade.get('entry_method', 'MARKET'),
@@ -733,6 +747,7 @@ class SQLiteManager:
                 trade.get('adx', 0),
                 trade.get('pullbackPct', 0),
                 trade.get('close_metrics_json', '{}'),
+                trade.get('marginUsd', trade.get('margin', 0)),  # P0-2: margin_usd column
             ))
             await db.commit()
     
@@ -832,6 +847,8 @@ class SQLiteManager:
                             'isLive': bool(d.get('is_live', 0)),
                             'hurst': d.get('hurst', 0.5) or 0.5,
                             'settingsSnapshot': d.get('settings_snapshot', {}),
+                            # P0-2: marginUsd from DB (margin_usd col) or fallback to computed
+                            'marginUsd': d.get('margin_usd', 0) or (d.get('margin', 0) or ((d.get('size_usd', 0) or 0) / max(d.get('leverage', 10) or 10, 1))),
                             # Phase 232: Close metrics snapshot
                             'close_metrics_json': d.get('close_metrics_json', '{}'),
                         }
@@ -950,8 +967,9 @@ class SQLiteManager:
                 INSERT OR REPLACE INTO positions (
                     id, symbol, side, entry_price, size, size_usd,
                     stop_loss, take_profit, leverage, open_time,
-                    signal_score, signal_score_raw, zscore, hurst, atr, htf_trend, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_score, signal_score_raw, zscore, hurst, atr, htf_trend, status,
+                    margin_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pos.get('id'),
                 pos.get('symbol'),
@@ -969,7 +987,8 @@ class SQLiteManager:
                 pos.get('hurst', 0),
                 pos.get('atr', 0),
                 pos.get('htfTrend', 'NEUTRAL'),
-                'OPEN'
+                'OPEN',
+                pos.get('marginUsd', 0),
             ))
             await db.commit()
     
@@ -2294,7 +2313,10 @@ class LiveBinanceTrader:
             self.exchange = ccxt_async.binance({
                 'apiKey': api_key,
                 'secret': api_secret,
-                'options': {'defaultType': 'future'},
+                'options': {
+                    'defaultType': 'future',
+                    'warnOnFetchOpenOrdersWithoutSymbol': False,  # P0-1: Suppress global fetch warning
+                },
                 'enableRateLimit': True,
             })
             
@@ -4201,8 +4223,25 @@ class LiveBinanceTrader:
                 if amt > 0.00001:
                     active_symbols.add(p.get('symbol', ''))
 
-            # 2) Get all open orders
-            all_orders = await self.exchange.fetch_open_orders()
+            # 2) Get all open orders (P0-1: retry on warning/error)
+            all_orders = []
+            try:
+                all_orders = await self.exchange.fetch_open_orders()
+            except Exception as fetch_err:
+                _err_str = str(fetch_err)
+                if 'warnOnFetchOpenOrdersWithoutSymbol' in _err_str or 'WARNING' in _err_str:
+                    logger.warning(f"🧹 ORPHAN_SWEEP: suppressing warning, retrying: {_err_str[:100]}")
+                    try:
+                        self.exchange.options['warnOnFetchOpenOrdersWithoutSymbol'] = False
+                        all_orders = await self.exchange.fetch_open_orders()
+                    except Exception as retry_err:
+                        logger.error(f"❌ ORPHAN_SWEEP_RETRY_FAILED: {retry_err}")
+                        result['errors'] += 1
+                        return result
+                else:
+                    logger.error(f"❌ ORPHAN_SWEEP_FETCH_FAILED: {fetch_err}")
+                    result['errors'] += 1
+                    return result
             result['scanned'] = len(all_orders)
 
             conditional_types = {'stop_market', 'take_profit_market', 'stop', 'take_profit', 'trailing_stop_market'}
@@ -4212,19 +4251,14 @@ class LiveBinanceTrader:
                 if order_type not in conditional_types:
                     continue
 
-                # Check reduce-only
-                _info = order.get('info', {})
-                _is_reduce = (
-                    order.get('reduceOnly', False)
-                    or str(_info.get('reduceOnly', 'false')).lower() == 'true'
-                    or str(_info.get('closePosition', 'false')).lower() == 'true'
-                )
-                if not _is_reduce:
+                # Check reduce-only — P0-1: single authority
+                if not self._order_is_reduce_only(order):
                     continue
 
                 # Extract symbol
                 order_symbol = order.get('symbol', '')  # ccxt format: BTC/USDT:USDT
                 # Convert to internal format
+                _info = order.get('info', {})
                 raw_sym = _info.get('symbol', '')  # Binance raw: BTCUSDT
                 if not raw_sym and '/' in order_symbol:
                     raw_sym = order_symbol.split('/')[0] + 'USDT'
@@ -8121,7 +8155,7 @@ LEV_APPLY_MODE = os.environ.get('LEV_APPLY_MODE', 'parity').lower()   # 'parity'
 SIZE_APPLY_MODE = os.environ.get('SIZE_APPLY_MODE', 'parity').lower()  # 'parity' | 'shadow'
 
 # Patch C: Universe prefilter thresholds
-UNIVERSE_MAX_COINS = int(os.environ.get('UNIVERSE_MAX_COINS', '150'))
+UNIVERSE_MAX_COINS = int(os.environ.get('UNIVERSE_MAX_COINS', '200'))
 UNIVERSE_MIN_VOLUME_USD = float(os.environ.get('UNIVERSE_MIN_VOLUME_USD', '500000'))   # min 24h quote volume
 UNIVERSE_MAX_SPREAD_PCT = float(os.environ.get('UNIVERSE_MAX_SPREAD_PCT', '0.8'))     # max bid-ask spread %
 UNIVERSE_PREFILTER_ENABLED = os.environ.get('UNIVERSE_PREFILTER_ENABLED', 'true').lower() == 'true'
@@ -8149,6 +8183,159 @@ RECOVERY_ARM_V2_ROI_FLOOR = float(os.environ.get('RECOVERY_ARM_V2_ROI_FLOOR', '-
 # RCA-FUN Patch 4: Drawdown reclaim breakeven
 DRAWDOWN_RECLAIM_BE_ENABLED = os.environ.get('DRAWDOWN_RECLAIM_BE_ENABLED', 'false').lower() == 'true'
 DRAWDOWN_RECLAIM_MIN_DD_PCT = float(os.environ.get('DRAWDOWN_RECLAIM_MIN_DD_PCT', '1.5'))  # min drawdown to qualify
+
+# ================================================================
+# ASL-1: Adaptive Leverage + Adaptive Size (Liquidity-Driven)
+# ================================================================
+ASL_MODE = os.environ.get('ASL_MODE', 'shadow').lower()  # off|shadow|lev_only|full
+ASL_EMA_ALPHA = float(os.environ.get('ASL_EMA_ALPHA', '0.3'))  # New sample weight for EMA smoothing
+
+# Per-symbol EMA state for modifier smoothing (avoids churn on every tick)
+_asl_lev_ema = {}   # {symbol: float}  — smoothed leverage modifier
+_asl_margin_ema = {}  # {symbol: float} — smoothed margin modifier
+
+
+def compute_market_quality_score(
+    spread_pct: float = None,
+    depth_usd: float = None,
+    volume_24h: float = None,
+    book_imbalance: float = None,
+) -> dict:
+    """ASL-1: Compute market quality score (0.0–1.0).
+    Sub-scores:
+      spread (40%): 1.0 @ ≤0.03%, 0.0 @ ≥0.5%
+      depth  (25%): log-scaled, 1.0 @ ≥$500k, 0.0 @ ≤$5k
+      volume (25%): log-scaled, 1.0 @ ≥$50M, 0.0 @ ≤$500k
+      imbalance (10%): 1.0 when balanced (abs ≤ 0.1), 0.0 @ abs ≥ 0.8
+    Missing data → 0.5 (neutral).
+    """
+    flags = []
+
+    # --- Spread sub-score (40%) ---
+    if spread_pct is not None and spread_pct > 0:
+        s = _clamp(1.0 - (spread_pct - 0.03) / 0.47, 0.0, 1.0)
+        flags.append('real_spread')
+    else:
+        s = 0.5
+        flags.append('missing_spread')
+
+    # --- Depth sub-score (25%) ---
+    if depth_usd is not None and depth_usd > 0:
+        # log-scale: $5k → 0.0, $500k → 1.0
+        d = _clamp((math.log10(max(depth_usd, 1)) - math.log10(5000)) /
+                    (math.log10(500000) - math.log10(5000)), 0.0, 1.0)
+        flags.append('real_depth')
+    elif volume_24h is not None and volume_24h > 0:
+        # Proxy: 1% of 24h vol, clamped to [$5k, $250k]
+        proxy = _clamp(volume_24h * 0.01, 5000, 250000)
+        d = _clamp((math.log10(max(proxy, 1)) - math.log10(5000)) /
+                    (math.log10(500000) - math.log10(5000)), 0.0, 1.0)
+        flags.append('proxy_depth')
+    else:
+        d = 0.5
+        flags.append('missing_depth')
+
+    # --- Volume sub-score (25%) ---
+    if volume_24h is not None and volume_24h > 0:
+        # log-scale: $500k → 0.0, $50M → 1.0
+        v = _clamp((math.log10(max(volume_24h, 1)) - math.log10(500000)) /
+                    (math.log10(50_000_000) - math.log10(500000)), 0.0, 1.0)
+        flags.append('real_volume')
+    else:
+        v = 0.5
+        flags.append('missing_volume')
+
+    # --- Imbalance sub-score (10%) ---
+    if book_imbalance is not None:
+        # Normalize: clamp to [-100, 100], then abs/100 → 0..1
+        norm_imb = abs(_clamp(book_imbalance, -100, 100)) / 100.0
+        # 1.0 when balanced (norm_imb ≤ 0.1), 0.0 when extreme (≥ 0.8)
+        i = _clamp(1.0 - (norm_imb - 0.1) / 0.7, 0.0, 1.0)
+        flags.append('real_imbalance')
+    else:
+        i = 0.5
+        flags.append('missing_imbalance')
+
+    score = s * 0.40 + d * 0.25 + v * 0.25 + i * 0.10
+    return {
+        'quality_score': round(score, 4),
+        'spread_sub': round(s, 3),
+        'depth_sub': round(d, 3),
+        'volume_sub': round(v, 3),
+        'imbalance_sub': round(i, 3),
+        'quality_data_flags': flags,
+    }
+
+
+def compute_adaptive_leverage(
+    base_leverage: int, quality_score: float,
+    atr_pct: float = 0.0,
+    symbol: str = '',
+) -> dict:
+    """ASL-1: Adapt leverage based on market quality.
+    quality_modifier range: [0.7, 1.3]
+    EMA smoothing: new_mod = alpha*raw + (1-alpha)*old
+    """
+    raw_mod = 0.7 + 0.6 * _clamp(quality_score, 0.0, 1.0)
+
+    # EMA smoothing
+    alpha = ASL_EMA_ALPHA
+    old_mod = _asl_lev_ema.get(symbol, raw_mod)
+    smoothed_mod = alpha * raw_mod + (1.0 - alpha) * old_mod
+    _asl_lev_ema[symbol] = smoothed_mod
+
+    adapted = base_leverage * smoothed_mod
+    leverage = max(3, int(round(adapted)))
+
+    return {
+        'leverage': leverage,
+        'base': base_leverage,
+        'quality_modifier_raw': round(raw_mod, 4),
+        'quality_modifier_smoothed': round(smoothed_mod, 4),
+        'quality_score': round(quality_score, 4),
+    }
+
+
+def compute_adaptive_margin(
+    balance: float, quality_score: float,
+    session_risk: float, size_mult: float,
+    leverage: int,
+    symbol: str = '',
+    margin_floor: float = 2.0, margin_cap: float = 10.0,
+    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.10,
+) -> dict:
+    """ASL-1: Adapt margin based on market quality.
+    margin_modifier range: [0.8, 1.2]
+    EMA smoothing: new_mod = alpha*raw + (1-alpha)*old
+    Same floor/cap clamp as compute_margin_target.
+    """
+    raw_mod = 0.8 + 0.4 * _clamp(quality_score, 0.0, 1.0)
+
+    # EMA smoothing
+    alpha = ASL_EMA_ALPHA
+    old_mod = _asl_margin_ema.get(symbol, raw_mod)
+    smoothed_mod = alpha * raw_mod + (1.0 - alpha) * old_mod
+    _asl_margin_ema[symbol] = smoothed_mod
+
+    raw_margin = balance * session_risk * size_mult * smoothed_mod
+    floor = max(margin_floor, balance * balance_floor_pct)
+    cap = min(margin_cap, balance * balance_cap_pct)
+    effective_floor = min(floor, cap)
+    margin = max(effective_floor, min(cap, raw_margin))
+    notional = margin * leverage
+
+    return {
+        'margin_usd': round(margin, 2),
+        'notional_usd': round(notional, 2),
+        'raw_margin': round(raw_margin, 4),
+        'floor': round(effective_floor, 2),
+        'cap': round(cap, 2),
+        'clamped': raw_margin < effective_floor or raw_margin > cap,
+        'quality_modifier_raw': round(raw_mod, 4),
+        'quality_modifier_smoothed': round(smoothed_mod, 4),
+        'quality_score': round(quality_score, 4),
+    }
+
 
 def compute_effective_leverage(
     atr_pct: float, spread_pct: float, volume_24h: float,
@@ -8248,6 +8435,33 @@ def compute_effective_leverage(
         'mode': mode,
     }
 
+
+# P0-2: Margin-First Sizing Helper
+def compute_margin_target(
+    balance: float, leverage: int, session_risk: float, size_mult: float,
+    margin_floor: float = 2.0, margin_cap: float = 10.0,
+    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.10,
+) -> dict:
+    """Compute margin-first position sizing.
+    Returns margin_usd (clamped) and notional_usd = margin * leverage.
+    Floor = max(margin_floor, balance * balance_floor_pct)
+    Cap = min(margin_cap, balance * balance_cap_pct)
+    """
+    raw_margin = balance * session_risk * size_mult
+    floor = max(margin_floor, balance * balance_floor_pct)
+    cap = min(margin_cap, balance * balance_cap_pct)
+    # Guard: if balance is very low, floor can exceed cap → use cap as effective floor
+    effective_floor = min(floor, cap)
+    margin = max(effective_floor, min(cap, raw_margin))
+    notional = margin * leverage
+    return {
+        'margin_usd': round(margin, 2),
+        'notional_usd': round(notional, 2),
+        'raw_margin': round(raw_margin, 4),
+        'floor': round(effective_floor, 2),
+        'cap': round(cap, 2),
+        'clamped': raw_margin < effective_floor or raw_margin > cap,
+    }
 
 def compute_position_size_usd(
     balance: float, leverage: float, session_risk: float,
@@ -12822,7 +13036,10 @@ class MultiCoinScanner:
                 
                 exchange_config = {
                     'enableRateLimit': True,
-                    'options': {'defaultType': 'future'}
+                    'options': {
+                        'defaultType': 'future',
+                        'warnOnFetchOpenOrdersWithoutSymbol': False,  # P0-1
+                    }
                 }
                 
                 if api_key and api_secret:
@@ -13338,7 +13555,10 @@ class MultiCoinScanner:
                 api_secret = os.environ.get('BINANCE_SECRET', '')
                 exchange_config = {
                     'enableRateLimit': True,
-                    'options': {'defaultType': 'future'}
+                    'options': {
+                        'defaultType': 'future',
+                        'warnOnFetchOpenOrdersWithoutSymbol': False,  # P0-1
+                    }
                 }
                 if api_key and api_secret:
                     exchange_config['apiKey'] = api_key
@@ -15331,7 +15551,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 existing_signal['counter_count'] = 0  # Reset counter
                 existing_signal['counter_first_ts'] = 0
                 # P0: Enrich snapshot on refresh
-                existing_signal['last_price'] = price
+                _refresh_price = price
+                _refresh_source = 'signal'
+                if not _refresh_price or _refresh_price <= 0:
+                    _refresh_price = last_candle_close.get(symbol, 0)
+                    _refresh_source = 'last_candle_close' if _refresh_price > 0 else 'none'
+                if not _refresh_price or _refresh_price <= 0:
+                    logger.warning(f"SIGNAL_PRICE_ZERO: {symbol} {action} refresh price=0 source={_refresh_source}")
+                existing_signal['last_price'] = _refresh_price
                 existing_signal['leverage'] = signal.get('leverage', existing_signal.get('leverage', 10))
                 existing_signal['strategy_mode'] = signal.get('strategyMode', signal.get('activeStrategy', existing_signal.get('strategy_mode', '')))
                 existing_signal['entry_quality_pass'] = signal.get('entryQualityPass', existing_signal.get('entry_quality_pass'))
@@ -25615,6 +25842,61 @@ class PaperTradingEngine:
         except Exception as _lev_shadow_err:
             logger.debug(f"LEV_SHADOW error: {_lev_shadow_err}")
         
+        # ================================================================
+        # ASL-1: Adaptive Leverage + Adaptive Size (Quality-Driven)
+        # Order: quality score → adaptive lev → adaptive margin → min-notional
+        # ================================================================
+        _asl_quality = None
+        if ASL_MODE != 'off':
+            try:
+                _asl_sp = float(signal.get('spreadPct', 0)) if signal else 0
+                _asl_vol = float(signal.get('volume24h', 0)) if signal else 0
+                _asl_imb = float(signal.get('imbalance', 0)) if signal else 0
+                # depth_usd from BBO if available, else None → proxy from volume
+                _asl_depth = None  # BBO doesn't expose total depth directly; use proxy
+                _asl_quality = compute_market_quality_score(
+                    spread_pct=_asl_sp if _asl_sp > 0 else None,
+                    depth_usd=_asl_depth,
+                    volume_24h=_asl_vol if _asl_vol > 0 else None,
+                    book_imbalance=_asl_imb,
+                )
+                _asl_qs = _asl_quality['quality_score']
+                _asl_lev_old = adjusted_leverage
+
+                # Adaptive Leverage
+                _asl_lev_result = compute_adaptive_leverage(
+                    base_leverage=adjusted_leverage,
+                    quality_score=_asl_qs,
+                    atr_pct=(atr / price * 100) if price > 0 else 10.0,
+                    symbol=trade_symbol,
+                )
+                _asl_lev_new = _asl_lev_result['leverage']
+                _asl_lev_delta = abs(_asl_lev_new - adjusted_leverage) / max(adjusted_leverage, 1) * 100
+
+                if ASL_MODE in ('lev_only', 'full'):
+                    if _asl_lev_delta > 20:
+                        logger.warning(
+                            f"ADAPTIVE_RISK_REGRESSION: {trade_symbol} lev={adjusted_leverage}->{_asl_lev_new} "
+                            f"delta={_asl_lev_delta:.1f}% quality={_asl_qs:.3f} — keeping old"
+                        )
+                    else:
+                        adjusted_leverage = _asl_lev_new
+                        logger.info(
+                            f"ADAPTIVE_RISK_APPLIED: {trade_symbol} lev={_asl_lev_old}->{adjusted_leverage} "
+                            f"quality={_asl_qs:.3f} mod={_asl_lev_result['quality_modifier_smoothed']:.3f} "
+                            f"flags={_asl_quality['quality_data_flags']} mode={ASL_MODE}"
+                        )
+                else:
+                    logger.info(
+                        f"ADAPTIVE_RISK_SHADOW: {trade_symbol} lev={adjusted_leverage}->{_asl_lev_new} "
+                        f"quality={_asl_qs:.3f} spread={_asl_sp:.4f}% vol24h=${_asl_vol:.0f} imb={_asl_imb:.2f} "
+                        f"mod_lev={_asl_lev_result['quality_modifier_smoothed']:.3f} "
+                        f"flags={_asl_quality['quality_data_flags']} mode=shadow"
+                    )
+            except Exception as _asl_err:
+                logger.debug(f"ASL-1 WS error: {_asl_err}")
+                _asl_quality = None
+        
         # DYNAMIC POSITION SIZING: Son 5 trade performansına göre risk ayarla
         dynamic_risk = self.get_dynamic_risk_per_trade()
         session_risk = session_manager.adjust_risk(dynamic_risk)
@@ -25712,21 +25994,59 @@ class PaperTradingEngine:
         
         trail_distance = _levels['trail_distance']
         
-        # Position sizing
-        risk_amount = self.balance * session_risk * size_mult
-        position_size_usd = risk_amount * adjusted_leverage
+        # Position sizing — P0-2: margin-first (ASL-1: adaptive in full mode)
+        if ASL_MODE == 'full' and _asl_quality is not None:
+            _margin_info = compute_adaptive_margin(
+                balance=self.balance, quality_score=_asl_quality['quality_score'],
+                session_risk=session_risk, size_mult=size_mult,
+                leverage=adjusted_leverage, symbol=trade_symbol,
+            )
+            # Shadow compare: what would baseline have produced?
+            _baseline_mi = compute_margin_target(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=size_mult,
+            )
+            logger.info(
+                f"ADAPTIVE_RISK_APPLIED: {trade_symbol} margin=${_baseline_mi['margin_usd']:.2f}->${_margin_info['margin_usd']:.2f} "
+                f"quality={_asl_quality['quality_score']:.3f} mod={_margin_info['quality_modifier_smoothed']:.3f} mode=full"
+            )
+        else:
+            _margin_info = compute_margin_target(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=size_mult,
+            )
+            # ASL shadow margin (info only)
+            if ASL_MODE == 'shadow' and _asl_quality is not None:
+                _asl_m_shadow = compute_adaptive_margin(
+                    balance=self.balance, quality_score=_asl_quality['quality_score'],
+                    session_risk=session_risk, size_mult=size_mult,
+                    leverage=adjusted_leverage, symbol=trade_symbol,
+                )
+                logger.info(
+                    f"ADAPTIVE_RISK_SHADOW: {trade_symbol} margin=${_margin_info['margin_usd']:.2f}->${_asl_m_shadow['margin_usd']:.2f} "
+                    f"quality={_asl_quality['quality_score']:.3f} mod={_asl_m_shadow['quality_modifier_smoothed']:.3f} mode=shadow"
+                )
+        _margin_usd = _margin_info['margin_usd']
+        position_size_usd = _margin_info['notional_usd']
         
-        # Apply MTF size modifier (bonus: 1.1 = +10%, penalty: 0.8 = -20%)
+        # Apply MTF size modifier to notional (margin stays in band)
         mtf_size_modifier = signal.get('mtf_size_modifier', 1.0) if signal else 1.0
-        position_size_usd = position_size_usd * mtf_size_modifier
+        if mtf_size_modifier != 1.0:
+            position_size_usd = position_size_usd * mtf_size_modifier
+            # Recompute margin from modified notional (keep within band)
+            _margin_usd_mtf = position_size_usd / max(adjusted_leverage, 1)
+            _margin_usd = max(_margin_info['floor'], min(_margin_info['cap'], _margin_usd_mtf))
+            position_size_usd = _margin_usd * adjusted_leverage
 
         # Bug Fix #3 & #4: Size reduction capping
-        # Calculate theoretical full base size to cap the reduction limit
-        full_size_usd = risk_amount * adjusted_leverage
+        full_size_usd = _margin_info['notional_usd']
         if full_size_usd > 0:
-            min_allowed = full_size_usd * 0.4  # Max 60% reduction across all variables
-            max_allowed = full_size_usd * 1.5  # Max 50% increase
+            min_allowed = full_size_usd * 0.4
+            max_allowed = full_size_usd * 1.5
             position_size_usd = max(min_allowed, min(max_allowed, position_size_usd))
+            # Re-clamp margin after reduction cap
+            _margin_usd = max(_margin_info['floor'], min(_margin_info['cap'], position_size_usd / max(adjusted_leverage, 1)))
+            position_size_usd = _margin_usd * adjusted_leverage
 
         # Phase RSP: Notional size cap — max % of balance per position
         raw_size_usd = position_size_usd
@@ -25742,8 +26062,15 @@ class PaperTradingEngine:
         size_cap_reason = ''
         if position_size_usd > max_size_usd:
             position_size_usd = max_size_usd
+            _margin_usd = position_size_usd / max(adjusted_leverage, 1)
             size_cap_reason = f"SIZE_CAP({raw_size_usd:.0f}→{position_size_usd:.0f})"
             reasons.append(size_cap_reason)
+        
+        logger.info(
+            f"MARGIN_FIRST: {trade_symbol} margin=${_margin_usd:.2f} "
+            f"(floor={_margin_info['floor']:.2f} cap={_margin_info['cap']:.2f} raw={_margin_info['raw_margin']:.2f}) "
+            f"notional=${position_size_usd:.2f} lev={adjusted_leverage}x"
+        )
         
         # Batch 2B: Dual shadow sizing — PARITY (apply or shadow) + V2 (info-only)
         try:
@@ -25766,7 +26093,10 @@ class PaperTradingEngine:
                 if _ps_delta <= 15:
                     _old_size = position_size_usd
                     position_size_usd = _parity_size['size_usd']
-                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {trade_symbol} ${_old_size:.2f}→${position_size_usd:.2f} caps={_parity_size['cap_reasons']}")
+                    # P0-2 fix: re-sync marginUsd after parity override
+                    _margin_usd = max(_margin_info['floor'], min(_margin_info['cap'], position_size_usd / max(adjusted_leverage, 1)))
+                    position_size_usd = _margin_usd * adjusted_leverage
+                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {trade_symbol} ${_old_size:.2f}→${position_size_usd:.2f} margin=${_margin_usd:.2f} caps={_parity_size['cap_reasons']}")
                 else:
                     logger.info(f"SIZE_PIPE_PARITY_FALLBACK: {trade_symbol} keeping old=${position_size_usd:.2f} (regression delta={_ps_delta:.1f}%)")
             # V2: v2_band mode — info only
@@ -25800,15 +26130,24 @@ class PaperTradingEngine:
         _fee_floor_usd = _fee_rate_rt * position_size_usd  # fee at this size
         _dynamic_min_notional = max(5.0, _fee_floor_usd / _expected_edge_pct if _expected_edge_pct > 0 else 5.0)
         if position_size_usd < _dynamic_min_notional:
-            # If sizing is slightly below floor, upscale to minimum notional when safe.
-            # This reduces avoidable rejects during low-balance/high-fragmentation regimes.
-            if _dynamic_min_notional <= max_size_usd and _dynamic_min_notional <= (self.balance * 0.20):
+            # P0-2: min-notional conflict rule — don't break margin cap
+            _min_not_margin = _dynamic_min_notional / max(adjusted_leverage, 1)
+            if _min_not_margin > _margin_info['cap']:
+                # Upsizing would break margin cap → reject
+                logger.info(
+                    f"🚫 MIN_NOTIONAL_REJECT: {trade_symbol} {side} notional=${position_size_usd:.2f} "
+                    f"< min=${_dynamic_min_notional:.2f} but upsize margin ${_min_not_margin:.2f} > cap ${_margin_info['cap']:.2f}"
+                )
+                self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL_REJECT")
+                return None
+            elif _dynamic_min_notional <= max_size_usd and _dynamic_min_notional <= (self.balance * 0.20):
                 old_size = position_size_usd
                 position_size_usd = _dynamic_min_notional
+                _margin_usd = position_size_usd / max(adjusted_leverage, 1)
                 reasons.append(f"MIN_NOTIONAL_UPSIZE({old_size:.2f}->{position_size_usd:.2f})")
                 logger.info(
                     f"🛠️ MIN_NOTIONAL_UPSIZE: {trade_symbol} {side} ${old_size:.2f} -> "
-                    f"${position_size_usd:.2f} (min={_dynamic_min_notional:.2f})"
+                    f"${position_size_usd:.2f} (min={_dynamic_min_notional:.2f}) margin=${_margin_usd:.2f}"
                 )
             else:
                 logger.info(
@@ -26113,6 +26452,7 @@ class PaperTradingEngine:
             "forecastProb": round(prob, 3) if 'prob' in locals() else 0.5,
             "size": position_size,
             "sizeUsd": position_size_usd,
+            "marginUsd": _margin_usd,  # P0-2: explicit margin field
             "stopLoss": sl,
             "takeProfit": tp,
             "trailActivation": trail_activation,
@@ -27254,7 +27594,7 @@ class PaperTradingEngine:
         # Paper Trading: Initial Margin = Position Size / Leverage
         # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
         leverage = new_position.get('leverage', 10)
-        initial_margin = new_position['sizeUsd'] / leverage
+        initial_margin = new_position.get('marginUsd', new_position['sizeUsd'] / leverage)
         new_position['initialMargin'] = initial_margin  # Store for close calculation
         
         # Live trading'de bakiyeyi düşürme - Binance zaten düşürdü
@@ -28198,6 +28538,58 @@ class PaperTradingEngine:
         except Exception:
             pass
         
+        # ================================================================
+        # ASL-1: Adaptive Leverage + Adaptive Size (Manual Path)
+        # Order: quality score → adaptive lev → adaptive margin → min-notional
+        # ================================================================
+        _asl_quality_m = None
+        if ASL_MODE != 'off':
+            try:
+                _asl_sp_m = float(signal.get('spreadPct', 0))
+                _asl_vol_m = float(signal.get('volume24h', 0))
+                _asl_imb_m = float(signal.get('imbalance', 0))
+                _asl_quality_m = compute_market_quality_score(
+                    spread_pct=_asl_sp_m if _asl_sp_m > 0 else None,
+                    depth_usd=None,
+                    volume_24h=_asl_vol_m if _asl_vol_m > 0 else None,
+                    book_imbalance=_asl_imb_m,
+                )
+                _asl_qs_m = _asl_quality_m['quality_score']
+                _asl_lev_old_m = adjusted_leverage
+
+                _asl_lev_result_m = compute_adaptive_leverage(
+                    base_leverage=adjusted_leverage,
+                    quality_score=_asl_qs_m,
+                    atr_pct=(float(signal.get('atr', 0)) / current_price * 100) if current_price > 0 else 10.0,
+                    symbol=self.symbol,
+                )
+                _asl_lev_new_m = _asl_lev_result_m['leverage']
+                _asl_lev_delta_m = abs(_asl_lev_new_m - adjusted_leverage) / max(adjusted_leverage, 1) * 100
+
+                if ASL_MODE in ('lev_only', 'full'):
+                    if _asl_lev_delta_m > 20:
+                        logger.warning(
+                            f"ADAPTIVE_RISK_REGRESSION: {self.symbol} lev={adjusted_leverage}->{_asl_lev_new_m} "
+                            f"delta={_asl_lev_delta_m:.1f}% quality={_asl_qs_m:.3f} path=manual — keeping old"
+                        )
+                    else:
+                        adjusted_leverage = _asl_lev_new_m
+                        logger.info(
+                            f"ADAPTIVE_RISK_APPLIED: {self.symbol} lev={_asl_lev_old_m}->{adjusted_leverage} "
+                            f"quality={_asl_qs_m:.3f} mod={_asl_lev_result_m['quality_modifier_smoothed']:.3f} "
+                            f"flags={_asl_quality_m['quality_data_flags']} mode={ASL_MODE} path=manual"
+                        )
+                else:
+                    logger.info(
+                        f"ADAPTIVE_RISK_SHADOW: {self.symbol} lev={adjusted_leverage}->{_asl_lev_new_m} "
+                        f"quality={_asl_qs_m:.3f} spread={_asl_sp_m:.4f}% vol24h=${_asl_vol_m:.0f} "
+                        f"mod_lev={_asl_lev_result_m['quality_modifier_smoothed']:.3f} "
+                        f"flags={_asl_quality_m['quality_data_flags']} mode=shadow path=manual"
+                    )
+            except Exception as _asl_err_m:
+                logger.debug(f"ASL-1 manual error: {_asl_err_m}")
+                _asl_quality_m = None
+        
         # Get size multiplier from signal and BalanceProtector
         signal_size_mult = signal.get('sizeMultiplier', 1.0)
         balance_size_mult = balance_protector.calculate_position_size_multiplier(self.balance)
@@ -28212,10 +28604,44 @@ class PaperTradingEngine:
         kelly_risk = self.calculate_kelly_fraction()
         session_risk = session_manager.adjust_risk(kelly_risk)
         
-        # Position Sizing with Kelly
-        risk_amount = self.balance * session_risk * final_size_mult
-        position_size_usd = risk_amount * adjusted_leverage
-        position_size = position_size_usd / current_price
+        # Position Sizing with Kelly — P0-2: margin-first (ASL-1: adaptive in full mode)
+        if ASL_MODE == 'full' and _asl_quality_m is not None:
+            _manual_margin_info = compute_adaptive_margin(
+                balance=self.balance, quality_score=_asl_quality_m['quality_score'],
+                session_risk=session_risk, size_mult=final_size_mult,
+                leverage=adjusted_leverage, symbol=self.symbol,
+            )
+            _baseline_mm = compute_margin_target(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=final_size_mult,
+            )
+            logger.info(
+                f"ADAPTIVE_RISK_APPLIED: {self.symbol} margin=${_baseline_mm['margin_usd']:.2f}->${_manual_margin_info['margin_usd']:.2f} "
+                f"quality={_asl_quality_m['quality_score']:.3f} mod={_manual_margin_info['quality_modifier_smoothed']:.3f} mode=full path=manual"
+            )
+        else:
+            _manual_margin_info = compute_margin_target(
+                balance=self.balance, leverage=adjusted_leverage,
+                session_risk=session_risk, size_mult=final_size_mult,
+            )
+            if ASL_MODE == 'shadow' and _asl_quality_m is not None:
+                _asl_m_shadow_m = compute_adaptive_margin(
+                    balance=self.balance, quality_score=_asl_quality_m['quality_score'],
+                    session_risk=session_risk, size_mult=final_size_mult,
+                    leverage=adjusted_leverage, symbol=self.symbol,
+                )
+                logger.info(
+                    f"ADAPTIVE_RISK_SHADOW: {self.symbol} margin=${_manual_margin_info['margin_usd']:.2f}->${_asl_m_shadow_m['margin_usd']:.2f} "
+                    f"quality={_asl_quality_m['quality_score']:.3f} mod={_asl_m_shadow_m['quality_modifier_smoothed']:.3f} mode=shadow path=manual"
+                )
+        _manual_margin_usd = _manual_margin_info['margin_usd']
+        position_size_usd = _manual_margin_info['notional_usd']
+        position_size = position_size_usd / current_price if current_price > 0 else 0
+        logger.info(
+            f"MARGIN_FIRST(manual): margin=${_manual_margin_usd:.2f} "
+            f"(floor={_manual_margin_info['floor']:.2f} cap={_manual_margin_info['cap']:.2f}) "
+            f"notional=${position_size_usd:.2f} lev={adjusted_leverage}x"
+        )
         
         # Batch 2B: Dual shadow sizing (manual) — PARITY (apply) + V2
         try:
@@ -28239,8 +28665,12 @@ class PaperTradingEngine:
                 if _mps_delta <= 15:
                     _old_size = position_size_usd
                     position_size_usd = _mp_size['size_usd']
-                    position_size = position_size_usd / current_price  # recalc
-                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {signal.get('symbol','')} ${_old_size:.2f}→${position_size_usd:.2f} path=manual")
+                    position_size = position_size_usd / current_price if current_price > 0 else position_size  # recalc
+                    # P0-2 fix: re-sync marginUsd after parity override
+                    _manual_margin_usd = max(_manual_margin_info['floor'], min(_manual_margin_info['cap'], position_size_usd / max(adjusted_leverage, 1)))
+                    position_size_usd = _manual_margin_usd * adjusted_leverage
+                    position_size = position_size_usd / current_price if current_price > 0 else position_size
+                    logger.info(f"SIZE_PIPE_PARITY_APPLIED: {signal.get('symbol','')} ${_old_size:.2f}→${position_size_usd:.2f} margin=${_manual_margin_usd:.2f} path=manual")
                 else:
                     logger.info(f"SIZE_PIPE_PARITY_FALLBACK: {signal.get('symbol','')} keeping old=${position_size_usd:.2f} path=manual")
             # V2 info
@@ -28254,6 +28684,35 @@ class PaperTradingEngine:
         except Exception:
             pass
         
+        # P1: Min-notional conflict parity (same as WS path)
+        _fee_rate_rt_m = 0.0008  # 0.08% round-trip
+        _expected_edge_pct_m = max(0.005, (_m_vol_pct2 * 0.3) if _m_vol_pct2 > 0 else 0.01)
+        _fee_floor_usd_m = _fee_rate_rt_m * position_size_usd
+        _dynamic_min_notional_m = max(5.0, _fee_floor_usd_m / _expected_edge_pct_m if _expected_edge_pct_m > 0 else 5.0)
+        if position_size_usd < _dynamic_min_notional_m:
+            _min_not_margin_m = _dynamic_min_notional_m / max(adjusted_leverage, 1)
+            if _min_not_margin_m > _manual_margin_info['cap']:
+                logger.info(
+                    f"🚫 MIN_NOTIONAL_REJECT: {self.symbol} {signal['action']} notional=${position_size_usd:.2f} "
+                    f"< min=${_dynamic_min_notional_m:.2f} but upsize margin ${_min_not_margin_m:.2f} > cap ${_manual_margin_info['cap']:.2f} path=manual"
+                )
+                return
+            elif _dynamic_min_notional_m <= (self.balance * 0.20):
+                _old_m_size = position_size_usd
+                position_size_usd = _dynamic_min_notional_m
+                _manual_margin_usd = position_size_usd / max(adjusted_leverage, 1)
+                position_size = position_size_usd / current_price if current_price > 0 else position_size
+                logger.info(
+                    f"🛠️ MIN_NOTIONAL_UPSIZE: {self.symbol} {signal['action']} ${_old_m_size:.2f} -> "
+                    f"${position_size_usd:.2f} (min={_dynamic_min_notional_m:.2f}) margin=${_manual_margin_usd:.2f} path=manual"
+                )
+            else:
+                logger.info(
+                    f"🚫 MIN_NOTIONAL: {self.symbol} {signal['action']} size=${position_size_usd:.2f} "
+                    f"< min=${_dynamic_min_notional_m:.2f} path=manual"
+                )
+                return
+        
         # Log session info
         session_info = session_manager.get_session_info()
         self.add_log(f"📍 Session: {session_info['name_tr']} | Kelly: {kelly_risk*100:.1f}% | Lev: {adjusted_leverage}x")
@@ -28265,6 +28724,7 @@ class PaperTradingEngine:
             "entryPrice": current_price,
             "size": position_size,
             "sizeUsd": position_size_usd,
+            "marginUsd": _manual_margin_usd,  # P0-2: explicit margin
             "contracts": position_size,  # Phase 223b: needed for partial TP
             "stopLoss": signal['sl'],
             "takeProfit": signal['tp'],
@@ -28302,9 +28762,8 @@ class PaperTradingEngine:
             "leverageCapReason": signal.get('leverageCapReason', ''),
         }
         
-        # Paper Trading: Initial Margin = Position Size / Leverage
-        # Kaldıraçlı işlemde sadece teminat miktarı bakiyeden düşülür
-        initial_margin = new_position['sizeUsd'] / adjusted_leverage
+        # Paper Trading: Initial Margin = marginUsd (authoritative), fallback sizeUsd/leverage
+        initial_margin = new_position.get('marginUsd', new_position['sizeUsd'] / adjusted_leverage)
         new_position['initialMargin'] = initial_margin  # Store for close calculation
         self.balance -= initial_margin
         
@@ -28694,7 +29153,7 @@ class PaperTradingEngine:
             logger.info(f"📊 PNL_FUNDING: {pos.get('symbol')} funding adjustment: ${accumulated_funding:+.4f}")
         
         # Paper Trading: Pozisyon kapandığında Initial Margin + PnL bakiyeye eklenir
-        initial_margin = pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10))
+        initial_margin = pos.get('marginUsd', pos.get('initialMargin', pos.get('sizeUsd', 0) / pos.get('leverage', 10)))
         
         # Live trading'de bakiye Binance'den senkronize edilir
         if not live_binance_trader.enabled:
@@ -28744,6 +29203,7 @@ class PaperTradingEngine:
             "exitPrice": exit_price,
             "size": pos.get('size', 0),
             "sizeUsd": pos.get('sizeUsd', 0),
+            "marginUsd": pos.get('marginUsd', initial_margin),  # P0-2: explicit margin
             "pnl": pnl,
             "pnlPercent": (pnl / initial_margin * 100) if initial_margin > 0 else 0,
             "margin": initial_margin,
@@ -29504,6 +29964,7 @@ class BinanceStreamer:
             'enableRateLimit': True,
             'options': {
                 'defaultType': 'future',
+                'warnOnFetchOpenOrdersWithoutSymbol': False,  # P0-1
             }
         })
         logger.info(f"Connected to Binance for {self.symbol}")
@@ -30505,6 +30966,14 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
         if age > PERSISTENT_SIGNAL_TTL_SEC:
             stale_symbols.append(sym)
             continue
+        # P1: Signal price=0 hardening — try fallback from last_candle_close
+        _sig_price = sig.get('last_price', 0)
+        _price_source = 'last_price'
+        if not _sig_price or _sig_price <= 0:
+            _sig_price = last_candle_close.get(sym, 0)
+            _price_source = 'last_candle_close' if _sig_price > 0 else 'none'
+        if not _sig_price or _sig_price <= 0:
+            logger.debug(f"SIGNAL_PRICE_ZERO: {sym} {sig.get('side')} price=0 source={_price_source}")
 
         persistent_signals.append({
             "symbol": sym,
@@ -30517,8 +30986,8 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
             "reentryCount": sig.get('reentry_count', 0),
             "lastCloseTs": sig.get('last_close_ts', 0),
             "ageSec": age,
-            # P0: Enriched snapshot fields
-            "lastPrice": sig.get('last_price', 0),
+            "lastPrice": _sig_price,
+            "lastPriceSource": _price_source,
             "entryPriceBackend": sig.get('entry_price_backend', 0),
             "leverage": sig.get('leverage', 10),
             "strategyMode": sig.get('strategy_mode', ''),
@@ -30571,10 +31040,28 @@ async def paper_trading_status():
     except Exception:
         data_quality = {}
     
+    # P1: Trade deduplication for API response
+    _seen_ids = set()
+    _deduped_trades = []
+    for t in global_paper_trader.trades:
+        tid = t.get('id', '')
+        if tid:
+            if tid in _seen_ids:
+                continue
+            _seen_ids.add(tid)
+        else:
+            # Fallback key: (symbol, closeTime bucket ±120s, pnl rounded, side)
+            _ct = t.get('closeTime', 0)
+            _fb_key = (t.get('symbol', ''), round(_ct / 120000) if _ct else 0, round(t.get('pnl', 0), 6), t.get('side', ''))
+            if _fb_key in _seen_ids:
+                continue
+            _seen_ids.add(_fb_key)
+        _deduped_trades.append(t)
+    
     return JSONResponse({
         "balance": global_paper_trader.balance,
         "positions": global_paper_trader.positions,
-        "trades": global_paper_trader.trades,  # ALL trades (no limit)
+        "trades": _deduped_trades,  # P1: deduplicated trades
         "stats": stats_with_today,
         "enabled": global_paper_trader.enabled,
         "logs": global_paper_trader.logs[-100:],  # Last 100 logs

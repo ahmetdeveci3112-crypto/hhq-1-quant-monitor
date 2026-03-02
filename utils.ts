@@ -41,3 +41,16 @@ export const formatCurrency = (amount: number | undefined | null): string => {
         maximumFractionDigits: 2
     });
 };
+
+/**
+ * P1: Canonical margin cascade — single source of truth.
+ * Order: marginUsd > margin > initialMargin > sizeUsd / leverage
+ */
+export const getPositionMargin = (pos: Record<string, any>): number => {
+    return (
+        pos.marginUsd ||
+        pos.margin ||
+        pos.initialMargin ||
+        (pos.sizeUsd || 0) / (pos.leverage || 10)
+    );
+};
