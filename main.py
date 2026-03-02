@@ -8277,7 +8277,7 @@ UNIVERSE_MAX_SPREAD_PCT = float(os.environ.get('UNIVERSE_MAX_SPREAD_PCT', '0.8')
 UNIVERSE_PREFILTER_ENABLED = os.environ.get('UNIVERSE_PREFILTER_ENABLED', 'true').lower() == 'true'
 
 # Patch D: EV Gate thresholds
-EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'false').lower() == 'true'
+EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'true').lower() == 'true'
 EV_SOFT_THRESHOLD = float(os.environ.get('EV_SOFT_THRESHOLD', '-0.002'))   # below this → soft penalty
 EV_HARD_THRESHOLD = float(os.environ.get('EV_HARD_THRESHOLD', '-0.01'))    # below this → hard block
 EV_HARD_BLOCK_ENABLED = os.environ.get('EV_HARD_BLOCK_ENABLED', 'false').lower() == 'true'
@@ -8312,17 +8312,17 @@ DQ_AUTO_APPLY_MIN_COVERAGE = float(os.environ.get('DQ_AUTO_APPLY_MIN_COVERAGE', 
 DQ_OPTIMIZE_MIN_COVERAGE = float(os.environ.get('DQ_OPTIMIZE_MIN_COVERAGE', '50'))       # below → optimize hard-blocked
 
 # RCA-FUN Patch 3: Leverage-aware recovery arm
-RECOVERY_ARM_V2_ENABLED = os.environ.get('RECOVERY_ARM_V2_ENABLED', 'false').lower() == 'true'
+RECOVERY_ARM_V2_ENABLED = os.environ.get('RECOVERY_ARM_V2_ENABLED', 'true').lower() == 'true'
 RECOVERY_ARM_V2_ROI_FLOOR = float(os.environ.get('RECOVERY_ARM_V2_ROI_FLOOR', '-20.0'))  # -20% ROI floor
 
 # RCA-FUN Patch 4: Drawdown reclaim breakeven
-DRAWDOWN_RECLAIM_BE_ENABLED = os.environ.get('DRAWDOWN_RECLAIM_BE_ENABLED', 'false').lower() == 'true'
+DRAWDOWN_RECLAIM_BE_ENABLED = os.environ.get('DRAWDOWN_RECLAIM_BE_ENABLED', 'true').lower() == 'true'
 DRAWDOWN_RECLAIM_MIN_DD_PCT = float(os.environ.get('DRAWDOWN_RECLAIM_MIN_DD_PCT', '1.5'))  # min drawdown to qualify
 
 # ================================================================
 # ASL-1: Adaptive Leverage + Adaptive Size (Liquidity-Driven)
 # ================================================================
-ASL_MODE = os.environ.get('ASL_MODE', 'shadow').lower()  # off|shadow|lev_only|full
+ASL_MODE = os.environ.get('ASL_MODE', 'full').lower()  # off|shadow|lev_only|full
 ASL_EMA_ALPHA = float(os.environ.get('ASL_EMA_ALPHA', '0.3'))  # New sample weight for EMA smoothing
 
 # Per-symbol EMA state for modifier smoothing (avoids churn on every tick)
