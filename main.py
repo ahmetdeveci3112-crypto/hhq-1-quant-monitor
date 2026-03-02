@@ -8242,7 +8242,7 @@ EV_HARD_BLOCK_ENABLED = os.environ.get('EV_HARD_BLOCK_ENABLED', 'false').lower()
 EV_SOFT_PENALTY_FACTOR = float(os.environ.get('EV_SOFT_PENALTY_FACTOR', '0.7'))  # multiply score/size by this
 
 # MF-1: Market Fallback Edge Gate
-FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'shadow').lower()  # 'shadow' | 'enforce'
+FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'enforce').lower()  # 'off' | 'shadow' | 'enforce'  # Phase B: enforce active
 FALLBACK_MIN_NET_EDGE = float(os.environ.get('FALLBACK_MIN_NET_EDGE', '0.0008'))       # absolute minimum edge
 FALLBACK_EDGE_COST_MULT = float(os.environ.get('FALLBACK_EDGE_COST_MULT', '1.25'))     # required_edge = max(MIN, MULT*cost)
 # RMP-1: Edge gate hard blocks (apply even in shadow — data quality guard)
