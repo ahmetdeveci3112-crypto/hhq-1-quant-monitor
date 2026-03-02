@@ -2290,6 +2290,8 @@ class LiveBinanceTrader:
         self._exec_diag_last_log_ms = 0
         # Local book subscription prep
         self._book_subscriptions = {}  # symbol -> {'subscribed_ms', 'last_update_ms'}
+        # P0 orphan fix: recently-closed symbols for sweep fallback (TTL 30min)
+        self._recently_closed_symbols: deque = deque(maxlen=200)  # (symbol, ts_ms)
         logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
     
     async def initialize(self):
@@ -4248,8 +4250,14 @@ class LiveBinanceTrader:
 
             for order in all_orders:
                 order_type = (order.get('type') or '').lower()
+                # P0 orphan fix: origType/type fallback (parity with cancel_reduce_only_conditionals)
                 if order_type not in conditional_types:
-                    continue
+                    info = order.get('info', {})
+                    alt_type = (info.get('origType') or info.get('type') or '').lower()
+                    if alt_type in conditional_types:
+                        order_type = alt_type
+                    else:
+                        continue
 
                 # Check reduce-only — P0-1: single authority
                 if not self._order_is_reduce_only(order):
@@ -4289,6 +4297,35 @@ class LiveBinanceTrader:
         except Exception as e:
             logger.error(f"❌ ORPHAN_SWEEP_ERROR: {e}")
             result['errors'] += 1
+
+        # P0 orphan fix: fallback to recently-closed symbols when global fetch returns empty
+        if result['scanned'] == 0 and self._recently_closed_symbols:
+            _now_ms = int(datetime.now().timestamp() * 1000)
+            _ttl_ms = 30 * 60 * 1000  # 30 minutes
+            # Prune expired entries
+            _valid = [(s, t) for s, t in self._recently_closed_symbols if (_now_ms - t) < _ttl_ms]
+            self._recently_closed_symbols.clear()
+            self._recently_closed_symbols.extend(_valid)
+            # Deduplicate symbols
+            _unique_syms = list(dict.fromkeys(s for s, _ in _valid))
+            _fb_attempted = len(_unique_syms)
+            _fb_cancelled = 0
+            _fb_errors = 0
+            for sym in _unique_syms:
+                try:
+                    res = await self.cancel_reduce_only_conditionals(sym, trace_id="SWEEP_FALLBACK")
+                    _fb_cancelled += res['cancelled']
+                    _fb_errors += res['errors']
+                    result['cancelled'] += res['cancelled']
+                    result['errors'] += res['errors']
+                except Exception as _fb_err:
+                    _fb_errors += 1
+                    logger.debug(f"SWEEP_FALLBACK error for {sym}: {_fb_err}")
+            logger.info(
+                f"ORPHAN_SWEEP_SCAN_EMPTY: recent_symbols_count={len(_valid)} "
+                f"fallback_attempted={_fb_attempted} fallback_cancelled_total={_fb_cancelled} "
+                f"fallback_errors={_fb_errors}"
+            )
 
         logger.info(
             f"🧹 ORPHAN_SWEEP_DONE: scanned={result['scanned']} orphans={result['orphans']} "
@@ -4330,6 +4367,8 @@ class LiveBinanceTrader:
                 res = await self.cancel_reduce_only_conditionals(symbol, trace_id)
                 
                 if res['cancelled'] > 0 or res['errors'] == 0:
+                    # P0 orphan fix: track recently-closed for sweep fallback
+                    self._recently_closed_symbols.append((symbol, int(datetime.now().timestamp() * 1000)))
                     logger.warning(f"✅ POST_CLOSE_CLEANUP_DONE: {symbol} cancelled={res['cancelled']} errors={res['errors']}{trace_str}")
                     return
                 
@@ -6313,6 +6352,12 @@ async def binance_position_sync_loop():
                             global_paper_trader.stats['losingTrades'] += 1
                     
                     logger.info(f"📥 CLOSE RECORDED: {pos.get('side')} {symbol} | PnL: ${trade.get('pnl', 0):.2f} | Reason: {trade.get('reason')}")
+                    
+                    # P0 orphan fix: fire-and-forget cleanup for externally closed symbol
+                    _ext_close_ts = int(datetime.now().timestamp() * 1000)
+                    _ext_trace = f"SYNC_CLOSE_{symbol}_{_ext_close_ts}"
+                    safe_create_task(live_binance_trader._post_close_cleanup(symbol, trace_id=_ext_trace))
+                    logger.info(f"SYNC_EXT_CLOSE_CLEANUP_START: {symbol} trace={_ext_trace}")
                 
                 global_paper_trader.positions = remaining_positions
                 
