@@ -56,6 +56,30 @@ interface MarketRegime {
         description: string;
     };
     recentChanges?: { from: string; to: string; time: string }[];
+    // DRU-1 dual-window fields
+    fast?: {
+        regime: string;
+        trendDirection: string;
+        confidence: number;
+        samples: number;
+        windowSec: number;
+    };
+    struct?: {
+        regime: string;
+        trendDirection: string;
+        confidence: number;
+        samples: number;
+        windowSec: number;
+    };
+    executionProfile?: {
+        tp_mult: number;
+        sl_mult: number;
+        trail_distance_mult: number;
+        confirmation_mult: number;
+        min_score_offset: number;
+        profile_source: string;
+        description: string;
+    };
 }
 
 interface Props {
@@ -140,13 +164,36 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                     {regimeStyle.label}
                                 </div>
                                 <div className="text-xs text-slate-400">
-                                    {marketRegime.params?.description || 'Piyasa Durumu'}
+                                    {marketRegime.executionProfile?.description || marketRegime.params?.description || 'Piyasa Durumu'}
                                 </div>
                             </div>
                         </div>
                         <div className="flex items-center gap-4">
-                            {/* BTC Trend Direction */}
-                            {marketRegime.trendDirection && (
+                            {/* DRU-1: Fast window — BTC Yönü (Hızlı) */}
+                            {marketRegime.fast && (
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500 uppercase">Hızlı Yön</div>
+                                    <div className={`text-sm font-bold ${marketRegime.fast.trendDirection === 'UP' ? 'text-emerald-400' :
+                                        marketRegime.fast.trendDirection === 'DOWN' ? 'text-rose-400' : 'text-slate-400'
+                                        }`}>
+                                        {marketRegime.fast.trendDirection === 'UP' ? '▲ YUKARI' :
+                                            marketRegime.fast.trendDirection === 'DOWN' ? '▼ AŞAĞI' : '— NÖTR'}
+                                    </div>
+                                    <div className="text-[9px] text-slate-600">{marketRegime.fast.samples}s / {Math.round(marketRegime.fast.windowSec / 60)}dk</div>
+                                </div>
+                            )}
+                            {/* DRU-1: Struct window — Yapısal Rejim */}
+                            {marketRegime.struct && (
+                                <div className="text-center">
+                                    <div className="text-[10px] text-slate-500 uppercase">Yapısal</div>
+                                    <div className={`text-sm font-bold ${getRegimeStyle(marketRegime.struct.regime).color}`}>
+                                        {getRegimeStyle(marketRegime.struct.regime).label}
+                                    </div>
+                                    <div className="text-[9px] text-slate-600">{marketRegime.struct.samples}s / {Math.round(marketRegime.struct.windowSec / 60)}dk</div>
+                                </div>
+                            )}
+                            {/* Fallback: legacy single trend (no dual window) */}
+                            {!marketRegime.fast && marketRegime.trendDirection && (
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500 uppercase">BTC Yönü</div>
                                     <div className={`text-sm font-bold ${marketRegime.trendDirection === 'UP' ? 'text-emerald-400' :
@@ -157,25 +204,25 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                     </div>
                                 </div>
                             )}
-                            {/* Regime Params */}
+                            {/* Execution Profile params — single authority */}
                             <div className="flex gap-3">
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500">Skor</div>
-                                    <div className={`text-sm font-bold ${(marketRegime.params?.min_score_adjustment || 0) > 0 ? 'text-rose-400' : (marketRegime.params?.min_score_adjustment || 0) < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
-                                        {(marketRegime.params?.min_score_adjustment || 0) > 0 ? '+' : ''}{marketRegime.params?.min_score_adjustment || 0}
+                                    <div className={`text-sm font-bold ${(marketRegime.executionProfile?.min_score_offset || 0) > 0 ? 'text-rose-400' : (marketRegime.executionProfile?.min_score_offset || 0) < 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
+                                        {(marketRegime.executionProfile?.min_score_offset || 0) > 0 ? '+' : ''}{marketRegime.executionProfile?.min_score_offset || 0}
                                     </div>
                                 </div>
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500">Takip</div>
-                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.trail_distance_mult?.toFixed(1) || '1.0'}</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.executionProfile?.trail_distance_mult?.toFixed(1) || '1.0'}</div>
                                 </div>
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500">SL</div>
-                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.sl_atr_mult?.toFixed(1) || '1.0'}</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.executionProfile?.sl_mult?.toFixed(1) || '1.0'}</div>
                                 </div>
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500">TP</div>
-                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.params?.tp_atr_mult?.toFixed(1) || '1.0'}</div>
+                                    <div className="text-sm font-bold text-slate-300">×{marketRegime.executionProfile?.tp_mult?.toFixed(1) || '1.0'}</div>
                                 </div>
                             </div>
                         </div>

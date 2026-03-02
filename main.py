@@ -14923,10 +14923,10 @@ async def background_scanner_loop():
                     try:
                         tuning = post_trade_tracker.get_tuning_recommendations()
                         if tuning:
-                            regime_profile = market_regime_manager.get_profile()
+                            regime_profile = market_regime_detector.get_execution_profile()
                             # Store tuning for use in update loop
                             global_paper_trader._tuning_recs = tuning
-                            logger.info(f"📊 Applied tuning: {tuning} regime={market_regime_manager.current_regime}")
+                            logger.info(f"📊 Applied tuning: {tuning} regime={regime_profile.get('profile_source')}")
                     except Exception as tune_err:
                         logger.debug(f"Tuning recommendations error: {tune_err}")
                 
@@ -16574,52 +16574,60 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.debug(f"OBI filter error for {symbol}: {obi_err}")
     
     # =====================================================
-    # Phase 60: MARKET REGIME FILTER
-    # TRENDING_DOWN durumunda LONG sinyallere ek kontrol
+    # Phase 60 + DRU-1: MARKET REGIME FILTER (fast regime)
+    # Fast window yön kararı → entry block/bonus/penalty
     # =====================================================
     try:
-        current_regime = market_regime_detector.current_regime
+        _entry_regime = market_regime_detector.fast_regime
+        _entry_dir = market_regime_detector.fast_trend_direction
+        _struct_regime = market_regime_detector.struct_regime
         regime_params = market_regime_detector.get_regime_params()
+        _regime_action = 'PASS'
         
         # TRENDING_DOWN durumunda LONG sinyallere ağır penalty
-        if current_regime == "TRENDING_DOWN" and action == "LONG":
+        if _entry_regime == "TRENDING_DOWN" and action == "LONG":
             long_penalty = regime_params.get('long_penalty', 0.5)
             
-            # %50+ penalty varsa sinyali reddet
             if long_penalty >= 0.5:
                 signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
                 safe_create_task(sqlite_manager.save_signal(signal_log_data))
                 reject_feedback("REGIME_BLOCKED:TRENDING_DOWN")
-                logger.info(f"🚫 REGIME BLOCK: {action} {symbol} - TRENDING_DOWN blocks LONGs")
+                _regime_action = 'BLOCK'
+                logger.info(f"🚫 REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BLOCK")
                 return
             else:
-                # Düşük penalty - sadece uyar
                 original_score = signal.get('confidenceScore', 60)
                 penalty_amount = int(original_score * long_penalty)
                 signal['confidenceScore'] = max(40, original_score - penalty_amount)
                 signal['regime_adjustment'] = f"TRENDING_DOWN penalty -{penalty_amount}"
-                logger.info(f"⚠️ REGIME PENALTY: {action} {symbol} | Score: -{penalty_amount}")
+                _regime_action = 'PENALTY'
+                logger.info(f"⚠️ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PENALTY score-={penalty_amount}")
         
         # TRENDING_UP durumunda SHORT sinyallere uyarı
-        elif current_regime == "TRENDING_UP" and action == "SHORT":
+        elif _entry_regime == "TRENDING_UP" and action == "SHORT":
             short_penalty = regime_params.get('short_penalty', 0.2)
             original_score = signal.get('confidenceScore', 60)
             penalty_amount = int(original_score * short_penalty)
             signal['confidenceScore'] = max(40, original_score - penalty_amount)
             signal['regime_adjustment'] = f"TRENDING_UP penalty -{penalty_amount}"
-            logger.info(f"⚠️ REGIME PENALTY: {action} {symbol} | Score: -{penalty_amount}")
+            _regime_action = 'PENALTY'
+            logger.info(f"⚠️ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PENALTY score-={penalty_amount}")
         
         # TRENDING_UP + LONG veya TRENDING_DOWN + SHORT = bonus
-        elif (current_regime == "TRENDING_UP" and action == "LONG"):
+        elif (_entry_regime == "TRENDING_UP" and action == "LONG"):
             long_bonus = regime_params.get('long_bonus', 0.15)
             signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + long_bonus)
             signal['regime_adjustment'] = f"TRENDING_UP bonus +{int(long_bonus*100)}%"
-            logger.info(f"✅ REGIME BONUS: {action} {symbol} | Size: +{int(long_bonus*100)}%")
-        elif (current_regime == "TRENDING_DOWN" and action == "SHORT"):
+            _regime_action = 'BONUS'
+            logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(long_bonus*100)}%")
+        elif (_entry_regime == "TRENDING_DOWN" and action == "SHORT"):
             short_bonus = regime_params.get('short_bonus', 0.2)
             signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + short_bonus)
             signal['regime_adjustment'] = f"TRENDING_DOWN bonus +{int(short_bonus*100)}%"
-            logger.info(f"✅ REGIME BONUS: {action} {symbol} | Size: +{int(short_bonus*100)}%")
+            _regime_action = 'BONUS'
+            logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(short_bonus*100)}%")
+        else:
+            logger.debug(f"REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PASS")
     except Exception as regime_err:
         logger.debug(f"Market Regime Filter error: {regime_err}")
     
@@ -19961,17 +19969,16 @@ class PortfolioRecoveryManager:
     
     def start_cooldown(self):
         """Start cooldown period after recovery close — regime-adaptive."""
-        # Adaptive cooldown: use market regime
+        # DRU-1: Adaptive cooldown uses struct_regime (single authority)
         try:
-            regime_profile = market_regime_manager.get_profile()
-            regime_name = regime_profile.get('regime', 'UNKNOWN')
-            if regime_name in ('TRENDING_UP', 'BULLISH'):
+            _struct = market_regime_detector.struct_regime
+            if _struct in ('TRENDING_UP',):
                 adaptive_hours = 1    # Trending up: quick recovery, don't miss
-            elif regime_name in ('RANGING', 'NEUTRAL', 'UNKNOWN'):
+            elif _struct in ('RANGING', 'QUIET'):
                 adaptive_hours = 2    # Normal
-            else:  # TRENDING_DOWN, BEARISH, VOLATILE
+            else:  # TRENDING_DOWN, VOLATILE, TRENDING
                 adaptive_hours = 4    # Risky market: longer cooldown
-            logger.info(f"⏸️ ADAPTIVE_COOLDOWN: regime={regime_name} → {adaptive_hours}h (was default {self.cooldown_hours}h)")
+            logger.info(f"⏸️ ADAPTIVE_COOLDOWN: struct_regime={_struct} → {adaptive_hours}h (was default {self.cooldown_hours}h)")
         except Exception:
             adaptive_hours = self.cooldown_hours
         self.cooldown_until = datetime.now() + timedelta(hours=adaptive_hours)
@@ -22238,28 +22245,48 @@ parameter_optimizer = ParameterOptimizer()
 
 class MarketRegimeDetector:
     """
-    Piyasa durumunu algılar ve AI optimizasyonuna veri sağlar.
-    BTC price action, volatilite ve trend analizi yapar.
+    DRU-1: Dual-window regime detection with single execution authority.
     
-    Phase 60: TRENDING_DOWN/TRENDING_UP ayrımı eklendi.
-    Düşüş trendinde LONG sinyallere ağır penalize uygulanır.
+    Fast window  (5 min)  → entry direction decisions (LONG/SHORT filter)
+    Struct window (2 hr)  → exit parameter management (SL/TP/trail multipliers)
+    
+    Backward compat:
+      current_regime  = struct_regime  (exit params)
+      trend_direction = fast_trend_direction (entry filter)
     """
     
-    TRENDING_UP = "TRENDING_UP"      # Güçlü yükselis trendi, LONG'lara bonus
-    TRENDING_DOWN = "TRENDING_DOWN"  # Güçlü düşüş trendi, LONG'lara veto
-    TRENDING = "TRENDING"            # Eski uyumluluk için (yön belirsiz)
-    RANGING = "RANGING"              # Yatay piyasa, SL sıkılaştır, TP yakınlaştır
-    VOLATILE = "VOLATILE"            # Yüksek volatilite, yüksek min score, seçici ol
-    QUIET = "QUIET"                  # Düşük volatilite, düşük min score, agresif ol
+    TRENDING_UP = "TRENDING_UP"
+    TRENDING_DOWN = "TRENDING_DOWN"
+    TRENDING = "TRENDING"
+    RANGING = "RANGING"
+    VOLATILE = "VOLATILE"
+    QUIET = "QUIET"
     
     def __init__(self):
+        # --- Time-based window config ---
+        self.fast_window_sec = 300     # 5 min
+        self.struct_window_sec = 7200  # 2 hr
+        
+        # --- Fast window state (entry decisions) ---
+        self.fast_regime = self.RANGING
+        self.fast_trend_direction = "NEUTRAL"
+        self.fast_confidence = 0.0
+        
+        # --- Structural window state (exit params) ---
+        self.struct_regime = self.RANGING
+        self.struct_trend_direction = "NEUTRAL"
+        self.struct_confidence = 0.0
+        
+        # --- Backward compat aliases ---
         self.current_regime = self.RANGING
-        self.trend_direction = "NEUTRAL"  # UP, DOWN, NEUTRAL
-        self.btc_prices = []  # Son 24 saatlik BTC fiyatları
+        self.trend_direction = "NEUTRAL"
+        
+        # --- Shared state ---
+        self.btc_prices = []
         self.last_update = None
         self.regime_history = []
         self.max_history = 100
-        logger.info("📊 MarketRegimeDetector initialized with Direction Awareness")
+        logger.info("📊 MarketRegimeDetector initialized — DRU-1 dual-window (fast=300s struct=7200s)")
     
     def update_btc_price(self, price: float, source: str = 'unknown') -> bool:
         """BTC fiyatını kaydet — 30s throttle veya %0.05 fiyat değişimi şartı."""
@@ -22269,154 +22296,229 @@ class MarketRegimeDetector:
             elapsed = (now - last['time']).total_seconds()
             price_change_pct = abs(price - last['price']) / last['price'] * 100 if last['price'] > 0 else 999
             if elapsed < 30 and price_change_pct < 0.05:
-                # Throttle: skip this sample
                 logger.debug(f"REGIME_SAMPLE_SKIPPED: elapsed={elapsed:.0f}s change={price_change_pct:.3f}% src={source}")
                 return False
         self.btc_prices.append({
             'price': price,
             'time': now
         })
-        # Son 24 saat tut (1440 dakika, throttle ile ~2/dk = ~2880; cap 500)
         if len(self.btc_prices) > 500:
             self.btc_prices = self.btc_prices[-500:]
         logger.debug(f"REGIME_INPUT_SOURCE={source} price={price:.1f} samples={len(self.btc_prices)}")
         return True
     
-    def detect_regime(self) -> str:
-        """Piyasa durumunu algıla."""
-        if len(self.btc_prices) < 10:
-            return self.RANGING  # Yeterli veri yok
+    # ------------------------------------------------------------------
+    # Core: classify a price window into regime + trend + confidence
+    # ------------------------------------------------------------------
+    def _classify_window(self, prices: list) -> tuple:
+        """Classify a list of prices → (regime, trend_direction, confidence).
+        Returns (RANGING, NEUTRAL, 0.0) if insufficient data."""
+        if len(prices) < 5:
+            return (self.RANGING, "NEUTRAL", 0.0)
         
-        prices = [p['price'] for p in self.btc_prices[-50:]]  # Son ~4 saat
-        
-        if len(prices) < 10:
-            return self.RANGING
-        
-        # Volatilite hesapla (standart sapma / ortalama)
         avg_price = sum(prices) / len(prices)
         variance = sum((p - avg_price) ** 2 for p in prices) / len(prices)
         std_dev = variance ** 0.5
-        volatility = (std_dev / avg_price) * 100  # Yüzde olarak
+        volatility = (std_dev / avg_price) * 100
         
-        # Trend hesapla (ilk vs son fiyat)
         first_half = sum(prices[:len(prices)//2]) / (len(prices)//2)
         second_half = sum(prices[len(prices)//2:]) / (len(prices) - len(prices)//2)
-        trend_strength = abs((second_half - first_half) / first_half) * 100  # Yüzde
-        
-        # Phase 60: Trend yönünü belirle
+        trend_strength = abs((second_half - first_half) / first_half) * 100
         trend_direction_raw = (second_half - first_half) / first_half * 100
-        if trend_direction_raw > 1.0:
-            self.trend_direction = "UP"
-        elif trend_direction_raw < -1.0:
-            self.trend_direction = "DOWN"
+        
+        if trend_direction_raw > 0.5:
+            trend_dir = "UP"
+        elif trend_direction_raw < -0.5:
+            trend_dir = "DOWN"
         else:
-            self.trend_direction = "NEUTRAL"
+            trend_dir = "NEUTRAL"
         
-        # Price range hesapla
-        price_range = (max(prices) - min(prices)) / avg_price * 100  # Yüzde
+        price_range = (max(prices) - min(prices)) / avg_price * 100
         
-        # Regime belirleme (Phase 60: Yön farkındalığı eklendi)
         if volatility > 2.0 or price_range > 5.0:
             regime = self.VOLATILE
         elif trend_strength > 1.5 and price_range > 2.0:
-            # Phase 60: Trend yönüne göre TRENDING_UP veya TRENDING_DOWN
-            if self.trend_direction == "DOWN":
+            if trend_dir == "DOWN":
                 regime = self.TRENDING_DOWN
-            elif self.trend_direction == "UP":
+            elif trend_dir == "UP":
                 regime = self.TRENDING_UP
             else:
-                regime = self.TRENDING  # Eski uyumluluk
+                regime = self.TRENDING
         elif volatility < 0.5 and price_range < 1.0:
             regime = self.QUIET
         else:
             regime = self.RANGING
         
-        # Değişiklik varsa logla
-        if regime != self.current_regime:
-            logger.info(f"📊 MARKET REGIME CHANGE: {self.current_regime} → {regime} (vol:{volatility:.2f}%, trend:{trend_strength:.2f}%, dir:{self.trend_direction}, range:{price_range:.2f}%)")
+        # Confidence: 0-1 based on how decisive the classification is
+        confidence = min(1.0, (volatility + trend_strength + price_range) / 10.0)
+        
+        return (regime, trend_dir, confidence)
+    
+    def detect_regime(self) -> str:
+        """Dual-window regime detection.
+        Fast (5 min) → entry direction; Structural (2 hr) → exit params."""
+        if len(self.btc_prices) < 5:
+            return self.RANGING
+        
+        now = datetime.now(timezone.utc)
+        
+        # --- Fast window: last fast_window_sec ---
+        fast_cutoff = now - timedelta(seconds=self.fast_window_sec)
+        fast_prices = [p['price'] for p in self.btc_prices if p['time'] >= fast_cutoff]
+        fast_regime, fast_dir, fast_conf = self._classify_window(fast_prices)
+        
+        # --- Structural window: last struct_window_sec ---
+        struct_cutoff = now - timedelta(seconds=self.struct_window_sec)
+        struct_prices = [p['price'] for p in self.btc_prices if p['time'] >= struct_cutoff]
+        struct_regime, struct_dir, struct_conf = self._classify_window(struct_prices)
+        
+        # --- Update fast state ---
+        self.fast_regime = fast_regime
+        self.fast_trend_direction = fast_dir
+        self.fast_confidence = fast_conf
+        
+        # --- Update structural state ---
+        prev_struct = self.struct_regime
+        self.struct_regime = struct_regime
+        self.struct_trend_direction = struct_dir
+        self.struct_confidence = struct_conf
+        
+        # --- Backward compat ---
+        self.current_regime = struct_regime
+        self.trend_direction = fast_dir  # entry filter uses fast direction
+        
+        # --- Divergence telemetry ---
+        if fast_regime != struct_regime:
+            logger.info(f"⚡ REGIME_DIVERGENCE: fast={fast_regime}({fast_dir}) struct={struct_regime}({struct_dir}) fast_samples={len(fast_prices)} struct_samples={len(struct_prices)}")
+        
+        # --- Regime change history (structural) ---
+        if struct_regime != prev_struct:
+            logger.info(f"📊 MARKET REGIME CHANGE (struct): {prev_struct} → {struct_regime} (dir:{struct_dir}, conf:{struct_conf:.2f}, samples:{len(struct_prices)})")
             self.regime_history.append({
-                'from': self.current_regime,
-                'to': regime,
-                'time': datetime.now(timezone.utc).isoformat(),
-                'volatility': volatility,
-                'trend_strength': trend_strength,
-                'trend_direction': self.trend_direction
+                'from': prev_struct,
+                'to': struct_regime,
+                'time': now.isoformat(),
+                'trend_direction': struct_dir,
+                'fast_regime': fast_regime,
+                'fast_direction': fast_dir
             })
             if len(self.regime_history) > self.max_history:
                 self.regime_history = self.regime_history[-self.max_history:]
         
-        self.current_regime = regime
-        self.last_update = datetime.now(timezone.utc)
-        
-        return regime
+        self.last_update = now
+        return struct_regime
     
     def get_regime_params(self) -> dict:
-        """
-        Mevcut regime için önerilen parametreleri döndür.
-        Bu değerler ParameterOptimizer tarafından kullanılır.
-        """
+        """Entry filter params — uses fast_regime for direction-based bonuses/penalties.
+        Backward compat: still returns min_score_adjustment, long_bonus etc."""
         params = {
-            # Phase 60: TRENDING_UP - Yükseliş trendinde LONG'lara bonus
             self.TRENDING_UP: {
-                'min_score_adjustment': -5,    # Daha agresif LONG
-                'trail_distance_mult': 1.3,    # Trail'i gevşet, trend devam etsin
-                'sl_atr_mult': 1.2,            # SL biraz gevşet
-                'tp_atr_mult': 1.5,            # TP'yi uzat
-                'long_bonus': 0.15,            # LONG sinyallere bonus
-                'short_penalty': 0.2,          # SHORT sinyallere penalty
+                'min_score_adjustment': -5,
+                'trail_distance_mult': 1.3,
+                'sl_atr_mult': 1.2,
+                'tp_atr_mult': 1.5,
+                'long_bonus': 0.15,
+                'short_penalty': 0.2,
                 'description': '📈 Yükseliş trendi - LONG bonus, SHORT riskli'
             },
-            # Phase 60: TRENDING_DOWN - Düşüş trendinde LONG'lara veto
             self.TRENDING_DOWN: {
-                'min_score_adjustment': +15,   # Çok seçici (LONG için)
-                'trail_distance_mult': 0.7,    # Trail'i sıkılaştır, hızlı çık
-                'sl_atr_mult': 0.8,            # SL sıkı tut
-                'tp_atr_mult': 0.7,            # TP yakın, hızlı kâr al
-                'long_penalty': 0.5,           # LONG sinyallere ağır penalty
-                'short_bonus': 0.2,            # SHORT sinyallere bonus
+                'min_score_adjustment': +15,
+                'trail_distance_mult': 0.7,
+                'sl_atr_mult': 0.8,
+                'tp_atr_mult': 0.7,
+                'long_penalty': 0.5,
+                'short_bonus': 0.2,
                 'description': '📉 Düşüş trendi - LONG riskli, SHORT bonus'
             },
             self.TRENDING: {
-                'min_score_adjustment': -5,    # Daha agresif
-                'trail_distance_mult': 1.3,    # Trail'i gevşet, trend devam etsin
-                'sl_atr_mult': 1.2,            # SL biraz gevşet
-                'tp_atr_mult': 1.5,            # TP'yi uzat
+                'min_score_adjustment': -5,
+                'trail_distance_mult': 1.3,
+                'sl_atr_mult': 1.2,
+                'tp_atr_mult': 1.5,
                 'description': 'Trend takibi modu - TP uzun, trail gevşek'
             },
             self.RANGING: {
-                'min_score_adjustment': 0,     # Normal
+                'min_score_adjustment': 0,
                 'trail_distance_mult': 1.0,
                 'sl_atr_mult': 1.0,
                 'tp_atr_mult': 1.0,
                 'description': 'Yatay piyasa - standart ayarlar'
             },
             self.VOLATILE: {
-                'min_score_adjustment': +10,   # Çok seçici
-                'trail_distance_mult': 0.8,    # Trail'i sıkılaştır
-                'sl_atr_mult': 1.3,            # SL gevşet (whipsaw koruması)
-                'tp_atr_mult': 0.8,            # TP yakınlaştır
+                'min_score_adjustment': +10,
+                'trail_distance_mult': 0.8,
+                'sl_atr_mult': 1.3,
+                'tp_atr_mult': 0.8,
                 'description': 'Volatil piyasa - yüksek seçicilik, hızlı çıkış'
             },
             self.QUIET: {
-                'min_score_adjustment': -10,   # Agresif
-                'trail_distance_mult': 0.9,    # Trail orta
-                'sl_atr_mult': 0.9,            # SL sıkı
-                'tp_atr_mult': 0.9,            # TP yakın
+                'min_score_adjustment': -10,
+                'trail_distance_mult': 0.9,
+                'sl_atr_mult': 0.9,
+                'tp_atr_mult': 0.9,
                 'description': 'Sakin piyasa - agresif giriş, sıkı çıkış'
             }
         }
-        return params.get(self.current_regime, params[self.RANGING])
+        return params.get(self.fast_regime, params[self.RANGING])
+    
+    def get_execution_profile(self) -> dict:
+        """Single authority: struct regime → execution multipliers.
+        Replaces MarketRegimeManager.get_profile() for all exit/entry score decisions."""
+        _profiles = {
+            self.TRENDING_UP: {
+                'tp_mult': 1.5, 'sl_mult': 1.2, 'trail_distance_mult': 1.3,
+                'confirmation_mult': 0.7, 'min_score_offset': -5,
+                'description': '📈 Struct: Yükseliş — TP uzak, trail gevşek'
+            },
+            self.TRENDING_DOWN: {
+                'tp_mult': 0.7, 'sl_mult': 0.8, 'trail_distance_mult': 0.7,
+                'confirmation_mult': 1.2, 'min_score_offset': +15,
+                'description': '📉 Struct: Düşüş — TP yakın, SL sıkı'
+            },
+            self.TRENDING: {
+                'tp_mult': 1.5, 'sl_mult': 0.8, 'trail_distance_mult': 1.0,
+                'confirmation_mult': 0.7, 'min_score_offset': -10,
+                'description': '📊 Struct: Trend — TP uzak, hızlı entry'
+            },
+            self.RANGING: {
+                'tp_mult': 1.0, 'sl_mult': 1.0, 'trail_distance_mult': 1.0,
+                'confirmation_mult': 1.0, 'min_score_offset': 0,
+                'description': '↔️ Struct: Yatay — standart'
+            },
+            self.VOLATILE: {
+                'tp_mult': 1.2, 'sl_mult': 1.2, 'trail_distance_mult': 1.3,
+                'confirmation_mult': 0.5, 'min_score_offset': +10,
+                'description': '🔥 Struct: Volatil — geniş SL/TP, hızlı confirm'
+            },
+            self.QUIET: {
+                'tp_mult': 0.8, 'sl_mult': 0.9, 'trail_distance_mult': 0.8,
+                'confirmation_mult': 1.5, 'min_score_offset': -5,
+                'description': '😴 Struct: Sakin — sıkı trail, uzun confirm'
+            },
+        }
+        profile = _profiles.get(self.struct_regime, _profiles[self.RANGING]).copy()
+        profile['profile_source'] = self.struct_regime
+        return profile
     
     def get_status(self) -> dict:
-        """API için durum özeti."""
-        # Stale watchdog: warn if regime hasn't been updated in >90s
+        """API durum özeti — DRU-1 dual-window payload."""
         _stale_sec = 999
         if self.last_update:
             _stale_sec = (datetime.now(timezone.utc) - self.last_update).total_seconds()
             if _stale_sec > 90:
                 logger.warning(f"⚠️ REGIME_STALE: lastUpdate {_stale_sec:.0f}s ago")
         _last_update_ms = int(self.last_update.timestamp() * 1000) if self.last_update else None
+        
+        now = datetime.now(timezone.utc)
+        fast_cutoff = now - timedelta(seconds=self.fast_window_sec)
+        struct_cutoff = now - timedelta(seconds=self.struct_window_sec)
+        fast_count = sum(1 for p in self.btc_prices if p['time'] >= fast_cutoff)
+        struct_count = sum(1 for p in self.btc_prices if p['time'] >= struct_cutoff)
+        
+        exec_profile = self.get_execution_profile()
+        
         return {
+            # Backward compat
             'currentRegime': self.current_regime,
             'trendDirection': self.trend_direction,
             'lastUpdate': self.last_update.isoformat() if self.last_update else None,
@@ -22424,7 +22526,23 @@ class MarketRegimeDetector:
             'staleSec': round(_stale_sec, 1),
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),
-            'recentChanges': self.regime_history[-5:] if self.regime_history else []
+            'recentChanges': self.regime_history[-5:] if self.regime_history else [],
+            # DRU-1 new fields
+            'fast': {
+                'regime': self.fast_regime,
+                'trendDirection': self.fast_trend_direction,
+                'confidence': round(self.fast_confidence, 3),
+                'samples': fast_count,
+                'windowSec': self.fast_window_sec,
+            },
+            'struct': {
+                'regime': self.struct_regime,
+                'trendDirection': self.struct_trend_direction,
+                'confidence': round(self.struct_confidence, 3),
+                'samples': struct_count,
+                'windowSec': self.struct_window_sec,
+            },
+            'executionProfile': exec_profile,
         }
 
 
@@ -23605,9 +23723,10 @@ class SignalGenerator:
         # Phase 28: Dynamic threshold from coin profile
         # Phase 152 FIX: User's min_confidence_score is always the floor
         user_min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 65
-        # Phase 224D: Apply regime offset to min_score
+        # DRU-1: Apply struct regime min_score_offset (single authority)
         try:
-            user_min_score = market_regime_manager.get_adjusted_min_score(user_min_score)
+            _exec_profile = market_regime_detector.get_execution_profile()
+            user_min_score = user_min_score + _exec_profile.get('min_score_offset', 0)
             user_min_score = max(40, min(95, user_min_score))  # Clamp to sane range
         except Exception:
             pass
@@ -26314,12 +26433,12 @@ class PaperTradingEngine:
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
         
-        # Phase 224D G5: Apply regime profile multipliers
+        # DRU-1: Apply struct regime execution profile (single authority)
         try:
-            regime_profile = market_regime_manager.get_profile()
+            regime_profile = market_regime_detector.get_execution_profile()
             tuning_recs = getattr(self, '_tuning_recs', {})
             
-            # Regime multipliers
+            # Regime multipliers from struct regime
             r_tp_mult = regime_profile.get('tp_mult', 1.0)
             r_sl_mult = regime_profile.get('sl_mult', 1.0)
             r_trail_mult = regime_profile.get('trail_distance_mult', 1.0)
@@ -26336,7 +26455,7 @@ class PaperTradingEngine:
             adjusted_trail_distance_atr *= r_trail_mult
             
             if r_tp_mult != 1.0 or r_sl_mult != 1.0 or r_trail_mult != 1.0:
-                logger.info(f"🎭 REGIME_PARAMS: {trade_symbol} | TP×{r_tp_mult:.2f} SL×{r_sl_mult:.2f} Trail×{r_trail_mult:.2f} regime={market_regime_manager.current_regime}")
+                logger.info(f"🎭 REGIME_EXEC_PROFILE_APPLIED: {trade_symbol} | TP×{r_tp_mult:.2f} SL×{r_sl_mult:.2f} Trail×{r_trail_mult:.2f} struct={regime_profile.get('profile_source')}")
         except Exception as rp_err:
             logger.debug(f"Regime profile params error: {rp_err}")
         
@@ -26589,9 +26708,9 @@ class PaperTradingEngine:
             logger.warning(f"⚠️ CONFIRM_DELAY clamp swapped: min({_confirm_clamp_min}) > max({_confirm_clamp_max})")
             _confirm_clamp_min, _confirm_clamp_max = _confirm_clamp_max, _confirm_clamp_min
 
-        # Phase 224D: Regime-based confirmation multiplier
+        # DRU-1: Regime-based confirmation multiplier (single authority)
         try:
-            regime_profile = market_regime_manager.get_profile()
+            regime_profile = market_regime_detector.get_execution_profile()
             confirm_mult = regime_profile.get('confirmation_mult', 1.0)
             signal_confirmation_delay_seconds = int(signal_confirmation_delay_seconds * confirm_mult)
             signal_confirmation_delay_seconds = max(_confirm_clamp_min, min(_confirm_clamp_max, signal_confirmation_delay_seconds))
