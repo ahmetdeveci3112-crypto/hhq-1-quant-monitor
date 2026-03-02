@@ -4130,6 +4130,21 @@ class LiveBinanceTrader:
             or (str(info_close_position).strip().lower() == 'true')
         )
     
+    def _raw_to_unified(self, raw: dict) -> dict:
+        """Convert raw Binance fapi order to CCXT-like unified format.
+        Used as fallback when CCXT fetch_open_orders returns empty.
+        """
+        _sym = raw.get('symbol', '')  # e.g. 'BTCUSDT'
+        _base = _sym[:-4] if _sym.endswith('USDT') else _sym
+        return {
+            'id': str(raw.get('orderId', '')),
+            'symbol': f"{_base}/USDT:USDT" if _base else _sym,
+            'type': (raw.get('origType') or raw.get('type', '')).lower(),
+            'info': raw,
+            'reduceOnly': str(raw.get('reduceOnly', 'false')).lower() == 'true',
+            'closePosition': str(raw.get('closePosition', 'false')).lower() == 'true',
+        }
+    
     async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
         """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
         Only targets STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT types.
@@ -4167,6 +4182,17 @@ class LiveBinanceTrader:
                     logger.info(f"🔄 POST_CLOSE_CLEANUP_FALLBACK_ALL_ORDERS: {symbol} found {len(open_orders)} orders via global fetch{trace_str}")
             except Exception as fallback_err:
                 logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fallback fetch_open_orders() failed: {fallback_err}{trace_str}")
+        
+        # Raw Binance fallback: fapiPrivateGetOpenOrders
+        if not open_orders and self.exchange:
+            try:
+                raw_orders = await self.exchange.fapiPrivateGetOpenOrders({'symbol': symbol})
+                if raw_orders:
+                    open_orders = [self._raw_to_unified(o) for o in raw_orders]
+                    used_fallback = True
+                    logger.info(f"🧹 ORPHAN_SWEEP_RAW_FALLBACK: {symbol} found {len(open_orders)} orders via fapiPrivateGetOpenOrders{trace_str}")
+            except Exception as raw_err:
+                logger.warning(f"⚠️ RAW_FALLBACK_FAIL: {symbol} fapiPrivateGetOpenOrders: {raw_err}{trace_str}")
                 result['errors'] = 1
                 return result
         
@@ -4239,12 +4265,26 @@ class LiveBinanceTrader:
                     except Exception as retry_err:
                         logger.error(f"❌ ORPHAN_SWEEP_RETRY_FAILED: {retry_err}")
                         result['errors'] += 1
-                        return result
                 else:
                     logger.error(f"❌ ORPHAN_SWEEP_FETCH_FAILED: {fetch_err}")
                     result['errors'] += 1
-                    return result
-            result['scanned'] = len(all_orders)
+            
+            # Raw Binance fallback: if CCXT returned 0, try fapiPrivateGetOpenOrders
+            if not all_orders and self.exchange:
+                try:
+                    raw_orders = await self.exchange.fapiPrivateGetOpenOrders()
+                    if raw_orders:
+                        all_orders = [self._raw_to_unified(o) for o in raw_orders]
+                        logger.info(f"🧹 ORPHAN_SWEEP_RAW_FALLBACK: {len(all_orders)} orders via fapiPrivateGetOpenOrders")
+                except Exception as raw_err:
+                    logger.warning(f"⚠️ ORPHAN_SWEEP_RAW_FALLBACK_FAIL: {raw_err}")
+                    result['errors'] += 1
+            
+            if not all_orders:
+                # Still empty after all fallbacks
+                result['scanned'] = 0
+            else:
+                result['scanned'] = len(all_orders)
 
             conditional_types = {'stop_market', 'take_profit_market', 'stop', 'take_profit', 'trailing_stop_market'}
 
@@ -7277,11 +7317,13 @@ TREND_RUNNER_TUNING_ENABLED = False
 # Phase 252: PERSISTENT SIGNAL LIFECYCLE — Feature Flags
 # ============================================================================
 PERSISTENT_SIGNAL_MODE = True             # Master switch for signal lifecycle
-COUNTER_SIGNAL_CONFIRM_COUNT = 2          # Opposites needed to invalidate
-COUNTER_SIGNAL_CONFIRM_WINDOW_SEC = 30    # Window for counter confirmations
+COUNTER_SIGNAL_CONFIRM_COUNT = 2          # Opposites needed to invalidate (confirm mode)
+COUNTER_SIGNAL_CONFIRM_WINDOW_SEC = 30    # Window for counter confirmations (confirm mode)
 MAX_REENTRY_PER_SIGNAL = 2                # Max re-entry attempts per signal
 MIN_REENTRY_COOLDOWN_SEC = 300            # Cooldown between re-entries (5min, was 90s)
 PERSISTENT_SIGNAL_TTL_SEC = 3600          # Active signal max lifetime (60 minutes)
+SIGNAL_FLIP_MODE = os.environ.get('SIGNAL_FLIP_MODE', 'immediate').lower()  # 'immediate' | 'confirm'
+SIGNAL_FLIP_COOLDOWN_SEC = int(os.environ.get('SIGNAL_FLIP_COOLDOWN_SEC', '10'))  # Storm guard
 
 # ============================================================================
 # ENTRY QUALITY GATE — Feature Flags
@@ -14201,6 +14243,10 @@ async def background_scanner_loop():
                             btc_price = btc_opp.get('currentPrice', 0)
                     if btc_price and btc_price > 0:
                         market_regime_detector.update_btc_price(btc_price)
+                        # Per-cycle regime detection — keeps lastUpdate fresh (was 15-min only)
+                        market_regime_detector.detect_regime()
+                    else:
+                        logger.debug(f"⚠️ REGIME_SKIP_NO_BTC_PRICE: btc_price={btc_price}")
                 except Exception as regime_err:
                     logger.debug(f"Market regime update error: {regime_err}")
                 
@@ -15710,21 +15756,33 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     reject_feedback("EXISTING_POSITION")
                     return
             else:
-                # ─── OPPOSITE DIRECTION: Counter-signal confirmation ───
-                if existing_signal['counter_count'] == 0:
-                    existing_signal['counter_first_ts'] = now_ts
-                existing_signal['counter_count'] += 1
-                
-                counter_age = now_ts - existing_signal['counter_first_ts']
-                
-                if (existing_signal['counter_count'] >= COUNTER_SIGNAL_CONFIRM_COUNT 
-                    and counter_age <= COUNTER_SIGNAL_CONFIRM_WINDOW_SEC):
-                    # ─── COUNTER CONFIRMED: Invalidate old signal, create new ───
-                    logger.warning(
-                        f"🔄 SIGNAL_FLIP: {symbol} {existing_signal['side']}→{action} "
-                        f"confirmed ({existing_signal['counter_count']} in {counter_age:.0f}s)"
+                # ─── OPPOSITE DIRECTION: Counter-signal handling ───
+                _old_side = existing_signal['side']
+
+                # ── Flip storm guard: cooldown between flips for same symbol ──
+                _last_flip_ts = existing_signal.get('last_flip_ts', 0)
+                if _last_flip_ts > 0 and (now_ts - _last_flip_ts) < SIGNAL_FLIP_COOLDOWN_SEC:
+                    _remaining = SIGNAL_FLIP_COOLDOWN_SEC - (now_ts - _last_flip_ts)
+                    logger.info(
+                        f"⚡ FLIP_STORM_GUARD: {symbol} {action} vs {_old_side} "
+                        f"cooldown {_remaining:.0f}s remaining"
                     )
-                    # Apply existing counter_signal_modifier logic to position
+                    signal_log_data['reject_reason'] = 'FLIP_STORM_COOLDOWN'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("FLIP_STORM_COOLDOWN")
+                    return
+
+                def _do_flip():
+                    """Shared flip logic: create new signal, apply modifier, cleanup."""
+                    pass  # placeholder, actual logic below
+
+                if SIGNAL_FLIP_MODE == 'immediate':
+                    # ── IMMEDIATE FLIP: first counter-signal triggers flip ──
+                    logger.warning(
+                        f"🔄 SIGNAL_FLIP_IMMEDIATE: {symbol} {_old_side}→{action} "
+                        f"score={signal.get('confidenceScore', 0)}"
+                    )
+                    # Apply counter_signal_modifier to existing position
                     if existing_position:
                         signal_score = signal.get('confidenceScore', 0)
                         if signal_score >= 90:
@@ -15737,19 +15795,18 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                             modifier = 0.85
                         else:
                             modifier = 1.0
-                        
                         if modifier < 1.0:
                             existing_position['counter_signal_modifier'] = modifier
                             existing_position['counter_signal_time'] = now_ts
                             effective_et = global_paper_trader.exit_tightness * modifier
                             logger.info(
-                                f"⚡ COUNTER_CONFIRMED: {symbol} {action} (score:{signal_score}) "
+                                f"⚡ FLIP_IMM_MODIFIER: {symbol} {action} (score:{signal_score}) "
                                 f"→ exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f}"
                             )
 
-                    # Counter flip must invalidate stale entry intentions immediately.
-                    await _cleanup_symbol_pending_orders(symbol, f"COUNTER_FLIP_{existing_signal['side']}_TO_{action}")
-                    
+                    # Cleanup pending entries
+                    await _cleanup_symbol_pending_orders(symbol, f"FLIP_IMM_{_old_side}_TO_{action}")
+
                     # Create new active signal (flip)
                     active_signals[symbol] = {
                         'side': action,
@@ -15762,7 +15819,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         'counter_first_ts': 0,
                         'reentry_count': 0,
                         'last_close_ts': existing_signal.get('last_close_ts', 0),
-                        # P0: Snapshot enrichment
+                        'last_flip_ts': now_ts,  # storm guard
                         'last_price': price,
                         'entry_price_backend': signal.get('entryPriceBackend', 0),
                         'leverage': signal.get('leverage', 10),
@@ -15771,37 +15828,107 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         'entry_quality_reasons': signal.get('entryQualityReasons', []),
                         'execution_reject_reason': '',
                     }
-                    
+
                     if existing_position:
                         signal_log_data['reject_reason'] = 'COUNTER_FLIP_EXISTING_POS'
                         safe_create_task(sqlite_manager.save_signal(signal_log_data))
                         reject_feedback("COUNTER_FLIP_EXISTING_POS")
                         return
                     # No position → fall through to re-entry check below
-                
-                elif counter_age > COUNTER_SIGNAL_CONFIRM_WINDOW_SEC:
-                    # Window expired — reset counter
-                    existing_signal['counter_count'] = 1
-                    existing_signal['counter_first_ts'] = now_ts
-                    logger.info(
-                        f"⏳ COUNTER_RESET: {symbol} {action} vs {existing_signal['side']} "
-                        f"window expired ({counter_age:.0f}s > {COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s), reset to 1"
-                    )
-                    signal_log_data['reject_reason'] = 'COUNTER_PENDING'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    reject_feedback("COUNTER_PENDING")
-                    return
+
                 else:
-                    # Within window but not enough confirmations yet
-                    logger.info(
-                        f"⏳ COUNTER_PENDING: {symbol} {action} vs {existing_signal['side']} "
-                        f"count={existing_signal['counter_count']}/{COUNTER_SIGNAL_CONFIRM_COUNT} "
-                        f"window={counter_age:.0f}s/{COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s"
-                    )
-                    signal_log_data['reject_reason'] = 'COUNTER_PENDING'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    reject_feedback("COUNTER_PENDING")
-                    return
+                    # ── CONFIRM MODE: original 2-confirm + 30s window ──
+                    if existing_signal['counter_count'] == 0:
+                        existing_signal['counter_first_ts'] = now_ts
+                    existing_signal['counter_count'] += 1
+
+                    counter_age = now_ts - existing_signal['counter_first_ts']
+
+                    if (existing_signal['counter_count'] >= COUNTER_SIGNAL_CONFIRM_COUNT
+                        and counter_age <= COUNTER_SIGNAL_CONFIRM_WINDOW_SEC):
+                        # ─── COUNTER CONFIRMED: Invalidate old signal, create new ───
+                        logger.warning(
+                            f"🔄 SIGNAL_FLIP: {symbol} {existing_signal['side']}→{action} "
+                            f"confirmed ({existing_signal['counter_count']} in {counter_age:.0f}s)"
+                        )
+                        # Apply existing counter_signal_modifier logic to position
+                        if existing_position:
+                            signal_score = signal.get('confidenceScore', 0)
+                            if signal_score >= 90:
+                                modifier = 0.4
+                            elif signal_score >= 80:
+                                modifier = 0.55
+                            elif signal_score >= 65:
+                                modifier = 0.7
+                            elif signal_score >= 50:
+                                modifier = 0.85
+                            else:
+                                modifier = 1.0
+
+                            if modifier < 1.0:
+                                existing_position['counter_signal_modifier'] = modifier
+                                existing_position['counter_signal_time'] = now_ts
+                                effective_et = global_paper_trader.exit_tightness * modifier
+                                logger.info(
+                                    f"⚡ COUNTER_CONFIRMED: {symbol} {action} (score:{signal_score}) "
+                                    f"→ exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f}"
+                                )
+
+                        # Counter flip must invalidate stale entry intentions immediately.
+                        await _cleanup_symbol_pending_orders(symbol, f"COUNTER_FLIP_{existing_signal['side']}_TO_{action}")
+
+                        # Create new active signal (flip)
+                        active_signals[symbol] = {
+                            'side': action,
+                            'score': signal.get('confidenceScore', 0),
+                            'created_ts': now_ts,
+                            'last_refresh_ts': now_ts,
+                            'ttl_sec': 600,
+                            'state': 'ACTIVE',
+                            'counter_count': 0,
+                            'counter_first_ts': 0,
+                            'reentry_count': 0,
+                            'last_close_ts': existing_signal.get('last_close_ts', 0),
+                            'last_flip_ts': now_ts,  # storm guard
+                            'last_price': price,
+                            'entry_price_backend': signal.get('entryPriceBackend', 0),
+                            'leverage': signal.get('leverage', 10),
+                            'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                            'entry_quality_pass': signal.get('entryQualityPass', False),
+                            'entry_quality_reasons': signal.get('entryQualityReasons', []),
+                            'execution_reject_reason': '',
+                        }
+
+                        if existing_position:
+                            signal_log_data['reject_reason'] = 'COUNTER_FLIP_EXISTING_POS'
+                            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                            reject_feedback("COUNTER_FLIP_EXISTING_POS")
+                            return
+                        # No position → fall through to re-entry check below
+
+                    elif counter_age > COUNTER_SIGNAL_CONFIRM_WINDOW_SEC:
+                        # Window expired — reset counter
+                        existing_signal['counter_count'] = 1
+                        existing_signal['counter_first_ts'] = now_ts
+                        logger.info(
+                            f"⏳ COUNTER_RESET: {symbol} {action} vs {existing_signal['side']} "
+                            f"window expired ({counter_age:.0f}s > {COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s), reset to 1"
+                        )
+                        signal_log_data['reject_reason'] = 'COUNTER_PENDING'
+                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        reject_feedback("COUNTER_PENDING")
+                        return
+                    else:
+                        # Within window but not enough confirmations yet
+                        logger.info(
+                            f"⏳ COUNTER_PENDING: {symbol} {action} vs {existing_signal['side']} "
+                            f"count={existing_signal['counter_count']}/{COUNTER_SIGNAL_CONFIRM_COUNT} "
+                            f"window={counter_age:.0f}s/{COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s"
+                        )
+                        signal_log_data['reject_reason'] = 'COUNTER_PENDING'
+                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        reject_feedback("COUNTER_PENDING")
+                        return
         else:
             # ─── NO EXISTING SIGNAL: Register new signal ───
             active_signals[symbol] = {
@@ -22256,10 +22383,17 @@ class MarketRegimeDetector:
     
     def get_status(self) -> dict:
         """API için durum özeti."""
+        # Stale watchdog: warn if regime hasn't been updated in >90s
+        _stale_sec = 999
+        if self.last_update:
+            _stale_sec = (datetime.now() - self.last_update).total_seconds()
+            if _stale_sec > 90:
+                logger.warning(f"⚠️ REGIME_STALE: lastUpdate {_stale_sec:.0f}s ago")
         return {
             'currentRegime': self.current_regime,
             'trendDirection': self.trend_direction,
             'lastUpdate': self.last_update.isoformat() if self.last_update else None,
+            'staleSec': round(_stale_sec, 1),
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),
             'recentChanges': self.regime_history[-5:] if self.regime_history else []
@@ -31356,6 +31490,24 @@ async def paper_trading_status():
             "warn": global_paper_trader.pipeline_metrics.get('recheck_warn', 0),
         },
     })
+
+
+# ============================================================================
+# OPS ENDPOINTS
+# ============================================================================
+
+@app.post("/ops/orphan-sweep-now")
+async def ops_orphan_sweep_now():
+    """Manual trigger: sweep orphan conditional orders for symbols with no open position."""
+    if not live_binance_trader.enabled or not live_binance_trader.exchange:
+        return JSONResponse({"error": "Live trading not enabled or exchange not initialized"}, status_code=400)
+    try:
+        result = await live_binance_trader.sweep_orphan_conditionals()
+        logger.info(f"🧹 OPS_ORPHAN_SWEEP_MANUAL: {result}")
+        return JSONResponse({"success": True, "result": result})
+    except Exception as e:
+        logger.error(f"❌ OPS_ORPHAN_SWEEP_ERROR: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ============================================================================
