@@ -22,7 +22,7 @@ import time
 import uuid
 import websockets
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 import ccxt.async_support as ccxt_async
@@ -6392,6 +6392,17 @@ async def binance_position_sync_loop():
                             global_paper_trader.stats['losingTrades'] += 1
                     
                     logger.info(f"📥 CLOSE RECORDED: {pos.get('side')} {symbol} | PnL: ${trade.get('pnl', 0):.2f} | Reason: {trade.get('reason')}")
+                    
+                    # Patch C: Feed PostTradeTracker from sync close path (idempotent)
+                    try:
+                        _already_tracked = any(t_id == trade.get('id') for t_id in post_trade_tracker.tracking)
+                        if not _already_tracked:
+                            post_trade_tracker.start_tracking(trade)
+                            logger.info(f"📊 POST_TRADE_SYNC: started tracking {symbol} id={trade.get('id')}")
+                        else:
+                            logger.debug(f"POST_TRADE_SYNC_SKIP: {symbol} already tracked")
+                    except Exception as pt_err:
+                        logger.debug(f"POST_TRADE_SYNC error: {pt_err}")
                     
                     # P0 orphan fix: fire-and-forget cleanup for externally closed symbol
                     _ext_close_ts = int(datetime.now().timestamp() * 1000)
@@ -14233,17 +14244,21 @@ async def background_scanner_loop():
                     total_pnl = sum(p.get('unrealizedPnl', 0) for p in pt.positions)
                     pt.add_log(f"📊 DURUM: {len(pt.positions)} poz | {active_sigs} sinyal | Bakiye: ${pt.balance:.0f} | Açık PnL: ${total_pnl:.2f}")
                 
-                # Update market regime with BTC price (from btc_filter OR from opportunities)
+                # Update market regime with BTC price (opportunity first, btc_filter fallback)
                 try:
-                    btc_price = btc_filter.btc_price
-                    if not btc_price or btc_price <= 0:
-                        # Fallback: get from scan results
-                        btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
-                        if btc_opp:
-                            btc_price = btc_opp.get('currentPrice', 0)
+                    _regime_src = 'none'
+                    btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
+                    btc_price = btc_opp.get('currentPrice', 0) if btc_opp else 0
                     if btc_price and btc_price > 0:
-                        market_regime_detector.update_btc_price(btc_price)
-                        # Per-cycle regime detection — keeps lastUpdate fresh (was 15-min only)
+                        _regime_src = 'opportunity'
+                    else:
+                        # Fallback: btc_filter (OHLCV-based)
+                        btc_price = btc_filter.btc_price
+                        if btc_price and btc_price > 0:
+                            _regime_src = 'btc_filter'
+                    if btc_price and btc_price > 0:
+                        market_regime_detector.update_btc_price(btc_price, source=_regime_src)
+                        # Per-cycle regime detection — keeps lastUpdate fresh
                         market_regime_detector.detect_regime()
                     else:
                         logger.debug(f"⚠️ REGIME_SKIP_NO_BTC_PRICE: btc_price={btc_price}")
@@ -14922,7 +14937,7 @@ async def background_scanner_loop():
                         # Phase 53: Update market regime with BTC price
                         btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
                         if btc_opp:
-                            market_regime_detector.update_btc_price(btc_opp.get('currentPrice', 0))
+                            market_regime_detector.update_btc_price(btc_opp.get('currentPrice', 0), source='optimizer')
                         regime = market_regime_detector.detect_regime()
                         regime_params = market_regime_detector.get_regime_params()
                         
@@ -22246,15 +22261,26 @@ class MarketRegimeDetector:
         self.max_history = 100
         logger.info("📊 MarketRegimeDetector initialized with Direction Awareness")
     
-    def update_btc_price(self, price: float):
-        """BTC fiyatını kaydet."""
+    def update_btc_price(self, price: float, source: str = 'unknown') -> bool:
+        """BTC fiyatını kaydet — 30s throttle veya %0.05 fiyat değişimi şartı."""
+        now = datetime.now(timezone.utc)
+        if self.btc_prices:
+            last = self.btc_prices[-1]
+            elapsed = (now - last['time']).total_seconds()
+            price_change_pct = abs(price - last['price']) / last['price'] * 100 if last['price'] > 0 else 999
+            if elapsed < 30 and price_change_pct < 0.05:
+                # Throttle: skip this sample
+                logger.debug(f"REGIME_SAMPLE_SKIPPED: elapsed={elapsed:.0f}s change={price_change_pct:.3f}% src={source}")
+                return False
         self.btc_prices.append({
             'price': price,
-            'time': datetime.now()
+            'time': now
         })
-        # Son 24 saat tut (1440 dakika, her 5dk'da 1 kayıt = 288 kayıt)
-        if len(self.btc_prices) > 300:
-            self.btc_prices = self.btc_prices[-300:]
+        # Son 24 saat tut (1440 dakika, throttle ile ~2/dk = ~2880; cap 500)
+        if len(self.btc_prices) > 500:
+            self.btc_prices = self.btc_prices[-500:]
+        logger.debug(f"REGIME_INPUT_SOURCE={source} price={price:.1f} samples={len(self.btc_prices)}")
+        return True
     
     def detect_regime(self) -> str:
         """Piyasa durumunu algıla."""
@@ -22311,7 +22337,7 @@ class MarketRegimeDetector:
             self.regime_history.append({
                 'from': self.current_regime,
                 'to': regime,
-                'time': datetime.now().isoformat(),
+                'time': datetime.now(timezone.utc).isoformat(),
                 'volatility': volatility,
                 'trend_strength': trend_strength,
                 'trend_direction': self.trend_direction
@@ -22320,7 +22346,7 @@ class MarketRegimeDetector:
                 self.regime_history = self.regime_history[-self.max_history:]
         
         self.current_regime = regime
-        self.last_update = datetime.now()
+        self.last_update = datetime.now(timezone.utc)
         
         return regime
     
@@ -22386,13 +22412,15 @@ class MarketRegimeDetector:
         # Stale watchdog: warn if regime hasn't been updated in >90s
         _stale_sec = 999
         if self.last_update:
-            _stale_sec = (datetime.now() - self.last_update).total_seconds()
+            _stale_sec = (datetime.now(timezone.utc) - self.last_update).total_seconds()
             if _stale_sec > 90:
                 logger.warning(f"⚠️ REGIME_STALE: lastUpdate {_stale_sec:.0f}s ago")
+        _last_update_ms = int(self.last_update.timestamp() * 1000) if self.last_update else None
         return {
             'currentRegime': self.current_regime,
             'trendDirection': self.trend_direction,
             'lastUpdate': self.last_update.isoformat() if self.last_update else None,
+            'lastUpdateMs': _last_update_ms,
             'staleSec': round(_stale_sec, 1),
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),

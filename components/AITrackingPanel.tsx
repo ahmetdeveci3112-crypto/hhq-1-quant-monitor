@@ -42,6 +42,7 @@ interface MarketRegime {
     currentRegime: string;
     trendDirection?: string;
     lastUpdate: string | null;
+    lastUpdateMs?: number | null;
     priceCount: number;
     params: {
         min_score_adjustment: number;
@@ -149,7 +150,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                 <div className="text-center">
                                     <div className="text-[10px] text-slate-500 uppercase">BTC Yönü</div>
                                     <div className={`text-sm font-bold ${marketRegime.trendDirection === 'UP' ? 'text-emerald-400' :
-                                            marketRegime.trendDirection === 'DOWN' ? 'text-rose-400' : 'text-slate-400'
+                                        marketRegime.trendDirection === 'DOWN' ? 'text-rose-400' : 'text-slate-400'
                                         }`}>
                                         {marketRegime.trendDirection === 'UP' ? '▲ YUKARI' :
                                             marketRegime.trendDirection === 'DOWN' ? '▼ AŞAĞI' : '— NÖTR'}
@@ -182,7 +183,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                     <div className="flex items-center justify-between mt-2">
                         {marketRegime.lastUpdate && (
                             <div className="text-[10px] text-slate-500">
-                                Son: {new Date(marketRegime.lastUpdate).toLocaleTimeString('tr-TR')} | {marketRegime.priceCount} fiyat
+                                Son: {(() => { const ms = marketRegime.lastUpdateMs; const d = ms ? new Date(ms) : new Date(marketRegime.lastUpdate!); return d.toLocaleTimeString('tr-TR', { timeZone: 'Europe/Istanbul', hour: '2-digit', minute: '2-digit', second: '2-digit' }); })()} | {marketRegime.priceCount} fiyat
                             </div>
                         )}
                         {/* Recent regime change */}
