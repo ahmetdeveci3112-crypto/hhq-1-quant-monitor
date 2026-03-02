@@ -8294,6 +8294,12 @@ EV_HARD_THRESHOLD = float(os.environ.get('EV_HARD_THRESHOLD', '-0.01'))    # bel
 EV_HARD_BLOCK_ENABLED = os.environ.get('EV_HARD_BLOCK_ENABLED', 'false').lower() == 'true'
 EV_SOFT_PENALTY_FACTOR = float(os.environ.get('EV_SOFT_PENALTY_FACTOR', '0.7'))  # multiply score/size by this
 
+# DCA-1: Dual-Confirmation Alignment Gate
+DUAL_REGIME_GATE_ENABLED = os.environ.get('DUAL_REGIME_GATE_ENABLED', 'true').lower() == 'true'
+DUAL_REGIME_CONFLICT_MODE = os.environ.get('DUAL_REGIME_CONFLICT_MODE', 'block')  # block | soft
+DUAL_REGIME_MIN_CONF = float(os.environ.get('DUAL_REGIME_MIN_CONF', '0.60'))
+DUAL_REGIME_SHADOW = os.environ.get('DUAL_REGIME_SHADOW', 'false').lower() == 'true'  # true=log-only
+
 # MF-1: Market Fallback Edge Gate
 FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'enforce').lower()  # 'off' | 'shadow' | 'enforce'  # Phase B: enforce active
 FALLBACK_MIN_NET_EDGE = float(os.environ.get('FALLBACK_MIN_NET_EDGE', '0.0008'))       # absolute minimum edge
@@ -14786,6 +14792,23 @@ async def background_scanner_loop():
                                 leverage=float(pos.get('leverage', 10)),
                             )
                             
+                            # DCA-1: Regime drift trail tightening
+                            if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
+                                try:
+                                    _drift_fast_dir = market_regime_detector.fast_trend_direction
+                                    _drift_struct_dir = market_regime_detector.struct_trend_direction
+                                    _drift_side = pos.get('side', 'LONG')
+                                    _drift_opposes_fast = (_drift_side == 'LONG' and _drift_fast_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_fast_dir == 'UP')
+                                    _drift_opposes_struct = (_drift_side == 'LONG' and _drift_struct_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_struct_dir == 'UP')
+                                    _pre_trail = dynamic_trail_distance
+                                    if _drift_opposes_fast and _drift_opposes_struct:
+                                        dynamic_trail_distance *= 0.70
+                                        logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {pos_symbol} {_drift_side} source=STRUCT_REVERSAL pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+                                    elif _drift_opposes_fast:
+                                        dynamic_trail_distance *= 0.85
+                                        logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {pos_symbol} {_drift_side} source=FAST_ONLY pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+                                except Exception:
+                                    pass
                             # Phase 231d: Dynamic trail activation threshold (ATR + spread + volume)
                             leverage = pos.get('leverage', 10)
                             if pos['side'] == 'LONG':
@@ -15282,6 +15305,24 @@ async def on_position_price_update(symbol: str, ticker: dict):
             adx=pos.get('adx', 20.0),
             leverage=float(pos.get('leverage', 10)),
         )
+        
+        # DCA-1: Regime drift trail tightening (WS path)
+        if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
+            try:
+                _drift_fast_dir = market_regime_detector.fast_trend_direction
+                _drift_struct_dir = market_regime_detector.struct_trend_direction
+                _drift_side = pos.get('side', 'LONG')
+                _drift_opposes_fast = (_drift_side == 'LONG' and _drift_fast_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_fast_dir == 'UP')
+                _drift_opposes_struct = (_drift_side == 'LONG' and _drift_struct_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_struct_dir == 'UP')
+                _pre_trail = dynamic_trail_distance
+                if _drift_opposes_fast and _drift_opposes_struct:
+                    dynamic_trail_distance *= 0.70
+                    logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=STRUCT_REVERSAL pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+                elif _drift_opposes_fast:
+                    dynamic_trail_distance *= 0.85
+                    logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=FAST_ONLY pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+            except Exception:
+                pass
         threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
             ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage, threshold_mult=threshold_mult
@@ -15518,6 +15559,24 @@ async def position_price_update_loop():
                             adx=pos.get('adx', 20.0),
                             leverage=float(pos.get('leverage', 10)),
                         )
+                        
+                        # DCA-1: Regime drift trail tightening (fast WS path)
+                        if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
+                            try:
+                                _drift_fast_dir = market_regime_detector.fast_trend_direction
+                                _drift_struct_dir = market_regime_detector.struct_trend_direction
+                                _drift_side = pos.get('side', 'LONG')
+                                _drift_opposes_fast = (_drift_side == 'LONG' and _drift_fast_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_fast_dir == 'UP')
+                                _drift_opposes_struct = (_drift_side == 'LONG' and _drift_struct_dir == 'DOWN') or (_drift_side == 'SHORT' and _drift_struct_dir == 'UP')
+                                _pre_trail = dynamic_trail_distance
+                                if _drift_opposes_fast and _drift_opposes_struct:
+                                    dynamic_trail_distance *= 0.70
+                                    logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=STRUCT_REVERSAL pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+                                elif _drift_opposes_fast:
+                                    dynamic_trail_distance *= 0.85
+                                    logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=FAST_ONLY pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
+                            except Exception:
+                                pass
                         threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
                             fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage, threshold_mult=threshold_mult
@@ -16574,62 +16633,119 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         logger.debug(f"OBI filter error for {symbol}: {obi_err}")
     
     # =====================================================
-    # Phase 60 + DRU-1: MARKET REGIME FILTER (fast regime)
-    # Fast window yön kararı → entry block/bonus/penalty
+    # Phase 60 + DRU-1 + DCA-1: MARKET REGIME FILTER
+    # When DCA enabled: skip score/size mutate → delegate to DCA gate
+    # When DCA disabled: legacy Phase 60 behavior
     # =====================================================
     try:
         _entry_regime = market_regime_detector.fast_regime
         _entry_dir = market_regime_detector.fast_trend_direction
         _struct_regime = market_regime_detector.struct_regime
+        _struct_dir = market_regime_detector.struct_trend_direction
         regime_params = market_regime_detector.get_regime_params()
         _regime_action = 'PASS'
         
-        # TRENDING_DOWN durumunda LONG sinyallere ağır penalty
-        if _entry_regime == "TRENDING_DOWN" and action == "LONG":
-            long_penalty = regime_params.get('long_penalty', 0.5)
-            
-            if long_penalty >= 0.5:
-                signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                reject_feedback("REGIME_BLOCKED:TRENDING_DOWN")
-                _regime_action = 'BLOCK'
-                logger.info(f"🚫 REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BLOCK")
-                return
-            else:
+        if DUAL_REGIME_GATE_ENABLED:
+            # DCA-1: Phase 60 delegates — no score/size mutation here
+            logger.info(f"🔀 REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime}({_entry_dir}) struct={_struct_regime}({_struct_dir}) action=DELEGATED_TO_DCA")
+            _regime_action = 'DELEGATED_TO_DCA'
+        else:
+            # Legacy Phase 60 behavior (DCA disabled)
+            if _entry_regime == "TRENDING_DOWN" and action == "LONG":
+                long_penalty = regime_params.get('long_penalty', 0.5)
+                if long_penalty >= 0.5:
+                    signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback("REGIME_BLOCKED:TRENDING_DOWN")
+                    _regime_action = 'BLOCK'
+                    logger.info(f"🚫 REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BLOCK")
+                    return
+                else:
+                    original_score = signal.get('confidenceScore', 60)
+                    penalty_amount = int(original_score * long_penalty)
+                    signal['confidenceScore'] = max(40, original_score - penalty_amount)
+                    signal['regime_adjustment'] = f"TRENDING_DOWN penalty -{penalty_amount}"
+                    _regime_action = 'PENALTY'
+                    logger.info(f"⚠️ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PENALTY score-={penalty_amount}")
+            elif _entry_regime == "TRENDING_UP" and action == "SHORT":
+                short_penalty = regime_params.get('short_penalty', 0.2)
                 original_score = signal.get('confidenceScore', 60)
-                penalty_amount = int(original_score * long_penalty)
+                penalty_amount = int(original_score * short_penalty)
                 signal['confidenceScore'] = max(40, original_score - penalty_amount)
-                signal['regime_adjustment'] = f"TRENDING_DOWN penalty -{penalty_amount}"
+                signal['regime_adjustment'] = f"TRENDING_UP penalty -{penalty_amount}"
                 _regime_action = 'PENALTY'
                 logger.info(f"⚠️ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PENALTY score-={penalty_amount}")
-        
-        # TRENDING_UP durumunda SHORT sinyallere uyarı
-        elif _entry_regime == "TRENDING_UP" and action == "SHORT":
-            short_penalty = regime_params.get('short_penalty', 0.2)
-            original_score = signal.get('confidenceScore', 60)
-            penalty_amount = int(original_score * short_penalty)
-            signal['confidenceScore'] = max(40, original_score - penalty_amount)
-            signal['regime_adjustment'] = f"TRENDING_UP penalty -{penalty_amount}"
-            _regime_action = 'PENALTY'
-            logger.info(f"⚠️ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PENALTY score-={penalty_amount}")
-        
-        # TRENDING_UP + LONG veya TRENDING_DOWN + SHORT = bonus
-        elif (_entry_regime == "TRENDING_UP" and action == "LONG"):
-            long_bonus = regime_params.get('long_bonus', 0.15)
-            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + long_bonus)
-            signal['regime_adjustment'] = f"TRENDING_UP bonus +{int(long_bonus*100)}%"
-            _regime_action = 'BONUS'
-            logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(long_bonus*100)}%")
-        elif (_entry_regime == "TRENDING_DOWN" and action == "SHORT"):
-            short_bonus = regime_params.get('short_bonus', 0.2)
-            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + short_bonus)
-            signal['regime_adjustment'] = f"TRENDING_DOWN bonus +{int(short_bonus*100)}%"
-            _regime_action = 'BONUS'
-            logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(short_bonus*100)}%")
-        else:
-            logger.debug(f"REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PASS")
+            elif (_entry_regime == "TRENDING_UP" and action == "LONG"):
+                long_bonus = regime_params.get('long_bonus', 0.15)
+                signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + long_bonus)
+                signal['regime_adjustment'] = f"TRENDING_UP bonus +{int(long_bonus*100)}%"
+                _regime_action = 'BONUS'
+                logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(long_bonus*100)}%")
+            elif (_entry_regime == "TRENDING_DOWN" and action == "SHORT"):
+                short_bonus = regime_params.get('short_bonus', 0.2)
+                signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * (1 + short_bonus)
+                signal['regime_adjustment'] = f"TRENDING_DOWN bonus +{int(short_bonus*100)}%"
+                _regime_action = 'BONUS'
+                logger.info(f"✅ REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BONUS size+={int(short_bonus*100)}%")
+            else:
+                logger.debug(f"REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=PASS")
     except Exception as regime_err:
         logger.debug(f"Market Regime Filter error: {regime_err}")
+    
+    # =====================================================
+    # DCA-1: DUAL-CONFIRMATION ALIGNMENT GATE
+    # Single authority entry decision when enabled
+    # =====================================================
+    if DUAL_REGIME_GATE_ENABLED:
+        try:
+            _fast_conf = market_regime_detector.fast_confidence
+            _struct_conf = market_regime_detector.struct_confidence
+            
+            _dca = compute_dual_regime_alignment(
+                signal_side=action,
+                fast_regime=_entry_regime, fast_dir=_entry_dir, fast_conf=_fast_conf,
+                struct_regime=_struct_regime, struct_dir=_struct_dir, struct_conf=_struct_conf,
+            )
+            
+            _dca_decision = _dca['decision']
+            _dca_align = _dca['alignment']
+            _dca_reason = _dca['reason_code']
+            
+            if _dca_decision == 'BLOCK':
+                if DUAL_REGIME_SHADOW:
+                    # Shadow mode: log but don't enforce
+                    logger.warning(f"👻 DUAL_REGIME_SHADOW_MISS: {action} {symbol} align={_dca_align} reason={_dca_reason} | Would have blocked")
+                else:
+                    # Enforce: reject signal
+                    signal_log_data['reject_reason'] = f'REGIME_CONFLICT_BLOCK:{_dca_reason}'
+                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    reject_feedback(f"REGIME_CONFLICT_BLOCK:{_dca_reason}")
+                    logger.warning(f"🚫 DUAL_REGIME_BLOCK: {action} {symbol} align={_dca_align} fast={_entry_regime}({_entry_dir}) struct={_struct_regime}({_struct_dir}) reason={_dca_reason}")
+                    return
+            else:
+                # Apply adjustments (score, size, leverage)
+                _pre_score = signal.get('confidenceScore', 60)
+                _pre_size = signal.get('sizeMultiplier', 1.0)
+                _pre_lev = int(signal.get('leverage', 10) or 10)
+                
+                if not DUAL_REGIME_SHADOW:
+                    signal['confidenceScore'] = max(40, min(95, _pre_score + _dca['score_adj']))
+                    signal['sizeMultiplier'] = max(0.4, min(1.3, _pre_size * _dca['size_mult']))
+                    _new_lev = max(3, min(75, int(_pre_lev * _dca['lev_mult'])))
+                    signal['leverage'] = _new_lev
+                    signal['regime_adjustment'] = f"DCA:{_dca_decision} score{'+' if _dca['score_adj']>=0 else ''}{_dca['score_adj']} size×{_dca['size_mult']:.2f} lev×{_dca['lev_mult']:.2f}"
+                
+                logger.info(
+                    f"📐 DUAL_REGIME_DECISION: {action} {symbol} "
+                    f"align={_dca_align} decision={_dca_decision} "
+                    f"fast={_entry_regime}({_entry_dir},{_fast_conf:.2f}) "
+                    f"struct={_struct_regime}({_struct_dir},{_struct_conf:.2f}) "
+                    f"score_adj={_dca['score_adj']} size_mult={_dca['size_mult']:.2f} lev_mult={_dca['lev_mult']:.2f} "
+                    f"reason={_dca_reason}"
+                    f"{' [SHADOW]' if DUAL_REGIME_SHADOW else ''}"
+                )
+        except Exception as dca_err:
+            logger.debug(f"DCA-1 gate error: {dca_err}")
     
     # ================================================================
     # Phase 215: MA ALIGNMENT HARD VETO
@@ -22548,6 +22664,103 @@ class MarketRegimeDetector:
 
 # Global Market Regime instance
 market_regime_detector = MarketRegimeDetector()
+
+
+# ============================================================================
+# DCA-1: DUAL-CONFIRMATION ALIGNMENT GATE — HELPER
+# ============================================================================
+def compute_dual_regime_alignment(
+    signal_side: str,
+    fast_regime: str, fast_dir: str, fast_conf: float,
+    struct_regime: str, struct_dir: str, struct_conf: float,
+    min_conf: float = None,
+) -> dict:
+    """Compute alignment between fast/struct regime windows and signal direction.
+    
+    Returns dict with:
+      alignment:   ALIGNED | NEUTRAL | CONFLICT
+      score_adj:   int  (additive to confidenceScore)
+      size_mult:   float (multiplicative to sizeMultiplier)
+      lev_mult:    float (multiplicative to leverage)
+      decision:    STRONG_ALLOW | SOFT_ALLOW | SOFT_ALLOW_LOW_RISK | BLOCK
+      reason_code: short code for telemetry
+    """
+    if min_conf is None:
+        min_conf = DUAL_REGIME_MIN_CONF
+    
+    # Determine if each window's direction supports the signal
+    def _dir_supports(direction: str, side: str) -> bool:
+        if side == 'LONG':
+            return direction == 'UP'
+        else:  # SHORT
+            return direction == 'DOWN'
+    
+    def _dir_opposes(direction: str, side: str) -> bool:
+        if side == 'LONG':
+            return direction == 'DOWN'
+        else:  # SHORT
+            return direction == 'UP'
+    
+    fast_supports = _dir_supports(fast_dir, signal_side)
+    fast_opposes = _dir_opposes(fast_dir, signal_side)
+    struct_supports = _dir_supports(struct_dir, signal_side)
+    struct_opposes = _dir_opposes(struct_dir, signal_side)
+    
+    # --- ALIGNED: both windows support signal ---
+    if fast_supports and struct_supports:
+        _min_c = min(fast_conf, struct_conf)
+        if _min_c >= min_conf:
+            return {
+                'alignment': 'ALIGNED',
+                'score_adj': 10,
+                'size_mult': max(0.4, min(1.3, 1.15)),
+                'lev_mult': max(0.7, min(1.2, 1.10)),
+                'decision': 'STRONG_ALLOW',
+                'reason_code': f'ALIGNED_CONF_{_min_c:.2f}',
+            }
+        else:
+            # Aligned but low confidence — treat as neutral
+            return {
+                'alignment': 'ALIGNED',
+                'score_adj': 5,
+                'size_mult': 1.05,
+                'lev_mult': 1.0,
+                'decision': 'SOFT_ALLOW',
+                'reason_code': f'ALIGNED_LOW_CONF_{_min_c:.2f}',
+            }
+    
+    # --- CONFLICT: at least one window opposes signal ---
+    if fast_opposes or struct_opposes:
+        if DUAL_REGIME_CONFLICT_MODE == 'soft':
+            # Soft mode: allow with heavy penalty
+            return {
+                'alignment': 'CONFLICT',
+                'score_adj': -8,
+                'size_mult': max(0.4, min(1.3, 0.50)),
+                'lev_mult': max(0.7, min(1.2, 0.80)),
+                'decision': 'SOFT_ALLOW_LOW_RISK',
+                'reason_code': f'CONFLICT_SOFT_f={fast_dir}_s={struct_dir}',
+            }
+        else:
+            # Block mode (default)
+            return {
+                'alignment': 'CONFLICT',
+                'score_adj': 0,
+                'size_mult': 1.0,
+                'lev_mult': 1.0,
+                'decision': 'BLOCK',
+                'reason_code': f'CONFLICT_BLOCK_f={fast_dir}_s={struct_dir}',
+            }
+    
+    # --- NEUTRAL: no clear alignment or opposition ---
+    return {
+        'alignment': 'NEUTRAL',
+        'score_adj': 0,
+        'size_mult': 1.0,
+        'lev_mult': 1.0,
+        'decision': 'SOFT_ALLOW',
+        'reason_code': 'NEUTRAL',
+    }
 
 
 # ============================================================================
