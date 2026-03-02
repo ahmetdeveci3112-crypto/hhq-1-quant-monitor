@@ -8292,11 +8292,11 @@ FALLBACK_EDGE_SPREAD_HARD_BLOCK_BPS = float(os.environ.get('FALLBACK_EDGE_SPREAD
 FALLBACK_EDGE_DEPTH_HARD_BLOCK_USD = float(os.environ.get('FALLBACK_EDGE_DEPTH_HARD_BLOCK_USD', '5000'))
 
 # RMP-1: TP Cost-Floor Guard
-TP_COST_FLOOR_MODE = os.environ.get('TP_COST_FLOOR_MODE', 'shadow').lower()  # shadow|enforce|off
+TP_COST_FLOOR_MODE = os.environ.get('TP_COST_FLOOR_MODE', 'enforce').lower()  # shadow|enforce|off
 TP_COST_FLOOR_MAX_DELAY_SEC = float(os.environ.get('TP_COST_FLOOR_MAX_DELAY_SEC', '45'))  # max TP hold after first hit
 
 # RMP-1: Portfolio Cluster Cap
-RMP_CLUSTER_CAP_MODE = os.environ.get('RMP_CLUSTER_CAP_MODE', 'shadow').lower()  # shadow|enforce|off
+RMP_CLUSTER_CAP_MODE = os.environ.get('RMP_CLUSTER_CAP_MODE', 'enforce').lower()  # shadow|enforce|off
 RMP_CLUSTER_CAP_PCT = float(os.environ.get('RMP_CLUSTER_CAP_PCT', '0.40'))  # 40% of balance per cluster+direction
 COIN_CLUSTER_MAP = {
     'BTCUSDT': 'major', 'ETHUSDT': 'major', 'BNBUSDT': 'major', 'SOLUSDT': 'major',
