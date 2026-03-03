@@ -7724,6 +7724,15 @@ def compute_sl_tp_levels(
             )
             logger.debug(f"RFX_SL_TP_V2: {symbol} {side} profile={RFX_RISK_PROFILE} parity={RFX_PARITY_MODE} "
                          f"sl={_v2_result['sl']:.6f} tp={_v2_result['tp']:.6f} src={_v2_result['meta']}")
+            # RFX-2B: Enrich v2 result with distance_truth (must not return without it)
+            try:
+                _v2_result['distance_truth'] = rfx_build_distance_truth(
+                    entry_price=entry_price, sl=_v2_result['sl'],
+                    tp=_v2_result['tp'], trail_distance=_v2_result['trail_distance'],
+                    side=side, leverage=safe_lev, meta=_v2_result.get('meta'),
+                )
+            except Exception:
+                _v2_result['distance_truth'] = {}
             return _v2_result
         except Exception as _rfx_e:
             logger.warning(f"RFX_SL_TP_V2 fallback to legacy: {_rfx_e}")
@@ -7791,7 +7800,7 @@ def compute_sl_tp_levels(
     except Exception:
         pass
     
-    return {
+    _result = {
         'sl': sl,
         'tp': tp,
         'trail_activation': trail_activation,
@@ -7810,6 +7819,16 @@ def compute_sl_tp_levels(
             'tick_size': tick,
         }
     }
+    # RFX-2B: Enrich legacy result with distance_truth
+    try:
+        _result['distance_truth'] = rfx_build_distance_truth(
+            entry_price=entry_price, sl=sl, tp=tp,
+            trail_distance=trail_distance, side=side,
+            leverage=safe_lev, meta=_result['meta'],
+        )
+    except Exception:
+        _result['distance_truth'] = {}
+    return _result
 
 
 # =========================================================================
@@ -8419,6 +8438,7 @@ try:
         should_set_breakeven as rfx_should_set_breakeven,
         compute_order_impact as rfx_compute_order_impact,
         DepthImpact as RFX_DepthImpact,
+        build_distance_truth as rfx_build_distance_truth,
     )
     from exit import (
         ExitStateMachine as RFX_ExitStateMachine,
@@ -27752,6 +27772,8 @@ class PaperTradingEngine:
             "signalLeverageEffective": adjusted_leverage,
             "leverageCapApplied": signal.get('leverageCapApplied', False) if signal else False,
             "leverageCapReason": signal.get('leverageCapReason', '') if signal else '',
+            # RFX-2B: Distance truth telemetry
+            "distance_truth": _levels.get('distance_truth', {}),
         }
         
         self.pending_orders.append(pending_order)
@@ -28621,6 +28643,8 @@ class PaperTradingEngine:
             # RFX-1D: Truth snapshot + regime adjustment propagation
             "truth_snapshot": order.get('truth_snapshot', {}),
             "regime_adjustment": order.get('regime_adjustment', ''),
+            # RFX-2B: Distance truth telemetry (recalculated at fill)
+            "distance_truth": _levels.get('distance_truth', order.get('distance_truth', {})),
         }
         
         # Phase 250: Compute adaptive TP ladder at fill time and lock to position
@@ -30105,6 +30129,8 @@ class PaperTradingEngine:
             # RFX-1D: Truth snapshot + regime adjustment propagation
             "truth_snapshot": signal.get('truth_snapshot', {}),
             "regime_adjustment": signal.get('regime_adjustment', ''),
+            # RFX-2B: Distance truth telemetry
+            "distance_truth": signal.get('distance_truth', {}),
         }
         
         # Paper Trading: Initial Margin = marginUsd (authoritative), fallback sizeUsd/leverage
@@ -30651,6 +30677,8 @@ class PaperTradingEngine:
                 'roi_pct': round((pnl / initial_margin * 100), 2) if initial_margin > 0 else 0,
                 'spreadLevel': pos.get('spreadLevel', 'unknown'),
                 'isTrailingActive': pos.get('isTrailingActive', False),
+                # RFX-2B: Distance truth snapshot at close
+                'distance_truth': pos.get('distance_truth', {}),
             }),
         }
         
@@ -32417,6 +32445,7 @@ async def paper_trading_status():
             "expiresAt": o.get("expiresAt", 0),
             "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
             "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
+            "distanceTruth": o.get("distance_truth", {}),  # RFX-2B
         }
         for o in global_paper_trader.pending_orders
     ]
@@ -33153,6 +33182,7 @@ async def paper_trading_get_settings():
             "expiresAt": o.get("expiresAt", 0),
             "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
             "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
+            "distanceTruth": o.get("distance_truth", {}),  # RFX-2B
         }
         for o in global_paper_trader.pending_orders
     ]
