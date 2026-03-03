@@ -28424,28 +28424,68 @@ class PaperTradingEngine:
         # Phase 250: Compute adaptive TP ladder at fill time and lock to position
         if TP_LADDER_ADAPTIVE_ENABLED:
             try:
-                _tp_ladder = compute_adaptive_tp_ladder(
-                    side=side,
-                    entry_price=fill_price,
-                    atr=atr,
-                    leverage=order['leverage'],
-                    spread_pct=order.get('spreadPct', 0.05),
-                    volume_ratio=order.get('volumeRatio', 1.0),
-                    adx=order.get('adx', 25.0),
-                    hurst=order.get('hurst', 0.50),
-                    coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
-                    exec_score=order.get('entryExecScore', 70.0),
-                    spread_level=order.get('spreadLevel', 'Normal'),
-                )
-                new_position['tp_ladder_levels'] = _tp_ladder['levels']
-                new_position['tp_ladder_version'] = _tp_ladder['version']
-                new_position['tp_ladder_anchor_entry'] = fill_price
-                # Phase 253: Immutable anchor levels — runtime TP always derived from these
-                import copy
-                new_position['tp_ladder_anchor_levels'] = copy.deepcopy(_tp_ladder['levels'])
-                new_position['tp_ladder_runtime_mult'] = 1.0
-                new_position['tp_ladder_state'] = {}
-                new_position['tp_ladder_telemetry'] = _tp_ladder['telemetry']
+                # ── RFX-1B: 4-tier TP ladder with TP_FINAL + monotonic ──
+                if RFX1B_TP_LADDER_V2 and _RFX_MODULES_AVAILABLE:
+                    _tick = get_tick_size(symbol)
+                    _risk_params_tp = None
+                    try:
+                        _rp_enum_tp = RFX_RiskProfile(RFX_RISK_PROFILE)
+                        _risk_params_tp = rfx_resolve_risk_params(_rp_enum_tp, order['leverage'])
+                    except Exception:
+                        pass
+                    _tp_ladder = rfx_compute_tp_ladder_v2(
+                        entry_price=fill_price,
+                        atr=atr,
+                        side=side,
+                        leverage=order['leverage'],
+                        tick_size=_tick,
+                        spread_pct=order.get('spreadPct', 0.05),
+                        risk_params=_risk_params_tp,
+                        adx=order.get('adx', 25.0),
+                        hurst=order.get('hurst', 0.50),
+                        volume_ratio=order.get('volumeRatio', 1.0),
+                        coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                        exec_score=order.get('entryExecScore', 70.0),
+                        spread_level=order.get('spreadLevel', 'Normal'),
+                    )
+                    new_position['tp_ladder_levels'] = _tp_ladder['levels']
+                    new_position['tp_ladder_version'] = _tp_ladder['version']
+                    new_position['tp_ladder_anchor_entry'] = fill_price
+                    import copy
+                    new_position['tp_ladder_anchor_levels'] = copy.deepcopy(_tp_ladder['levels'])
+                    new_position['tp_ladder_runtime_mult'] = 1.0
+                    new_position['tp_ladder_state'] = {}
+                    new_position['tp_ladder_telemetry'] = _tp_ladder['telemetry']
+                    new_position['tp_ladder_prices'] = _tp_ladder.get('prices', {})
+                    logger.info(
+                        f"📊 RFX1B_TP_LADDER: {side} entry={fill_price:.4f} "
+                        f"4-tier monotonic | tp_final_roi={_tp_ladder['telemetry'].get('tp_final_target_roi', '?')}% "
+                        f"epsilon_fixes={_tp_ladder['telemetry'].get('epsilon_fixes', 0)}"
+                    )
+                else:
+                    # ── Legacy 3-tier ladder ──
+                    _tp_ladder = compute_adaptive_tp_ladder(
+                        side=side,
+                        entry_price=fill_price,
+                        atr=atr,
+                        leverage=order['leverage'],
+                        spread_pct=order.get('spreadPct', 0.05),
+                        volume_ratio=order.get('volumeRatio', 1.0),
+                        adx=order.get('adx', 25.0),
+                        hurst=order.get('hurst', 0.50),
+                        coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                        exec_score=order.get('entryExecScore', 70.0),
+                        spread_level=order.get('spreadLevel', 'Normal'),
+                    )
+                    new_position['tp_ladder_levels'] = _tp_ladder['levels']
+                    new_position['tp_ladder_version'] = _tp_ladder['version']
+                    new_position['tp_ladder_anchor_entry'] = fill_price
+                    # Phase 253: Immutable anchor levels — runtime TP always derived from these
+                    import copy
+                    new_position['tp_ladder_anchor_levels'] = copy.deepcopy(_tp_ladder['levels'])
+                    new_position['tp_ladder_runtime_mult'] = 1.0
+                    new_position['tp_ladder_state'] = {}
+                    new_position['tp_ladder_telemetry'] = _tp_ladder['telemetry']
             except Exception as tp_err:
                 logger.warning(f"⚠️ TP_LADDER compute error: {tp_err}, will use legacy")
         # =====================================================================

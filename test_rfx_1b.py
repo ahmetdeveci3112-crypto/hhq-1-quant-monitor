@@ -465,3 +465,68 @@ class TestMainPyFlags:
         d = sm.evaluate(ctx)
         assert d.action == ExitAction.CLOSE_EMERGENCY
         assert sm.is_terminal
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 6: TP Ladder V2 Entry Path Regression
+# ═══════════════════════════════════════════════════════════════════
+
+class TestTPLadderEntryPath:
+    """Regression: TP_FINAL must exist in ladder when RFX1B_TP_LADDER_V2=true."""
+
+    def test_v2_ladder_has_tp_final(self):
+        """compute_tp_ladder_v2 output contains tp_final level."""
+        result = compute_tp_ladder_v2(65000, 1200, 'LONG', 10, tick_size=0.01)
+        keys = [lv['key'] for lv in result['levels']]
+        assert 'tp_final' in keys, f"tp_final missing from ladder keys: {keys}"
+        assert len(keys) == 4, f"Expected 4 tiers, got {len(keys)}: {keys}"
+
+    def test_v2_ladder_has_tp_final_price(self):
+        """compute_tp_ladder_v2 output contains tp_final in prices dict."""
+        result = compute_tp_ladder_v2(65000, 1200, 'LONG', 10, tick_size=0.01)
+        assert 'tp_final' in result['prices'], "tp_final missing from prices dict"
+        assert result['prices']['tp_final'] > 0
+
+    def test_entry_path_simulation_v2(self):
+        """Simulate entry-path adapter: position gets 4-tier ladder with tp_final."""
+        # This simulates what main.py does at position creation
+        ladder = compute_tp_ladder_v2(
+            entry_price=65000, atr=1200, side='LONG', leverage=10,
+            tick_size=0.01, spread_pct=0.05,
+        )
+        # Simulate position dict population
+        new_position = {}
+        new_position['tp_ladder_levels'] = ladder['levels']
+        new_position['tp_ladder_prices'] = ladder.get('prices', {})
+        new_position['tp_ladder_telemetry'] = ladder['telemetry']
+
+        # Assert tp_final is present in the position's ladder
+        level_keys = [lv['key'] for lv in new_position['tp_ladder_levels']]
+        assert 'tp_final' in level_keys, f"tp_final missing from position ladder: {level_keys}"
+        assert 'tp_final' in new_position['tp_ladder_prices']
+        assert new_position['tp_ladder_prices']['tp_final'] > 65000  # LONG → above entry
+
+    def test_entry_path_simulation_short(self):
+        """SHORT simulation: tp_final price below entry."""
+        ladder = compute_tp_ladder_v2(
+            entry_price=65000, atr=1200, side='SHORT', leverage=10,
+            tick_size=0.01, spread_pct=0.05,
+        )
+        new_position = {}
+        new_position['tp_ladder_levels'] = ladder['levels']
+        new_position['tp_ladder_prices'] = ladder.get('prices', {})
+
+        level_keys = [lv['key'] for lv in new_position['tp_ladder_levels']]
+        assert 'tp_final' in level_keys
+        assert new_position['tp_ladder_prices']['tp_final'] < 65000  # SHORT → below entry
+
+    def test_legacy_ladder_no_tp_final(self):
+        """Legacy compute_adaptive_tp_ladder has NO tp_final (3-tier only)."""
+        from main import compute_adaptive_tp_ladder
+        result = compute_adaptive_tp_ladder(
+            side='LONG', entry_price=65000, atr=1200, leverage=10,
+        )
+        keys = [lv['key'] for lv in result['levels']]
+        assert 'tp_final' not in keys, f"Legacy should NOT have tp_final: {keys}"
+        assert len(keys) == 3
+
