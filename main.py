@@ -8294,6 +8294,37 @@ DEFAULT_UNIVERSE_CAP = 200  # fallback when UNIVERSE_MAX_COINS <= 0 and ALLOW_AL
 # P0-1: ATR scale semantic migration
 ATR_SCALE_VERSION = os.environ.get('ATR_SCALE_VERSION', 'auto')  # auto | legacy_deci | direct
 
+# ═══════════════════════════════════════════════════════════════════
+# RFX-1A: Feature flags — all default OFF for zero behavioral change
+# ═══════════════════════════════════════════════════════════════════
+RFX_SL_TP_V2 = os.environ.get('RFX_SL_TP_V2', 'false').lower() == 'true'
+RFX_EMERGENCY_V2 = os.environ.get('RFX_EMERGENCY_V2', 'false').lower() == 'true'
+RFX_LIQUIDITY_NATIVE = os.environ.get('RFX_LIQUIDITY_NATIVE', 'false').lower() == 'true'
+RFX_EXIT_SM_ENABLED = os.environ.get('RFX_EXIT_SM_ENABLED', 'false').lower() == 'true'
+RFX_RISK_PROFILE = os.environ.get('RFX_RISK_PROFILE', 'BALANCED')  # BALANCED | AGGRESSIVE | ULTRA_AGGRESSIVE
+RFX_PARITY_MODE = os.environ.get('RFX_PARITY_MODE', 'true').lower() == 'true'  # When true, v2 produces v1-identical output
+
+# RFX-1A: Import risk modules (safe fallback if not available)
+_RFX_MODULES_AVAILABLE = False
+try:
+    from risk import (
+        LiquidityProfile as RFX_LiquidityProfile,
+        RiskProfile as RFX_RiskProfile,
+        resolve_risk_params as rfx_resolve_risk_params,
+        compute_sl_tp_levels_v2 as rfx_compute_sl_tp_levels_v2,
+        check_emergency as rfx_check_emergency,
+        compute_breakeven_buffer_pct as rfx_compute_breakeven_buffer_pct,
+        should_set_breakeven as rfx_should_set_breakeven,
+    )
+    from exit import ExitStateMachine as RFX_ExitStateMachine, ExitState as RFX_ExitState
+    _RFX_MODULES_AVAILABLE = True
+    logger.info(f"✅ RFX-1A modules loaded | SL_TP_V2={RFX_SL_TP_V2} EMERGENCY_V2={RFX_EMERGENCY_V2} "
+                f"LIQUIDITY_NATIVE={RFX_LIQUIDITY_NATIVE} EXIT_SM={RFX_EXIT_SM_ENABLED} "
+                f"PROFILE={RFX_RISK_PROFILE} PARITY={RFX_PARITY_MODE}")
+except ImportError as _rfx_err:
+    logger.warning(f"⚠️ RFX-1A modules not available: {_rfx_err} — using legacy paths")
+
+
 def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float:
     """Convert raw ATR setting to effective multiplier.
     auto: raw > 15 → legacy_deci (raw/10), else direct (raw).
