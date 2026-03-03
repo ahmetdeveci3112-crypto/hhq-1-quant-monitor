@@ -8363,7 +8363,15 @@ RFX1B_LEGACY_FALLBACK_ON_ERROR = os.environ.get('RFX1B_LEGACY_FALLBACK_ON_ERROR'
 _exit_inflight: set = set()
 _rfx1b_fallback_count: int = 0  # Metric: how many times legacy fallback triggered
 
-# RFX-1A/1B: Import risk modules (safe fallback if not available)
+# ═══════════════════════════════════════════════════════════════════
+# RFX-1C: Order-size-aware depth gate — default OFF
+# ═══════════════════════════════════════════════════════════════════
+RFX1C_DEPTH_GATE_MODE = os.environ.get('RFX1C_DEPTH_GATE_MODE', 'off')  # off | shadow | enforce
+RFX1C_MAX_IMPACT_PCT = float(os.environ.get('RFX1C_MAX_IMPACT_PCT', '0.10'))  # 10% max order-to-depth
+RFX1C_MIN_DEPTH_FLOOR_USD = float(os.environ.get('RFX1C_MIN_DEPTH_FLOOR_USD', '5000'))  # $5K absolute floor
+RFX1C_IMPACT_TELEMETRY_SAMPLE_RATE = float(os.environ.get('RFX1C_IMPACT_TELEMETRY_SAMPLE_RATE', '1.0'))
+
+# RFX-1A/1B/1C: Import risk modules (safe fallback if not available)
 _RFX_MODULES_AVAILABLE = False
 try:
     from risk import (
@@ -8375,6 +8383,8 @@ try:
         check_emergency as rfx_check_emergency,
         compute_breakeven_buffer_pct as rfx_compute_breakeven_buffer_pct,
         should_set_breakeven as rfx_should_set_breakeven,
+        compute_order_impact as rfx_compute_order_impact,
+        DepthImpact as RFX_DepthImpact,
     )
     from exit import (
         ExitStateMachine as RFX_ExitStateMachine,
@@ -8384,13 +8394,14 @@ try:
         ExitDecision as RFX_ExitDecision,
     )
     _RFX_MODULES_AVAILABLE = True
-    logger.info(f"✅ RFX-1A/1B modules loaded | SL_TP_V2={RFX_SL_TP_V2} EMERGENCY_V2={RFX_EMERGENCY_V2} "
+    logger.info(f"✅ RFX-1A/1B/1C modules loaded | SL_TP_V2={RFX_SL_TP_V2} EMERGENCY_V2={RFX_EMERGENCY_V2} "
                 f"LIQUIDITY_NATIVE={RFX_LIQUIDITY_NATIVE} EXIT_SM={RFX_EXIT_SM_ENABLED} "
                 f"1B_EXIT_WIRING={RFX1B_EXIT_WIRING} 1B_TRAIL_DUAL={RFX1B_TRAIL_DUAL} "
                 f"1B_BE_ON_TRAIL={RFX1B_BE_ON_TRAIL} 1B_TP_LADDER={RFX1B_TP_LADDER_V2} "
+                f"1C_DEPTH_GATE={RFX1C_DEPTH_GATE_MODE} "
                 f"PROFILE={RFX_RISK_PROFILE} PARITY={RFX_PARITY_MODE}")
 except ImportError as _rfx_err:
-    logger.warning(f"⚠️ RFX-1A/1B modules not available: {_rfx_err} — using legacy paths")
+    logger.warning(f"⚠️ RFX-1A/1B/1C modules not available: {_rfx_err} — using legacy paths")
 
 
 def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float:
@@ -16554,7 +16565,76 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_volume_ratio >= THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
             )
-            if 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass):
+            # ═══════════════════════════════════════════════════════
+            # RFX-1C: Order-size-aware depth gate
+            # shadow: telemetry only, legacy decides
+            # enforce: impact-based primary, legacy softpass fallback
+            # ═══════════════════════════════════════════════════════
+            _rfx1c_bypass = False  # True if enforce mode passes
+            if RFX1C_DEPTH_GATE_MODE != 'off' and _RFX_MODULES_AVAILABLE:
+                try:
+                    _bid_depth = float(depth_data.get('total_bid_usd', 0) or 0)
+                    _ask_depth = float(depth_data.get('total_ask_usd', 0) or 0)
+                    _size_mult = float(signal.get('sizeMultiplier', 1.0) or 1.0)
+                    _planned_margin = self.balance * self.risk_per_trade * _size_mult
+                    _impact = rfx_compute_order_impact(
+                        planned_margin_usd=_planned_margin,
+                        leverage=signal_leverage,
+                        side=action,  # LONG or SHORT
+                        bid_depth_usd=_bid_depth,
+                        ask_depth_usd=_ask_depth,
+                        max_impact_pct=RFX1C_MAX_IMPACT_PCT,
+                        min_depth_floor_usd=RFX1C_MIN_DEPTH_FLOOR_USD,
+                    )
+                    # Telemetry — always log (sample rate respected)
+                    import random as _rfx1c_rnd
+                    if _rfx1c_rnd.random() < RFX1C_IMPACT_TELEMETRY_SAMPLE_RATE:
+                        logger.info(
+                            f"📊 RFX1C_{_impact.telemetry_tag}: {action} {symbol} "
+                            f"impact={_impact.impact_ratio:.2%} "
+                            f"notional=${_impact.planned_notional_usd:.0f} "
+                            f"margin=${_impact.planned_margin_usd:.0f} "
+                            f"bid_depth=${_bid_depth:.0f} ask_depth=${_ask_depth:.0f} "
+                            f"used_depth=${_impact.used_depth_usd:.0f} "
+                            f"mode={RFX1C_DEPTH_GATE_MODE} reason={_impact.reason}"
+                        )
+                    # Store telemetry in signal log
+                    signal_log_data['rfx1c_impact_ratio'] = _impact.impact_ratio
+                    signal_log_data['rfx1c_order_notional'] = _impact.planned_notional_usd
+                    signal_log_data['rfx1c_bid_depth'] = _bid_depth
+                    signal_log_data['rfx1c_ask_depth'] = _ask_depth
+                    signal_log_data['rfx1c_used_depth'] = _impact.used_depth_usd
+                    signal_log_data['rfx1c_verdict'] = _impact.telemetry_tag
+                    signal_log_data['rfx1c_mode'] = RFX1C_DEPTH_GATE_MODE
+                    signal_log_data['rfx1c_reason'] = _impact.reason
+                    
+                    if RFX1C_DEPTH_GATE_MODE == 'shadow':
+                        # Shadow: log divergence if impact would change outcome
+                        if _impact.passes and total_depth < dynamic_depth_threshold:
+                            logger.info(
+                                f"📊 RFX1C_SHADOW_MISS: {action} {symbol} "
+                                f"impact_pass=True but legacy would block "
+                                f"(depth=${total_depth:.0f}<${dynamic_depth_threshold:.0f})"
+                            )
+                            signal_log_data['rfx1c_verdict'] = 'RFX1C_SHADOW_MISS'
+                        # Shadow mode: proceed to legacy decision below
+                    
+                    elif RFX1C_DEPTH_GATE_MODE == 'enforce':
+                        if _impact.passes:
+                            # Order-size-aware pass — bypass legacy thin-book gate
+                            _rfx1c_bypass = True
+                            logger.info(
+                                f"✅ RFX1C_PASS: {action} {symbol} "
+                                f"impact={_impact.impact_ratio:.2%} "
+                                f"notional=${_impact.planned_notional_usd:.0f} "
+                                f"depth=${_impact.used_depth_usd:.0f} → BYPASS_LEGACY"
+                            )
+                        # If not passes: fall through to legacy gate + softpasses
+                
+                except Exception as _rfx1c_err:
+                    logger.warning(f"⚠️ RFX1C_ERROR: {symbol} {_rfx1c_err} — legacy fallback")
+            
+            if not _rfx1c_bypass and 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass):
                 # Phase 237: Soft Risk Gate fallback before hard reject
                 if SOFT_RISK_GATE_ENABLED:
                     _rg = evaluate_risk_gate(signal, {

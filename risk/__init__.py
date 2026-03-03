@@ -1,4 +1,4 @@
-"""RFX-1A/1B: Risk kernel package.
+"""RFX-1A/1B/1C: Risk kernel package.
 
 All risk computation modules live here.
 Dependency direction: main.py → risk (never risk → main).
@@ -19,6 +19,7 @@ from risk.breakeven import (
     should_set_breakeven,
     BreakevenDecision,
 )
+from risk.depth_gate import compute_order_impact, DepthImpact, estimate_slippage_bps
 
 __all__ = [
     'LiquidityProfile',
@@ -28,4 +29,5 @@ __all__ = [
     'check_emergency', 'EmergencyResult',
     'compute_breakeven_buffer_pct', 'compute_breakeven_price',
     'should_set_breakeven', 'BreakevenDecision',
+    'compute_order_impact', 'DepthImpact', 'estimate_slippage_bps',
 ]
