@@ -241,7 +241,12 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         <span className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider flex items-center gap-1">
                                             <Zap className="w-2.5 h-2.5 text-amber-500" /> Hızlı (5dk)
                                         </span>
-                                        <span className="text-[9px] text-slate-600 font-mono">{marketRegime.fast.samples} örnek</span>
+                                        <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
+                                            {marketRegime.fast.samples} örnek / 5dk
+                                            {marketRegime.fast.samples < 5 && (
+                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
+                                            )}
+                                        </span>
                                     </div>
                                     <div className="flex items-center gap-1.5 mb-1">
                                         <span className={`text-xs font-bold ${dir.color}`}>{dir.label}</span>
@@ -267,9 +272,9 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                 <div className="bg-slate-800/40 rounded-lg p-2.5">
                                     <div className="flex items-center justify-between mb-1">
                                         <span className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider flex items-center gap-1">
-                                            🏗️ Yapısal (2s)
+                                            🏗️ Yapısal (2sa)
                                         </span>
-                                        <span className="text-[9px] text-slate-600 font-mono">{marketRegime.struct.samples} örnek</span>
+                                        <span className="text-[9px] text-slate-600 font-mono">{marketRegime.struct.samples} örnek / 2sa</span>
                                     </div>
                                     <div className="flex items-center gap-1.5 mb-1">
                                         <span className={`text-xs font-bold ${dir.color}`}>{dir.label}</span>

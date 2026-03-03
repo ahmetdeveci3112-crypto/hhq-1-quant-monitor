@@ -359,6 +359,10 @@ export interface CoinOpportunity {
 export interface ScannerStats {
   totalCoins: number;
   analyzedCoins: number;
+  // RFX-1D.1: Semantic coin counts
+  marketUniverseCoins?: number;
+  scannedCoins?: number;
+  effectiveMaxCoins?: number;
   longSignals: number;
   shortSignals: number;
   activeSignals: number;

@@ -13862,15 +13862,21 @@ class MultiCoinScanner:
         long_count = sum(1 for o in self.opportunities if o.get('signalAction') == 'LONG')
         short_count = sum(1 for o in self.opportunities if o.get('signalAction') == 'SHORT')
         
+        _pfm = getattr(self, '_prefilter_metrics', {})
+        _analyzed = len(self.opportunities)
         return {
             "totalCoins": len(self.coins),
-            "analyzedCoins": len(self.opportunities),
+            "analyzedCoins": _analyzed,
+            # RFX-1D.1: Semantic coin counts for UI truth
+            "marketUniverseCoins": len(self.coins),
+            "scannedCoins": _pfm.get('final', _analyzed),
+            "effectiveMaxCoins": _pfm.get('effectiveMaxCoins', _analyzed),
             "longSignals": long_count,
             "shortSignals": short_count,
             "activeSignals": len(self.active_signals),
             "lastUpdate": datetime.now().timestamp(),
-        "lastUpdateIsoUtc": datetime.now(timezone.utc).isoformat(),  # RFX-1D: UTC ISO for UI
-            "prefilterMetrics": getattr(self, '_prefilter_metrics', {}),
+            "lastUpdateIsoUtc": datetime.now(timezone.utc).isoformat(),  # RFX-1D: UTC ISO for UI
+            "prefilterMetrics": _pfm,
         }
     
     async def preload_all_coins(self, top_n: int = 50):
@@ -14115,6 +14121,10 @@ async def update_ui_cache(opportunities: list, stats: dict):
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
             "analyzedCoins": len(ui_state_cache.opportunities),
+            # RFX-1D.1: Semantic coin counts for UI truth
+            "marketUniverseCoins": stats.get('marketUniverseCoins', len(multi_coin_scanner.coins)),
+            "scannedCoins": stats.get('scannedCoins', len(ui_state_cache.opportunities)),
+            "effectiveMaxCoins": stats.get('effectiveMaxCoins', len(ui_state_cache.opportunities)),
             "longSignals": long_count,
             "shortSignals": short_count,
             "activeSignals": len(persistent_signals),
@@ -34162,6 +34172,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                 "stats": {
                     "totalCoins": scanner_stats.get('totalCoins', len(getattr(multi_coin_scanner, 'coins', []))),
                     "analyzedCoins": scanner_stats.get('analyzedCoins', len(getattr(multi_coin_scanner, 'analyzers', {}))),
+                    # RFX-1D.1: Semantic coin counts for UI truth
+                    "marketUniverseCoins": scanner_stats.get('marketUniverseCoins', len(getattr(multi_coin_scanner, 'coins', []))),
+                    "scannedCoins": scanner_stats.get('scannedCoins', scanner_stats.get('analyzedCoins', 0)),
+                    "effectiveMaxCoins": scanner_stats.get('effectiveMaxCoins', scanner_stats.get('analyzedCoins', 0)),
                     "longSignals": long_count,
                     "shortSignals": short_count,
                     "activeSignals": len(persistent_signals), # Phase 259

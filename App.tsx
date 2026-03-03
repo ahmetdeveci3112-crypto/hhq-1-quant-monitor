@@ -1253,7 +1253,8 @@ export default function App() {
             </div>
             <div className="flex items-center gap-4 text-xs">
               <span className="text-slate-400">
-                <span className="font-bold text-white">{scannerStats.totalCoins}</span> Varlık
+                <span className="font-bold text-white">{scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}</span>
+                <span className="text-slate-600">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span> Varlık
               </span>
               <span className="text-emerald-400">
                 🟢 <span className="font-bold">{scannerStats.longSignals}</span>
@@ -1339,7 +1340,7 @@ export default function App() {
         <div className="grid grid-cols-4 gap-2 mb-4">
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Varlık</span>
-            <span className="text-sm font-bold text-white">{scannerStats.totalCoins}</span>
+            <span className="text-sm font-bold text-white">{scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}<span className="text-[10px] text-slate-600 font-normal">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span></span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
