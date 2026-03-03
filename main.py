@@ -2566,8 +2566,8 @@ class LiveBinanceTrader:
                     # ================================================================
                     # Use same formulas as paper trading
                     # Phase 221: Use same formula as open_position for consistency
-                    sl_atr_mult = (global_paper_trader.sl_atr / 10) if global_paper_trader else 1.5
-                    tp_atr_mult = (global_paper_trader.tp_atr / 10) if global_paper_trader else 3.0
+                    sl_atr_mult = resolve_atr_multiplier(global_paper_trader.sl_atr) if global_paper_trader else 1.5
+                    tp_atr_mult = resolve_atr_multiplier(global_paper_trader.tp_atr) if global_paper_trader else 3.0
                     trail_activation_atr = 1.5
                     trail_distance_atr = 1.0
                     exit_tightness = global_paper_trader.exit_tightness if global_paper_trader else 1.0
@@ -5692,8 +5692,8 @@ async def binance_position_sync_loop():
             if not _phase218_recalc_done and len(global_paper_trader.positions) > 0:
                 _phase218_recalc_done = True
                 fixed_count = 0
-                sl_atr_corrected = global_paper_trader.sl_atr / 10  # 15 → 1.5
-                tp_atr_corrected = global_paper_trader.tp_atr / 10  # 30 → 3.0
+                sl_atr_corrected = resolve_atr_multiplier(global_paper_trader.sl_atr)
+                tp_atr_corrected = resolve_atr_multiplier(global_paper_trader.tp_atr)
                 et = global_paper_trader.exit_tightness  # 1.2
                 
                 for pos in global_paper_trader.positions:
@@ -6055,8 +6055,8 @@ async def binance_position_sync_loop():
                         _tp_roi_target = 5.0   # Min 5% ROI gain
                         _sl_dist_from_lev = entry_price * (_sl_roi_target / max(_sync_leverage, 1) / 100)
                         _tp_dist_from_lev = entry_price * (_tp_roi_target / max(_sync_leverage, 1) / 100)
-                        _sl_dist_from_atr = atr * global_paper_trader.sl_atr / 10
-                        _tp_dist_from_atr = atr * global_paper_trader.tp_atr / 10
+                        _sl_dist_from_atr = atr * resolve_atr_multiplier(global_paper_trader.sl_atr)
+                        _tp_dist_from_atr = atr * resolve_atr_multiplier(global_paper_trader.tp_atr)
                         _eff_sl_dist = max(_sl_dist_from_atr, _sl_dist_from_lev)
                         _eff_tp_dist = max(_tp_dist_from_atr, _tp_dist_from_lev)
 
@@ -8286,6 +8286,27 @@ UNIVERSE_MAX_COINS = int(os.environ.get('UNIVERSE_MAX_COINS', '200'))
 UNIVERSE_MIN_VOLUME_USD = float(os.environ.get('UNIVERSE_MIN_VOLUME_USD', '500000'))   # min 24h quote volume
 UNIVERSE_MAX_SPREAD_PCT = float(os.environ.get('UNIVERSE_MAX_SPREAD_PCT', '0.8'))     # max bid-ask spread %
 UNIVERSE_PREFILTER_ENABLED = os.environ.get('UNIVERSE_PREFILTER_ENABLED', 'true').lower() == 'true'
+# P0-3: Universe ranking + safety cap
+UNIVERSE_RANK_MODE = os.environ.get('UNIVERSE_RANK_MODE', 'volume')  # volume | quality
+UNIVERSE_ALLOW_ALL = os.environ.get('UNIVERSE_ALLOW_ALL', 'false').lower() == 'true'
+DEFAULT_UNIVERSE_CAP = 200  # fallback when UNIVERSE_MAX_COINS <= 0 and ALLOW_ALL=false
+
+# P0-1: ATR scale semantic migration
+ATR_SCALE_VERSION = os.environ.get('ATR_SCALE_VERSION', 'auto')  # auto | legacy_deci | direct
+
+def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float:
+    """Convert raw ATR setting to effective multiplier.
+    auto: raw > 15 → legacy_deci (raw/10), else direct (raw).
+    legacy_deci: always raw/10.
+    direct: always raw.
+    """
+    sv = scale_version or ATR_SCALE_VERSION
+    if sv == 'direct':
+        return float(raw_value)
+    if sv == 'legacy_deci':
+        return float(raw_value) / 10.0
+    # auto: raw > 15 → legacy, else direct
+    return float(raw_value) / 10.0 if raw_value > 15 else float(raw_value)
 
 # Patch D: EV Gate thresholds
 EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'true').lower() == 'true'
@@ -13547,16 +13568,21 @@ class MultiCoinScanner:
                 import math
                 _quality = math.log10(max(_qvol, 1)) * (1.0 - min(_spread_pct / 2.0, 0.5))
                 _scored_candidates.append((_sym, _tk, _quality))
-            # Sort by quality descending, then slice
-            _scored_candidates.sort(key=lambda x: x[2], reverse=True)
-            # ALL mode: UNIVERSE_MAX_COINS <= 0 means no cap
-            _max = len(_scored_candidates) if UNIVERSE_MAX_COINS <= 0 else min(UNIVERSE_MAX_COINS, len(_scored_candidates))
-            _sliced_count = len(_scored_candidates) - _max if len(_scored_candidates) > _max else 0
-            _sliced = _scored_candidates[:_max]
+            # P0-3: Sort by rank mode (volume or quality)
+            if UNIVERSE_RANK_MODE == 'volume':
+                _scored_candidates.sort(key=lambda x: float(x[1].get('quoteVolume', 0) or 0), reverse=True)
+            else:
+                _scored_candidates.sort(key=lambda x: x[2], reverse=True)  # quality score
+            # P0-3: Safe cap — UNIVERSE_ALLOW_ALL required for no-cap mode
+            _allow_all = (UNIVERSE_MAX_COINS <= 0 and UNIVERSE_ALLOW_ALL)
+            _requested_cap = UNIVERSE_MAX_COINS if UNIVERSE_MAX_COINS > 0 else DEFAULT_UNIVERSE_CAP
+            _effective_max = len(_scored_candidates) if _allow_all else min(_requested_cap, len(_scored_candidates))
+            _sliced_count = len(_scored_candidates) - _effective_max if len(_scored_candidates) > _effective_max else 0
+            _sliced = _scored_candidates[:_effective_max]
             tickers = {s: t for s, t, _ in _sliced}
             _depth_filtered = _pre_total - _stable_filtered - _vol_filtered - _spread_filtered - len(_scored_candidates)
             _prefilter_ms = (time.time() - _prefilter_start) * 1000
-            _max_label = 'ALL' if UNIVERSE_MAX_COINS <= 0 else str(UNIVERSE_MAX_COINS)
+            _max_label = 'ALL' if _allow_all else str(_effective_max)
             # UF-1: Store cycle metrics for observability
             self._prefilter_metrics = {
                 'scan_ts': int(time.time()),
@@ -13567,12 +13593,16 @@ class MultiCoinScanner:
                 'spread_filtered': _spread_filtered,
                 'sliced': _sliced_count,
                 'final': len(tickers),
+                'effectiveMaxCoins': _effective_max,
+                'requestedMaxCoins': UNIVERSE_MAX_COINS,
+                'rankMode': UNIVERSE_RANK_MODE,
+                'allowAll': _allow_all,
             }
             logger.info(
                 f"🔬 UNIVERSE_PREFILTER_CYCLE: {_pre_total}→{len(tickers)} coins | "
                 f"stable_filtered={_stable_filtered} vol_filtered={_vol_filtered} spread_filtered={_spread_filtered} "
                 f"sliced={_sliced_count} | "
-                f"scan_ms={_prefilter_ms:.1f} max_coins={_max_label}"
+                f"scan_ms={_prefilter_ms:.1f} max_coins={_max_label} rank={UNIVERSE_RANK_MODE}"
             )
         else:
             self._prefilter_metrics = {
@@ -14223,6 +14253,20 @@ async def background_scanner_loop():
                     )
                 except asyncio.TimeoutError:
                     logger.error(f"⏱️ SCAN TIMEOUT: scan_all_coins > {SCANNER_SCAN_TIMEOUT_SEC:.0f}s (cycle skipped)")
+                    # P0-2: Still feed regime even on timeout
+                    try:
+                        btc_price, _src = get_btc_reference_price()
+                        if btc_price > 0:
+                            market_regime_detector.update_btc_price(btc_price, source=f'timeout_{_src}')
+                            market_regime_detector.detect_regime()
+                            logger.info(f"REGIME_FEED_RECOVER: btc={btc_price:.0f} src={_src} (timeout path)")
+                    except Exception as _tfe:
+                        logger.debug(f"Timeout regime feed error: {_tfe}")
+                    # P1-4: Degrade path — heartbeat UI cache
+                    try:
+                        ui_state_cache.last_update = datetime.now().timestamp()
+                    except Exception:
+                        pass
                     await asyncio.sleep(1)
                     continue
                 stats = multi_coin_scanner.get_scanner_stats()
@@ -14250,24 +14294,14 @@ async def background_scanner_loop():
                     total_pnl = sum(p.get('unrealizedPnl', 0) for p in pt.positions)
                     pt.add_log(f"📊 DURUM: {len(pt.positions)} poz | {active_sigs} sinyal | Bakiye: ${pt.balance:.0f} | Açık PnL: ${total_pnl:.2f}")
                 
-                # Update market regime with BTC price (opportunity first, btc_filter fallback)
+                # P0-2: Update market regime with BTC price (multi-source cascade)
                 try:
-                    _regime_src = 'none'
-                    btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
-                    btc_price = btc_opp.get('currentPrice', 0) if btc_opp else 0
-                    if btc_price and btc_price > 0:
-                        _regime_src = 'opportunity'
-                    else:
-                        # Fallback: btc_filter (OHLCV-based)
-                        btc_price = btc_filter.btc_price
-                        if btc_price and btc_price > 0:
-                            _regime_src = 'btc_filter'
+                    btc_price, _regime_src = get_btc_reference_price()
                     if btc_price and btc_price > 0:
                         market_regime_detector.update_btc_price(btc_price, source=_regime_src)
-                        # Per-cycle regime detection — keeps lastUpdate fresh
                         market_regime_detector.detect_regime()
                     else:
-                        logger.debug(f"⚠️ REGIME_SKIP_NO_BTC_PRICE: btc_price={btc_price}")
+                        logger.debug(f"⚠️ REGIME_SKIP_NO_BTC_PRICE: src={_regime_src}")
                 except Exception as regime_err:
                     logger.debug(f"Market regime update error: {regime_err}")
                 
@@ -14957,10 +14991,10 @@ async def background_scanner_loop():
                 if int(datetime.now().timestamp()) % 900 < scan_interval:
                     logger.info("🤖 AI Optimizer check triggered (15-min interval)")
                     try:
-                        # Phase 53: Update market regime with BTC price
-                        btc_opp = next((o for o in opportunities if o['symbol'] == 'BTCUSDT'), None)
-                        if btc_opp:
-                            market_regime_detector.update_btc_price(btc_opp.get('currentPrice', 0), source='optimizer')
+                        # P0-2: Update market regime with BTC price (multi-source)
+                        btc_price, _opt_src = get_btc_reference_price()
+                        if btc_price > 0:
+                            market_regime_detector.update_btc_price(btc_price, source=f'optimizer_{_opt_src}')
                         regime = market_regime_detector.detect_regime()
                         regime_params = market_regime_detector.get_regime_params()
                         
@@ -22665,6 +22699,56 @@ class MarketRegimeDetector:
 # Global Market Regime instance
 market_regime_detector = MarketRegimeDetector()
 
+# P0-2: BTC reference price — module-level cache
+_btc_price_cache = 0.0
+_btc_price_cache_ts = 0.0
+
+def get_btc_reference_price(scan_tickers: dict = None) -> tuple:
+    """P0-2: Get BTC reference price from best available source.
+    Priority: scan_tickers → WS → btc_filter → last-known cache.
+    Returns (price, source_str). Updates module cache on success.
+    """
+    global _btc_price_cache, _btc_price_cache_ts
+    import time as _time
+    
+    # Source 1: scan_all_coins tickers map (freshest during scan cycle)
+    if scan_tickers:
+        btc_tk = scan_tickers.get('BTCUSDT', {})
+        p = float(btc_tk.get('last', 0) or btc_tk.get('lastPrice', 0) or 0)
+        if p > 0:
+            _btc_price_cache = p
+            _btc_price_cache_ts = _time.time()
+            return (p, 'scan_tickers')
+    
+    # Source 2: WebSocket manager
+    try:
+        ws_tickers = binance_ws_manager.get_tickers(['BTCUSDT'])
+        if ws_tickers and 'BTCUSDT' in ws_tickers:
+            p = float(ws_tickers['BTCUSDT'].get('last', 0) or ws_tickers['BTCUSDT'].get('price', 0) or 0)
+            if p > 0:
+                _btc_price_cache = p
+                _btc_price_cache_ts = _time.time()
+                return (p, 'ws_manager')
+    except Exception:
+        pass
+    
+    # Source 3: btc_filter (OHLCV-based)
+    try:
+        p = float(getattr(btc_filter, 'btc_price', 0) or 0)
+        if p > 0:
+            _btc_price_cache = p
+            _btc_price_cache_ts = _time.time()
+            return (p, 'btc_filter')
+    except Exception:
+        pass
+    
+    # Source 4: Last-known-good cache
+    if _btc_price_cache > 0:
+        age = _time.time() - _btc_price_cache_ts
+        return (_btc_price_cache, f'cache_{int(age)}s')
+    
+    return (0.0, 'none')
+
 
 # ============================================================================
 # DCA-1: DUAL-CONFIRMATION ALIGNMENT GATE — HELPER
@@ -26220,8 +26304,8 @@ class PaperTradingEngine:
                     15.0
                 )
                 _dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(_atr_for_levels, _entry_for_levels)
-                _adj_sl_atr = (self.sl_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
-                _adj_tp_atr = (self.tp_atr / 10) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
+                _adj_sl_atr = resolve_atr_multiplier(self.sl_atr) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
+                _adj_tp_atr = resolve_atr_multiplier(self.tp_atr) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
                 _base_trail_activation_atr = float(existing_pending.get('dynamic_trail_activation', self.trail_activation_atr))
                 _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
                 _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
@@ -26630,8 +26714,8 @@ class PaperTradingEngine:
             15.0
         )
 
-        adjusted_sl_atr = (self.sl_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = (self.tp_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
+        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
         if signal and 'dynamic_trail_activation' in signal:
@@ -27945,8 +28029,8 @@ class PaperTradingEngine:
             15.0
         )
 
-        adjusted_sl_atr = (self.sl_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
-        adjusted_tp_atr = (self.tp_atr / 10) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
+        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
         if 'dynamic_trail_activation' in order:
@@ -32538,6 +32622,9 @@ async def paper_trading_get_settings():
         "equityCurve": global_paper_trader.equity_curve[-100:],
         "slAtr": global_paper_trader.sl_atr,
         "tpAtr": global_paper_trader.tp_atr,
+        "slAtrEffective": resolve_atr_multiplier(global_paper_trader.sl_atr),
+        "tpAtrEffective": resolve_atr_multiplier(global_paper_trader.tp_atr),
+        "atrScaleVersion": ATR_SCALE_VERSION,
         "trailActivationAtr": global_paper_trader.trail_activation_atr,
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
         "maxPositions": global_paper_trader.max_positions,
@@ -32730,8 +32817,8 @@ async def paper_trading_update_settings(
             side = pos.get('side', '')
             
             # Recalculate TP/SL with new exit_tightness via unified helper
-            adjusted_sl_atr = (global_paper_trader.sl_atr / 10) * global_paper_trader.exit_tightness
-            adjusted_tp_atr = (global_paper_trader.tp_atr / 10) * global_paper_trader.exit_tightness
+            adjusted_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr) * global_paper_trader.exit_tightness
+            adjusted_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr) * global_paper_trader.exit_tightness
             adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
             adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
             
@@ -32770,6 +32857,9 @@ async def paper_trading_update_settings(
         "riskPerTrade": global_paper_trader.risk_per_trade,
         "slAtr": global_paper_trader.sl_atr,
         "tpAtr": global_paper_trader.tp_atr,
+        "slAtrEffective": resolve_atr_multiplier(global_paper_trader.sl_atr),
+        "tpAtrEffective": resolve_atr_multiplier(global_paper_trader.tp_atr),
+        "atrScaleVersion": ATR_SCALE_VERSION,
         "trailActivationAtr": global_paper_trader.trail_activation_atr,
         "trailDistanceAtr": global_paper_trader.trail_distance_atr,
         "maxPositions": global_paper_trader.max_positions,
@@ -33266,8 +33356,8 @@ async def paper_trading_market_order(request: Request):
                 return JSONResponse({"success": False, "error": f"Binance leverage set failed for {symbol} → {leverage}x"}, status_code=500)
         
         # SL/TP via unified helper (gains leverage floor + cost floor + tick snap)
-        _mo_adj_sl_atr = global_paper_trader.sl_atr / 10
-        _mo_adj_tp_atr = global_paper_trader.tp_atr / 10
+        _mo_adj_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr)
+        _mo_adj_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr)
         _mo_adj_trail_act = global_paper_trader.trail_activation_atr
         _mo_adj_trail_dist = global_paper_trader.trail_distance_atr
         _mo_levels = compute_sl_tp_levels(
