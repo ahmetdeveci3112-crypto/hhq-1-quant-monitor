@@ -619,6 +619,17 @@ class SQLiteManager:
                 pass
             await db.commit()
             
+            # RFX-1D: truth_snapshot_json + regime_adjustment columns
+            for _tbl in ('signals', 'positions'):
+                for _col, _typ in [
+                    ('truth_snapshot_json', "TEXT DEFAULT '{}'"),
+                    ('regime_adjustment', "TEXT DEFAULT ''"),
+                ]:
+                    try:
+                        await db.execute(f'ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}')
+                    except:
+                        pass
+            await db.commit()
             self._initialized = True
             logger.info("✅ SQLite database initialized with all tables")
     
@@ -911,13 +922,23 @@ class SQLiteManager:
     async def save_signal(self, signal_data: dict):
         """Save a signal (accepted or rejected) for performance analysis."""
         async with aiosqlite.connect(self.db_path) as db:
+            # RFX-1D: serialize truth_snapshot if present
+            _ts_json = '{}'
+            _ts_raw = signal_data.get('truth_snapshot')
+            if _ts_raw and isinstance(_ts_raw, dict):
+                try:
+                    import json as _json
+                    _ts_json = _json.dumps(_ts_raw)
+                except Exception:
+                    _ts_json = '{}'
             await db.execute('''
                 INSERT INTO signals (
                     symbol, action, price, zscore, hurst, atr, signal_score,
                     htf_trend, mtf_confirmed, mtf_reason, blacklisted, accepted,
                     reject_reason, z_threshold, min_confidence, entry_tightness,
-                    exit_tightness, timestamp, obi_value
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_tightness, timestamp, obi_value,
+                    truth_snapshot_json, regime_adjustment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 signal_data.get('symbol'),
                 signal_data.get('action'),
@@ -938,6 +959,8 @@ class SQLiteManager:
                 signal_data.get('exit_tightness', 1.0),
                 signal_data.get('timestamp', int(datetime.now().timestamp() * 1000)),
                 signal_data.get('obi_value', 0),  # Phase 211: OBI depth value
+                _ts_json,  # RFX-1D: truth snapshot JSON
+                signal_data.get('regime_adjustment', ''),  # RFX-1D: regime adjustment
             ))
             await db.commit()
     
@@ -963,13 +986,22 @@ class SQLiteManager:
     async def save_open_position(self, pos: dict):
         """Save an open position to database."""
         async with aiosqlite.connect(self.db_path) as db:
+            # RFX-1D: serialize truth_snapshot for position persistence
+            _pos_ts_json = '{}'
+            _pos_ts_raw = pos.get('truth_snapshot')
+            if _pos_ts_raw and isinstance(_pos_ts_raw, dict):
+                try:
+                    import json as _json
+                    _pos_ts_json = _json.dumps(_pos_ts_raw)
+                except Exception:
+                    _pos_ts_json = '{}'
             await db.execute('''
                 INSERT OR REPLACE INTO positions (
                     id, symbol, side, entry_price, size, size_usd,
                     stop_loss, take_profit, leverage, open_time,
                     signal_score, signal_score_raw, zscore, hurst, atr, htf_trend, status,
-                    margin_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    margin_usd, truth_snapshot_json, regime_adjustment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pos.get('id'),
                 pos.get('symbol'),
@@ -989,6 +1021,8 @@ class SQLiteManager:
                 pos.get('htfTrend', 'NEUTRAL'),
                 'OPEN',
                 pos.get('marginUsd', 0),
+                _pos_ts_json,  # RFX-1D
+                pos.get('regime_adjustment', ''),  # RFX-1D
             ))
             await db.commit()
     
@@ -13835,6 +13869,7 @@ class MultiCoinScanner:
             "shortSignals": short_count,
             "activeSignals": len(self.active_signals),
             "lastUpdate": datetime.now().timestamp(),
+        "lastUpdateIsoUtc": datetime.now(timezone.utc).isoformat(),  # RFX-1D: UTC ISO for UI
             "prefilterMetrics": getattr(self, '_prefilter_metrics', {}),
         }
     
@@ -16969,6 +17004,80 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 )
         except Exception as dca_err:
             logger.debug(f"DCA-1 gate error: {dca_err}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RFX-1D: Truth Snapshot — single point of capture
+    # Captured AFTER regime + DCA, with explicit defaults (no dir())
+    # ═══════════════════════════════════════════════════════════════
+    _dca_decision_val = 'N/A'
+    _dca_align_val = 'N/A'
+    _dca_reason_val = ''
+    _dca_score_adj_val = 0
+    _dca_size_mult_val = 1.0
+    _dca_lev_mult_val = 1.0
+    _entry_regime_val = 'UNKNOWN'
+    _entry_dir_val = 'NEUTRAL'
+    _fast_conf_val = 0.0
+    _struct_regime_val = 'UNKNOWN'
+    _struct_dir_val = 'NEUTRAL'
+    _struct_conf_val = 0.0
+    _regime_action_val = 'UNKNOWN'
+    
+    try:
+        # Regime values (set in Phase 60 block above)
+        _entry_regime_val = _entry_regime
+        _entry_dir_val = _entry_dir
+        _struct_regime_val = _struct_regime
+        _struct_dir_val = _struct_dir
+        _regime_action_val = _regime_action
+    except NameError:
+        pass
+    
+    try:
+        _fast_conf_val = round(_fast_conf, 3)
+        _struct_conf_val = round(_struct_conf, 3)
+    except NameError:
+        pass
+    
+    try:
+        if DUAL_REGIME_GATE_ENABLED:
+            _dca_decision_val = _dca_decision
+            _dca_align_val = _dca_align
+            _dca_reason_val = _dca_reason
+            _dca_score_adj_val = _dca.get('score_adj', 0)
+            _dca_size_mult_val = _dca.get('size_mult', 1.0)
+            _dca_lev_mult_val = _dca.get('lev_mult', 1.0)
+    except (NameError, AttributeError):
+        pass
+    
+    try:
+        _exec_profile_snap = market_regime_detector.get_execution_profile()
+    except Exception:
+        _exec_profile_snap = {}
+    
+    _truth_snapshot = {
+        'fast_regime': _entry_regime_val,
+        'fast_direction': _entry_dir_val,
+        'fast_confidence': _fast_conf_val,
+        'struct_regime': _struct_regime_val,
+        'struct_direction': _struct_dir_val,
+        'struct_confidence': _struct_conf_val,
+        'exec_profile_source': _exec_profile_snap.get('profile_source', ''),
+        'exec_sl_mult': _exec_profile_snap.get('sl_mult', 1.0),
+        'exec_tp_mult': _exec_profile_snap.get('tp_mult', 1.0),
+        'exec_trail_mult': _exec_profile_snap.get('trail_mult', 1.0),
+        'dca_decision': _dca_decision_val,
+        'dca_alignment': _dca_align_val,
+        'dca_score_adj': _dca_score_adj_val,
+        'dca_size_mult': _dca_size_mult_val,
+        'dca_lev_mult': _dca_lev_mult_val,
+        'dca_reason': _dca_reason_val,
+        'regime_action': _regime_action_val,
+        'snapshot_ts_utc': int(datetime.now(timezone.utc).timestamp() * 1000),
+    }
+    signal['truth_snapshot'] = _truth_snapshot
+    signal_log_data['truth_snapshot'] = _truth_snapshot
+    signal_log_data['regime_adjustment'] = signal.get('regime_adjustment', '')
     
     # ================================================================
     # Phase 215: MA ALIGNMENT HARD VETO
@@ -28499,6 +28608,9 @@ class PaperTradingEngine:
             "signalLeverageEffective": order['leverage'],
             "leverageCapApplied": order.get('leverageCapApplied', False),
             "leverageCapReason": order.get('leverageCapReason', ''),
+            # RFX-1D: Truth snapshot + regime adjustment propagation
+            "truth_snapshot": order.get('truth_snapshot', {}),
+            "regime_adjustment": order.get('regime_adjustment', ''),
         }
         
         # Phase 250: Compute adaptive TP ladder at fill time and lock to position
@@ -29980,6 +30092,9 @@ class PaperTradingEngine:
             "signalLeverageEffective": adjusted_leverage,
             "leverageCapApplied": signal.get('leverageCapApplied', False),
             "leverageCapReason": signal.get('leverageCapReason', ''),
+            # RFX-1D: Truth snapshot + regime adjustment propagation
+            "truth_snapshot": signal.get('truth_snapshot', {}),
+            "regime_adjustment": signal.get('regime_adjustment', ''),
         }
         
         # Paper Trading: Initial Margin = marginUsd (authoritative), fallback sizeUsd/leverage
@@ -32290,6 +32405,8 @@ async def paper_trading_status():
             "recheckNextAt": o.get("recheckNextAt", 0),
             "recheckDecision": o.get("recheckDecision"),
             "expiresAt": o.get("expiresAt", 0),
+            "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
+            "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
         }
         for o in global_paper_trader.pending_orders
     ]
@@ -33016,6 +33133,8 @@ async def paper_trading_get_settings():
             "recheckNextAt": o.get("recheckNextAt", 0),
             "recheckDecision": o.get("recheckDecision"),
             "expiresAt": o.get("expiresAt", 0),
+            "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
+            "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
         }
         for o in global_paper_trader.pending_orders
     ]
