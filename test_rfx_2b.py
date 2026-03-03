@@ -184,6 +184,81 @@ class TestBuildDistanceTruthEdgeCases:
 
 
 # ═════════════════════════════════════════════════════════
+# RFX-2B.1: Quality flags
+# ═════════════════════════════════════════════════════════
+
+class TestQualityFlags:
+
+    def test_clean_scenario_no_sanitize_flag(self):
+        """Clean inputs → no SANITIZED flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 10, meta={
+            'sl_source': 'ATR', 'tp_source': 'ATR',
+            'sl_dist_atr': 3.0, 'tp_dist_atr': 6.0,
+        })
+        assert 'SANITIZED' not in result['quality_flags']
+
+    def test_nan_input_triggers_sanitized(self):
+        """NaN input → SANITIZED flag."""
+        result = build_distance_truth(100, float('nan'), 106, 1.5, 'LONG', 10)
+        assert 'SANITIZED' in result['quality_flags']
+
+    def test_inf_input_triggers_sanitized(self):
+        """Inf input → SANITIZED flag."""
+        result = build_distance_truth(100, 97, float('inf'), 1.5, 'LONG', 10)
+        assert 'SANITIZED' in result['quality_flags']
+
+    def test_low_leverage_flag(self):
+        """Leverage=1 → LOW_LEVERAGE flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 1)
+        assert 'LOW_LEVERAGE' in result['quality_flags']
+
+    def test_normal_leverage_no_flag(self):
+        """Leverage=10 → no LOW_LEVERAGE flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 10)
+        assert 'LOW_LEVERAGE' not in result['quality_flags']
+
+    def test_sl_lev_floor_active(self):
+        """LEV_FLOOR source → SL_LEV_FLOOR_ACTIVE flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 10, meta={
+            'sl_source': 'LEV_FLOOR', 'tp_source': 'ATR',
+        })
+        assert 'SL_LEV_FLOOR_ACTIVE' in result['quality_flags']
+
+    def test_tp_cost_floor_active(self):
+        """COST_FLOOR source → TP_COST_FLOOR_ACTIVE flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 10, meta={
+            'sl_source': 'ATR', 'tp_source': 'COST_FLOOR',
+        })
+        assert 'TP_COST_FLOOR_ACTIVE' in result['quality_flags']
+
+    def test_sl_floor_drift_high(self):
+        """When effective SL >> ATR SL → SL_FLOOR_DRIFT_HIGH flag."""
+        # effective SL = |100 - 95| = 5% = 5.0 pct
+        # ATR SL = sl_dist_atr = 2.0 → 2.0% of entry
+        # 5.0 > 2.0 * 1.5 (3.0) → YES, drift
+        result = build_distance_truth(100, 95, 106, 1.5, 'LONG', 10, meta={
+            'sl_source': 'LEV_FLOOR', 'tp_source': 'ATR',
+            'sl_dist_atr': 2.0, 'tp_dist_atr': 6.0,
+        })
+        assert 'SL_FLOOR_DRIFT_HIGH' in result['quality_flags']
+
+    def test_no_drift_when_close(self):
+        """When effective ≈ ATR → no drift flag."""
+        result = build_distance_truth(100, 97, 106, 1.5, 'LONG', 10, meta={
+            'sl_source': 'ATR', 'tp_source': 'ATR',
+            'sl_dist_atr': 2.8,  # effective=3.0, atr_pct=2.8, 3.0 < 2.8*1.5=4.2
+            'tp_dist_atr': 5.5,  # effective=6.0, atr_pct=5.5, 6.0 < 5.5*2.0=11.0
+        })
+        assert 'SL_FLOOR_DRIFT_HIGH' not in result['quality_flags']
+        assert 'TP_FLOOR_DRIFT_HIGH' not in result['quality_flags']
+
+    def test_quality_flags_key_always_present(self):
+        """quality_flags is always a list."""
+        result = build_distance_truth(100, 97, 103, 1.0, 'LONG', 5)
+        assert isinstance(result['quality_flags'], list)
+
+
+# ═════════════════════════════════════════════════════════
 # Integration: compute_sl_tp_levels ↔ distance_truth
 # ═════════════════════════════════════════════════════════
 
@@ -211,6 +286,8 @@ class TestComputeLevelsIntegration:
             assert 'sl_dist_pct_effective' in dt
             assert 'tp_dist_pct_effective' in dt
             assert 'sl_source' in dt
+            assert 'quality_flags' in dt
+            assert isinstance(dt['quality_flags'], list)
             assert dt['sl_dist_pct_effective'] > 0
             assert dt['tp_dist_pct_effective'] > 0
         except ImportError:
@@ -235,5 +312,6 @@ class TestComputeLevelsIntegration:
             assert dt['distance_version'] == 'v2'
             assert dt['leverage_used'] == 20
             assert dt['sl_dist_roi_effective'] > 0
+            assert 'quality_flags' in dt
         except ImportError:
             pytest.skip("Risk modules not importable in test env")

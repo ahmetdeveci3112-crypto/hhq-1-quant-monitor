@@ -100,6 +100,22 @@ def build_distance_truth(
     def _r(v: float, n: int = 4) -> float:
         return round(_safe(v), n)
 
+    # ── Quality flags ──
+    quality_flags = []
+    if any(not isinstance(x, (int, float)) or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
+           for x in [entry_price, sl, tp, trail_distance]):
+        quality_flags.append('SANITIZED')
+    if _lev <= 1:
+        quality_flags.append('LOW_LEVERAGE')
+    if sl_source == 'LEV_FLOOR':
+        quality_flags.append('SL_LEV_FLOOR_ACTIVE')
+    if tp_source == 'COST_FLOOR':
+        quality_flags.append('TP_COST_FLOOR_ACTIVE')
+    if sl_dist_pct > 0 and sl_dist_atr_pct > 0 and sl_dist_pct > sl_dist_atr_pct * 1.5:
+        quality_flags.append('SL_FLOOR_DRIFT_HIGH')  # Floor expanded SL >50% beyond ATR
+    if tp_dist_pct > 0 and tp_dist_atr_pct > 0 and tp_dist_pct > tp_dist_atr_pct * 2.0:
+        quality_flags.append('TP_FLOOR_DRIFT_HIGH')  # Floor expanded TP >100% beyond ATR
+
     return {
         # Effective distances (from snapped prices — what the trader actually sees)
         'sl_dist_price_effective': _r(sl_dist_price, 8),
@@ -131,4 +147,6 @@ def build_distance_truth(
         'distance_version': version,
         'distance_source_tags': source_tags,
         'leverage_used': _lev,
+        # RFX-2B.1: Quality flags
+        'quality_flags': quality_flags,
     }

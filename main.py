@@ -28646,6 +28646,20 @@ class PaperTradingEngine:
             # RFX-2B: Distance truth telemetry (recalculated at fill)
             "distance_truth": _levels.get('distance_truth', order.get('distance_truth', {})),
         }
+        # RFX-2B.1: Quality tag — mark source
+        _dt_pos = new_position.get('distance_truth', {})
+        if _dt_pos:
+            _dt_pos['distance_truth_source'] = 'FILL_RECALC'
+        else:
+            _dt_pos = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
+            new_position['distance_truth'] = _dt_pos
+        # RFX-2B.1: Shadow alarm — log enforcement candidates (no decision change)
+        _dt_flags = new_position.get('distance_truth', {}).get('quality_flags', [])
+        if _dt_flags:
+            _dt_src = new_position.get('distance_truth', {}).get('distance_truth_source', '?')
+            logger.info(f"📏 DIST_TRUTH: {symbol} {side} src={_dt_src} flags={_dt_flags} "
+                        f"sl_roi={new_position.get('distance_truth', {}).get('sl_dist_roi_effective', 0):.1f}% "
+                        f"tp_roi={new_position.get('distance_truth', {}).get('tp_dist_roi_effective', 0):.1f}%")
         
         # Phase 250: Compute adaptive TP ladder at fill time and lock to position
         if TP_LADDER_ADAPTIVE_ENABLED:
@@ -30132,6 +30146,30 @@ class PaperTradingEngine:
             # RFX-2B: Distance truth telemetry
             "distance_truth": signal.get('distance_truth', {}),
         }
+        # RFX-2B.1: Fallback recompute — signal-direct path has no distance_truth
+        if not new_position.get('distance_truth') and _RFX_MODULES_AVAILABLE:
+            try:
+                _dt_fallback = rfx_build_distance_truth(
+                    entry_price=current_price, sl=signal['sl'],
+                    tp=signal['tp'], trail_distance=signal.get('trailDistance', 0),
+                    side=signal['action'], leverage=adjusted_leverage, meta=None,
+                )
+                _dt_fallback['distance_truth_source'] = 'SIGNAL_RECOMPUTE'
+                new_position['distance_truth'] = _dt_fallback
+            except Exception as _dt_err:
+                logger.debug(f"RFX-2B.1: distance_truth recompute failed: {_dt_err}")
+                new_position['distance_truth'] = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
+        elif new_position.get('distance_truth'):
+            new_position['distance_truth']['distance_truth_source'] = 'SIGNAL_PROPAGATED'
+        else:
+            new_position['distance_truth'] = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
+        # RFX-2B.1: Shadow alarm — log enforcement candidates (no decision change)
+        _dt_flags_m = new_position.get('distance_truth', {}).get('quality_flags', [])
+        if _dt_flags_m:
+            _dt_src_m = new_position.get('distance_truth', {}).get('distance_truth_source', '?')
+            logger.info(f"📏 DIST_TRUTH: {self.symbol} {signal['action']} src={_dt_src_m} flags={_dt_flags_m} "
+                        f"sl_roi={new_position.get('distance_truth', {}).get('sl_dist_roi_effective', 0):.1f}% "
+                        f"tp_roi={new_position.get('distance_truth', {}).get('tp_dist_roi_effective', 0):.1f}%")
         
         # Paper Trading: Initial Margin = marginUsd (authoritative), fallback sizeUsd/leverage
         initial_margin = new_position.get('marginUsd', new_position['sizeUsd'] / adjusted_leverage)
