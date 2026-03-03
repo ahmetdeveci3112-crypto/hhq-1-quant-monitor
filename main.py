@@ -13865,7 +13865,7 @@ class MultiCoinScanner:
         _pfm = getattr(self, '_prefilter_metrics', {})
         _analyzed = len(self.opportunities)
         return {
-            "totalCoins": len(self.coins),
+            "totalCoins": len(self.coins),  # DEPRECATED(RFX-2A): Use marketUniverseCoins/scannedCoins instead
             "analyzedCoins": _analyzed,
             # RFX-1D.1: Semantic coin counts for UI truth
             "marketUniverseCoins": len(self.coins),
@@ -32731,6 +32731,8 @@ async def optimizer_status():
     except Exception as e:
         logger.error(f"Error building tracking list: {e}")
     
+    # RFX-2A: Include scanner stats for truth contract consistency
+    _scanner_stats = multi_coin_scanner.get_scanner_stats() if 'multi_coin_scanner' in globals() else {}
     return JSONResponse({
         "enabled": parameter_optimizer.enabled,
         "lastOptimization": parameter_optimizer.last_optimization,
@@ -32746,7 +32748,13 @@ async def optimizer_status():
             "conflictMode": DUAL_REGIME_CONFLICT_MODE,
             "minConf": DUAL_REGIME_MIN_CONF,
         },
-        "scoreAnalysis": score_component_analyzer.get_status()
+        "scoreAnalysis": score_component_analyzer.get_status(),
+        # RFX-2A: Scanner stats for UI truth contract
+        "scannerStats": {
+            "marketUniverseCoins": _scanner_stats.get('marketUniverseCoins', 0),
+            "scannedCoins": _scanner_stats.get('scannedCoins', 0),
+            "effectiveMaxCoins": _scanner_stats.get('effectiveMaxCoins', 0),
+        },
     })
 
 @app.post("/optimizer/run")
@@ -34338,8 +34346,12 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                     "totalPnlPercent": pnl_data.get('totalPnlPercent', 0),
                     "liveBalance": initial_live_balance,
                     # Scanner stats
-                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,  # DEPRECATED(RFX-2A)
                     "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    # RFX-2A: Semantic coin counts (truth contract)
+                    "marketUniverseCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "scannedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    "effectiveMaxCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
                     "longSignals": _ps_live_long,
                     "shortSignals": _ps_live_short,
                     "activeSignals": len(_ps_live)
@@ -34366,8 +34378,12 @@ async def ui_websocket_endpoint(websocket: WebSocket):
                     **global_paper_trader.stats,
                     **pnl_data,
                     # Scanner stats
-                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "totalCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,  # DEPRECATED(RFX-2A)
                     "analyzedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    # RFX-2A: Semantic coin counts (truth contract)
+                    "marketUniverseCoins": len(multi_coin_scanner.coins) if multi_coin_scanner and multi_coin_scanner.coins else 0,
+                    "scannedCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
+                    "effectiveMaxCoins": len(multi_coin_scanner.opportunities) if multi_coin_scanner else 0,
                     "longSignals": _ps_paper_long,
                     "shortSignals": _ps_paper_short,
                     "activeSignals": len(_ps_paper)

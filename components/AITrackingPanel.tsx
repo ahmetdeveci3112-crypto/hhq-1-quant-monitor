@@ -274,7 +274,12 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         <span className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider flex items-center gap-1">
                                             🏗️ Yapısal (2sa)
                                         </span>
-                                        <span className="text-[9px] text-slate-600 font-mono">{marketRegime.struct.samples} örnek / 2sa</span>
+                                        <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
+                                            {marketRegime.struct.samples} örnek / 2sa
+                                            {marketRegime.struct.samples < 20 && (
+                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
+                                            )}
+                                        </span>
                                     </div>
                                     <div className="flex items-center gap-1.5 mb-1">
                                         <span className={`text-xs font-bold ${dir.color}`}>{dir.label}</span>

@@ -203,6 +203,9 @@ export default function App() {
   const [scannerStats, setScannerStats] = useState<ScannerStats>({
     totalCoins: 0,
     analyzedCoins: 0,
+    marketUniverseCoins: 0,
+    scannedCoins: 0,
+    effectiveMaxCoins: 0,
     longSignals: 0,
     shortSignals: 0,
     activeSignals: 0,
