@@ -361,10 +361,16 @@ class TestExitStateMachine:
         assert sm.is_terminal is True
 
     def test_evaluate_returns_hold(self):
-        """RFX-1A skeleton: evaluate() always returns HOLD."""
+        """RFX-1B: evaluate() returns ExitDecision with HOLD for small move."""
+        from exit.state_machine import EvalContext
         sm = ExitStateMachine(pos_id='test5', side='LONG', entry_price=65000.0)
-        action = sm.evaluate(65500.0, 1200.0)
-        assert action == ExitAction.HOLD
+        ctx = EvalContext(
+            tick_price=65500.0, atr=1200.0, entry_price=65000.0,
+            side='LONG', leverage=10, trailing_stop=0, is_trailing_active=False,
+            tp_ladder=[], spread_pct=0.05, tick_size=0.01, margin_usd=650,
+        )
+        decision = sm.evaluate(ctx)
+        assert decision.action == ExitAction.HOLD
 
     def test_serialization(self):
         """to_dict / from_dict round-trip."""

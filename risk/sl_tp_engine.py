@@ -1,4 +1,4 @@
-"""RFX-1A: SL/TP/Trail computation engine — single authority.
+"""RFX-1A/1B: SL/TP/Trail computation engine — single authority.
 
 Contains BOTH v1 (legacy parity) and v2 (LiquidityProfile-aware) functions.
 Pure utility — no imports from main.py (blocker 2).
@@ -326,3 +326,189 @@ def compute_sl_tp_levels_v2(
             'tp_liq_mult': tp_liq_mult,
         }
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RFX-1B: TP Ladder V2 — 4-tier with TP_FINAL + monotonic guarantee
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_tp_ladder_v2(
+    entry_price: float,
+    atr: float,
+    side: str,
+    leverage: int,
+    tick_size: float = 0.0001,
+    spread_pct: float = 0.05,
+    risk_params: Optional[RiskParams] = None,
+    adx: float = 25.0,
+    hurst: float = 0.50,
+    volume_ratio: float = 1.0,
+    coin_daily_trend: str = 'NEUTRAL',
+    exec_score: float = 70.0,
+    spread_level: str = 'Normal',
+) -> dict:
+    """RFX-1B: 4-tier TP ladder with TP_FINAL and monotonic guarantee.
+
+    B2 enforcement:
+      1. Compute ROI targets → convert to price distances
+      2. Tick-snap each price
+      3. Post-snap: if TP[i] >= TP[i+1], bump TP[i+1] += tick_size
+      4. assert TP1 < TP2 < TP3 < TP_FINAL
+
+    Returns:
+        {
+            'levels': [{'key': 'tp1', 'pct': float, 'close_pct': float}, ...],
+            'prices': {'tp1': float, 'tp2': float, 'tp3': float, 'tp_final': float},
+            'version': 'v2',
+            'monotonic': True,
+            'telemetry': {...}
+        }
+    """
+    safe_entry = max(0.0001, float(entry_price or 1.0))
+    safe_atr = max(safe_entry * 0.005, float(atr or safe_entry * 0.02))
+    safe_lev = max(1, int(leverage or 10))
+    safe_tick = max(1e-8, float(tick_size or 0.0001))
+    safe_adx = float(adx or 25.0)
+    safe_exec = float(exec_score or 70.0)
+    safe_vol_ratio = float(volume_ratio or 1.0)
+
+    # ── TP_FINAL ROI target from profile ──
+    if risk_params is not None:
+        tp_final_target_roi = risk_params.tp_final_target_roi
+    else:
+        tp_final_target_roi = 40.0  # BALANCED default
+
+    # ── ATR as percentage of price ──
+    atr_pct = safe_atr / safe_entry * 100
+
+    # ── Spread multiplier ──
+    spread_mults = {
+        'Very Low': 0.5, 'Low': 0.75, 'Normal': 1.0,
+        'High': 1.5, 'Very High': 2.5, 'Extreme': 3.5, 'Ultra': 5.0,
+    }
+    s_mult = spread_mults.get(spread_level, 1.0)
+    base_tp_pct = atr_pct * s_mult
+
+    # ── TP levels as ROI % (leverage-normalized) ──
+    tp1_roi = max(base_tp_pct * safe_lev, 8.0)     # ~8% ROI minimum
+    tp2_roi = max(base_tp_pct * 2.0 * safe_lev, 20.0)  # ~20% ROI minimum
+    tp3_roi = max(base_tp_pct * 3.5 * safe_lev, 40.0)  # ~40% ROI minimum
+    tp_final_roi = tp_final_target_roi  # From profile
+
+    # Convert ROI% → price distance %
+    tp1_pct = tp1_roi / safe_lev
+    tp2_pct = tp2_roi / safe_lev
+    tp3_pct = tp3_roi / safe_lev
+    tp_final_pct = tp_final_roi / safe_lev
+
+    # ── Cost floor ──
+    est_cost_pct = (0.04 * 2) + float(spread_pct or 0.05)
+    tp1_pct = max(tp1_pct, est_cost_pct * 2.0)
+    tp2_pct = max(tp2_pct, est_cost_pct * 3.0)
+    tp3_pct = max(tp3_pct, est_cost_pct * 4.0)
+    tp_final_pct = max(tp_final_pct, est_cost_pct * 5.0)
+
+    # ── Convert to absolute prices ──
+    if side == 'LONG':
+        tp1_price = safe_entry * (1 + tp1_pct / 100)
+        tp2_price = safe_entry * (1 + tp2_pct / 100)
+        tp3_price = safe_entry * (1 + tp3_pct / 100)
+        tp_final_price = safe_entry * (1 + tp_final_pct / 100)
+    else:  # SHORT
+        tp1_price = safe_entry * (1 - tp1_pct / 100)
+        tp2_price = safe_entry * (1 - tp2_pct / 100)
+        tp3_price = safe_entry * (1 - tp3_pct / 100)
+        tp_final_price = safe_entry * (1 - tp_final_pct / 100)
+
+    # ── Tick-snap ──
+    if side == 'LONG':
+        tp1_price = snap_to_tick(tp1_price, safe_tick, 'up')
+        tp2_price = snap_to_tick(tp2_price, safe_tick, 'up')
+        tp3_price = snap_to_tick(tp3_price, safe_tick, 'up')
+        tp_final_price = snap_to_tick(tp_final_price, safe_tick, 'up')
+    else:  # SHORT — closer to entry is DOWN
+        tp1_price = snap_to_tick(tp1_price, safe_tick, 'down')
+        tp2_price = snap_to_tick(tp2_price, safe_tick, 'down')
+        tp3_price = snap_to_tick(tp3_price, safe_tick, 'down')
+        tp_final_price = snap_to_tick(tp_final_price, safe_tick, 'down')
+
+    # ── B2: Epsilon-tick monotonic enforcement ──
+    # For LONG: TP1 < TP2 < TP3 < TP_FINAL (ascending from entry)
+    # For SHORT: TP1 > TP2 > TP3 > TP_FINAL (descending from entry)
+    prices = [tp1_price, tp2_price, tp3_price, tp_final_price]
+    epsilon_fixes = 0
+    if side == 'LONG':
+        for i in range(1, len(prices)):
+            while prices[i] <= prices[i - 1]:
+                prices[i] += safe_tick
+                epsilon_fixes += 1
+    else:  # SHORT — each subsequent TP should be LOWER
+        for i in range(1, len(prices)):
+            while prices[i] >= prices[i - 1]:
+                prices[i] -= safe_tick
+                epsilon_fixes += 1
+    tp1_price, tp2_price, tp3_price, tp_final_price = prices
+
+    # Runtime assertion (B2)
+    if side == 'LONG':
+        assert tp1_price < tp2_price < tp3_price < tp_final_price, \
+            f"LONG monotonic violated: {tp1_price} < {tp2_price} < {tp3_price} < {tp_final_price}"
+    else:
+        assert tp1_price > tp2_price > tp3_price > tp_final_price, \
+            f"SHORT monotonic violated: {tp1_price} > {tp2_price} > {tp3_price} > {tp_final_price}"
+
+    # ── Recalculate pct from snapped prices ──
+    tp1_pct = abs(tp1_price - safe_entry) / safe_entry * 100
+    tp2_pct = abs(tp2_price - safe_entry) / safe_entry * 100
+    tp3_pct = abs(tp3_price - safe_entry) / safe_entry * 100
+    tp_final_pct = abs(tp_final_price - safe_entry) / safe_entry * 100
+
+    # ── Adaptive close ratios ──
+    close1, close2, close3, close_final = 0.30, 0.25, 0.25, 0.20
+    trend_aligned = (
+        (side == 'LONG' and coin_daily_trend in ('BULLISH', 'STRONG_BULLISH')) or
+        (side == 'SHORT' and coin_daily_trend in ('BEARISH', 'STRONG_BEARISH'))
+    )
+    if safe_exec < 60 or safe_vol_ratio < 0.9:
+        close1, close2, close3, close_final = 0.40, 0.25, 0.20, 0.15
+    elif safe_adx > 30 and trend_aligned:
+        close1, close2, close3, close_final = 0.20, 0.25, 0.25, 0.30
+
+    # Normalize to sum=1.0
+    total = close1 + close2 + close3 + close_final
+    close1 /= total
+    close2 /= total
+    close3 /= total
+    close_final /= total
+
+    levels = [
+        {'key': 'tp1', 'pct': round(tp1_pct, 4), 'close_pct': round(close1, 2)},
+        {'key': 'tp2', 'pct': round(tp2_pct, 4), 'close_pct': round(close2, 2)},
+        {'key': 'tp3', 'pct': round(tp3_pct, 4), 'close_pct': round(close3, 2)},
+        {'key': 'tp_final', 'pct': round(tp_final_pct, 4), 'close_pct': round(close_final, 2)},
+    ]
+
+    telemetry = {
+        'atr_pct': round(atr_pct, 3),
+        'spread_mult': s_mult,
+        'base_tp_pct': round(base_tp_pct, 3),
+        'cost_floor_pct': round(est_cost_pct, 4),
+        'close_split': f"{close1:.0%}/{close2:.0%}/{close3:.0%}/{close_final:.0%}",
+        'tp_final_target_roi': tp_final_target_roi,
+        'epsilon_fixes': epsilon_fixes,
+        'profile': risk_params.profile.value if risk_params else 'NONE',
+    }
+
+    return {
+        'levels': levels,
+        'prices': {
+            'tp1': round(tp1_price, 8),
+            'tp2': round(tp2_price, 8),
+            'tp3': round(tp3_price, 8),
+            'tp_final': round(tp_final_price, 8),
+        },
+        'version': 'v2',
+        'monotonic': True,
+        'telemetry': telemetry,
+    }
+

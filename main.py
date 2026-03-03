@@ -8350,7 +8350,20 @@ RFX_EXIT_SM_ENABLED = os.environ.get('RFX_EXIT_SM_ENABLED', 'false').lower() == 
 RFX_RISK_PROFILE = os.environ.get('RFX_RISK_PROFILE', 'BALANCED')  # BALANCED | AGGRESSIVE | ULTRA_AGGRESSIVE
 RFX_PARITY_MODE = os.environ.get('RFX_PARITY_MODE', 'true').lower() == 'true'  # When true, v2 produces v1-identical output
 
-# RFX-1A: Import risk modules (safe fallback if not available)
+# ═══════════════════════════════════════════════════════════════════
+# RFX-1B: Behavioral feature flags — all default OFF
+# ═══════════════════════════════════════════════════════════════════
+RFX1B_EXIT_WIRING = os.environ.get('RFX1B_EXIT_WIRING', 'false').lower() == 'true'  # SM sole authority
+RFX1B_TRAIL_DUAL = os.environ.get('RFX1B_TRAIL_DUAL', 'false').lower() == 'true'    # PT + LRT dual trail
+RFX1B_BE_ON_TRAIL = os.environ.get('RFX1B_BE_ON_TRAIL', 'false').lower() == 'true'  # BE on trail activation
+RFX1B_TP_LADDER_V2 = os.environ.get('RFX1B_TP_LADDER_V2', 'false').lower() == 'true'  # TP_FINAL + monotonic
+RFX1B_LEGACY_FALLBACK_ON_ERROR = os.environ.get('RFX1B_LEGACY_FALLBACK_ON_ERROR', 'true').lower() == 'true'  # Fallback on SM exception
+
+# RFX-1B: Inflight guard for close idempotency (B4)
+_exit_inflight: set = set()
+_rfx1b_fallback_count: int = 0  # Metric: how many times legacy fallback triggered
+
+# RFX-1A/1B: Import risk modules (safe fallback if not available)
 _RFX_MODULES_AVAILABLE = False
 try:
     from risk import (
@@ -8358,17 +8371,26 @@ try:
         RiskProfile as RFX_RiskProfile,
         resolve_risk_params as rfx_resolve_risk_params,
         compute_sl_tp_levels_v2 as rfx_compute_sl_tp_levels_v2,
+        compute_tp_ladder_v2 as rfx_compute_tp_ladder_v2,
         check_emergency as rfx_check_emergency,
         compute_breakeven_buffer_pct as rfx_compute_breakeven_buffer_pct,
         should_set_breakeven as rfx_should_set_breakeven,
     )
-    from exit import ExitStateMachine as RFX_ExitStateMachine, ExitState as RFX_ExitState
+    from exit import (
+        ExitStateMachine as RFX_ExitStateMachine,
+        ExitState as RFX_ExitState,
+        ExitAction as RFX_ExitAction,
+        EvalContext as RFX_EvalContext,
+        ExitDecision as RFX_ExitDecision,
+    )
     _RFX_MODULES_AVAILABLE = True
-    logger.info(f"✅ RFX-1A modules loaded | SL_TP_V2={RFX_SL_TP_V2} EMERGENCY_V2={RFX_EMERGENCY_V2} "
+    logger.info(f"✅ RFX-1A/1B modules loaded | SL_TP_V2={RFX_SL_TP_V2} EMERGENCY_V2={RFX_EMERGENCY_V2} "
                 f"LIQUIDITY_NATIVE={RFX_LIQUIDITY_NATIVE} EXIT_SM={RFX_EXIT_SM_ENABLED} "
+                f"1B_EXIT_WIRING={RFX1B_EXIT_WIRING} 1B_TRAIL_DUAL={RFX1B_TRAIL_DUAL} "
+                f"1B_BE_ON_TRAIL={RFX1B_BE_ON_TRAIL} 1B_TP_LADDER={RFX1B_TP_LADDER_V2} "
                 f"PROFILE={RFX_RISK_PROFILE} PARITY={RFX_PARITY_MODE}")
 except ImportError as _rfx_err:
-    logger.warning(f"⚠️ RFX-1A modules not available: {_rfx_err} — using legacy paths")
+    logger.warning(f"⚠️ RFX-1A/1B modules not available: {_rfx_err} — using legacy paths")
 
 
 def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float:
@@ -19601,10 +19623,177 @@ class TimeBasedPositionManager:
                     logger.info(f"📊 POS_DEBUG: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} entry={entry_price:.4f} curr={current_price:.4f}")
                 
                 # ===============================================
+                # RFX-1B: SM sole authority exit evaluation
+                # When RFX1B_EXIT_WIRING=true: SM decides, legacy skipped (B1)
+                # ===============================================
+                _rfx1b_sm_handled = False
+                if RFX1B_EXIT_WIRING and _RFX_MODULES_AVAILABLE and contracts > 0:
+                    try:
+                        # Deserialize SM from position (or skip if not attached)
+                        _sm_data = pos.get('_exit_sm')
+                        if _sm_data:
+                            _sm = RFX_ExitStateMachine.from_dict(_sm_data)
+                            
+                            # Build EvalContext with all required fields
+                            _spread_pct = pos.get('spread_pct', 0.05)
+                            _tick = get_tick_size(symbol)
+                            _atr = pos.get('atr', current_price * 0.02)
+                            _leverage = pos.get('leverage', 10)
+                            _tp_ladder = pos.get('tp_ladder_levels', [])
+                            _risk_params = None
+                            _liq_profile = None
+                            try:
+                                _rp_enum = RFX_RiskProfile(RFX_RISK_PROFILE)
+                                _risk_params = rfx_resolve_risk_params(_rp_enum, _leverage)
+                            except Exception:
+                                pass
+                            
+                            _eval_ctx = RFX_EvalContext(
+                                tick_price=current_price,
+                                atr=_atr,
+                                entry_price=entry_price,
+                                side=side,
+                                leverage=_leverage,
+                                trailing_stop=pos.get('trailingStop', 0),
+                                is_trailing_active=is_trailing_active,
+                                tp_ladder=_tp_ladder,
+                                spread_pct=_spread_pct,
+                                tick_size=_tick,
+                                margin_usd=pos.get('initialMargin', 0),
+                                risk_params=_risk_params,
+                                liq_profile=_liq_profile,
+                                recovery_mode=pos.get('recovery_mode', False),
+                                recovery_low=pos.get('recovery_low', 0),
+                                recovery_high=pos.get('recovery_high', 0),
+                                breakeven_activated=pos.get('breakeven_activated', False),
+                                partial_tp_state=pos.get('partial_tp_state', {}),
+                                tp1_trail_armed=pos.get('tp1_trail_armed', False),
+                            )
+                            
+                            _decision = _sm.evaluate(_eval_ctx)
+                            _action = _decision.action
+                            
+                            # ── Map SM actions to existing functions ──
+                            if _action == RFX_ExitAction.HOLD:
+                                pass  # B1: HOLD = wait, legacy does NOT run
+                            
+                            elif _action == RFX_ExitAction.SET_BREAKEVEN:
+                                # B3: SL write via apply_sl_floor only
+                                if _decision.suggested_price > 0:
+                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_BE')
+                                    pos['breakeven_activated'] = True
+                                    logger.info(f"🔧 RFX1B_SM_BE: {symbol} BE=${_decision.suggested_price:.6f} | {_decision.reason}")
+                            
+                            elif _action == RFX_ExitAction.ARM_PT:
+                                pos['isTrailingActive'] = True
+                                pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                if RFX1B_BE_ON_TRAIL and _decision.suggested_price > 0:
+                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_PT_BE')
+                                    pos['breakeven_activated'] = True
+                                logger.info(f"🔧 RFX1B_SM_PT: {symbol} trail armed | {_decision.reason}")
+                            
+                            elif _action == RFX_ExitAction.ARM_LRT:
+                                pos['recovery_mode'] = True
+                                if RFX1B_TRAIL_DUAL:
+                                    pos['isTrailingActive'] = True
+                                logger.info(f"🔧 RFX1B_SM_LRT: {symbol} loss recovery trail | {_decision.reason}")
+                            
+                            elif _action == RFX_ExitAction.TIGHTEN_TRAIL:
+                                # B3: Trail tighten via apply_sl_floor only
+                                if _decision.suggested_price > 0:
+                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_TRAIL_TIGHTEN')
+                                    logger.debug(f"🔧 RFX1B_SM_TRAIL: {symbol} tighten→${_decision.suggested_price:.6f}")
+                            
+                            elif _action == RFX_ExitAction.PARTIAL_TP:
+                                # Execute partial close at TP level
+                                _tp_key = _decision.tp_key
+                                _close_pct = _decision.close_pct
+                                _partial_state = pos.get('partial_tp_state', {})
+                                if not _partial_state.get(_tp_key, False):
+                                    original_contracts = pos.get('original_contracts', contracts)
+                                    close_contracts = original_contracts * _close_pct
+                                    # LIVE partial close
+                                    if pos.get('isLive', False) and close_contracts > 0:
+                                        try:
+                                            _result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
+                                            if _result:
+                                                pos['_partial_close_ts'] = datetime.now().timestamp()
+                                                logger.warning(f"💰 RFX1B_TP {_tp_key}: {symbol} closed {_close_pct*100:.0f}% LIVE")
+                                            else:
+                                                logger.error(f"❌ RFX1B_TP LIVE FAIL: {symbol} {_tp_key}")
+                                                _sm.state = _sm.history[-1].from_state if _sm.history else RFX_ExitState.OPEN
+                                                pos['_exit_sm'] = _sm.to_dict()
+                                                _rfx1b_sm_handled = True
+                                                continue
+                                        except Exception as _tp_err:
+                                            logger.error(f"❌ RFX1B_TP LIVE ERROR: {symbol} {_tp_key} {_tp_err}")
+                                            _sm.state = _sm.history[-1].from_state if _sm.history else RFX_ExitState.OPEN
+                                            pos['_exit_sm'] = _sm.to_dict()
+                                            _rfx1b_sm_handled = True
+                                            continue
+                                    # Update local state
+                                    if not pos.get('original_contracts'):
+                                        pos['original_contracts'] = contracts
+                                    _partial_state[_tp_key] = True
+                                    pos['partial_tp_state'] = _partial_state
+                                    new_contracts = max(0, contracts - close_contracts)
+                                    pos['contracts'] = new_contracts
+                                    pos['size'] = new_contracts
+                                    # BE re-confirm on TP1 (idempotent)
+                                    if _tp_key == 'tp1' and _decision.suggested_price > 0:
+                                        apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_TP1_BE')
+                                        pos['breakeven_activated'] = True
+                                        pos['isTrailingActive'] = True
+                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                    logger.warning(f"💰 RFX1B_TP {_tp_key}: {symbol} {side} partial {_close_pct*100:.0f}% | {_decision.reason}")
+                                    actions["partial_tp"].append({'symbol': symbol, 'tp': _tp_key, 'source': 'SM'})
+                            
+                            elif _action in (RFX_ExitAction.CLOSE_TP, RFX_ExitAction.CLOSE_SL, RFX_ExitAction.CLOSE_EMERGENCY):
+                                # B4: Inflight guard — prevent duplicate close
+                                if pos_id not in _exit_inflight:
+                                    _exit_inflight.add(pos_id)
+                                    _close_reason = {
+                                        RFX_ExitAction.CLOSE_TP: 'RFX1B_TP_FINAL',
+                                        RFX_ExitAction.CLOSE_SL: 'RFX1B_SL_FINAL',
+                                        RFX_ExitAction.CLOSE_EMERGENCY: 'RFX1B_EMERGENCY',
+                                    }.get(_action, 'RFX1B_CLOSE')
+                                    logger.warning(f"🔴 RFX1B_{_action.value}: {symbol} {side} FULL CLOSE | {_decision.reason}")
+                                    try:
+                                        paper_trader.close_via_engine(pos, current_price, _close_reason, _action.value)
+                                        positions_to_remove.append(pos)
+                                    except Exception as _close_err:
+                                        logger.error(f"❌ RFX1B_CLOSE_FAIL: {symbol} {_close_err}")
+                                    finally:
+                                        _exit_inflight.discard(pos_id)
+                                else:
+                                    logger.warning(f"⚠️ RFX1B_INFLIGHT_SKIP: {symbol} already closing (B4 guard)")
+                            
+                            # Persist SM state + telemetry
+                            pos['_exit_sm'] = _sm.to_dict()
+                            pos['_exit_sm_decision_source'] = 'SM'
+                            _rfx1b_sm_handled = True
+                            
+                    except Exception as _sm_err:
+                        # B1: Fallback only on exception + flag
+                        global _rfx1b_fallback_count
+                        _rfx1b_fallback_count += 1
+                        logger.warning(
+                            f"⚠️ RFX1B_FALLBACK #{_rfx1b_fallback_count}: {symbol} SM exception: {_sm_err} "
+                            f"| fallback={'LEGACY' if RFX1B_LEGACY_FALLBACK_ON_ERROR else 'NONE'}"
+                        )
+                        pos['_exit_sm_decision_source'] = 'LEGACY_FALLBACK'
+                        if not RFX1B_LEGACY_FALLBACK_ON_ERROR:
+                            _rfx1b_sm_handled = True  # No fallback — skip legacy too
+                
+                # ===============================================
                 # PHASE 250: ADAPTIVE PARTIAL TAKE PROFIT
                 # Uses locked TP ladder from position (computed at fill)
                 # Legacy fallback for old positions without tp_ladder_levels
+                # B1: When RFX1B_EXIT_WIRING=true, SM handles above — legacy skipped
                 # ===============================================
+                if _rfx1b_sm_handled:
+                    continue  # SM sole authority handled this position
+                
                 if unrealized_pnl > 0 and contracts > 0:
                     # Get spread level and ATR for TP calculation
                     spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))

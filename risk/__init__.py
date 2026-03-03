@@ -1,4 +1,4 @@
-"""RFX-1A: Risk kernel package.
+"""RFX-1A/1B: Risk kernel package.
 
 All risk computation modules live here.
 Dependency direction: main.py → risk (never risk → main).
@@ -7,6 +7,7 @@ from risk.liquidity_profile import LiquidityProfile
 from risk.policy import RiskProfile, RiskParams, resolve_risk_params, RISK_PROFILES
 from risk.sl_tp_engine import (
     compute_sl_tp_levels_v2,
+    compute_tp_ladder_v2,
     estimate_trade_cost,
     snap_to_tick,
     ensure_tick_safe_buffer,
@@ -22,8 +23,8 @@ from risk.breakeven import (
 __all__ = [
     'LiquidityProfile',
     'RiskProfile', 'RiskParams', 'resolve_risk_params', 'RISK_PROFILES',
-    'compute_sl_tp_levels_v2', 'estimate_trade_cost', 'snap_to_tick',
-    'ensure_tick_safe_buffer',
+    'compute_sl_tp_levels_v2', 'compute_tp_ladder_v2',
+    'estimate_trade_cost', 'snap_to_tick', 'ensure_tick_safe_buffer',
     'check_emergency', 'EmergencyResult',
     'compute_breakeven_buffer_pct', 'compute_breakeven_price',
     'should_set_breakeven', 'BreakevenDecision',
