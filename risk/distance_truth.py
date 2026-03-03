@@ -150,3 +150,103 @@ def build_distance_truth(
         # RFX-2B.1: Quality flags
         'quality_flags': quality_flags,
     }
+
+
+def aggregate_distance_truth_stats(items: list) -> dict:
+    """Aggregate distance_truth stats across positions/trades.
+
+    Args:
+        items: List of dicts each optionally containing 'distance_truth' key.
+
+    Returns:
+        Dict with coverage metrics, flag rates, source distribution,
+        and shadow enforcement threshold counters.
+    """
+    total = len(items)
+    if total == 0:
+        return {
+            'total': 0, 'with_dt': 0, 'coverage_pct': 0.0,
+            'flag_rates': {}, 'source_rates': {},
+            'shadow_enforcement': {},
+            'avg_sl_roi_pct': 0.0, 'avg_tp_roi_pct': 0.0,
+        }
+
+    with_dt = 0
+    flag_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    sl_roi_sum = 0.0
+    tp_roi_sum = 0.0
+    roi_count = 0
+
+    # Shadow enforcement thresholds
+    sl_roi_over_50 = 0   # SL ROI > 50% — very wide stop
+    sl_roi_over_100 = 0  # SL ROI > 100% — extreme stop
+    tp_roi_over_200 = 0  # TP ROI > 200% — very wide target
+    drift_count = 0       # Any DRIFT_HIGH flag
+
+    for item in items:
+        dt = item.get('distance_truth') or {}
+        if not dt or not isinstance(dt, dict):
+            continue
+        # Only count items that have actual distance data (not just source tag)
+        if 'sl_dist_pct_effective' not in dt and 'distance_truth_source' not in dt:
+            continue
+        with_dt += 1
+
+        # Source distribution
+        src = dt.get('distance_truth_source', 'UNKNOWN')
+        source_counts[src] = source_counts.get(src, 0) + 1
+
+        # Flag frequency
+        for flag in dt.get('quality_flags', []):
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+            if 'DRIFT_HIGH' in flag:
+                drift_count += 1
+
+        # ROI aggregation
+        sl_roi = dt.get('sl_dist_roi_effective', 0)
+        tp_roi = dt.get('tp_dist_roi_effective', 0)
+        if isinstance(sl_roi, (int, float)) and sl_roi > 0:
+            sl_roi_sum += sl_roi
+            roi_count += 1
+            if sl_roi > 50:
+                sl_roi_over_50 += 1
+            if sl_roi > 100:
+                sl_roi_over_100 += 1
+        if isinstance(tp_roi, (int, float)) and tp_roi > 0:
+            tp_roi_sum += tp_roi
+            if tp_roi > 200:
+                tp_roi_over_200 += 1
+
+    coverage_pct = round((with_dt / total) * 100, 1) if total > 0 else 0.0
+
+    # Convert counts to rates (percentage of items with dt)
+    flag_rates = {}
+    for flag, count in sorted(flag_counts.items(), key=lambda x: -x[1]):
+        flag_rates[flag] = {
+            'count': count,
+            'rate_pct': round((count / with_dt) * 100, 1) if with_dt > 0 else 0.0,
+        }
+
+    source_rates = {}
+    for src, count in sorted(source_counts.items(), key=lambda x: -x[1]):
+        source_rates[src] = {
+            'count': count,
+            'rate_pct': round((count / with_dt) * 100, 1) if with_dt > 0 else 0.0,
+        }
+
+    return {
+        'total': total,
+        'with_dt': with_dt,
+        'coverage_pct': coverage_pct,
+        'flag_rates': flag_rates,
+        'source_rates': source_rates,
+        'shadow_enforcement': {
+            'sl_roi_over_50_count': sl_roi_over_50,
+            'sl_roi_over_100_count': sl_roi_over_100,
+            'tp_roi_over_200_count': tp_roi_over_200,
+            'drift_high_count': drift_count,
+        },
+        'avg_sl_roi_pct': round(sl_roi_sum / roi_count, 1) if roi_count > 0 else 0.0,
+        'avg_tp_roi_pct': round(tp_roi_sum / roi_count, 1) if roi_count > 0 else 0.0,
+    }

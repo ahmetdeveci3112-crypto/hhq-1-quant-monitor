@@ -14,7 +14,7 @@ import pytest
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from risk.distance_truth import build_distance_truth, _safe
+from risk.distance_truth import build_distance_truth, aggregate_distance_truth_stats, _safe
 
 
 # ═════════════════════════════════════════════════════════
@@ -315,3 +315,132 @@ class TestComputeLevelsIntegration:
             assert 'quality_flags' in dt
         except ImportError:
             pytest.skip("Risk modules not importable in test env")
+
+
+# ═════════════════════════════════════════════════════════
+# RFX-2C: Aggregate Distance Truth Stats
+# ═════════════════════════════════════════════════════════
+
+def _make_item(sl_roi=30.0, tp_roi=60.0, flags=None, source='FILL_RECALC'):
+    """Helper to build a mock item with distance_truth."""
+    return {
+        'distance_truth': {
+            'sl_dist_pct_effective': 3.0,
+            'sl_dist_roi_effective': sl_roi,
+            'tp_dist_roi_effective': tp_roi,
+            'distance_truth_source': source,
+            'quality_flags': flags or [],
+        }
+    }
+
+
+class TestAggregateEmpty:
+
+    def test_empty_list(self):
+        result = aggregate_distance_truth_stats([])
+        assert result['total'] == 0
+        assert result['with_dt'] == 0
+        assert result['coverage_pct'] == 0.0
+
+    def test_items_without_dt(self):
+        """Items with no distance_truth → 0 coverage."""
+        result = aggregate_distance_truth_stats([{'symbol': 'BTC'}, {'symbol': 'ETH'}])
+        assert result['total'] == 2
+        assert result['with_dt'] == 0
+        assert result['coverage_pct'] == 0.0
+
+
+class TestAggregateCoverage:
+
+    def test_full_coverage(self):
+        items = [_make_item(), _make_item(), _make_item()]
+        result = aggregate_distance_truth_stats(items)
+        assert result['total'] == 3
+        assert result['with_dt'] == 3
+        assert result['coverage_pct'] == 100.0
+
+    def test_partial_coverage(self):
+        items = [_make_item(), {'symbol': 'ETH'}, _make_item()]
+        result = aggregate_distance_truth_stats(items)
+        assert result['total'] == 3
+        assert result['with_dt'] == 2
+        assert result['coverage_pct'] == round(2/3 * 100, 1)
+
+
+class TestAggregateFlagRates:
+
+    def test_flag_frequency(self):
+        items = [
+            _make_item(flags=['SANITIZED', 'LOW_LEVERAGE']),
+            _make_item(flags=['SANITIZED']),
+            _make_item(flags=[]),
+        ]
+        result = aggregate_distance_truth_stats(items)
+        assert result['flag_rates']['SANITIZED']['count'] == 2
+        assert result['flag_rates']['SANITIZED']['rate_pct'] == round(2/3 * 100, 1)
+        assert result['flag_rates']['LOW_LEVERAGE']['count'] == 1
+
+    def test_no_flags(self):
+        items = [_make_item(), _make_item()]
+        result = aggregate_distance_truth_stats(items)
+        assert result['flag_rates'] == {}
+
+
+class TestAggregateSourceRates:
+
+    def test_source_distribution(self):
+        items = [
+            _make_item(source='FILL_RECALC'),
+            _make_item(source='FILL_RECALC'),
+            _make_item(source='SIGNAL_RECOMPUTE'),
+        ]
+        result = aggregate_distance_truth_stats(items)
+        assert result['source_rates']['FILL_RECALC']['count'] == 2
+        assert result['source_rates']['SIGNAL_RECOMPUTE']['count'] == 1
+
+
+class TestAggregateShadowEnforcement:
+
+    def test_sl_roi_thresholds(self):
+        items = [
+            _make_item(sl_roi=30),   # normal
+            _make_item(sl_roi=60),   # >50
+            _make_item(sl_roi=120),  # >50 AND >100
+        ]
+        result = aggregate_distance_truth_stats(items)
+        se = result['shadow_enforcement']
+        assert se['sl_roi_over_50_count'] == 2   # 60, 120
+        assert se['sl_roi_over_100_count'] == 1  # 120
+
+    def test_tp_roi_threshold(self):
+        items = [
+            _make_item(tp_roi=100),
+            _make_item(tp_roi=250),  # >200
+        ]
+        result = aggregate_distance_truth_stats(items)
+        assert result['shadow_enforcement']['tp_roi_over_200_count'] == 1
+
+    def test_drift_count(self):
+        items = [
+            _make_item(flags=['SL_FLOOR_DRIFT_HIGH']),
+            _make_item(flags=['TP_FLOOR_DRIFT_HIGH']),
+            _make_item(flags=[]),
+        ]
+        result = aggregate_distance_truth_stats(items)
+        assert result['shadow_enforcement']['drift_high_count'] == 2
+
+
+class TestAggregateRoiAverages:
+
+    def test_avg_roi(self):
+        items = [_make_item(sl_roi=20, tp_roi=40), _make_item(sl_roi=40, tp_roi=80)]
+        result = aggregate_distance_truth_stats(items)
+        assert result['avg_sl_roi_pct'] == 30.0  # (20+40)/2
+        assert result['avg_tp_roi_pct'] == 60.0  # (40+80)/2
+
+    def test_avg_roi_with_missing(self):
+        """Items without valid ROI should not affect average."""
+        items = [_make_item(sl_roi=20, tp_roi=40), {'symbol': 'ETH'}]
+        result = aggregate_distance_truth_stats(items)
+        assert result['avg_sl_roi_pct'] == 20.0
+        assert result['avg_tp_roi_pct'] == 40.0

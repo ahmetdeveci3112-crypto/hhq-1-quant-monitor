@@ -20,7 +20,7 @@ from risk.breakeven import (
     BreakevenDecision,
 )
 from risk.depth_gate import compute_order_impact, DepthImpact, estimate_slippage_bps
-from risk.distance_truth import build_distance_truth
+from risk.distance_truth import build_distance_truth, aggregate_distance_truth_stats
 
 __all__ = [
     'LiquidityProfile',
@@ -32,4 +32,5 @@ __all__ = [
     'should_set_breakeven', 'BreakevenDecision',
     'compute_order_impact', 'DepthImpact', 'estimate_slippage_bps',
     'build_distance_truth',
+    'aggregate_distance_truth_stats',
 ]

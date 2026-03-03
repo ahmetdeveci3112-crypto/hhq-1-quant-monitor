@@ -8439,6 +8439,7 @@ try:
         compute_order_impact as rfx_compute_order_impact,
         DepthImpact as RFX_DepthImpact,
         build_distance_truth as rfx_build_distance_truth,
+        aggregate_distance_truth_stats as rfx_aggregate_distance_truth_stats,
     )
     from exit import (
         ExitStateMachine as RFX_ExitStateMachine,
@@ -30160,6 +30161,7 @@ class PaperTradingEngine:
                 logger.debug(f"RFX-2B.1: distance_truth recompute failed: {_dt_err}")
                 new_position['distance_truth'] = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
         elif new_position.get('distance_truth'):
+            new_position['distance_truth'] = dict(new_position['distance_truth'])  # shallow copy: avoid signal mutation
             new_position['distance_truth']['distance_truth_source'] = 'SIGNAL_PROPAGATED'
         else:
             new_position['distance_truth'] = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
@@ -32768,6 +32770,25 @@ async def trade_analysis():
                    for k, v in trade_pattern_analyzer.hour_wr.items()},
     }
 
+# RFX-2C: Distance truth flag rate aggregation
+def _get_distance_truth_stats() -> dict:
+    """Aggregate distance_truth stats from active positions + recent closed trades."""
+    try:
+        if not _RFX_MODULES_AVAILABLE:
+            return {}
+        positions = global_paper_trader.positions if 'global_paper_trader' in globals() else []
+        # Last 50 closed trades for recent flag rate
+        trades = global_paper_trader.trades[-50:] if 'global_paper_trader' in globals() else []
+        pos_stats = rfx_aggregate_distance_truth_stats(positions)
+        trade_stats = rfx_aggregate_distance_truth_stats(trades)
+        return {
+            'positions': pos_stats,
+            'recentTrades': trade_stats,
+        }
+    except Exception as e:
+        logger.debug(f"RFX-2C: distance truth stats failed: {e}")
+        return {}
+
 @app.get("/optimizer/status")
 async def optimizer_status():
     """Get optimizer status and analysis."""
@@ -32822,6 +32843,8 @@ async def optimizer_status():
             "scannedCoins": _scanner_stats.get('scannedCoins', 0),
             "effectiveMaxCoins": _scanner_stats.get('effectiveMaxCoins', 0),
         },
+        # RFX-2C: Distance truth flag rate dashboard
+        "distanceTruthStats": _get_distance_truth_stats(),
     })
 
 @app.post("/optimizer/run")
