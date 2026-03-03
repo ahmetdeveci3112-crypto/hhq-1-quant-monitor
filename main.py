@@ -7662,6 +7662,39 @@ def compute_sl_tp_levels(
     """
     safe_lev = max(1, int(leverage))
     
+    # ── RFX-1A Adapter: delegate to v2 when flag is ON ──
+    if RFX_SL_TP_V2 and _RFX_MODULES_AVAILABLE:
+        try:
+            tick = 0.0001
+            try:
+                tick = get_tick_size(symbol)
+            except Exception:
+                pass
+            # Build LiquidityProfile from available context (neutral if no data)
+            _rfx_lp = RFX_LiquidityProfile.neutral()
+            # Resolve risk params from profile
+            _rfx_profile = RFX_RiskProfile(RFX_RISK_PROFILE) if RFX_RISK_PROFILE in ('BALANCED', 'AGGRESSIVE', 'ULTRA_AGGRESSIVE') else RFX_RiskProfile.BALANCED
+            _rfx_rp = rfx_resolve_risk_params(_rfx_profile, safe_lev, _rfx_lp)
+            _v2_result = rfx_compute_sl_tp_levels_v2(
+                entry_price=entry_price, atr=atr, side=side, leverage=leverage,
+                adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
+                adjusted_trail_act_atr=adjusted_trail_act_atr,
+                adjusted_trail_dist_atr=adjusted_trail_dist_atr,
+                spread_pct=spread_pct,
+                canary_sl_mult=canary_sl_mult, canary_tp_mult=canary_tp_mult,
+                canary_trail_mult=canary_trail_mult,
+                tick_size=tick,
+                liq_profile=_rfx_lp,
+                risk_params=_rfx_rp,
+                parity_mode=RFX_PARITY_MODE,
+            )
+            logger.debug(f"RFX_SL_TP_V2: {symbol} {side} profile={RFX_RISK_PROFILE} parity={RFX_PARITY_MODE} "
+                         f"sl={_v2_result['sl']:.6f} tp={_v2_result['tp']:.6f} src={_v2_result['meta']}")
+            return _v2_result
+        except Exception as _rfx_e:
+            logger.warning(f"RFX_SL_TP_V2 fallback to legacy: {_rfx_e}")
+    
+
     # ── Step 1: Raw distances ──
     sl_dist_atr = atr * adjusted_sl_atr
     tp_dist_atr = atr * adjusted_tp_atr
@@ -7763,6 +7796,19 @@ def compute_breakeven_buffer_pct(
     Phase 245: Updated fee to real measured value, wider clamp range.
     Returns float ratio, e.g. 0.0015 for 0.15%.
     """
+    # ── RFX-1A Adapter: delegate to risk.breakeven when flag is ON ──
+    if RFX_LIQUIDITY_NATIVE and _RFX_MODULES_AVAILABLE:
+        try:
+            return rfx_compute_breakeven_buffer_pct(
+                spread_pct=spread_pct,
+                expected_slippage_pct=expected_slippage_pct,
+                is_live=is_live,
+                spread_level=spread_level,
+                reason=reason,
+            )
+        except Exception as _rfx_e:
+            logger.warning(f"RFX_BREAKEVEN fallback to legacy: {_rfx_e}")
+    
     try:
         ROUND_TRIP_FEE_PCT = 0.08  # Phase 245: Real measured fee (BNB discount)
         # Spread contribution (60% of spread — partial fill expected)
@@ -10561,6 +10607,16 @@ def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: fl
       - Never tighter than 1.5x current SL distance (avoid premature trigger)
     Returns True if emergency breach detected.
     """
+    # ── RFX-1A Adapter: delegate to risk.emergency static_v1 ──
+    # NOTE: Uses check_emergency_sl_static_v1 (12% ROI trail-based), NOT
+    # check_emergency (50% ROI entry-based). Parity with THIS exact function.
+    if RFX_EMERGENCY_V2 and _RFX_MODULES_AVAILABLE:
+        try:
+            from risk.emergency import check_emergency_sl_static_v1 as _rfx_static
+            return _rfx_static(pos, current_price, trailing_stop)
+        except Exception as _rfx_e:
+            logger.warning(f"RFX_EMERGENCY_V2 fallback to legacy: {_rfx_e}")
+    
     entry_price = pos.get('entryPrice', 0)
     if entry_price <= 0 or trailing_stop <= 0:
         return False
@@ -28595,6 +28651,19 @@ class PaperTradingEngine:
             logger.info(f"📂 Position saved to SQLite: {symbol} openTime={new_position.get('openTime')}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
+        
+        # ── RFX-1A: Attach ExitStateMachine skeleton ──
+        if RFX_EXIT_SM_ENABLED and _RFX_MODULES_AVAILABLE:
+            try:
+                _sm = RFX_ExitStateMachine(
+                    pos_id=new_position.get('id', str(uuid.uuid4())),
+                    side=new_position.get('side', 'LONG'),
+                    entry_price=float(new_position.get('entryPrice', 0)),
+                )
+                new_position['_exit_sm'] = _sm.to_dict()
+                logger.info(f"🔧 RFX_EXIT_SM attached: {symbol} state={_sm.state.value}")
+            except Exception as _sm_err:
+                logger.warning(f"RFX_EXIT_SM attach failed: {_sm_err}")
         
         # Phase 266: Finalize entry forecast event (AFTER position actually created)
         _efe_status = 'MARKET_FALLBACK' if force_market else 'FILLED'
