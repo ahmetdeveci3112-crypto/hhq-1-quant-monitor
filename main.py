@@ -4149,19 +4149,27 @@ class LiveBinanceTrader:
     # Deterministic cleanup of reduceOnly stop/TP orders after position close.
     # ================================================================
     @staticmethod
+    def _parse_bool(val) -> bool:
+        """Parse boolean from CCXT/Binance raw fields. Handles True, 'true', '1', 'yes', 'y'."""
+        if val is True:
+            return True
+        if isinstance(val, str):
+            return val.strip().lower() in ('true', '1', 'yes', 'y')
+        return False
+
+    @staticmethod
     def _order_is_reduce_only(order: dict) -> bool:
         """Strict exit-order parse for CCXT + Binance raw fields.
         Accepts both reduceOnly and closePosition=true (Binance close-all conditionals).
+        Uses _parse_bool for robust string/bool handling.
         """
-        raw_reduce = order.get('reduceOnly')
-        info_reduce = (order.get('info') or {}).get('reduceOnly')
-        raw_close_position = order.get('closePosition')
-        info_close_position = (order.get('info') or {}).get('closePosition')
+        _pb = LiveBinanceTrader._parse_bool
+        info = order.get('info') or {}
         return (
-            (raw_reduce is True)
-            or (str(info_reduce).strip().lower() == 'true')
-            or (raw_close_position is True)
-            or (str(info_close_position).strip().lower() == 'true')
+            _pb(order.get('reduceOnly'))
+            or _pb(info.get('reduceOnly'))
+            or _pb(order.get('closePosition'))
+            or _pb(info.get('closePosition'))
         )
     
     def _raw_to_unified(self, raw: dict) -> dict:
@@ -4261,8 +4269,33 @@ class LiveBinanceTrader:
                 if '-2011' in err_str or 'Unknown order' in err_str:
                     logger.info(f"ℹ️ POST_CLOSE_CLEANUP: Order {order['id']} already gone for {symbol}{trace_str}")
                 else:
-                    result['errors'] += 1
-                    logger.warning(f"⚠️ POST_CLOSE_CLEANUP: Cancel failed for {order['id']} {symbol}: {cancel_err}{trace_str}")
+                    # Retry with alternate ccxt symbol derived from order/info
+                    _alt_sym = None
+                    _order_sym = order.get('symbol', '')
+                    _info_sym = (order.get('info') or {}).get('symbol', '')
+                    if _order_sym and '/' in _order_sym and _order_sym != cancel_symbol:
+                        _alt_sym = _order_sym
+                    elif _info_sym and _info_sym.endswith('USDT'):
+                        _alt_base = _info_sym[:-4]
+                        _alt_sym = f"{_alt_base}/USDT:USDT"
+                    
+                    if _alt_sym and _alt_sym != cancel_symbol:
+                        try:
+                            logger.info(f"🔄 ORPHAN_CANCEL_RETRY: order={order['id']} from={cancel_symbol} to={_alt_sym}{trace_str}")
+                            await self.exchange.cancel_order(order['id'], _alt_sym)
+                            result['cancelled'] += 1
+                            result['order_ids'].append(order['id'])
+                            logger.info(f"✅ ORPHAN_CANCEL_RETRY_OK: order={order['id']} alt_sym={_alt_sym}{trace_str}")
+                        except Exception as retry_err:
+                            _retry_str = str(retry_err)
+                            if '-2011' in _retry_str or 'Unknown order' in _retry_str:
+                                logger.info(f"ℹ️ ORPHAN_CANCEL_RETRY: Order {order['id']} already gone{trace_str}")
+                            else:
+                                result['errors'] += 1
+                                logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym1={cancel_symbol} sym2={_alt_sym} err1={cancel_err} err2={retry_err}{trace_str}")
+                    else:
+                        result['errors'] += 1
+                        logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym={cancel_symbol} no_alt_available err={cancel_err}{trace_str}")
         
         return result
 
@@ -4322,6 +4355,11 @@ class LiveBinanceTrader:
 
             conditional_types = {'stop_market', 'take_profit_market', 'stop', 'take_profit', 'trailing_stop_market'}
 
+            # Global sweep mode: if no active positions, all reduce-only conditionals are orphans
+            _global_sweep = len(active_symbols) == 0 and len(all_orders) > 0
+            if _global_sweep:
+                logger.warning(f"🧹 ORPHAN_GLOBAL_SWEEP_START: active_symbols=0 total_open_orders={len(all_orders)}")
+
             for order in all_orders:
                 order_type = (order.get('type') or '').lower()
                 # P0 orphan fix: origType/type fallback (parity with cancel_reduce_only_conditionals)
@@ -4345,28 +4383,62 @@ class LiveBinanceTrader:
                 if not raw_sym and '/' in order_symbol:
                     raw_sym = order_symbol.split('/')[0] + 'USDT'
 
-                if raw_sym in active_symbols:
+                # USDT guard: skip non-USDT markets (safety)
+                if raw_sym and not raw_sym.endswith('USDT'):
+                    logger.info(f"ℹ️ ORPHAN_SWEEP_SKIP_NON_USDT: {raw_sym} order={order['id']}")
+                    continue
+
+                # In normal mode, skip if position still exists
+                if not _global_sweep and raw_sym in active_symbols:
                     continue  # position still exists, not orphan
 
                 # Orphan found — cancel
                 result['orphans'] += 1
+                cancel_sym = order_symbol if '/' in order_symbol else f"{raw_sym[:-4]}/USDT:USDT" if raw_sym and len(raw_sym) > 4 else order_symbol
                 try:
-                    cancel_sym = order_symbol if '/' in order_symbol else f"{raw_sym[:-4]}/USDT:USDT"
                     await self.exchange.cancel_order(order['id'], cancel_sym)
                     result['cancelled'] += 1
                     if raw_sym not in result['symbols']:
                         result['symbols'].append(raw_sym)
                     logger.warning(
                         f"🧹 ORPHAN_SWEEP_CANCELLED: {raw_sym} order={order['id']} "
-                        f"type={order_type} — no open position"
+                        f"type={order_type} — {'global_sweep' if _global_sweep else 'no open position'}"
                     )
                 except Exception as cancel_err:
                     err_str = str(cancel_err)
                     if '-2011' in err_str or 'Unknown order' in err_str:
                         logger.info(f"ℹ️ ORPHAN_SWEEP: order {order['id']} already gone for {raw_sym}")
                     else:
-                        result['errors'] += 1
-                        logger.warning(f"⚠️ ORPHAN_SWEEP_FAILED: {raw_sym} order={order['id']}: {cancel_err}")
+                        # Retry with alternate ccxt symbol
+                        _alt_sym = None
+                        _order_sym = order.get('symbol', '')
+                        _info_sym = _info.get('symbol', '')
+                        if _order_sym and '/' in _order_sym and _order_sym != cancel_sym:
+                            _alt_sym = _order_sym
+                        elif _info_sym and _info_sym.endswith('USDT') and len(_info_sym) > 4:
+                            _alt_sym = f"{_info_sym[:-4]}/USDT:USDT"
+                        
+                        if _alt_sym and _alt_sym != cancel_sym:
+                            try:
+                                logger.info(f"🔄 ORPHAN_CANCEL_RETRY: order={order['id']} from={cancel_sym} to={_alt_sym}")
+                                await self.exchange.cancel_order(order['id'], _alt_sym)
+                                result['cancelled'] += 1
+                                if raw_sym not in result['symbols']:
+                                    result['symbols'].append(raw_sym)
+                                logger.info(f"✅ ORPHAN_CANCEL_RETRY_OK: order={order['id']} alt_sym={_alt_sym}")
+                            except Exception as retry_err:
+                                _retry_str = str(retry_err)
+                                if '-2011' in _retry_str or 'Unknown order' in _retry_str:
+                                    logger.info(f"ℹ️ ORPHAN_CANCEL_RETRY: order {order['id']} already gone")
+                                else:
+                                    result['errors'] += 1
+                                    logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym1={cancel_sym} sym2={_alt_sym} err1={cancel_err} err2={retry_err}")
+                        else:
+                            result['errors'] += 1
+                            logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym={cancel_sym} no_alt_available err={cancel_err}")
+
+            if _global_sweep:
+                logger.warning(f"🧹 ORPHAN_GLOBAL_SWEEP_DONE: cancelled={result['cancelled']} errors={result['errors']} symbols={result['symbols'][:10]}")
 
         except Exception as e:
             logger.error(f"❌ ORPHAN_SWEEP_ERROR: {e}")
@@ -13328,6 +13400,73 @@ class UIStateCache:
 ui_state_cache = UIStateCache()
 
 
+# ============================================================================
+# TRADE DEDUPLICATION HELPER (single authority)
+# ============================================================================
+# Source-aware trade dedup: POS > BIN > BINANCE.
+# Zero-data trades excluded from analytics. Sorting built-in (closeTime desc).
+
+_TRADE_SOURCE_PRIORITY = {'POS_': 3, 'BIN_': 2, 'BINANCE_': 1}
+
+def _trade_get_source_type(tid: str) -> tuple:
+    """Return (source_type, priority) for a trade ID."""
+    for prefix, prio in _TRADE_SOURCE_PRIORITY.items():
+        if tid.startswith(prefix):
+            return (prefix.rstrip('_'), prio)
+    return ('UNKNOWN', 0)
+
+def _trade_is_analytics_valid(t: dict) -> bool:
+    """Exclude zero-data / synthetic trades from PnL analytics."""
+    if t.get('entryPrice', t.get('entry_price', 0)) <= 0:
+        return False
+    if t.get('exitPrice', t.get('exit_price', 0)) <= 0:
+        return False
+    if t.get('sizeUsd', t.get('size_usd', t.get('marginUsd', t.get('margin_usd', 1)))) <= 0:
+        return False
+    return True
+
+def dedupe_trades_for_ui(trades: list) -> tuple:
+    """Deduplicate trades for UI display. Single authority used by all paths.
+    Returns (deduped_trades, stats_dict).
+    Trades are sorted by closeTime descending (built-in, callers should NOT re-sort).
+    """
+    dedup_groups: dict = {}  # key → (priority, trade_copy)
+    for t in trades:
+        tid = t.get('id', '')
+        src_type, src_prio = _trade_get_source_type(tid)
+
+        # Strip source prefix for cross-source matching
+        base_id = tid
+        for pfx in _TRADE_SOURCE_PRIORITY:
+            if base_id.startswith(pfx):
+                base_id = base_id[len(pfx):]
+                break
+
+        # Dedup key: (symbol, base_id) OR fallback (symbol, close_time_bucket, side)
+        if base_id:
+            dk = ('id', t.get('symbol', ''), base_id)
+        else:
+            ct = t.get('closeTime', t.get('close_time', 0))
+            dk = ('fb', t.get('symbol', ''), round(ct / 120000) if ct else 0, t.get('side', ''))
+
+        prev = dedup_groups.get(dk)
+        if prev is None or src_prio > prev[0]:
+            # Shallow copy + annotate source_type (never mutate original)
+            dedup_groups[dk] = (src_prio, {**t, 'source_type': src_type})
+
+    deduped = [v[1] for v in dedup_groups.values()]
+    # Sort by closeTime descending — built-in, callers should NOT re-sort
+    deduped.sort(key=lambda x: x.get('closeTime', x.get('close_time', 0)), reverse=True)
+    analytics_valid = [t for t in deduped if _trade_is_analytics_valid(t)]
+
+    stats = {
+        'rawCount': len(trades),
+        'dedupedCount': len(deduped),
+        'analyticsValidCount': len(analytics_valid),
+    }
+    return deduped, stats
+
+
 class MultiCoinScanner:
     """
     Phase 31: Multi-Coin Scanner
@@ -14264,12 +14403,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 ui_state_cache.balance = balance_data.get('walletBalance', 0)
                 ui_state_cache.live_balance = balance_data
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
-                # Keep trade history live from engine memory; Binance income sync remains enrichment/backfill.
-                ui_state_cache.trades = sorted(
-                    global_paper_trader.trades,
-                    key=lambda t: t.get('closeTime', t.get('close_time', 0)),
-                    reverse=True
-                )
+                # Keep trade history live from engine memory; dedup via single-authority helper.
+                _deduped, _ = dedupe_trades_for_ui(global_paper_trader.trades)
+                ui_state_cache.trades = _deduped
                 ui_state_cache.trading_mode = "live"
                 logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
                 cached_pnl = getattr(live_binance_trader, 'cached_pnl', None)
@@ -14292,12 +14428,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
             ui_state_cache.positions = global_paper_trader.positions
             ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
             ui_state_cache.trading_mode = "paper"
-            # Phase 232: Sync trades on every cycle (fix stale cache)
-            ui_state_cache.trades = sorted(
-                global_paper_trader.trades,
-                key=lambda t: t.get('closeTime', t.get('close_time', 0)),
-                reverse=True
-            )
+            # Phase 232: Sync trades on every cycle (dedup via single-authority helper)
+            _deduped, _ = dedupe_trades_for_ui(global_paper_trader.trades)
+            ui_state_cache.trades = _deduped
         
         # Phase 150: Trade history — SQLite first, then Binance delta
         now = datetime.now().timestamp()
@@ -32731,59 +32864,8 @@ async def paper_trading_status():
     except Exception:
         data_quality = {}
     
-    # P0-RCA #1: Source-aware trade deduplication (projection-only, no physical deletion)
-    # Priority: POS > BIN > BINANCE. Zero-data trades excluded from analytics.
-    _SOURCE_PRIORITY = {'POS_': 3, 'BIN_': 2, 'BINANCE_': 1}
-
-    def _get_source_type(tid: str) -> tuple:
-        """Return (source_type, priority) for a trade ID."""
-        for prefix, prio in _SOURCE_PRIORITY.items():
-            if tid.startswith(prefix):
-                return (prefix.rstrip('_'), prio)
-        return ('UNKNOWN', 0)
-
-    def _is_analytics_valid(t: dict) -> bool:
-        """Exclude zero-data / synthetic trades from PnL analytics."""
-        if t.get('entryPrice', t.get('entry_price', 0)) <= 0:
-            return False
-        if t.get('exitPrice', t.get('exit_price', 0)) <= 0:
-            return False
-        if t.get('sizeUsd', t.get('size_usd', t.get('marginUsd', t.get('margin_usd', 1)))) <= 0:
-            return False
-        return True
-
-    # Group by dedup key → keep highest priority source
-    # P1-FIX: Use shallow copies to avoid mutating shared trade objects
-    _dedup_groups: dict = {}  # key → (priority, trade_copy)
-    for t in global_paper_trader.trades:
-        tid = t.get('id', '')
-        _src_type, _src_prio = _get_source_type(tid)
-
-        # Primary key: exact ID (strip source prefix for cross-source matching)
-        _base_id = tid
-        for _pfx in _SOURCE_PRIORITY:
-            if _base_id.startswith(_pfx):
-                _base_id = _base_id[len(_pfx):]
-                break
-
-        # Dedup key: (symbol, base_id) OR fallback (symbol, close_time_bucket, side)
-        if _base_id:
-            _dk = ('id', t.get('symbol', ''), _base_id)
-        else:
-            _ct = t.get('closeTime', t.get('close_time', 0))
-            _dk = ('fb', t.get('symbol', ''), round(_ct / 120000) if _ct else 0, t.get('side', ''))
-
-        prev = _dedup_groups.get(_dk)
-        if prev is None or _src_prio > prev[0]:
-            # Shallow copy + annotate source_type on the copy, NOT the original
-            _tcopy = {**t, 'source_type': _src_type}
-            _dedup_groups[_dk] = (_src_prio, _tcopy)
-
-    _deduped_trades = [v[1] for v in _dedup_groups.values()]
-    # Sort by close time descending for UI
-    _deduped_trades.sort(key=lambda x: x.get('closeTime', x.get('close_time', 0)), reverse=True)
-    # P1-FIX: Filter analytics-valid trades (exclude zero-data / synthetic)
-    _analytics_trades = [t for t in _deduped_trades if _is_analytics_valid(t)]
+    # P0-RCA #1: Source-aware trade dedup via single-authority helper
+    _deduped_trades, _dedup_stats = dedupe_trades_for_ui(global_paper_trader.trades)
     
     return JSONResponse({
         "balance": global_paper_trader.balance,
@@ -32810,11 +32892,7 @@ async def paper_trading_status():
             "warn": global_paper_trader.pipeline_metrics.get('recheck_warn', 0),
         },
         # P1-FIX: Dedup telemetry
-        "dedupStats": {
-            "rawCount": len(global_paper_trader.trades),
-            "dedupedCount": len(_deduped_trades),
-            "analyticsValidCount": len(_analytics_trades),
-        },
+        "dedupStats": _dedup_stats,
     })
 
 

@@ -114,6 +114,17 @@ const getDirInfo = (dir: string) => {
     return { color: 'text-slate-400', label: '— NÖTR' };
 };
 
+/** Convert windowSec to a human-readable Turkish label (e.g., 300→"5dk", 7200→"2sa") */
+const formatWindowSec = (sec?: number): string => {
+    if (!sec || sec <= 0) return '?';
+    if (sec >= 3600) {
+        const h = Math.round(sec / 3600);
+        return `${h}sa`;
+    }
+    const m = Math.round(sec / 60);
+    return `${m}dk`;
+};
+
 export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime, dcaConfig }) => {
     const safeTracking = tracking || [];
     const safeAnalyses = analyses || [];
@@ -239,10 +250,10 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                 <div className="bg-slate-800/40 rounded-lg p-2.5">
                                     <div className="flex items-center justify-between mb-1">
                                         <span className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider flex items-center gap-1">
-                                            <Zap className="w-2.5 h-2.5 text-amber-500" /> Hızlı (5dk)
+                                            <Zap className="w-2.5 h-2.5 text-amber-500" /> Hızlı ({formatWindowSec(marketRegime.fast.windowSec)})
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
-                                            {marketRegime.fast.samples} örnek / 5dk
+                                            {marketRegime.fast.samples} örnek / {formatWindowSec(marketRegime.fast.windowSec)}
                                             {marketRegime.fast.samples < 5 && (
                                                 <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
                                             )}
@@ -272,10 +283,10 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                 <div className="bg-slate-800/40 rounded-lg p-2.5">
                                     <div className="flex items-center justify-between mb-1">
                                         <span className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider flex items-center gap-1">
-                                            🏗️ Yapısal (2sa)
+                                            🏗️ Yapısal ({formatWindowSec(marketRegime.struct.windowSec)})
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
-                                            {marketRegime.struct.samples} örnek / 2sa
+                                            {marketRegime.struct.samples} örnek / {formatWindowSec(marketRegime.struct.windowSec)}
                                             {marketRegime.struct.samples < 20 && (
                                                 <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
                                             )}

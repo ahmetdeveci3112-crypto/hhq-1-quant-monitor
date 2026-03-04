@@ -1765,7 +1765,7 @@ export default function App() {
                     const isLong = trade.side === 'LONG';
                     const isWin = trade.pnl >= 0;
                     return (
-                      <div key={i} className={`p-3 rounded-lg border ${isWin ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
+                      <div key={trade.id || `${trade.symbol}_${trade.closeTime}_${i}`} className={`p-3 rounded-lg border ${isWin ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center gap-2">
                             <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'YOK'}</span>
@@ -1820,7 +1820,7 @@ export default function App() {
                         const roi = (trade as any).roi !== undefined ? (trade as any).roi :
                           ((trade as any).margin && (trade as any).margin > 0 ? (trade.pnl / (trade as any).margin) * 100 : 0);
                         return (
-                          <tr key={i} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
+                          <tr key={trade.id || `${trade.symbol}_${trade.closeTime}_${i}`} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
                             <td className="py-3 px-4 text-slate-400 font-mono text-xs">
                               {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
                             </td>
