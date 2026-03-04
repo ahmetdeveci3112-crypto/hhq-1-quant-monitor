@@ -8391,7 +8391,12 @@ UNIVERSE_ALLOW_ALL = os.environ.get('UNIVERSE_ALLOW_ALL', 'false').lower() == 't
 DEFAULT_UNIVERSE_CAP = 200  # fallback when UNIVERSE_MAX_COINS <= 0 and ALLOW_ALL=false
 
 # P0-1: ATR scale semantic migration
-ATR_SCALE_VERSION = os.environ.get('ATR_SCALE_VERSION', 'auto')  # auto | legacy_deci | direct
+# P0-FIX: ATR Scale — canonical = DECI (stored integer / 10 = multiplier)
+# ATR_SEMVER tracks the convention version for state-file migration.
+# v1 = broken 'auto' heuristic (values ≤15 treated as direct — BUG)
+# v2 = always DECI: 15 → 1.5×, 30 → 3.0×, 20 → 2.0×
+ATR_SEMVER = 2
+ATR_SCALE_VERSION = os.environ.get('ATR_SCALE_VERSION', 'deci_canonical')  # deci_canonical | direct (debug only)
 
 # ═══════════════════════════════════════════════════════════════════
 # RFX-1A: Feature flags — all default OFF for zero behavioral change
@@ -8460,18 +8465,20 @@ except ImportError as _rfx_err:
 
 
 def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float:
-    """Convert raw ATR setting to effective multiplier.
-    auto: raw > 15 → legacy_deci (raw/10), else direct (raw).
-    legacy_deci: always raw/10.
-    direct: always raw.
+    """Convert stored ATR setting (DECI integer) to effective multiplier.
+
+    Canonical storage: DECI — raw / 10.0
+        15 → 1.5×,  30 → 3.0×,  20 → 2.0×
+
+    P0-FIX: The previous 'auto' heuristic (raw > 15 → /10, else direct) was
+    broken — sl_atr=15 (meaning 1.5×) was treated as 15.0×.
+    Now always divides by 10.  'direct' kept ONLY as env-var escape hatch.
     """
     sv = scale_version or ATR_SCALE_VERSION
     if sv == 'direct':
         return float(raw_value)
-    if sv == 'legacy_deci':
-        return float(raw_value) / 10.0
-    # auto: raw > 15 → legacy, else direct
-    return float(raw_value) / 10.0 if raw_value > 15 else float(raw_value)
+    # v2 canonical: always DECI — no auto heuristic
+    return float(raw_value) / 10.0
 
 # Patch D: EV Gate thresholds
 EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'true').lower() == 'true'
@@ -8639,8 +8646,8 @@ def compute_adaptive_margin(
     session_risk: float, size_mult: float,
     leverage: int,
     symbol: str = '',
-    margin_floor: float = 2.0, margin_cap: float = 10.0,
-    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.10,
+    margin_floor: float = 5.0, margin_cap: float = 10.0,
+    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.15,
 ) -> dict:
     """ASL-1: Adapt margin based on market quality.
     margin_modifier range: [0.8, 1.2]
@@ -8777,8 +8784,8 @@ def compute_effective_leverage(
 # P0-2: Margin-First Sizing Helper
 def compute_margin_target(
     balance: float, leverage: int, session_risk: float, size_mult: float,
-    margin_floor: float = 2.0, margin_cap: float = 10.0,
-    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.10,
+    margin_floor: float = 5.0, margin_cap: float = 10.0,
+    balance_floor_pct: float = 0.02, balance_cap_pct: float = 0.15,
 ) -> dict:
     """Compute margin-first position sizing.
     Returns margin_usd (clamped) and notional_usd = margin * leverage.
@@ -21156,20 +21163,20 @@ class LossRecoveryTrailManager:
         # Track recovery state: {symbol: {peak_loss: float, peak_recovery: float, trail_active: bool}}
         self.recovery_state = {}
         
-        # Spread-based loss thresholds (how deep loss before recovery tracking)
+        # P0-RCA #4: Spread-based loss thresholds — widened to give positions more room
         self.loss_thresholds = {
-            'Very Low': -3.0,   # BTC/ETH
-            'Low': -4.0,
-            'Normal': -5.0,
-            'High': -7.0,
-            'Very High': -10.0, # Meme coins - need more room
-            'Extreme': -15.0,   # Hyper-volatile
-            'Ultra': -20.0      # Extreme edge cases
+            'Very Low': -5.0,   # BTC/ETH — was -3%, too tight
+            'Low': -6.0,        # was -4%
+            'Normal': -7.0,     # was -5%
+            'High': -10.0,      # was -7%
+            'Very High': -12.0,  # Meme coins — was -10%
+            'Extreme': -15.0,   # Hyper-volatile — unchanged
+            'Ultra': -20.0      # Extreme edge cases — unchanged
         }
         
-        # Recovery percentages
-        self.recovery_activation_pct = 0.30  # Must recover 30% of loss to activate trail
-        self.trail_giveback_pct = 0.50       # Close if gives back 50% of recovery
+        # P0-RCA #4: Recovery percentages — relaxed to reduce premature exits
+        self.recovery_activation_pct = 0.50  # Must recover 50% of loss (was 30%)
+        self.trail_giveback_pct = 0.65       # Close if gives back 65% of recovery (was 50%)
         
         logger.info("📊 LossRecoveryTrailManager initialized")
     
@@ -22638,8 +22645,10 @@ PARAM_LIMITS = {
     'min_score_low':      {'min': 30,  'max': 60,   'step': 1},
     'min_score_high':     {'min': 60,  'max': 95,   'step': 1},
     'max_positions':      {'min': 2,   'max': 15,   'step': 1},
-    'sl_atr':             {'min': 1.0, 'max': 5.0,  'step': 0.1},
-    'tp_atr':             {'min': 1.0, 'max': 8.0,  'step': 0.1},
+    # P0-FIX: sl_atr/tp_atr in DECI scale (10 = 1.0× ATR).  Canonical v2.
+    # Min aligned with hyperopt search ranges (sl: 1.0×, tp: 1.5×).
+    'sl_atr':             {'min': 10,  'max': 50,   'step': 1},   # 1.0× – 5.0× ATR
+    'tp_atr':             {'min': 15,  'max': 80,   'step': 1},   # 1.5× – 8.0× ATR
     'trail_activation_atr': {'min': 0.3, 'max': 4.0, 'step': 0.1},
     'trail_distance_atr': {'min': 0.2, 'max': 3.0,  'step': 0.1},
 }
@@ -22649,7 +22658,11 @@ def _clamp_param(name: str, value):
     lim = PARAM_LIMITS.get(name)
     if lim is None:
         return value
-    return max(lim['min'], min(lim['max'], value))
+    clamped = max(lim['min'], min(lim['max'], value))
+    # P0-RCA #3: Drift detection — log when value was silently changed
+    if clamped != value:
+        logger.warning(f"⚠️ SETTINGS_DRIFT: {name} clamped {value} → {clamped} (limits: {lim['min']}–{lim['max']})")
+    return clamped
 
 # ============================================================================
 # PHASE 155: AI OPTIMIZER - GRADIENT-BASED PARAMETER OPTIMIZER
@@ -22910,8 +22923,9 @@ class MarketRegimeDetector:
     
     def __init__(self):
         # --- Time-based window config ---
-        self.fast_window_sec = 300     # 5 min
-        self.struct_window_sec = 7200  # 2 hr
+        # P0-RCA #5: Expanded from 5min/2h to 1h/4h for less noisy regime detection
+        self.fast_window_sec = int(os.environ.get('BTC_FAST_WINDOW_SEC', 3600))    # 1 hour (was 5 min)
+        self.struct_window_sec = int(os.environ.get('BTC_STRUCT_WINDOW_SEC', 14400))  # 4 hours (was 2 hr)
         
         # --- Fast window state (entry decisions) ---
         self.fast_regime = self.RANGING
@@ -22932,7 +22946,7 @@ class MarketRegimeDetector:
         self.last_update = None
         self.regime_history = []
         self.max_history = 100
-        logger.info("📊 MarketRegimeDetector initialized — DRU-1 dual-window (fast=300s struct=7200s)")
+        logger.info(f"📊 MarketRegimeDetector initialized — DRU-1 dual-window (fast={self.fast_window_sec}s struct={self.struct_window_sec}s)")
     
     def update_btc_price(self, price: float, source: str = 'unknown') -> bool:
         """BTC fiyatını kaydet — 30s throttle veya %0.05 fiyat değişimi şartı."""
@@ -29261,21 +29275,21 @@ class PaperTradingEngine:
         if pos['side'] == 'LONG':
             loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
             
-            # Only if in loss (>1%) and price is recovering
-            if loss_pct > 1:
+            # P0-RCA #4: Only if in meaningful loss (>3%) and price is recovering (was >1%)
+            if loss_pct > 3:
                 if 'recovery_low' not in pos:
                     pos['recovery_low'] = current_price
                 elif current_price < pos['recovery_low']:
                     pos['recovery_low'] = current_price
                     
-                # If price bounced from low by 0.3 ATR
-                if current_price > pos['recovery_low'] + (atr * 0.3):
+                # P0-RCA #4: If price bounced from low by 0.6 ATR (was 0.3 — too tight)
+                if current_price > pos['recovery_low'] + (atr * 0.6):
                     if not pos.get('recovery_mode', False):
                         pos['recovery_mode'] = True
-                        pos['recovery_sl'] = current_price - (atr * 0.3)
+                        pos['recovery_sl'] = current_price - (atr * 0.6)
                         self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
                     else:
-                        new_recovery_sl = current_price - (atr * 0.3)
+                        new_recovery_sl = current_price - (atr * 0.6)
                         if new_recovery_sl > pos.get('recovery_sl', 0):
                             pos['recovery_sl'] = new_recovery_sl
                             
@@ -29287,19 +29301,20 @@ class PaperTradingEngine:
         elif pos['side'] == 'SHORT':
             loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
             
-            if loss_pct > 1:  # %1 kayıpta recovery mode (daha erken müdahale)
+            if loss_pct > 3:  # P0-RCA #4: was 1%, too early to activate recovery
                 if 'recovery_high' not in pos:
                     pos['recovery_high'] = current_price
                 elif current_price > pos['recovery_high']:
                     pos['recovery_high'] = current_price
                     
-                if current_price < pos['recovery_high'] - (atr * 0.3):
+                # P0-RCA #4: 0.6 ATR trail distance (was 0.3)
+                if current_price < pos['recovery_high'] - (atr * 0.6):
                     if not pos.get('recovery_mode', False):
                         pos['recovery_mode'] = True
-                        pos['recovery_sl'] = current_price + (atr * 0.3)
+                        pos['recovery_sl'] = current_price + (atr * 0.6)
                         self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
                     else:
-                        new_recovery_sl = current_price + (atr * 0.3)
+                        new_recovery_sl = current_price + (atr * 0.6)
                         if new_recovery_sl < pos.get('recovery_sl', float('inf')):
                             pos['recovery_sl'] = new_recovery_sl
                             
@@ -29603,10 +29618,40 @@ class PaperTradingEngine:
                     _r = data.get('risk_per_trade', 0.02)
                     if _r > 1.0:  # legacy state had percent (2.0 = 2%), normalize to ratio
                         _r = _r / 100.0
-                    self.risk_per_trade = max(0.002, min(0.05, _r))
+                    self.risk_per_trade = max(0.002, min(0.10, _r))  # P0-RCA #2: raised from 5% to 10%
                     # Phase 18: Load full trading parameters
-                    self.sl_atr = data.get('sl_atr', 15)  # Default: 15 (1.5x ATR)
-                    self.tp_atr = data.get('tp_atr', 30)  # Default: 30 (3.0x ATR)
+                    # P0-HOTFIX: Semver-aware ATR migration (v1 auto → v2 canonical DECI)
+                    _saved_semver = data.get('atr_semver', 1)
+                    _raw_sl = data.get('sl_atr', 15)
+                    _raw_tp = data.get('tp_atr', 30)
+
+                    if _saved_semver < ATR_SEMVER:
+                        # Replay old 'auto' heuristic to recover effective multiplier:
+                        #   auto: raw <= 15 → used directly (e.g. 5 → 5.0×)
+                        #          raw > 15 → divided by 10 (e.g. 50 → 5.0×)
+                        # Then convert effective multiplier → DECI (×10)
+                        def _migrate_atr(raw, label):
+                            if isinstance(raw, float) and raw < 3.0:
+                                # Direct float from hyperopt (e.g. 1.5 → 1.5×)
+                                effective = raw
+                            elif raw <= 15:
+                                # Old auto: small int used directly (e.g. 5 → 5.0×)
+                                effective = float(raw)
+                            else:
+                                # Old auto: large int already deci (e.g. 50 → 5.0×)
+                                effective = raw / 10.0
+                            new_deci = int(round(effective * 10))
+                            logger.info(
+                                f"ATR_MIGRATION v{_saved_semver}→v{ATR_SEMVER}: "
+                                f"{label} raw={raw} → effective={effective:.1f}× → deci={new_deci}"
+                            )
+                            return new_deci
+
+                        _raw_sl = _migrate_atr(_raw_sl, 'sl_atr')
+                        _raw_tp = _migrate_atr(_raw_tp, 'tp_atr')
+
+                    self.sl_atr = _clamp_param('sl_atr', int(_raw_sl))
+                    self.tp_atr = _clamp_param('tp_atr', int(_raw_tp))
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
                     self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
                     self.max_positions = data.get('max_positions', 50)  # Default: 50
@@ -29682,6 +29727,7 @@ class PaperTradingEngine:
                 "leverage": self.leverage,
                 "risk_per_trade": self.risk_per_trade,
                 # Phase 18: Save full trading parameters
+                "atr_semver": ATR_SEMVER,  # P0-FIX: track scale version for migration
                 "sl_atr": self.sl_atr,
                 "tp_atr": self.tp_atr,
                 "trail_activation_atr": self.trail_activation_atr,
@@ -32496,23 +32542,59 @@ async def paper_trading_status():
     except Exception:
         data_quality = {}
     
-    # P1: Trade deduplication for API response
-    _seen_ids = set()
-    _deduped_trades = []
+    # P0-RCA #1: Source-aware trade deduplication (projection-only, no physical deletion)
+    # Priority: POS > BIN > BINANCE. Zero-data trades excluded from analytics.
+    _SOURCE_PRIORITY = {'POS_': 3, 'BIN_': 2, 'BINANCE_': 1}
+
+    def _get_source_type(tid: str) -> tuple:
+        """Return (source_type, priority) for a trade ID."""
+        for prefix, prio in _SOURCE_PRIORITY.items():
+            if tid.startswith(prefix):
+                return (prefix.rstrip('_'), prio)
+        return ('UNKNOWN', 0)
+
+    def _is_analytics_valid(t: dict) -> bool:
+        """Exclude zero-data / synthetic trades from PnL analytics."""
+        if t.get('entryPrice', t.get('entry_price', 0)) <= 0:
+            return False
+        if t.get('exitPrice', t.get('exit_price', 0)) <= 0:
+            return False
+        if t.get('sizeUsd', t.get('size_usd', t.get('marginUsd', t.get('margin_usd', 1)))) <= 0:
+            return False
+        return True
+
+    # Group by dedup key → keep highest priority source
+    # P1-FIX: Use shallow copies to avoid mutating shared trade objects
+    _dedup_groups: dict = {}  # key → (priority, trade_copy)
     for t in global_paper_trader.trades:
         tid = t.get('id', '')
-        if tid:
-            if tid in _seen_ids:
-                continue
-            _seen_ids.add(tid)
+        _src_type, _src_prio = _get_source_type(tid)
+
+        # Primary key: exact ID (strip source prefix for cross-source matching)
+        _base_id = tid
+        for _pfx in _SOURCE_PRIORITY:
+            if _base_id.startswith(_pfx):
+                _base_id = _base_id[len(_pfx):]
+                break
+
+        # Dedup key: (symbol, base_id) OR fallback (symbol, close_time_bucket, side)
+        if _base_id:
+            _dk = ('id', t.get('symbol', ''), _base_id)
         else:
-            # Fallback key: (symbol, closeTime bucket ±120s, pnl rounded, side)
-            _ct = t.get('closeTime', 0)
-            _fb_key = (t.get('symbol', ''), round(_ct / 120000) if _ct else 0, round(t.get('pnl', 0), 6), t.get('side', ''))
-            if _fb_key in _seen_ids:
-                continue
-            _seen_ids.add(_fb_key)
-        _deduped_trades.append(t)
+            _ct = t.get('closeTime', t.get('close_time', 0))
+            _dk = ('fb', t.get('symbol', ''), round(_ct / 120000) if _ct else 0, t.get('side', ''))
+
+        prev = _dedup_groups.get(_dk)
+        if prev is None or _src_prio > prev[0]:
+            # Shallow copy + annotate source_type on the copy, NOT the original
+            _tcopy = {**t, 'source_type': _src_type}
+            _dedup_groups[_dk] = (_src_prio, _tcopy)
+
+    _deduped_trades = [v[1] for v in _dedup_groups.values()]
+    # Sort by close time descending for UI
+    _deduped_trades.sort(key=lambda x: x.get('closeTime', x.get('close_time', 0)), reverse=True)
+    # P1-FIX: Filter analytics-valid trades (exclude zero-data / synthetic)
+    _analytics_trades = [t for t in _deduped_trades if _is_analytics_valid(t)]
     
     return JSONResponse({
         "balance": global_paper_trader.balance,
@@ -32537,6 +32619,12 @@ async def paper_trading_status():
             "pass": global_paper_trader.pipeline_metrics.get('recheck_pass', 0),
             "fail": global_paper_trader.pipeline_metrics.get('recheck_fail', 0),
             "warn": global_paper_trader.pipeline_metrics.get('recheck_warn', 0),
+        },
+        # P1-FIX: Dedup telemetry
+        "dedupStats": {
+            "rawCount": len(global_paper_trader.trades),
+            "dedupedCount": len(_deduped_trades),
+            "analyticsValidCount": len(_analytics_trades),
         },
     })
 
@@ -33050,20 +33138,25 @@ async def get_performance_summary():
         source = "paper"
     
     total_trades = len(trades)
-    total_pnl = sum(t.get('pnl', 0) for t in trades)
-    winning_trades = len([t for t in trades if t.get('pnl', 0) > 0])
-    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    # P0-RCA #1: Exclude zero-data/synthetic trades from analytics
+    _valid_trades = [t for t in trades if
+        t.get('entryPrice', t.get('entry_price', 0)) > 0 and
+        t.get('exitPrice', t.get('exit_price', 0)) > 0]
+    total_pnl = sum(t.get('pnl', 0) for t in _valid_trades)
+    winning_trades = len([t for t in _valid_trades if t.get('pnl', 0) > 0])
+    _analytics_count = len(_valid_trades)
+    win_rate = (winning_trades / _analytics_count * 100) if _analytics_count > 0 else 0
     
     # Recent performance (last 7 days)
     week_ago = datetime.now().timestamp() * 1000 - (7 * 24 * 60 * 60 * 1000)
-    recent_trades = [t for t in trades if t.get('closeTime', t.get('close_time', 0)) > week_ago]
+    recent_trades = [t for t in _valid_trades if t.get('closeTime', t.get('close_time', 0)) > week_ago]
     recent_pnl = sum(t.get('pnl', 0) for t in recent_trades)
     recent_wins = len([t for t in recent_trades if t.get('pnl', 0) > 0])
     recent_wr = (recent_wins / len(recent_trades) * 100) if recent_trades else 0
     
     # Close reason breakdown — EX-1: prefer closeReasonNormalized, fallback to legacy normalize
     reason_stats = {}
-    for t in trades:
+    for t in _valid_trades:
         reason = t.get('closeReasonNormalized')
         if not reason:
             # Legacy fallback for trades without the normalized field
@@ -33082,8 +33175,8 @@ async def get_performance_summary():
     # Average trade metrics
     avg_win = 0
     avg_loss = 0
-    wins = [t.get('pnl', 0) for t in trades if t.get('pnl', 0) > 0]
-    losses = [t.get('pnl', 0) for t in trades if t.get('pnl', 0) < 0]
+    wins = [t.get('pnl', 0) for t in _valid_trades if t.get('pnl', 0) > 0]
+    losses = [t.get('pnl', 0) for t in _valid_trades if t.get('pnl', 0) < 0]
     if wins:
         avg_win = sum(wins) / len(wins)
     if losses:
@@ -33335,8 +33428,8 @@ async def paper_trading_update_settings(
         # UI sends percent (2 = 2%), normalize to ratio
         if r > 1.0:
             r = r / 100.0
-        # Safety clamp: 0.2% - 5%
-        r = max(0.002, min(0.05, r))
+        # P0-RCA #2: Safety clamp: 0.2% - 10% (was 5%; raised for $10 margin on $100 balance)
+        r = max(0.002, min(0.10, r))
         global_paper_trader.risk_per_trade = r
     # Phase 264: Server-side clamp all incoming values
     clamped_fields = []

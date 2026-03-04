@@ -118,6 +118,8 @@ class HHQHyperOptimizer:
     - trail_activation, trail_distance: Trailing stop params
     """
     
+    # P0-RCA #6: All ATR values here are DIRECT scale (e.g., 2.0 = 2× ATR).
+    # apply_to_trader() converts sl_atr/tp_atr to 10× before setting on trader.
     HYPERPARAMETERS = [
         {'name': 'sl_atr',           'type': 'float', 'min': 1.0,  'max': 5.0,  'default': 2.0},
         {'name': 'tp_atr',           'type': 'float', 'min': 1.5,  'max': 8.0,  'default': 3.0},
@@ -247,10 +249,13 @@ class HHQHyperOptimizer:
         except Exception:
             pass  # If check fails, proceed with apply
         
-        # Map hyperopt param names to trader attributes (Phase 264: aligned with PARAM_LIMITS)
+        # P0-RCA #6: Map hyperopt param names to trader attributes
+        # Hyperopt searches in DIRECT scale (e.g., sl_atr=2.0 = 2× ATR).
+        # Runtime stores sl_atr/tp_atr in 10× scale (e.g., 20 = 2.0× ATR).
+        # Clamp bounds must match PARAM_LIMITS ÷ 10.
         param_map = {
-            'sl_atr': ('sl_atr', lambda v: int(round(max(1.0, min(5.0, v)) * 10))),  # stored as 10x
-            'tp_atr': ('tp_atr', lambda v: int(round(max(1.0, min(8.0, v)) * 10))),
+            'sl_atr': ('sl_atr', lambda v: int(round(max(1.0, min(5.0, v)) * 10))),    # [10,50] runtime
+            'tp_atr': ('tp_atr', lambda v: int(round(max(1.5, min(8.0, v)) * 10))),    # [15,80] runtime
             'exit_tightness': ('exit_tightness', lambda v: max(0.3, min(3.0, v))),
             'entry_tightness': ('entry_tightness', lambda v: max(0.5, min(4.0, v))),
             'trail_activation': ('trail_activation_atr', lambda v: max(0.3, min(4.0, v))),
