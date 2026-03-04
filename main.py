@@ -8525,6 +8525,18 @@ DQ_OPTIMIZE_MIN_COVERAGE = float(os.environ.get('DQ_OPTIMIZE_MIN_COVERAGE', '50'
 RECOVERY_ARM_V2_ENABLED = os.environ.get('RECOVERY_ARM_V2_ENABLED', 'true').lower() == 'true'
 RECOVERY_ARM_V2_ROI_FLOOR = float(os.environ.get('RECOVERY_ARM_V2_ROI_FLOOR', '-20.0'))  # -20% ROI floor
 
+# RFX-2D: Counter-Trend Exit Relaxation
+COUNTER_EXIT_RELAX_ENABLED = os.environ.get('COUNTER_EXIT_RELAX_ENABLED', 'true').lower() == 'true'
+CT_RELAX_SL_MIN = float(os.environ.get('COUNTER_EXIT_RELAX_SL_MIN', '1.30'))
+CT_RELAX_SL_MAX = float(os.environ.get('COUNTER_EXIT_RELAX_SL_MAX', '1.90'))
+CT_RELAX_TRAIL_ACT_MIN = float(os.environ.get('COUNTER_EXIT_RELAX_TRAIL_ACT_MIN', '1.15'))
+CT_RELAX_TRAIL_ACT_MAX = float(os.environ.get('COUNTER_EXIT_RELAX_TRAIL_ACT_MAX', '1.35'))
+CT_RELAX_TRAIL_DIST_MIN = float(os.environ.get('COUNTER_EXIT_RELAX_TRAIL_DIST_MIN', '1.35'))
+CT_RELAX_TRAIL_DIST_MAX = float(os.environ.get('COUNTER_EXIT_RELAX_TRAIL_DIST_MAX', '1.90'))
+CT_WIDE_TRAIL_FLOOR_MULT = float(os.environ.get('CT_WIDE_TRAIL_FLOOR_MULT', '0.70'))  # WIDE→NORMAL tighten factor (must be <1)
+CT_WIDE_TO_NORMAL_PROFIT_OVER_BE = float(os.environ.get('CT_WIDE_TO_NORMAL_PROFIT', '0.3'))  # +0.3% over BE
+CT_WIDE_TO_NORMAL_AGE_SEC = int(os.environ.get('CT_WIDE_TO_NORMAL_AGE_SEC', '900'))  # 15 min
+
 # RCA-FUN Patch 4: Drawdown reclaim breakeven
 DRAWDOWN_RECLAIM_BE_ENABLED = os.environ.get('DRAWDOWN_RECLAIM_BE_ENABLED', 'true').lower() == 'true'
 DRAWDOWN_RECLAIM_MIN_DD_PCT = float(os.environ.get('DRAWDOWN_RECLAIM_MIN_DD_PCT', '1.5'))  # min drawdown to qualify
@@ -14728,6 +14740,45 @@ async def background_scanner_loop():
                             # Prevents false triggers from intra-candle wicks/spikes
                             candle_close_price = last_candle_close.get(pos_symbol, current_price)
                             
+                            # =========================================================
+                            # RFX-2D: Two-Phase Trail — WIDE → NORMAL transition
+                            # Counter-trend positions start WIDE; switch to NORMAL when
+                            # pnl >= BE+0.3% or age >= 900s (15 min).
+                            # =========================================================
+                            if COUNTER_EXIT_RELAX_ENABLED and pos.get('trail_phase') == 'WIDE':
+                                _ct_pos_age = datetime.now().timestamp() - (pos.get('openTime', 0) / 1000) if pos.get('openTime', 0) > 0 else 0
+                                if pos['side'] == 'LONG':
+                                    _ct_roi = (candle_close_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+                                else:
+                                    _ct_roi = (entry_price - candle_close_price) / entry_price * 100 if entry_price > 0 else 0
+                                
+                                _be_buffer = compute_breakeven_buffer_pct(pos) if callable(compute_breakeven_buffer_pct) else 0.15
+                                _phase_switch = False
+                                if _ct_roi >= (_be_buffer + CT_WIDE_TO_NORMAL_PROFIT_OVER_BE):
+                                    _phase_switch = True
+                                    _phase_reason = f"profit={_ct_roi:.2f}%>=BE+{CT_WIDE_TO_NORMAL_PROFIT_OVER_BE}%"
+                                elif _ct_pos_age >= CT_WIDE_TO_NORMAL_AGE_SEC:
+                                    _phase_switch = True
+                                    _phase_reason = f"age={_ct_pos_age:.0f}s>={CT_WIDE_TO_NORMAL_AGE_SEC}s"
+                                
+                                if _phase_switch:
+                                    pos['trail_phase'] = 'NORMAL'
+                                    # Tighten trail by halving the CT relaxation multiplier
+                                    _ct_str_pos = float(pos.get('counterTrendStrength', 0) or 0)
+                                    _wide_floor = min(max(CT_WIDE_TRAIL_FLOOR_MULT, 0.1), 0.99)  # clamp: must strictly tighten
+                                    if _ct_str_pos > 0:
+                                        _old_trail_dist = pos.get('trailDistance', 0)
+                                        _old_trail_act = pos.get('trailActivation', 0)
+                                        _entry = pos.get('entryPrice', entry_price)
+                                        _atr = pos.get('atr', 0)
+                                        if _atr > 0 and _old_trail_dist > 0:
+                                            # Reduce trail distance by wide_floor ratio (must shrink)
+                                            _new_trail_dist = _old_trail_dist * _wide_floor
+                                            pos['trailDistance'] = _new_trail_dist
+                                            if _new_trail_dist >= _old_trail_dist:
+                                                logger.error(f"⚠️ CT_TRAIL_TIGHTEN_FAIL: {pos_symbol} new={_new_trail_dist:.6f} >= old={_old_trail_dist:.6f} floor={_wide_floor}")
+                                    logger.info(f"COUNTER_TRAIL_PHASE_SWITCH: {pos_symbol} WIDE→NORMAL | {_phase_reason} | str={_ct_str_pos:.2f} floor={_wide_floor:.2f}")
+                            
                             sl = pos.get('stopLoss', 0)
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
@@ -15868,6 +15919,45 @@ async def position_price_update_loop():
         logger.info("Position Price Updater cancelled")
     except Exception as e:
         logger.error(f"Position updater fatal error: {e}")
+
+# ============================================================================
+# RFX-2D: Counter-Trend Classification (single authority)
+# ============================================================================
+def classify_counter_trend(action: str, mtf_result: dict, dca_alignment: str,
+                           coin_trends: dict, symbol: str) -> tuple:
+    """
+    Determine if a signal is counter-trend and its strength.
+    
+    Returns:
+        (is_counter_trend: bool, strength: float 0..1)
+    """
+    mtf_score = int(mtf_result.get('mtf_score', 0) or 0)
+    is_ct = False
+
+    # Rule 1: Negative MTF score
+    if mtf_score <= -10:
+        is_ct = True
+
+    # Rule 2: DCA conflict
+    if str(dca_alignment).upper() == 'CONFLICT':
+        is_ct = True
+
+    # Rule 3: Action vs higher TF trend mismatch
+    trends = coin_trends.get(symbol, {})
+    t_4h = str(trends.get('trend_4h', '')).upper()
+    t_1d = str(trends.get('trend_1d', '')).upper()
+    if action == 'LONG' and ('BEARISH' in t_4h or 'BEARISH' in t_1d):
+        is_ct = True
+    if action == 'SHORT' and ('BULLISH' in t_4h or 'BULLISH' in t_1d):
+        is_ct = True
+
+    # Strength: abs(negative mtf) / 60, clamped [0, 1]
+    strength = min(1.0, max(0.0, abs(min(mtf_score, 0)) / 60.0))
+    if str(dca_alignment).upper() == 'CONFLICT':
+        strength = min(1.0, strength + 0.25)
+
+    return is_ct, strength
+
 
 async def process_signal_for_paper_trading(signal: dict, price: float):
     """Process a signal for paper trading execution."""
@@ -17116,6 +17206,33 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     signal['truth_snapshot'] = _truth_snapshot
     signal_log_data['truth_snapshot'] = _truth_snapshot
     signal_log_data['regime_adjustment'] = signal.get('regime_adjustment', '')
+    
+    # ================================================================
+    # RFX-2D: Counter-Trend Classification (single authority)
+    # Must run AFTER truth_snapshot (needs MTF + DCA) and BEFORE exit param calc
+    # ================================================================
+    _ct_is_counter = False
+    _ct_strength = 0.0
+    try:
+        _ct_mtf_result = mtf_confirmation.confirm_signal(symbol, action) if 'mtf_confirmation' in dir() else {}
+        _ct_dca_align = _dca_align_val
+        _ct_coin_trends = mtf_confirmation.coin_trends if 'mtf_confirmation' in dir() else {}
+        _ct_is_counter, _ct_strength = classify_counter_trend(
+            action, _ct_mtf_result, _ct_dca_align, _ct_coin_trends, symbol
+        )
+    except Exception as _ct_err:
+        logger.debug(f"RFX-2D classify error: {_ct_err}")
+    
+    signal['counterTrend'] = _ct_is_counter
+    signal['counterTrendStrength'] = round(_ct_strength, 3)
+    _truth_snapshot['counterTrend'] = _ct_is_counter
+    _truth_snapshot['counterTrendStrength'] = round(_ct_strength, 3)
+    
+    if _ct_is_counter:
+        logger.info(
+            f"🔄 COUNTER_TREND_CLASSIFIED: {action} {symbol} "
+            f"strength={_ct_strength:.2f} dca={_dca_align_val}"
+        )
     
     # ================================================================
     # Phase 215: MA ALIGNMENT HARD VETO
@@ -21213,6 +21330,12 @@ class LossRecoveryTrailManager:
                 contracts = float(pos.get('contracts', pos.get('positionAmt', 0)))
                 spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
                 
+                # RFX-2D: Counter-trend positions get relaxed recovery thresholds
+                _is_ct_recovery = COUNTER_EXIT_RELAX_ENABLED and pos.get('counterTrend', False)
+                _ct_str_rec = float(pos.get('counterTrendStrength', 0) or 0)
+                _recovery_act_pct = 0.65 if _is_ct_recovery else self.recovery_activation_pct  # 65% vs 50%
+                _trail_giveback = (0.75 + 0.03 * _ct_str_rec) if _is_ct_recovery else self.trail_giveback_pct  # 75-78% vs 65%
+                
                 if entry_price <= 0 or current_price <= 0 or contracts == 0:
                     continue
                 
@@ -21284,12 +21407,13 @@ class LossRecoveryTrailManager:
                     
                     if not state.get('trail_active', False):
                         # Check if we should activate trail
-                        if recovery_ratio >= self.recovery_activation_pct:
+                        if recovery_ratio >= _recovery_act_pct:
                             state['trail_active'] = True
                             state['trail_activation_pnl'] = pnl_pct
                             self.recovery_state[state_key] = state
                             actions["recovery_trail_activated"].append(symbol)
-                            logger.warning(f"🔄 RECOVERY TRAIL ACTIVATED: {symbol} {side} peak_loss={peak_loss:.2f}% current={pnl_pct:.2f}% recovered={recovery_ratio*100:.0f}%")
+                            _ct_tag = ' [CT_RELAXED]' if _is_ct_recovery else ''
+                            logger.warning(f"🔄 RECOVERY TRAIL ACTIVATED{_ct_tag}: {symbol} {side} peak_loss={peak_loss:.2f}% current={pnl_pct:.2f}% recovered={recovery_ratio*100:.0f}% act_pct={_recovery_act_pct:.0%}")
                     else:
                         # Trail is active - check if giving back too much
                         peak_recovery_pnl = state['peak_recovery']
@@ -21298,9 +21422,10 @@ class LossRecoveryTrailManager:
                         
                         giveback_ratio = 1 - (current_recovery / recovery_from_peak) if recovery_from_peak > 0 else 0
                         
-                        if giveback_ratio >= self.trail_giveback_pct:
+                        if giveback_ratio >= _trail_giveback:
                             # Gave back too much - CLOSE!
-                            logger.warning(f"🔄 RECOVERY TRAIL CLOSE: {symbol} {side} - gave back {giveback_ratio*100:.0f}% of recovery")
+                            _ct_close_tag = 'COUNTER_RECOVERY_CLOSE' if _is_ct_recovery else 'RECOVERY TRAIL CLOSE'
+                            logger.warning(f"🔄 {_ct_close_tag}: {symbol} {side} - gave back {giveback_ratio*100:.0f}% of recovery (threshold={_trail_giveback:.0%})")
                             try:
                                 # Phase 181: Set reason with full trade_data for trade history
                                 size_usd = pos.get('sizeUsd', 0)
@@ -27224,7 +27349,29 @@ class PaperTradingEngine:
             15.0
         )
 
-        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        # ================================================================
+        # RFX-2D: Counter-Trend Exit Relaxation multipliers
+        # Widens SL/trail for counter-trend trades to prevent premature exits
+        # ================================================================
+        ct_sl_mult = 1.0
+        ct_trail_act_mult = 1.0
+        ct_trail_dist_mult = 1.0
+        _is_ct_signal = signal.get('counterTrend', False) if signal else False
+        _ct_str = float(signal.get('counterTrendStrength', 0) or 0) if signal else 0.0
+
+        if COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal:
+            ct_sl_mult = max(CT_RELAX_SL_MIN, min(CT_RELAX_SL_MAX, CT_RELAX_SL_MIN + (CT_RELAX_SL_MAX - CT_RELAX_SL_MIN) * _ct_str))
+            ct_trail_act_mult = max(CT_RELAX_TRAIL_ACT_MIN, min(CT_RELAX_TRAIL_ACT_MAX, CT_RELAX_TRAIL_ACT_MIN + (CT_RELAX_TRAIL_ACT_MAX - CT_RELAX_TRAIL_ACT_MIN) * _ct_str))
+            ct_trail_dist_mult = max(CT_RELAX_TRAIL_DIST_MIN, min(CT_RELAX_TRAIL_DIST_MAX, CT_RELAX_TRAIL_DIST_MIN + (CT_RELAX_TRAIL_DIST_MAX - CT_RELAX_TRAIL_DIST_MIN) * _ct_str))
+            logger.info(
+                f"COUNTER_EXIT_RELAX_APPLIED: {trade_symbol} {side} "
+                f"str={_ct_str:.2f} sl×{ct_sl_mult:.2f} trailAct×{ct_trail_act_mult:.2f} "
+                f"trailDist×{ct_trail_dist_mult:.2f}"
+            )
+        elif signal and not _is_ct_signal:
+            logger.debug(f"COUNTER_EXIT_RELAX_BYPASS: {trade_symbol} {side} (non-countertrend)")
+
+        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
         adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
@@ -27237,8 +27384,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
         
         # DRU-1: Apply struct regime execution profile (single authority)
         try:
@@ -27775,6 +27922,10 @@ class PaperTradingEngine:
             "memoryExtensionSec": memory_extend_sec,
             "effectiveExitTightness": effective_exit_tightness,
             "trend_mode": is_trend_mode,
+            # RFX-2D: Counter-Trend + Two-Phase Trail
+            "counterTrend": _is_ct_signal,
+            "counterTrendStrength": round(_ct_str, 3),
+            "trail_phase": "WIDE" if (COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal) else "NORMAL",
             "settingsSnapshot": settings_snapshot,
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
             # Phase 237C: State machine fields
@@ -28541,7 +28692,20 @@ class PaperTradingEngine:
             15.0
         )
 
-        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult
+        # RFX-2D: Counter-Trend Exit Relaxation (parity with open_position)
+        ct_sl_mult = 1.0
+        ct_trail_act_mult = 1.0
+        ct_trail_dist_mult = 1.0
+        _is_ct_order = order.get('counterTrend', False)
+        _ct_str_ord = float(order.get('counterTrendStrength', 0) or 0)
+
+        if COUNTER_EXIT_RELAX_ENABLED and _is_ct_order:
+            ct_sl_mult = max(CT_RELAX_SL_MIN, min(CT_RELAX_SL_MAX, CT_RELAX_SL_MIN + (CT_RELAX_SL_MAX - CT_RELAX_SL_MIN) * _ct_str_ord))
+            ct_trail_act_mult = max(CT_RELAX_TRAIL_ACT_MIN, min(CT_RELAX_TRAIL_ACT_MAX, CT_RELAX_TRAIL_ACT_MIN + (CT_RELAX_TRAIL_ACT_MAX - CT_RELAX_TRAIL_ACT_MIN) * _ct_str_ord))
+            ct_trail_dist_mult = max(CT_RELAX_TRAIL_DIST_MIN, min(CT_RELAX_TRAIL_DIST_MAX, CT_RELAX_TRAIL_DIST_MIN + (CT_RELAX_TRAIL_DIST_MAX - CT_RELAX_TRAIL_DIST_MIN) * _ct_str_ord))
+            logger.info(f"COUNTER_EXIT_RELAX_APPLIED (exec): {symbol} {side} str={_ct_str_ord:.2f} sl×{ct_sl_mult:.2f} trailAct×{ct_trail_act_mult:.2f} trailDist×{ct_trail_dist_mult:.2f}")
+
+        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
         adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         
         # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
@@ -28552,8 +28716,8 @@ class PaperTradingEngine:
             base_trail_activation_atr = self.trail_activation_atr
             base_trail_distance_atr = self.trail_distance_atr
         
-        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
         
         # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
         _ord_spread = float(order.get('spreadPct', 0.05))
@@ -28625,6 +28789,10 @@ class PaperTradingEngine:
             "strategyLabel": order.get('strategyLabel', 'Legacy'),
             # Phase 202: Trend Mode flag for stepped SL
             "trend_mode": is_trend_mode,
+            # RFX-2D: Counter-Trend + Two-Phase Trail (carry from order)
+            "counterTrend": order.get('counterTrend', False),
+            "counterTrendStrength": float(order.get('counterTrendStrength', 0) or 0),
+            "trail_phase": order.get('trail_phase', 'NORMAL'),
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
@@ -28670,6 +28838,13 @@ class PaperTradingEngine:
             new_position['distance_truth'] = _dt_pos
         # RFX-2B.1: Shadow alarm — log enforcement candidates (no decision change)
         _dt_flags = new_position.get('distance_truth', {}).get('quality_flags', [])
+        # RFX-2D: Inject CT flags into distance_truth
+        if new_position.get('counterTrend', False):
+            _dt_flags = list(_dt_flags)  # copy
+            _dt_flags.append('CT_RELAX')
+            if new_position.get('trail_phase') == 'WIDE':
+                _dt_flags.append('CT_WIDE')
+            new_position.setdefault('distance_truth', {})['quality_flags'] = _dt_flags
         if _dt_flags:
             _dt_src = new_position.get('distance_truth', {}).get('distance_truth_source', '?')
             logger.info(f"📏 DIST_TRUTH: {symbol} {side} src={_dt_src} flags={_dt_flags} "
@@ -29272,24 +29447,30 @@ class PaperTradingEngine:
         """If in loss and recovering, trail to minimize loss."""
         entry = pos['entryPrice']
         
+        # RFX-2D: Counter-trend gets wider thresholds
+        _is_ct_lr = COUNTER_EXIT_RELAX_ENABLED and pos.get('counterTrend', False)
+        _lr_loss_threshold = 5 if _is_ct_lr else 3    # 5% vs 3%
+        _lr_atr_mult = 0.9 if _is_ct_lr else 0.6      # 0.9 vs 0.6
+        
         if pos['side'] == 'LONG':
             loss_pct = ((entry - current_price) / entry) * 100 if entry > 0 else 0
             
-            # P0-RCA #4: Only if in meaningful loss (>3%) and price is recovering (was >1%)
-            if loss_pct > 3:
+            # P0-RCA #4: Only if in meaningful loss (>threshold) and price is recovering
+            if loss_pct > _lr_loss_threshold:
                 if 'recovery_low' not in pos:
                     pos['recovery_low'] = current_price
                 elif current_price < pos['recovery_low']:
                     pos['recovery_low'] = current_price
                     
-                # P0-RCA #4: If price bounced from low by 0.6 ATR (was 0.3 — too tight)
-                if current_price > pos['recovery_low'] + (atr * 0.6):
+                # P0-RCA #4: If price bounced from low by _lr_atr_mult * ATR
+                if current_price > pos['recovery_low'] + (atr * _lr_atr_mult):
                     if not pos.get('recovery_mode', False):
                         pos['recovery_mode'] = True
-                        pos['recovery_sl'] = current_price - (atr * 0.6)
-                        self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
+                        pos['recovery_sl'] = current_price - (atr * _lr_atr_mult)
+                        _ct_lr_tag = ' [CT]' if _is_ct_lr else ''
+                        self.add_log(f"🔄 RECOVERY MODE{_ct_lr_tag}: Zarar minimizasyonu aktif @ ${current_price:.6f} (ATR×{_lr_atr_mult})")
                     else:
-                        new_recovery_sl = current_price - (atr * 0.6)
+                        new_recovery_sl = current_price - (atr * _lr_atr_mult)
                         if new_recovery_sl > pos.get('recovery_sl', 0):
                             pos['recovery_sl'] = new_recovery_sl
                             
@@ -29301,20 +29482,21 @@ class PaperTradingEngine:
         elif pos['side'] == 'SHORT':
             loss_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
             
-            if loss_pct > 3:  # P0-RCA #4: was 1%, too early to activate recovery
+            if loss_pct > _lr_loss_threshold:  # RFX-2D: CT-aware threshold
                 if 'recovery_high' not in pos:
                     pos['recovery_high'] = current_price
                 elif current_price > pos['recovery_high']:
                     pos['recovery_high'] = current_price
                     
-                # P0-RCA #4: 0.6 ATR trail distance (was 0.3)
-                if current_price < pos['recovery_high'] - (atr * 0.6):
+                # P0-RCA #4: _lr_atr_mult ATR trail distance
+                if current_price < pos['recovery_high'] - (atr * _lr_atr_mult):
                     if not pos.get('recovery_mode', False):
                         pos['recovery_mode'] = True
-                        pos['recovery_sl'] = current_price + (atr * 0.6)
-                        self.add_log(f"🔄 RECOVERY MODE: Zarar minimizasyonu aktif @ ${current_price:.6f}")
+                        pos['recovery_sl'] = current_price + (atr * _lr_atr_mult)
+                        _ct_lr_tag = ' [CT]' if _is_ct_lr else ''
+                        self.add_log(f"🔄 RECOVERY MODE{_ct_lr_tag}: Zarar minimizasyonu aktif @ ${current_price:.6f} (ATR×{_lr_atr_mult})")
                     else:
-                        new_recovery_sl = current_price + (atr * 0.6)
+                        new_recovery_sl = current_price + (atr * _lr_atr_mult)
                         if new_recovery_sl < pos.get('recovery_sl', float('inf')):
                             pos['recovery_sl'] = new_recovery_sl
                             
@@ -30213,6 +30395,13 @@ class PaperTradingEngine:
             new_position['distance_truth'] = {'distance_truth_source': 'DIST_TRUTH_MISSING'}
         # RFX-2B.1: Shadow alarm — log enforcement candidates (no decision change)
         _dt_flags_m = new_position.get('distance_truth', {}).get('quality_flags', [])
+        # RFX-2D: Inject CT flags into distance_truth (signal-direct path)
+        if new_position.get('counterTrend', False):
+            _dt_flags_m = list(_dt_flags_m)
+            _dt_flags_m.append('CT_RELAX')
+            if new_position.get('trail_phase') == 'WIDE':
+                _dt_flags_m.append('CT_WIDE')
+            new_position.setdefault('distance_truth', {})['quality_flags'] = _dt_flags_m
         if _dt_flags_m:
             _dt_src_m = new_position.get('distance_truth', {}).get('distance_truth_source', '?')
             logger.info(f"📏 DIST_TRUTH: {self.symbol} {signal['action']} src={_dt_src_m} flags={_dt_flags_m} "
