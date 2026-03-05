@@ -468,9 +468,10 @@ class MLGovernanceService:
 
         policy = self.get_policy(model_key)
         
-        # Phase 268: Require minimum samples before rollback decision
-        sample_count = recent_metrics.get('sample_count', 0)
-        if sample_count < policy['min_samples']:
+        # Phase 268: Require minimum samples only when the caller provides them.
+        # Manual/diagnostic checks may only supply degraded metrics (pnl/brier).
+        sample_count = recent_metrics.get('sample_count')
+        if sample_count is not None and sample_count < policy['min_samples']:
             return {'should_rollback': False, 'reason': f'insufficient_samples ({sample_count}/{policy["min_samples"]})'}
         
         train_metrics = champion.get('metrics', {})

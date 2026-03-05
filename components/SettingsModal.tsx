@@ -12,7 +12,7 @@ interface OptimizerStats {
 interface Props {
   onClose: () => void;
   settings: SystemSettings;
-  onSave: (s: SystemSettings) => void;
+  onSave: (s: SystemSettings) => Promise<void> | void;
   optimizerStats?: OptimizerStats;
   onToggleOptimizer?: () => void;
   phase193Status?: {
@@ -38,15 +38,26 @@ const formatUnix = (ts?: number) => {
 
 export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, onForceApplyLast, settingsSnapshot, apiUrl }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Sync localSettings when settings prop changes (AI made changes)
   React.useEffect(() => {
     setLocalSettings(settings);
+    setSaveError(null);
   }, [settings]);
 
-  const handleSave = () => {
-    onSave(localSettings);
-    onClose();
+  const handleSave = async () => {
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      await onSave(localSettings);
+      onClose();
+    } catch (err: any) {
+      setSaveError(err?.message || 'Ayarlar kaydedilemedi');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // ── ML Governance toggle state ──
@@ -144,6 +155,81 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
   const sensitivity = getSensitivityLevel();
   const entryLevel = getEntryLevel();
   const exitLevel = getExitLevel();
+  const riskTone = (localSettings.riskPerTrade >= 2.5 || (localSettings.leverageMultiplier ?? 1) >= 1.4)
+    ? 'Atak'
+    : localSettings.riskPerTrade <= 1.2 && (localSettings.leverageMultiplier ?? 1) <= 0.8
+      ? 'Koruyucu'
+      : 'Dengeli';
+  const selectivityTone = (localSettings.zScoreThreshold >= 1.9 || localSettings.minConfidenceScore >= 82)
+    ? 'Yüksek kalite, düşük frekans'
+    : localSettings.zScoreThreshold <= 1.2 || localSettings.minConfidenceScore <= 62
+      ? 'Yüksek frekans, gevşek filtre'
+      : 'Fırsat ve kalite dengeli';
+  const holdingTone = localSettings.strategyMode === 'SMART_V3_RUNNER' || localSettings.exitTightness >= 1.5
+    ? 'Trend taşıyan, runner odaklı'
+    : localSettings.exitTightness <= 0.9
+      ? 'Erken realize, hızlı koruma'
+      : 'Dengeli tutuş';
+
+  const applyPreset = (preset: 'capital' | 'balanced' | 'runner') => {
+    if (preset === 'capital') {
+      setLocalSettings({
+        ...localSettings,
+        strategyMode: 'LEGACY',
+        zScoreThreshold: 1.9,
+        minConfidenceScore: 80,
+        minScoreLow: 58,
+        minScoreHigh: 92,
+        entryTightness: 2.2,
+        exitTightness: 1.0,
+        stopLossAtr: 1.3,
+        takeProfit: 2.6,
+        trailActivationAtr: 1.3,
+        trailDistanceAtr: 1.1,
+        riskPerTrade: 1.1,
+        maxPositions: 5,
+        leverageMultiplier: 0.7,
+      });
+      return;
+    }
+    if (preset === 'runner') {
+      setLocalSettings({
+        ...localSettings,
+        strategyMode: 'SMART_V3_RUNNER',
+        zScoreThreshold: 1.5,
+        minConfidenceScore: 72,
+        minScoreLow: 58,
+        minScoreHigh: 88,
+        entryTightness: 1.5,
+        exitTightness: 1.7,
+        stopLossAtr: 1.6,
+        takeProfit: 3.8,
+        trailActivationAtr: 1.6,
+        trailDistanceAtr: 1.6,
+        riskPerTrade: 2.2,
+        maxPositions: 7,
+        leverageMultiplier: 1.2,
+      });
+      return;
+    }
+    setLocalSettings({
+      ...localSettings,
+      strategyMode: 'SMART_V2',
+      zScoreThreshold: 1.6,
+      minConfidenceScore: 74,
+      minScoreLow: 60,
+      minScoreHigh: 90,
+      entryTightness: 1.8,
+      exitTightness: 1.2,
+      stopLossAtr: 1.5,
+      takeProfit: 3.0,
+      trailActivationAtr: 1.5,
+      trailDistanceAtr: 1.5,
+      riskPerTrade: 1.8,
+      maxPositions: 8,
+      leverageMultiplier: 1.0,
+    });
+  };
 
   // AI açıkken ayarları kilitle
   const isLocked = optimizerStats?.enabled ?? false;
@@ -248,6 +334,61 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </span>
               </div>
             )}
+
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <button
+                onClick={() => applyPreset('capital')}
+                className="rounded-xl border border-emerald-500/20 bg-emerald-500/8 px-3 py-2 text-left hover:bg-emerald-500/12 transition-colors"
+              >
+                <div className="text-[11px] font-bold text-emerald-300">Sermaye Koru</div>
+                <div className="text-[10px] text-slate-500">Düşük risk, seçici giriş</div>
+              </button>
+              <button
+                onClick={() => applyPreset('balanced')}
+                className="rounded-xl border border-cyan-500/20 bg-cyan-500/8 px-3 py-2 text-left hover:bg-cyan-500/12 transition-colors"
+              >
+                <div className="text-[11px] font-bold text-cyan-300">PnL Dengeli</div>
+                <div className="text-[10px] text-slate-500">Ana kullanım profili</div>
+              </button>
+              <button
+                onClick={() => applyPreset('runner')}
+                className="rounded-xl border border-amber-500/20 bg-amber-500/8 px-3 py-2 text-left hover:bg-amber-500/12 transition-colors"
+              >
+                <div className="text-[11px] font-bold text-amber-300">Trend Runner</div>
+                <div className="text-[10px] text-slate-500">Pozisyonu uzatır</div>
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950/60 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Beklenen Etki</span>
+                <span className="text-[10px] rounded-full border border-slate-700 px-2 py-0.5 text-slate-300">
+                  {localSettings.strategyMode}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                <div className="rounded-lg bg-slate-900/70 p-2">
+                  <div className="text-slate-500">Risk Bütçesi</div>
+                  <div className="mt-1 font-semibold text-white">{riskTone}</div>
+                  <div className="text-slate-400">%{localSettings.riskPerTrade.toFixed(1)} • {localSettings.maxPositions} poz. • {(localSettings.leverageMultiplier ?? 1).toFixed(1)}x lev</div>
+                </div>
+                <div className="rounded-lg bg-slate-900/70 p-2">
+                  <div className="text-slate-500">Sinyal Seçiciliği</div>
+                  <div className="mt-1 font-semibold text-white">{selectivityTone}</div>
+                  <div className="text-slate-400">Z {localSettings.zScoreThreshold.toFixed(1)} • minConf {localSettings.minConfidenceScore}</div>
+                </div>
+                <div className="rounded-lg bg-slate-900/70 p-2">
+                  <div className="text-slate-500">Pozisyon Stili</div>
+                  <div className="mt-1 font-semibold text-white">{holdingTone}</div>
+                  <div className="text-slate-400">Entry {localSettings.entryTightness.toFixed(1)}x • Exit {localSettings.exitTightness.toFixed(1)}x</div>
+                </div>
+                <div className="rounded-lg bg-slate-900/70 p-2">
+                  <div className="text-slate-500">SL / TP Profili</div>
+                  <div className="mt-1 font-semibold text-white">{localSettings.stopLossAtr.toFixed(1)}x / {localSettings.takeProfit.toFixed(1)}x ATR</div>
+                  <div className="text-slate-400">Trail act {localSettings.trailActivationAtr.toFixed(1)}x • dist {localSettings.trailDistanceAtr.toFixed(1)}x</div>
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* Signal Algorithm Sensitivity Section */}
@@ -556,34 +697,66 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-slate-300 mb-1">Zarar Durdur (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Zarar Durdur (x ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
-                    step="0.5"
+                    step="0.1"
                     min="1"
                     max="5"
                     value={localSettings.stopLossAtr}
                     onChange={e => setLocalSettings({ ...localSettings, stopLossAtr: parseFloat(e.target.value) })}
                     className="bg-transparent w-full text-white outline-none text-sm"
                   />
-                  <span className="text-slate-500 text-xs ml-2">ATR</span>
+                  <span className="text-slate-500 text-xs ml-2">x ATR</span>
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs text-slate-300 mb-1">Kâr Al (ATR)</label>
+                <label className="block text-xs text-slate-300 mb-1">Kâr Al (x ATR)</label>
                 <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
                   <input
                     type="number"
-                    step="0.5"
+                    step="0.1"
                     min="1"
                     max="8"
                     value={localSettings.takeProfit}
                     onChange={e => setLocalSettings({ ...localSettings, takeProfit: parseFloat(e.target.value) })}
                     className="bg-transparent w-full text-white outline-none text-sm"
                   />
-                  <span className="text-slate-500 text-xs ml-2">ATR</span>
+                  <span className="text-slate-500 text-xs ml-2">x ATR</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-300 mb-1">Trail Aktivasyon (x ATR)</label>
+                <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.3"
+                    max="4.0"
+                    value={localSettings.trailActivationAtr}
+                    onChange={e => setLocalSettings({ ...localSettings, trailActivationAtr: parseFloat(e.target.value) })}
+                    className="bg-transparent w-full text-white outline-none text-sm"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">x ATR</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-300 mb-1">Trail Mesafe (x ATR)</label>
+                <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.2"
+                    max="3.0"
+                    value={localSettings.trailDistanceAtr}
+                    onChange={e => setLocalSettings({ ...localSettings, trailDistanceAtr: parseFloat(e.target.value) })}
+                    className="bg-transparent w-full text-white outline-none text-sm"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">x ATR</span>
                 </div>
               </div>
 
@@ -1034,10 +1207,22 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
         </div>
 
         <div className="p-6 border-t border-slate-800 flex justify-end gap-3 sticky bottom-0 bg-slate-900">
+          {saveError && (
+            <div className="mr-auto max-w-[60%] rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-300">
+              {saveError}
+            </div>
+          )}
           <button onClick={onClose} className="px-4 py-2 text-slate-400 hover:text-white font-medium">İptal</button>
-          <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition-colors">
+          <button
+            onClick={handleSave}
+            disabled={isSaving}
+            className={`flex items-center gap-2 px-6 py-2 rounded-lg font-bold transition-colors ${isSaving
+              ? 'bg-indigo-700/60 text-slate-300 cursor-wait'
+              : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+              }`}
+          >
             <Save className="w-4 h-4" />
-            Kaydet
+            {isSaving ? 'Kaydediliyor...' : 'Kaydet'}
           </button>
         </div>
       </div>

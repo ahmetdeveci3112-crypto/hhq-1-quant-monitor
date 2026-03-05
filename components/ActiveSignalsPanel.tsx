@@ -219,6 +219,9 @@ const getQualityTooltip = (signal: CoinOpportunity): string => {
     lines.push(`EQ: ${signal.entryQualityPass ? 'GEÇTİ' : 'GEÇMEDİ'} (${eqCount}/3)`);
     lines.push(`EQ detay: ${eqReasons}`);
     lines.push(`Execution: ${fmtNum(signal.entryExecScore, 1)} (${signal.entryExecPassed === false ? 'zayıf' : 'uygun'})`);
+    if (signal.qualitySizeMult || signal.qualityLeverageCap) {
+        lines.push(`Risk Ayarı: boyut x${fmtNum(signal.qualitySizeMult, 2, '1.00')} | lev cap ${signal.qualityLeverageCap || '-'}`);
+    }
     lines.push(`Hacim: ${fmtNum(signal.volumeRatio, 2)}x${signal.isVolumeSpike ? ' (sıçrama var)' : ''}`);
     lines.push(`OrderBook: imb ${fmtNum(signal.imbalance, 1)} | trend ${fmtNum(signal.obImbalanceTrend, 1)}`);
     if (signal.fibActive) {
@@ -443,6 +446,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
             entryQualityPass: liveOpp.entryQualityPass ?? sig.entryQualityPass ?? false,
             entryQualityReasons: liveOpp.entryQualityReasons || sig.entryQualityReasons || [],
             executionRejectReason: liveOpp.executionRejectReason || sig.executionRejectReason || '',
+            qualitySizeMult: liveOpp.qualitySizeMult ?? sig.qualitySizeMult,
+            qualityLeverageCap: liveOpp.qualityLeverageCap ?? sig.qualityLeverageCap,
         } as CoinOpportunity;
     });
 
@@ -505,6 +510,13 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     const eqCount = allSignals.filter(s => s.entryQualityPass).length;
     const fibCount = allSignals.filter(s => s.fibActive).length;
     const volCount = allSignals.filter(s => s.isVolumeSpike).length;
+    const execScores = activeSignals.map(s => Number(s.entryExecScore)).filter(n => Number.isFinite(n) && n > 0);
+    const avgExecScore = execScores.length > 0 ? execScores.reduce((sum, n) => sum + n, 0) / execScores.length : 0;
+    const runnerCount = activeSignals.filter(s => s.strategyMode === 'SMART_V3_RUNNER' || s.strategyLabel?.includes('RUNNER')).length;
+    const qualitySizeValues = activeSignals.map(s => Number(s.qualitySizeMult)).filter(n => Number.isFinite(n) && n > 0);
+    const avgQualitySize = qualitySizeValues.length > 0
+        ? qualitySizeValues.reduce((sum, n) => sum + n, 0) / qualitySizeValues.length
+        : 1;
 
     // Mobile Card Component
     const SignalCard = ({ signal, key: _key }: { signal: CoinOpportunity; key?: string }) => {
@@ -671,6 +683,33 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                         {f.label} {f.count > 0 && <span className="ml-0.5 text-[9px] opacity-70">({f.count})</span>}
                     </button>
                 ))}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 border-b border-slate-800/30 bg-slate-950/50 px-4 py-3 lg:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Kalite Geçişi</div>
+                    <div className="mt-1 text-sm font-semibold text-white">{eqCount}/{allSignals.length || 0}</div>
+                    <div className="text-[10px] text-slate-400">EQ gate pass</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Exec</div>
+                    <div className={`mt-1 text-sm font-semibold ${avgExecScore >= 66 ? 'text-emerald-400' : avgExecScore >= 58 ? 'text-amber-400' : 'text-rose-400'}`}>
+                        {avgExecScore > 0 ? avgExecScore.toFixed(1) : '—'}
+                    </div>
+                    <div className="text-[10px] text-slate-400">Emir kalitesi skoru</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Runner Yoğunluğu</div>
+                    <div className="mt-1 text-sm font-semibold text-amber-300">{runnerCount}</div>
+                    <div className="text-[10px] text-slate-400">Trend runner sinyali</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Size Bias</div>
+                    <div className={`mt-1 text-sm font-semibold ${avgQualitySize >= 1 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                        x{avgQualitySize.toFixed(2)}
+                    </div>
+                    <div className="text-[10px] text-slate-400">Kalite bazlı boyut</div>
+                </div>
             </div>
 
             {/* MOBILE: Card Layout */}

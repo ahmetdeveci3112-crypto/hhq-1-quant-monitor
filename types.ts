@@ -174,8 +174,8 @@ export interface PortfolioStats {
 
 export interface SystemSettings {
   leverage: number;
-  stopLossAtr: number;
-  takeProfit: number;
+  stopLossAtr: number;          // Human-scale ATR multiplier (1.5 => 1.5x ATR)
+  takeProfit: number;           // Human-scale ATR multiplier (3.0 => 3.0x ATR)
   riskPerTrade: number;
   trailActivationAtr: number;
   trailDistanceAtr: number;
@@ -342,6 +342,8 @@ export interface CoinOpportunity {
   btcOverride?: boolean;
   overrideLeverageCap?: number;
   overrideSizeMult?: number;
+  qualitySizeMult?: number;
+  qualityLeverageCap?: number;
   strategyMode?: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER';
   activeStrategy?: string;
   strategyLabel?: string;

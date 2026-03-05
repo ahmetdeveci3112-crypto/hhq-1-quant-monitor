@@ -126,6 +126,11 @@ def test_ml_governance():
     # Check rollback policy
     rollback_check = svc.check_rollback('test_model', recent_metrics={'brier': 0.50, 'pnl': -10})
     assert rollback_check['should_rollback'], "Should trigger rollback on degraded metrics"
+    rollback_guard = svc.check_rollback(
+        'test_model',
+        recent_metrics={'sample_count': 20, 'brier': 0.50, 'pnl': -10}
+    )
+    assert not rollback_guard['should_rollback'], "Insufficient sample_count should still block auto rollback"
 
     # Flag off → no registration
     svc.enabled = False
@@ -200,9 +205,12 @@ def test_pnl_attribution():
     reason_result = svc.aggregate_by_reason(trades, 168)
     assert len(reason_result['buckets']) == 1
     assert reason_result['buckets'][0]['reason'] == 'TP'
+    # Aggregation fallback must not inflate decompose counters
+    status_after_aggregations = svc.get_status()
+    assert status_after_aggregations['total_decomposed'] == 1
 
     # Status
-    status = svc.get_status()
+    status = status_after_aggregations
     assert status['total_decomposed'] == 1
 
     print("✅ test_pnl_attribution PASSED")

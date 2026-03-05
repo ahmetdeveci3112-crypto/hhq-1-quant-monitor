@@ -2298,18 +2298,18 @@ class LiveBinanceTrader:
         self._bbo_cache_ttl_ms = int(os.environ.get('EXEC_BBO_CACHE_TTL_MS', '400'))
         self._http_session = None  # Reused aiohttp.ClientSession
         # Execution gate config
-        self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '15.0'))
+        self.exec_max_spread_bps = float(os.environ.get('EXEC_MAX_SPREAD_BPS_DEFAULT', '8.0'))
         self.exec_min_top_book_usdt = float(os.environ.get('EXEC_MIN_TOP_BOOK_NOTIONAL_USDT', '100.0'))
-        self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.40'))
+        self.exec_entry_score_min = float(os.environ.get('EXEC_ENTRY_SCORE_MIN', '0.55'))
         # RHP-1B: Entry exec score source policy
         self.exec_score_source = os.environ.get('ENTRY_EXEC_SCORE_SOURCE', 'penalized')  # penalized|raw|min
         if self.exec_score_source not in ('penalized', 'raw', 'min'):
             logger.warning(f"⚠️ Invalid ENTRY_EXEC_SCORE_SOURCE='{self.exec_score_source}', falling back to 'penalized'")
             self.exec_score_source = 'penalized'
-        self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.25'))
-        self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.55'))
+        self.exec_micro_weight = float(os.environ.get('EXEC_MICRO_WEIGHT', '0.35'))
+        self.exec_signal_weight = float(os.environ.get('EXEC_SIGNAL_WEIGHT', '0.45'))
         self.exec_risk_weight = float(os.environ.get('EXEC_RISK_WEIGHT', '0.20'))
-        self.exec_max_drift_bps = float(os.environ.get('EXEC_MAX_DRIFT_BPS', '25.0'))
+        self.exec_max_drift_bps = float(os.environ.get('EXEC_MAX_DRIFT_BPS', '15.0'))
         self.exec_force_market_drift_hard = os.environ.get('EXEC_FORCE_MARKET_DRIFT_HARD_BLOCK', 'true').lower() == 'true'
         # Diagnostic counters (reason-classified)
         self._exec_diag = {
@@ -3307,7 +3307,7 @@ class LiveBinanceTrader:
         Returns dict: final, signal, micro, risk, reason.
         """
         # Signal component: 0-150 range → 0-1
-        sig = max(0.0, min(1.0, float(signal_score_raw or 0) / 120.0))
+        sig = max(0.0, min(1.0, float(signal_score_raw or 0) / 150.0))
 
         # Micro component
         spread_bps = bbo_result.get('spread_bps')
@@ -6100,6 +6100,30 @@ async def binance_position_sync_loop():
                 
                 for bp in binance_positions:
                     symbol = bp.get('symbol', '')
+                    _sync_runner_controls = resolve_runner_exit_controls(
+                        payload=bp,
+                        default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                    )
+                    _sync_exec_source = bp.get('execution_profile_source', 'neutral')
+                    _sync_wide_profit = _to_float_safe(bp.get('runner_wide_profit_pct', 0.20), 0.20)
+                    _sync_wide_age = int(_to_float_safe(bp.get('runner_wide_age_sec', 600), 600))
+                    try:
+                        _sync_exec_profile = resolve_strategy_execution_profile(
+                            mode=_sync_runner_controls['mode'],
+                            counter_trend=False,
+                            ct_strength=0.0,
+                        )
+                        _sync_exec_source = str(bp.get('execution_profile_source', _sync_exec_profile.source or 'neutral'))
+                        _sync_wide_profit = _to_float_safe(
+                            bp.get('runner_wide_profit_pct', _sync_exec_profile.wide_to_normal_profit_pct),
+                            _sync_exec_profile.wide_to_normal_profit_pct,
+                        )
+                        _sync_wide_age = int(_to_float_safe(
+                            bp.get('runner_wide_age_sec', _sync_exec_profile.wide_to_normal_age_sec),
+                            _sync_exec_profile.wide_to_normal_age_sec,
+                        ))
+                    except Exception:
+                        pass
                     
                     # Check if position already exists in engine
                     if symbol not in existing_symbols:
@@ -6150,6 +6174,8 @@ async def binance_position_sync_loop():
                             settings_activation=global_paper_trader.trail_activation_atr,  # Phase 231: Cap
                             settings_distance=global_paper_trader.trail_distance_atr  # Phase 231: Cap
                         )
+                        trail_activation_atr *= _sync_runner_controls['trail_act_mult']
+                        trail_distance_atr *= _sync_runner_controls['trail_dist_mult']
                         
                         logger.info(f"📊 Volatility calc: {symbol} ATR%={volatility_pct:.2f}% → trail_act={trail_activation_atr}x, trail_dist={trail_distance_atr}x")
                         
@@ -6167,7 +6193,7 @@ async def binance_position_sync_loop():
                         _sl_dist_from_atr = atr * resolve_atr_multiplier(global_paper_trader.sl_atr)
                         _tp_dist_from_atr = atr * resolve_atr_multiplier(global_paper_trader.tp_atr)
                         _eff_sl_dist = max(_sl_dist_from_atr, _sl_dist_from_lev)
-                        _eff_tp_dist = max(_tp_dist_from_atr, _tp_dist_from_lev)
+                        _eff_tp_dist = max(_tp_dist_from_atr, _tp_dist_from_lev) * _sync_runner_controls['tp_tighten']
 
                         if bp['side'] == 'LONG':
                             # For LONG: if mark > entry, position is profitable
@@ -6229,6 +6255,17 @@ async def binance_position_sync_loop():
                             'spread_level': bp.get('spread_level', 'Normal'),
                             'spreadPct': sync_spread_pct,
                             'atr_pct': bp.get('atr_pct', volatility_pct),
+                            # SMART_V3_RUNNER: synced execution profile propagation
+                            'strategyMode': _sync_runner_controls['mode'],
+                            'activeStrategy': bp.get('activeStrategy', 'sync'),
+                            'strategyLabel': bp.get('strategyLabel', 'Synced'),
+                            'execution_profile_source': _sync_exec_source,
+                            'runner_trail_act_mult': _sync_runner_controls['trail_act_mult'],
+                            'runner_trail_dist_mult': _sync_runner_controls['trail_dist_mult'],
+                            'runner_tp_tighten': _sync_runner_controls['tp_tighten'],
+                            'runner_be_buffer_mult': _sync_runner_controls['be_buffer_mult'],
+                            'runner_wide_profit_pct': _sync_wide_profit,
+                            'runner_wide_age_sec': _sync_wide_age,
                         }
                         
                         # RHP-1A: Hydrate signal scores from DB (restart continuity)
@@ -6259,6 +6296,15 @@ async def binance_position_sync_loop():
                             if pos.get('symbol') == symbol:
                                 # FORCE isLive=True for all Binance positions
                                 pos['isLive'] = True
+                                if not pos.get('strategyMode'):
+                                    pos['strategyMode'] = _sync_runner_controls['mode']
+                                pos.setdefault('execution_profile_source', _sync_exec_source)
+                                pos.setdefault('runner_trail_act_mult', _sync_runner_controls['trail_act_mult'])
+                                pos.setdefault('runner_trail_dist_mult', _sync_runner_controls['trail_dist_mult'])
+                                pos.setdefault('runner_tp_tighten', _sync_runner_controls['tp_tighten'])
+                                pos.setdefault('runner_be_buffer_mult', _sync_runner_controls['be_buffer_mult'])
+                                pos.setdefault('runner_wide_profit_pct', _sync_wide_profit)
+                                pos.setdefault('runner_wide_age_sec', _sync_wide_age)
                                 
                                 # Phase 188: Cooldown after partial close — don't overwrite size
                                 # for 30 seconds to prevent duplicate reduction orders
@@ -6287,6 +6333,10 @@ async def binance_position_sync_loop():
                                 
                                 # Phase 154: Initialize ALL exit params if missing
                                 pos_atr = pos.get('atr', entry_price * 0.02) if entry_price > 0 else 0
+                                _sync_runner_live = resolve_runner_exit_controls(
+                                    payload=pos,
+                                    default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                                )
                                 
                                 # Initialize ATR if missing
                                 if not pos.get('atr') and entry_price > 0:
@@ -6304,7 +6354,7 @@ async def binance_position_sync_loop():
                                 
                                 # Initialize TP if missing or zero
                                 if not pos.get('takeProfit') or pos.get('takeProfit', 0) == 0:
-                                    tp_mult = global_paper_trader.tp_multiplier
+                                    tp_mult = global_paper_trader.tp_multiplier * _sync_runner_live['tp_tighten']
                                     if pos['side'] == 'LONG':
                                         pos['takeProfit'] = entry_price + (pos_atr * tp_mult)
                                     else:
@@ -6322,7 +6372,7 @@ async def binance_position_sync_loop():
                                 
                                 # Initialize trailActivation if missing
                                 if not pos.get('trailActivation') or pos.get('trailActivation', 0) == 0:
-                                    trail_act_mult = global_paper_trader.trail_activation_atr
+                                    trail_act_mult = global_paper_trader.trail_activation_atr * _sync_runner_live['trail_act_mult']
                                     if pos['side'] == 'LONG':
                                         pos['trailActivation'] = entry_price + (pos_atr * trail_act_mult)
                                     else:
@@ -6331,7 +6381,7 @@ async def binance_position_sync_loop():
                                 
                                 # Initialize trailDistance if missing
                                 if not pos.get('trailDistance'):
-                                    pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr
+                                    pos['trailDistance'] = pos_atr * global_paper_trader.trail_distance_atr * _sync_runner_live['trail_dist_mult']
                                     logger.info(f"📊 Exit fix: {symbol} trailDistance set to {pos['trailDistance']:.6f}")
                                 
                                 # Initialize trailingStop if missing (use SL as initial value)
@@ -6350,16 +6400,20 @@ async def binance_position_sync_loop():
                                     sync_roi = sync_price_move * sync_leverage
                                     
                                     # Phase 231h: Only price_move check + breakeven on activation
-                                    if (sync_price_move >= 0.75 or sync_roi >= 5.0) and not pos.get('isTrailingActive', False):
+                                    sync_min_move = 0.75 * _sync_runner_live['trail_act_mult']
+                                    sync_min_roi = 5.0 * _sync_runner_live['trail_act_mult']
+                                    if (sync_price_move >= sync_min_move or sync_roi >= sync_min_roi) and not pos.get('isTrailingActive', False):
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         # Breakeven on BOTH stopLoss AND trailingStop
                                         if pos['side'] == 'LONG':
                                             _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
+                                            _sync_buf = apply_runner_be_buffer(_sync_buf, _sync_runner_live)
                                             be_price = entry_price * (1 + _sync_buf)
                                             apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
                                         else:
                                             _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
+                                            _sync_buf = apply_runner_be_buffer(_sync_buf, _sync_runner_live)
                                             be_price = entry_price * (1 - _sync_buf)
                                             apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
                                         logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL+Trail→breakeven")
@@ -6478,6 +6532,12 @@ async def binance_position_sync_loop():
                             "trailingStop": pos.get('trailingStop', 0),
                             "isTrailingActive": is_trailing,
                             "atr": pos.get('atr', 0),
+                            "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+                            "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+                            "runner_trail_act_mult": pos.get('runner_trail_act_mult', 1.0),
+                            "runner_trail_dist_mult": pos.get('runner_trail_dist_mult', 1.0),
+                            "runner_tp_tighten": pos.get('runner_tp_tighten', 1.0),
+                            "runner_be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
                         }
                     
                     global_paper_trader.trades.append(trade)
@@ -9220,9 +9280,10 @@ def get_smart_v2_strategy_profile(
     macro_trend_dir: str = "NEUTRAL",  # Phase 235: "UP", "DOWN", "NEUTRAL"
 ) -> dict:
     """
-    Select SMART_V2 strategy and return strategy-specific entry/exit tuning.
-    Falls back to LEGACY-neutral multipliers when mode != SMART_V2.
+    Select smart strategy profile and return strategy-specific entry/exit tuning.
+    Falls back to LEGACY-neutral multipliers when mode is not smart.
     """
+    normalized_mode = normalize_strategy_mode(mode)
     base_profile = {
         "strategy_mode": STRATEGY_MODE_LEGACY,
         "active_strategy": "legacy",
@@ -9236,7 +9297,7 @@ def get_smart_v2_strategy_profile(
         "notes": [],
     }
 
-    if not is_smart_mode(str(mode or STRATEGY_MODE_LEGACY).upper()):
+    if not is_smart_mode(normalized_mode):
         return base_profile
 
     safe_side = "LONG" if signal_side == "LONG" else "SHORT"
@@ -9251,7 +9312,7 @@ def get_smart_v2_strategy_profile(
     ob_alignment = side_sign * (float(imbalance or 0.0) * 0.65 + float(ob_imbalance_trend or 0.0) * 0.35)
 
     profile = {
-        "strategy_mode": STRATEGY_MODE_SMART_V2,
+        "strategy_mode": normalized_mode,
         "active_strategy": "balanced_flow",
         "strategy_label": "Dengeli Akış",
         "threshold_mult": 1.0,
@@ -9369,6 +9430,61 @@ def get_smart_v2_strategy_profile(
     return profile
 
 
+def _to_float_safe(value, default: float) -> float:
+    """Best-effort float conversion."""
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def resolve_runner_exit_controls(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> dict:
+    """Resolve SMART_V3_RUNNER exit controls from signal/order/position payload."""
+    data = payload or {}
+    mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    enabled = (mode == STRATEGY_MODE_SMART_V3_RUNNER)
+    base_act = 1.0
+    base_dist = 1.0
+    base_tp = 1.0
+    base_be = 1.0
+    if enabled:
+        try:
+            _ct = bool(data.get('counterTrend', False) or data.get('counter_trend', False))
+            _ct_strength = _to_float_safe(data.get('counterTrendStrength', data.get('counter_trend_strength', 0.0)), 0.0)
+            _base_profile = resolve_strategy_execution_profile(mode=mode, counter_trend=_ct, ct_strength=_ct_strength)
+            base_act = _to_float_safe(_base_profile.trail_activation_mult, 1.0)
+            base_dist = _to_float_safe(_base_profile.trail_distance_mult, 1.0)
+            base_tp = _to_float_safe(_base_profile.tp_tighten_intensity, 1.0)
+            base_be = _to_float_safe(_base_profile.be_buffer_mult, 1.0)
+        except Exception:
+            pass
+    trail_act_mult = _clamp(_to_float_safe(data.get('runner_trail_act_mult', base_act), base_act), 0.60, 1.80)
+    trail_dist_mult = _clamp(_to_float_safe(data.get('runner_trail_dist_mult', base_dist), base_dist), 0.60, 1.80)
+    tp_tighten = _clamp(_to_float_safe(data.get('runner_tp_tighten', base_tp), base_tp), 0.70, 1.40)
+    be_buffer_mult = _clamp(_to_float_safe(data.get('runner_be_buffer_mult', base_be), base_be), 0.70, 1.60)
+    if not enabled:
+        trail_act_mult = 1.0
+        trail_dist_mult = 1.0
+        tp_tighten = 1.0
+        be_buffer_mult = 1.0
+    return {
+        'mode': mode,
+        'enabled': enabled,
+        'trail_act_mult': trail_act_mult,
+        'trail_dist_mult': trail_dist_mult,
+        'tp_tighten': tp_tighten,
+        'be_buffer_mult': be_buffer_mult,
+    }
+
+
+def apply_runner_be_buffer(base_buffer_ratio: float, runner_controls: dict) -> float:
+    """Apply V3 runner BE buffer multiplier with safe ratio clamps."""
+    if not runner_controls or not runner_controls.get('enabled', False):
+        return base_buffer_ratio
+    adjusted = float(base_buffer_ratio) * float(runner_controls.get('be_buffer_mult', 1.0))
+    return _clamp(adjusted, 0.0008, 0.02)  # 0.08% .. 2.00%
+
+
 def compute_execution_quality_score(
     signal_side: str,
     confidence_score: float,
@@ -9469,6 +9585,42 @@ def compute_execution_quality_score(
         "passed": score >= EXEC_QUALITY_MIN_SCORE,
         "strict_passed": score >= EXEC_QUALITY_STRICT_MIN_SCORE,
         "notes": notes[:6],
+    }
+
+
+def compute_quality_risk_adjustment(
+    *,
+    strategy_mode: str,
+    entry_quality_pass: bool,
+    eq_count: int,
+    exec_quality_score: float,
+) -> dict:
+    """Translate setup quality into conservative size/leverage adjustments.
+
+    Goal: let exceptional setups carry slightly more risk budget while reducing
+    exposure for borderline-but-still-accepted entries.
+    """
+    safe_mode = normalize_strategy_mode(strategy_mode)
+    size_mult = 1.0
+    lev_cap = 0
+    notes = []
+
+    if eq_count >= 3 and exec_quality_score >= EXEC_QUALITY_STRICT_MIN_SCORE:
+        size_mult = 1.12 if safe_mode == STRATEGY_MODE_SMART_V3_RUNNER else 1.08
+        notes.append("QUAL_ALPHA")
+    elif (not entry_quality_pass) or exec_quality_score < (EXEC_QUALITY_MIN_SCORE + 2):
+        size_mult = 0.78 if safe_mode == STRATEGY_MODE_SMART_V3_RUNNER else 0.82
+        lev_cap = 8 if is_smart_mode(safe_mode) else 6
+        notes.append("QUAL_DEFENSE")
+    elif eq_count <= 1:
+        size_mult = 0.90
+        lev_cap = 10 if is_smart_mode(safe_mode) else 8
+        notes.append("QUAL_CAUTION")
+
+    return {
+        "size_mult": round(size_mult, 3),
+        "lev_cap": int(lev_cap),
+        "notes": notes,
     }
 
 
@@ -13442,6 +13594,41 @@ def _trade_is_analytics_valid(t: dict) -> bool:
         return False
     return True
 
+def _trade_quality_score(t: dict) -> int:
+    """Higher score means richer/more trustworthy trade row."""
+    score = 0
+    if _trade_is_analytics_valid(t):
+        score += 3
+    if abs(_to_float_safe(t.get('pnl', 0), 0.0)) > 0:
+        score += 1
+    if t.get('signalScore', 0) or t.get('signalScoreRaw', 0):
+        score += 1
+    if normalize_strategy_mode(t.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_LEGACY:
+        score += 1
+    if str(t.get('execution_profile_source', 'neutral')).lower() != 'neutral':
+        score += 1
+    return score
+
+def _trade_similarity_key(t: dict):
+    """Cross-source similarity key to collapse POS/BIN mirrors of same close."""
+    symbol = str(t.get('symbol', '') or '')
+    side = str(t.get('side', '') or '')
+    close_time = int(t.get('closeTime', t.get('close_time', 0)) or 0)
+    if not symbol or close_time <= 0:
+        return None
+    entry = _to_float_safe(t.get('entryPrice', t.get('entry_price', 0)), 0.0)
+    exit_price = _to_float_safe(t.get('exitPrice', t.get('exit_price', 0)), 0.0)
+    pnl = _to_float_safe(t.get('pnl', 0), 0.0)
+    return (
+        'sim',
+        symbol,
+        side,
+        round(close_time / 120000),  # 2-minute bucket
+        round(entry, 6),
+        round(exit_price, 6),
+        round(pnl, 2),
+    )
+
 def dedupe_trades_for_ui(trades: list) -> tuple:
     """Deduplicate trades for UI display. Single authority used by all paths.
     Returns (deduped_trades, stats_dict).
@@ -13470,8 +13657,22 @@ def dedupe_trades_for_ui(trades: list) -> tuple:
         if prev is None or src_prio > prev[0]:
             # Shallow copy + annotate source_type (never mutate original)
             dedup_groups[dk] = (src_prio, {**t, 'source_type': src_type})
+    first_pass = [v[1] for v in dedup_groups.values()]
 
-    deduped = [v[1] for v in dedup_groups.values()]
+    # Phase 2: cross-source similarity dedupe (POS/BIN/BINANCE mirror rows).
+    similarity_groups: dict = {}
+    for t in first_pass:
+        tid = t.get('id', '')
+        _, src_prio = _trade_get_source_type(tid)
+        sim_key = _trade_similarity_key(t)
+        if sim_key is None:
+            sim_key = ('raw', tid, id(t))
+        row_score = _trade_quality_score(t)
+        prev = similarity_groups.get(sim_key)
+        if prev is None or (src_prio, row_score) > (prev[0], prev[1]):
+            similarity_groups[sim_key] = (src_prio, row_score, t)
+
+    deduped = [v[2] for v in similarity_groups.values()]
     # Sort by closeTime descending — built-in, callers should NOT re-sort
     deduped.sort(key=lambda x: x.get('closeTime', x.get('close_time', 0)), reverse=True)
     analytics_valid = [t for t in deduped if _trade_is_analytics_valid(t)]
@@ -15197,6 +15398,10 @@ async def background_scanner_loop():
                             # Update trailing stop if in profit
                             trail_activation = pos.get('trailActivation', entry_price)
                             trail_distance = pos.get('trailDistance', 0)
+                            _runner_controls = resolve_runner_exit_controls(
+                                payload=pos,
+                                default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                            )
                             
                             # Hybrid dynamic trail distance (includes exit_tightness multiplier).
                             pos_atr = pos.get('atr', entry_price * 0.02)
@@ -15219,6 +15424,7 @@ async def background_scanner_loop():
                                 adx=pos.get('adx', 20.0),
                                 leverage=float(pos.get('leverage', 10)),
                             )
+                            dynamic_trail_distance *= _runner_controls['trail_dist_mult']
                             
                             # DCA-1: Regime drift trail tightening
                             if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
@@ -15246,7 +15452,7 @@ async def background_scanner_loop():
                             roi_pct = price_move_pct * leverage
                             
                             # Dynamic thresholds from market conditions
-                            threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
+                            threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0)) * _runner_controls['trail_act_mult']
                             min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
                                 pos_atr_pct, pos_spread, pos_vol_ratio, leverage, threshold_mult=threshold_mult
                             )
@@ -15262,6 +15468,7 @@ async def background_scanner_loop():
                             
                             # Phase 231h → 238A: Dynamic fee buffer for breakeven
                             _sc_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP')
+                            _sc_buf = apply_runner_be_buffer(_sc_buf, _runner_controls)
                             be_long = entry_price * (1 + _sc_buf)
                             be_short = entry_price * (1 - _sc_buf)
                             
@@ -15558,6 +15765,10 @@ async def on_position_price_update(symbol: str, ticker: dict):
         # ---- SL/TP Kontrolü (Spike Bypass ile) ----
         # Phase 205: Use candle close price for exit DECISIONS
         candle_close_price = last_candle_close.get(symbol, current_price)
+        _runner_controls = resolve_runner_exit_controls(
+            payload=pos,
+            default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+        )
         
         sl = pos.get('stopLoss', 0)
         tp = pos.get('takeProfit', 0)
@@ -15693,6 +15904,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             logger.warning(f"📊 FAILED_CONTINUATION (WS): {symbol} {pos['side']} — {fc_count_ws} başarısız deneme")
             _be_spread_ws = pos.get('spreadPct', 0.05)
             _be_buf_ws = compute_breakeven_buffer_pct(spread_pct=_be_spread_ws, spread_level=pos.get('spreadLevel', 'LOW'), reason='FAILED_CONTINUATION')
+            _be_buf_ws = apply_runner_be_buffer(_be_buf_ws, _runner_controls)
             be_exit_ws = entry_price * (1 + _be_buf_ws) if pos['side'] == 'LONG' else entry_price * (1 - _be_buf_ws)
             pos['beBufferPct'] = round(_be_buf_ws * 100, 4)
             pos['beBufferSource'] = 'dynamic'
@@ -15733,6 +15945,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             adx=pos.get('adx', 20.0),
             leverage=float(pos.get('leverage', 10)),
         )
+        dynamic_trail_distance *= _runner_controls['trail_dist_mult']
         
         # DCA-1: Regime drift trail tightening (WS path)
         if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
@@ -15751,7 +15964,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=FAST_ONLY pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
             except Exception:
                 pass
-        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
+        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0)) * _runner_controls['trail_act_mult']
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
             ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage, threshold_mult=threshold_mult
         )
@@ -15767,6 +15980,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         # Phase 231h → 238A: Dynamic fee buffer for breakeven
         _ws_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_WS')
+        _ws_buf = apply_runner_be_buffer(_ws_buf, _runner_controls)
         be_long = entry_price * (1 + _ws_buf)
         be_short = entry_price * (1 - _ws_buf)
         
@@ -15957,6 +16171,10 @@ async def position_price_update_loop():
                         # Update trailing stop if in profit
                         trail_activation = pos.get('trailActivation', entry_price)
                         trail_distance = pos.get('trailDistance', 0)
+                        _runner_controls = resolve_runner_exit_controls(
+                            payload=pos,
+                            default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                        )
                         
                         pos_atr = pos.get('atr', entry_price * 0.02)
                         fast_pnl_pct = pos.get('unrealizedPnlPercent', 0)
@@ -15987,6 +16205,7 @@ async def position_price_update_loop():
                             adx=pos.get('adx', 20.0),
                             leverage=float(pos.get('leverage', 10)),
                         )
+                        dynamic_trail_distance *= _runner_controls['trail_dist_mult']
                         
                         # DCA-1: Regime drift trail tightening (fast WS path)
                         if DUAL_REGIME_GATE_ENABLED and not DUAL_REGIME_SHADOW:
@@ -16005,7 +16224,7 @@ async def position_price_update_loop():
                                     logger.info(f"🌊 DUAL_REGIME_EXEC_DRIFT: {symbol} {_drift_side} source=FAST_ONLY pre_trail={_pre_trail:.6f} post_trail={dynamic_trail_distance:.6f} fast={_drift_fast_dir} struct={_drift_struct_dir}")
                             except Exception:
                                 pass
-                        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0))
+                        threshold_mult = math.sqrt(_clamp(effective_et, 0.3, 15.0)) * _runner_controls['trail_act_mult']
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
                             fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage, threshold_mult=threshold_mult
                         )
@@ -16021,6 +16240,7 @@ async def position_price_update_loop():
                         
                         # Phase 231h → 238A: Dynamic fee buffer for breakeven
                         _fast_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FAST')
+                        _fast_buf = apply_runner_be_buffer(_fast_buf, _runner_controls)
                         be_long = entry_price * (1 + _fast_buf)
                         be_short = entry_price * (1 - _fast_buf)
                         
@@ -16857,7 +17077,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_score >= 105   # Phase RSP: was 90
                 and eq_count >= 2         # Phase RSP: was 1
                 and signal_spread <= 0.08 # Phase RSP: was 0.12
-                and total_depth >= 5_000  # was 2_500 — $2.5K too low for safe execution
+                and total_depth >= 2_500  # legacy micro soft-pass contract
             )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
@@ -16889,7 +17109,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     _bid_depth = float(depth_data.get('total_bid_usd', 0) or 0)
                     _ask_depth = float(depth_data.get('total_ask_usd', 0) or 0)
                     _size_mult = float(signal.get('sizeMultiplier', 1.0) or 1.0)
-                    _planned_margin = self.balance * self.risk_per_trade * _size_mult
+                    # process_signal_for_paper_trading is a module-level coroutine.
+                    # Use the live paper-trader state instead of nonexistent method scope.
+                    _planned_margin = (
+                        float(global_paper_trader.balance)
+                        * float(global_paper_trader.risk_per_trade)
+                        * _size_mult
+                    )
                     _impact = rfx_compute_order_impact(
                         planned_margin_usd=_planned_margin,
                         leverage=signal_leverage,
@@ -23032,6 +23258,16 @@ def _clamp_param(name: str, value):
         logger.warning(f"⚠️ SETTINGS_DRIFT: {name} clamped {value} → {clamped} (limits: {lim['min']}–{lim['max']})")
     return clamped
 
+
+def _normalize_atr_setting_input(name: str, value):
+    """Accept UI-friendly ATR multipliers while preserving internal deci scale."""
+    if value is None:
+        return None
+    raw = float(value)
+    if name in ('sl_atr', 'tp_atr') and 0 < raw < 10:
+        return raw * 10.0
+    return raw
+
 # ============================================================================
 # PHASE 155: AI OPTIMIZER - GRADIENT-BASED PARAMETER OPTIMIZER
 # ============================================================================
@@ -24906,15 +25142,24 @@ class SignalGenerator:
         except Exception:
             pass
         
+        user_z_threshold = (
+            float(getattr(global_paper_trader, 'z_score_threshold', 1.6))
+            if 'global_paper_trader' in globals() and global_paper_trader
+            else 1.6
+        )
         if coin_profile:
-            base_threshold = coin_profile.get('optimal_threshold', 1.6)
+            profile_threshold = float(coin_profile.get('optimal_threshold', user_z_threshold) or user_z_threshold)
+            # Let the user z-score setting bias the adaptive per-coin threshold
+            # without erasing coin-specific structure.
+            user_threshold_bias = (user_z_threshold - 1.6) * 0.75
+            base_threshold = _clamp(profile_threshold + user_threshold_bias, 0.8, 2.5)
             # Phase 152: coin_profile min_score cannot go below user's setting
             coin_min = coin_profile.get('min_score', 55)
             min_score_required = max(coin_min, user_min_score)
             is_backtest = coin_profile.get('is_backtest', False)
             logger.debug(f"Using coin profile: threshold={base_threshold}, min_score={min_score_required} (coin={coin_min}, user={user_min_score})")
         else:
-            base_threshold = 1.5
+            base_threshold = user_z_threshold
             min_score_required = user_min_score
             is_backtest = False
         
@@ -24935,11 +25180,12 @@ class SignalGenerator:
         # =====================================================================
         # SMART_V2: Auto strategy routing + strategy-specific tuning
         # =====================================================================
-        strategy_mode = (
+        requested_strategy_mode = (
             getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
             if 'global_paper_trader' in globals() and global_paper_trader
             else STRATEGY_MODE_LEGACY
         )
+        strategy_mode = normalize_strategy_mode(requested_strategy_mode)
         pre_signal_side = "SHORT" if zscore > 0 else "LONG"
         # Phase 235: Pass macro trend direction for regime-aware directional tuning
         _s2_trend_dir = "NEUTRAL"
@@ -24961,7 +25207,7 @@ class SignalGenerator:
             ob_imbalance_trend=ob_imbalance_trend,
             macro_trend_dir=_s2_trend_dir,
         )
-        strategy_mode = smart_v2_profile.get('strategy_mode', STRATEGY_MODE_LEGACY)
+        strategy_mode = normalize_strategy_mode(smart_v2_profile.get('strategy_mode', strategy_mode))
         active_strategy = smart_v2_profile.get('active_strategy', 'legacy')
         strategy_label = smart_v2_profile.get('strategy_label', 'Legacy')
         strategy_threshold_mult = float(smart_v2_profile.get('threshold_mult', 1.0))
@@ -25705,7 +25951,14 @@ class SignalGenerator:
         
         logger.info(f"📍 PRE_SCORE: {symbol} {signal_side} score={score} min={min_score_required} | reasons: {','.join(reasons[:4])}")
         
-        if score < min_score_required:
+        # Entry quality + execution quality can still recover after the pre-score
+        # check. Full EQ pass now adds up to +6 in adaptive modes and execution
+        # quality can add up to +4, so keep the defer budget aligned with the
+        # real post-gate upside instead of killing borderline high-quality setups.
+        pre_score_recovery_budget = 4
+        if ENTRY_QUALITY_GATE_ENABLED:
+            pre_score_recovery_budget = 10 if is_adaptive_mode(str(strategy_mode).upper()) else 8
+        if score < min_score_required and (score + pre_score_recovery_budget) < min_score_required:
             # Debug log for signal rejection (every 50th to avoid spam)
             if hasattr(self, '_reject_count'):
                 self._reject_count += 1
@@ -25715,6 +25968,11 @@ class SignalGenerator:
             if self._reject_count % 10 == 1:
                 logger.info(f"📊 SCORE_LOW: {symbol} {signal_side} score={score} < min={min_score_required} | Z={zscore:.2f} H={hurst:.2f} | reasons: {', '.join(reasons[:5])}")
             return None
+        elif score < min_score_required:
+            logger.info(
+                f"🟨 PRE_SCORE_DEFER: {symbol} {signal_side} score={score} < min={min_score_required} "
+                f"| defer_eq_exec=True budget=+{pre_score_recovery_budget}"
+            )
         
         # Phase 128: TRACE LOG - score check passed
         logger.info(f"✅ SCORE_PASS: {symbol} {signal_side} score={score} >= min={min_score_required}")
@@ -25795,6 +26053,14 @@ class SignalGenerator:
                     logger.info(f"⚠️ {fail_detail}: {symbol} {signal_side} score-={eq_penalty} → {score}")
             else:
                 reasons.append(f"EQ_PASS({eq_pass_count}/3)")
+                eq_score_bonus = 0
+                if eq_pass_count == 3:
+                    eq_score_bonus = 6 if adaptive_mode else 4
+                elif eq_pass_count == 2:
+                    eq_score_bonus = 2
+                if eq_score_bonus:
+                    score += eq_score_bonus
+                    reasons.append(f"EQ_SCORE(+{eq_score_bonus})")
                 if eq_pass_count == 3:
                     reasons.append("EQ_STRONG")
 
@@ -26280,7 +26546,27 @@ class SignalGenerator:
         if volatile_soft_risk_cap:
             size_mult *= VOLATILE_VETO_SOFTPASS_SIZE_MULT
             reasons.append(f"VOL_SIZE({VOLATILE_VETO_SOFTPASS_SIZE_MULT:.2f}x)")
-        
+        quality_risk_adj = compute_quality_risk_adjustment(
+            strategy_mode=strategy_mode,
+            entry_quality_pass=entry_quality_pass,
+            eq_count=eq_pass_count,
+            exec_quality_score=exec_quality_score,
+        )
+        size_mult *= quality_risk_adj['size_mult']
+        size_mult = _clamp(size_mult, 0.35, 1.65)
+        for _qr_note in quality_risk_adj.get('notes', []):
+            if _qr_note == 'QUAL_ALPHA':
+                reasons.append(f"{_qr_note}(+{int(round((quality_risk_adj['size_mult'] - 1.0) * 100))}%)")
+            elif _qr_note in ('QUAL_DEFENSE', 'QUAL_CAUTION'):
+                reasons.append(f"{_qr_note}({int(round((quality_risk_adj['size_mult'] - 1.0) * 100))}%)")
+            else:
+                reasons.append(_qr_note)
+        if quality_risk_adj.get('lev_cap'):
+            _qual_old_lev = final_leverage
+            final_leverage = min(final_leverage, int(quality_risk_adj['lev_cap']))
+            if final_leverage < _qual_old_lev:
+                reasons.append(f"QUAL_LEV_CAP({_qual_old_lev}→{final_leverage}x)")
+
         self.last_signal_time = now
         
         # Log spread level and leverage with ATR% for debugging
@@ -26374,6 +26660,8 @@ class SignalGenerator:
             'timestamp': now,
             'confidenceScore': score,
             'sizeMultiplier': size_mult,
+            'qualitySizeMult': quality_risk_adj.get('size_mult', 1.0),
+            'qualityLeverageCap': quality_risk_adj.get('lev_cap', 0),
             'leverage': final_leverage,  # Phase 29: Dynamic leverage
             'strategyMode': strategy_mode,
             'activeStrategy': active_strategy,
@@ -27210,6 +27498,18 @@ class PaperTradingEngine:
         existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
         existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
         existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
+        _runner_payload = {**existing_pending}
+        if signal:
+            _runner_payload.update(signal)
+        _runner_controls = resolve_runner_exit_controls(
+            payload=_runner_payload,
+            default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
+        )
+        existing_pending['strategyMode'] = _runner_controls['mode']
+        existing_pending['runner_trail_act_mult'] = _runner_controls['trail_act_mult']
+        existing_pending['runner_trail_dist_mult'] = _runner_controls['trail_dist_mult']
+        existing_pending['runner_tp_tighten'] = _runner_controls['tp_tighten']
+        existing_pending['runner_be_buffer_mult'] = _runner_controls['be_buffer_mult']
 
         try:
             new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
@@ -27257,6 +27557,10 @@ class PaperTradingEngine:
                 _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
                 _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
                 _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
+                if _runner_controls.get('enabled', False):
+                    _adj_tp_atr *= _runner_controls['tp_tighten']
+                    _adj_trail_activation_atr *= _runner_controls['trail_act_mult']
+                    _adj_trail_distance_atr *= _runner_controls['trail_dist_mult']
 
                 _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
                 _ord_spread = float(existing_pending.get('spreadPct', 0.05))
@@ -27660,6 +27964,10 @@ class PaperTradingEngine:
             0.3,
             15.0
         )
+        _runner_controls = resolve_runner_exit_controls(
+            payload=signal if signal else {},
+            default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
+        )
 
         # ================================================================
         # RFX-2D: Counter-Trend Exit Relaxation multipliers
@@ -27698,6 +28006,17 @@ class PaperTradingEngine:
         
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
+
+        if _runner_controls.get('enabled', False):
+            adjusted_tp_atr *= _runner_controls['tp_tighten']
+            adjusted_trail_activation_atr *= _runner_controls['trail_act_mult']
+            adjusted_trail_distance_atr *= _runner_controls['trail_dist_mult']
+            logger.info(
+                f"🏃 RUNNER_EXIT_APPLIED(open): {trade_symbol} {side} "
+                f"tp×{_runner_controls['tp_tighten']:.2f} "
+                f"trail_act×{_runner_controls['trail_act_mult']:.2f} "
+                f"trail_dist×{_runner_controls['trail_dist_mult']:.2f}"
+            )
         
         # DRU-1: Apply struct regime execution profile (single authority)
         try:
@@ -28227,7 +28546,7 @@ class PaperTradingEngine:
             "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
             "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
             "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
-            "strategyMode": signal.get('strategyMode', STRATEGY_MODE_LEGACY) if signal else STRATEGY_MODE_LEGACY,
+            "strategyMode": _runner_controls.get('mode', STRATEGY_MODE_LEGACY),
             "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
             "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
             "reinforcedCount": reinforce_count,
@@ -28242,10 +28561,10 @@ class PaperTradingEngine:
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
             # SMART_V3_RUNNER: execution profile propagation
             "execution_profile_source": signal.get('execution_profile_source', 'neutral') if signal else 'neutral',
-            "runner_trail_act_mult": signal.get('runner_trail_act_mult', 1.0) if signal else 1.0,
-            "runner_trail_dist_mult": signal.get('runner_trail_dist_mult', 1.0) if signal else 1.0,
-            "runner_tp_tighten": signal.get('runner_tp_tighten', 1.0) if signal else 1.0,
-            "runner_be_buffer_mult": signal.get('runner_be_buffer_mult', 1.0) if signal else 1.0,
+            "runner_trail_act_mult": _runner_controls.get('trail_act_mult', 1.0),
+            "runner_trail_dist_mult": _runner_controls.get('trail_dist_mult', 1.0),
+            "runner_tp_tighten": _runner_controls.get('tp_tighten', 1.0),
+            "runner_be_buffer_mult": _runner_controls.get('be_buffer_mult', 1.0),
             "runner_wide_profit_pct": signal.get('runner_wide_profit_pct', 0.20) if signal else 0.20,
             "runner_wide_age_sec": signal.get('runner_wide_age_sec', 600) if signal else 600,
             # RFX-3A: Execution style propagation
@@ -29100,6 +29419,15 @@ class PaperTradingEngine:
             0.3,
             15.0
         )
+        _runner_controls = resolve_runner_exit_controls(
+            payload=order,
+            default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
+        )
+        order['strategyMode'] = _runner_controls['mode']
+        order['runner_trail_act_mult'] = _runner_controls['trail_act_mult']
+        order['runner_trail_dist_mult'] = _runner_controls['trail_dist_mult']
+        order['runner_tp_tighten'] = _runner_controls['tp_tighten']
+        order['runner_be_buffer_mult'] = _runner_controls['be_buffer_mult']
 
         # RFX-2D: Counter-Trend Exit Relaxation (parity with open_position)
         ct_sl_mult = 1.0
@@ -29127,6 +29455,16 @@ class PaperTradingEngine:
         
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
+        if _runner_controls.get('enabled', False):
+            adjusted_tp_atr *= _runner_controls['tp_tighten']
+            adjusted_trail_activation_atr *= _runner_controls['trail_act_mult']
+            adjusted_trail_distance_atr *= _runner_controls['trail_dist_mult']
+            logger.info(
+                f"🏃 RUNNER_EXIT_APPLIED(exec): {symbol} {side} "
+                f"tp×{_runner_controls['tp_tighten']:.2f} "
+                f"trail_act×{_runner_controls['trail_act_mult']:.2f} "
+                f"trail_dist×{_runner_controls['trail_dist_mult']:.2f}"
+            )
         
         # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
         _ord_spread = float(order.get('spreadPct', 0.05))
@@ -30257,11 +30595,11 @@ class PaperTradingEngine:
                     self.sl_atr = _clamp_param('sl_atr', int(_raw_sl))
                     self.tp_atr = _clamp_param('tp_atr', int(_raw_tp))
                     self.trail_activation_atr = data.get('trail_activation_atr', 1.5)
-                    self.trail_distance_atr = data.get('trail_distance_atr', 1.0)
-                    self.max_positions = data.get('max_positions', 50)  # Default: 50
+                    self.trail_distance_atr = data.get('trail_distance_atr', 1.5)
+                    self.max_positions = data.get('max_positions', 8)
                     # Phase 32: Load algorithm sensitivity settings
                     self.z_score_threshold = data.get('z_score_threshold', 1.6)  # Default: 1.6
-                    self.min_confidence_score = data.get('min_confidence_score', 68)  # Default: 68
+                    self.min_confidence_score = data.get('min_confidence_score', 74)
                     # Phase 50: Dynamic Min Score Range
                     self.min_score_low = data.get('min_score_low', 60)  # Default: 60
                     self.min_score_high = data.get('min_score_high', 90)  # Default: 90
@@ -33980,6 +34318,21 @@ async def paper_trading_update_settings(
     leverageMultiplier: float = None
 ):
     """Update cloud trading settings."""
+    old_risk_per_trade = float(getattr(global_paper_trader, 'risk_per_trade', 0.02) or 0.02)
+    old_max_positions = int(getattr(global_paper_trader, 'max_positions', 8) or 8)
+    old_z_threshold = float(getattr(global_paper_trader, 'z_score_threshold', 1.6) or 1.6)
+    old_min_conf = int(getattr(global_paper_trader, 'min_confidence_score', 74) or 74)
+    old_min_score_low = int(getattr(global_paper_trader, 'min_score_low', 60) or 60)
+    old_min_score_high = int(getattr(global_paper_trader, 'min_score_high', 90) or 90)
+    old_entry_tightness = float(getattr(global_paper_trader, 'entry_tightness', 1.8) or 1.8)
+    old_strategy_mode = str(getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY))
+    old_lev_mult = float(getattr(global_paper_trader, 'leverage_multiplier', 1.0) or 1.0)
+    pending_clear_reasons = []
+
+    def _mark_pending_clear(reason: str):
+        if reason not in pending_clear_reasons:
+            pending_clear_reasons.append(reason)
+
     if symbol:
         global_paper_trader.symbol = symbol
         # Switch Binance Streamer to new symbol
@@ -33999,14 +34352,15 @@ async def paper_trading_update_settings(
         # P0-RCA #2: Safety clamp: 0.2% - 10% (was 5%; raised for $10 margin on $100 balance)
         r = max(0.002, min(0.10, r))
         global_paper_trader.risk_per_trade = r
+        if abs(old_risk_per_trade - r) > 0.0005:
+            _mark_pending_clear('risk')
     # Phase 264: Server-side clamp all incoming values
-    clamped_fields = []
-    
+
     if slAtr is not None:
-        slAtr = _clamp_param('sl_atr', slAtr)
+        slAtr = int(round(_clamp_param('sl_atr', _normalize_atr_setting_input('sl_atr', slAtr))))
         global_paper_trader.sl_atr = slAtr
     if tpAtr is not None:
-        tpAtr = _clamp_param('tp_atr', tpAtr)
+        tpAtr = int(round(_clamp_param('tp_atr', _normalize_atr_setting_input('tp_atr', tpAtr))))
         global_paper_trader.tp_atr = tpAtr
     if trailActivationAtr is not None:
         trailActivationAtr = _clamp_param('trail_activation_atr', trailActivationAtr)
@@ -34017,20 +34371,30 @@ async def paper_trading_update_settings(
     if maxPositions is not None:
         maxPositions = int(_clamp_param('max_positions', maxPositions))
         global_paper_trader.max_positions = maxPositions
+        if old_max_positions != maxPositions:
+            _mark_pending_clear('max_positions')
     # Algorithm sensitivity settings
     if zScoreThreshold is not None:
         zScoreThreshold = _clamp_param('z_score_threshold', zScoreThreshold)
         global_paper_trader.z_score_threshold = zScoreThreshold
+        if abs(old_z_threshold - zScoreThreshold) > 0.009:
+            _mark_pending_clear('z_threshold')
     if minConfidenceScore is not None:
         minConfidenceScore = int(_clamp_param('min_confidence_score', minConfidenceScore))
         global_paper_trader.min_confidence_score = minConfidenceScore
+        if old_min_conf != minConfidenceScore:
+            _mark_pending_clear('min_conf')
     # Phase 50: Dynamic Min Score Range
     if minScoreLow is not None:
         minScoreLow = int(_clamp_param('min_score_low', minScoreLow))
         global_paper_trader.min_score_low = minScoreLow
+        if old_min_score_low != minScoreLow:
+            _mark_pending_clear('min_score_low')
     if minScoreHigh is not None:
         minScoreHigh = int(_clamp_param('min_score_high', minScoreHigh))
         global_paper_trader.min_score_high = minScoreHigh
+        if old_min_score_high != minScoreHigh:
+            _mark_pending_clear('min_score_high')
     # Phase 264: Ensure min_score_low <= min_score_high
     if hasattr(global_paper_trader, 'min_score_low') and hasattr(global_paper_trader, 'min_score_high'):
         if global_paper_trader.min_score_low > global_paper_trader.min_score_high:
@@ -34040,11 +34404,12 @@ async def paper_trading_update_settings(
     if entryTightness is not None:
         entryTightness = _clamp_param('entry_tightness', entryTightness)
         global_paper_trader.entry_tightness = entryTightness
+        if abs(old_entry_tightness - entryTightness) > 0.009:
+            _mark_pending_clear('entry_tightness')
     if exitTightness is not None:
         exitTightness = _clamp_param('exit_tightness', exitTightness)
         global_paper_trader.exit_tightness = exitTightness
     if strategyMode is not None:
-        old_mode = getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
         normalized_mode = str(strategyMode).upper()
         if normalized_mode not in VALID_STRATEGY_MODES:
             return JSONResponse(
@@ -34052,12 +34417,8 @@ async def paper_trading_update_settings(
                 status_code=400
             )
         global_paper_trader.strategy_mode = normalized_mode
-        if old_mode != normalized_mode and global_paper_trader.pending_orders:
-            stale_count = len(global_paper_trader.pending_orders)
-            global_paper_trader.pending_orders.clear()
-            global_paper_trader.add_log(
-                f"⚠️ SETTINGS_CHANGED_STRATEGY_MODE: {stale_count} pending order temizlendi ({old_mode}→{normalized_mode})"
-            )
+        if old_strategy_mode != normalized_mode:
+            _mark_pending_clear('strategy_mode')
     
     # Phase 57: Kill Switch settings
     if killSwitchFirstReduction is not None:
@@ -34070,15 +34431,22 @@ async def paper_trading_update_settings(
     # Phase 216: Leverage multiplier
     if leverageMultiplier is not None:
         clamped = max(0.3, min(3.0, leverageMultiplier))
-        old_mult = getattr(global_paper_trader, 'leverage_multiplier', 1.0)
         global_paper_trader.leverage_multiplier = clamped
-        logger.info(f"⚡ Leverage Multiplier updated: {old_mult:.1f}x → {clamped:.1f}x")
-        # Fix P1: Clear pending orders with stale leverage when multiplier changes
-        if abs(old_mult - clamped) > 0.01 and global_paper_trader.pending_orders:
-            stale_count = len(global_paper_trader.pending_orders)
-            global_paper_trader.pending_orders.clear()
-            global_paper_trader.add_log(f"⚠️ SETTINGS_CHANGED_LEVERAGE_MULTIPLIER: {stale_count} pending orders cleared (lev {old_mult:.1f}x→{clamped:.1f}x)")
-            logger.info(f"🗑️ Cleared {stale_count} pending orders due to leverage multiplier change")
+        logger.info(f"⚡ Leverage Multiplier updated: {old_lev_mult:.1f}x → {clamped:.1f}x")
+        if abs(old_lev_mult - clamped) > 0.01:
+            _mark_pending_clear('leverage_multiplier')
+
+    pending_orders_cleared = 0
+    if pending_clear_reasons and global_paper_trader.pending_orders:
+        pending_orders_cleared = len(global_paper_trader.pending_orders)
+        global_paper_trader.pending_orders.clear()
+        clear_reason_text = ",".join(pending_clear_reasons[:5])
+        global_paper_trader.add_log(
+            f"⚠️ SETTINGS_CHANGED_PENDING_CLEAR: {pending_orders_cleared} pending orders temizlendi ({clear_reason_text})"
+        )
+        logger.info(
+            f"🗑️ Cleared {pending_orders_cleared} pending orders after settings change: {clear_reason_text}"
+        )
     
     # Settings log throttle: skip noisy duplicate logs
     settings_log_message = (
@@ -34119,6 +34487,13 @@ async def paper_trading_update_settings(
             adjusted_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr) * global_paper_trader.exit_tightness
             adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
             adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
+            _runner_controls = resolve_runner_exit_controls(
+                payload=pos,
+                default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+            )
+            adjusted_tp_atr *= _runner_controls['tp_tighten']
+            adjusted_trail_activation_atr *= _runner_controls['trail_act_mult']
+            adjusted_trail_distance_atr *= _runner_controls['trail_dist_mult']
             
             _s_symbol = pos.get('symbol', '')
             _s_levels = compute_sl_tp_levels(
@@ -34163,12 +34538,17 @@ async def paper_trading_update_settings(
         "maxPositions": global_paper_trader.max_positions,
         "zScoreThreshold": global_paper_trader.z_score_threshold,
         "minConfidenceScore": global_paper_trader.min_confidence_score,
+        "minScoreLow": global_paper_trader.min_score_low,
+        "minScoreHigh": global_paper_trader.min_score_high,
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
         "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
         "killSwitchFullClose": daily_kill_switch.full_close_pct,
+        "leverageMultiplier": getattr(global_paper_trader, 'leverage_multiplier', 1.0),
         "updatedPositions": updated_positions,
+        "pendingOrdersCleared": pending_orders_cleared,
+        "pendingOrdersClearReasons": pending_clear_reasons,
         "param_limits": PARAM_LIMITS
     })
 
@@ -34658,6 +35038,13 @@ async def paper_trading_market_order(request: Request):
         _mo_adj_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr)
         _mo_adj_trail_act = global_paper_trader.trail_activation_atr
         _mo_adj_trail_dist = global_paper_trader.trail_distance_atr
+        _mo_runner_controls = resolve_runner_exit_controls(
+            payload={"strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)},
+            default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+        )
+        _mo_adj_tp_atr *= _mo_runner_controls['tp_tighten']
+        _mo_adj_trail_act *= _mo_runner_controls['trail_act_mult']
+        _mo_adj_trail_dist *= _mo_runner_controls['trail_dist_mult']
         _mo_levels = compute_sl_tp_levels(
             entry_price=price, atr=atr, side=side,
             leverage=leverage, symbol=symbol,
@@ -34733,6 +35120,12 @@ async def paper_trading_market_order(request: Request):
             "openTime": int(datetime.now().timestamp() * 1000),
             "leverage": leverage,
             "isLive": live_binance_trader.enabled,
+            "strategyMode": _mo_runner_controls['mode'],
+            "execution_profile_source": "manual",
+            "runner_trail_act_mult": _mo_runner_controls['trail_act_mult'],
+            "runner_trail_dist_mult": _mo_runner_controls['trail_dist_mult'],
+            "runner_tp_tighten": _mo_runner_controls['tp_tighten'],
+            "runner_be_buffer_mult": _mo_runner_controls['be_buffer_mult'],
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,

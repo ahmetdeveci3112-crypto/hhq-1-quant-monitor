@@ -51,6 +51,72 @@ const INITIAL_STATS: PortfolioStats = {
   avgLoss: 0,
 };
 
+const STRATEGY_MODES: SystemSettings['strategyMode'][] = ['LEGACY', 'SMART_V2', 'SMART_V3_RUNNER'];
+
+const DEFAULT_SETTINGS: SystemSettings = {
+  leverage: 10,
+  stopLossAtr: 1.5,
+  takeProfit: 3.0,
+  riskPerTrade: 2,
+  trailActivationAtr: 1.5,
+  trailDistanceAtr: 1.5,
+  maxPositions: 8,
+  zScoreThreshold: 1.6,
+  minConfidenceScore: 74,
+  minScoreLow: 60,
+  minScoreHigh: 90,
+  entryTightness: 1.8,
+  exitTightness: 1.2,
+  strategyMode: 'LEGACY',
+  killSwitchFirstReduction: -100,
+  killSwitchFullClose: -150,
+  leverageMultiplier: 1.0
+};
+
+const toFiniteNumber = (value: unknown, fallback: number): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const resolveAtrSetting = (effectiveValue: unknown, rawValue: unknown, fallback: number): number => {
+  if (effectiveValue !== undefined && effectiveValue !== null) {
+    return toFiniteNumber(effectiveValue, fallback);
+  }
+  if (rawValue !== undefined && rawValue !== null) {
+    const parsedRaw = Number(rawValue);
+    if (Number.isFinite(parsedRaw)) {
+      return parsedRaw >= 10 ? parsedRaw / 10 : parsedRaw;
+    }
+  }
+  return fallback;
+};
+
+const normalizeStrategyMode = (value: unknown, fallback: SystemSettings['strategyMode']): SystemSettings['strategyMode'] => (
+  STRATEGY_MODES.includes(value as SystemSettings['strategyMode'])
+    ? value as SystemSettings['strategyMode']
+    : fallback
+);
+
+const mapBackendSettingsToUI = (data: any, fallback: SystemSettings): SystemSettings => ({
+  leverage: toFiniteNumber(data?.leverage, fallback.leverage),
+  stopLossAtr: resolveAtrSetting(data?.slAtrEffective, data?.slAtr, fallback.stopLossAtr),
+  takeProfit: resolveAtrSetting(data?.tpAtrEffective, data?.tpAtr, fallback.takeProfit),
+  riskPerTrade: toFiniteNumber(data?.riskPerTrade, fallback.riskPerTrade / 100) * 100,
+  trailActivationAtr: toFiniteNumber(data?.trailActivationAtr, fallback.trailActivationAtr),
+  trailDistanceAtr: toFiniteNumber(data?.trailDistanceAtr, fallback.trailDistanceAtr),
+  maxPositions: toFiniteNumber(data?.maxPositions, fallback.maxPositions),
+  zScoreThreshold: toFiniteNumber(data?.zScoreThreshold, fallback.zScoreThreshold),
+  minConfidenceScore: toFiniteNumber(data?.minConfidenceScore, fallback.minConfidenceScore),
+  minScoreLow: toFiniteNumber(data?.minScoreLow, fallback.minScoreLow || 60),
+  minScoreHigh: toFiniteNumber(data?.minScoreHigh, fallback.minScoreHigh || 90),
+  entryTightness: toFiniteNumber(data?.entryTightness, fallback.entryTightness),
+  exitTightness: toFiniteNumber(data?.exitTightness, fallback.exitTightness),
+  strategyMode: normalizeStrategyMode(data?.strategyMode, fallback.strategyMode),
+  killSwitchFirstReduction: toFiniteNumber(data?.killSwitchFirstReduction, fallback.killSwitchFirstReduction),
+  killSwitchFullClose: toFiniteNumber(data?.killSwitchFullClose, fallback.killSwitchFullClose),
+  leverageMultiplier: toFiniteNumber(data?.leverageMultiplier, fallback.leverageMultiplier),
+});
+
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
 // SMART_V3_RUNNER: Deterministic execution source resolver for header chip
@@ -265,25 +331,7 @@ export default function App() {
 
   // Settings Modal
   const [showSettings, setShowSettings] = useState(false);
-  const [settings, setSettings] = useState<SystemSettings>({
-    leverage: 10,
-    stopLossAtr: 30,
-    takeProfit: 20,
-    riskPerTrade: 2,
-    trailActivationAtr: 1.5,
-    trailDistanceAtr: 1,
-    maxPositions: 50,
-    zScoreThreshold: 1.6,
-    minConfidenceScore: 68,
-    minScoreLow: 60,
-    minScoreHigh: 90,
-    entryTightness: 1.8,
-    exitTightness: 1.2,
-    strategyMode: 'LEGACY',
-    killSwitchFirstReduction: -100,
-    killSwitchFullClose: -150,
-    leverageMultiplier: 1.0
-  });
+  const [settings, setSettings] = useState<SystemSettings>(DEFAULT_SETTINGS);
 
   const wsRef = useRef<WebSocket | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -680,6 +728,74 @@ export default function App() {
   // No local handling logic needed for Cloud Trading
   // Logic moved to Backend (main.py)
 
+  const refreshRuntimeSettings = useCallback(async (reason: string) => {
+    try {
+      const settingsRes = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
+      if (!settingsRes.ok) return;
+      const backendSettings = await settingsRes.json();
+      setSettings(prev => mapBackendSettingsToUI(backendSettings, prev));
+      if (backendSettings.symbol) {
+        setSelectedCoin(backendSettings.symbol);
+      }
+      addLog(reason);
+    } catch {
+      // Best-effort refresh only.
+    }
+  }, [addLog]);
+
+  const handleSettingsSave = useCallback(async (nextSettings: SystemSettings) => {
+    const params = new URLSearchParams({
+      leverage: String(nextSettings.leverage),
+      riskPerTrade: String(nextSettings.riskPerTrade),
+      slAtr: String(nextSettings.stopLossAtr),
+      tpAtr: String(nextSettings.takeProfit),
+      trailActivationAtr: String(nextSettings.trailActivationAtr),
+      trailDistanceAtr: String(nextSettings.trailDistanceAtr),
+      maxPositions: String(nextSettings.maxPositions),
+      zScoreThreshold: String(nextSettings.zScoreThreshold),
+      minConfidenceScore: String(nextSettings.minConfidenceScore),
+      minScoreLow: String(nextSettings.minScoreLow || 60),
+      minScoreHigh: String(nextSettings.minScoreHigh || 90),
+      entryTightness: String(nextSettings.entryTightness),
+      exitTightness: String(nextSettings.exitTightness),
+      strategyMode: String(nextSettings.strategyMode || 'LEGACY'),
+      killSwitchFirstReduction: String(nextSettings.killSwitchFirstReduction),
+      killSwitchFullClose: String(nextSettings.killSwitchFullClose),
+      leverageMultiplier: String(nextSettings.leverageMultiplier ?? 1.0),
+    });
+    if (selectedCoin) {
+      params.set('symbol', selectedCoin);
+    }
+
+    const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params.toString()}`, {
+      method: 'POST',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || 'Ayarlar kaydedilemedi');
+    }
+
+    const appliedSettings = mapBackendSettingsToUI(data, nextSettings);
+    setSettings(appliedSettings);
+    if (data.symbol) {
+      setSelectedCoin(data.symbol);
+    }
+
+    if ((data.pendingOrdersCleared || 0) > 0) {
+      const reasons = Array.isArray(data.pendingOrdersClearReasons) && data.pendingOrdersClearReasons.length > 0
+        ? ` (${data.pendingOrdersClearReasons.join(', ')})`
+        : '';
+      addLog(`🧹 ${data.pendingOrdersCleared} bekleyen emir ayar değişimi sonrası temizlendi${reasons}`);
+    }
+    if ((data.updatedPositions || 0) > 0) {
+      addLog(`🔄 ${data.updatedPositions} açık pozisyonun TP/SL seviyesi yeni exit parametreleriyle eşitlendi`);
+    }
+    addLog(
+      `⚙️ Ayarlar uygulandı: ${appliedSettings.strategyMode} | Z ${appliedSettings.zScoreThreshold.toFixed(1)} | ` +
+      `SL ${appliedSettings.stopLossAtr.toFixed(1)}x | TP ${appliedSettings.takeProfit.toFixed(1)}x`
+    );
+  }, [addLog, selectedCoin]);
+
   // Phase 17 & 18: Fetch cloud state and settings on page load
   useEffect(() => {
     const fetchCloudState = async () => {
@@ -698,25 +814,8 @@ export default function App() {
         } else {
           setSelectedCoin('BTCUSDT'); // Fallback
         }
-        setSettings({
-          leverage: data.leverage ?? 10,
-          stopLossAtr: data.slAtr ?? 30,
-          takeProfit: data.tpAtr ?? 20,
-          riskPerTrade: (data.riskPerTrade ?? 0.02) * 100,
-          trailActivationAtr: data.trailActivationAtr ?? 1.5,
-          trailDistanceAtr: data.trailDistanceAtr ?? 1,
-          maxPositions: data.maxPositions ?? 50,
-          zScoreThreshold: data.zScoreThreshold ?? 1.6,
-          minConfidenceScore: data.minConfidenceScore ?? 68,
-          minScoreLow: data.minScoreLow ?? 60,
-          minScoreHigh: data.minScoreHigh ?? 90,
-          entryTightness: data.entryTightness ?? 1.8,
-          exitTightness: data.exitTightness ?? 1.2,
-          strategyMode: (['LEGACY', 'SMART_V2', 'SMART_V3_RUNNER'].includes(data.strategyMode) ? data.strategyMode : 'LEGACY'),
-          killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
-          killSwitchFullClose: data.killSwitchFullClose ?? -150,
-          leverageMultiplier: data.leverageMultiplier ?? 1.0
-        });
+        const cloudSettings = mapBackendSettingsToUI(data, DEFAULT_SETTINGS);
+        setSettings(cloudSettings);
 
         // Phase 18 UX: Auto-connect WebSocket when cloud trading is enabled
         if (data.enabled) {
@@ -743,61 +842,20 @@ export default function App() {
 
         const symbol = data.symbol || 'YOK';
         const leverage = data.leverage || 0;
-        addLog(`☁️ Cloud Synced: ${symbol} | ${leverage} x | SL:${data.slAtr || 30} TP:${data.tpAtr || 20} | $${(data.balance || 0).toFixed(0)} `);
+        addLog(
+          `☁️ Cloud Synced: ${symbol} | ${leverage}x | ` +
+          `SL:${cloudSettings.stopLossAtr.toFixed(1)}x TP:${cloudSettings.takeProfit.toFixed(1)}x | ` +
+          `$${(data.balance || 0).toFixed(0)}`
+        );
         setIsSynced(true); // Phase 27: Allow auto-save only after sync
       } catch (e) {
         console.log('Cloud state fetch failed:', e);
-        if (!selectedCoin) setSelectedCoin('BTCUSDT'); // Fallback on error
+        setSelectedCoin(prev => prev || 'BTCUSDT'); // Fallback on error
         setIsSynced(true); // Enable anyway to allow local overrides if network fails
       }
     };
     fetchCloudState();
   }, [addLog]);
-
-  // Phase 18: Auto-save settings to cloud when changed (debounced)
-  const settingsRef = useRef(settings);
-  const coinRef = useRef(selectedCoin);
-  useEffect(() => {
-    // Skip on first render OR if not synced yet (Phase 27)
-    if (!isSynced) return;
-    if (settingsRef.current === settings && coinRef.current === selectedCoin) return;
-    settingsRef.current = settings;
-    coinRef.current = selectedCoin;
-
-    const saveToCloud = async () => {
-      try {
-        const params = new URLSearchParams({
-          symbol: selectedCoin,
-          leverage: String(settings.leverage),
-          riskPerTrade: String(settings.riskPerTrade / 100),
-          slAtr: String(settings.stopLossAtr),
-          tpAtr: String(settings.takeProfit),
-          trailActivationAtr: String(settings.trailActivationAtr),
-          trailDistanceAtr: String(settings.trailDistanceAtr),
-          maxPositions: String(settings.maxPositions),
-          zScoreThreshold: String(settings.zScoreThreshold),
-          minConfidenceScore: String(settings.minConfidenceScore),
-          minScoreLow: String(settings.minScoreLow || 50),
-          minScoreHigh: String(settings.minScoreHigh || 70),
-          entryTightness: String(settings.entryTightness),
-          exitTightness: String(settings.exitTightness),
-          strategyMode: String(settings.strategyMode || 'LEGACY'),
-          killSwitchFirstReduction: String(settings.killSwitchFirstReduction),
-          killSwitchFullClose: String(settings.killSwitchFullClose),
-          leverageMultiplier: String(settings.leverageMultiplier ?? 1.0)
-        });
-        const res = await fetch(`${BACKEND_API_URL}/paper-trading/settings?${params}`, { method: 'POST' });
-        if (res.ok) {
-          console.log('Settings synced to cloud');
-        }
-      } catch (e) {
-        console.log('Settings sync failed:', e);
-      }
-    };
-
-    const timer = setTimeout(saveToCloud, 500);
-    return () => clearTimeout(timer);
-  }, [settings, selectedCoin]);
 
   // Phase 53: Fetch optimizer status when AI tab is active
   useEffect(() => {
@@ -915,31 +973,13 @@ export default function App() {
 
         // Phase 269: Refresh runtime settings after successful apply
         if (data.params_applied) {
-          try {
-            const settingsRes = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
-            if (settingsRes.ok) {
-              const s = await settingsRes.json();
-              setSettings(prev => ({
-                ...prev,
-                leverage: s.leverage ?? prev.leverage,
-                stopLossAtr: s.slAtr ?? prev.stopLossAtr,
-                takeProfit: s.tpAtr ?? prev.takeProfit,
-                trailActivationAtr: s.trailActivationAtr ?? prev.trailActivationAtr,
-                trailDistanceAtr: s.trailDistanceAtr ?? prev.trailDistanceAtr,
-                zScoreThreshold: s.zScoreThreshold ?? prev.zScoreThreshold,
-                minConfidenceScore: s.minConfidenceScore ?? prev.minConfidenceScore,
-                entryTightness: s.entryTightness ?? prev.entryTightness,
-                exitTightness: s.exitTightness ?? prev.exitTightness,
-              }));
-              addLog('🔄 Runtime ayarları hyperopt sonrası güncellendi');
-            }
-          } catch { /* settings refresh best-effort */ }
+          await refreshRuntimeSettings('🔄 Runtime ayarları hyperopt sonrası güncellendi');
         }
       }
     } catch (err) {
       addLog('❌ Hyperopt çalıştırma hatası');
     }
-  }, [addLog]);
+  }, [addLog, refreshRuntimeSettings]);
 
   // Phase 265: Hyperopt settings update
   const handleHyperoptSettings = useCallback(async (patch: Record<string, any>) => {
@@ -971,25 +1011,7 @@ export default function App() {
 
         // Phase 269: Refresh runtime settings after successful force-apply
         if (data.applied) {
-          try {
-            const settingsRes = await fetch(`${BACKEND_API_URL}/paper-trading/settings`);
-            if (settingsRes.ok) {
-              const s = await settingsRes.json();
-              setSettings(prev => ({
-                ...prev,
-                leverage: s.leverage ?? prev.leverage,
-                stopLossAtr: s.slAtr ?? prev.stopLossAtr,
-                takeProfit: s.tpAtr ?? prev.takeProfit,
-                trailActivationAtr: s.trailActivationAtr ?? prev.trailActivationAtr,
-                trailDistanceAtr: s.trailDistanceAtr ?? prev.trailDistanceAtr,
-                zScoreThreshold: s.zScoreThreshold ?? prev.zScoreThreshold,
-                minConfidenceScore: s.minConfidenceScore ?? prev.minConfidenceScore,
-                entryTightness: s.entryTightness ?? prev.entryTightness,
-                exitTightness: s.exitTightness ?? prev.exitTightness,
-              }));
-              addLog('🔄 Runtime ayarları force-apply sonrası güncellendi');
-            }
-          } catch { /* best-effort */ }
+          await refreshRuntimeSettings('🔄 Runtime ayarları force-apply sonrası güncellendi');
         }
       } else {
         const err = await res.json();
@@ -998,7 +1020,7 @@ export default function App() {
     } catch (err) {
       addLog('❌ Force Apply hatası');
     }
-  }, [addLog]);
+  }, [addLog, refreshRuntimeSettings]);
 
   // Phase 52: Toggle AI Optimizer
   const toggleOptimizer = async () => {
@@ -1258,7 +1280,7 @@ export default function App() {
         <SettingsModal
           settings={settings}
           onClose={() => setShowSettings(false)}
-          onSave={setSettings}
+          onSave={handleSettingsSave}
           optimizerStats={optimizerStats}
           onToggleOptimizer={toggleOptimizer}
           phase193Status={phase193Status}

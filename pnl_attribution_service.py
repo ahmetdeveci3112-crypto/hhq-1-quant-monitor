@@ -50,12 +50,17 @@ class PnLAttributionService:
     # ------------------------------------------------------------------
     # Core decomposition
     # ------------------------------------------------------------------
-    def decompose_trade(self, trade: Dict) -> Dict:
+    def decompose_trade(self, trade: Dict, count_metrics: bool = True) -> Dict:
         """Decompose a single trade's PnL into components.
 
         Args:
             trade: dict with entryPrice, exitPrice, size, side, leverage,
                    entry_slippage, accumulated_funding, signalPrice, reason, etc.
+
+        Args:
+            count_metrics: When False, skip service-level counters for internal
+                fallback parsing paths. This keeps status telemetry aligned with
+                externally requested decompositions.
 
         Returns:
             dict with pnl_gross, fee_cost, slippage_cost, funding_cost,
@@ -165,7 +170,8 @@ class PnLAttributionService:
                     f"delta={abs(pnl_net - expected_net):.6f}"
                 )
 
-            self._total_decomposed += 1
+            if count_metrics:
+                self._total_decomposed += 1
 
             result = {
                 'pnl_gross': round(pnl_gross, 6),
@@ -394,7 +400,7 @@ class PnLAttributionService:
                 if ep > 0:
                     normalized['size'] = float(normalized['sizeUsd']) / ep
 
-            decomp = self.decompose_trade(normalized)
+            decomp = self.decompose_trade(normalized, count_metrics=False)
             decomp_attr = json.loads(decomp.get('attribution_json', '{}'))
             if isinstance(decomp_attr, dict) and any(abs(float(decomp_attr.get(k, 0) or 0)) > 1e-12 for k in metric_keys):
                 return {

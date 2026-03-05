@@ -12,6 +12,7 @@ Run: python3 -m pytest test_rfx_1c.py -v --override-ini="asyncio_mode=auto"
 import os
 import sys
 import math
+import inspect
 
 import pytest
 
@@ -366,3 +367,12 @@ class TestMainPyFlags:
         )
         assert isinstance(result, DepthImpact)
         assert result.passes is True
+
+    def test_process_signal_depth_gate_uses_global_trader_state(self):
+        """Depth gate in process_signal_for_paper_trading must not reference method-scope self."""
+        import main
+
+        src = inspect.getsource(main.process_signal_for_paper_trading)
+        assert 'global_paper_trader.balance' in src
+        assert 'global_paper_trader.risk_per_trade' in src
+        assert 'self.balance * self.risk_per_trade' not in src

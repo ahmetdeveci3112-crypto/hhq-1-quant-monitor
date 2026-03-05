@@ -112,6 +112,10 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
 
     const maxPnl = Math.max(...dailyPnl.map(d => Math.abs(d.pnl)), 1);
     const showAttribution = Boolean(attribution && (attribution.has_data || attribution.trade_count > 0));
+    const winRate = toNum(summary?.winRate) / 100;
+    const avgWin = toNum(summary?.avgWin);
+    const avgLoss = toNum(summary?.avgLoss);
+    const expectancy = (winRate * avgWin) + ((1 - winRate) * avgLoss);
 
     return (
         <div className="space-y-6">
@@ -123,7 +127,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                 </div>
             )}
 
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 sm:gap-4">
                 <div className="bg-gradient-to-br from-emerald-900/50 to-emerald-800/30 border border-emerald-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <TrendingUp className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-400" />
@@ -173,6 +177,19 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                     </div>
                     <div className="text-[10px] sm:text-xs text-amber-400 mt-1 truncate">
                         K ${summary?.avgWin?.toFixed(2) || '0'} / Z ${summary?.avgLoss?.toFixed(2) || '0'}
+                    </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-violet-900/50 to-violet-800/30 border border-violet-700/50 rounded-xl p-2 sm:p-4">
+                    <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
+                        <TrendingDown className="w-4 h-4 sm:w-5 sm:h-5 text-violet-300" />
+                        <span className="text-xs sm:text-sm text-violet-200">Expectancy</span>
+                    </div>
+                    <div className={`text-lg sm:text-2xl font-bold ${expectancy >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        ${expectancy.toFixed(2)}
+                    </div>
+                    <div className="text-[10px] sm:text-xs text-violet-300 mt-1 truncate">
+                        İşlem başına beklenen net katkı
                     </div>
                 </div>
             </div>
