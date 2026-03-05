@@ -39,11 +39,13 @@ interface OptimizerStats {
 }
 
 interface MarketRegime {
-    currentRegime: string;
-    trendDirection?: string;
+    currentRegime: string | null;
+    trendDirection?: string | null;
     lastUpdate: string | null;
     lastUpdateMs?: number | null;
-    priceCount: number;
+    staleSec?: number | null;
+    priceCount: number | null;
+    readyState?: string;
     params: {
         min_score_adjustment: number;
         trail_distance_mult: number;
@@ -54,6 +56,16 @@ interface MarketRegime {
         long_penalty?: number;
         short_bonus?: number;
         description: string;
+    } | null;
+    dataFlow?: {
+        inputSource?: string;
+        lastBtcPrice?: number | null;
+        lastInputMs?: number | null;
+        isStale?: boolean;
+        fastSamples?: number;
+        structSamples?: number;
+        minSamplesPerWindow?: number;
+        readyState?: string;
     };
     recentChanges?: { from: string; to: string; time: string }[];
     fast?: {
@@ -62,14 +74,14 @@ interface MarketRegime {
         confidence: number;
         samples: number;
         windowSec: number;
-    };
+    } | null;
     struct?: {
         regime: string;
         trendDirection: string;
         confidence: number;
         samples: number;
         windowSec: number;
-    };
+    } | null;
     executionProfile?: {
         tp_mult: number;
         sl_mult: number;
@@ -77,7 +89,34 @@ interface MarketRegime {
         confirmation_mult: number;
         min_score_offset: number;
         profile_source: string;
+        profile_key?: string;
+        source_kind?: string;
+        source_label?: string;
         description: string;
+    } | null;
+    dcaPreview?: {
+        enabled: boolean;
+        shadow: boolean;
+        conflictMode: string;
+        minConf: number;
+        windowAlignment: string;
+        preferredSide: string;
+        long?: {
+            alignment: string;
+            score_adj: number;
+            size_mult: number;
+            lev_mult: number;
+            decision: string;
+            reason_code: string;
+        } | null;
+        short?: {
+            alignment: string;
+            score_adj: number;
+            size_mult: number;
+            lev_mult: number;
+            decision: string;
+            reason_code: string;
+        } | null;
     };
 }
 
@@ -133,33 +172,59 @@ const formatWindowSec = (sec?: number): string => {
     return `${m}dk`;
 };
 
+const formatInputSource = (source?: string): string => {
+    const raw = String(source || '').trim().toLowerCase();
+    if (!raw || raw === 'none') return 'bekleniyor';
+    if (raw === 'scan_tickers') return 'scanner';
+    if (raw === 'ws_manager') return 'ws';
+    if (raw === 'btc_filter') return 'btc_filter';
+    if (raw.startsWith('cache_')) return `cache (${raw.replace('cache_', '').replace('s', 'sn')})`;
+    return raw;
+};
+
+const formatCompactPrice = (price?: number | null): string => {
+    if (!price || price <= 0) return '—';
+    return `$${price.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+};
+
+const getReadyStateInfo = (state?: string) => {
+    switch (state) {
+        case 'live':
+            return { label: 'CANLI', color: 'text-emerald-400', badge: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20', desc: 'BTC rejim akışı sağlıklı ve kullanılabilir.' };
+        case 'warming_up':
+            return { label: 'ISINIYOR', color: 'text-amber-400', badge: 'bg-amber-500/15 text-amber-400 border border-amber-500/20', desc: 'Örnek sayısı artıyor; rejim yorumu temkinli okunmalı.' };
+        case 'stale':
+            return { label: 'BAYAT', color: 'text-rose-400', badge: 'bg-rose-500/15 text-rose-400 border border-rose-500/20', desc: 'BTC rejim akışı gecikmiş; kararları kesin veri gibi okumayın.' };
+        case 'error':
+            return { label: 'HATA', color: 'text-rose-400', badge: 'bg-rose-500/15 text-rose-400 border border-rose-500/20', desc: 'Regime payload fallback modunda; backend akışı kontrol edilmeli.' };
+        default:
+            return { label: 'BEKLIYOR', color: 'text-slate-400', badge: 'bg-slate-800 text-slate-400 border border-slate-700', desc: 'BTC rejim verisi henüz yeterli değil.' };
+    }
+};
+
+const getDecisionTone = (decision?: string) => {
+    switch (decision) {
+        case 'STRONG_ALLOW':
+            return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20';
+        case 'SOFT_ALLOW':
+            return 'text-amber-300 bg-amber-500/10 border-amber-500/20';
+        case 'SOFT_ALLOW_LOW_RISK':
+            return 'text-cyan-300 bg-cyan-500/10 border-cyan-500/20';
+        case 'BLOCK':
+            return 'text-rose-400 bg-rose-500/10 border-rose-500/20';
+        default:
+            return 'text-slate-400 bg-slate-800 border-slate-700';
+    }
+};
+
 export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime, dcaConfig, strategyMode }) => {
     const safeTracking = tracking || [];
     const safeAnalyses = analyses || [];
-    const regime = getRegimeLabel(marketRegime?.currentRegime || 'RANGING');
-
-    // DCA decision compute for display
-    const getDcaDecision = () => {
-        if (!dcaConfig?.enabled) return null;
-        if (!marketRegime?.fast || !marketRegime?.struct) return { label: 'VERİ YOK', color: 'text-slate-500', align: '—' };
-        const { fast, struct } = marketRegime;
-        const bothUp = fast.trendDirection === 'UP' && struct.trendDirection === 'UP';
-        const bothDown = fast.trendDirection === 'DOWN' && struct.trendDirection === 'DOWN';
-        const conflict = (fast.trendDirection === 'UP' && struct.trendDirection === 'DOWN') ||
-            (fast.trendDirection === 'DOWN' && struct.trendDirection === 'UP');
-        if (bothUp || bothDown) {
-            const minConf = Math.min(fast.confidence, struct.confidence);
-            if (minConf >= (dcaConfig.minConf || 0.60)) return { label: 'STRONG_ALLOW', color: 'text-emerald-400', align: 'ALIGNED' };
-            return { label: 'SOFT_ALLOW', color: 'text-emerald-300', align: 'ALIGNED' };
-        }
-        if (conflict) {
-            return dcaConfig.shadow
-                ? { label: 'SHADOW_MISS', color: 'text-purple-400', align: 'CONFLICT' }
-                : { label: 'BLOCK', color: 'text-rose-400', align: 'CONFLICT' };
-        }
-        return { label: 'SOFT_ALLOW', color: 'text-amber-400', align: 'NEUTRAL' };
-    };
-    const dca = getDcaDecision();
+    const rawRegime = marketRegime?.currentRegime || marketRegime?.struct?.regime || '';
+    const hasRegimeSignal = Boolean(rawRegime || marketRegime?.fast || marketRegime?.struct || marketRegime?.dataFlow?.lastBtcPrice);
+    const regime = rawRegime ? getRegimeLabel(rawRegime) : { icon: '🛰️', label: 'BTC REJIM', color: 'text-slate-400' };
+    const readyInfo = getReadyStateInfo(marketRegime?.dataFlow?.readyState || marketRegime?.readyState);
+    const dcaPreview = marketRegime?.dcaPreview;
 
     // Format TR time
     const formatTrTime = () => {
@@ -198,7 +263,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
                             }`}
                     >
-                        {stats.enabled ? '🤖 AI Aktif' : '🤖 AI Pasif'}
+                        {stats.enabled ? '🤖 Optimize Aktif' : '🤖 Optimize Pasif'}
                     </button>
                 </div>
             </div>
@@ -228,11 +293,13 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                     {/* Top row: icon + label + time */}
                     <div className="flex items-center justify-between mb-3">
                         <div className="flex items-center gap-2">
-                            <span className="text-2xl">{regime.icon}</span>
+                            <span className="text-2xl">{hasRegimeSignal ? regime.icon : '🛰️'}</span>
                             <div>
-                                <div className={`text-base font-bold ${regime.color}`}>{regime.label}</div>
+                                <div className={`text-base font-bold ${hasRegimeSignal ? regime.color : readyInfo.color}`}>
+                                    {hasRegimeSignal ? regime.label : 'BTC REJIM BEKLENIYOR'}
+                                </div>
                                 <div className="text-[10px] text-slate-600">
-                                    {marketRegime.executionProfile?.description || marketRegime.params?.description || 'Piyasa Durumu'}
+                                    {marketRegime.executionProfile?.description || marketRegime.params?.description || readyInfo.desc}
                                 </div>
                             </div>
                         </div>
@@ -240,11 +307,39 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             {formatTrTime() && (
                                 <div className="text-[10px] text-slate-600 font-mono">Son: {formatTrTime()}</div>
                             )}
-                            {marketRegime.executionProfile?.profile_source && (
-                                <div className="text-[9px] text-slate-700">Kaynak: {marketRegime.executionProfile.profile_source}</div>
+                            {(marketRegime.executionProfile?.source_label || marketRegime.executionProfile?.profile_source) && (
+                                <div className="text-[9px] text-slate-700">
+                                    Profil: {marketRegime.executionProfile?.source_label || marketRegime.executionProfile?.profile_source}
+                                </div>
                             )}
                         </div>
                     </div>
+
+                    <div className="flex flex-wrap gap-2 mb-3">
+                        <span className={`px-2 py-1 rounded-lg text-[10px] font-semibold ${readyInfo.badge}`}>
+                            {readyInfo.label}
+                        </span>
+                        <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-300 border border-slate-700">
+                            BTC: {formatCompactPrice(marketRegime.dataFlow?.lastBtcPrice)}
+                        </span>
+                        <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-300 border border-slate-700">
+                            Akış: {formatInputSource(marketRegime.dataFlow?.inputSource)}
+                        </span>
+                        <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-400 border border-slate-700">
+                            Örnek: {marketRegime.dataFlow?.fastSamples ?? 0}/{marketRegime.dataFlow?.structSamples ?? 0}
+                        </span>
+                        {marketRegime.staleSec !== undefined && marketRegime.staleSec !== null && (
+                            <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-400 border border-slate-700">
+                                stale {Math.round(marketRegime.staleSec)}sn
+                            </span>
+                        )}
+                    </div>
+
+                    {readyInfo.label !== 'CANLI' && (
+                        <div className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-200">
+                            {readyInfo.desc}
+                        </div>
+                    )}
 
                     {/* Dual regime windows */}
                     <div className="grid grid-cols-2 gap-2 mb-3">
@@ -340,36 +435,69 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             </span>
                         </div>
                     )}
-                    {dca && (
-                        <div className="flex items-center justify-between bg-slate-800/40 rounded-lg px-2.5 py-2 mb-3">
-                            <div className="flex items-center gap-1.5">
-                                <Shield className="w-3.5 h-3.5 text-slate-600" />
-                                <span className="text-[9px] text-slate-500 uppercase font-semibold">DCA Kararı</span>
+                    {dcaPreview?.enabled && (
+                        <div className="mb-3 space-y-2">
+                            <div className="flex items-center justify-between bg-slate-800/40 rounded-lg px-2.5 py-2">
+                                <div className="flex items-center gap-1.5">
+                                    <Shield className="w-3.5 h-3.5 text-slate-600" />
+                                    <span className="text-[9px] text-slate-500 uppercase font-semibold">Dual Regime DCA</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[10px] font-bold text-slate-300">{dcaPreview.windowAlignment}</span>
+                                    <span className="text-[9px] text-slate-600">Prefer: {dcaPreview.preferredSide}</span>
+                                </div>
                             </div>
-                            <div className="flex items-center gap-1.5">
-                                <span className={`text-xs font-bold font-mono ${dca.color}`}>{dca.label}</span>
-                                <span className="text-[9px] text-slate-600">{dca.align}</span>
+                            <div className="grid grid-cols-2 gap-2">
+                                {[
+                                    { side: 'LONG', preview: dcaPreview.long },
+                                    { side: 'SHORT', preview: dcaPreview.short },
+                                ].map(({ side, preview }) => (
+                                    <div key={side} className="rounded-lg border border-slate-800 bg-slate-900/40 p-2">
+                                        <div className="mb-1 flex items-center justify-between">
+                                            <span className={`text-[10px] font-bold ${side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{side}</span>
+                                            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold border ${getDecisionTone(preview?.decision)}`}>
+                                                {preview?.decision || '—'}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between text-[9px] text-slate-500">
+                                            <span>Align</span>
+                                            <span className="text-slate-300">{preview?.alignment || '—'}</span>
+                                        </div>
+                                        <div className="flex justify-between text-[9px] text-slate-500">
+                                            <span>Skor</span>
+                                            <span className="text-slate-300">{preview ? `${preview.score_adj >= 0 ? '+' : ''}${preview.score_adj}` : '—'}</span>
+                                        </div>
+                                        <div className="flex justify-between text-[9px] text-slate-500">
+                                            <span>Boyut / Lev</span>
+                                            <span className="text-slate-300">{preview ? `×${preview.size_mult.toFixed(2)} / ×${preview.lev_mult.toFixed(2)}` : '—'}</span>
+                                        </div>
+                                    </div>
+                                ))}
                             </div>
                         </div>
                     )}
 
                     {/* Execution Profile */}
                     <div className="pt-2.5 border-t border-slate-800">
-                        <div className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider mb-2">Execution Profile (Struct)</div>
-                        <div className="grid grid-cols-5 gap-2">
-                            {[
-                                { label: 'Skor', value: `${(marketRegime.executionProfile?.min_score_offset || 0) > 0 ? '+' : ''}${marketRegime.executionProfile?.min_score_offset || 0}`, color: (marketRegime.executionProfile?.min_score_offset || 0) > 0 ? 'text-rose-400' : (marketRegime.executionProfile?.min_score_offset || 0) < 0 ? 'text-emerald-400' : 'text-slate-300' },
-                                { label: 'Takip', value: `×${marketRegime.executionProfile?.trail_distance_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
-                                { label: 'SL', value: `×${marketRegime.executionProfile?.sl_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
-                                { label: 'TP', value: `×${marketRegime.executionProfile?.tp_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
-                                { label: 'Confirm', value: `×${marketRegime.executionProfile?.confirmation_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
-                            ].map((p, i) => (
-                                <div key={i} className="text-center">
-                                    <div className="text-[9px] text-slate-600">{p.label}</div>
-                                    <div className={`text-sm font-bold font-mono ${p.color}`}>{p.value}</div>
-                                </div>
-                            ))}
-                        </div>
+                        <div className="text-[9px] text-slate-500 uppercase font-semibold tracking-wider mb-2">Execution Profile (BTC Struct)</div>
+                        {marketRegime.executionProfile ? (
+                            <div className="grid grid-cols-5 gap-2">
+                                {[
+                                    { label: 'Skor', value: `${(marketRegime.executionProfile.min_score_offset || 0) > 0 ? '+' : ''}${marketRegime.executionProfile.min_score_offset || 0}`, color: (marketRegime.executionProfile.min_score_offset || 0) > 0 ? 'text-rose-400' : (marketRegime.executionProfile.min_score_offset || 0) < 0 ? 'text-emerald-400' : 'text-slate-300' },
+                                    { label: 'Takip', value: `×${marketRegime.executionProfile.trail_distance_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
+                                    { label: 'SL', value: `×${marketRegime.executionProfile.sl_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
+                                    { label: 'TP', value: `×${marketRegime.executionProfile.tp_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
+                                    { label: 'Confirm', value: `×${marketRegime.executionProfile.confirmation_mult?.toFixed(1) || '1.0'}`, color: 'text-slate-300' },
+                                ].map((p, i) => (
+                                    <div key={i} className="text-center">
+                                        <div className="text-[9px] text-slate-600">{p.label}</div>
+                                        <div className={`text-sm font-bold font-mono ${p.color}`}>{p.value}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="text-[10px] text-slate-600">Execution profile henüz hazır değil.</div>
+                        )}
                     </div>
 
                     {/* Recent change */}

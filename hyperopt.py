@@ -183,6 +183,7 @@ class HHQHyperOptimizer:
         self.last_apply_reason = ''
         self.last_apply_params: Dict[str, Any] = {}
         self.last_optimize_time = 0
+        self.last_improvement_pct = 0.0
         # Phase 269 P2: Persistent run-level apply telemetry
         self.last_run_apply_result = 'never'
         self.last_run_apply_reason = ''
@@ -308,6 +309,16 @@ class HHQHyperOptimizer:
         if trader is None:
             from main import global_paper_trader
             trader = global_paper_trader
+
+        try:
+            from main import parameter_optimizer
+            if getattr(parameter_optimizer, 'enabled', False):
+                self.last_apply_result = 'skipped'
+                self.last_apply_reason = 'runtime_owned_by_ai_optimizer'
+                logger.warning("⏭️ Hyperopt apply skipped: runtime owned by AI optimizer")
+                return {'applied': False, 'reason': 'runtime_owned_by_ai_optimizer'}
+        except Exception:
+            pass
         
         if not force and not self.auto_apply_enabled:
             self.last_apply_result = 'skipped'
@@ -576,6 +587,7 @@ class HHQHyperOptimizer:
             default_score = self._evaluate_with_params(default_params)
             
             improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0
+            self.last_improvement_pct = improvement
             
             self.last_optimize_time = int(time.time())
             
@@ -735,6 +747,7 @@ class HHQHyperOptimizer:
             if hyperopt_runs:
                 last_run = hyperopt_runs[0]
                 self.best_score = last_run.get('score_after', 0)
+                self.last_improvement_pct = last_run.get('improvement_pct', 0) or 0
                 self.best_params = {}
                 for p in last_run.get('params', []):
                     self.best_params[p['param_name']] = p['new_value']
@@ -752,6 +765,7 @@ class HHQHyperOptimizer:
             'is_optimized': self.is_optimized,
             'strategy_mode': self.strategy_mode,
             'best_score': round(self.best_score, 4),
+            'improvement_pct': round(self.last_improvement_pct, 1),
             'best_params': {k: round(v, 3) if isinstance(v, float) else v 
                           for k, v in self.best_params.items()},
             'optimization_count': self.optimization_count,
@@ -769,6 +783,7 @@ class HHQHyperOptimizer:
             'last_apply_result': self.last_apply_result,
             'last_apply_reason': self.last_apply_reason,
             'last_apply_params_count': len(self.last_apply_params),
+            'params_applied_live': self.last_apply_result == 'applied' and bool(self.last_apply_params),
             # Phase 269 P2: Persistent run-level telemetry
             'run_apply_result': self.last_run_apply_result,
             'run_apply_reason': self.last_run_apply_reason,

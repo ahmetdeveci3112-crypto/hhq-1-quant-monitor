@@ -19953,11 +19953,13 @@ class StoplossFrequencyGuard:
         now = time.time()
         lookback_start = now - (self.lookback_minutes * 60)
         recent = [(t, s, r) for t, s, r in self._stoploss_events if t > lookback_start]
+        cooldown_remaining_sec = max(0, int(self._lock_until - now)) if self._lock_until > now else 0
         
         return {
             'enabled': self.enabled,
             'global_locked': self._lock_until > now,
-            'global_lock_remaining_min': max(0, int((self._lock_until - now) / 60)) if self._lock_until > now else 0,
+            'global_lock_remaining_min': max(0, int(cooldown_remaining_sec / 60)) if cooldown_remaining_sec > 0 else 0,
+            'cooldown_remaining': cooldown_remaining_sec,
             'recent_stoplosses': len(recent),
             'max_stoplosses': self.max_stoplosses,
             'lookback_minutes': self.lookback_minutes,
@@ -19968,17 +19970,59 @@ class StoplossFrequencyGuard:
     
     def update_settings(self, settings: dict):
         """Update guard settings from UI."""
-        if 'sl_guard_enabled' in settings:
-            self.enabled = settings['sl_guard_enabled']
-        if 'sl_guard_lookback' in settings:
-            self.lookback_minutes = max(5, min(240, settings['sl_guard_lookback']))
-        if 'sl_guard_max_sl' in settings:
-            self.max_stoplosses = max(1, min(20, settings['sl_guard_max_sl']))
-        if 'sl_guard_cooldown' in settings:
-            self.cooldown_minutes = max(5, min(120, settings['sl_guard_cooldown']))
-        if 'sl_guard_per_pair' in settings:
-            self.only_per_pair = settings['sl_guard_per_pair']
-        logger.info(f"StoplossFrequencyGuard settings updated: {self.get_status()}")
+        settings = settings or {}
+        alias_map = {
+            'enabled': 'sl_guard_enabled',
+            'lookback_minutes': 'sl_guard_lookback',
+            'max_stoplosses': 'sl_guard_max_sl',
+            'cooldown_minutes': 'sl_guard_cooldown',
+            'only_per_pair': 'sl_guard_per_pair',
+        }
+        normalized = {}
+        ignored_keys = []
+        for key, value in settings.items():
+            target_key = alias_map.get(key, key)
+            if target_key in ('sl_guard_enabled', 'sl_guard_lookback', 'sl_guard_max_sl', 'sl_guard_cooldown', 'sl_guard_per_pair'):
+                normalized[target_key] = value
+            else:
+                ignored_keys.append(key)
+
+        updated_keys = []
+
+        def _to_bool(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ('1', 'true', 'yes', 'on')
+            return bool(value)
+
+        def _to_int(value, fallback):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        if 'sl_guard_enabled' in normalized:
+            self.enabled = _to_bool(normalized['sl_guard_enabled'])
+            updated_keys.append('enabled')
+        if 'sl_guard_lookback' in normalized:
+            self.lookback_minutes = max(5, min(240, _to_int(normalized['sl_guard_lookback'], self.lookback_minutes)))
+            updated_keys.append('lookback_minutes')
+        if 'sl_guard_max_sl' in normalized:
+            self.max_stoplosses = max(1, min(20, _to_int(normalized['sl_guard_max_sl'], self.max_stoplosses)))
+            updated_keys.append('max_stoplosses')
+        if 'sl_guard_cooldown' in normalized:
+            self.cooldown_minutes = max(5, min(120, _to_int(normalized['sl_guard_cooldown'], self.cooldown_minutes)))
+            updated_keys.append('cooldown_minutes')
+        if 'sl_guard_per_pair' in normalized:
+            self.only_per_pair = _to_bool(normalized['sl_guard_per_pair'])
+            updated_keys.append('only_per_pair')
+
+        status = self.get_status()
+        status['updated_keys'] = updated_keys
+        status['ignored_keys'] = ignored_keys
+        logger.info(f"StoplossFrequencyGuard settings updated: {status}")
+        return status
 
 
 # Global instance
@@ -23548,12 +23592,23 @@ class MarketRegimeDetector:
         # --- Shared state ---
         self.btc_prices = []
         self.last_update = None
+        self.last_input_source = 'none'
+        self.last_input_price = 0.0
+        self.last_input_time = None
         self.regime_history = []
         self.max_history = 100
         logger.info(f"📊 MarketRegimeDetector initialized — DRU-1 dual-window (fast={self.fast_window_sec}s struct={self.struct_window_sec}s)")
     
     def update_btc_price(self, price: float, source: str = 'unknown') -> bool:
         """BTC fiyatını kaydet — 30s throttle veya %0.05 fiyat değişimi şartı."""
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            logger.debug(f"REGIME_SAMPLE_REJECTED: invalid price={price} src={source}")
+            return False
+        if not math.isfinite(price) or price <= 0:
+            logger.debug(f"REGIME_SAMPLE_REJECTED: non-finite price={price} src={source}")
+            return False
         now = datetime.now(timezone.utc)
         if self.btc_prices:
             last = self.btc_prices[-1]
@@ -23568,6 +23623,9 @@ class MarketRegimeDetector:
         })
         if len(self.btc_prices) > 500:
             self.btc_prices = self.btc_prices[-500:]
+        self.last_input_source = source or 'unknown'
+        self.last_input_price = price
+        self.last_input_time = now
         logger.debug(f"REGIME_INPUT_SOURCE={source} price={price:.1f} samples={len(self.btc_prices)}")
         return True
     
@@ -23762,22 +23820,82 @@ class MarketRegimeDetector:
         }
         profile = _profiles.get(self.struct_regime, _profiles[self.RANGING]).copy()
         profile['profile_source'] = self.struct_regime
+        profile['profile_key'] = self.struct_regime
+        profile['source_kind'] = 'btc_struct_regime'
+        profile['source_label'] = f"BTC Struct • {self.struct_regime}"
         return profile
+
+    def _get_ready_state(self, fast_count: int, struct_count: int, stale_sec: Optional[float]) -> str:
+        if len(self.btc_prices) == 0 or self.last_update is None:
+            return 'waiting'
+        if stale_sec is not None and stale_sec > 90:
+            return 'stale'
+        if fast_count < 5 or struct_count < 5:
+            return 'warming_up'
+        return 'live'
+
+    def _build_dca_preview(self) -> dict:
+        fast_dir = self.fast_trend_direction
+        struct_dir = self.struct_trend_direction
+
+        if fast_dir == struct_dir and fast_dir in ('UP', 'DOWN'):
+            window_alignment = 'ALIGNED'
+            preferred_side = 'LONG' if fast_dir == 'UP' else 'SHORT'
+        elif fast_dir in ('UP', 'DOWN') and struct_dir in ('UP', 'DOWN') and fast_dir != struct_dir:
+            window_alignment = 'CONFLICT'
+            preferred_side = 'NONE'
+        else:
+            window_alignment = 'NEUTRAL'
+            preferred_side = 'NONE'
+
+        long_preview = compute_dual_regime_alignment(
+            signal_side='LONG',
+            fast_regime=self.fast_regime,
+            fast_dir=self.fast_trend_direction,
+            fast_conf=self.fast_confidence,
+            struct_regime=self.struct_regime,
+            struct_dir=self.struct_trend_direction,
+            struct_conf=self.struct_confidence,
+            min_conf=DUAL_REGIME_MIN_CONF,
+        )
+        short_preview = compute_dual_regime_alignment(
+            signal_side='SHORT',
+            fast_regime=self.fast_regime,
+            fast_dir=self.fast_trend_direction,
+            fast_conf=self.fast_confidence,
+            struct_regime=self.struct_regime,
+            struct_dir=self.struct_trend_direction,
+            struct_conf=self.struct_confidence,
+            min_conf=DUAL_REGIME_MIN_CONF,
+        )
+
+        return {
+            'enabled': DUAL_REGIME_GATE_ENABLED,
+            'shadow': DUAL_REGIME_SHADOW,
+            'conflictMode': DUAL_REGIME_CONFLICT_MODE,
+            'minConf': DUAL_REGIME_MIN_CONF,
+            'windowAlignment': window_alignment,
+            'preferredSide': preferred_side,
+            'long': long_preview,
+            'short': short_preview,
+        }
     
     def get_status(self) -> dict:
         """API durum özeti — DRU-1 dual-window payload."""
-        _stale_sec = 999
+        _stale_sec = None
         if self.last_update:
             _stale_sec = (datetime.now(timezone.utc) - self.last_update).total_seconds()
             if _stale_sec > 90:
                 logger.warning(f"⚠️ REGIME_STALE: lastUpdate {_stale_sec:.0f}s ago")
         _last_update_ms = int(self.last_update.timestamp() * 1000) if self.last_update else None
+        _last_input_ms = int(self.last_input_time.timestamp() * 1000) if self.last_input_time else None
         
         now = datetime.now(timezone.utc)
         fast_cutoff = now - timedelta(seconds=self.fast_window_sec)
         struct_cutoff = now - timedelta(seconds=self.struct_window_sec)
         fast_count = sum(1 for p in self.btc_prices if p['time'] >= fast_cutoff)
         struct_count = sum(1 for p in self.btc_prices if p['time'] >= struct_cutoff)
+        ready_state = self._get_ready_state(fast_count, struct_count, _stale_sec)
         
         exec_profile = self.get_execution_profile()
         
@@ -23787,10 +23905,22 @@ class MarketRegimeDetector:
             'trendDirection': self.trend_direction,
             'lastUpdate': self.last_update.isoformat() if self.last_update else None,
             'lastUpdateMs': _last_update_ms,
-            'staleSec': round(_stale_sec, 1),
+            'staleSec': round(_stale_sec, 1) if _stale_sec is not None else None,
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),
             'recentChanges': self.regime_history[-5:] if self.regime_history else [],
+            'readyState': ready_state,
+            'dataFlow': {
+                'inputSource': self.last_input_source,
+                'lastBtcPrice': round(self.last_input_price, 2) if self.last_input_price > 0 else None,
+                'lastInputMs': _last_input_ms,
+                'isStale': ready_state == 'stale',
+                'fastSamples': fast_count,
+                'structSamples': struct_count,
+                'minSamplesPerWindow': 5,
+                'readyState': ready_state,
+            },
+            'dcaPreview': self._build_dca_preview(),
             # DRU-1 new fields
             'fast': {
                 'regime': self.fast_regime,
@@ -33728,11 +33858,18 @@ async def paper_trading_toggle():
 async def optimizer_toggle():
     """Toggle auto-optimizer on/off."""
     parameter_optimizer.enabled = not parameter_optimizer.enabled
+    hyperopt_auto_apply_disabled = False
     
     # Phase 60: Sync with paper_trader for dynamic calculations
     if global_paper_trader:
         global_paper_trader.ai_optimizer_enabled = parameter_optimizer.enabled
         global_paper_trader.save_state()
+
+    if parameter_optimizer.enabled and hhq_hyperoptimizer and getattr(hhq_hyperoptimizer, 'auto_apply_enabled', False):
+        hhq_hyperoptimizer.auto_apply_enabled = False
+        hyperopt_auto_apply_disabled = True
+        await hhq_hyperoptimizer.save_settings()
+        logger.warning("🔒 Runtime ownership moved to AI optimizer — Hyperopt auto-apply disabled")
     
     status = "enabled" if parameter_optimizer.enabled else "disabled"
     logger.info(f"🤖 Auto-optimizer {status}")
@@ -33747,7 +33884,8 @@ async def optimizer_toggle():
     return JSONResponse({
         "success": True, 
         "enabled": parameter_optimizer.enabled, 
-        "message": f"Auto-optimizer {status}"
+        "message": f"Auto-optimizer {status}",
+        "hyperopt_auto_apply_disabled": hyperopt_auto_apply_disabled,
     })
 
 @app.get("/trade-analysis")
@@ -33812,6 +33950,45 @@ async def optimizer_status():
             })
     except Exception as e:
         logger.error(f"Error building tracking list: {e}")
+
+    try:
+        regime_status = market_regime_detector.get_status()
+    except Exception as e:
+        logger.warning(f"Optimizer status regime payload fallback: {e}")
+        regime_status = {
+            "currentRegime": None,
+            "trendDirection": None,
+            "lastUpdate": None,
+            "lastUpdateMs": None,
+            "staleSec": None,
+            "priceCount": 0,
+            "params": {},
+            "recentChanges": [],
+            "readyState": "error",
+            "dataFlow": {
+                "inputSource": "error",
+                "lastBtcPrice": None,
+                "lastInputMs": None,
+                "isStale": True,
+                "fastSamples": 0,
+                "structSamples": 0,
+                "minSamplesPerWindow": 5,
+                "readyState": "error",
+            },
+            "dcaPreview": {
+                "enabled": DUAL_REGIME_GATE_ENABLED,
+                "shadow": DUAL_REGIME_SHADOW,
+                "conflictMode": DUAL_REGIME_CONFLICT_MODE,
+                "minConf": DUAL_REGIME_MIN_CONF,
+                "windowAlignment": "NEUTRAL",
+                "preferredSide": "NONE",
+                "long": None,
+                "short": None,
+            },
+            "fast": None,
+            "struct": None,
+            "executionProfile": None,
+        }
     
     # RFX-2A: Include scanner stats for truth contract consistency
     _scanner_stats = multi_coin_scanner.get_scanner_stats() if 'multi_coin_scanner' in globals() else {}
@@ -33823,7 +34000,7 @@ async def optimizer_status():
         "trackingCount": len(post_trade_tracker.tracking),
         "trackingList": tracking_list,
         "recentAnalyses": post_trade_tracker.analysis_results[-10:],
-        "marketRegime": market_regime_detector.get_status(),
+        "marketRegime": regime_status,
         "dcaConfig": {
             "enabled": DUAL_REGIME_GATE_ENABLED,
             "shadow": DUAL_REGIME_SHADOW,
@@ -34577,11 +34754,13 @@ async def phase193_status():
     
     freqai_status = freqai_model.get_status() if freqai_model else {"enabled": False, "error": "not installed"}
     freqai_status['min_samples_for_train'] = 30
+    hyperopt_status = hhq_hyperoptimizer.get_status() if hhq_hyperoptimizer else {"enabled": False, "error": "not installed"}
+    hyperopt_status['runtime_owner'] = 'ai_optimizer' if parameter_optimizer.enabled else 'manual_or_hyperopt'
     
     return JSONResponse({
         "stoploss_guard": stoploss_frequency_guard.get_status(),
         "freqai": freqai_status,
-        "hyperopt": hhq_hyperoptimizer.get_status() if hhq_hyperoptimizer else {"enabled": False, "error": "not installed"},
+        "hyperopt": hyperopt_status,
         "ws_manager": ccxt_ws_manager.get_status() if ccxt_ws_manager else {"enabled": False, "error": "not installed"},
         "pandas_ta": PANDAS_TA_AVAILABLE,
         "ml_diagnostics": {
@@ -34601,8 +34780,13 @@ async def phase193_status():
 async def phase193_sl_guard_settings(request: Request):
     """Update StoplossFrequencyGuard settings."""
     data = await request.json()
-    stoploss_frequency_guard.update_settings(data)
-    return JSONResponse(stoploss_frequency_guard.get_status())
+    status = stoploss_frequency_guard.update_settings(data)
+    if data and not status.get('updated_keys'):
+        return JSONResponse({
+            "error": "No recognized stoploss guard settings supplied",
+            **status,
+        }, status_code=400)
+    return JSONResponse(status)
 
 @app.post("/phase193/freqai/retrain")
 async def phase193_freqai_retrain():
@@ -34879,6 +35063,16 @@ async def phase193_hyperopt_run(request: Request):
     n_trials = data.get('n_trials', 100)
     apply = data.get('apply', False)
     force_apply = data.get('force_apply', False)
+
+    if parameter_optimizer.enabled and (apply or force_apply):
+        status = hhq_hyperoptimizer.get_status()
+        status['runtime_owner'] = 'ai_optimizer'
+        return JSONResponse({
+            "error": "RUNTIME_OWNERSHIP_LOCK",
+            "reason": "ai_optimizer_controls_runtime",
+            "message": "AI Optimizer aktifken Hyperopt sadece dry-run calisabilir.",
+            **status,
+        }, status_code=409)
     
     # Load trade data from paper trader if not already loaded
     if not hhq_hyperoptimizer.trade_data and 'global_paper_trader' in globals():
@@ -34924,6 +35118,16 @@ async def phase193_hyperopt_settings(request: Request):
         return JSONResponse({"error": "Hyperopt not available"}, status_code=400)
     
     data = await request.json()
+
+    if parameter_optimizer.enabled and bool(data.get('auto_apply_enabled')):
+        status = hhq_hyperoptimizer.get_status()
+        status['runtime_owner'] = 'ai_optimizer'
+        return JSONResponse({
+            "error": "RUNTIME_OWNERSHIP_LOCK",
+            "reason": "ai_optimizer_controls_runtime",
+            "message": "AI Optimizer aktifken Hyperopt auto-apply acilamaz.",
+            **status,
+        }, status_code=409)
     
     if 'auto_apply_enabled' in data:
         hhq_hyperoptimizer.auto_apply_enabled = bool(data['auto_apply_enabled'])
@@ -34955,6 +35159,16 @@ async def phase193_hyperopt_force_apply_last():
     
     if not hhq_hyperoptimizer.best_params:
         return JSONResponse({"error": "No best params available. Run optimize first."}, status_code=400)
+
+    if parameter_optimizer.enabled:
+        status = hhq_hyperoptimizer.get_status()
+        status['runtime_owner'] = 'ai_optimizer'
+        return JSONResponse({
+            "error": "RUNTIME_OWNERSHIP_LOCK",
+            "reason": "ai_optimizer_controls_runtime",
+            "message": "AI Optimizer aktifken force-apply kullanilamaz.",
+            **status,
+        }, status_code=409)
     
     # DQ-1: Coverage guard — block force-apply if coverage < threshold
     try:

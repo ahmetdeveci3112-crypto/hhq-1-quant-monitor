@@ -16,9 +16,9 @@ interface Props {
   optimizerStats?: OptimizerStats;
   onToggleOptimizer?: () => void;
   phase193Status?: {
-    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
+    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; global_lock_remaining_min?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; min_samples_for_train?: number };
-    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string; run_apply_ts?: number };
+    hyperopt: { enabled: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string; run_apply_ts?: number; params_applied_live?: boolean; runtime_owner?: string };
     ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
   } | null;
   onSLGuardSettings?: (s: any) => void;
@@ -233,6 +233,13 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
 
   // AI açıkken ayarları kilitle
   const isLocked = optimizerStats?.enabled ?? false;
+  const slGuardStatus = phase193Status?.stoploss_guard;
+  const slGuardRemainingMin = slGuardStatus?.global_lock_remaining_min
+    ?? Math.ceil((slGuardStatus?.cooldown_remaining ?? 0) / 60);
+  const hyperoptStatus = phase193Status?.hyperopt;
+  const hyperoptRuntimeLocked = isLocked || hyperoptStatus?.runtime_owner === 'ai_optimizer';
+  const hyperoptHasBestParams = Boolean(hyperoptStatus?.is_optimized);
+  const hyperoptAppliedLive = Boolean(hyperoptStatus?.params_applied_live);
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -864,12 +871,17 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     <div className="flex items-center gap-2">
                       <ShieldAlert className="w-4 h-4 text-orange-400" />
                       <span className="text-sm font-medium text-white">Zarar Koruma Kalkanı</span>
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.stoploss_guard.global_locked
-                        ? 'bg-rose-500/20 text-rose-400'
-                        : 'bg-emerald-500/20 text-emerald-400'
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.stoploss_guard.enabled
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.stoploss_guard.global_locked ? '🔒 Kilitli — Yeni işlem engellendi' : '🟢 Aktif'}
+                        {phase193Status.stoploss_guard.enabled ? '🟢 Aktif' : '⚫ Pasif'}
                       </span>
+                      {phase193Status.stoploss_guard.global_locked && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-400">
+                          🔒 {slGuardRemainingMin}dk yeni işlem bloklu
+                        </span>
+                      )}
                     </div>
                     <button
                       onClick={() => onSLGuardSettings?.({ enabled: !phase193Status.stoploss_guard.enabled })}
@@ -941,6 +953,11 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   {/* Durum Özeti */}
                   <div className="mt-3 bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
                     📋 <span className="text-amber-400">Kural:</span> Son {phase193Status.stoploss_guard.lookback_minutes || 60} dk'da {phase193Status.stoploss_guard.max_stoplosses || 3} SL yenilirse → {phase193Status.stoploss_guard.cooldown_minutes || 30} dk boyunca yeni işlem açılmaz
+                    {phase193Status.stoploss_guard.global_locked && (
+                      <span className="block mt-1 text-rose-400">
+                        Şu an koruma aktif: yaklaşık {slGuardRemainingMin} dk daha yeni pozisyon açılmaz.
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -995,22 +1012,33 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     <div className="flex items-center gap-2">
                       <FlaskConical className="w-4 h-4 text-cyan-400" />
                       <span className="text-sm font-medium text-white">Parametre Optimizasyonu</span>
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${phase193Status.hyperopt.is_optimized ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-500/20 text-slate-400'
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${hyperoptAppliedLive
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : hyperoptHasBestParams
+                          ? 'bg-cyan-500/15 text-cyan-300'
+                          : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize Edildi' : '⏳ Henüz Çalıştırılmadı'}
+                        {hyperoptAppliedLive ? '✅ Runtime Uygulandı' : hyperoptHasBestParams ? '🧪 Param Hazır' : '⏳ Henüz Çalıştırılmadı'}
                       </span>
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-500 mb-3">
                     🔬 Optuna ile Z-Skoru, SL/TP, giriş/çıkış gibi parametreleri otomatik optimize eder.
                   </p>
+                  {hyperoptRuntimeLocked && (
+                    <div className="mb-3 rounded-lg border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-2 text-[10px] text-fuchsia-200">
+                      Runtime şu an AI Optimizer tarafından yönetiliyor. Hyperopt dry-run çalışabilir, fakat auto-apply ve apply işlemleri kilitli.
+                    </div>
+                  )}
 
                   {/* Auto-Apply Toggle */}
                   <div className="flex items-center justify-between bg-slate-900/50 rounded-lg p-2 mb-3">
                     <span className="text-[10px] text-slate-400">Otomatik Uygula</span>
                     <button
+                      disabled={hyperoptRuntimeLocked}
                       onClick={() => onHyperoptSettings?.({ auto_apply_enabled: !phase193Status.hyperopt.auto_apply_enabled })}
                       className={`w-9 h-5 rounded-full transition-colors relative ${phase193Status.hyperopt.auto_apply_enabled ? 'bg-cyan-500' : 'bg-slate-600'
+                        } ${hyperoptRuntimeLocked ? 'opacity-50 cursor-not-allowed' : ''
                         }`}
                     >
                       <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${phase193Status.hyperopt.auto_apply_enabled ? 'left-[18px]' : 'left-0.5'
@@ -1029,13 +1057,19 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     <div className="bg-slate-900/50 rounded p-2 text-center">
                       <div className="text-[10px] text-slate-500">İyileşme</div>
                       <div className={`text-sm font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
-                        {phase193Status.hyperopt.improvement_pct ? `+%${phase193Status.hyperopt.improvement_pct.toFixed(1)}` : '—'}
+                        {phase193Status.hyperopt.improvement_pct !== undefined ? `${phase193Status.hyperopt.improvement_pct >= 0 ? '+' : ''}%${phase193Status.hyperopt.improvement_pct.toFixed(1)}` : '—'}
                       </div>
                     </div>
                   </div>
 
                   {/* Apply Telemetry */}
                   <div className="bg-slate-900/50 rounded-lg p-2 mb-3 space-y-1">
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-slate-500">Runtime Owner</span>
+                      <span className={`font-bold ${hyperoptRuntimeLocked ? 'text-fuchsia-300' : 'text-slate-300'}`}>
+                        {hyperoptRuntimeLocked ? 'AI Optimizer' : hyperoptAppliedLive ? 'Hyperopt' : 'Manuel'}
+                      </span>
+                    </div>
                     <div className="flex justify-between text-[10px]">
                       <span className="text-slate-500">Son Optimize</span>
                       <span className="text-slate-300">{formatUnix(phase193Status.hyperopt.last_optimize_time)}</span>
@@ -1086,14 +1120,22 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                       🧪 Dry Run
                     </button>
                     <button
+                      disabled={hyperoptRuntimeLocked}
                       onClick={() => onHyperoptRun?.(100, true, false)}
-                      className="text-[10px] font-bold py-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+                      className={`text-[10px] font-bold py-2 rounded-lg border transition-colors ${hyperoptRuntimeLocked
+                        ? 'bg-slate-800 text-slate-500 border-slate-700 cursor-not-allowed'
+                        : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/20'
+                        }`}
                     >
                       🔬 Optimize+Apply
                     </button>
                     <button
+                      disabled={hyperoptRuntimeLocked}
                       onClick={() => onForceApplyLast?.()}
-                      className="text-[10px] font-bold py-2 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition-colors"
+                      className={`text-[10px] font-bold py-2 rounded-lg border transition-colors ${hyperoptRuntimeLocked
+                        ? 'bg-slate-800 text-slate-500 border-slate-700 cursor-not-allowed'
+                        : 'bg-amber-500/10 text-amber-400 border-amber-500/30 hover:bg-amber-500/20'
+                        }`}
                     >
                       ⚡ Force Apply
                     </button>
@@ -1188,7 +1230,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                             )}
                           </div>
                           <div className="flex justify-between text-[10px]">
-                            <span className="text-slate-500">Toplam Olay</span>
+                            <span className="text-slate-500">Bu Oturum Olayı</span>
                             <span className="text-slate-300 font-mono">{gov?.event_count ?? 0}</span>
                           </div>
                         </div>

@@ -120,6 +120,22 @@ const mapBackendSettingsToUI = (data: any, fallback: SystemSettings): SystemSett
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
 // SMART_V3_RUNNER: Deterministic execution source resolver for header chip
+const formatExecutionSourceLabel = (source: string, marketRegime?: any): string => {
+  const raw = String(source || '').trim();
+  if (!raw) return 'bekleniyor';
+
+  const upper = raw.toUpperCase();
+  if (upper === 'MANUAL') return 'manuel';
+  if (upper === 'NEUTRAL') return 'neutral';
+  if (marketRegime?.executionProfile?.profile_source && upper === String(marketRegime.executionProfile.profile_source).toUpperCase()) {
+    return marketRegime.executionProfile.source_label || `btc-struct:${upper.toLowerCase()}`;
+  }
+  if (['TRENDING_UP', 'TRENDING_DOWN', 'TRENDING', 'RANGING', 'VOLATILE', 'QUIET'].includes(upper)) {
+    return `btc-struct:${upper.toLowerCase()}`;
+  }
+  return raw;
+};
+
 const resolveExecutionSourceForUI = (
   positions: any[],
   signals: any[],
@@ -127,7 +143,7 @@ const resolveExecutionSourceForUI = (
 ): string => {
   // Step 1: First open position's source
   const pos = (positions || []).find((p: any) => p.execution_profile_source);
-  if (pos) return pos.execution_profile_source;
+  if (pos) return formatExecutionSourceLabel(pos.execution_profile_source, marketRegime);
   // Step 2: Latest active signal (sort by timestamp descending)
   const activeSignals = (signals || [])
     .filter((s: any) => s.signalAction !== 'NONE' && s.execution_profile_source)
@@ -136,9 +152,11 @@ const resolveExecutionSourceForUI = (
       const tsB = Number(b.signalTs || b.ts || b.timestamp || b.time || 0);
       return tsB - tsA;
     });
-  if (activeSignals.length > 0) return activeSignals[0].execution_profile_source;
+  if (activeSignals.length > 0) return formatExecutionSourceLabel(activeSignals[0].execution_profile_source, marketRegime);
   // Step 3: Market regime execution profile
-  if (marketRegime?.executionProfile?.profile_source) return marketRegime.executionProfile.profile_source;
+  if (marketRegime?.executionProfile?.profile_source) {
+    return formatExecutionSourceLabel(marketRegime.executionProfile.profile_source, marketRegime);
+  }
   // Step 4: Fallback
   return 'bekleniyor';
 };
@@ -365,9 +383,9 @@ export default function App() {
 
   // Phase 193: Module status state
   const [phase193Status, setPhase193Status] = useState<{
-    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
+    stoploss_guard: { enabled: boolean; global_locked: boolean; recent_stoplosses: number; cooldown_remaining?: number; global_lock_remaining_min?: number; lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number };
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
-    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string; run_apply_ts?: number };
+    hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string; run_apply_ts?: number; params_applied_live?: boolean; runtime_owner?: string };
     ws_manager: { enabled: boolean; connected?: boolean };
     ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
     pandas_ta: boolean;
@@ -376,9 +394,60 @@ export default function App() {
   // Phase 53: Market Regime state
   const [marketRegime, setMarketRegime] = useState<{
     currentRegime: string;
+    trendDirection?: string | null;
     lastUpdate: string | null;
+    lastUpdateMs?: number | null;
+    staleSec?: number | null;
     priceCount: number;
     params: { min_score_adjustment: number; trail_distance_mult: number; description: string };
+    readyState?: string;
+    dataFlow?: {
+      inputSource?: string;
+      lastBtcPrice?: number | null;
+      lastInputMs?: number | null;
+      isStale?: boolean;
+      fastSamples?: number;
+      structSamples?: number;
+      minSamplesPerWindow?: number;
+      readyState?: string;
+    };
+    fast?: {
+      regime: string;
+      trendDirection: string;
+      confidence: number;
+      samples: number;
+      windowSec: number;
+    } | null;
+    struct?: {
+      regime: string;
+      trendDirection: string;
+      confidence: number;
+      samples: number;
+      windowSec: number;
+    } | null;
+    executionProfile?: {
+      tp_mult: number;
+      sl_mult: number;
+      trail_distance_mult: number;
+      confirmation_mult: number;
+      min_score_offset: number;
+      profile_source: string;
+      profile_key?: string;
+      source_kind?: string;
+      source_label?: string;
+      description: string;
+    } | null;
+    dcaPreview?: {
+      enabled: boolean;
+      shadow: boolean;
+      conflictMode: string;
+      minConf: number;
+      windowAlignment: string;
+      preferredSide: string;
+      long?: any;
+      short?: any;
+    };
+    recentChanges?: { from: string; to: string; time: string }[];
   } | null>(null);
   const [dcaConfig, setDcaConfig] = useState<{
     enabled: boolean;
@@ -915,16 +984,24 @@ export default function App() {
 
   // Phase 193: StoplossGuard settings update
   const handleSLGuardSettings = useCallback(async (settings: { lookback_minutes?: number; max_stoplosses?: number; cooldown_minutes?: number; enabled?: boolean }) => {
+    const payload = {
+      ...(settings.enabled !== undefined ? { sl_guard_enabled: settings.enabled } : {}),
+      ...(settings.lookback_minutes !== undefined ? { sl_guard_lookback: settings.lookback_minutes } : {}),
+      ...(settings.max_stoplosses !== undefined ? { sl_guard_max_sl: settings.max_stoplosses } : {}),
+      ...(settings.cooldown_minutes !== undefined ? { sl_guard_cooldown: settings.cooldown_minutes } : {}),
+    };
     try {
       const res = await fetch(`${BACKEND_API_URL}/phase193/stoploss-guard/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings)
+        body: JSON.stringify(payload)
       });
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
         setPhase193Status(prev => prev ? { ...prev, stoploss_guard: data } : prev);
-        addLog(`🛡️ SL Kalkanı ayarları güncellendi`);
+        addLog(`🛡️ SL Kalkanı güncellendi: ${data.updated_keys?.join(', ') || 'durum yenilendi'}`);
+      } else {
+        addLog(`❌ SL Kalkanı ayarları reddedildi: ${data.error || data.reason || 'Geçersiz istek'}`);
       }
     } catch (err) {
       addLog('❌ SL Kalkanı ayar güncelleme hatası');
@@ -959,8 +1036,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ n_trials: nTrials, apply, force_apply: forceApply })
       });
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
         // Phase 269: Semantic log messages
         const applyMsg = data.params_applied
           ? '✅ Parametreler uygulandı'
@@ -975,6 +1052,11 @@ export default function App() {
         if (data.params_applied) {
           await refreshRuntimeSettings('🔄 Runtime ayarları hyperopt sonrası güncellendi');
         }
+      } else {
+        if (data?.runtime_owner === 'ai_optimizer') {
+          setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+        }
+        addLog(`❌ Hyperopt reddedildi: ${data.message || data.error || 'Hata'}`);
       }
     } catch (err) {
       addLog('❌ Hyperopt çalıştırma hatası');
@@ -989,10 +1071,15 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch)
       });
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
         setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
         addLog(`🔬 Hyperopt ayarları güncellendi`);
+      } else {
+        if (data?.runtime_owner === 'ai_optimizer') {
+          setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+        }
+        addLog(`❌ Hyperopt ayarları reddedildi: ${data.message || data.error || 'Hata'}`);
       }
     } catch (err) {
       addLog('❌ Hyperopt ayar güncelleme hatası');
@@ -1003,8 +1090,8 @@ export default function App() {
     try {
       addLog('⚡ Son en iyi parametreleri zorla uyguluyor...');
       const res = await fetch(`${BACKEND_API_URL}/phase193/hyperopt/force-apply-last`, { method: 'POST' });
+      const data = await res.json();
       if (res.ok) {
-        const data = await res.json();
         const msg = data.applied ? '✅ Parametreler uygulandı' : `⏭️ Apply başarısız: ${data.reason}`;
         addLog(`⚡ Force Apply: ${msg}`);
         setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
@@ -1014,8 +1101,10 @@ export default function App() {
           await refreshRuntimeSettings('🔄 Runtime ayarları force-apply sonrası güncellendi');
         }
       } else {
-        const err = await res.json();
-        addLog(`❌ Force Apply: ${err.error || 'Hata'}`);
+        if (data?.runtime_owner === 'ai_optimizer') {
+          setPhase193Status(prev => prev ? { ...prev, hyperopt: { ...prev.hyperopt, ...data } } : prev);
+        }
+        addLog(`❌ Force Apply: ${data.message || data.error || 'Hata'}`);
       }
     } catch (err) {
       addLog('❌ Force Apply hatası');
@@ -1029,6 +1118,20 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setOptimizerStats(prev => ({ ...prev, enabled: data.enabled }));
+        setPhase193Status(prev => prev ? {
+          ...prev,
+          hyperopt: {
+            ...prev.hyperopt,
+            runtime_owner: data.enabled ? 'ai_optimizer' : 'manual_or_hyperopt',
+          }
+        } : prev);
+        if (data.hyperopt_auto_apply_disabled) {
+          setPhase193Status(prev => prev ? {
+            ...prev,
+            hyperopt: { ...prev.hyperopt, auto_apply_enabled: false, runtime_owner: 'ai_optimizer' }
+          } : prev);
+          addLog('🔒 Hyperopt auto-apply kapatıldı: runtime artık AI Optimizer kontrolünde');
+        }
         addLog(`🤖 YZ Optimize Edici ${data.enabled ? 'aktif' : 'pasif'}`);
       }
     } catch (err) {
@@ -1359,7 +1462,7 @@ export default function App() {
             <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
             <span>{settings.strategyMode}</span>
             <span className="text-[8px] font-normal normal-case opacity-70">
-              kaynak: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals, marketRegime)}
+              profil: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals, marketRegime)}
             </span>
           </div>
         </div>
@@ -2019,8 +2122,8 @@ export default function App() {
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
                         <div className="text-[10px] text-slate-500">Bekleme</div>
                         <div className="text-lg font-bold text-slate-300">
-                          {phase193Status.stoploss_guard.cooldown_remaining
-                            ? `${Math.ceil(phase193Status.stoploss_guard.cooldown_remaining / 60)}dk`
+                          {(phase193Status.stoploss_guard.global_lock_remaining_min ?? 0) > 0
+                            ? `${phase193Status.stoploss_guard.global_lock_remaining_min}dk`
                             : '—'}
                         </div>
                       </div>
@@ -2075,15 +2178,22 @@ export default function App() {
                         <FlaskConical className="w-4 h-4 text-cyan-400" />
                         Hyperopt
                       </h4>
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.hyperopt.is_optimized
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${phase193Status.hyperopt.params_applied_live
                         ? 'bg-emerald-500/20 text-emerald-400'
-                        : phase193Status.hyperopt.enabled
-                          ? 'bg-amber-500/20 text-amber-400'
-                          : 'bg-slate-500/20 text-slate-400'
+                        : phase193Status.hyperopt.is_optimized
+                          ? 'bg-cyan-500/15 text-cyan-300'
+                          : phase193Status.hyperopt.enabled
+                            ? 'bg-amber-500/20 text-amber-400'
+                            : 'bg-slate-500/20 text-slate-400'
                         }`}>
-                        {phase193Status.hyperopt.is_optimized ? '✅ Optimize' : phase193Status.hyperopt.enabled ? '⏳ Hazır' : '⚫ Pasif'}
+                        {phase193Status.hyperopt.params_applied_live ? '✅ Runtime' : phase193Status.hyperopt.is_optimized ? '🧪 Hazır' : phase193Status.hyperopt.enabled ? '⏳ Hazır' : '⚫ Pasif'}
                       </span>
                     </div>
+                    {phase193Status.hyperopt.runtime_owner === 'ai_optimizer' && (
+                      <div className="mb-2 rounded-lg border border-fuchsia-500/20 bg-fuchsia-500/10 px-2 py-1 text-[10px] text-fuchsia-200">
+                        Apply yolu kilitli: runtime AI Optimizer kontrolünde.
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-2">
                       <div className="bg-slate-800/50 rounded-lg p-2 text-center">
                         <div className="text-[10px] text-slate-500">En İyi Skor</div>
@@ -2095,8 +2205,8 @@ export default function App() {
                         <div className="text-[10px] text-slate-500">İyileşme</div>
                         <div className={`text-lg font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'
                           }`}>
-                          {phase193Status.hyperopt.improvement_pct
-                            ? `+${phase193Status.hyperopt.improvement_pct.toFixed(1)}%`
+                          {phase193Status.hyperopt.improvement_pct !== undefined
+                            ? `${phase193Status.hyperopt.improvement_pct >= 0 ? '+' : ''}${phase193Status.hyperopt.improvement_pct.toFixed(1)}%`
                             : '—'}
                         </div>
                       </div>
