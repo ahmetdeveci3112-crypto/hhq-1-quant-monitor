@@ -370,13 +370,14 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
         );
     }
 
-    // SMART_V2 & Strategy Router badge (Phase 207)
-    if (signal.strategyMode === 'SMART_V2' || signal.activeStrategy || signal.strategyLabel) {
+    // SMART_V2 & Strategy Router badge (Phase 207) + SMART_V3_RUNNER
+    if (signal.strategyMode === 'SMART_V2' || signal.strategyMode === 'SMART_V3_RUNNER' || signal.activeStrategy || signal.strategyLabel) {
         const strat = signal.strategyLabel || signal.activeStrategy || signal.strategyMode || 'SMART_V2';
         let bgClass = "bg-cyan-500/15 text-cyan-300"; // default
 
         if (strat.includes('TREND')) bgClass = "bg-emerald-500/20 text-emerald-300 border border-emerald-500/20";
         if (strat.includes('MEAN_REVERSION') || strat.includes('MEAN_REOVERSION') || strat.includes('RSI')) bgClass = "bg-amber-500/20 text-amber-300 border border-amber-500/20";
+        if (signal.strategyMode === 'SMART_V3_RUNNER' || strat.includes('V3') || strat.includes('RUNNER')) bgClass = "bg-amber-500/20 text-amber-300 border border-amber-400/30";
 
         badges.push(
             <span
@@ -384,7 +385,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
                 className={`text-[9px] px-1 py-0.5 rounded font-bold ${bgClass}`}
                 title={withDetails(`Aktif Strateji: ${strat}`)}
             >
-                {strat.replace('SMART_V2', 'S2')}
+                {strat.replace('SMART_V2', 'S2').replace('SMART_V3_RUNNER', '🔥V3R')}
             </span>
         );
     }

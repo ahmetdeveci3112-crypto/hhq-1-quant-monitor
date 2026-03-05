@@ -9184,8 +9184,11 @@ def blend_macro_bias(
         return {"dir": "NEUTRAL", "confidence": 0.0, "w_coin": 0.65, "w_btc": 0.35}
 
 
-STRATEGY_MODE_LEGACY = "LEGACY"
-STRATEGY_MODE_SMART_V2 = "SMART_V2"
+from risk.strategy_profile import (
+    STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2, STRATEGY_MODE_SMART_V3_RUNNER,
+    VALID_STRATEGY_MODES, normalize_strategy_mode, is_adaptive_mode, is_smart_mode,
+    StrategyExecutionProfile, resolve_strategy_execution_profile,
+)
 
 
 def get_smart_v2_strategy_profile(
@@ -9219,7 +9222,7 @@ def get_smart_v2_strategy_profile(
         "notes": [],
     }
 
-    if str(mode or STRATEGY_MODE_LEGACY).upper() != STRATEGY_MODE_SMART_V2:
+    if not is_smart_mode(str(mode or STRATEGY_MODE_LEGACY).upper()):
         return base_profile
 
     safe_side = "LONG" if signal_side == "LONG" else "SHORT"
@@ -14680,7 +14683,7 @@ async def background_scanner_loop():
 
                     # FIB pre-warm only in SMART_V2 to keep LEGACY path lightweight.
                     strategy_mode_upper = str(getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)).upper()
-                    if FIB_ENABLED and strategy_mode_upper == STRATEGY_MODE_SMART_V2:
+                    if FIB_ENABLED and is_smart_mode(strategy_mode_upper):
                         for opp in opportunities:
                             s = opp.get('symbol', '')
                             if s and s not in mtf_seen and opp.get('signalScore', 0) > 0:
@@ -16829,7 +16832,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and total_depth >= dynamic_depth_threshold * 0.82
             )
             legacy_soft_pass = (
-                strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+                is_adaptive_mode(strategy_mode_upper)
                 and signal_score >= 95
                 and eq_count >= 1
                 and signal_spread <= 0.24
@@ -16844,7 +16847,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
             smart_soft_pass = (
                 THIN_BOOK_SMART_SOFTPASS_ENABLED
-                and strategy_mode_upper == STRATEGY_MODE_SMART_V2
+                and is_smart_mode(strategy_mode_upper)
                 and signal_score >= THIN_BOOK_SMART_SOFTPASS_MIN_SCORE
                 and eq_count >= THIN_BOOK_SMART_SOFTPASS_MIN_EQ
                 and exec_score >= THIN_BOOK_SMART_SOFTPASS_MIN_EXEC
@@ -16853,7 +16856,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
             super_soft_pass = (
                 THIN_BOOK_SUPER_SOFTPASS_ENABLED
-                and strategy_mode_upper == STRATEGY_MODE_SMART_V2
+                and is_smart_mode(strategy_mode_upper)
                 and signal_score >= THIN_BOOK_SUPER_SOFTPASS_MIN_SCORE
                 and eq_count >= THIN_BOOK_SUPER_SOFTPASS_MIN_EQ
                 and exec_score >= THIN_BOOK_SUPER_SOFTPASS_MIN_EXEC
@@ -17087,7 +17090,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal_log_data['obi_value'] = round(obi_value, 4)
             vol_ratio_val = signal.get('volumeRatio', 1.0)
             strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
-            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+            adaptive_mode = is_adaptive_mode(strategy_mode_upper)
             neutral_obi_limit = 0.10 if adaptive_mode else 0.12
             neutral_vol_limit = 0.9 if adaptive_mode else 1.2
             if abs(obi_value) < neutral_obi_limit and vol_ratio_val < neutral_vol_limit:
@@ -17391,7 +17394,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         eq_count = len(signal.get('entryQualityReasons') or [])
         strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
         exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
-        adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+        adaptive_mode = is_adaptive_mode(strategy_mode_upper)
         smart_relax_enabled = (
             adaptive_mode
             and bool(signal.get('entryQualityPass', False))
@@ -24862,7 +24865,7 @@ class SignalGenerator:
         strategy_min_offset = int(smart_v2_profile.get('min_score_offset', 0))
         strategy_notes = list(smart_v2_profile.get('notes', []))
 
-        if strategy_mode == STRATEGY_MODE_SMART_V2:
+        if is_smart_mode(strategy_mode):
             effective_threshold *= strategy_threshold_mult
             min_score_required = int(_clamp(min_score_required + strategy_min_offset, 40, 95))
         
@@ -24989,7 +24992,7 @@ class SignalGenerator:
             return None
 
         # Strategy score tuning (post-side, pre-confluence).
-        if strategy_mode == STRATEGY_MODE_SMART_V2:
+        if is_smart_mode(strategy_mode):
             if strategy_score_bonus != 0:
                 score += strategy_score_bonus
                 reasons.append(f"S2B({strategy_score_bonus:+d})")
@@ -25471,7 +25474,7 @@ class SignalGenerator:
 
             # SMART_V2 vs LEGACY scaling
             _strat = str(strategy_mode or "").upper()
-            if _strat != STRATEGY_MODE_SMART_V2:
+            if not is_smart_mode(_strat):
                 # LEGACY: bias'ı yarıya yakın
                 pro_bias = int(pro_bias * 0.55)
                 counter_bias = int(counter_bias * 0.55)
@@ -25622,7 +25625,7 @@ class SignalGenerator:
         
         if ENTRY_QUALITY_GATE_ENABLED:
             strategy_mode_upper = str(strategy_mode).upper()
-            adaptive_mode = strategy_mode_upper in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+            adaptive_mode = is_adaptive_mode(strategy_mode_upper)
 
             eq_min_volume_ratio = EQ_MIN_VOLUME_RATIO
             eq_min_imbalance = EQ_MIN_IMBALANCE
@@ -25763,7 +25766,7 @@ class SignalGenerator:
         # Konfirmasyon 2: Volume/Liquidity Kontrolü (Phase 123 + Phase EQG)
         # Phase EQG: 24h volume threshold artık EQ_MIN_VOLUME_24H ile kontrol ediliyor
         # Ama ek güvenlik olarak çok düşük hacim kontrolü kalıyor
-        adaptive_mode = str(strategy_mode).upper() in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2)
+        adaptive_mode = is_adaptive_mode(str(strategy_mode).upper())
         min_volume = 500_000  # $500K min 24h volume (hard floor)
         if adaptive_mode:
             # Adaptive modes (LEGACY + SMART_V2): allow more mid-cap coverage while keeping microcaps filtered.
@@ -26196,6 +26199,22 @@ class SignalGenerator:
         
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
         
+        # SMART_V3_RUNNER: Resolve execution profile (exit/trail/BE tuning)
+        _is_ct_for_profile = 'is_counter_trend' in dir() and bool(is_counter_trend)
+        _ct_str_for_profile = float(blended_conf if ('is_counter_trend' in dir() and is_counter_trend and 'blended_conf' in dir()) else 0.0)
+        _exec_profile = resolve_strategy_execution_profile(
+            mode=strategy_mode,
+            counter_trend=_is_ct_for_profile,
+            ct_strength=_ct_str_for_profile,
+        )
+        if _exec_profile.mode == STRATEGY_MODE_SMART_V3_RUNNER:
+            logger.info(
+                f"🏃 STRATEGY_PROFILE_APPLIED: {symbol} {signal_side} "
+                f"mode={_exec_profile.mode} source={_exec_profile.source} "
+                f"trail_act={_exec_profile.trail_activation_mult} trail_dist={_exec_profile.trail_distance_mult} "
+                f"tp_tighten={_exec_profile.tp_tighten_intensity} be_buf={_exec_profile.be_buffer_mult}"
+            )
+        
         return {
             'action': signal_side,
             'price': price,        # Signal price
@@ -26217,6 +26236,14 @@ class SignalGenerator:
             'smartEntryMult': strategy_entry_mult,
             'smartExitMult': strategy_exit_mult,
             'smartLeverageMult': strategy_leverage_mult,
+            # SMART_V3_RUNNER: execution profile fields
+            'execution_profile_source': _exec_profile.source if '_exec_profile' in dir() else 'neutral',
+            'runner_trail_act_mult': _exec_profile.trail_activation_mult if '_exec_profile' in dir() else 1.0,
+            'runner_trail_dist_mult': _exec_profile.trail_distance_mult if '_exec_profile' in dir() else 1.0,
+            'runner_tp_tighten': _exec_profile.tp_tighten_intensity if '_exec_profile' in dir() else 1.0,
+            'runner_be_buffer_mult': _exec_profile.be_buffer_mult if '_exec_profile' in dir() else 1.0,
+            'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct if '_exec_profile' in dir() else 0.20,
+            'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec if '_exec_profile' in dir() else 600,
             'spreadLevel': spread_params['level'],
             'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
             'pullbackMinDyn': round(dyn_min_pb_pct, 4),  # Phase 239V2: Dynamic floor (percent)
@@ -26327,7 +26354,7 @@ class PaperTradingEngine:
         self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
         self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
         # Strategy engine mode
-        self.strategy_mode = STRATEGY_MODE_LEGACY  # LEGACY | SMART_V2
+        self.strategy_mode = STRATEGY_MODE_LEGACY  # LEGACY | SMART_V2 | SMART_V3_RUNNER
         # Phase 200: Counter-signal adaptive exit tightness cache TTL
         self.counter_signal_ttl = 900  # 15 minutes
         # Phase 19: Server-side persistent logs
@@ -28061,6 +28088,14 @@ class PaperTradingEngine:
             "trail_phase": "WIDE" if (COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal) else "NORMAL",
             "settingsSnapshot": settings_snapshot,
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
+            # SMART_V3_RUNNER: execution profile propagation
+            "execution_profile_source": signal.get('execution_profile_source', 'neutral') if signal else 'neutral',
+            "runner_trail_act_mult": signal.get('runner_trail_act_mult', 1.0) if signal else 1.0,
+            "runner_trail_dist_mult": signal.get('runner_trail_dist_mult', 1.0) if signal else 1.0,
+            "runner_tp_tighten": signal.get('runner_tp_tighten', 1.0) if signal else 1.0,
+            "runner_be_buffer_mult": signal.get('runner_be_buffer_mult', 1.0) if signal else 1.0,
+            "runner_wide_profit_pct": signal.get('runner_wide_profit_pct', 0.20) if signal else 0.20,
+            "runner_wide_age_sec": signal.get('runner_wide_age_sec', 600) if signal else 600,
             # Phase 237C: State machine fields
             "state": "CREATED" if PENDING_SM_V2_ENABLED else "LEGACY",
             "stateChangedAt": int(datetime.now().timestamp() * 1000),
@@ -28926,6 +28961,14 @@ class PaperTradingEngine:
             "counterTrend": order.get('counterTrend', False),
             "counterTrendStrength": float(order.get('counterTrendStrength', 0) or 0),
             "trail_phase": order.get('trail_phase', 'NORMAL'),
+            # SMART_V3_RUNNER: execution profile propagation
+            "execution_profile_source": order.get('execution_profile_source', 'neutral'),
+            "runner_trail_act_mult": order.get('runner_trail_act_mult', 1.0),
+            "runner_trail_dist_mult": order.get('runner_trail_dist_mult', 1.0),
+            "runner_tp_tighten": order.get('runner_tp_tighten', 1.0),
+            "runner_be_buffer_mult": order.get('runner_be_buffer_mult', 1.0),
+            "runner_wide_profit_pct": order.get('runner_wide_profit_pct', 0.20),
+            "runner_wide_age_sec": order.get('runner_wide_age_sec', 600),
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
@@ -29979,9 +30022,7 @@ class PaperTradingEngine:
                     # Phase 36: Load entry/exit tightness
                     self.entry_tightness = data.get('entry_tightness', 1.8)  # Default: Gevşek
                     self.exit_tightness = data.get('exit_tightness', 1.2)  # Default: 1.2x
-                    self.strategy_mode = str(data.get('strategy_mode', STRATEGY_MODE_LEGACY)).upper()
-                    if self.strategy_mode not in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
-                        self.strategy_mode = STRATEGY_MODE_LEGACY
+                    self.strategy_mode = normalize_strategy_mode(data.get('strategy_mode', STRATEGY_MODE_LEGACY))
                     # Phase 57: Load Kill Switch settings
                     if 'kill_switch_first_reduction' in data:
                         daily_kill_switch.first_reduction_pct = data.get('kill_switch_first_reduction', -100)
@@ -31050,6 +31091,13 @@ class PaperTradingEngine:
             "tpMultiplier": pos.get('tpMultiplier', 0),
             # Phase 155: AI Optimizer settings snapshot from open time
             "settingsSnapshot": pos.get('settingsSnapshot', {}),
+            # SMART_V3_RUNNER: close telemetry
+            "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+            "runner_trail_act_mult": pos.get('runner_trail_act_mult', 1.0),
+            "runner_trail_dist_mult": pos.get('runner_trail_dist_mult', 1.0),
+            "runner_tp_tighten": pos.get('runner_tp_tighten', 1.0),
+            "runner_be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
             # Phase 186: Execution quality + complete position data
             "entry_method": pos.get('entry_method', 'MARKET'),
             "entry_slippage": pos.get('entry_slippage', 0),
@@ -33745,9 +33793,9 @@ async def paper_trading_update_settings(
     if strategyMode is not None:
         old_mode = getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)
         normalized_mode = str(strategyMode).upper()
-        if normalized_mode not in (STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2):
+        if normalized_mode not in VALID_STRATEGY_MODES:
             return JSONResponse(
-                {"success": False, "error": f"Invalid strategyMode: {strategyMode}. Use LEGACY or SMART_V2"},
+                {"success": False, "error": f"Invalid strategyMode: {strategyMode}. Use LEGACY, SMART_V2, or SMART_V3_RUNNER"},
                 status_code=400
             )
         global_paper_trader.strategy_mode = normalized_mode

@@ -72,6 +72,7 @@ def compute_breakeven_price(
     liq_profile: Optional[LiquidityProfile] = None,
     spread_pct: float = 0.05,
     spread_level: str = "Normal",
+    be_buffer_mult: float = 1.0,
 ) -> float:
     """Compute breakeven price including all costs.
 
@@ -89,7 +90,7 @@ def compute_breakeven_price(
             spread_level=spread_level,
         )
 
-    buffer_price = entry_price * buffer_ratio
+    buffer_price = entry_price * buffer_ratio * be_buffer_mult
 
     if side == 'LONG':
         return entry_price + buffer_price

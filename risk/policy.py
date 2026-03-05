@@ -55,6 +55,9 @@ class RiskParams:
     kill_first_reduction_roi: float  # First reduction margin % (-30 BAL, -50 AGGR, -70 ULTRA)
     kill_full_close_roi: float       # Full close margin % (-60 BAL, -80 AGGR, -95 ULTRA)
 
+    # ── Strategy Context ──
+    strategy_mode: str = 'LEGACY'  # SMART_V3_RUNNER context
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Profile definitions
@@ -115,6 +118,7 @@ def resolve_risk_params(
     profile: RiskProfile = RiskProfile.BALANCED,
     leverage: int = 10,
     liq_profile: Optional[LiquidityProfile] = None,
+    strategy_mode: str = 'LEGACY',
 ) -> RiskParams:
     """Resolve concrete risk parameters from profile + market conditions.
 
@@ -138,6 +142,7 @@ def resolve_risk_params(
 
     return RiskParams(
         profile=profile,
+        strategy_mode=strategy_mode,
         sl_roi_floor=p['sl_roi_floor'],
         emergency_roi=min(p['emergency_roi'], safe_emergency_cap),
         emergency_cap_roi=safe_emergency_cap,

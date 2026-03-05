@@ -175,31 +175,79 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             <h3 className="text-sm font-semibold text-cyan-400 uppercase tracking-wider mb-3">
               Strateji Motoru
             </h3>
-            <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3">
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'LEGACY' })}
-                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${localSettings.strategyMode === 'LEGACY'
-                    ? 'bg-slate-600/70 border-slate-400 text-white'
-                    : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
-                    }`}
-                >
-                  Legacy
-                </button>
-                <button
-                  onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'SMART_V2' })}
-                  className={`px-3 py-2 rounded-lg text-sm font-semibold border transition-colors ${localSettings.strategyMode === 'SMART_V2'
-                    ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300'
-                    : 'bg-slate-900/40 border-slate-700 text-slate-300 hover:border-slate-500'
-                    }`}
-                >
-                  SMART_V2
-                </button>
-              </div>
-              <p className="text-[10px] text-slate-500 mt-2">
-                Legacy: mevcut davranış. SMART_V2: coin rejimine göre strateji otomatik seçilir ve giriş/çıkış çarpanları optimize edilir.
-              </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {/* LEGACY Card */}
+              <button
+                onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'LEGACY' })}
+                className={`relative text-left p-3 rounded-xl border-2 transition-all duration-200 ${localSettings.strategyMode === 'LEGACY'
+                  ? 'bg-slate-700/40 border-slate-400 shadow-[0_0_12px_rgba(148,163,184,0.15)]'
+                  : 'bg-slate-900/40 border-slate-700/50 hover:border-slate-600'
+                  }`}
+              >
+                {localSettings.strategyMode === 'LEGACY' && (
+                  <span className="absolute top-2 right-2 text-[10px] bg-slate-500/20 text-slate-300 px-1.5 py-0.5 rounded-full font-bold">✓</span>
+                )}
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-base">🛡️</span>
+                  <span className="text-sm font-bold text-white">Legacy</span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-slate-500/20 text-slate-400 font-semibold border border-slate-600/30">Düşük Risk</span>
+                </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  Klasik giriş/çıkış kuralları. Sabit SL/TP, hızlı trail aktivasyonu. Deneyimsiz kullanıcılar veya düşük volatilite dönemleri için önerilir.
+                </p>
+              </button>
+
+              {/* SMART_V2 Card */}
+              <button
+                onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'SMART_V2' })}
+                className={`relative text-left p-3 rounded-xl border-2 transition-all duration-200 ${localSettings.strategyMode === 'SMART_V2'
+                  ? 'bg-cyan-500/10 border-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.15)]'
+                  : 'bg-slate-900/40 border-slate-700/50 hover:border-slate-600'
+                  }`}
+              >
+                {localSettings.strategyMode === 'SMART_V2' && (
+                  <span className="absolute top-2 right-2 text-[10px] bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 rounded-full font-bold">✓</span>
+                )}
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-base">⚡</span>
+                  <span className="text-sm font-bold text-white">SMART V2</span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-400 font-semibold border border-cyan-500/20">Orta Risk</span>
+                </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  Coin rejimine göre strateji seçimi. Adaptif SL/TP ve giriş/çıkış optimizasyonu. Çoğu piyasa koşulunda önerilen mod.
+                </p>
+              </button>
+
+              {/* SMART_V3_RUNNER Card */}
+              <button
+                onClick={() => setLocalSettings({ ...localSettings, strategyMode: 'SMART_V3_RUNNER' })}
+                className={`relative text-left p-3 rounded-xl border-2 transition-all duration-200 ${localSettings.strategyMode === 'SMART_V3_RUNNER'
+                  ? 'bg-amber-500/10 border-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.15)]'
+                  : 'bg-slate-900/40 border-slate-700/50 hover:border-slate-600'
+                  }`}
+              >
+                {localSettings.strategyMode === 'SMART_V3_RUNNER' && (
+                  <span className="absolute top-2 right-2 text-[10px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded-full font-bold">✓</span>
+                )}
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-base">🔥</span>
+                  <span className="text-sm font-bold text-white">V3 Runner</span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 font-semibold border border-amber-500/20">Trend Avcısı</span>
+                </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  V2 tabanlı, kârdaki pozisyonları daha uzun taşır. Trail geç sıkışır (×1.30/×1.45), BE güvenli (×1.20), erken çıkış azalır. Trend takibi için ideal.
+                </p>
+              </button>
             </div>
+
+            {/* Dirty-state change summary */}
+            {localSettings.strategyMode !== settings.strategyMode && (
+              <div className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+                <span className="text-[10px] text-amber-400 font-semibold">
+                  ⚠️ Geçiş: {settings.strategyMode} → {localSettings.strategyMode}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Signal Algorithm Sensitivity Section */}

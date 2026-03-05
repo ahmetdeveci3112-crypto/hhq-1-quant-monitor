@@ -53,6 +53,27 @@ const INITIAL_STATS: PortfolioStats = {
 
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
+// SMART_V3_RUNNER: Deterministic execution source resolver for header chip
+const resolveExecutionSourceForUI = (
+  positions: any[],
+  signals: any[]
+): string => {
+  // Step 1: First open position's source
+  const pos = (positions || []).find((p: any) => p.execution_profile_source);
+  if (pos) return pos.execution_profile_source;
+  // Step 2: Latest active signal (sort by timestamp descending)
+  const activeSignals = (signals || [])
+    .filter((s: any) => s.signalAction !== 'NONE' && s.execution_profile_source)
+    .sort((a: any, b: any) => {
+      const tsA = Number(a.signalTs || a.ts || a.timestamp || a.time || 0);
+      const tsB = Number(b.signalTs || b.ts || b.timestamp || b.time || 0);
+      return tsB - tsA;
+    });
+  if (activeSignals.length > 0) return activeSignals[0].execution_profile_source;
+  // Step 3: Fallback
+  return 'bilinmiyor';
+};
+
 // Phase 58: Generate tooltip with detailed algorithm criteria for close reason
 const getReasonTooltip = (trade: any): string => {
   const reason = trade.reason || trade.closeReason || '';
@@ -151,6 +172,22 @@ const getReasonTooltip = (trade: any): string => {
     lines.push('');
     lines.push('━━━ MANUEL KAPATMA ━━━');
     lines.push('Kullanıcı tarafından kapatıldı');
+  }
+
+  // SMART_V3_RUNNER: Append runner profile fields when present
+  const tradeStrategyMode = trade.strategyMode || '';
+  const tradeExecSource = trade.execution_profile_source || '';
+  if (tradeStrategyMode || tradeExecSource) {
+    lines.push('');
+    lines.push('━━━ STRATEJİ PROFİLİ ━━━');
+    if (tradeStrategyMode) lines.push(`Mod: ${tradeStrategyMode}`);
+    if (tradeExecSource) lines.push(`Kaynak: ${tradeExecSource}`);
+    const actMult = trade.runner_trail_act_mult;
+    const distMult = trade.runner_trail_dist_mult;
+    const beMult = trade.runner_be_buffer_mult;
+    if (actMult && actMult !== 1.0 || distMult && distMult !== 1.0 || beMult && beMult !== 1.0) {
+      lines.push(`Trail: act ×${(actMult || 1).toFixed(2)} | dist ×${(distMult || 1).toFixed(2)} | BE ×${(beMult || 1).toFixed(2)}`);
+    }
   }
 
   return lines.join('\n');
@@ -672,7 +709,7 @@ export default function App() {
           minScoreHigh: data.minScoreHigh ?? 90,
           entryTightness: data.entryTightness ?? 1.8,
           exitTightness: data.exitTightness ?? 1.2,
-          strategyMode: (data.strategyMode === 'SMART_V2' ? 'SMART_V2' : 'LEGACY'),
+          strategyMode: (['LEGACY', 'SMART_V2', 'SMART_V3_RUNNER'].includes(data.strategyMode) ? data.strategyMode : 'LEGACY'),
           killSwitchFirstReduction: data.killSwitchFirstReduction ?? -100,
           killSwitchFullClose: data.killSwitchFullClose ?? -150,
           leverageMultiplier: data.leverageMultiplier ?? 1.0
@@ -1286,6 +1323,20 @@ export default function App() {
               <span className="text-[10px] font-bold text-rose-400 uppercase">SL Kalkanı</span>
             </div>
           )}
+
+          {/* SMART_V3_RUNNER: Strategy chip + execution profile source */}
+          <div className={`hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[10px] font-bold uppercase ${settings.strategyMode === 'SMART_V3_RUNNER'
+            ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
+            : settings.strategyMode === 'SMART_V2'
+              ? 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400'
+              : 'bg-slate-800/50 border-slate-700/30 text-slate-400'
+            }`}>
+            <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
+            <span>{settings.strategyMode}</span>
+            <span className="text-[8px] font-normal normal-case opacity-70">
+              kaynak: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals)}
+            </span>
+          </div>
         </div>
 
         <div className="flex items-center gap-2 md:gap-4">
@@ -1912,6 +1963,7 @@ export default function App() {
                   onToggle={toggleOptimizer}
                   marketRegime={marketRegime || undefined}
                   dcaConfig={dcaConfig || undefined}
+                  strategyMode={settings.strategyMode}
                 />
               </div>
 

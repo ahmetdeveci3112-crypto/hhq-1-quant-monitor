@@ -3,6 +3,8 @@
 Contains BOTH v1 (legacy parity) and v2 (LiquidityProfile-aware) functions.
 Pure utility — no imports from main.py (blocker 2).
 
+SMART_V3_RUNNER: v2 accepts optional strategy_profile for trail tuning.
+
 Extracted from main.py:
   - compute_sl_tp_levels (L7627-7745)
   - estimate_trade_cost (L7518-7545)
@@ -16,6 +18,12 @@ from typing import Optional
 
 from risk.liquidity_profile import LiquidityProfile
 from risk.policy import RiskParams, RiskProfile, resolve_risk_params
+
+# Optional import — strategy_profile is only used when explicitly passed
+try:
+    from risk.strategy_profile import StrategyExecutionProfile
+except ImportError:
+    StrategyExecutionProfile = None  # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -210,6 +218,7 @@ def compute_sl_tp_levels_v2(
     liq_profile: Optional[LiquidityProfile] = None,
     risk_params: Optional[RiskParams] = None,
     parity_mode: bool = False,
+    strategy_profile: Optional['StrategyExecutionProfile'] = None,
 ) -> dict:
     """V2 SL/TP computation with LiquidityProfile and RiskParams.
 
@@ -281,6 +290,13 @@ def compute_sl_tp_levels_v2(
 
     # ── Step 6: Side-aware application ──
     trail_act_mult = canary_trail_mult * trail_liq_mult
+    # SMART_V3_RUNNER: apply strategy_profile trail multipliers
+    _sp_trail_act = 1.0
+    _sp_trail_dist = 1.0
+    if strategy_profile is not None and not parity_mode:
+        _sp_trail_act = getattr(strategy_profile, 'trail_activation_mult', 1.0)
+        _sp_trail_dist = getattr(strategy_profile, 'trail_distance_mult', 1.0)
+    trail_act_mult *= _sp_trail_act
     if side == 'LONG':
         sl = max(entry_price * 0.01, entry_price - sl_dist)
         tp = entry_price + tp_dist
@@ -290,7 +306,7 @@ def compute_sl_tp_levels_v2(
         tp = max(entry_price * 0.01, entry_price - tp_dist)
         trail_activation = max(entry_price * 0.01, entry_price - (atr * adjusted_trail_act_atr * trail_act_mult))
 
-    trail_distance = atr * adjusted_trail_dist_atr * trail_act_mult
+    trail_distance = atr * adjusted_trail_dist_atr * trail_act_mult * _sp_trail_dist
 
     # ── Step 7: Tick-size snap ──
     try:

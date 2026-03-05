@@ -95,7 +95,15 @@ interface Props {
     onToggle: () => void;
     marketRegime?: MarketRegime;
     dcaConfig?: DcaConfig;
+    strategyMode?: string;
 }
+
+/** Ratio-based low-sample threshold: avoids spam in longer windows */
+const isLowSampleCount = (samples: number, windowSec: number): boolean => {
+    const expected = Math.max(1, Math.floor(windowSec / 30));
+    const minNeeded = Math.max(3, Math.floor(expected * 0.25));
+    return samples < minNeeded;
+};
 
 const getRegimeLabel = (regime: string) => {
     switch (regime) {
@@ -125,7 +133,7 @@ const formatWindowSec = (sec?: number): string => {
     return `${m}dk`;
 };
 
-export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime, dcaConfig }) => {
+export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime, dcaConfig, strategyMode }) => {
     const safeTracking = tracking || [];
     const safeAnalyses = analyses || [];
     const regime = getRegimeLabel(marketRegime?.currentRegime || 'RANGING');
@@ -254,8 +262,8 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
                                             {marketRegime.fast.samples} örnek / {formatWindowSec(marketRegime.fast.windowSec)}
-                                            {marketRegime.fast.samples < 5 && (
-                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
+                                            {isLowSampleCount(marketRegime.fast.samples, marketRegime.fast.windowSec) && (
+                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">⚠ Düşük örnek</span>
                                             )}
                                         </span>
                                     </div>
@@ -287,8 +295,8 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
                                             {marketRegime.struct.samples} örnek / {formatWindowSec(marketRegime.struct.windowSec)}
-                                            {marketRegime.struct.samples < 20 && (
-                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">Düşük örnek</span>
+                                            {isLowSampleCount(marketRegime.struct.samples, marketRegime.struct.windowSec) && (
+                                                <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">⚠ Düşük örnek</span>
                                             )}
                                         </span>
                                     </div>
@@ -317,7 +325,21 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                         </div>
                     )}
 
-                    {/* DCA Decision */}
+                    {/* Strategy Mode Chip + DCA Decision */}
+                    {strategyMode && (
+                        <div className="flex items-center justify-between bg-slate-800/40 rounded-lg px-2.5 py-2 mb-3">
+                            <span className="text-[9px] text-slate-500 uppercase font-semibold">Aktif Mod</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${strategyMode === 'SMART_V3_RUNNER'
+                                    ? 'bg-amber-500/15 text-amber-400 border border-amber-500/20'
+                                    : strategyMode === 'SMART_V2'
+                                        ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/20'
+                                        : 'bg-slate-500/15 text-slate-400 border border-slate-600/20'
+                                }`}>
+                                {strategyMode === 'SMART_V3_RUNNER' ? '🔥 ' : strategyMode === 'SMART_V2' ? '⚡ ' : '🛡️ '}
+                                {strategyMode}
+                            </span>
+                        </div>
+                    )}
                     {dca && (
                         <div className="flex items-center justify-between bg-slate-800/40 rounded-lg px-2.5 py-2 mb-3">
                             <div className="flex items-center gap-1.5">

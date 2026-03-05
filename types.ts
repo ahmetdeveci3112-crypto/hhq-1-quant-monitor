@@ -135,6 +135,13 @@ export interface Trade {
   // Phase 139: Support both 'reason' (new) and 'closeReason' (legacy)
   reason?: string;           // Primary field from backend
   closeReason?: CloseReason; // Legacy compatibility
+  // SMART_V3_RUNNER: execution profile telemetry
+  strategyMode?: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER';
+  execution_profile_source?: string;
+  runner_trail_act_mult?: number;
+  runner_trail_dist_mult?: number;
+  runner_tp_tighten?: number;
+  runner_be_buffer_mult?: number;
 }
 
 export interface EquityPoint {
@@ -182,7 +189,7 @@ export interface SystemSettings {
   // Entry/Exit control settings
   entryTightness: number;       // 0.5-15.0: Pullback multiplier (lower = tighter entry, higher = looser)
   exitTightness: number;        // 0.5-15.0: SL/TP multiplier (lower = quick exit, higher = hold longer)
-  strategyMode: 'LEGACY' | 'SMART_V2'; // Strategy engine mode
+  strategyMode: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER'; // Strategy engine mode
   // Kill Switch settings
   killSwitchFirstReduction: number;  // -5 to -30: First reduction threshold (default -15)
   killSwitchFullClose: number;       // -10 to -50: Full close threshold (default -20)
@@ -335,7 +342,7 @@ export interface CoinOpportunity {
   btcOverride?: boolean;
   overrideLeverageCap?: number;
   overrideSizeMult?: number;
-  strategyMode?: 'LEGACY' | 'SMART_V2';
+  strategyMode?: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER';
   activeStrategy?: string;
   strategyLabel?: string;
   // Execution-stage reject reason from backend pipeline (if signal couldn't become an order)
@@ -383,3 +390,5 @@ export interface ScannerUpdate {
   };
   timestamp: number;
 }
+
+export const VALID_STRATEGY_MODES = ['LEGACY', 'SMART_V2', 'SMART_V3_RUNNER'] as const;
