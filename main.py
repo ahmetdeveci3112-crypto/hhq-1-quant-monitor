@@ -32860,6 +32860,7 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
             "entryPriceBackend": sig.get('entry_price_backend', 0),
             "leverage": sig.get('leverage', 10),
             "strategyMode": sig.get('strategy_mode', ''),
+            "execution_profile_source": sig.get('execution_profile_source', 'neutral'),
             "entryQualityPass": sig.get('entry_quality_pass', False),
             "entryQualityReasons": sig.get('entry_quality_reasons', []),
             "executionRejectReason": sig.get('execution_reject_reason', ''),

@@ -56,7 +56,8 @@ const INITIAL_STATS: PortfolioStats = {
 // SMART_V3_RUNNER: Deterministic execution source resolver for header chip
 const resolveExecutionSourceForUI = (
   positions: any[],
-  signals: any[]
+  signals: any[],
+  marketRegime?: any
 ): string => {
   // Step 1: First open position's source
   const pos = (positions || []).find((p: any) => p.execution_profile_source);
@@ -70,8 +71,10 @@ const resolveExecutionSourceForUI = (
       return tsB - tsA;
     });
   if (activeSignals.length > 0) return activeSignals[0].execution_profile_source;
-  // Step 3: Fallback
-  return 'bilinmiyor';
+  // Step 3: Market regime execution profile
+  if (marketRegime?.executionProfile?.profile_source) return marketRegime.executionProfile.profile_source;
+  // Step 4: Fallback
+  return 'bekleniyor';
 };
 
 // Phase 58: Generate tooltip with detailed algorithm criteria for close reason
@@ -1334,7 +1337,7 @@ export default function App() {
             <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
             <span>{settings.strategyMode}</span>
             <span className="text-[8px] font-normal normal-case opacity-70">
-              kaynak: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals)}
+              kaynak: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals, marketRegime)}
             </span>
           </div>
         </div>
