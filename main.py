@@ -5363,6 +5363,9 @@ async def lifespan(app: FastAPI):
     """Application lifespan: start background scanner and position updater on startup."""
     global background_scanner_task, position_updater_task, binance_sync_task
     
+    # RFX-3A: Log feature flag states at startup
+    rfx3_startup_log_flags()
+    
     # Initialize SQLite database
     logger.info("📁 Initializing SQLite database...")
     await sqlite_manager.init_db()
@@ -9188,6 +9191,17 @@ from risk.strategy_profile import (
     STRATEGY_MODE_LEGACY, STRATEGY_MODE_SMART_V2, STRATEGY_MODE_SMART_V3_RUNNER,
     VALID_STRATEGY_MODES, normalize_strategy_mode, is_adaptive_mode, is_smart_mode,
     StrategyExecutionProfile, resolve_strategy_execution_profile,
+)
+
+# RFX-3A: Regime-based execution styles
+from risk.execution_style import (
+    EXEC_STYLE_MARKET, EXEC_STYLE_MR_LIMIT, EXEC_STYLE_BREAKOUT,
+    RFX3_EXEC_STYLE_ENABLED, RFX3_MR_LIMIT_ENABLED,
+    RFX3_BREAKOUT_RECLAIM_ENABLED, RFX3_STRUCT_PARTIAL_TP_ENABLED,
+    MR_ZONE_TIMEOUT_SEC, RECLAIM_LOOKBACK_CANDLES,
+    classify_execution_style, build_structural_zone,
+    is_reclaim_confirmed, compute_structural_partial_tp_pct,
+    startup_log_flags as rfx3_startup_log_flags,
 )
 
 
@@ -20274,6 +20288,99 @@ class TimeBasedPositionManager:
                 if _rfx1b_sm_handled:
                     continue  # SM sole authority handled this position
                 
+                # ===============================================
+                # RFX-3A: Structural Partial TP
+                # Hit structural zone target → kısmi realize + runner trail + BE floor
+                # Idempotency: struct_partial_1 key + _exit_inflight guard
+                # ===============================================
+                _struct_ptp_pct = pos.get('struct_partial_tp_pct', 0)
+                if (
+                    RFX3_STRUCT_PARTIAL_TP_ENABLED
+                    and _struct_ptp_pct > 0
+                    and unrealized_pnl > 0
+                    and contracts > 0
+                ):
+                    _partial_state = pos.get('partial_tp_state', {})
+                    if _partial_state.get('struct_partial_1'):
+                        # Already realized — skip (idempotency)
+                        pass
+                    elif pos_id in _exit_inflight:
+                        # Inflight guard — prevent duplicate partial close
+                        logger.info(f"⚠️ STRUCTURAL_PARTIAL_TP_SKIP_DUP: {symbol} {side} (inflight guard)")
+                    else:
+                        # Check if profit reached structural zone distance
+                        _zone_data = pos.get('structural_zone', {})
+                        _zone_price = _zone_data.get('zone_price', 0)
+                        _zone_conf = _zone_data.get('zone_confidence', 0.5)
+                        _entry = pos.get('entryPrice', current_price)
+                        
+                        _target_hit = False
+                        if _zone_price > 0 and _entry > 0:
+                            if side == 'LONG' and current_price >= _zone_price:
+                                _target_hit = True
+                            elif side == 'SHORT' and current_price <= _zone_price:
+                                _target_hit = True
+                        
+                        if not _target_hit:
+                            # Fallback: use profit % threshold based on ATR
+                            _pos_atr = pos.get('atr', _entry * 0.02)
+                            _atr_target_pct = (_pos_atr / _entry * 100) if _entry > 0 else 2.0
+                            _profit_pct = abs(unrealized_pnl) / (contracts * _entry) * 100 if (contracts * _entry) > 0 else 0
+                            if _profit_pct >= _atr_target_pct * 1.5:
+                                _target_hit = True
+                        
+                        if _target_hit:
+                            _exit_inflight.add(pos_id)
+                            try:
+                                _realize_frac = compute_structural_partial_tp_pct(
+                                    confidence=_zone_conf,
+                                )
+                                _close_contracts = max(1, int(contracts * _realize_frac))
+                                _close_contracts = min(_close_contracts, int(contracts * 0.50))  # Never more than 50%
+                                
+                                if _close_contracts > 0:
+                                    _partial_state['struct_partial_1'] = True
+                                    pos['partial_tp_state'] = _partial_state
+                                    
+                                    new_contracts = max(0, contracts - _close_contracts)
+                                    pos['contracts'] = new_contracts
+                                    pos['size'] = new_contracts
+                                    
+                                    # BE floor: entry + fee estimate (mandatory after partial)
+                                    _fee_est = _entry * 0.001  # ~0.1% fee buffer
+                                    _be_floor = _entry + _fee_est if side == 'LONG' else _entry - _fee_est
+                                    if pos.get('stopLoss'):
+                                        if side == 'LONG':
+                                            pos['stopLoss'] = max(pos['stopLoss'], _be_floor)
+                                        else:
+                                            pos['stopLoss'] = min(pos['stopLoss'], _be_floor)
+                                    pos['breakeven_activated'] = True
+                                    pos['isTrailingActive'] = True
+                                    pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                    
+                                    logger.warning(
+                                        f"💰 STRUCTURAL_PARTIAL_TP: {symbol} {side} "
+                                        f"realized={_realize_frac*100:.0f}% ({_close_contracts}/{contracts}) "
+                                        f"zone_conf={_zone_conf} be_floor={_be_floor:.6f}"
+                                    )
+                                    logger.info(
+                                        f"🏃 RUNNER_CONTINUE: {symbol} {side} "
+                                        f"remaining={new_contracts} be_floor={_be_floor:.6f}"
+                                    )
+                                    actions["partial_tp"].append({
+                                        'symbol': symbol, 'tp': 'struct_partial_1', 'source': 'RFX3A'
+                                    })
+                            except Exception as _stp_err:
+                                logger.error(f"❌ STRUCTURAL_PARTIAL_TP_FAIL: {symbol} {_stp_err}")
+                            finally:
+                                _exit_inflight.discard(pos_id)
+                
+                # ===============================================
+                # PHASE 250: ADAPTIVE PARTIAL TAKE PROFIT
+                # Uses locked TP ladder from position (computed at fill)
+                # Legacy fallback for old positions without tp_ladder_levels
+                # B1: When RFX1B_EXIT_WIRING=true, SM handles above — legacy skipped
+                # ===============================================
                 if unrealized_pnl > 0 and contracts > 0:
                     # Get spread level and ATR for TP calculation
                     spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))
@@ -26215,6 +26322,46 @@ class SignalGenerator:
                 f"tp_tighten={_exec_profile.tp_tighten_intensity} be_buf={_exec_profile.be_buffer_mult}"
             )
         
+        # RFX-3A: Classify execution style for SMART_V3_RUNNER
+        _exec_style = EXEC_STYLE_MARKET
+        _structural_zone = None
+        _structural_zone_dict = {}
+        _fallback_stage = ''
+        if _exec_profile.exec_style_enabled and RFX3_EXEC_STYLE_ENABLED:
+            _regime_for_style = regime_label if 'regime_label' in dir() else 'RANGING'
+            _structure_for_style = smc_structure if 'smc_structure' in dir() else 'NONE'
+            _hurst_for_style = hurst if 'hurst' in dir() else 0.5
+            _zscore_for_style = z_score if 'z_score' in dir() else 0.0
+            _exec_style = classify_execution_style(
+                regime=_regime_for_style,
+                structure=_structure_for_style,
+                hurst=_hurst_for_style,
+                zscore=_zscore_for_style,
+                side=signal_side,
+            )
+            # Build structural zone from available SR/FVG data
+            _sr_supports = sr_levels.get('supports', []) if ('sr_levels' in dir() and sr_levels) else []
+            _sr_resistances = sr_levels.get('resistances', []) if ('sr_levels' in dir() and sr_levels) else []
+            _fvgs_for_zone = smc_data.get('fvgs', []) if ('smc_data' in dir() and smc_data) else []
+            _structural_zone = build_structural_zone(
+                supports=_sr_supports,
+                resistances=_sr_resistances,
+                fvgs=_fvgs_for_zone,
+                price=price,
+                side=signal_side,
+                atr=atr if 'atr' in dir() else 0,
+                tick_size=tick_size if 'tick_size' in dir() else 0,
+                spread=spread_actual if 'spread_actual' in dir() else 0,
+            )
+            if _structural_zone:
+                _structural_zone_dict = _structural_zone.to_dict()
+                _fallback_stage = _structural_zone.fallback_stage
+            logger.info(
+                f"🎯 EXEC_STYLE_SELECTED: {symbol} {signal_side} "
+                f"style={_exec_style} regime={_regime_for_style} "
+                f"fallback_stage={_fallback_stage} zone={_structural_zone_dict}"
+            )
+        
         return {
             'action': signal_side,
             'price': price,        # Signal price
@@ -26245,6 +26392,11 @@ class SignalGenerator:
             'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct if '_exec_profile' in dir() else 0.20,
             'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec if '_exec_profile' in dir() else 600,
             'spreadLevel': spread_params['level'],
+            # RFX-3A: Execution style telemetry
+            'execution_style': _exec_style,
+            'structural_zone': _structural_zone_dict,
+            'structural_fallback_stage': _fallback_stage,
+            'struct_partial_tp_pct': _exec_profile.struct_partial_tp_pct if _exec_profile.exec_style_enabled else 0,
             'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
             'pullbackMinDyn': round(dyn_min_pb_pct, 4),  # Phase 239V2: Dynamic floor (percent)
             'pullbackModelVersion': 'v2',  # Phase 239V2
@@ -28096,6 +28248,11 @@ class PaperTradingEngine:
             "runner_be_buffer_mult": signal.get('runner_be_buffer_mult', 1.0) if signal else 1.0,
             "runner_wide_profit_pct": signal.get('runner_wide_profit_pct', 0.20) if signal else 0.20,
             "runner_wide_age_sec": signal.get('runner_wide_age_sec', 600) if signal else 600,
+            # RFX-3A: Execution style propagation
+            "execution_style": signal.get('execution_style', EXEC_STYLE_MARKET) if signal else EXEC_STYLE_MARKET,
+            "structural_zone": signal.get('structural_zone', {}) if signal else {},
+            "structural_fallback_stage": signal.get('structural_fallback_stage', '') if signal else '',
+            "struct_partial_tp_pct": signal.get('struct_partial_tp_pct', 0) if signal else 0,
             # Phase 237C: State machine fields
             "state": "CREATED" if PENDING_SM_V2_ENABLED else "LEGACY",
             "stateChangedAt": int(datetime.now().timestamp() * 1000),
@@ -28313,6 +28470,90 @@ class PaperTradingEngine:
                     logger.info(f"Signal confirmed after 5min wait: {order['id']}")
                     if PENDING_SM_V2_ENABLED:
                         transition_pending_state(order, 'WAIT_CONFIRM', 'signal_confirmed', current_time)            
+            # =================================================================
+            # RFX-3A: Execution Style Entry Gating
+            # MR_ZONE_LIMIT: Zone-based limit entry with timeout fallback
+            # BREAKOUT_RECLAIM: Reclaim confirmation gate with NO_DATA fail-safe
+            # =================================================================
+            _order_exec_style = order.get('execution_style', EXEC_STYLE_MARKET)
+            if _order_exec_style != EXEC_STYLE_MARKET and is_confirmed and RFX3_EXEC_STYLE_ENABLED:
+                _zone_data = order.get('structural_zone', {})
+                _zone_price = _zone_data.get('zone_price', 0)
+                _zone_width = _zone_data.get('zone_width', 0)
+                _created_at = order.get('createdAt', current_time)
+                _style_age_sec = (current_time - _created_at) / 1000
+
+                if _order_exec_style == EXEC_STYLE_MR_LIMIT and RFX3_MR_LIMIT_ENABLED:
+                    # MR: Check if price entered zone
+                    _in_zone = _zone_price > 0 and abs(current_price - _zone_price) <= _zone_width
+                    if _in_zone:
+                        logger.info(
+                            f"🎯 ENTRY_ZONE_LIMIT_FILLED: {symbol} {side} "
+                            f"price={current_price} zone={_zone_price}±{_zone_width}"
+                        )
+                        # Allow fall-through to trailing entry
+                    elif _style_age_sec < MR_ZONE_TIMEOUT_SEC:
+                        # Still waiting for zone entry — skip trailing entry this tick
+                        if int(_style_age_sec) % 60 < 5:
+                            logger.debug(
+                                f"⏳ MR_ZONE_WAIT: {symbol} {side} "
+                                f"price={current_price} zone={_zone_price}±{_zone_width} "
+                                f"age={_style_age_sec:.0f}s"
+                            )
+                        continue
+                    else:
+                        # Timeout: fallback to existing trailing entry flow
+                        order['execution_style'] = EXEC_STYLE_MARKET  # degrade
+                        logger.info(
+                            f"⏰ ENTRY_ZONE_LIMIT_TIMEOUT: {symbol} {side} "
+                            f"age={_style_age_sec:.0f}s > {MR_ZONE_TIMEOUT_SEC}s → MARKET fallback"
+                        )
+
+                elif _order_exec_style == EXEC_STYLE_BREAKOUT and RFX3_BREAKOUT_RECLAIM_ENABLED:
+                    # Breakout: Check reclaim confirmation
+                    # Fail-safe: if NO_DATA → fallback to existing flow (not cancel)
+                    _reclaim_checked = order.get('_reclaim_checked', False)
+                    if not _reclaim_checked:
+                        # Get recent candles from opportunity data
+                        _opp_for_reclaim = None
+                        for opp in opportunities:
+                            if opp.get('symbol') == symbol:
+                                _opp_for_reclaim = opp
+                                break
+                        _candles = _opp_for_reclaim.get('recent_candles', []) if _opp_for_reclaim else []
+                        _broken_level = _zone_price if _zone_price > 0 else entry_price
+                        _confirmed, _reason = is_reclaim_confirmed(
+                            candles=_candles,
+                            broken_level=_broken_level,
+                            side=side,
+                        )
+                        if _confirmed:
+                            order['_reclaim_checked'] = True
+                            logger.info(
+                                f"💥 ENTRY_RECLAIM_CONFIRMED: {symbol} {side} "
+                                f"level={_broken_level} reason={_reason}"
+                            )
+                            # Allow fall-through to trailing entry
+                        elif _reason == "NO_DATA":
+                            # Fail-safe: no candle data → fallback to existing flow
+                            order['execution_style'] = EXEC_STYLE_MARKET
+                            order['_reclaim_checked'] = True
+                            logger.info(
+                                f"⚠️ ENTRY_RECLAIM_NO_DATA: {symbol} {side} "
+                                f"→ MARKET fallback (data unavailable)"
+                            )
+                        elif _style_age_sec > RECLAIM_LOOKBACK_CANDLES * 5 * 60:
+                            # Timeout (5 candles × 5min) → cancel
+                            order['execution_style'] = EXEC_STYLE_MARKET
+                            order['_reclaim_checked'] = True
+                            logger.info(
+                                f"⏰ ENTRY_RECLAIM_TIMEOUT: {symbol} {side} "
+                                f"reason={_reason} → MARKET fallback"
+                            )
+                        else:
+                            # Still waiting for reclaim
+                            continue
+
             # =================================================================
             # Phase 175: TRAILING ENTRY (mirrors Trailing Take Profit logic)
             # Instead of bounce+volume+trending, simply track bottom/peak
@@ -28969,6 +29210,11 @@ class PaperTradingEngine:
             "runner_be_buffer_mult": order.get('runner_be_buffer_mult', 1.0),
             "runner_wide_profit_pct": order.get('runner_wide_profit_pct', 0.20),
             "runner_wide_age_sec": order.get('runner_wide_age_sec', 600),
+            # RFX-3A: Execution style propagation
+            "execution_style": order.get('execution_style', EXEC_STYLE_MARKET),
+            "structural_zone": order.get('structural_zone', {}),
+            "structural_fallback_stage": order.get('structural_fallback_stage', ''),
+            "struct_partial_tp_pct": order.get('struct_partial_tp_pct', 0),
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
@@ -31098,6 +31344,10 @@ class PaperTradingEngine:
             "runner_trail_dist_mult": pos.get('runner_trail_dist_mult', 1.0),
             "runner_tp_tighten": pos.get('runner_tp_tighten', 1.0),
             "runner_be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
+            # RFX-3A: Execution style close telemetry
+            "execution_style": pos.get('execution_style', 'MARKET'),
+            "structural_fallback_stage": pos.get('structural_fallback_stage', ''),
+            "struct_partial_tp_pct": pos.get('struct_partial_tp_pct', 0),
             # Phase 186: Execution quality + complete position data
             "entry_method": pos.get('entry_method', 'MARKET'),
             "entry_slippage": pos.get('entry_slippage', 0),
@@ -32861,6 +33111,8 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
             "leverage": sig.get('leverage', 10),
             "strategyMode": sig.get('strategy_mode', ''),
             "execution_profile_source": sig.get('execution_profile_source', 'neutral'),
+            "executionStyle": sig.get('execution_style', 'MARKET'),
+            "structuralFallbackStage": sig.get('structural_fallback_stage', ''),
             "entryQualityPass": sig.get('entry_quality_pass', False),
             "entryQualityReasons": sig.get('entry_quality_reasons', []),
             "executionRejectReason": sig.get('execution_reject_reason', ''),
@@ -35989,6 +36241,7 @@ if __name__ == "__main__":
     import uvicorn
     
     logger.info("Starting HHQ-1 Quant Backend v2.0...")
+    rfx3_startup_log_flags()  # RFX-3A: Log feature flag states at boot
     logger.info("WebSocket endpoint: ws://localhost:8000/ws?symbol=BTCUSDT")
     logger.info("Backtest endpoint: POST http://localhost:8000/backtest")
     logger.info("Health check: http://localhost:8000/health")

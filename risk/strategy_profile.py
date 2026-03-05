@@ -89,6 +89,10 @@ class StrategyExecutionProfile:
     wide_to_normal_age_sec: int       # 600 baseline, 900 runner
     wide_trail_floor_mult: float      # 0.70 always (boundary rule)
     source: str                       # "neutral" | "resolver"
+    # RFX-3A: Execution style fields
+    exec_style_enabled: bool          # False for LEGACY/V2, True for V3R + master flag
+    struct_partial_tp_pct: float      # 0.30 default — fraction to realize at structural target
+    struct_partial_be_floor: bool     # True — mandate BE floor after partial TP
 
     # ── Computed convenience ──
 
@@ -117,6 +121,9 @@ class StrategyExecutionProfile:
             wide_to_normal_age_sec=600,
             wide_trail_floor_mult=0.70,
             source="neutral",
+            exec_style_enabled=False,
+            struct_partial_tp_pct=0.0,
+            struct_partial_be_floor=False,
         )
 
     def to_log_dict(self) -> dict:
@@ -130,6 +137,8 @@ class StrategyExecutionProfile:
             "be_buffer_m": self.be_buffer_mult,
             "wide_profit_pct": self.wide_to_normal_profit_pct,
             "wide_age_sec": self.wide_to_normal_age_sec,
+            "exec_style": self.exec_style_enabled,
+            "partial_tp_pct": self.struct_partial_tp_pct,
         }
 
 
@@ -158,6 +167,9 @@ def resolve_strategy_execution_profile(
         return StrategyExecutionProfile.neutral(safe_mode)
 
     # ── SMART_V3_RUNNER: runner deltas on top of V2 baseline ──
+    # Import flag at call time to support test overrides
+    from risk.execution_style import RFX3_EXEC_STYLE_ENABLED
+
     return StrategyExecutionProfile(
         mode=STRATEGY_MODE_SMART_V3_RUNNER,
         trail_activation_mult=1.30,
@@ -171,4 +183,7 @@ def resolve_strategy_execution_profile(
         wide_to_normal_age_sec=900,
         wide_trail_floor_mult=0.70,
         source="resolver",
+        exec_style_enabled=RFX3_EXEC_STYLE_ENABLED,
+        struct_partial_tp_pct=0.30,
+        struct_partial_be_floor=True,
     )
