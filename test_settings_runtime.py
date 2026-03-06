@@ -355,6 +355,46 @@ def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_b
     assert blocked['reason'] == 'too_far_from_entry'
 
 
+def test_evaluate_min_notional_soft_upsize_only_allows_strong_tight_spread_cases():
+    allowed = main.evaluate_min_notional_soft_upsize(
+        signal_score=94,
+        spread_pct=0.04,
+        required_margin_usd=1.05,
+        margin_cap_usd=1.0,
+        dynamic_min_notional_usd=8.0,
+        max_size_usd=12.0,
+        balance_usd=100.0,
+    )
+    blocked = main.evaluate_min_notional_soft_upsize(
+        signal_score=82,
+        spread_pct=0.12,
+        required_margin_usd=1.05,
+        margin_cap_usd=1.0,
+        dynamic_min_notional_usd=8.0,
+        max_size_usd=12.0,
+        balance_usd=100.0,
+    )
+
+    assert allowed['allow'] is True
+    assert allowed['reason'] == 'soft_upsize'
+    assert blocked['allow'] is False
+    assert blocked['reason'] in {'score_too_low', 'spread_too_wide'}
+
+
+def test_compute_pending_retry_wait_ms_shortens_wait_for_confirmed_high_score():
+    now_ms = 1_770_000_000_000
+    order = {
+        'confirmed': True,
+        'signalScore': 93,
+        'createdAt': now_ms - 400_000,
+    }
+    wait_fast = main.compute_pending_retry_wait_ms(order, now_ms, 30_000, 'bbo_spread:spread_too_wide')
+    wait_default = main.compute_pending_retry_wait_ms(order, now_ms, 30_000, 'neutral')
+
+    assert wait_fast == main.PENDING_FAST_RETRY_WAIT_MS
+    assert wait_default == 30_000
+
+
 @pytest.mark.asyncio
 async def test_paper_trading_status_exposes_pending_summary_and_execution_diagnostics(monkeypatch):
     now_ms = 1_770_000_000_000
@@ -410,4 +450,5 @@ async def test_paper_trading_status_exposes_pending_summary_and_execution_diagno
     assert payload['pendingOrders'][0]['waitState'] == 'confirm_wait'
     assert payload['pendingOrders'][0]['feedbackReason'] == 'ENTRY_SCORE_LOW:0.51'
     assert payload['executionDiagnostics']['thresholds']['maxSpreadBps'] == 8.0
+    assert payload['executionDiagnostics']['relaxations']['pendingFastRetryEnabled'] is True
     assert payload['executionDiagnostics']['counters']['spread_block'] == 3

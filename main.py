@@ -8634,6 +8634,16 @@ PENDING_NEAR_ENTRY_MIN_AGE_SEC = int(os.environ.get('PENDING_NEAR_ENTRY_MIN_AGE_
 PENDING_NEAR_ENTRY_SCORE_MIN = float(os.environ.get('PENDING_NEAR_ENTRY_SCORE_MIN', '88'))
 PENDING_NEAR_ENTRY_BAND_ATR_MULT = float(os.environ.get('PENDING_NEAR_ENTRY_BAND_ATR_MULT', '0.15'))
 PENDING_NEAR_ENTRY_BAND_BPS = float(os.environ.get('PENDING_NEAR_ENTRY_BAND_BPS', '10.0'))
+PENDING_FAST_RETRY_ENABLED = _env_bool("PENDING_FAST_RETRY_ENABLED", True)
+PENDING_FAST_RETRY_SCORE_MIN = float(os.environ.get('PENDING_FAST_RETRY_SCORE_MIN', '88'))
+PENDING_FAST_RETRY_MIN_AGE_SEC = int(os.environ.get('PENDING_FAST_RETRY_MIN_AGE_SEC', '180'))
+PENDING_FAST_RETRY_WAIT_MS = int(os.environ.get('PENDING_FAST_RETRY_WAIT_MS', '15000'))
+
+MIN_NOTIONAL_SOFT_UPSIZE_ENABLED = _env_bool("MIN_NOTIONAL_SOFT_UPSIZE_ENABLED", True)
+MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN', '88'))
+MIN_NOTIONAL_SOFT_UPSIZE_SPREAD_MAX_PCT = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_SPREAD_MAX_PCT', '0.08'))
+MIN_NOTIONAL_SOFT_UPSIZE_MARGIN_CAP_MULT = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_MARGIN_CAP_MULT', '1.20'))
+MIN_NOTIONAL_SOFT_UPSIZE_BALANCE_PCT = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_BALANCE_PCT', '0.22'))
 
 # MF-1: Market Fallback Edge Gate
 FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'enforce').lower()  # 'off' | 'shadow' | 'enforce'  # Phase B: enforce active
@@ -26958,6 +26968,59 @@ def evaluate_aged_near_entry_fill(order: dict, current_price: float, current_tim
     return result
 
 
+def evaluate_min_notional_soft_upsize(signal_score: float, spread_pct: float, required_margin_usd: float,
+                                      margin_cap_usd: float, dynamic_min_notional_usd: float,
+                                      max_size_usd: float, balance_usd: float) -> dict:
+    """Allow a small margin-cap breach for strong, low-spread setups near exchange minimums."""
+    result = {
+        'allow': False,
+        'reason': 'disabled',
+        'new_notional_usd': dynamic_min_notional_usd,
+        'new_margin_usd': required_margin_usd,
+    }
+    if not MIN_NOTIONAL_SOFT_UPSIZE_ENABLED:
+        return result
+    if signal_score < MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN:
+        result['reason'] = 'score_too_low'
+        return result
+    if spread_pct <= 0 or spread_pct > MIN_NOTIONAL_SOFT_UPSIZE_SPREAD_MAX_PCT:
+        result['reason'] = 'spread_too_wide'
+        return result
+    if required_margin_usd <= 0 or margin_cap_usd <= 0 or dynamic_min_notional_usd <= 0:
+        result['reason'] = 'invalid_limits'
+        return result
+    if required_margin_usd > (margin_cap_usd * MIN_NOTIONAL_SOFT_UPSIZE_MARGIN_CAP_MULT):
+        result['reason'] = 'margin_cap_too_far'
+        return result
+
+    max_soft_notional = min(max_size_usd, balance_usd * MIN_NOTIONAL_SOFT_UPSIZE_BALANCE_PCT)
+    if dynamic_min_notional_usd > max_soft_notional:
+        result['reason'] = 'balance_cap_exceeded'
+        return result
+
+    result['allow'] = True
+    result['reason'] = 'soft_upsize'
+    return result
+
+
+def compute_pending_retry_wait_ms(order: dict, current_time: int, default_wait_ms: int, reason: str = '') -> int:
+    """Retry strong confirmed pendings sooner without bypassing any risk gates."""
+    wait_ms = max(1_000, int(default_wait_ms))
+    if not PENDING_FAST_RETRY_ENABLED or not order:
+        return wait_ms
+
+    confirmed = bool(order.get('confirmed', False))
+    score = float(order.get('signalScore', 0) or 0)
+    created_at = int(order.get('createdAt', current_time) or current_time)
+    age_sec = max(0.0, (current_time - created_at) / 1000.0)
+    reason_l = str(reason or '').lower()
+    fast_reason = any(token in reason_l for token in ('spread', 'bbo', 'drift', 'recheck', 'entry_score'))
+
+    if confirmed and score >= PENDING_FAST_RETRY_SCORE_MIN and age_sec >= PENDING_FAST_RETRY_MIN_AGE_SEC and fast_reason:
+        return min(wait_ms, max(5_000, PENDING_FAST_RETRY_WAIT_MS))
+    return wait_ms
+
+
 def build_pending_orders_observability(pending_orders: list, execution_feedback: dict = None,
                                        now_ms: int = None, min_confidence_score: int = 74) -> dict:
     """Decorate pending orders with wait-state diagnostics and a compact summary."""
@@ -27064,6 +27127,15 @@ def build_execution_diagnostics_snapshot(trader) -> dict:
             "maxSpreadBps": float(getattr(trader, 'exec_max_spread_bps', 0.0) or 0.0),
             "maxDriftBps": float(getattr(trader, 'exec_max_drift_bps', 0.0) or 0.0),
             "scoreSource": str(getattr(trader, 'exec_score_source', 'unknown')),
+        },
+        "relaxations": {
+            "pendingFastRetryEnabled": PENDING_FAST_RETRY_ENABLED,
+            "pendingFastRetryWaitMs": PENDING_FAST_RETRY_WAIT_MS,
+            "pendingFastRetryScoreMin": PENDING_FAST_RETRY_SCORE_MIN,
+            "minNotionalSoftUpsizeEnabled": MIN_NOTIONAL_SOFT_UPSIZE_ENABLED,
+            "minNotionalSoftUpsizeScoreMin": MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN,
+            "minNotionalSoftUpsizeSpreadMaxPct": MIN_NOTIONAL_SOFT_UPSIZE_SPREAD_MAX_PCT,
+            "minNotionalSoftUpsizeMarginCapMult": MIN_NOTIONAL_SOFT_UPSIZE_MARGIN_CAP_MULT,
         },
         "counters": diag,
     }
@@ -28526,13 +28598,34 @@ class PaperTradingEngine:
             # P0-2: min-notional conflict rule — don't break margin cap
             _min_not_margin = _dynamic_min_notional / max(adjusted_leverage, 1)
             if _min_not_margin > _margin_info['cap']:
-                # Upsizing would break margin cap → reject
-                logger.info(
-                    f"🚫 MIN_NOTIONAL_REJECT: {trade_symbol} {side} notional=${position_size_usd:.2f} "
-                    f"< min=${_dynamic_min_notional:.2f} but upsize margin ${_min_not_margin:.2f} > cap ${_margin_info['cap']:.2f}"
+                _soft_upsize = evaluate_min_notional_soft_upsize(
+                    signal_score=float(signal.get('confidenceScore', 0) if signal else 0),
+                    spread_pct=spread_pct,
+                    required_margin_usd=_min_not_margin,
+                    margin_cap_usd=_margin_info['cap'],
+                    dynamic_min_notional_usd=_dynamic_min_notional,
+                    max_size_usd=max_size_usd,
+                    balance_usd=self.balance,
                 )
-                self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL_REJECT")
-                return None
+                if _soft_upsize['allow']:
+                    old_size = position_size_usd
+                    position_size_usd = _soft_upsize['new_notional_usd']
+                    _margin_usd = _soft_upsize['new_margin_usd']
+                    reasons.append(f"MIN_NOTIONAL_SOFT_UPSIZE({old_size:.2f}->{position_size_usd:.2f})")
+                    logger.info(
+                        f"🟡 MIN_NOTIONAL_SOFT_UPSIZE: {trade_symbol} {side} ${old_size:.2f} -> "
+                        f"${position_size_usd:.2f} margin=${_margin_usd:.2f} "
+                        f"(cap=${_margin_info['cap']:.2f}, spread={spread_pct:.3f}%)"
+                    )
+                else:
+                    # Upsizing would break margin cap → reject
+                    logger.info(
+                        f"🚫 MIN_NOTIONAL_REJECT: {trade_symbol} {side} notional=${position_size_usd:.2f} "
+                        f"< min=${_dynamic_min_notional:.2f} but upsize margin ${_min_not_margin:.2f} > cap ${_margin_info['cap']:.2f} "
+                        f"reason={_soft_upsize['reason']}"
+                    )
+                    self.set_execution_feedback(trade_symbol, "MIN_NOTIONAL_REJECT")
+                    return None
             elif _dynamic_min_notional <= max_size_usd and _dynamic_min_notional <= (self.balance * 0.20):
                 old_size = position_size_usd
                 position_size_usd = _dynamic_min_notional
@@ -29615,7 +29708,8 @@ class PaperTradingEngine:
         if decision == 'WARN_WAIT' and not force_market:
             self.pipeline_metrics.setdefault('recheck_warn', 0)
             self.pipeline_metrics['recheck_warn'] += 1
-            wait_until = current_time + 30_000
+            wait_ms = compute_pending_retry_wait_ms(order, current_time, 30_000, rv.get('reason_summary', 'WARN_WAIT'))
+            wait_until = current_time + wait_ms
             order['recheckNextAt'] = max(
                 int(order.get('recheckNextAt', 0) or 0),
                 wait_until
@@ -29624,9 +29718,11 @@ class PaperTradingEngine:
                 int(order.get('confirmAfter', current_time)),
                 wait_until
             )
+            order['lastWaitMs'] = wait_ms
+            order['lastWaitReason'] = rv.get('reason_summary', 'WARN_WAIT')
             logger.info(
                 f"⚠️ ENTRY_RECHECK_WAIT: {symbol} {side} score={rv['recheck_score']:.0f} "
-                f"→ waiting 30s | {rv['reason_summary']}"
+                f"→ waiting {wait_ms/1000:.0f}s | {rv['reason_summary']}"
             )
             return False  # order stays, not executed
 
@@ -29719,14 +29815,17 @@ class PaperTradingEngine:
         now_ms = int(datetime.now().timestamp() * 1000)
 
         def _requeue_pending(wait_ms: int, reason: str):
-            next_ms = now_ms + max(1_000, int(wait_ms))
+            effective_wait_ms = compute_pending_retry_wait_ms(order, now_ms, wait_ms, reason)
+            next_ms = now_ms + effective_wait_ms
             order['recheckNextAt'] = max(int(order.get('recheckNextAt', 0) or 0), next_ms)
             order['confirmAfter'] = max(int(order.get('confirmAfter', now_ms) or now_ms), next_ms)
+            order['lastWaitMs'] = effective_wait_ms
+            order['lastWaitReason'] = reason
             if order not in self.pending_orders:
                 self.pending_orders.append(order)
             logger.info(
                 f"⏳ PENDING_REQUEUE: {order.get('side','')} {order.get('symbol','')} "
-                f"reason={reason} wait_ms={wait_ms}"
+                f"reason={reason} wait_ms={effective_wait_ms}"
             )
         
         # Phase 55: Check if already have position in this coin
@@ -31411,11 +31510,31 @@ class PaperTradingEngine:
         if position_size_usd < _dynamic_min_notional_m:
             _min_not_margin_m = _dynamic_min_notional_m / max(adjusted_leverage, 1)
             if _min_not_margin_m > _manual_margin_info['cap']:
-                logger.info(
-                    f"🚫 MIN_NOTIONAL_REJECT: {self.symbol} {signal['action']} notional=${position_size_usd:.2f} "
-                    f"< min=${_dynamic_min_notional_m:.2f} but upsize margin ${_min_not_margin_m:.2f} > cap ${_manual_margin_info['cap']:.2f} path=manual"
+                _manual_soft_upsize = evaluate_min_notional_soft_upsize(
+                    signal_score=float(signal.get('confidenceScore', 0) or 0),
+                    spread_pct=_m_sp,
+                    required_margin_usd=_min_not_margin_m,
+                    margin_cap_usd=_manual_margin_info['cap'],
+                    dynamic_min_notional_usd=_dynamic_min_notional_m,
+                    max_size_usd=self.balance * 0.15,
+                    balance_usd=self.balance,
                 )
-                return
+                if _manual_soft_upsize['allow']:
+                    _old_m_size = position_size_usd
+                    position_size_usd = _manual_soft_upsize['new_notional_usd']
+                    _manual_margin_usd = _manual_soft_upsize['new_margin_usd']
+                    position_size = position_size_usd / current_price if current_price > 0 else position_size
+                    logger.info(
+                        f"🟡 MIN_NOTIONAL_SOFT_UPSIZE: {self.symbol} {signal['action']} ${_old_m_size:.2f} -> "
+                        f"${position_size_usd:.2f} margin=${_manual_margin_usd:.2f} path=manual"
+                    )
+                else:
+                    logger.info(
+                        f"🚫 MIN_NOTIONAL_REJECT: {self.symbol} {signal['action']} notional=${position_size_usd:.2f} "
+                        f"< min=${_dynamic_min_notional_m:.2f} but upsize margin ${_min_not_margin_m:.2f} > cap ${_manual_margin_info['cap']:.2f} "
+                        f"path=manual reason={_manual_soft_upsize['reason']}"
+                    )
+                    return
             elif _dynamic_min_notional_m <= (self.balance * 0.20):
                 _old_m_size = position_size_usd
                 position_size_usd = _dynamic_min_notional_m
