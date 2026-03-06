@@ -276,3 +276,138 @@ async def test_optimizer_status_falls_back_when_regime_payload_errors(monkeypatc
     assert response.status_code == 200
     assert payload['marketRegime']['readyState'] == 'error'
     assert payload['marketRegime']['dataFlow']['inputSource'] == 'error'
+
+
+def test_build_pending_orders_observability_classifies_wait_states():
+    now_ms = 1_770_000_000_000
+    pending_orders = [
+        {
+            'id': 'po-confirm',
+            'symbol': 'AAAUSDT',
+            'side': 'LONG',
+            'confirmed': False,
+            'signalScore': 82,
+            'createdAt': now_ms - 30_000,
+            'confirmAfter': now_ms + 45_000,
+            'expiresAt': now_ms + 600_000,
+        },
+        {
+            'id': 'po-recheck',
+            'symbol': 'BBBUSDT',
+            'side': 'SHORT',
+            'confirmed': True,
+            'signalScore': 91,
+            'createdAt': now_ms - 900_000,
+            'confirmAfter': now_ms - 600_000,
+            'recheckNextAt': now_ms + 20_000,
+            'expiresAt': now_ms + 300_000,
+        },
+        {
+            'id': 'po-trail',
+            'symbol': 'CCCUSDT',
+            'side': 'SHORT',
+            'confirmed': True,
+            'signalScore': 95,
+            'createdAt': now_ms - 1_200_000,
+            'confirmAfter': now_ms - 1_000_000,
+            'expiresAt': now_ms + 90_000,
+            'trailingEntryActive': True,
+            'trailEntryDistance': 0.4,
+            'entryPrice': 100.0,
+        },
+    ]
+    feedback = {'BBBUSDT': {'reason': 'BLOCK_OPEN_SPREAD:spread_too_wide', 'ts': now_ms}}
+
+    result = main.build_pending_orders_observability(
+        pending_orders,
+        execution_feedback=feedback,
+        now_ms=now_ms,
+        min_confidence_score=74,
+    )
+
+    assert result['summary']['states']['confirm_wait'] == 1
+    assert result['summary']['states']['recheck_wait'] == 1
+    assert result['summary']['states']['trail_reversal_wait'] == 1
+    assert result['summary']['recheckWaiting'] == 1
+    assert result['summary']['expiringSoon'] == 1
+    assert result['orders'][1]['feedbackReason'] == 'BLOCK_OPEN_SPREAD:spread_too_wide'
+    assert result['orders'][2]['trailEntryDistancePct'] == 0.4
+
+
+def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_band():
+    now_ms = 1_770_000_000_000
+    order = {
+        'side': 'SHORT',
+        'confirmed': True,
+        'trailingEntryActive': False,
+        'entryPrice': 100.0,
+        'atr': 1.0,
+        'signalScore': 94,
+        'createdAt': now_ms - 700_000,
+    }
+
+    allowed = main.evaluate_aged_near_entry_fill(order, current_price=99.93, current_time=now_ms, min_confidence_score=74)
+    blocked = main.evaluate_aged_near_entry_fill(order, current_price=99.60, current_time=now_ms, min_confidence_score=74)
+
+    assert allowed['allow'] is True
+    assert allowed['reason'] == 'aged_near_entry'
+    assert blocked['allow'] is False
+    assert blocked['reason'] == 'too_far_from_entry'
+
+
+@pytest.mark.asyncio
+async def test_paper_trading_status_exposes_pending_summary_and_execution_diagnostics(monkeypatch):
+    now_ms = 1_770_000_000_000
+
+    async def fake_quality():
+        return {'trades_total_24h': 2, 'trade_metadata_coverage_pct_24h': 66.7}
+
+    trader = SimpleNamespace(
+        balance=123.4,
+        positions=[],
+        trades=[],
+        stats={},
+        enabled=True,
+        logs=[],
+        equity_curve=[],
+        pending_orders=[{
+            'id': 'po-1',
+            'symbol': 'TESTUSDT',
+            'side': 'LONG',
+            'confirmed': False,
+            'signalScore': 77,
+            'entryPrice': 10.0,
+            'createdAt': now_ms - 10_000,
+            'confirmAfter': now_ms + 30_000,
+            'expiresAt': now_ms + 600_000,
+        }],
+        execution_feedback={'TESTUSDT': {'reason': 'ENTRY_SCORE_LOW:0.51', 'ts': now_ms}},
+        pipeline_metrics={'recheck_pass': 0, 'recheck_fail': 0, 'recheck_warn': 1},
+        min_confidence_score=74,
+        get_today_pnl=lambda: {'todayPnl': 0.0, 'todayPnlPercent': 0.0},
+    )
+    live_trader = SimpleNamespace(
+        trading_mode='live',
+        enabled=True,
+        last_order_error=None,
+        exec_entry_score_min=0.55,
+        exec_max_spread_bps=8.0,
+        exec_max_drift_bps=15.0,
+        exec_score_source='penalized',
+        _exec_diag={'spread_block': 3, 'gate_block_total': 5},
+    )
+
+    monkeypatch.setattr(main, 'global_paper_trader', trader)
+    monkeypatch.setattr(main, 'live_binance_trader', live_trader)
+    monkeypatch.setattr(main.sqlite_manager, 'get_trade_data_quality_24h', fake_quality)
+
+    response = await main.paper_trading_status()
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload['pendingSummary']['count'] == 1
+    assert payload['pendingSummary']['states']['confirm_wait'] == 1
+    assert payload['pendingOrders'][0]['waitState'] == 'confirm_wait'
+    assert payload['pendingOrders'][0]['feedbackReason'] == 'ENTRY_SCORE_LOW:0.51'
+    assert payload['executionDiagnostics']['thresholds']['maxSpreadBps'] == 8.0
+    assert payload['executionDiagnostics']['counters']['spread_block'] == 3

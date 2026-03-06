@@ -4759,7 +4759,7 @@ class LiveBinanceTrader:
             }
             
         except Exception as e:
-            logger.error(f"PnL fetch error: {e}")
+            logger.error(f"PnL fetch error: {_format_exception_context(e)}")
             return {
                 'todayPnl': 0, 'todayPnlPercent': 0,
                 'totalPnl': 0, 'totalPnlPercent': 0,
@@ -8627,6 +8627,13 @@ DUAL_REGIME_GATE_ENABLED = os.environ.get('DUAL_REGIME_GATE_ENABLED', 'true').lo
 DUAL_REGIME_CONFLICT_MODE = os.environ.get('DUAL_REGIME_CONFLICT_MODE', 'block')  # block | soft
 DUAL_REGIME_MIN_CONF = float(os.environ.get('DUAL_REGIME_MIN_CONF', '0.60'))
 DUAL_REGIME_SHADOW = os.environ.get('DUAL_REGIME_SHADOW', 'false').lower() == 'true'  # true=log-only
+
+# Pending entry observability + low-risk aged-entry assist
+PENDING_NEAR_ENTRY_FILL_ENABLED = _env_bool("PENDING_NEAR_ENTRY_FILL_ENABLED", True)
+PENDING_NEAR_ENTRY_MIN_AGE_SEC = int(os.environ.get('PENDING_NEAR_ENTRY_MIN_AGE_SEC', '600'))
+PENDING_NEAR_ENTRY_SCORE_MIN = float(os.environ.get('PENDING_NEAR_ENTRY_SCORE_MIN', '88'))
+PENDING_NEAR_ENTRY_BAND_ATR_MULT = float(os.environ.get('PENDING_NEAR_ENTRY_BAND_ATR_MULT', '0.15'))
+PENDING_NEAR_ENTRY_BAND_BPS = float(os.environ.get('PENDING_NEAR_ENTRY_BAND_BPS', '10.0'))
 
 # MF-1: Market Fallback Edge Gate
 FALLBACK_EDGE_GATE_MODE = os.environ.get('FALLBACK_EDGE_GATE_MODE', 'enforce').lower()  # 'off' | 'shadow' | 'enforce'  # Phase B: enforce active
@@ -14061,7 +14068,7 @@ class MultiCoinScanner:
                         logger.warning(f"BookTicker REST failed: status={resp.status}")
                         return {}
         except Exception as e:
-            logger.warning(f"BookTicker REST error: {e}")
+            logger.warning(f"BookTicker REST error: {_format_exception_context(e)}")
             return {}
     
     async def scan_all_coins(self) -> list:
@@ -17882,7 +17889,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal['vp_boost'] = vp_boost
             logger.info(f"📈 VP BOOST: {symbol} +{vp_boost*100:.0f}% @ POC={coin_vp.poc:.6f}")
     except Exception as vp_err:
-        logger.warning(f"Volume Profile error: {vp_err}")
+        logger.warning(f"Volume Profile error: {_format_exception_context(vp_err)}")
     
     # =====================================================
     # DYNAMIC TRAIL PARAMETERS (Cloud Scanner - WebSocket Parity)
@@ -26873,6 +26880,195 @@ class SignalGenerator:
 # WhaleDetector removed — WhaleTracker (L4412) is the active implementation
 # See project_analysis.md #5 for details
 
+def _format_exception_context(exc: Exception) -> str:
+    """Return a compact, non-empty exception description for logs."""
+    if exc is None:
+        return "unknown"
+    exc_type = type(exc).__name__
+    message = str(exc).strip()
+    if message:
+        return f"{exc_type}: {message}"
+    detail = repr(exc).strip()
+    return f"{exc_type}: {detail}" if detail else exc_type
+
+
+def evaluate_aged_near_entry_fill(order: dict, current_price: float, current_time: int,
+                                   min_confidence_score: float) -> dict:
+    """Allow a narrow, aged pending fill near entry without reopening wide gates."""
+    result = {
+        'allow': False,
+        'reason': 'disabled',
+        'distance_pct': 0.0,
+        'band_pct': 0.0,
+        'age_sec': 0,
+    }
+    if not PENDING_NEAR_ENTRY_FILL_ENABLED:
+        return result
+    if not order or not bool(order.get('confirmed', False)) or bool(order.get('trailingEntryActive', False)):
+        result['reason'] = 'not_confirmed'
+        return result
+
+    entry_price = float(order.get('entryPrice', 0) or 0)
+    atr = float(order.get('atr', 0) or 0)
+    score = float(order.get('signalScore', 0) or 0)
+    created_at = int(order.get('createdAt', current_time) or current_time)
+    side = str(order.get('side', ''))
+    age_sec = max(0.0, (current_time - created_at) / 1000.0)
+    result['age_sec'] = round(age_sec, 1)
+
+    if current_price <= 0 or entry_price <= 0 or side not in ('LONG', 'SHORT'):
+        result['reason'] = 'invalid_price'
+        return result
+    if age_sec < PENDING_NEAR_ENTRY_MIN_AGE_SEC:
+        result['reason'] = 'too_fresh'
+        return result
+
+    required_score = max(float(min_confidence_score), PENDING_NEAR_ENTRY_SCORE_MIN)
+    if score < required_score:
+        result['reason'] = 'score_too_low'
+        return result
+
+    band_abs = max(
+        entry_price * (PENDING_NEAR_ENTRY_BAND_BPS / 10_000.0),
+        atr * PENDING_NEAR_ENTRY_BAND_ATR_MULT if atr > 0 else 0.0,
+    )
+    if band_abs <= 0:
+        result['reason'] = 'band_unavailable'
+        return result
+
+    if side == 'LONG':
+        if current_price <= entry_price:
+            result['reason'] = 'entry_touched'
+            return result
+        distance_abs = current_price - entry_price
+    else:
+        if current_price >= entry_price:
+            result['reason'] = 'entry_touched'
+            return result
+        distance_abs = entry_price - current_price
+
+    result['distance_pct'] = round((distance_abs / entry_price) * 100.0, 4)
+    result['band_pct'] = round((band_abs / entry_price) * 100.0, 4)
+    if distance_abs > band_abs:
+        result['reason'] = 'too_far_from_entry'
+        return result
+
+    result['allow'] = True
+    result['reason'] = 'aged_near_entry'
+    return result
+
+
+def build_pending_orders_observability(pending_orders: list, execution_feedback: dict = None,
+                                       now_ms: int = None, min_confidence_score: int = 74) -> dict:
+    """Decorate pending orders with wait-state diagnostics and a compact summary."""
+    execution_feedback = execution_feedback or {}
+    now_ms = int(now_ms or int(datetime.now().timestamp() * 1000))
+    decorated = []
+    states = {}
+    feedback_reasons = {}
+    confirmed_count = 0
+    trailing_count = 0
+    expiring_soon = 0
+    aged_confirmed = 0
+    recheck_waiting = 0
+
+    for order in pending_orders or []:
+        symbol = str(order.get('symbol', ''))
+        created_at = int(order.get('createdAt', now_ms) or now_ms)
+        confirm_after = int(order.get('confirmAfter', 0) or 0)
+        expires_at = int(order.get('expiresAt', 0) or 0)
+        recheck_next = int(order.get('recheckNextAt', 0) or 0)
+        confirmed = bool(order.get('confirmed', False))
+        trailing_active = bool(order.get('trailingEntryActive', False))
+        age_sec = max(0, int((now_ms - created_at) / 1000))
+        confirm_in_sec = max(0, int((confirm_after - now_ms) / 1000)) if confirm_after else 0
+        expires_in_sec = max(0, int((expires_at - now_ms) / 1000)) if expires_at else 0
+        recheck_in_sec = max(0, int((recheck_next - now_ms) / 1000)) if recheck_next else 0
+        feedback = execution_feedback.get(symbol, {}) if symbol else {}
+        feedback_reason = str(feedback.get('reason', '') or '')
+
+        if confirmed:
+            confirmed_count += 1
+        if trailing_active:
+            trailing_count += 1
+        if recheck_in_sec > 0:
+            recheck_waiting += 1
+        if confirmed and age_sec >= PENDING_NEAR_ENTRY_MIN_AGE_SEC:
+            aged_confirmed += 1
+        if expires_in_sec and expires_in_sec <= 120:
+            expiring_soon += 1
+
+        if recheck_in_sec > 0:
+            wait_state = 'recheck_wait'
+            wait_reason = feedback_reason or f"recheck_backoff:{order.get('recheckDecision') or 'pending'}"
+        elif not confirmed:
+            wait_state = 'confirm_wait'
+            wait_reason = 'waiting_confirmation_delay'
+        elif trailing_active:
+            wait_state = 'trail_reversal_wait'
+            wait_reason = feedback_reason or 'waiting_trailing_reversal'
+        else:
+            wait_state = 'entry_touch_wait'
+            wait_reason = feedback_reason or 'waiting_entry_touch'
+
+        if wait_state == 'entry_touch_wait' and confirmed and age_sec >= PENDING_NEAR_ENTRY_MIN_AGE_SEC:
+            wait_state = 'aged_entry_touch_wait'
+            if not feedback_reason:
+                wait_reason = 'aged_confirmed_waiting_near_entry_opportunity'
+        if expires_in_sec and expires_in_sec <= 120:
+            wait_reason = f"{wait_reason}|expiring_soon"
+
+        states[wait_state] = states.get(wait_state, 0) + 1
+        if feedback_reason:
+            feedback_reasons[feedback_reason] = feedback_reasons.get(feedback_reason, 0) + 1
+
+        trail_entry_distance = float(order.get('trailEntryDistance', 0) or 0)
+        entry_price = float(order.get('entryPrice', 0) or 0)
+        decorated.append({
+            "waitState": wait_state,
+            "waitReason": wait_reason,
+            "ageSec": age_sec,
+            "confirmInSec": confirm_in_sec,
+            "recheckInSec": recheck_in_sec,
+            "expiresInSec": expires_in_sec,
+            "feedbackReason": feedback_reason or None,
+            "scoreBuffer": round(float(order.get('signalScore', 0) or 0) - float(min_confidence_score), 2),
+            "trailEntryActive": trailing_active,
+            "trailEntryDistancePct": round((trail_entry_distance / entry_price) * 100.0, 4) if entry_price > 0 and trail_entry_distance > 0 else 0.0,
+            "allowMarket": bool(order.get('allowMarket', False)),
+            "recheckDecision": order.get('recheckDecision'),
+        })
+
+    top_feedback = sorted(feedback_reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
+    return {
+        "orders": decorated,
+        "summary": {
+            "count": len(pending_orders or []),
+            "confirmed": confirmed_count,
+            "trailingActive": trailing_count,
+            "recheckWaiting": recheck_waiting,
+            "agedConfirmed": aged_confirmed,
+            "expiringSoon": expiring_soon,
+            "states": states,
+            "feedbackReasons": [{"reason": reason, "count": count} for reason, count in top_feedback],
+        }
+    }
+
+
+def build_execution_diagnostics_snapshot(trader) -> dict:
+    """Expose live execution thresholds and counters for ops visibility."""
+    diag = dict(getattr(trader, '_exec_diag', {}) or {})
+    return {
+        "thresholds": {
+            "entryScoreMin": float(getattr(trader, 'exec_entry_score_min', 0.0) or 0.0),
+            "maxSpreadBps": float(getattr(trader, 'exec_max_spread_bps', 0.0) or 0.0),
+            "maxDriftBps": float(getattr(trader, 'exec_max_drift_bps', 0.0) or 0.0),
+            "scoreSource": str(getattr(trader, 'exec_score_source', 'unknown')),
+        },
+        "counters": diag,
+    }
+
+
 class PaperTradingEngine:
     """
     Simulates trading execution on the backend (Server-Side).
@@ -26958,6 +27154,7 @@ class PaperTradingEngine:
             'thin_book_soft_override': 0, 'thin_book_super_override': 0,
             'order_attempted': 0, 'order_success': 0, 'order_failed': 0,
             'market_fallback_failed': 0,
+            'near_entry_attempt': 0, 'near_entry_wait': 0,
             'signal_accepted': 0, 'open_attempted': 0, 'open_created': 0,
             'open_rejected': 0, 'open_reject_reasons': {},
             # Phase 237: Signal quality counters
@@ -29019,6 +29216,31 @@ class PaperTradingEngine:
                     reached_entry = True
                 elif side == 'SHORT' and current_price >= entry_price:
                     reached_entry = True
+
+                near_entry_fill = evaluate_aged_near_entry_fill(
+                    order=order,
+                    current_price=float(current_price),
+                    current_time=current_time,
+                    min_confidence_score=self.min_confidence_score,
+                )
+                if not reached_entry and near_entry_fill['allow']:
+                    self.pipeline_metrics.setdefault('near_entry_attempt', 0)
+                    self.pipeline_metrics['near_entry_attempt'] += 1
+                    order['nearEntryAssist'] = near_entry_fill
+                    self.add_log(
+                        f"⚡ AGED NEAR ENTRY: {side} {symbol} @ ${current_price:.6f} | "
+                        f"dist={near_entry_fill['distance_pct']:.3f}% <= band={near_entry_fill['band_pct']:.3f}%"
+                    )
+                    logger.info(
+                        f"⚡ AGED_NEAR_ENTRY_ATTEMPT: {side} {symbol} price=${current_price:.6f} "
+                        f"entry=${entry_price:.6f} dist={near_entry_fill['distance_pct']:.3f}% "
+                        f"band={near_entry_fill['band_pct']:.3f}% age={near_entry_fill['age_sec']:.0f}s"
+                    )
+                    _near_entry_done = await self._gate_and_execute(order, current_price, opportunities, current_time)
+                    if not _near_entry_done:
+                        self.pipeline_metrics.setdefault('near_entry_wait', 0)
+                        self.pipeline_metrics['near_entry_wait'] += 1
+                    continue
 
                 if reached_entry:
                     # Start trailing entry — track the extreme price
@@ -33606,26 +33828,31 @@ async def paper_trading_status():
     """Get current paper trading status - used for initial UI sync."""
     today_pnl_data = global_paper_trader.get_today_pnl()
     stats_with_today = {**global_paper_trader.stats, **today_pnl_data}
-    pending_orders = [
-        {
-            "id": o.get("id"),
-            "symbol": o.get("symbol"),
-            "side": o.get("side"),
-            "state": o.get("state"),
-            "confirmed": bool(o.get("confirmed", False)),
-            "signalScore": o.get("signalScore", 0),
-            "entryPrice": o.get("entryPrice", 0),
-            "createdAt": o.get("createdAt", 0),
-            "confirmAfter": o.get("confirmAfter", 0),
-            "recheckNextAt": o.get("recheckNextAt", 0),
-            "recheckDecision": o.get("recheckDecision"),
-            "expiresAt": o.get("expiresAt", 0),
-            "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
-            "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
-            "distanceTruth": o.get("distance_truth", {}),  # RFX-2B
-        }
-        for o in global_paper_trader.pending_orders
-    ]
+    pending_obs = build_pending_orders_observability(
+        global_paper_trader.pending_orders,
+        execution_feedback=getattr(global_paper_trader, 'execution_feedback', {}),
+        min_confidence_score=getattr(global_paper_trader, 'min_confidence_score', 74),
+    )
+    pending_orders = []
+    for order, diag in zip(global_paper_trader.pending_orders, pending_obs["orders"]):
+        pending_orders.append({
+            "id": order.get("id"),
+            "symbol": order.get("symbol"),
+            "side": order.get("side"),
+            "state": order.get("state"),
+            "confirmed": bool(order.get("confirmed", False)),
+            "signalScore": order.get("signalScore", 0),
+            "entryPrice": order.get("entryPrice", 0),
+            "createdAt": order.get("createdAt", 0),
+            "confirmAfter": order.get("confirmAfter", 0),
+            "recheckNextAt": order.get("recheckNextAt", 0),
+            "recheckDecision": order.get("recheckDecision"),
+            "expiresAt": order.get("expiresAt", 0),
+            "truthSnapshot": order.get("truth_snapshot", {}),  # RFX-1D
+            "regimeAdjustment": order.get("regime_adjustment", ""),  # RFX-1D
+            "distanceTruth": order.get("distance_truth", {}),  # RFX-2B
+            **diag,
+        })
     
     # Phase 239: Data quality metrics
     try:
@@ -33649,7 +33876,9 @@ async def paper_trading_status():
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
         "pendingOrdersCount": len(global_paper_trader.pending_orders),
         "pendingOrders": pending_orders,
+        "pendingSummary": pending_obs["summary"],
         "lastOrderError": live_binance_trader.last_order_error,
+        "executionDiagnostics": build_execution_diagnostics_snapshot(live_binance_trader),
         # Phase 237D: Reject attribution summary
         "falseNegativeSummary": get_reject_attribution_summary() if REJECT_ATTRIBUTION_ENABLED else {},
         # Phase 239: Trade metadata quality
@@ -34285,7 +34514,7 @@ async def get_performance_summary():
                 binance_today_pnl_pct = pnl_data.get('todayPnlPercent', 0)
                 binance_total_pnl_income = pnl_data.get('totalPnl', 0)
     except Exception as e:
-        logger.debug(f"Binance today PnL fetch error: {e}")
+        logger.debug(f"Binance today PnL fetch error: {_format_exception_context(e)}")
     
     return JSONResponse({
         "success": True,
@@ -34403,26 +34632,31 @@ async def scanner_status():
 @app.get("/paper-trading/settings")
 async def paper_trading_get_settings():
     """Get current cloud trading settings."""
-    pending_orders = [
-        {
-            "id": o.get("id"),
-            "symbol": o.get("symbol"),
-            "side": o.get("side"),
-            "state": o.get("state"),
-            "confirmed": bool(o.get("confirmed", False)),
-            "signalScore": o.get("signalScore", 0),
-            "entryPrice": o.get("entryPrice", 0),
-            "createdAt": o.get("createdAt", 0),
-            "confirmAfter": o.get("confirmAfter", 0),
-            "recheckNextAt": o.get("recheckNextAt", 0),
-            "recheckDecision": o.get("recheckDecision"),
-            "expiresAt": o.get("expiresAt", 0),
-            "truthSnapshot": o.get("truth_snapshot", {}),  # RFX-1D
-            "regimeAdjustment": o.get("regime_adjustment", ""),  # RFX-1D
-            "distanceTruth": o.get("distance_truth", {}),  # RFX-2B
-        }
-        for o in global_paper_trader.pending_orders
-    ]
+    pending_obs = build_pending_orders_observability(
+        global_paper_trader.pending_orders,
+        execution_feedback=getattr(global_paper_trader, 'execution_feedback', {}),
+        min_confidence_score=getattr(global_paper_trader, 'min_confidence_score', 74),
+    )
+    pending_orders = []
+    for order, diag in zip(global_paper_trader.pending_orders, pending_obs["orders"]):
+        pending_orders.append({
+            "id": order.get("id"),
+            "symbol": order.get("symbol"),
+            "side": order.get("side"),
+            "state": order.get("state"),
+            "confirmed": bool(order.get("confirmed", False)),
+            "signalScore": order.get("signalScore", 0),
+            "entryPrice": order.get("entryPrice", 0),
+            "createdAt": order.get("createdAt", 0),
+            "confirmAfter": order.get("confirmAfter", 0),
+            "recheckNextAt": order.get("recheckNextAt", 0),
+            "recheckDecision": order.get("recheckDecision"),
+            "expiresAt": order.get("expiresAt", 0),
+            "truthSnapshot": order.get("truth_snapshot", {}),  # RFX-1D
+            "regimeAdjustment": order.get("regime_adjustment", ""),  # RFX-1D
+            "distanceTruth": order.get("distance_truth", {}),  # RFX-2B
+            **diag,
+        })
     return JSONResponse({
         "symbol": global_paper_trader.symbol,
         "leverage": global_paper_trader.leverage,
@@ -34470,7 +34704,9 @@ async def paper_trading_get_settings():
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
         "param_limits": PARAM_LIMITS,
         "pendingOrdersCount": len(global_paper_trader.pending_orders),
-        "pendingOrders": pending_orders
+        "pendingOrders": pending_orders,
+        "pendingSummary": pending_obs["summary"],
+        "executionDiagnostics": build_execution_diagnostics_snapshot(live_binance_trader),
     })
 
 @app.post("/paper-trading/settings")
@@ -36118,7 +36354,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                         signal['vp_boost'] = vp_boost
                                         logger.info(f"📈 VP BOOST: {active_symbol} +{vp_boost*100:.0f}% @ POC={coin_vp.poc:.6f}")
                                 except Exception as vp_err:
-                                    logger.warning(f"Volume Profile error: {vp_err}")
+                                    logger.warning(f"Volume Profile error: {_format_exception_context(vp_err)}")
                                 
                                 # =====================================================
                                 # DYNAMIC TRAIL PARAMETERS (Cloud Scanner Parity)
