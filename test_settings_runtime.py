@@ -449,6 +449,32 @@ def test_build_pending_orders_observability_prefers_order_local_feedback_and_hid
     assert result['orders'][0]['feedbackReason'] == 'force_spread_soft:spread_too_wide:9.5bps'
 
 
+def test_build_pending_orders_observability_prefers_feedback_reason_over_symbol_feedback():
+    now_ms = 1_770_000_000_000
+    pending_orders = [{
+        'id': 'po-local-feedback',
+        'symbol': 'LOCALUSDT',
+        'side': 'LONG',
+        'confirmed': True,
+        'signalScore': 88,
+        'entryPrice': 10.0,
+        'signalPrice': 10.1,
+        'createdAt': now_ms - 300_000,
+        'confirmAfter': now_ms - 60_000,
+        'expiresAt': now_ms + 300_000,
+        'feedbackReason': 'ENTRY_RECHECK_FAIL:OB_VETO(7.0)',
+    }]
+
+    result = main.build_pending_orders_observability(
+        pending_orders,
+        execution_feedback={'LOCALUSDT': {'reason': 'BLOCK_OPEN_SPREAD:spread_too_wide', 'ts': now_ms}},
+        now_ms=now_ms,
+        min_confidence_score=80,
+    )
+
+    assert result['orders'][0]['feedbackReason'] == 'ENTRY_RECHECK_FAIL:OB_VETO(7.0)'
+
+
 def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_band():
     now_ms = 1_770_000_000_000
     order = {
@@ -565,6 +591,33 @@ def test_revalidate_pending_entry_softens_mild_ob_veto_for_confirmed_high_score_
     assert result['decision'] == 'WARN_WAIT'
     assert result['hard_reject'] is False
     assert 'OB_SOFTEN(6.2)' in result['reasons']
+
+
+def test_revalidate_pending_entry_waits_on_microstructure_disagreement_without_direction_flip():
+    now_ms = 1_770_000_000_000
+    order = {
+        'symbol': 'WAITUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 90,
+        'spreadPct': 0.05,
+        'createdAt': now_ms - 1_200_000,
+        'minConfidenceScoreSnapshot': 80,
+    }
+    opportunity = {
+        'signalAction': 'NONE',
+        'spreadPct': 0.14,
+        'volumeRatio': 0.18,
+        'obImbalanceTrend': 8.1,
+    }
+
+    result = main.revalidate_pending_entry(order, opportunity, now_ms)
+
+    assert result['decision'] == 'WARN_WAIT'
+    assert result['hard_reject'] is False
+    assert 'SPREAD_HIGH(0.140)' in result['reasons']
+    assert 'OB_VETO(8.1)' in result['reasons']
+    assert 'VOL_VERYLOW(0.18)' in result['reasons']
 
 
 def test_reinforce_confirmed_pending_keeps_short_entry_closer_to_market_and_preserves_timers(tmp_path):

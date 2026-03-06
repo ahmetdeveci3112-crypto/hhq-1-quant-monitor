@@ -10315,7 +10315,6 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         score += 6
         reasons.append(f"SPREAD_HIGH({live_spread:.3f})")
     else:
-        hard_reject = True
         spread_reject = True
         reasons.append(f"SPREAD_REJECT({live_spread:.3f}>{spread_limit:.3f})")
 
@@ -10331,7 +10330,6 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
             score += 4
             reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
         else:
-            hard_reject = True
             ob_veto = True
             reasons.append(f"OB_VETO({live_ob_trend:.1f})")
     else:  # SHORT
@@ -10345,7 +10343,6 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
             score += 4
             reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
         else:
-            hard_reject = True
             ob_veto = True
             reasons.append(f"OB_VETO({live_ob_trend:.1f})")
 
@@ -10361,7 +10358,6 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         reasons.append(f"VOL_LOW({live_vol_ratio:.2f})")
     else:
         if live_spread > 0.20:
-            hard_reject = True
             liquidity_reject = True
             reasons.append(f"LIQ_REJECT(vol={live_vol_ratio:.2f},sp={live_spread:.3f})")
         else:
@@ -10391,7 +10387,6 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         liquidity_reject=liquidity_reject,
         live_ob_trend=live_ob_trend,
     ):
-        hard_reject = False
         softened_hard_reject = True
         score = max(score, 46.0 if live_side == 'NONE' else 52.0)
         reasons.append(f"OB_SOFTEN({live_ob_trend:.1f})")
@@ -10404,9 +10399,9 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     elif score >= 40:
         decision = 'WARN_WAIT'
     else:
-        # Very low score should not be dropped immediately unless stale.
-        # Keep it waiting for a short period to avoid fallback starvation.
-        decision = 'FAIL_DROP' if age_min >= 30 else 'WARN_WAIT'
+        # Pending recheck is now entry-viability-only. Microstructure weakness
+        # should wait/retry and let live BBO/drift gates remain final authority.
+        decision = 'WARN_WAIT'
 
     allow_market = (
         not hard_reject and (
@@ -27248,10 +27243,14 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             order.get('minConfidenceScoreSnapshot', min_confidence_score),
             PENDING_NEAR_ENTRY_SCORE_MIN,
         )
-        order_local_reason = str(order.get('lastWaitReason', '') or '')
+        order_local_reason = str(order.get('feedbackReason', '') or '')
         if order_local_reason:
             feedback_reason = order_local_reason
-        elif feedback_reason.startswith('FINAL_SCORE_BELOW_MIN') and score >= float(min_confidence_score):
+        else:
+            order_local_reason = str(order.get('lastWaitReason', '') or '')
+            if order_local_reason:
+                feedback_reason = order_local_reason
+        if not order_local_reason and feedback_reason.startswith('FINAL_SCORE_BELOW_MIN') and score >= float(min_confidence_score):
             feedback_reason = ''
 
         if confirmed:
@@ -27802,6 +27801,33 @@ class PaperTradingEngine:
         """Clear execution feedback once symbol progresses to pending/filled."""
         if symbol in self.execution_feedback:
             self.execution_feedback.pop(symbol, None)
+
+    def set_pending_execution_feedback(self, order: Optional[dict], reason: str, *, wait: bool = False):
+        """Persist pending-order-local feedback while keeping legacy symbol feedback in sync."""
+        if order is None:
+            return
+        now_ms = int(datetime.now().timestamp() * 1000)
+        text = str(reason or '').strip()
+        if not text:
+            return
+        order['feedbackReason'] = text
+        order['feedbackTs'] = now_ms
+        if wait:
+            order['lastWaitReason'] = text
+        symbol = str(order.get('symbol', '') or '')
+        if symbol:
+            self.set_execution_feedback(symbol, text)
+
+    def clear_pending_execution_feedback(self, order: Optional[dict]):
+        """Clear pending-order-local feedback and matching symbol-level residue."""
+        if order is None:
+            return
+        order.pop('feedbackReason', None)
+        order.pop('feedbackTs', None)
+        order.pop('lastWaitReason', None)
+        symbol = str(order.get('symbol', '') or '')
+        if symbol:
+            self.clear_execution_feedback(symbol)
 
     def get_execution_feedback(self, symbol: str, ttl_sec: int = 1800) -> Optional[dict]:
         """Get recent execution feedback; auto-expire stale entries."""
@@ -29352,14 +29378,14 @@ class PaperTradingEngine:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
                         self.pipeline_metrics['fallback_gate_blocked'] += 1
-                        self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                        self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
                         logger.info(f"🚫 MARKET FALLBACK BLOCKED(EXPIRE): {side} {symbol} | removing stale pending")
                         self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
                     continue
                 if order in self.pending_orders:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics['pending_expired'] += 1
-                self.set_execution_feedback(symbol, "PENDING_EXPIRED")
+                self.set_pending_execution_feedback(order, "PENDING_EXPIRED")
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'timeout', current_time)
@@ -29388,7 +29414,7 @@ class PaperTradingEngine:
                 if pending_age_min > (stale_threshold_min + stale_grace_min) and adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['stale_dropped'] += 1
-                    self.set_execution_feedback(symbol, "STALE_SIGNAL")
+                    self.set_pending_execution_feedback(order, "STALE_SIGNAL")
                     self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
                     logger.info(
                         f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, "
@@ -29407,7 +29433,7 @@ class PaperTradingEngine:
                 self.pending_orders.remove(order)
                 self.pipeline_metrics.setdefault('low_score_pending_dropped', 0)
                 self.pipeline_metrics['low_score_pending_dropped'] += 1
-                self.set_execution_feedback(symbol, "PENDING_SCORE_BELOW_MIN")
+                self.set_pending_execution_feedback(order, "PENDING_SCORE_BELOW_MIN")
                 self.add_log(
                     f"🧹 PENDING_SCORE_DROP: {side} {symbol} "
                     f"score={signal_score:.0f} < min={score_floor:.0f} (age={pending_age_min:.0f}m)"
@@ -29445,7 +29471,7 @@ class PaperTradingEngine:
                         if price_drop_pct > 3.0:  # Fiyat %3'den fazla düştü - entry kaçırıldı
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
-                            self.set_execution_feedback(symbol, "SIGNAL_MISSED")
+                            self.set_pending_execution_feedback(order, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
                             self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
@@ -29456,7 +29482,7 @@ class PaperTradingEngine:
                         if price_rise_pct > 3.0:  # Fiyat %3'den fazla yükseldi - entry kaçırıldı
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
-                            self.set_execution_feedback(symbol, "SIGNAL_MISSED")
+                            self.set_pending_execution_feedback(order, "SIGNAL_MISSED")
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
                             self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
@@ -29728,14 +29754,14 @@ class PaperTradingEngine:
                                     self.pending_orders.remove(order)
                                 self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
                                 self.pipeline_metrics['fallback_gate_blocked'] += 1
-                                self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                                self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
                                 logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
                                 self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
-                        self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
+                        self.set_pending_execution_feedback(order, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} düşüş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} dropped {((entry_price-current_price)/atr):.1f}×ATR below entry")
                         self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'trail_fail', current_time)
@@ -29777,14 +29803,14 @@ class PaperTradingEngine:
                                     self.pending_orders.remove(order)
                                 self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
                                 self.pipeline_metrics['fallback_gate_blocked'] += 1
-                                self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                                self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
                                 logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
                                 self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
-                        self.set_execution_feedback(symbol, "TRAIL_ENTRY_FAIL")
+                        self.set_pending_execution_feedback(order, "TRAIL_ENTRY_FAIL")
                         self.add_log(f"❌ TRAIL ENTRY FAIL: {side} {symbol} yükseliş devam (${current_price:.6f})")
                         logger.info(f"❌ TRAIL ENTRY CANCEL: {side} {symbol} rose {((current_price-entry_price)/atr):.1f}×ATR above entry")
                         self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'trail_fail', current_time)
@@ -29804,7 +29830,7 @@ class PaperTradingEngine:
                                 self.pending_orders.remove(order)
                             self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
                             self.pipeline_metrics['fallback_gate_blocked'] += 1
-                            self.set_execution_feedback(symbol, "MARKET_FALLBACK_BLOCKED")
+                            self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
                             logger.info(f"🚫 MARKET FALLBACK BLOCKED(TIMEOUT): {side} {symbol} | removing pending")
                             self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
                         continue
@@ -29812,7 +29838,7 @@ class PaperTradingEngine:
                     if order in self.pending_orders:
                         self.pending_orders.remove(order)
                     self.pipeline_metrics['trail_entry_timeout'] += 1
-                    self.set_execution_feedback(symbol, "TRAIL_ENTRY_TIMEOUT")
+                    self.set_pending_execution_feedback(order, "TRAIL_ENTRY_TIMEOUT")
                     self.add_log(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} (15dk reversal olmadı, score={signal_score})")
                     logger.info(f"⏰ TRAIL ENTRY TIMEOUT: {side} {symbol} after {elapsed_secs:.0f}s score={signal_score}")
                     self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'trail_timeout', current_time)
@@ -29840,7 +29866,7 @@ class PaperTradingEngine:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics.setdefault('canary_market_block', 0)
                 self.pipeline_metrics['canary_market_block'] += 1
-                self.set_execution_feedback(symbol, "CANARY_MARKET_BLOCK")
+                self.set_pending_execution_feedback(order, "CANARY_MARKET_BLOCK")
                 self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'canary_no_market_fallback', current_time)
                 logger.info(f"🐤 CANARY: force-market blocked for {symbol}, order expired")
                 return True  # order removed
@@ -29878,7 +29904,7 @@ class PaperTradingEngine:
                     self.pipeline_metrics.setdefault('open_reject_reasons', {})
                     self.pipeline_metrics['open_reject_reasons'][_hard_reason] = \
                         self.pipeline_metrics['open_reject_reasons'].get(_hard_reason, 0) + 1
-                    self.set_execution_feedback(symbol, _hard_reason)
+                    self.set_pending_execution_feedback(order, _hard_reason)
                     self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _hard_reason.lower(), current_time)
                     logger.warning(
                         f"🚫 EDGE_GATE_BLOCK: {side} {symbol} | reason={_hard_reason} "
@@ -29917,7 +29943,7 @@ class PaperTradingEngine:
                         self.pipeline_metrics.setdefault('open_reject_reasons', {})
                         self.pipeline_metrics['open_reject_reasons'][_block_reason] = \
                             self.pipeline_metrics['open_reject_reasons'].get(_block_reason, 0) + 1
-                        self.set_execution_feedback(symbol, _block_reason)
+                        self.set_pending_execution_feedback(order, _block_reason)
                         self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _block_reason.lower(), current_time)
                         logger.warning(f"🚫 EDGE_GATE_BLOCK: {_snap} reason={_block_reason} req={_required_edge:.4f}")
                         return True  # order removed
@@ -29955,7 +29981,7 @@ class PaperTradingEngine:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics.setdefault('recheck_fail', 0)
                 self.pipeline_metrics['recheck_fail'] += 1
-                self.set_execution_feedback(symbol, "ENTRY_RECHECK_FAIL")
+                self.set_pending_execution_feedback(order, f"ENTRY_RECHECK_FAIL:{rv['reason_summary']}")
                 self.add_log(
                     f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
                     f"| {rv['reason_summary']}"
@@ -29986,7 +30012,7 @@ class PaperTradingEngine:
                 wait_until
             )
             order['lastWaitMs'] = wait_ms
-            order['lastWaitReason'] = rv.get('reason_summary', 'WARN_WAIT')
+            self.set_pending_execution_feedback(order, rv.get('reason_summary', 'WARN_WAIT'), wait=True)
             logger.info(
                 f"⚠️ ENTRY_RECHECK_WAIT: {symbol} {side} score={rv['recheck_score']:.0f} "
                 f"→ waiting {wait_ms/1000:.0f}s | {rv['reason_summary']}"
@@ -30038,7 +30064,7 @@ class PaperTradingEngine:
                             f"\U0001f6ab ENTRY_SCORE_LOW: {side} {symbol} score={escore['final']:.3f} "
                             f"< min={live_binance_trader.exec_entry_score_min} | sig={escore['signal']:.2f} micro={escore['micro']:.2f} risk={escore['risk']:.2f}"
                         )
-                        self.set_execution_feedback(symbol, f"ENTRY_SCORE_LOW:{escore['final']:.3f}")
+                        self.set_pending_execution_feedback(order, f"ENTRY_SCORE_LOW:{escore['final']:.3f}", wait=True)
                         return False  # order stays, wait
 
                 # ===== Drift Guard =====
@@ -30053,7 +30079,7 @@ class PaperTradingEngine:
                         logger.info(f"\u26a0\ufe0f DRIFT_SOFT: {side} {symbol} drift={drift_bps:.1f}bps > max but force_market=True, proceeding")
                     else:
                         live_binance_trader._exec_diag['gate_block_total'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps")
+                        self.set_pending_execution_feedback(order, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps", wait=True)
                         logger.warning(f"\U0001f6ab BLOCK_OPEN_DRIFT: {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps")
                         return False  # order stays, wait for price to converge
 
@@ -30065,6 +30091,7 @@ class PaperTradingEngine:
         self.pipeline_metrics.setdefault('recheck_pass', 0)
         self.pipeline_metrics['recheck_pass'] += 1
         order['recheckNextAt'] = 0
+        self.clear_pending_execution_feedback(order)
 
         # force_market is passed through as-is; recheck does NOT downgrade it.
         await self.execute_pending_order(order, fill_price, force_market=force_market)
@@ -30087,7 +30114,7 @@ class PaperTradingEngine:
             order['recheckNextAt'] = max(int(order.get('recheckNextAt', 0) or 0), next_ms)
             order['confirmAfter'] = max(int(order.get('confirmAfter', now_ms) or now_ms), next_ms)
             order['lastWaitMs'] = effective_wait_ms
-            order['lastWaitReason'] = reason
+            self.set_pending_execution_feedback(order, reason, wait=True)
             if order not in self.pending_orders:
                 self.pending_orders.append(order)
             logger.info(
@@ -30418,7 +30445,7 @@ class PaperTradingEngine:
                             live_binance_trader._exec_diag['stale_block_count'] += 1
                             live_binance_trader._exec_diag['gate_block_total'] += 1
                             self.pipeline_metrics['spread_rejected'] += 1
-                            self.set_execution_feedback(symbol, f"BLOCK_OPEN_STALE_BBO:{reason}")
+                            self.set_pending_execution_feedback(order, f"BLOCK_OPEN_STALE_BBO:{reason}", wait=True)
                             logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_STALE_BBO | reason={reason}")
                             self.add_log(f"🚫 BBO VETO: {symbol} stale BBO")
                             _requeue_pending(30_000, f"stale_bbo:{reason}")
@@ -30428,7 +30455,7 @@ class PaperTradingEngine:
                             live_binance_trader._exec_diag['spread_block'] += 1
                             live_binance_trader._exec_diag['gate_block_total'] += 1
                             self.pipeline_metrics['spread_rejected'] += 1
-                            self.set_execution_feedback(symbol, f"BLOCK_OPEN_SPREAD:{reason}")
+                            self.set_pending_execution_feedback(order, f"BLOCK_OPEN_SPREAD:{reason}", wait=True)
                             logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_SPREAD | reason={reason} spread_bps={pre_vbbo.get('spread_bps')}")
                             self.add_log(f"🚫 SPREAD FILTER: {symbol} entry skipped ({reason})")
                             _requeue_pending(30_000, f"bbo_spread:{reason}")
@@ -30438,7 +30465,7 @@ class PaperTradingEngine:
                         live_binance_trader._exec_diag['invalid_block_count'] += 1
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['spread_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{reason}")
+                        self.set_pending_execution_feedback(order, f"BLOCK_OPEN_INVALID_BBO:{reason}", wait=True)
                         logger.warning(f"🚫 BBO_VETO: {side} {symbol} BLOCK_OPEN_INVALID_BBO | reason={reason}")
                         self.add_log(f"🚫 BBO VETO: {symbol} entry skipped ({reason})")
                         _requeue_pending(30_000, f"invalid_bbo:{reason}")
@@ -30482,7 +30509,7 @@ class PaperTradingEngine:
                     if fill_slippage > MAX_FILL_SLIPPAGE_PCT:
                         logger.warning(f"🚫 SLIPPAGE_GUARD: {side} {symbol} fill slippage {fill_slippage:.3f}% > max {MAX_FILL_SLIPPAGE_PCT}% — CLOSING immediately")
                         self.add_log(f"🚫 SLIPPAGE REJECT: {symbol} closed (fill slip {fill_slippage:.2f}%)")
-                        self.set_execution_feedback(symbol, f"SLIPPAGE_REJECT:{fill_slippage:.2f}%")
+                        self.set_pending_execution_feedback(order, f"SLIPPAGE_REJECT:{fill_slippage:.2f}%")
                         try:
                             await live_binance_trader.close_position(
                                 symbol=symbol,
@@ -30525,7 +30552,7 @@ class PaperTradingEngine:
                     order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ BINANCE ORDER FAILED - skipping position creation")
                     self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
-                    self.set_execution_feedback(symbol, f"BINANCE_ORDER_FAILED:{order_error}")
+                    self.set_pending_execution_feedback(order, f"BINANCE_ORDER_FAILED:{order_error}")
                     return  # Don't create position if Binance order failed
                     
             except Exception as e:
@@ -30536,7 +30563,7 @@ class PaperTradingEngine:
                     error_msg = f"{error_msg} | {order_error[:80]}"
                 logger.error(f"❌ LIVE ORDER ERROR: {e}")
                 self.add_log(f"❌ BINANCE HATASI: {side} {symbol} - {error_msg}")
-                self.set_execution_feedback(symbol, "BINANCE_ORDER_ERROR")
+                self.set_pending_execution_feedback(order, "BINANCE_ORDER_ERROR")
                 return  # Don't create position if there was an error
         elif force_market and is_live_mode:
             # Force market: BBO + drift guard still enforced for safety
@@ -30562,13 +30589,13 @@ class PaperTradingEngine:
                                 f"⚠️ FORCE_MARKET_SPREAD_SOFT_WAIT: {side} {symbol} "
                                 f"spread_bps={fm_spread_bps:.1f} reason={fm_reason}"
                             )
-                            self.set_execution_feedback(symbol, f"FORCE_MARKET_WAIT:{fm_reason}:{fm_spread_bps:.1f}bps")
+                            self.set_pending_execution_feedback(order, f"FORCE_MARKET_WAIT:{fm_reason}:{fm_spread_bps:.1f}bps", wait=True)
                             _requeue_pending(15_000, f"force_spread_soft:{fm_reason}:{fm_spread_bps:.1f}bps")
                             return
                         live_binance_trader._exec_diag['invalid_block_count'] += 1
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['spread_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{fm_reason}")
+                        self.set_pending_execution_feedback(order, f"BLOCK_OPEN_INVALID_BBO:{fm_reason}", wait=True)
                         logger.warning(f"🚫 FORCE_MARKET BBO_VETO: {side} {symbol} | reason={fm_reason}")
                         self.add_log(f"🚫 FORCE MARKET BBO VETO: {symbol} ({fm_reason})")
                         _requeue_pending(30_000, f"force_invalid_bbo:{fm_reason}")
@@ -30590,12 +30617,12 @@ class PaperTradingEngine:
                                 f"⚠️ FORCE_MARKET_DRIFT_SOFT_WAIT: {side} {symbol} "
                                 f"drift={fm_drift_bps:.1f}bps"
                             )
-                            self.set_execution_feedback(symbol, f"FORCE_MARKET_WAIT:drift:{fm_drift_bps:.1f}bps")
+                            self.set_pending_execution_feedback(order, f"FORCE_MARKET_WAIT:drift:{fm_drift_bps:.1f}bps", wait=True)
                             _requeue_pending(15_000, f"force_drift_soft:{fm_drift_bps:.1f}bps")
                             return
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['drift_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{fm_drift_bps:.1f}bps")
+                        self.set_pending_execution_feedback(order, f"BLOCK_OPEN_DRIFT:{fm_drift_bps:.1f}bps", wait=True)
                         logger.warning(f"🚫 FORCE_MARKET DRIFT_BLOCK: {side} {symbol} drift={fm_drift_bps:.1f}bps")
                         self.add_log(f"🚫 FORCE MARKET DRIFT: {symbol} {fm_drift_bps:.0f}bps")
                         _requeue_pending(30_000, f"force_drift_block:{fm_drift_bps:.1f}bps")
@@ -30644,7 +30671,7 @@ class PaperTradingEngine:
                     order_error = (live_binance_trader.last_order_error or "unknown_order_error")[:120]
                     logger.error(f"❌ FORCE MARKET FAILED - skipping position creation")
                     self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - Emir gönderilemedi ({order_error})")
-                    self.set_execution_feedback(symbol, f"MARKET_FALLBACK_FAILED:{order_error}")
+                    self.set_pending_execution_feedback(order, f"MARKET_FALLBACK_FAILED:{order_error}")
                     return
             except Exception as e:
                 self.pipeline_metrics['order_failed'] += 1
@@ -30655,7 +30682,7 @@ class PaperTradingEngine:
                     error_msg = f"{error_msg} | {order_error[:80]}"
                 logger.error(f"❌ FORCE MARKET ERROR: {e}")
                 self.add_log(f"❌ MARKET FALLBACK HATASI: {side} {symbol} - {error_msg}")
-                self.set_execution_feedback(symbol, "MARKET_FALLBACK_ERROR")
+                self.set_pending_execution_feedback(order, "MARKET_FALLBACK_ERROR")
                 return
         else:
             # Paper mode execution observability parity
