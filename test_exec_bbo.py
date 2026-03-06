@@ -547,3 +547,33 @@ def test_42_execute_pending_drift_block_increments_gate_block_total(trader):
     trader._exec_diag['gate_block_total'] += 1
     assert trader._exec_diag['gate_block_total'] == 1
 
+
+@pytest.mark.asyncio
+async def test_43_close_forwards_cleanup_order_ids(trader):
+    trader._get_valid_bbo = AsyncMock(return_value=_valid_bbo())
+    trader.exchange.create_market_order = AsyncMock(return_value={
+        'id': 'close_43',
+        'status': 'filled',
+        'average': 65000.0,
+        'fee': {'cost': 0.02},
+    })
+    trader._post_close_cleanup = AsyncMock()
+
+    await trader.close_position('BTCUSDT', 'LONG', 0.001, cleanup_order_ids=['sl_43'])
+
+    trader._post_close_cleanup.assert_called_once_with('BTCUSDT', None, ['sl_43'])
+
+
+@pytest.mark.asyncio
+async def test_44_post_close_cleanup_uses_raw_cancel_hint(trader):
+    trader.get_positions = AsyncMock(return_value=[])
+    trader.exchange.fetch_open_orders = AsyncMock(side_effect=[[], []])
+    trader.exchange.fapiPrivateGetOpenOrders = AsyncMock(return_value=[])
+    trader.exchange.cancel_order = AsyncMock(side_effect=Exception("ccxt cancel failed"))
+    trader.exchange.fapiPrivateDeleteOrder = AsyncMock(return_value={'orderId': 'sl_44'})
+
+    with patch('main.asyncio.sleep', new=AsyncMock()):
+        await trader._post_close_cleanup('BTCUSDT', trace_id='t44', cleanup_order_ids=['sl_44'])
+
+    trader.exchange.fapiPrivateDeleteOrder.assert_awaited_once_with({'symbol': 'BTCUSDT', 'orderId': 'sl_44'})
+    assert trader._recently_closed_symbols[-1][0] == 'BTCUSDT'

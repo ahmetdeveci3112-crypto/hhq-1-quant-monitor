@@ -3866,10 +3866,19 @@ class LiveBinanceTrader:
             # Full market fallback on any error
             return await self.place_market_order(symbol, side, size_usd, leverage)
     
-    async def close_position(self, symbol: str, side: str, amount: float, trace_id: str = None, close_scope: str = "FULL") -> dict:
+    async def close_position(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        trace_id: str = None,
+        close_scope: str = "FULL",
+        cleanup_order_ids: Optional[list] = None,
+    ) -> dict:
         """Pozisyon kapat (reduceOnly=True) — Market order. Phase 186: with exec logging.
         Phase 261: Added trace_id for full layer telemetry.
-        Patch A: close_scope='FULL'|'PARTIAL' — only FULL triggers _post_close_cleanup."""
+        Patch A: close_scope='FULL'|'PARTIAL' — only FULL triggers _post_close_cleanup.
+        cleanup_order_ids: known protective conditional order ids for deterministic cleanup."""
         if not self.enabled or not self.exchange:
             logger.error("❌ LiveBinanceTrader not enabled, close rejected")
             return None
@@ -3935,7 +3944,7 @@ class LiveBinanceTrader:
             
             # Patch A: Only fire cleanup on FULL close (not partial)
             if close_scope == "FULL":
-                asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id, cleanup_order_ids))
             else:
                 logger.info(f"ℹ️ PARTIAL_CLOSE_NO_CLEANUP: {symbol} scope={close_scope} — skipping conditional cleanup")
             
@@ -3970,7 +3979,7 @@ class LiveBinanceTrader:
                 if not found_pos or remaining_amt <= 0.00001:  # Epsilon
                     logger.warning(f"✅ REDUCE_ONLY_FIX: {side} {symbol} is already flat (rem={remaining_amt}). Graceful success.")
                     if close_scope == "FULL":
-                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id, cleanup_order_ids))
                     else:
                         logger.info(f"ℹ️ PARTIAL_CLOSE_RETRY_NO_CLEANUP: {symbol} scope={close_scope} — already flat, skipping cleanup")
                     return {
@@ -3999,7 +4008,7 @@ class LiveBinanceTrader:
                     )
                     logger.info(f"✅ CLOSE RETRY SUCCESS: {side} {symbol} | Order: {order.get('id', 'N/A')}")
                     if close_scope == "FULL":
-                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id))
+                        asyncio.ensure_future(self._post_close_cleanup(symbol, trace_id, cleanup_order_ids))
                     else:
                         logger.info(f"ℹ️ PARTIAL_CLOSE_RETRY_NO_CLEANUP: {symbol} scope={close_scope} — retry succeeded, skipping cleanup")
                     return {
@@ -4186,6 +4195,37 @@ class LiveBinanceTrader:
             'reduceOnly': str(raw.get('reduceOnly', 'false')).lower() == 'true',
             'closePosition': str(raw.get('closePosition', 'false')).lower() == 'true',
         }
+
+    async def _cancel_known_conditional_order(self, symbol: str, order_id: str, trace_id: str = None) -> bool:
+        """Cancel a known Binance conditional order id even if open-order fetch misses it."""
+        if not order_id or not self.enabled or not self.exchange:
+            return False
+
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        order_id = str(order_id)
+        trace_str = f" [trace={trace_id}]" if trace_id else ""
+
+        try:
+            await self.exchange.cancel_order(order_id, ccxt_symbol)
+            logger.info(f"🗑️ POST_CLOSE_HINT_CANCELLED: {symbol} order={order_id}{trace_str}")
+            return True
+        except Exception as cancel_err:
+            err_str = str(cancel_err)
+            if '-2011' in err_str or 'Unknown order' in err_str:
+                logger.info(f"ℹ️ POST_CLOSE_HINT_ALREADY_GONE: {symbol} order={order_id}{trace_str}")
+                return True
+
+        try:
+            await self.exchange.fapiPrivateDeleteOrder({'symbol': symbol, 'orderId': order_id})
+            logger.info(f"✅ POST_CLOSE_HINT_RAW_CANCELLED: {symbol} order={order_id}{trace_str}")
+            return True
+        except Exception as raw_err:
+            raw_str = str(raw_err)
+            if '-2011' in raw_str or 'Unknown order' in raw_str:
+                logger.info(f"ℹ️ POST_CLOSE_HINT_RAW_ALREADY_GONE: {symbol} order={order_id}{trace_str}")
+                return True
+            logger.warning(f"⚠️ POST_CLOSE_HINT_CANCEL_FAILED: {symbol} order={order_id} err={raw_err}{trace_str}")
+            return False
     
     async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
         """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
@@ -4480,13 +4520,16 @@ class LiveBinanceTrader:
         return result
 
     
-    async def _post_close_cleanup(self, symbol: str, trace_id: str = None):
+    async def _post_close_cleanup(self, symbol: str, trace_id: str = None, cleanup_order_ids: Optional[list] = None):
         """Phase 270: Retry-based post-close cleanup with flat-position guard.
         Called as fire-and-forget from close_position success path.
         5 attempts with backoff [0.2, 0.5, 1.0, 3.0, 8.0].
         """
         trace_str = f" [trace={trace_id}]" if trace_id else ""
         backoffs = [0.2, 0.5, 1.0, 3.0, 8.0]
+        known_order_ids = list(dict.fromkeys(
+            str(order_id) for order_id in (cleanup_order_ids or []) if order_id
+        ))
         
         for attempt, delay in enumerate(backoffs, 1):
             try:
@@ -4510,7 +4553,24 @@ class LiveBinanceTrader:
                         continue
                 
                 logger.info(f"🧹 POST_CLOSE_CLEANUP_START: {symbol} attempt {attempt}/{len(backoffs)}{trace_str}")
+                hinted_cancelled = 0
+                if known_order_ids:
+                    remaining_order_ids = []
+                    for order_id in known_order_ids:
+                        if await self._cancel_known_conditional_order(symbol, order_id, trace_id):
+                            hinted_cancelled += 1
+                        else:
+                            remaining_order_ids.append(order_id)
+                    known_order_ids = remaining_order_ids
+                    if hinted_cancelled > 0:
+                        logger.info(
+                            f"🧹 POST_CLOSE_HINTS_DONE: {symbol} hinted_cancelled={hinted_cancelled} "
+                            f"remaining_hints={len(known_order_ids)}{trace_str}"
+                        )
                 res = await self.cancel_reduce_only_conditionals(symbol, trace_id)
+                if hinted_cancelled > 0:
+                    res = dict(res)
+                    res['cancelled'] += hinted_cancelled
                 
                 if res['cancelled'] > 0 or res['errors'] == 0:
                     # P0 orphan fix: track recently-closed for sweep fallback
@@ -6576,7 +6636,10 @@ async def binance_position_sync_loop():
                     # P0 orphan fix: fire-and-forget cleanup for externally closed symbol
                     _ext_close_ts = int(datetime.now().timestamp() * 1000)
                     _ext_trace = f"SYNC_CLOSE_{symbol}_{_ext_close_ts}"
-                    safe_create_task(live_binance_trader._post_close_cleanup(symbol, trace_id=_ext_trace))
+                    _cleanup_order_ids = []
+                    if pos.get('exchange_sl_order_id'):
+                        _cleanup_order_ids.append(str(pos['exchange_sl_order_id']))
+                    safe_create_task(live_binance_trader._post_close_cleanup(symbol, trace_id=_ext_trace, cleanup_order_ids=_cleanup_order_ids))
                     logger.info(f"SYNC_EXT_CLOSE_CLEANUP_START: {symbol} trace={_ext_trace}")
                 
                 global_paper_trader.positions = remaining_positions
@@ -20858,6 +20921,8 @@ class TimeBasedPositionManager:
                                             remaining_contracts = pos['contracts']
                                             sl_result = await live_binance_trader.set_stop_loss(symbol, side, remaining_contracts, breakeven_sl)
                                             if sl_result:
+                                                pos['exchange_sl_order_id'] = sl_result.get('id', pos.get('exchange_sl_order_id', ''))
+                                                pos['exchange_sl_price'] = sl_result.get('stopPrice', breakeven_sl)
                                                 logger.warning(f"🔒 TP1_BREAKEVEN LIVE ✅: {symbol} SL set to ${breakeven_sl:.6f} on Binance")
                                             else:
                                                 logger.error(f"❌ TP1_BREAKEVEN LIVE FAILED: {symbol} - set_stop_loss returned None")
@@ -32439,6 +32504,9 @@ class PaperTradingEngine:
             side = pos.get('side', 'LONG')
             # Phase 141: Use contracts with size fallback for consistency with Binance API
             amount = pos.get('contracts', pos.get('size', 0))
+            cleanup_order_ids = []
+            if pos.get('exchange_sl_order_id'):
+                cleanup_order_ids.append(str(pos['exchange_sl_order_id']))
             
             if pos.get('_already_closed_on_exchange', False):
                 logger.info(
@@ -32452,7 +32520,7 @@ class PaperTradingEngine:
                 # Immediate attempt
                 try:
                     asyncio.ensure_future(
-                        live_binance_trader._post_close_cleanup(symbol, trace_id)
+                        live_binance_trader._post_close_cleanup(symbol, trace_id, cleanup_order_ids)
                     )
                 except Exception:
                     pass
@@ -32460,7 +32528,7 @@ class PaperTradingEngine:
                 async def _manual_deferred_cleanup():
                     await asyncio.sleep(3)
                     try:
-                        await live_binance_trader._post_close_cleanup(symbol, trace_id)
+                        await live_binance_trader._post_close_cleanup(symbol, trace_id, cleanup_order_ids)
                     except Exception:
                         pass
                 try:
@@ -32473,11 +32541,11 @@ class PaperTradingEngine:
                 try:
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
-                        asyncio.ensure_future(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
+                        asyncio.ensure_future(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol, cleanup_order_ids))
                     else:
-                        loop.run_until_complete(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
+                        loop.run_until_complete(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol, cleanup_order_ids))
                 except RuntimeError:
-                    asyncio.run(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol))
+                    asyncio.run(self._close_on_binance(symbol, side, amount, trace_id, trade.get('id'), pos_id or symbol, cleanup_order_ids))
             
             # Phase 157: Schedule Binance trade history fetch after close
             ui_state_cache.trigger_trade_fetch(delay_seconds=3)
@@ -32508,7 +32576,16 @@ class PaperTradingEngine:
         except Exception as e:
             logger.debug(f"Coin performance record error: {e}")
     
-    async def _close_on_binance(self, symbol: str, side: str, amount: float, trace_id: str = None, trade_id: str = None, lock_key: str = None):
+    async def _close_on_binance(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        trace_id: str = None,
+        trade_id: str = None,
+        lock_key: str = None,
+        cleanup_order_ids: Optional[list] = None,
+    ):
         """Helper to close position on Binance asynchronously.
         Phase 87: Now fetches actual Binance position size to prevent partial closes.
         Phase 261: Clears exit_inflight lock when done.
@@ -32527,7 +32604,13 @@ class PaperTradingEngine:
                         logger.warning(f"⚠️ Size mismatch: Paper={amount:.4f}, Binance={actual_amount:.4f} - using Binance size")
                     break
             
-            result = await live_binance_trader.close_position(symbol, side, actual_amount, trace_id=trace_id)
+            result = await live_binance_trader.close_position(
+                symbol,
+                side,
+                actual_amount,
+                trace_id=trace_id,
+                cleanup_order_ids=cleanup_order_ids,
+            )
             if result:
                 close_order_id = str(result.get('id', ''))
                 close_slippage = float(result.get('slippage_pct', 0) or 0)
@@ -32554,7 +32637,7 @@ class PaperTradingEngine:
                 async def _deferred_cleanup():
                     await asyncio.sleep(3)
                     try:
-                        await live_binance_trader._post_close_cleanup(symbol, trace_id)
+                        await live_binance_trader._post_close_cleanup(symbol, trace_id, cleanup_order_ids)
                     except Exception as dc_err:
                         logger.warning(f"⚠️ POST_CLOSE_CLEANUP_DEFERRED failed: {symbol}: {dc_err}")
                 safe_create_task(_deferred_cleanup())
@@ -35769,7 +35852,8 @@ async def paper_trading_close(position_id: str):
                     symbol=symbol,
                     side=side,
                     amount=amount,
-                    trace_id=trace_id
+                    trace_id=trace_id,
+                    cleanup_order_ids=[str(pos['exchange_sl_order_id'])] if pos.get('exchange_sl_order_id') else None,
                 )
                 if binance_close:
                     fill_price = float(binance_close.get('average') or binance_close.get('price') or 0)
