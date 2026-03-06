@@ -14,6 +14,8 @@ class DummyTrader(SimpleNamespace):
             symbol='BTCUSDT',
             leverage=10,
             risk_per_trade=0.02,
+            enabled=True,
+            balance=10000.0,
             sl_atr=15,
             tp_atr=30,
             trail_activation_atr=1.5,
@@ -29,7 +31,12 @@ class DummyTrader(SimpleNamespace):
             leverage_multiplier=1.0,
             pending_orders=[{'id': 'po-1'}],
             positions=[],
+            trades=[],
+            stats={},
+            equity_curve=[],
             logs=[],
+            pipeline_metrics={},
+            execution_feedback={},
             ai_optimizer_enabled=False,
         )
 
@@ -38,6 +45,9 @@ class DummyTrader(SimpleNamespace):
 
     def save_state(self):
         return None
+
+    def get_today_pnl(self):
+        return {'todayPnl': 0.0, 'todayPnlPercent': 0.0}
 
 
 class DummyRequest:
@@ -334,6 +344,52 @@ def test_build_pending_orders_observability_classifies_wait_states():
     assert result['orders'][2]['trailEntryDistancePct'] == 0.4
 
 
+def test_pending_rescue_score_floor_tracks_runtime_quality_floor():
+    assert main.resolve_pending_rescue_score_min(74, 88) == 78
+    assert main.resolve_pending_rescue_score_min(84, 88) == 88
+    assert main.resolve_pending_rescue_score_min(92, 88) == 92
+
+
+def test_build_pending_orders_observability_exposes_pending_anchor_and_score_floor():
+    now_ms = 1_770_000_000_000
+    pending_orders = [{
+        'id': 'po-aged',
+        'symbol': 'AGEDUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 79,
+        'signalPrice': 100.0,
+        'entryPrice': 98.0,
+        'pullbackLocked': 0.0125,
+        'createdAt': now_ms - 900_000,
+        'confirmAfter': now_ms - 600_000,
+        'expiresAt': now_ms + 600_000,
+        'reinforcedCount': 3,
+        'strategyMode': main.STRATEGY_MODE_SMART_V3_RUNNER,
+        'execution_style': main.EXEC_STYLE_BREAKOUT,
+        'structural_fallback_stage': 'fib_support',
+        'minConfidenceScoreSnapshot': 82,
+    }]
+
+    result = main.build_pending_orders_observability(
+        pending_orders,
+        execution_feedback={},
+        now_ms=now_ms,
+        min_confidence_score=82,
+    )
+
+    assert result['summary']['belowScoreFloor'] == 1
+    assert result['summary']['states']['aged_entry_touch_wait'] == 1
+    assert result['orders'][0]['rescueScoreMin'] == 86.0
+    assert result['orders'][0]['signalPrice'] == 100.0
+    assert result['orders'][0]['pullbackLockedPct'] == 1.25
+    assert result['orders'][0]['entryFromSignalPct'] == 2.0
+    assert result['orders'][0]['reinforcedCount'] == 3
+    assert result['orders'][0]['strategyMode'] == main.STRATEGY_MODE_SMART_V3_RUNNER
+    assert result['orders'][0]['executionStyle'] == main.EXEC_STYLE_BREAKOUT
+    assert result['orders'][0]['structuralFallbackStage'] == 'fib_support'
+
+
 def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_band():
     now_ms = 1_770_000_000_000
     order = {
@@ -353,6 +409,24 @@ def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_b
     assert allowed['reason'] == 'aged_near_entry'
     assert blocked['allow'] is False
     assert blocked['reason'] == 'too_far_from_entry'
+
+
+def test_evaluate_aged_near_entry_fill_uses_runtime_score_floor_buffer():
+    now_ms = 1_770_000_000_000
+    order = {
+        'side': 'SHORT',
+        'confirmed': True,
+        'trailingEntryActive': False,
+        'entryPrice': 100.0,
+        'atr': 1.0,
+        'signalScore': 85,
+        'createdAt': now_ms - 700_000,
+    }
+
+    blocked = main.evaluate_aged_near_entry_fill(order, current_price=99.93, current_time=now_ms, min_confidence_score=82)
+
+    assert blocked['allow'] is False
+    assert blocked['reason'] == 'score_too_low'
 
 
 def test_evaluate_min_notional_soft_upsize_only_allows_strong_tight_spread_cases():
@@ -395,9 +469,108 @@ def test_compute_pending_retry_wait_ms_shortens_wait_for_confirmed_high_score():
     assert wait_default == 30_000
 
 
+def test_compute_pending_retry_wait_ms_respects_pending_score_floor_snapshot():
+    now_ms = 1_770_000_000_000
+    order = {
+        'confirmed': True,
+        'signalScore': 85,
+        'createdAt': now_ms - 400_000,
+        'minConfidenceScoreSnapshot': 84,
+    }
+
+    wait_ms = main.compute_pending_retry_wait_ms(order, now_ms, 30_000, 'bbo_spread:spread_too_wide')
+
+    assert wait_ms == 30_000
+
+
+def test_reinforce_confirmed_pending_keeps_short_entry_closer_to_market_and_preserves_timers(tmp_path):
+    trader = main.PaperTradingEngine(state_file=str(tmp_path / 'paper_state.json'))
+    now_ms = 1_770_000_000_000
+    pending = {
+        'id': 'po-short',
+        'symbol': 'TESTUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 72,
+        'signalScoreRaw': 72,
+        'entryPrice': 105.0,
+        'signalPrice': 106.0,
+        'pullbackLocked': 0.01,
+        'createdAt': now_ms - 120_000,
+        'confirmAfter': now_ms + 45_000,
+        'expiresAt': now_ms + 600_000,
+        'spreadPct': 0.05,
+        'volumeRatio': 1.1,
+        'atr': 1.0,
+        'leverage': 10,
+        'trend_mode': False,
+    }
+    signal = {
+        'confidenceScore': 90,
+        '_rawConfidenceScore': 94,
+        'entryPrice': 110.0,
+        'signalPrice': 111.0,
+        'pullbackLocked': 0.02,
+        'spreadPct': 0.04,
+        'volumeRatio': 1.7,
+        'execution_style': main.EXEC_STYLE_BREAKOUT,
+        'structural_fallback_stage': 'fib_breakout',
+        'truth_snapshot': {'fast_regime': 'TRENDING'},
+        'regime_adjustment': 'trend_bias',
+        'memoryExtensionSec': 900,
+    }
+
+    with patch.object(main, 'resolve_runner_exit_controls', return_value={
+        'enabled': True,
+        'mode': main.STRATEGY_MODE_SMART_V3_RUNNER,
+        'trail_act_mult': 1.2,
+        'trail_dist_mult': 1.1,
+        'tp_tighten': 0.9,
+        'be_buffer_mult': 1.0,
+    }):
+        updated = trader._reinforce_pending_order(pending, 'SHORT', 100.0, 1.0, signal, 'TESTUSDT')
+
+    assert updated['entryPrice'] <= 105.0
+    assert updated['expiresAt'] == now_ms + 600_000
+    assert updated['confirmAfter'] == now_ms + 45_000
+    assert updated['signalPrice'] == 111.0
+    assert updated['pullbackLocked'] == 0.02
+    assert updated['reinforcedCount'] == 1
+    assert updated['strategyMode'] == main.STRATEGY_MODE_SMART_V3_RUNNER
+    assert updated['execution_style'] == main.EXEC_STYLE_BREAKOUT
+    assert updated['structural_fallback_stage'] == 'fib_breakout'
+
+
+@pytest.mark.asyncio
+async def test_check_pending_orders_drops_confirmed_low_score_pending_without_market_rescue(tmp_path):
+    trader = main.PaperTradingEngine(state_file=str(tmp_path / 'paper_state.json'))
+    now_ms = int(main.datetime.now().timestamp() * 1000)
+    trader.min_confidence_score = 80
+    trader.pending_orders = [{
+        'id': 'po-drop',
+        'symbol': 'DROPUSDT',
+        'side': 'LONG',
+        'confirmed': True,
+        'signalScore': 72,
+        'entryPrice': 100.0,
+        'signalPrice': 101.0,
+        'createdAt': now_ms - ((main.PENDING_NEAR_ENTRY_MIN_AGE_SEC + 120) * 1000),
+        'confirmAfter': now_ms - 30_000,
+        'expiresAt': now_ms + 600_000,
+        'allowMarket': False,
+        'minConfidenceScoreSnapshot': 80,
+    }]
+
+    await trader.check_pending_orders([{'symbol': 'DROPUSDT', 'price': 99.5}])
+
+    assert trader.pending_orders == []
+    assert trader.pipeline_metrics['low_score_pending_dropped'] == 1
+    assert trader.execution_feedback['DROPUSDT']['reason'] == 'PENDING_SCORE_BELOW_MIN'
+
+
 @pytest.mark.asyncio
 async def test_paper_trading_status_exposes_pending_summary_and_execution_diagnostics(monkeypatch):
-    now_ms = 1_770_000_000_000
+    now_ms = int(main.datetime.now().timestamp() * 1000)
 
     async def fake_quality():
         return {'trades_total_24h': 2, 'trade_metadata_coverage_pct_24h': 66.7}
@@ -414,12 +587,18 @@ async def test_paper_trading_status_exposes_pending_summary_and_execution_diagno
             'id': 'po-1',
             'symbol': 'TESTUSDT',
             'side': 'LONG',
-            'confirmed': False,
-            'signalScore': 77,
+            'confirmed': True,
+            'signalScore': 72,
+            'signalPrice': 10.2,
             'entryPrice': 10.0,
+            'pullbackLocked': 0.012,
             'createdAt': now_ms - 10_000,
-            'confirmAfter': now_ms + 30_000,
+            'confirmAfter': now_ms - 30_000,
             'expiresAt': now_ms + 600_000,
+            'reinforcedCount': 2,
+            'strategyMode': main.STRATEGY_MODE_SMART_V3_RUNNER,
+            'execution_style': main.EXEC_STYLE_BREAKOUT,
+            'structural_fallback_stage': 'fib_support',
         }],
         execution_feedback={'TESTUSDT': {'reason': 'ENTRY_SCORE_LOW:0.51', 'ts': now_ms}},
         pipeline_metrics={'recheck_pass': 0, 'recheck_fail': 0, 'recheck_warn': 1},
@@ -446,9 +625,52 @@ async def test_paper_trading_status_exposes_pending_summary_and_execution_diagno
 
     assert response.status_code == 200
     assert payload['pendingSummary']['count'] == 1
-    assert payload['pendingSummary']['states']['confirm_wait'] == 1
-    assert payload['pendingOrders'][0]['waitState'] == 'confirm_wait'
+    assert payload['pendingSummary']['belowScoreFloor'] == 1
+    assert payload['pendingSummary']['states']['entry_touch_wait'] == 1
+    assert payload['pendingOrders'][0]['waitState'] == 'entry_touch_wait'
     assert payload['pendingOrders'][0]['feedbackReason'] == 'ENTRY_SCORE_LOW:0.51'
+    assert payload['pendingOrders'][0]['signalPrice'] == 10.2
+    assert payload['pendingOrders'][0]['pullbackLocked'] == 0.012
+    assert payload['pendingOrders'][0]['reinforcedCount'] == 2
+    assert payload['pendingOrders'][0]['strategyMode'] == main.STRATEGY_MODE_SMART_V3_RUNNER
+    assert payload['pendingOrders'][0]['executionStyle'] == main.EXEC_STYLE_BREAKOUT
+    assert payload['pendingOrders'][0]['structuralFallbackStage'] == 'fib_support'
     assert payload['executionDiagnostics']['thresholds']['maxSpreadBps'] == 8.0
     assert payload['executionDiagnostics']['relaxations']['pendingFastRetryEnabled'] is True
     assert payload['executionDiagnostics']['counters']['spread_block'] == 3
+
+
+@pytest.mark.asyncio
+async def test_paper_trading_settings_exposes_pending_anchor_fields(monkeypatch):
+    now_ms = int(main.datetime.now().timestamp() * 1000)
+    trader = DummyTrader()
+    trader.pending_orders = [{
+        'id': 'po-2',
+        'symbol': 'ANCHORUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 81,
+        'signalPrice': 100.0,
+        'entryPrice': 98.7,
+        'pullbackLocked': 0.015,
+        'createdAt': now_ms - 10_000,
+        'confirmAfter': now_ms - 5_000,
+        'expiresAt': now_ms + 600_000,
+        'reinforcedCount': 1,
+        'strategyMode': main.STRATEGY_MODE_SMART_V3_RUNNER,
+        'execution_style': main.EXEC_STYLE_BREAKOUT,
+        'structural_fallback_stage': 'fib_resistance',
+    }]
+
+    monkeypatch.setattr(main, 'global_paper_trader', trader)
+
+    response = await main.paper_trading_get_settings()
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload['pendingOrders'][0]['signalPrice'] == 100.0
+    assert payload['pendingOrders'][0]['pullbackLocked'] == 0.015
+    assert payload['pendingOrders'][0]['reinforcedCount'] == 1
+    assert payload['pendingOrders'][0]['strategyMode'] == main.STRATEGY_MODE_SMART_V3_RUNNER
+    assert payload['pendingOrders'][0]['executionStyle'] == main.EXEC_STYLE_BREAKOUT
+    assert payload['pendingOrders'][0]['structuralFallbackStage'] == 'fib_resistance'

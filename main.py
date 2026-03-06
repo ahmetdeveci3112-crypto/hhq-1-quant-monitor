@@ -8701,6 +8701,7 @@ PENDING_FAST_RETRY_ENABLED = _env_bool("PENDING_FAST_RETRY_ENABLED", True)
 PENDING_FAST_RETRY_SCORE_MIN = float(os.environ.get('PENDING_FAST_RETRY_SCORE_MIN', '88'))
 PENDING_FAST_RETRY_MIN_AGE_SEC = int(os.environ.get('PENDING_FAST_RETRY_MIN_AGE_SEC', '180'))
 PENDING_FAST_RETRY_WAIT_MS = int(os.environ.get('PENDING_FAST_RETRY_WAIT_MS', '15000'))
+PENDING_RESCUE_SCORE_BUFFER = float(os.environ.get('PENDING_RESCUE_SCORE_BUFFER', '4.0'))
 
 MIN_NOTIONAL_SOFT_UPSIZE_ENABLED = _env_bool("MIN_NOTIONAL_SOFT_UPSIZE_ENABLED", True)
 MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN', '88'))
@@ -18056,6 +18057,20 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
             global_paper_trader.pipeline_metrics.setdefault('ev_soft_penalty', 0)
             global_paper_trader.pipeline_metrics['ev_soft_penalty'] += 1
+
+    final_signal_score = float(signal.get('confidenceScore', 0) or 0)
+    min_signal_score = float(getattr(global_paper_trader, 'min_confidence_score', 74) or 74)
+    if final_signal_score < min_signal_score:
+        signal_log_data['reject_reason'] = f'FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}<{min_signal_score:.1f}'
+        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        global_paper_trader.pipeline_metrics.setdefault('late_score_rejected', 0)
+        global_paper_trader.pipeline_metrics['late_score_rejected'] += 1
+        reject_feedback(f"FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}")
+        logger.info(
+            f"🚫 FINAL_SCORE_BELOW_MIN: {action} {symbol} score={final_signal_score:.1f} "
+            f"< min={min_signal_score:.1f} after late penalties"
+        )
+        return
     
     # Execute trade
     global_paper_trader.pipeline_metrics.setdefault('signal_accepted', 0)
@@ -26967,6 +26982,56 @@ def _format_exception_context(exc: Exception) -> str:
     return f"{exc_type}: {detail}" if detail else exc_type
 
 
+def extract_signal_anchor_price(signal: dict, fallback: float = 0.0) -> float:
+    """Resolve the latest signal anchor price used for pending-entry tracking."""
+    if not isinstance(signal, dict):
+        return float(fallback or 0.0)
+
+    for key in ('signalPrice', 'priceAtSignal', 'entryAnchorPrice', 'price'):
+        try:
+            value = float(signal.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+
+    return float(fallback or 0.0)
+
+
+def extract_signal_pullback_locked_fraction(signal: dict, fallback: float = 0.0) -> float:
+    """Normalize signal pullback data into a locked fraction for pending orders."""
+    if not isinstance(signal, dict):
+        return _clamp(float(fallback or 0.0), 0.0, 0.25)
+
+    candidates = (
+        signal.get('pullbackLocked'),
+        signal.get('pullbackDynFinal'),
+        signal.get('pullbackPct'),
+        signal.get('pullbackMinDyn'),
+    )
+    for raw in candidates:
+        try:
+            value = float(raw or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value <= 0:
+            continue
+        if value > 1.0:
+            value /= 100.0
+        return _clamp(value, 0.0, 0.25)
+
+    return _clamp(float(fallback or 0.0), 0.0, 0.25)
+
+
+def resolve_pending_rescue_score_min(min_confidence_score: float, configured_floor: float) -> float:
+    """Keep pending rescue thresholds near the configured quality floor, not far above it."""
+    base = max(0.0, float(min_confidence_score or 0.0))
+    configured = max(0.0, float(configured_floor or 0.0))
+    if base <= 0:
+        return configured
+    return max(base, min(configured, base + PENDING_RESCUE_SCORE_BUFFER))
+
+
 def evaluate_aged_near_entry_fill(order: dict, current_price: float, current_time: int,
                                    min_confidence_score: float) -> dict:
     """Allow a narrow, aged pending fill near entry without reopening wide gates."""
@@ -26998,7 +27063,7 @@ def evaluate_aged_near_entry_fill(order: dict, current_price: float, current_tim
         result['reason'] = 'too_fresh'
         return result
 
-    required_score = max(float(min_confidence_score), PENDING_NEAR_ENTRY_SCORE_MIN)
+    required_score = resolve_pending_rescue_score_min(min_confidence_score, PENDING_NEAR_ENTRY_SCORE_MIN)
     if score < required_score:
         result['reason'] = 'score_too_low'
         return result
@@ -27076,12 +27141,16 @@ def compute_pending_retry_wait_ms(order: dict, current_time: int, default_wait_m
 
     confirmed = bool(order.get('confirmed', False))
     score = float(order.get('signalScore', 0) or 0)
+    score_floor = resolve_pending_rescue_score_min(
+        order.get('minConfidenceScoreSnapshot', 74),
+        PENDING_FAST_RETRY_SCORE_MIN,
+    )
     created_at = int(order.get('createdAt', current_time) or current_time)
     age_sec = max(0.0, (current_time - created_at) / 1000.0)
     reason_l = str(reason or '').lower()
     fast_reason = any(token in reason_l for token in ('spread', 'bbo', 'drift', 'recheck', 'entry_score'))
 
-    if confirmed and score >= PENDING_FAST_RETRY_SCORE_MIN and age_sec >= PENDING_FAST_RETRY_MIN_AGE_SEC and fast_reason:
+    if confirmed and score >= score_floor and age_sec >= PENDING_FAST_RETRY_MIN_AGE_SEC and fast_reason:
         return min(wait_ms, max(5_000, PENDING_FAST_RETRY_WAIT_MS))
     return wait_ms
 
@@ -27099,6 +27168,7 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
     expiring_soon = 0
     aged_confirmed = 0
     recheck_waiting = 0
+    below_score_floor = 0
 
     for order in pending_orders or []:
         symbol = str(order.get('symbol', ''))
@@ -27114,6 +27184,17 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
         recheck_in_sec = max(0, int((recheck_next - now_ms) / 1000)) if recheck_next else 0
         feedback = execution_feedback.get(symbol, {}) if symbol else {}
         feedback_reason = str(feedback.get('reason', '') or '')
+        score = float(order.get('signalScore', 0) or 0)
+        signal_price = float(order.get('signalPrice', 0) or 0)
+        entry_price = float(order.get('entryPrice', 0) or 0)
+        pullback_locked = extract_signal_pullback_locked_fraction(
+            {'pullbackLocked': order.get('pullbackLocked', 0)},
+            0.0,
+        )
+        rescue_score_min = resolve_pending_rescue_score_min(
+            order.get('minConfidenceScoreSnapshot', min_confidence_score),
+            PENDING_NEAR_ENTRY_SCORE_MIN,
+        )
 
         if confirmed:
             confirmed_count += 1
@@ -27123,6 +27204,8 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             recheck_waiting += 1
         if confirmed and age_sec >= PENDING_NEAR_ENTRY_MIN_AGE_SEC:
             aged_confirmed += 1
+        if score < float(min_confidence_score):
+            below_score_floor += 1
         if expires_in_sec and expires_in_sec <= 120:
             expiring_soon += 1
 
@@ -27151,7 +27234,9 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             feedback_reasons[feedback_reason] = feedback_reasons.get(feedback_reason, 0) + 1
 
         trail_entry_distance = float(order.get('trailEntryDistance', 0) or 0)
-        entry_price = float(order.get('entryPrice', 0) or 0)
+        entry_from_signal_pct = 0.0
+        if signal_price > 0 and entry_price > 0:
+            entry_from_signal_pct = abs(entry_price - signal_price) / signal_price * 100.0
         decorated.append({
             "waitState": wait_state,
             "waitReason": wait_reason,
@@ -27160,11 +27245,19 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             "recheckInSec": recheck_in_sec,
             "expiresInSec": expires_in_sec,
             "feedbackReason": feedback_reason or None,
-            "scoreBuffer": round(float(order.get('signalScore', 0) or 0) - float(min_confidence_score), 2),
+            "scoreBuffer": round(score - float(min_confidence_score), 2),
+            "rescueScoreMin": round(rescue_score_min, 2),
             "trailEntryActive": trailing_active,
             "trailEntryDistancePct": round((trail_entry_distance / entry_price) * 100.0, 4) if entry_price > 0 and trail_entry_distance > 0 else 0.0,
             "allowMarket": bool(order.get('allowMarket', False)),
             "recheckDecision": order.get('recheckDecision'),
+            "signalPrice": signal_price,
+            "pullbackLockedPct": round(pullback_locked * 100.0, 4) if pullback_locked > 0 else 0.0,
+            "entryFromSignalPct": round(entry_from_signal_pct, 4) if entry_from_signal_pct > 0 else 0.0,
+            "reinforcedCount": int(order.get('reinforcedCount', 0) or 0),
+            "strategyMode": order.get('strategyMode'),
+            "executionStyle": order.get('execution_style'),
+            "structuralFallbackStage": order.get('structural_fallback_stage'),
         })
 
     top_feedback = sorted(feedback_reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
@@ -27176,6 +27269,7 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             "trailingActive": trailing_count,
             "recheckWaiting": recheck_waiting,
             "agedConfirmed": aged_confirmed,
+            "belowScoreFloor": below_score_floor,
             "expiringSoon": expiring_soon,
             "states": states,
             "feedbackReasons": [{"reason": reason, "count": count} for reason, count in top_feedback],
@@ -27298,6 +27392,8 @@ class PaperTradingEngine:
             'soft_pass_count': 0, 'hard_reject_count': 0,
             'tradeability_reject_count': 0, 'false_negative_count': 0,
             'risk_gate_soft_pass': 0,
+            'late_score_rejected': 0,
+            'low_score_pending_dropped': 0,
         }
         # Settings log spam guard
         self._last_settings_log_ts = 0
@@ -27951,6 +28047,7 @@ class PaperTradingEngine:
         new_score = int(signal.get('confidenceScore', 0) if signal else 0)
         score_gap = new_score - old_score
         reinforce_count = int(existing_pending.get('reinforcedCount', 0) or 0) + 1
+        is_confirmed = bool(existing_pending.get('confirmed', False))
 
         existing_pending['reinforcedCount'] = reinforce_count
         existing_pending['signalScore'] = max(old_score, new_score)
@@ -27962,6 +28059,16 @@ class PaperTradingEngine:
         existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
         existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
         existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
+        existing_pending['atr'] = atr if atr > 0 else existing_pending.get('atr', 0)
+        existing_pending['truth_snapshot'] = signal.get('truth_snapshot', existing_pending.get('truth_snapshot', {})) if signal else existing_pending.get('truth_snapshot', {})
+        existing_pending['regime_adjustment'] = signal.get('regime_adjustment', existing_pending.get('regime_adjustment', '')) if signal else existing_pending.get('regime_adjustment', '')
+        existing_pending['structural_zone'] = signal.get('structural_zone', existing_pending.get('structural_zone', {})) if signal else existing_pending.get('structural_zone', {})
+        existing_pending['structural_fallback_stage'] = signal.get('structural_fallback_stage', existing_pending.get('structural_fallback_stage', '')) if signal else existing_pending.get('structural_fallback_stage', '')
+        existing_pending['execution_style'] = signal.get('execution_style', existing_pending.get('execution_style', EXEC_STYLE_MARKET)) if signal else existing_pending.get('execution_style', EXEC_STYLE_MARKET)
+        existing_pending['minConfidenceScoreSnapshot'] = max(
+            float(existing_pending.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score),
+            float(self.min_confidence_score),
+        )
         _runner_payload = {**existing_pending}
         if signal:
             _runner_payload.update(signal)
@@ -27981,14 +28088,34 @@ class PaperTradingEngine:
             blend_alpha = 0.35 if score_gap >= 0 else 0.20
             blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
 
-            locked_entry_raw = float(existing_pending.get('pullbackLocked', 0))
-            locked_entry_frac = locked_entry_raw / 100.0 if locked_entry_raw > 0.50 else locked_entry_raw
+            signal_price = extract_signal_anchor_price(signal, existing_pending.get('signalPrice', price))
+            locked_entry_frac = extract_signal_pullback_locked_fraction(
+                signal,
+                existing_pending.get('pullbackLocked', 0),
+            )
+            if signal_price > 0:
+                existing_pending['signalPrice'] = signal_price
             if locked_entry_frac > 0:
-                signal_price = float(existing_pending.get('signalPrice', price))
+                existing_pending['pullbackLocked'] = locked_entry_frac
+
+            if is_confirmed:
                 if side == 'LONG':
-                    blended = min(blended, signal_price * (1 - locked_entry_frac))
+                    blended = max(old_entry, blended)
                 else:
-                    blended = max(blended, signal_price * (1 + locked_entry_frac))
+                    blended = min(old_entry, blended)
+            if locked_entry_frac > 0:
+                if side == 'LONG':
+                    _locked_target = signal_price * (1 - locked_entry_frac)
+                    blended = (
+                        max(old_entry, min(blended, _locked_target))
+                        if is_confirmed else min(blended, _locked_target)
+                    )
+                else:
+                    _locked_target = signal_price * (1 + locked_entry_frac)
+                    blended = (
+                        min(old_entry, max(blended, _locked_target))
+                        if is_confirmed else max(blended, _locked_target)
+                    )
 
             existing_pending['entryPrice'] = blended
 
@@ -28047,12 +28174,13 @@ class PaperTradingEngine:
             pass
 
         extend_sec = max(180, int(signal.get('memoryExtensionSec', 0) if signal else 0))
-        existing_pending['expiresAt'] = max(
-            int(existing_pending.get('expiresAt', now_ms)),
-            now_ms + (extend_sec * 1000)
-        )
+        if not is_confirmed:
+            existing_pending['expiresAt'] = max(
+                int(existing_pending.get('expiresAt', now_ms)),
+                now_ms + (extend_sec * 1000)
+            )
         confirm_after = int(existing_pending.get('confirmAfter', now_ms))
-        if confirm_after > now_ms:
+        if (not is_confirmed) and confirm_after > now_ms:
             remaining = confirm_after - now_ms
             speedup = 0.80 if reinforce_count <= 1 else 0.65
             existing_pending['confirmAfter'] = now_ms + int(remaining * speedup)
@@ -28957,16 +29085,7 @@ class PaperTradingEngine:
         # which invalidates the original signal pattern.
         # Corridor limit: max 0.8 ATR favorable move allowed before chase is declared.
         
-        if signal:
-            signal_price = float(
-                signal.get('signalPrice')
-                or signal.get('priceAtSignal')
-                or signal.get('entryAnchorPrice')
-                or signal.get('price')
-                or price
-            )
-        else:
-            signal_price = price
+        signal_price = extract_signal_anchor_price(signal, price)
         
         if side == 'LONG':
             move_from_signal = price - signal_price
@@ -29043,6 +29162,9 @@ class PaperTradingEngine:
             "counterTrendStrength": round(_ct_str, 3),
             "trail_phase": "WIDE" if (COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal) else "NORMAL",
             "settingsSnapshot": settings_snapshot,
+            "minConfidenceScoreSnapshot": float(self.min_confidence_score),
+            "truth_snapshot": signal.get('truth_snapshot', {}) if signal else {},
+            "regime_adjustment": signal.get('regime_adjustment', '') if signal else '',
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
             # SMART_V3_RUNNER: execution profile propagation
             "execution_profile_source": signal.get('execution_profile_source', 'neutral') if signal else 'neutral',
@@ -29138,6 +29260,7 @@ class PaperTradingEngine:
             side = order.get('side', '')
             entry_price = order.get('entryPrice', 0)
             expires_at = order.get('expiresAt', 0)
+            score_floor = float(order.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score)
             
             # Find current price for this symbol (also used by expiry fallback)
             current_price = None
@@ -29151,7 +29274,7 @@ class PaperTradingEngine:
             forecast_prob = order.get('forecastProb', 0.5)
             
             # Phase 262: Modulate fallback min score based on forecast (applied to ALL fallback paths)
-            fb_min_score = MARKET_FALLBACK_MIN_SCORE
+            fb_min_score = max(MARKET_FALLBACK_MIN_SCORE, score_floor)
             if ENTRY_FORECAST_ENABLED:
                 if forecast_prob < 0.4:
                     fb_min_score -= 10  # Runaway trend -> easier fallback
@@ -29216,6 +29339,27 @@ class PaperTradingEngine:
                     )
                     self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'stale_signal', current_time)
                     continue
+
+            if (
+                is_confirmed
+                and pending_age_min >= (PENDING_NEAR_ENTRY_MIN_AGE_SEC / 60.0)
+                and signal_score < score_floor
+                and not bool(order.get('allowMarket', False))
+            ):
+                self.pending_orders.remove(order)
+                self.pipeline_metrics.setdefault('low_score_pending_dropped', 0)
+                self.pipeline_metrics['low_score_pending_dropped'] += 1
+                self.set_execution_feedback(symbol, "PENDING_SCORE_BELOW_MIN")
+                self.add_log(
+                    f"🧹 PENDING_SCORE_DROP: {side} {symbol} "
+                    f"score={signal_score:.0f} < min={score_floor:.0f} (age={pending_age_min:.0f}m)"
+                )
+                logger.info(
+                    f"🧹 PENDING_SCORE_DROP: {order['id']} removed "
+                    f"(score={signal_score:.0f} < min={score_floor:.0f}, age={pending_age_min:.0f}m)"
+                )
+                self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'pending_score_below_min', current_time)
+                continue
             
             if not current_price or current_price <= 0:
                 continue
@@ -34044,12 +34188,18 @@ async def paper_trading_status():
             "state": order.get("state"),
             "confirmed": bool(order.get("confirmed", False)),
             "signalScore": order.get("signalScore", 0),
+            "signalPrice": order.get("signalPrice", 0),
             "entryPrice": order.get("entryPrice", 0),
+            "pullbackLocked": order.get("pullbackLocked", 0),
             "createdAt": order.get("createdAt", 0),
             "confirmAfter": order.get("confirmAfter", 0),
             "recheckNextAt": order.get("recheckNextAt", 0),
             "recheckDecision": order.get("recheckDecision"),
             "expiresAt": order.get("expiresAt", 0),
+            "reinforcedCount": int(order.get("reinforcedCount", 0) or 0),
+            "strategyMode": order.get("strategyMode"),
+            "executionStyle": order.get("execution_style"),
+            "structuralFallbackStage": order.get("structural_fallback_stage"),
             "truthSnapshot": order.get("truth_snapshot", {}),  # RFX-1D
             "regimeAdjustment": order.get("regime_adjustment", ""),  # RFX-1D
             "distanceTruth": order.get("distance_truth", {}),  # RFX-2B
@@ -34848,12 +34998,18 @@ async def paper_trading_get_settings():
             "state": order.get("state"),
             "confirmed": bool(order.get("confirmed", False)),
             "signalScore": order.get("signalScore", 0),
+            "signalPrice": order.get("signalPrice", 0),
             "entryPrice": order.get("entryPrice", 0),
+            "pullbackLocked": order.get("pullbackLocked", 0),
             "createdAt": order.get("createdAt", 0),
             "confirmAfter": order.get("confirmAfter", 0),
             "recheckNextAt": order.get("recheckNextAt", 0),
             "recheckDecision": order.get("recheckDecision"),
             "expiresAt": order.get("expiresAt", 0),
+            "reinforcedCount": int(order.get("reinforcedCount", 0) or 0),
+            "strategyMode": order.get("strategyMode"),
+            "executionStyle": order.get("execution_style"),
+            "structuralFallbackStage": order.get("structural_fallback_stage"),
             "truthSnapshot": order.get("truth_snapshot", {}),  # RFX-1D
             "regimeAdjustment": order.get("regime_adjustment", ""),  # RFX-1D
             "distanceTruth": order.get("distance_truth", {}),  # RFX-2B
