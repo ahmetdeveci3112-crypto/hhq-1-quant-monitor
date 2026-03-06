@@ -350,6 +350,31 @@ def test_pending_rescue_score_floor_tracks_runtime_quality_floor():
     assert main.resolve_pending_rescue_score_min(92, 88) == 92
 
 
+def test_should_soften_pending_recheck_hard_reject_only_for_confirmed_high_score_mild_ob_veto():
+    order = {
+        'confirmed': True,
+        'signalScore': 92,
+        'minConfidenceScoreSnapshot': 80,
+    }
+
+    assert main.should_soften_pending_recheck_hard_reject(
+        order,
+        direction_flip=False,
+        spread_reject=False,
+        ob_veto=True,
+        liquidity_reject=False,
+        live_ob_trend=6.4,
+    ) is True
+    assert main.should_soften_pending_recheck_hard_reject(
+        order,
+        direction_flip=False,
+        spread_reject=False,
+        ob_veto=True,
+        liquidity_reject=False,
+        live_ob_trend=12.0,
+    ) is False
+
+
 def test_build_pending_orders_observability_exposes_pending_anchor_and_score_floor():
     now_ms = 1_770_000_000_000
     pending_orders = [{
@@ -388,6 +413,40 @@ def test_build_pending_orders_observability_exposes_pending_anchor_and_score_flo
     assert result['orders'][0]['strategyMode'] == main.STRATEGY_MODE_SMART_V3_RUNNER
     assert result['orders'][0]['executionStyle'] == main.EXEC_STYLE_BREAKOUT
     assert result['orders'][0]['structuralFallbackStage'] == 'fib_support'
+
+
+def test_build_pending_orders_observability_prefers_order_local_feedback_and_hides_stale_final_score():
+    now_ms = 1_770_000_000_000
+    pending_orders = [{
+        'id': 'po-feedback',
+        'symbol': 'FDBKUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 92,
+        'entryPrice': 100.0,
+        'signalPrice': 99.0,
+        'createdAt': now_ms - 900_000,
+        'confirmAfter': now_ms - 600_000,
+        'expiresAt': now_ms + 600_000,
+    }]
+
+    stale_feedback = {'FDBKUSDT': {'reason': 'FINAL_SCORE_BELOW_MIN:66.5', 'ts': now_ms}}
+    result = main.build_pending_orders_observability(
+        pending_orders,
+        execution_feedback=stale_feedback,
+        now_ms=now_ms,
+        min_confidence_score=80,
+    )
+    assert result['orders'][0]['feedbackReason'] is None
+
+    pending_orders[0]['lastWaitReason'] = 'force_spread_soft:spread_too_wide:9.5bps'
+    result = main.build_pending_orders_observability(
+        pending_orders,
+        execution_feedback=stale_feedback,
+        now_ms=now_ms,
+        min_confidence_score=80,
+    )
+    assert result['orders'][0]['feedbackReason'] == 'force_spread_soft:spread_too_wide:9.5bps'
 
 
 def test_evaluate_aged_near_entry_fill_requires_confirmed_high_score_and_tight_band():
@@ -481,6 +540,31 @@ def test_compute_pending_retry_wait_ms_respects_pending_score_floor_snapshot():
     wait_ms = main.compute_pending_retry_wait_ms(order, now_ms, 30_000, 'bbo_spread:spread_too_wide')
 
     assert wait_ms == 30_000
+
+
+def test_revalidate_pending_entry_softens_mild_ob_veto_for_confirmed_high_score_pending():
+    now_ms = 1_770_000_000_000
+    order = {
+        'symbol': 'SOFTUSDT',
+        'side': 'SHORT',
+        'confirmed': True,
+        'signalScore': 92,
+        'spreadPct': 0.06,
+        'createdAt': now_ms - 900_000,
+        'minConfidenceScoreSnapshot': 80,
+    }
+    opportunity = {
+        'signalAction': 'NONE',
+        'spreadPct': 0.07,
+        'volumeRatio': 0.28,
+        'obImbalanceTrend': 6.2,
+    }
+
+    result = main.revalidate_pending_entry(order, opportunity, now_ms)
+
+    assert result['decision'] == 'WARN_WAIT'
+    assert result['hard_reject'] is False
+    assert 'OB_SOFTEN(6.2)' in result['reasons']
 
 
 def test_reinforce_confirmed_pending_keeps_short_entry_closer_to_market_and_preserves_timers(tmp_path):

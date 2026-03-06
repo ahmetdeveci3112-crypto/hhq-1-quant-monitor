@@ -8702,6 +8702,8 @@ PENDING_FAST_RETRY_SCORE_MIN = float(os.environ.get('PENDING_FAST_RETRY_SCORE_MI
 PENDING_FAST_RETRY_MIN_AGE_SEC = int(os.environ.get('PENDING_FAST_RETRY_MIN_AGE_SEC', '180'))
 PENDING_FAST_RETRY_WAIT_MS = int(os.environ.get('PENDING_FAST_RETRY_WAIT_MS', '15000'))
 PENDING_RESCUE_SCORE_BUFFER = float(os.environ.get('PENDING_RESCUE_SCORE_BUFFER', '4.0'))
+PENDING_RECHECK_SOFT_OB_VETO_MAX = float(os.environ.get('PENDING_RECHECK_SOFT_OB_VETO_MAX', '8.5'))
+FORCE_MARKET_DRIFT_SOFT_MULT = float(os.environ.get('FORCE_MARKET_DRIFT_SOFT_MULT', '1.35'))
 
 MIN_NOTIONAL_SOFT_UPSIZE_ENABLED = _env_bool("MIN_NOTIONAL_SOFT_UPSIZE_ENABLED", True)
 MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN = float(os.environ.get('MIN_NOTIONAL_SOFT_UPSIZE_SCORE_MIN', '88'))
@@ -10276,6 +10278,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     order_side = order.get('side', '')
     order_spread = float(order.get('spreadPct', 0.05) or 0.05)
     order_signal_score = float(order.get('signalScore', 0) or 0)
+    order_score_floor = float(order.get('minConfidenceScoreSnapshot', 74) or 74)
     created_at = int(order.get('createdAt', now_ms) or now_ms)
     age_min = (now_ms - created_at) / 60000.0
 
@@ -10283,6 +10286,10 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     live_spread = float(opportunity.get('spreadPct', 0) or 0)
     live_vol_ratio = float(opportunity.get('volumeRatio', 1.0) or 1.0)
     live_ob_trend = float(opportunity.get('obImbalanceTrend', 0) or 0)
+    direction_flip = False
+    spread_reject = False
+    ob_veto = False
+    liquidity_reject = False
 
     # ── 1. Direction alignment (30 pt) ─────────────────────────
     if live_side == order_side:
@@ -10293,6 +10300,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         reasons.append("DIR_NEUTRAL")
     else:
         hard_reject = True
+        direction_flip = True
         reasons.append(f"DIR_FLIP({order_side}→{live_side})")
 
     # ── 2. Spread health (20 pt) ──────────────────────────────
@@ -10308,6 +10316,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         reasons.append(f"SPREAD_HIGH({live_spread:.3f})")
     else:
         hard_reject = True
+        spread_reject = True
         reasons.append(f"SPREAD_REJECT({live_spread:.3f}>{spread_limit:.3f})")
 
     # ── 3. Order book alignment (20 pt) ───────────────────────
@@ -10323,6 +10332,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
             reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
         else:
             hard_reject = True
+            ob_veto = True
             reasons.append(f"OB_VETO({live_ob_trend:.1f})")
     else:  # SHORT
         if live_ob_trend < -2:
@@ -10336,6 +10346,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
             reasons.append(f"OB_WEAK({live_ob_trend:.1f})")
         else:
             hard_reject = True
+            ob_veto = True
             reasons.append(f"OB_VETO({live_ob_trend:.1f})")
 
     # ── 4. Volume / liquidity health (15 pt) ──────────────────
@@ -10351,6 +10362,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     else:
         if live_spread > 0.20:
             hard_reject = True
+            liquidity_reject = True
             reasons.append(f"LIQ_REJECT(vol={live_vol_ratio:.2f},sp={live_spread:.3f})")
         else:
             score += 2
@@ -10370,6 +10382,20 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         score += 2
         reasons.append(f"AGE_STALE({age_min:.0f}m)")
 
+    softened_hard_reject = False
+    if should_soften_pending_recheck_hard_reject(
+        order,
+        direction_flip=direction_flip,
+        spread_reject=spread_reject,
+        ob_veto=ob_veto,
+        liquidity_reject=liquidity_reject,
+        live_ob_trend=live_ob_trend,
+    ):
+        hard_reject = False
+        softened_hard_reject = True
+        score = max(score, 46.0 if live_side == 'NONE' else 52.0)
+        reasons.append(f"OB_SOFTEN({live_ob_trend:.1f})")
+
     # ── Unified decision ──────────────────────────────────────
     if hard_reject:
         decision = 'FAIL_DROP'
@@ -10385,7 +10411,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     allow_market = (
         not hard_reject and (
             (score >= 70 and order_signal_score >= 85) or
-            (force_market and score >= 50 and order_signal_score >= 75)
+            (force_market and score >= 50 and order_signal_score >= max(75, order_score_floor + 4))
         )
     )
 
@@ -10393,7 +10419,7 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     logger.info(
         f"ENTRY_RECHECK_DECISION: {order.get('symbol','')} {order_side} "
         f"decision={decision} score={score:.0f} hard={hard_reject} "
-        f"| {reason_summary}"
+        f"softened={softened_hard_reject} | {reason_summary}"
     )
 
     return {
@@ -27032,6 +27058,33 @@ def resolve_pending_rescue_score_min(min_confidence_score: float, configured_flo
     return max(base, min(configured, base + PENDING_RESCUE_SCORE_BUFFER))
 
 
+def should_soften_pending_recheck_hard_reject(
+    order: dict,
+    *,
+    direction_flip: bool,
+    spread_reject: bool,
+    ob_veto: bool,
+    liquidity_reject: bool,
+    live_ob_trend: float,
+) -> bool:
+    """Allow mild micro-structure disagreement to degrade into wait, not drop."""
+    if not order or direction_flip or spread_reject or liquidity_reject or not ob_veto:
+        return False
+
+    if not bool(order.get('confirmed', False)):
+        return False
+
+    score_floor = resolve_pending_rescue_score_min(
+        order.get('minConfidenceScoreSnapshot', 74),
+        PENDING_NEAR_ENTRY_SCORE_MIN,
+    )
+    signal_score = float(order.get('signalScore', 0) or 0)
+    if signal_score < score_floor:
+        return False
+
+    return abs(float(live_ob_trend or 0.0)) <= PENDING_RECHECK_SOFT_OB_VETO_MAX
+
+
 def evaluate_aged_near_entry_fill(order: dict, current_price: float, current_time: int,
                                    min_confidence_score: float) -> dict:
     """Allow a narrow, aged pending fill near entry without reopening wide gates."""
@@ -27195,6 +27248,11 @@ def build_pending_orders_observability(pending_orders: list, execution_feedback:
             order.get('minConfidenceScoreSnapshot', min_confidence_score),
             PENDING_NEAR_ENTRY_SCORE_MIN,
         )
+        order_local_reason = str(order.get('lastWaitReason', '') or '')
+        if order_local_reason:
+            feedback_reason = order_local_reason
+        elif feedback_reason.startswith('FINAL_SCORE_BELOW_MIN') and score >= float(min_confidence_score):
+            feedback_reason = ''
 
         if confirmed:
             confirmed_count += 1
@@ -30487,18 +30545,54 @@ class PaperTradingEngine:
                 try:
                     fm_vbbo = await live_binance_trader.validate_bbo(symbol)
                     if not fm_vbbo['valid']:
+                        fm_reason = str(fm_vbbo.get('reason', 'unknown') or 'unknown')
+                        fm_spread_bps = float(fm_vbbo.get('spread_bps', 0) or 0)
+                        soft_spread_limit = float(live_binance_trader.exec_max_spread_bps or 0) * FORCE_MARKET_DRIFT_SOFT_MULT
+                        order_score = float(order.get('signalScore', 0) or 0)
+                        order_score_floor = float(order.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score)
+                        can_soft_wait = (
+                            bool(order.get('confirmed', False))
+                            and fm_reason == 'spread_too_wide'
+                            and fm_spread_bps > 0
+                            and fm_spread_bps <= max(soft_spread_limit, live_binance_trader.exec_max_spread_bps + 2.0)
+                            and order_score >= resolve_pending_rescue_score_min(order_score_floor, PENDING_NEAR_ENTRY_SCORE_MIN)
+                        )
+                        if can_soft_wait:
+                            logger.info(
+                                f"⚠️ FORCE_MARKET_SPREAD_SOFT_WAIT: {side} {symbol} "
+                                f"spread_bps={fm_spread_bps:.1f} reason={fm_reason}"
+                            )
+                            self.set_execution_feedback(symbol, f"FORCE_MARKET_WAIT:{fm_reason}:{fm_spread_bps:.1f}bps")
+                            _requeue_pending(15_000, f"force_spread_soft:{fm_reason}:{fm_spread_bps:.1f}bps")
+                            return
                         live_binance_trader._exec_diag['invalid_block_count'] += 1
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['spread_rejected'] += 1
-                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{fm_vbbo['reason']}")
-                        logger.warning(f"🚫 FORCE_MARKET BBO_VETO: {side} {symbol} | reason={fm_vbbo['reason']}")
-                        self.add_log(f"🚫 FORCE MARKET BBO VETO: {symbol} ({fm_vbbo['reason']})")
-                        _requeue_pending(30_000, f"force_invalid_bbo:{fm_vbbo['reason']}")
+                        self.set_execution_feedback(symbol, f"BLOCK_OPEN_INVALID_BBO:{fm_reason}")
+                        logger.warning(f"🚫 FORCE_MARKET BBO_VETO: {side} {symbol} | reason={fm_reason}")
+                        self.add_log(f"🚫 FORCE MARKET BBO VETO: {symbol} ({fm_reason})")
+                        _requeue_pending(30_000, f"force_invalid_bbo:{fm_reason}")
                         return
                     fm_mid = fm_vbbo['bbo'].get('mid', 0) if fm_vbbo.get('valid') else 0
                     fm_drift_bps, fm_drift_blocked, _ = live_binance_trader._check_pre_trade_drift(
                         order.get('signalPrice', fill_price), fm_mid)
                     if fm_drift_blocked:
+                        order_score = float(order.get('signalScore', 0) or 0)
+                        order_score_floor = float(order.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score)
+                        soft_drift_limit = float(live_binance_trader.exec_max_drift_bps or 0) * FORCE_MARKET_DRIFT_SOFT_MULT
+                        can_soft_wait = (
+                            bool(order.get('confirmed', False))
+                            and fm_drift_bps <= max(soft_drift_limit, live_binance_trader.exec_max_drift_bps + 3.0)
+                            and order_score >= resolve_pending_rescue_score_min(order_score_floor, PENDING_NEAR_ENTRY_SCORE_MIN)
+                        )
+                        if can_soft_wait:
+                            logger.info(
+                                f"⚠️ FORCE_MARKET_DRIFT_SOFT_WAIT: {side} {symbol} "
+                                f"drift={fm_drift_bps:.1f}bps"
+                            )
+                            self.set_execution_feedback(symbol, f"FORCE_MARKET_WAIT:drift:{fm_drift_bps:.1f}bps")
+                            _requeue_pending(15_000, f"force_drift_soft:{fm_drift_bps:.1f}bps")
+                            return
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.pipeline_metrics['drift_rejected'] += 1
                         self.set_execution_feedback(symbol, f"BLOCK_OPEN_DRIFT:{fm_drift_bps:.1f}bps")
