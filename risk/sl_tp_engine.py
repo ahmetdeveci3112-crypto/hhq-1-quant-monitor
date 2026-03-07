@@ -362,6 +362,7 @@ def compute_tp_ladder_v2(
     coin_daily_trend: str = 'NEUTRAL',
     exec_score: float = 70.0,
     spread_level: str = 'Normal',
+    tp_tighten_mult: float = 1.0,
 ) -> dict:
     """RFX-1B: 4-tier TP ladder with TP_FINAL and monotonic guarantee.
 
@@ -423,6 +424,12 @@ def compute_tp_ladder_v2(
     tp2_pct = max(tp2_pct, est_cost_pct * 3.0)
     tp3_pct = max(tp3_pct, est_cost_pct * 4.0)
     tp_final_pct = max(tp_final_pct, est_cost_pct * 5.0)
+
+    tighten = max(0.70, min(1.40, float(tp_tighten_mult or 1.0)))
+    tp1_pct *= tighten
+    tp2_pct *= tighten
+    tp3_pct *= tighten
+    tp_final_pct *= tighten
 
     # ── Convert to absolute prices ──
     if side == 'LONG':
@@ -513,6 +520,7 @@ def compute_tp_ladder_v2(
         'tp_final_target_roi': tp_final_target_roi,
         'epsilon_fixes': epsilon_fixes,
         'profile': risk_params.profile.value if risk_params else 'NONE',
+        'tp_tighten_mult': round(tighten, 3),
     }
 
     return {
@@ -527,4 +535,3 @@ def compute_tp_ladder_v2(
         'monotonic': True,
         'telemetry': telemetry,
     }
-

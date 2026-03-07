@@ -5015,12 +5015,19 @@ class LiveBinanceTrader:
                             # Override PnL from trade_data if available (more accurate)
                             if trade_data.get('pnl') is not None:
                                 pnl = trade_data.get('pnl')
-                
+                prefer_memory_close_reason = (
+                    symbol in pending_close_reasons
+                    and get_runner_exit_owner(
+                        pending_close_reasons.get(symbol, {}).get('trade_data', {}),
+                        default_mode=STRATEGY_MODE_LEGACY,
+                    ) == V3_EXIT_OWNER
+                )
+
                 # If not found in memory, try SQLite (for persistence after restart)
                 # Phase 229: Pass close_order_id from in-memory or UserTrades
                 mem_close_oid = pending_close_reasons.get(symbol, {}).get('close_order_id', '') if symbol in pending_close_reasons else ''
                 effective_close_oid = mem_close_oid or close_order_id
-                if reason_detail == 'Position closed on Binance':
+                if reason_detail == 'Position closed on Binance' or not prefer_memory_close_reason:
                     try:
                         sqlite_close = await sqlite_manager.get_pending_close_reason(symbol, timestamp, window_minutes=60, close_order_id=effective_close_oid)
                         if sqlite_close:
@@ -6324,6 +6331,26 @@ async def binance_position_sync_loop():
                             'runner_trail_dist_mult': _sync_runner_controls['trail_dist_mult'],
                             'runner_tp_tighten': _sync_runner_controls['tp_tighten'],
                             'runner_be_buffer_mult': _sync_runner_controls['be_buffer_mult'],
+                            'runnerContext': bp.get('runnerContext', _sync_runner_controls.get('runner_context', '')),
+                            'exitOwner': bp.get('exitOwner', _sync_runner_controls.get('exit_owner', LEGACY_EXIT_OWNER)),
+                            'tpCloseSplit': bp.get('tpCloseSplit', format_runner_close_split(_sync_runner_controls.get('tp_close_split', (0.30, 0.25, 0.25, 0.20)))),
+                            'tpLadderVersion': bp.get('tpLadderVersion', bp.get('tp_ladder_version', '')),
+                            'tp1ArmDelaySec': int(bp.get('tp1ArmDelaySec', _sync_runner_controls.get('trail_arm_delay_sec', 0)) or 0),
+                            'tp1ArmAtrReq': float(bp.get('tp1ArmAtrReq', _sync_runner_controls.get('trail_arm_atr_req', 0.0)) or 0.0),
+                            'beAfterTrailAtrReq': float(bp.get('beAfterTrailAtrReq', _sync_runner_controls.get('be_after_trail_atr_req', 0.0)) or 0.0),
+                            'trailArmed': bool(bp.get('trailArmed', False)),
+                            'trailArmReason': bp.get('trailArmReason', ''),
+                            'trailArmSince': bp.get('trailArmSince', 0),
+                            'trailArmPrice': bp.get('trailArmPrice', 0.0),
+                            'trailArmElapsedSec': int(bp.get('trailArmElapsedSec', 0) or 0),
+                            'oppositePressureCount': int(bp.get('oppositePressureCount', 0) or 0),
+                            'oppositeBestScore': float(bp.get('oppositeBestScore', 0.0) or 0.0),
+                            'oppositeLastSeenTs': bp.get('oppositeLastSeenTs', 0),
+                            'recoveryStage': int(bp.get('recoveryStage', 0) or 0),
+                            'internalProtectionOnly': bool(bp.get('internalProtectionOnly', False)),
+                            'protectionRetryAt': bp.get('protectionRetryAt', 0),
+                            'protectionRetryPrice': float(bp.get('protectionRetryPrice', 0.0) or 0.0),
+                            'lastExitDecision': bp.get('lastExitDecision', ''),
                             'runner_wide_profit_pct': _sync_wide_profit,
                             'runner_wide_age_sec': _sync_wide_age,
                         }
@@ -6363,6 +6390,26 @@ async def binance_position_sync_loop():
                                 pos.setdefault('runner_trail_dist_mult', _sync_runner_controls['trail_dist_mult'])
                                 pos.setdefault('runner_tp_tighten', _sync_runner_controls['tp_tighten'])
                                 pos.setdefault('runner_be_buffer_mult', _sync_runner_controls['be_buffer_mult'])
+                                pos.setdefault('runnerContext', bp.get('runnerContext', _sync_runner_controls.get('runner_context', '')))
+                                pos.setdefault('exitOwner', bp.get('exitOwner', _sync_runner_controls.get('exit_owner', LEGACY_EXIT_OWNER)))
+                                pos.setdefault('tpCloseSplit', bp.get('tpCloseSplit', format_runner_close_split(_sync_runner_controls.get('tp_close_split', (0.30, 0.25, 0.25, 0.20)))))
+                                pos.setdefault('tpLadderVersion', bp.get('tpLadderVersion', bp.get('tp_ladder_version', '')))
+                                pos.setdefault('tp1ArmDelaySec', int(bp.get('tp1ArmDelaySec', _sync_runner_controls.get('trail_arm_delay_sec', 0)) or 0))
+                                pos.setdefault('tp1ArmAtrReq', float(bp.get('tp1ArmAtrReq', _sync_runner_controls.get('trail_arm_atr_req', 0.0)) or 0.0))
+                                pos.setdefault('beAfterTrailAtrReq', float(bp.get('beAfterTrailAtrReq', _sync_runner_controls.get('be_after_trail_atr_req', 0.0)) or 0.0))
+                                pos.setdefault('trailArmed', False)
+                                pos.setdefault('trailArmReason', '')
+                                pos.setdefault('trailArmSince', 0)
+                                pos.setdefault('trailArmPrice', 0.0)
+                                pos.setdefault('trailArmElapsedSec', 0)
+                                pos.setdefault('oppositePressureCount', 0)
+                                pos.setdefault('oppositeBestScore', 0.0)
+                                pos.setdefault('oppositeLastSeenTs', 0)
+                                pos.setdefault('recoveryStage', 0)
+                                pos.setdefault('internalProtectionOnly', False)
+                                pos.setdefault('protectionRetryAt', 0)
+                                pos.setdefault('protectionRetryPrice', 0.0)
+                                pos.setdefault('lastExitDecision', '')
                                 pos.setdefault('runner_wide_profit_pct', _sync_wide_profit)
                                 pos.setdefault('runner_wide_age_sec', _sync_wide_age)
                                 
@@ -9532,19 +9579,19 @@ def resolve_runner_exit_controls(payload: dict = None, default_mode: str = STRAT
     base_be = 1.0
     if enabled:
         try:
-            _ct = bool(data.get('counterTrend', False) or data.get('counter_trend', False))
-            _ct_strength = _to_float_safe(data.get('counterTrendStrength', data.get('counter_trend_strength', 0.0)), 0.0)
-            _base_profile = resolve_strategy_execution_profile(mode=mode, counter_trend=_ct, ct_strength=_ct_strength)
-            base_act = _to_float_safe(_base_profile.trail_activation_mult, 1.0)
-            base_dist = _to_float_safe(_base_profile.trail_distance_mult, 1.0)
-            base_tp = _to_float_safe(_base_profile.tp_tighten_intensity, 1.0)
-            base_be = _to_float_safe(_base_profile.be_buffer_mult, 1.0)
+            _ctx_cfg = resolve_v3_runner_context_config(data, default_mode=default_mode)
+            base_act = _to_float_safe(_ctx_cfg.get('trail_act_mult', 1.0), 1.0)
+            base_dist = _to_float_safe(_ctx_cfg.get('trail_dist_mult', 1.0), 1.0)
+            base_tp = _to_float_safe(_ctx_cfg.get('tp_tighten', 1.0), 1.0)
+            base_be = _to_float_safe(_ctx_cfg.get('be_buffer_mult', 1.0), 1.0)
         except Exception:
             pass
     trail_act_mult = _clamp(_to_float_safe(data.get('runner_trail_act_mult', base_act), base_act), 0.60, 1.80)
     trail_dist_mult = _clamp(_to_float_safe(data.get('runner_trail_dist_mult', base_dist), base_dist), 0.60, 1.80)
     tp_tighten = _clamp(_to_float_safe(data.get('runner_tp_tighten', base_tp), base_tp), 0.70, 1.40)
     be_buffer_mult = _clamp(_to_float_safe(data.get('runner_be_buffer_mult', base_be), base_be), 0.70, 1.60)
+    context = classify_v3_runner_context(data, default_mode=default_mode) if enabled else ""
+    context_cfg = resolve_v3_runner_context_config(data, default_mode=default_mode) if enabled else {}
     if not enabled:
         trail_act_mult = 1.0
         trail_dist_mult = 1.0
@@ -9557,6 +9604,12 @@ def resolve_runner_exit_controls(payload: dict = None, default_mode: str = STRAT
         'trail_dist_mult': trail_dist_mult,
         'tp_tighten': tp_tighten,
         'be_buffer_mult': be_buffer_mult,
+        'runner_context': context,
+        'tp_close_split': context_cfg.get('tp_close_split', (0.30, 0.25, 0.25, 0.20)),
+        'trail_arm_delay_sec': int(context_cfg.get('trail_arm_delay_sec', 0)),
+        'trail_arm_atr_req': float(context_cfg.get('trail_arm_atr_req', 0.0)),
+        'be_after_trail_atr_req': float(context_cfg.get('be_after_trail_atr_req', 0.0)),
+        'exit_owner': get_runner_exit_owner(data, default_mode=default_mode),
     }
 
 
@@ -9566,6 +9619,214 @@ def apply_runner_be_buffer(base_buffer_ratio: float, runner_controls: dict) -> f
         return base_buffer_ratio
     adjusted = float(base_buffer_ratio) * float(runner_controls.get('be_buffer_mult', 1.0))
     return _clamp(adjusted, 0.0008, 0.02)  # 0.08% .. 2.00%
+
+
+V3_EXIT_OWNER = "V3_RUNNER_SM"
+LEGACY_EXIT_OWNER = "LEGACY"
+V3_RUNNER_CONTEXT_TREND = "trend_aligned"
+V3_RUNNER_CONTEXT_COUNTER = "countertrend"
+V3_RUNNER_CONTEXT_RECOVERY = "recovery"
+V3_RUNNER_CONTEXT_CONFIGS = {
+    V3_RUNNER_CONTEXT_TREND: {
+        "trail_act_mult": 1.55,
+        "trail_dist_mult": 1.80,
+        "tp_tighten": 1.00,
+        "be_buffer_mult": 0.90,
+        "tp_close_split": (0.15, 0.20, 0.25, 0.40),
+        "trail_arm_delay_sec": 90,
+        "trail_arm_atr_req": 0.50,
+        "be_after_trail_atr_req": 0.00,
+    },
+    V3_RUNNER_CONTEXT_COUNTER: {
+        "trail_act_mult": 1.40,
+        "trail_dist_mult": 1.65,
+        "tp_tighten": 0.92,
+        "be_buffer_mult": 1.00,
+        "tp_close_split": (0.20, 0.25, 0.25, 0.30),
+        "trail_arm_delay_sec": 60,
+        "trail_arm_atr_req": 0.35,
+        "be_after_trail_atr_req": 0.25,
+    },
+    V3_RUNNER_CONTEXT_RECOVERY: {
+        "trail_act_mult": 1.20,
+        "trail_dist_mult": 1.40,
+        "tp_tighten": 1.00,
+        "be_buffer_mult": 1.00,
+        "tp_close_split": (0.20, 0.25, 0.25, 0.30),
+        "trail_arm_delay_sec": 45,
+        "trail_arm_atr_req": 0.25,
+        "be_after_trail_atr_req": 0.15,
+    },
+}
+
+
+def _is_bullish_daily_trend(trend: str) -> bool:
+    return str(trend or '').upper() in ('BULLISH', 'STRONG_BULLISH')
+
+
+def _is_bearish_daily_trend(trend: str) -> bool:
+    return str(trend or '').upper() in ('BEARISH', 'STRONG_BEARISH')
+
+
+def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
+    """Classify SMART_V3_RUNNER positions/signals into runner execution contexts."""
+    data = payload or {}
+    mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    if mode != STRATEGY_MODE_SMART_V3_RUNNER:
+        return ""
+
+    explicit = str(data.get('runnerContext', data.get('runner_context', '')) or '').strip().lower()
+    if explicit in V3_RUNNER_CONTEXT_CONFIGS:
+        return explicit
+
+    if bool(data.get('recovery_mode', False)) or int(data.get('recoveryStage', data.get('recovery_stage', 0)) or 0) > 0:
+        return V3_RUNNER_CONTEXT_RECOVERY
+
+    side = str(data.get('side', data.get('action', '')) or '').upper()
+    daily_trend = str(data.get('coinDailyTrend', data.get('coin_daily_trend', 'NEUTRAL')) or 'NEUTRAL').upper()
+    is_counter = bool(data.get('counterTrend', data.get('counter_trend', False)))
+    if side == 'LONG':
+        aligned = _is_bullish_daily_trend(daily_trend)
+        opposed = _is_bearish_daily_trend(daily_trend)
+    elif side == 'SHORT':
+        aligned = _is_bearish_daily_trend(daily_trend)
+        opposed = _is_bullish_daily_trend(daily_trend)
+    else:
+        aligned = False
+        opposed = False
+
+    if is_counter or opposed:
+        return V3_RUNNER_CONTEXT_COUNTER
+    if aligned:
+        return V3_RUNNER_CONTEXT_TREND
+    return V3_RUNNER_CONTEXT_COUNTER
+
+
+def resolve_v3_runner_context_config(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> dict:
+    """Resolve the context-specific runner config for SMART_V3_RUNNER."""
+    context = classify_v3_runner_context(payload, default_mode=default_mode)
+    return dict(V3_RUNNER_CONTEXT_CONFIGS.get(context, V3_RUNNER_CONTEXT_CONFIGS[V3_RUNNER_CONTEXT_COUNTER]))
+
+
+def format_runner_close_split(split: tuple[float, float, float, float]) -> str:
+    return "/".join(f"{int(round(part * 100))}" for part in split)
+
+
+def get_runner_exit_owner(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
+    data = payload or {}
+    mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    return V3_EXIT_OWNER if mode == STRATEGY_MODE_SMART_V3_RUNNER else LEGACY_EXIT_OWNER
+
+
+def apply_runner_tp_close_split(levels: list, split: tuple[float, float, float, float]) -> list:
+    """Apply a 4-tier runner split to TP ladder levels while preserving keys/pcts."""
+    adjusted = []
+    padded = list(split[:4]) + [0.0] * max(0, 4 - len(split))
+    for idx, level in enumerate(levels or []):
+        cloned = dict(level)
+        if idx < 4:
+            cloned['close_pct'] = round(float(padded[idx]), 2)
+        adjusted.append(cloned)
+    return adjusted
+
+
+def build_v3_runner_fallback_tp_ladder(
+    entry_price: float,
+    atr: float,
+    side: str,
+    leverage: int,
+    spread_pct: float,
+    volume_ratio: float,
+    adx: float,
+    hurst: float,
+    coin_daily_trend: str,
+    exec_score: float,
+    spread_level: str,
+    tp_tighten: float,
+    close_split: tuple[float, float, float, float],
+) -> dict:
+    """Fallback 4-tier ladder for V3 when the RFX ladder is unavailable."""
+    base = compute_adaptive_tp_ladder(
+        side=side,
+        entry_price=entry_price,
+        atr=atr,
+        leverage=leverage,
+        spread_pct=spread_pct,
+        volume_ratio=volume_ratio,
+        adx=adx,
+        hurst=hurst,
+        coin_daily_trend=coin_daily_trend,
+        exec_score=exec_score,
+        spread_level=spread_level,
+    )
+    raw_levels = list(base.get('levels', []))
+    if not raw_levels:
+        return {"levels": [], "version": "v3-fallback-empty", "telemetry": {"close_split": ""}, "prices": {}}
+    levels = []
+    prices = {}
+    safe_entry = max(float(entry_price or 0), 1e-8)
+    safe_tick = get_tick_size("") if False else 0.0
+    for level in raw_levels:
+        levels.append({
+            'key': level.get('key'),
+            'pct': round(float(level.get('pct', 0)) * float(tp_tighten), 4),
+            'close_pct': level.get('close_pct', 0),
+        })
+    last_pct = max(levels[-1].get('pct', 0), levels[-2].get('pct', 0) if len(levels) > 1 else 0)
+    final_pct = round(max(last_pct * 1.35, last_pct + 0.25), 4)
+    levels.append({'key': 'tp_final', 'pct': final_pct, 'close_pct': 0.0})
+    levels = apply_runner_tp_close_split(levels, close_split)
+    for level in levels:
+        pct = float(level.get('pct', 0))
+        if side == 'LONG':
+            prices[level['key']] = round(safe_entry * (1 + pct / 100), 8)
+        else:
+            prices[level['key']] = round(safe_entry * (1 - pct / 100), 8)
+    return {
+        "levels": levels,
+        "version": "v3-fallback-4tier",
+        "telemetry": {
+            **base.get('telemetry', {}),
+            "tp_tighten_mult": round(float(tp_tighten), 3),
+            "close_split": format_runner_close_split(close_split),
+        },
+        "prices": prices,
+    }
+
+
+def is_v3_runner_position_payload(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> bool:
+    return get_runner_exit_owner(payload, default_mode=default_mode) == V3_EXIT_OWNER
+
+
+def is_v3_trail_arm_pending(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> bool:
+    data = payload or {}
+    return (
+        is_v3_runner_position_payload(data, default_mode=default_mode)
+        and bool(data.get('trailArmed', False))
+        and not bool(data.get('isTrailingActive', False))
+    )
+
+
+def get_trail_exit_confirmation_requirements(payload: dict = None, profitable: bool = True, default_mode: str = STRATEGY_MODE_LEGACY) -> tuple[int, int]:
+    if profitable and is_v3_runner_position_payload(payload, default_mode=default_mode):
+        return 4, 12
+    return 2, 5
+
+
+def update_trail_breach_telemetry(pos: dict, current_price: float, candle_close_price: float, trailing_stop: float, ticks: int, seconds: float) -> None:
+    pos['breachCurrentPrice'] = float(current_price or 0)
+    pos['breachCandleClose'] = float(candle_close_price or 0)
+    pos['breachTrailStop'] = float(trailing_stop or 0)
+    pos['breachTicks'] = int(ticks or 0)
+    pos['breachSeconds'] = round(float(seconds or 0.0), 2)
+
+
+def clear_trail_breach_telemetry(pos: dict) -> None:
+    pos['breachCurrentPrice'] = 0.0
+    pos['breachCandleClose'] = 0.0
+    pos['breachTrailStop'] = 0.0
+    pos['breachTicks'] = 0
+    pos['breachSeconds'] = 0.0
 
 
 def compute_execution_quality_score(
@@ -15336,14 +15597,32 @@ async def background_scanner_loop():
                                     trail_age = now_ts - trail_active_since if trail_active_since > 0 else 999
                                     if trail_age < MIN_TRAIL_ACTIVE_SEC:
                                         continue  # trail too fresh, skip exit
-                                    # Trail breach confirmation: need 2+ ticks AND 5s
+                                    trail_profitable = pos.get('unrealizedPnlPercent', 0) >= 0
+                                    trail_confirm_ticks, trail_confirm_seconds = get_trail_exit_confirmation_requirements(
+                                        pos,
+                                        profitable=trail_profitable,
+                                        default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                                    )
                                     if pos.get('trailBreachCount', 0) == 0:
                                         pos['trailBreachStartTime'] = now_ts
                                     pos['trailBreachCount'] = pos.get('trailBreachCount', 0) + 1
                                     trail_breach_dur = now_ts - pos.get('trailBreachStartTime', now_ts)
-                                    if pos['trailBreachCount'] >= 2 and trail_breach_dur >= 5:
+                                    update_trail_breach_telemetry(
+                                        pos,
+                                        current_price=current_price,
+                                        candle_close_price=candle_close_price,
+                                        trailing_stop=trailing_stop,
+                                        ticks=pos['trailBreachCount'],
+                                        seconds=trail_breach_dur,
+                                    )
+                                    if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
                                         reason = 'TRAIL_EXIT'
-                                        logger.info(f"🔴 TRAIL EXIT (confirmed): {pos_symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f} | {pos['trailBreachCount']} ticks / {trail_breach_dur:.0f}s")
+                                        logger.info(
+                                            f"🔴 TRAIL EXIT (confirmed): {pos_symbol} {pos['side']} "
+                                            f"| current=${current_price:.6f} close=${candle_close_price:.6f} trail=${trailing_stop:.6f} "
+                                            f"| {pos['trailBreachCount']}/{trail_confirm_ticks} ticks "
+                                            f"| {trail_breach_dur:.0f}/{trail_confirm_seconds:.0f}s"
+                                        )
                                         exit_engine.request_exit(pos, current_price, reason)
                                         continue
                                     else:
@@ -15405,6 +15684,7 @@ async def background_scanner_loop():
                                 # Phase 268 fix: reset trail breach counters too
                                 pos['trailBreachCount'] = 0
                                 pos['trailBreachStartTime'] = 0
+                                clear_trail_breach_telemetry(pos)
                             
                             # =========================================================
                             # Phase 183: TP_HIT → Limit Order (saves slippage)
@@ -15581,6 +15861,8 @@ async def background_scanner_loop():
                                     price_move_pct >= min_price_move_for_trail or
                                     (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
                                 )
+                                if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                                    trail_should_activate = False
                                 if trail_should_activate or trail_already_active:
                                     new_trailing = candle_close_price - dynamic_trail_distance
                                     # Phase 231h: Clamp — trail stop never below breakeven
@@ -15599,6 +15881,8 @@ async def background_scanner_loop():
                                     price_move_pct >= min_price_move_for_trail or
                                     (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
                                 )
+                                if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                                    trail_should_activate = False
                                 if trail_should_activate or trail_already_active:
                                     new_trailing = candle_close_price + dynamic_trail_distance
                                     # Phase 231h: Clamp — trail stop never above breakeven
@@ -15948,14 +16232,32 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 trail_age = now_ts - trail_active_since if trail_active_since > 0 else 999
                 if trail_age < MIN_TRAIL_ACTIVE_SEC:
                     continue  # trail too fresh, skip exit
-                # Trail breach confirmation: need 2+ ticks AND 5s
+                trail_profitable = pos.get('unrealizedPnlPercent', 0) >= 0
+                trail_confirm_ticks, trail_confirm_seconds = get_trail_exit_confirmation_requirements(
+                    pos,
+                    profitable=trail_profitable,
+                    default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
+                )
                 if pos.get('trailBreachCount', 0) == 0:
                     pos['trailBreachStartTime'] = now_ts
                 pos['trailBreachCount'] = pos.get('trailBreachCount', 0) + 1
                 trail_breach_dur = now_ts - pos.get('trailBreachStartTime', now_ts)
-                if pos['trailBreachCount'] >= 2 and trail_breach_dur >= 5:
+                update_trail_breach_telemetry(
+                    pos,
+                    current_price=current_price,
+                    candle_close_price=candle_close_price,
+                    trailing_stop=trailing_stop,
+                    ticks=pos['trailBreachCount'],
+                    seconds=trail_breach_dur,
+                )
+                if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
                     reason = 'TRAIL_EXIT'
-                    logger.info(f"🔴 TRAIL EXIT (confirmed, WS): {symbol} {pos['side']} @ ${current_price:.6f} | Trail ${trailing_stop:.6f} | {pos['trailBreachCount']} ticks / {trail_breach_dur:.0f}s")
+                    logger.info(
+                        f"🔴 TRAIL EXIT (confirmed, WS): {symbol} {pos['side']} "
+                        f"| current=${current_price:.6f} close=${candle_close_price:.6f} trail=${trailing_stop:.6f} "
+                        f"| {pos['trailBreachCount']}/{trail_confirm_ticks} ticks "
+                        f"| {trail_breach_dur:.0f}/{trail_confirm_seconds:.0f}s"
+                    )
                     exit_engine.request_exit(pos, current_price, reason)
                     continue
                 else:
@@ -15985,6 +16287,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
             # Phase 268 fix: reset trail breach counters too
             pos['trailBreachCount'] = 0
             pos['trailBreachStartTime'] = 0
+            clear_trail_breach_telemetry(pos)
         
         # TP Hit Check (Phase 268: use conservative exit price)
         # Phase 205: Use candle close for TP decision
@@ -16093,6 +16396,8 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 ws_price_move_pct >= ws_min_price_move or
                 (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
             )
+            if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                ws_should_activate = False
             if ws_should_activate or ws_trail_already_active:
                 new_trailing = candle_close_price - dynamic_trail_distance
                 # Phase 231h: Clamp — trail stop never below breakeven
@@ -16109,6 +16414,8 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 ws_price_move_pct >= ws_min_price_move or
                 (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
             )
+            if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                ws_should_activate = False
             if ws_should_activate or ws_trail_already_active:
                 new_trailing = candle_close_price + dynamic_trail_distance
                 new_trailing = min(new_trailing, be_short)
@@ -16352,6 +16659,8 @@ async def position_price_update_loop():
                                 fast_price_move >= fast_min_price_move or
                                 (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
                             )
+                            if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                                fast_should_activate = False
                             if fast_should_activate or fast_trail_already_active:
                                 new_trailing = current_price - dynamic_trail_distance
                                 # Phase 231h: Clamp — trail stop never below breakeven
@@ -16367,6 +16676,8 @@ async def position_price_update_loop():
                                 fast_price_move >= fast_min_price_move or
                                 (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
                             )
+                            if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
+                                fast_should_activate = False
                             if fast_should_activate or fast_trail_already_active:
                                 new_trailing = current_price + dynamic_trail_distance
                                 new_trailing = min(new_trailing, be_short)
@@ -20461,6 +20772,328 @@ class TimeBasedPositionManager:
         self.early_trail_minutes = 30  # Activate trail if profitable but stagnant for 30 min
         
         logger.info("📊 TimeBasedPositionManager initialized")
+
+    @staticmethod
+    def _is_v3_runner_position(pos: dict) -> bool:
+        return (
+            normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER
+            and pos.get('exitOwner', LEGACY_EXIT_OWNER) == V3_EXIT_OWNER
+        )
+
+    @staticmethod
+    def _current_r_multiple(pos: dict, current_price: float) -> float:
+        entry = float(pos.get('entryPrice', 0) or 0)
+        initial_sl = float(pos.get('initialStopLoss', pos.get('stopLoss', 0)) or 0)
+        risk_dist = abs(entry - initial_sl)
+        if entry <= 0 or risk_dist <= 0 or current_price <= 0:
+            return 0.0
+        if pos.get('side') == 'LONG':
+            return (current_price - entry) / risk_dist
+        return (entry - current_price) / risk_dist
+
+    def _get_v3_opposite_pressure(self, pos: dict) -> tuple[bool, float]:
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', '')
+        sig = active_signals.get(symbol, {}) if 'active_signals' in globals() else {}
+        if not sig:
+            return False, 0.0
+        sig_side = str(sig.get('side', '')).upper()
+        if not sig_side or sig_side == side:
+            return False, 0.0
+        last_seen = float(sig.get('last_refresh_ts', sig.get('created_ts', 0)) or 0)
+        now_ts = time.time()
+        if last_seen <= 0 or now_ts - last_seen > 90:
+            return False, 0.0
+        min_required = float(getattr(global_paper_trader, 'min_confidence_score', 74) or 74) + 8.0
+        score = float(sig.get('score', 0) or 0)
+        return score >= min_required, score
+
+    async def _execute_v3_partial_close(self, paper_trader, pos: dict, current_price: float, close_pct: float, reason: str, label: str) -> bool:
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', 'LONG')
+        contracts = float(pos.get('contracts', pos.get('size', 0)) or 0)
+        if contracts <= 0:
+            return False
+        original_contracts = float(pos.get('original_contracts', contracts) or contracts)
+        current_size_usd = float(pos.get('sizeUsd', 0) or 0)
+        current_initial_margin = float(pos.get('initialMargin', 0) or 0)
+        if not pos.get('original_contracts'):
+            pos['original_contracts'] = contracts
+            pos['original_size'] = pos.get('size', contracts)
+            pos['original_sizeUsd'] = pos.get('sizeUsd', 0)
+            pos['original_initialMargin'] = pos.get('initialMargin', 0)
+        close_contracts = max(0.0, min(contracts, original_contracts * float(close_pct)))
+        if close_contracts <= 0:
+            return False
+
+        live_success = True
+        close_oid = ''
+        if pos.get('isLive', False):
+            try:
+                result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
+                if result:
+                    pos['_partial_close_ts'] = datetime.now().timestamp()
+                    close_oid = str(result.get('id', ''))
+                    if close_oid:
+                        safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
+                else:
+                    live_success = False
+            except Exception as e:
+                live_success = False
+                logger.error(f"❌ V3_PARTIAL_CLOSE ERROR: {symbol} {label} - {e}")
+        if not live_success:
+            return False
+
+        entry_price = float(pos.get('entryPrice', current_price) or current_price)
+        if side == 'LONG':
+            pnl = (current_price - entry_price) * close_contracts
+        else:
+            pnl = (entry_price - current_price) * close_contracts
+        ratio = max(0.0, (contracts - close_contracts) / contracts) if contracts > 0 else 0.0
+        released_margin = current_initial_margin * (1.0 - ratio)
+        pos['contracts'] = max(0.0, contracts - close_contracts)
+        pos['size'] = pos['contracts']
+        pos['sizeUsd'] = current_size_usd * ratio
+        if 'initialMargin' in pos:
+            pos['initialMargin'] = current_initial_margin * ratio
+        paper_trader.balance += released_margin + pnl
+        pos['lastExitDecision'] = reason
+
+        partial_trade = {
+            "id": f"{pos.get('id', '')}_{label}",
+            "symbol": symbol,
+            "side": side,
+            "entryPrice": entry_price,
+            "exitPrice": current_price,
+            "size": close_contracts,
+            "sizeUsd": close_contracts * current_price,
+            "pnl": pnl,
+            "pnlPercent": ((current_price - entry_price) / entry_price * 100) if entry_price > 0 and side == 'LONG' else ((entry_price - current_price) / entry_price * 100 if entry_price > 0 else 0),
+            "openTime": pos.get('openTime', 0),
+            "closeTime": int(datetime.now().timestamp() * 1000),
+            "reason": reason,
+            "closeReason": reason,
+            "closeReasonNormalized": paper_trader._normalize_close_reason(reason),
+            "leverage": pos.get('leverage', 10),
+            "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "runnerContext": pos.get('runnerContext', ''),
+            "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
+        }
+        paper_trader.trades.append(partial_trade)
+        logger.warning(f"💰 V3_RUNNER_PARTIAL: {symbol} {side} {label} close={close_pct*100:.0f}% @ ${current_price:.6f} reason={reason} oid={close_oid[:12]}")
+        return True
+
+    def _tighten_v3_stop_distance(self, pos: dict, current_price: float, tighten_fraction: float, reason: str) -> bool:
+        effective_stop = float(pos.get('trailingStop', pos.get('stopLoss', 0)) or 0)
+        if effective_stop <= 0 or current_price <= 0:
+            return False
+        side = pos.get('side', 'LONG')
+        if side == 'LONG':
+            distance = current_price - effective_stop
+            if distance <= 0:
+                return False
+            new_stop = current_price - (distance * (1.0 - tighten_fraction))
+        else:
+            distance = effective_stop - current_price
+            if distance <= 0:
+                return False
+            new_stop = current_price + (distance * (1.0 - tighten_fraction))
+        apply_sl_floor(pos, new_stop, reason)
+        pos['lastExitDecision'] = reason
+        logger.info(f"🔧 V3_RUNNER_TIGHTEN: {pos.get('symbol')} {side} stop→${pos.get('trailingStop', 0):.6f} reason={reason}")
+        return True
+
+    async def _sync_v3_protective_order(self, pos: dict, stop_price: float, reason: str) -> None:
+        if not pos.get('isLive', False):
+            return
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', 'LONG')
+        contracts = float(pos.get('contracts', 0) or 0)
+        if stop_price <= 0 or contracts <= 0:
+            return
+        try:
+            sl_result = await live_binance_trader.set_stop_loss(symbol, side, contracts, stop_price)
+            if sl_result:
+                pos['exchange_sl_order_id'] = sl_result.get('id', pos.get('exchange_sl_order_id', ''))
+                pos['exchange_sl_price'] = sl_result.get('stopPrice', stop_price)
+                pos['internalProtectionOnly'] = False
+                pos['protectionRetryAt'] = 0
+                pos['protectionRetryPrice'] = 0.0
+                return
+            raise RuntimeError("set_stop_loss returned None")
+        except Exception as e:
+            pos['internalProtectionOnly'] = True
+            pos['protectionRetryAt'] = int(time.time()) + 15
+            pos['protectionRetryPrice'] = stop_price
+            pos['lastExitDecision'] = f"{reason}_RETRY"
+            logger.warning(f"⚠️ V3_PROTECTION_RETRY: {symbol} {side} stop=${stop_price:.6f} reason={reason} err={e}")
+
+    async def _maybe_retry_v3_protection(self, pos: dict, current_price: float) -> None:
+        if not pos.get('internalProtectionOnly', False):
+            return
+        retry_at = int(pos.get('protectionRetryAt', 0) or 0)
+        target = float(pos.get('protectionRetryPrice', 0.0) or 0.0)
+        if retry_at <= 0 or target <= 0 or time.time() < retry_at:
+            return
+        atr = float(pos.get('atr', 0) or 0)
+        tick = get_tick_size(pos.get('symbol', ''))
+        safe_gap = max((atr * 0.15) if atr > 0 else 0.0, tick * 5)
+        side = pos.get('side', 'LONG')
+        if side == 'LONG' and current_price <= target + safe_gap:
+            pos['protectionRetryAt'] = int(time.time()) + 15
+            return
+        if side == 'SHORT' and current_price >= target - safe_gap:
+            pos['protectionRetryAt'] = int(time.time()) + 15
+            return
+        await self._sync_v3_protective_order(pos, target, "RETRY_SYNC")
+
+    async def _handle_v3_runner_position(self, paper_trader, pos: dict, current_price: float, actions: dict) -> bool:
+        now_ts = time.time()
+        pos.setdefault('exitOwner', V3_EXIT_OWNER)
+        pos.setdefault('runnerContext', classify_v3_runner_context(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER))
+        pos.setdefault('baseRunnerContext', pos.get('runnerContext', V3_RUNNER_CONTEXT_COUNTER))
+        pos.setdefault('trailArmed', False)
+        pos.setdefault('trailArmSince', 0)
+        pos.setdefault('trailArmPrice', 0.0)
+        pos.setdefault('oppositePressureCount', 0)
+        pos.setdefault('oppositeBestScore', 0.0)
+        pos.setdefault('oppositeLastSeenTs', 0)
+        pos.setdefault('recoveryStage', 0)
+        pos.setdefault('internalProtectionOnly', False)
+        pos.setdefault('lastExitDecision', '')
+
+        atr = float(pos.get('atr', current_price * 0.01) or (current_price * 0.01))
+        current_r = self._current_r_multiple(pos, current_price)
+        pos['trailArmElapsedSec'] = int(max(0, now_ts - float(pos.get('trailArmSince', 0) or 0))) if pos.get('trailArmed') else 0
+        await self._maybe_retry_v3_protection(pos, current_price)
+
+        has_opp, opp_score = self._get_v3_opposite_pressure(pos)
+        if has_opp:
+            last_seen = float(pos.get('oppositeLastSeenTs', 0) or 0)
+            if last_seen > 0 and (now_ts - last_seen) <= 120:
+                pos['oppositePressureCount'] = int(pos.get('oppositePressureCount', 0) or 0) + 1
+            else:
+                pos['oppositePressureCount'] = 1
+            pos['oppositeBestScore'] = max(float(pos.get('oppositeBestScore', 0.0) or 0.0), opp_score)
+            pos['oppositeLastSeenTs'] = now_ts
+        elif current_r > -0.10:
+            pos['oppositePressureCount'] = max(0, int(pos.get('oppositePressureCount', 0) or 0) - 1)
+            if pos['oppositePressureCount'] == 0:
+                pos['oppositeBestScore'] = 0.0
+                pos['oppositeLastSeenTs'] = 0
+                if int(pos.get('recoveryStage', 0) or 0) > 0:
+                    pos['recoveryStage'] = 0
+                    pos['runnerContext'] = pos.get('baseRunnerContext', pos.get('runnerContext', V3_RUNNER_CONTEXT_COUNTER))
+
+        recovery_stage = int(pos.get('recoveryStage', 0) or 0)
+        if current_r <= -0.30 and int(pos.get('oppositePressureCount', 0) or 0) >= 2 and recovery_stage < 1:
+            if self._tighten_v3_stop_distance(pos, current_price, 0.25, 'RECOVERY_TIGHTEN_STAGE1'):
+                pos['recoveryStage'] = 1
+                pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
+                actions["time_reduced"].append(f"{pos.get('symbol')} recovery_stage1")
+                return True
+        if current_r <= -0.50 and int(pos.get('oppositePressureCount', 0) or 0) >= 4 and recovery_stage < 2:
+            reduced = await self._execute_v3_partial_close(paper_trader, pos, current_price, 0.25, 'RECOVERY_REDUCE', 'RECOVERY_S2')
+            if reduced:
+                self._tighten_v3_stop_distance(pos, current_price, 0.25, 'RECOVERY_TIGHTEN_STAGE2')
+                pos['recoveryStage'] = 2
+                pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
+                actions["time_reduced"].append(f"{pos.get('symbol')} recovery_stage2")
+                return True
+        if current_r <= -0.80 and int(pos.get('oppositePressureCount', 0) or 0) >= 6 and recovery_stage < 3:
+            pos['recoveryStage'] = 3
+            pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
+            pos['lastExitDecision'] = 'RECOVERY_EXIT'
+            paper_trader.close_via_engine(pos, current_price, 'RECOVERY_EXIT', 'V3_RUNNER')
+            actions["time_closed"].append(f"{pos.get('symbol')} recovery_exit")
+            return True
+
+        if not pos.get('tp_ladder_levels'):
+            pos['lastExitDecision'] = 'V3_NO_TP_LADDER'
+            return True
+
+        entry_price = float(pos.get('entryPrice', current_price) or current_price)
+        if entry_price > 0:
+            if pos.get('side') == 'LONG':
+                profit_pct = ((current_price - entry_price) / entry_price) * 100
+            else:
+                profit_pct = ((entry_price - current_price) / entry_price) * 100
+        else:
+            profit_pct = 0.0
+
+        partial_state = pos.get('partial_tp_state', {})
+        for level in pos.get('tp_ladder_levels', []):
+            level_key = level.get('key')
+            if not level_key or partial_state.get(level_key, False):
+                continue
+            if profit_pct < float(level.get('pct', 0) or 0):
+                continue
+            if level_key == 'tp_final':
+                pos['lastExitDecision'] = 'TP_FINAL_EXIT'
+                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_EXIT', 'V3_RUNNER')
+                actions["time_closed"].append(f"{pos.get('symbol')} tp_final")
+                return True
+            close_pct = float(level.get('close_pct', 0) or 0)
+            if close_pct <= 0:
+                continue
+            partial_state[level_key] = True
+            pos['partial_tp_state'] = partial_state
+            ok = await self._execute_v3_partial_close(paper_trader, pos, current_price, close_pct, f"TP_PARTIAL_{level_key.upper()}", level_key.upper())
+            if not ok:
+                partial_state[level_key] = False
+                pos['partial_tp_state'] = partial_state
+                pos['lastExitDecision'] = f"PARTIAL_FAILED_{level_key}"
+                return True
+            actions["partial_tp"].append(f"{pos.get('symbol')}_{level_key}({profit_pct:.1f}%)")
+            pos['lastExitDecision'] = f"TP_PARTIAL_{level_key.upper()}"
+            if level_key == 'tp1':
+                pos['trailArmed'] = True
+                pos['trailArmReason'] = f"TP1_{pos.get('runnerContext', '')}"
+                pos['trailArmSince'] = now_ts
+                pos['trailArmPrice'] = current_price
+                pos['trailArmElapsedSec'] = 0
+            return True
+
+        if pos.get('trailArmed', False) and not pos.get('isTrailingActive', False):
+            elapsed = max(0.0, now_ts - float(pos.get('trailArmSince', now_ts) or now_ts))
+            arm_price = float(pos.get('trailArmPrice', current_price) or current_price)
+            if pos.get('side') == 'LONG':
+                favorable = current_price - arm_price
+            else:
+                favorable = arm_price - current_price
+            arm_delay = int(pos.get('tp1ArmDelaySec', 0) or 0)
+            arm_atr_req = float(pos.get('tp1ArmAtrReq', 0.0) or 0.0) * atr
+            pos['trailArmElapsedSec'] = int(elapsed)
+            if elapsed >= arm_delay and favorable >= arm_atr_req:
+                trail_dist = float(pos.get('trailDistance', atr * 1.5) or (atr * 1.5))
+                if pos.get('side') == 'LONG':
+                    new_trail_stop = max(current_price - trail_dist, entry_price)
+                else:
+                    new_trail_stop = min(current_price + trail_dist, entry_price)
+                apply_sl_floor(pos, new_trail_stop, 'V3_TP1_TRAIL_DELAYED')
+                pos['isTrailingActive'] = True
+                pos['trailActiveSince'] = now_ts
+                pos['trailArmed'] = False
+                pos['lastExitDecision'] = 'TRAIL_ARMED_ACTIVATED'
+                be_req = float(pos.get('beAfterTrailAtrReq', 0.0) or 0.0) * atr
+                if favorable >= be_req:
+                    fee_buffer = apply_runner_be_buffer(0.006, {
+                        "enabled": True,
+                        "be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
+                    })
+                    _tick = get_tick_size(pos.get('symbol', ''))
+                    safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, pos.get('side', 'LONG'))
+                    if pos.get('side') == 'LONG':
+                        breakeven_sl = snap_to_tick(entry_price + safe_delta, _tick, 'up')
+                    else:
+                        breakeven_sl = snap_to_tick(entry_price - safe_delta, _tick, 'down')
+                    apply_sl_floor(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
+                    pos['breakeven_activated'] = True
+                    await self._sync_v3_protective_order(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
+                return True
+
+        pos['lastExitDecision'] = f"V3_HOLD_R={current_r:.2f}"
+        return True
     
     async def check_positions(self, paper_trader) -> dict:
         """
@@ -20501,6 +21134,11 @@ class TimeBasedPositionManager:
                 self._debug_count += 1
                 if self._debug_count % 100 == 1:
                     logger.info(f"📊 POS_DEBUG: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} entry={entry_price:.4f} curr={current_price:.4f}")
+
+                if contracts > 0 and self._is_v3_runner_position(pos):
+                    _v3_handled = await self._handle_v3_runner_position(paper_trader, pos, current_price, actions)
+                    if _v3_handled:
+                        continue
                 
                 # ===============================================
                 # RFX-1B: SM sole authority exit evaluation
@@ -26848,12 +27486,25 @@ class SignalGenerator:
             counter_trend=_is_ct_for_profile,
             ct_strength=_ct_str_for_profile,
         )
+        _runner_controls_sig = resolve_runner_exit_controls(
+            payload={
+                'strategyMode': strategy_mode,
+                'side': signal_side,
+                'coinDailyTrend': coin_daily_trend,
+                'counterTrend': _is_ct_for_profile,
+                'counterTrendStrength': _ct_str_for_profile,
+            },
+            default_mode=strategy_mode,
+        )
         if _exec_profile.mode == STRATEGY_MODE_SMART_V3_RUNNER:
             logger.info(
                 f"🏃 STRATEGY_PROFILE_APPLIED: {symbol} {signal_side} "
                 f"mode={_exec_profile.mode} source={_exec_profile.source} "
-                f"trail_act={_exec_profile.trail_activation_mult} trail_dist={_exec_profile.trail_distance_mult} "
-                f"tp_tighten={_exec_profile.tp_tighten_intensity} be_buf={_exec_profile.be_buffer_mult}"
+                f"context={_runner_controls_sig.get('runner_context', '')} "
+                f"trail_act={_runner_controls_sig.get('trail_act_mult', _exec_profile.trail_activation_mult)} "
+                f"trail_dist={_runner_controls_sig.get('trail_dist_mult', _exec_profile.trail_distance_mult)} "
+                f"tp_tighten={_runner_controls_sig.get('tp_tighten', _exec_profile.tp_tighten_intensity)} "
+                f"be_buf={_runner_controls_sig.get('be_buffer_mult', _exec_profile.be_buffer_mult)}"
             )
         
         # RFX-3A: Classify execution style for SMART_V3_RUNNER
@@ -26921,12 +27572,18 @@ class SignalGenerator:
             'smartLeverageMult': strategy_leverage_mult,
             # SMART_V3_RUNNER: execution profile fields
             'execution_profile_source': _exec_profile.source if '_exec_profile' in dir() else 'neutral',
-            'runner_trail_act_mult': _exec_profile.trail_activation_mult if '_exec_profile' in dir() else 1.0,
-            'runner_trail_dist_mult': _exec_profile.trail_distance_mult if '_exec_profile' in dir() else 1.0,
-            'runner_tp_tighten': _exec_profile.tp_tighten_intensity if '_exec_profile' in dir() else 1.0,
-            'runner_be_buffer_mult': _exec_profile.be_buffer_mult if '_exec_profile' in dir() else 1.0,
+            'runner_trail_act_mult': _runner_controls_sig.get('trail_act_mult', 1.0),
+            'runner_trail_dist_mult': _runner_controls_sig.get('trail_dist_mult', 1.0),
+            'runner_tp_tighten': _runner_controls_sig.get('tp_tighten', 1.0),
+            'runner_be_buffer_mult': _runner_controls_sig.get('be_buffer_mult', 1.0),
             'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct if '_exec_profile' in dir() else 0.20,
             'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec if '_exec_profile' in dir() else 600,
+            'runnerContext': _runner_controls_sig.get('runner_context', ''),
+            'exitOwner': _runner_controls_sig.get('exit_owner', LEGACY_EXIT_OWNER),
+            'tpCloseSplit': format_runner_close_split(_runner_controls_sig.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))),
+            'tp1ArmDelaySec': _runner_controls_sig.get('trail_arm_delay_sec', 0),
+            'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
+            'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
             'spreadLevel': spread_params['level'],
             # RFX-3A: Execution style telemetry
             'execution_style': _exec_style,
@@ -29256,6 +29913,12 @@ class PaperTradingEngine:
             "runner_trail_dist_mult": _runner_controls.get('trail_dist_mult', 1.0),
             "runner_tp_tighten": _runner_controls.get('tp_tighten', 1.0),
             "runner_be_buffer_mult": _runner_controls.get('be_buffer_mult', 1.0),
+            "runnerContext": signal.get('runnerContext', _runner_controls.get('runner_context', '')) if signal else _runner_controls.get('runner_context', ''),
+            "exitOwner": signal.get('exitOwner', _runner_controls.get('exit_owner', LEGACY_EXIT_OWNER)) if signal else _runner_controls.get('exit_owner', LEGACY_EXIT_OWNER),
+            "tpCloseSplit": signal.get('tpCloseSplit', format_runner_close_split(_runner_controls.get('tp_close_split', (0.30, 0.25, 0.25, 0.20)))) if signal else format_runner_close_split(_runner_controls.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))),
+            "tp1ArmDelaySec": signal.get('tp1ArmDelaySec', _runner_controls.get('trail_arm_delay_sec', 0)) if signal else _runner_controls.get('trail_arm_delay_sec', 0),
+            "tp1ArmAtrReq": signal.get('tp1ArmAtrReq', _runner_controls.get('trail_arm_atr_req', 0.0)) if signal else _runner_controls.get('trail_arm_atr_req', 0.0),
+            "beAfterTrailAtrReq": signal.get('beAfterTrailAtrReq', _runner_controls.get('be_after_trail_atr_req', 0.0)) if signal else _runner_controls.get('be_after_trail_atr_req', 0.0),
             "runner_wide_profit_pct": signal.get('runner_wide_profit_pct', 0.20) if signal else 0.20,
             "runner_wide_age_sec": signal.get('runner_wide_age_sec', 600) if signal else 600,
             # RFX-3A: Execution style propagation
@@ -30252,6 +30915,9 @@ class PaperTradingEngine:
             "trailingStop": sl,
             "trailActivation": trail_activation,
             "trailDistance": trail_distance,
+            "initialStopLoss": sl,
+            "initialTrailActivation": trail_activation,
+            "initialTrailDistance": trail_distance,
             "isTrailingActive": False,
             "unrealizedPnl": 0.0,
             "unrealizedPnlPercent": 0.0,
@@ -30291,6 +30957,26 @@ class PaperTradingEngine:
             "runner_trail_dist_mult": order.get('runner_trail_dist_mult', 1.0),
             "runner_tp_tighten": order.get('runner_tp_tighten', 1.0),
             "runner_be_buffer_mult": order.get('runner_be_buffer_mult', 1.0),
+            "runnerContext": order.get('runnerContext', ''),
+            "exitOwner": order.get('exitOwner', LEGACY_EXIT_OWNER),
+            "tpCloseSplit": order.get('tpCloseSplit', ''),
+            "tp1ArmDelaySec": int(order.get('tp1ArmDelaySec', 0) or 0),
+            "tp1ArmAtrReq": float(order.get('tp1ArmAtrReq', 0.0) or 0.0),
+            "beAfterTrailAtrReq": float(order.get('beAfterTrailAtrReq', 0.0) or 0.0),
+            "trailArmed": False,
+            "trailArmReason": "",
+            "trailArmSince": 0,
+            "trailArmPrice": 0.0,
+            "trailArmElapsedSec": 0,
+            "oppositePressureCount": 0,
+            "oppositeBestScore": 0.0,
+            "oppositeLastSeenTs": 0,
+            "recoveryStage": 0,
+            "recoveryReason": "",
+            "internalProtectionOnly": False,
+            "protectionRetryAt": 0,
+            "protectionRetryPrice": 0.0,
+            "lastExitDecision": "",
             "runner_wide_profit_pct": order.get('runner_wide_profit_pct', 0.20),
             "runner_wide_age_sec": order.get('runner_wide_age_sec', 600),
             # RFX-3A: Execution style propagation
@@ -30356,11 +31042,21 @@ class PaperTradingEngine:
                         f"sl_roi={new_position.get('distance_truth', {}).get('sl_dist_roi_effective', 0):.1f}% "
                         f"tp_roi={new_position.get('distance_truth', {}).get('tp_dist_roi_effective', 0):.1f}%")
         
+        _runner_owner = order.get('exitOwner', LEGACY_EXIT_OWNER)
+        _runner_context = order.get('runnerContext', '')
+        _runner_split_raw = _runner_controls.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))
+        _runner_split = tuple(float(x) for x in _runner_split_raw)
+        _runner_tp_tighten = float(order.get('runner_tp_tighten', _runner_controls.get('tp_tighten', 1.0)) or 1.0)
+
         # Phase 250: Compute adaptive TP ladder at fill time and lock to position
         if TP_LADDER_ADAPTIVE_ENABLED:
             try:
+                _force_v3_four_tier = (
+                    order.get('strategyMode') == STRATEGY_MODE_SMART_V3_RUNNER
+                    and _runner_owner == V3_EXIT_OWNER
+                )
                 # ── RFX-1B: 4-tier TP ladder with TP_FINAL + monotonic ──
-                if RFX1B_TP_LADDER_V2 and _RFX_MODULES_AVAILABLE:
+                if (RFX1B_TP_LADDER_V2 and _RFX_MODULES_AVAILABLE) or _force_v3_four_tier:
                     _tick = get_tick_size(symbol)
                     _risk_params_tp = None
                     try:
@@ -30382,9 +31078,16 @@ class PaperTradingEngine:
                         coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
                         exec_score=order.get('entryExecScore', 70.0),
                         spread_level=order.get('spreadLevel', 'Normal'),
+                        tp_tighten_mult=_runner_tp_tighten,
                     )
+                    if _force_v3_four_tier:
+                        _tp_ladder['levels'] = apply_runner_tp_close_split(_tp_ladder.get('levels', []), _runner_split)
+                        _tp_ladder.setdefault('telemetry', {})
+                        _tp_ladder['telemetry']['close_split'] = format_runner_close_split(_runner_split)
+                        _tp_ladder['telemetry']['runner_context'] = _runner_context
                     new_position['tp_ladder_levels'] = _tp_ladder['levels']
                     new_position['tp_ladder_version'] = _tp_ladder['version']
+                    new_position['tpLadderVersion'] = _tp_ladder['version']
                     new_position['tp_ladder_anchor_entry'] = fill_price
                     import copy
                     new_position['tp_ladder_anchor_levels'] = copy.deepcopy(_tp_ladder['levels'])
@@ -30399,21 +31102,39 @@ class PaperTradingEngine:
                     )
                 else:
                     # ── Legacy 3-tier ladder ──
-                    _tp_ladder = compute_adaptive_tp_ladder(
-                        side=side,
-                        entry_price=fill_price,
-                        atr=atr,
-                        leverage=order['leverage'],
-                        spread_pct=order.get('spreadPct', 0.05),
-                        volume_ratio=order.get('volumeRatio', 1.0),
-                        adx=order.get('adx', 25.0),
-                        hurst=order.get('hurst', 0.50),
-                        coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
-                        exec_score=order.get('entryExecScore', 70.0),
-                        spread_level=order.get('spreadLevel', 'Normal'),
-                    )
+                    if _force_v3_four_tier:
+                        _tp_ladder = build_v3_runner_fallback_tp_ladder(
+                            entry_price=fill_price,
+                            atr=atr,
+                            side=side,
+                            leverage=order['leverage'],
+                            spread_pct=order.get('spreadPct', 0.05),
+                            volume_ratio=order.get('volumeRatio', 1.0),
+                            adx=order.get('adx', 25.0),
+                            hurst=order.get('hurst', 0.50),
+                            coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                            exec_score=order.get('entryExecScore', 70.0),
+                            spread_level=order.get('spreadLevel', 'Normal'),
+                            tp_tighten=_runner_tp_tighten,
+                            close_split=_runner_split,
+                        )
+                    else:
+                        _tp_ladder = compute_adaptive_tp_ladder(
+                            side=side,
+                            entry_price=fill_price,
+                            atr=atr,
+                            leverage=order['leverage'],
+                            spread_pct=order.get('spreadPct', 0.05),
+                            volume_ratio=order.get('volumeRatio', 1.0),
+                            adx=order.get('adx', 25.0),
+                            hurst=order.get('hurst', 0.50),
+                            coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                            exec_score=order.get('entryExecScore', 70.0),
+                            spread_level=order.get('spreadLevel', 'Normal'),
+                        )
                     new_position['tp_ladder_levels'] = _tp_ladder['levels']
                     new_position['tp_ladder_version'] = _tp_ladder['version']
+                    new_position['tpLadderVersion'] = _tp_ladder['version']
                     new_position['tp_ladder_anchor_entry'] = fill_price
                     # Phase 253: Immutable anchor levels — runtime TP always derived from these
                     import copy
@@ -32483,6 +33204,18 @@ class PaperTradingEngine:
             "runner_trail_dist_mult": pos.get('runner_trail_dist_mult', 1.0),
             "runner_tp_tighten": pos.get('runner_tp_tighten', 1.0),
             "runner_be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
+            "runnerContext": pos.get('runnerContext', ''),
+            "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
+            "tpCloseSplit": pos.get('tpCloseSplit', ''),
+            "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
+            "trailArmed": pos.get('trailArmed', False),
+            "trailArmReason": pos.get('trailArmReason', ''),
+            "trailArmElapsedSec": int(pos.get('trailArmElapsedSec', 0) or 0),
+            "oppositePressureCount": int(pos.get('oppositePressureCount', 0) or 0),
+            "oppositeBestScore": float(pos.get('oppositeBestScore', 0.0) or 0.0),
+            "recoveryStage": int(pos.get('recoveryStage', 0) or 0),
+            "internalProtectionOnly": bool(pos.get('internalProtectionOnly', False)),
+            "lastExitDecision": pos.get('lastExitDecision', ''),
             # RFX-3A: Execution style close telemetry
             "execution_style": pos.get('execution_style', 'MARKET'),
             "structural_fallback_stage": pos.get('structural_fallback_stage', ''),
@@ -32522,6 +33255,22 @@ class PaperTradingEngine:
                 'roi_pct': round((pnl / initial_margin * 100), 2) if initial_margin > 0 else 0,
                 'spreadLevel': pos.get('spreadLevel', 'unknown'),
                 'isTrailingActive': pos.get('isTrailingActive', False),
+                'runnerContext': pos.get('runnerContext', ''),
+                'exitOwner': pos.get('exitOwner', LEGACY_EXIT_OWNER),
+                'tpCloseSplit': pos.get('tpCloseSplit', ''),
+                'trailArmed': pos.get('trailArmed', False),
+                'trailArmReason': pos.get('trailArmReason', ''),
+                'trailArmElapsedSec': int(pos.get('trailArmElapsedSec', 0) or 0),
+                'oppositePressureCount': int(pos.get('oppositePressureCount', 0) or 0),
+                'oppositeBestScore': float(pos.get('oppositeBestScore', 0.0) or 0.0),
+                'recoveryStage': int(pos.get('recoveryStage', 0) or 0),
+                'internalProtectionOnly': bool(pos.get('internalProtectionOnly', False)),
+                'lastExitDecision': pos.get('lastExitDecision', ''),
+                'breachCurrentPrice': float(pos.get('breachCurrentPrice', 0.0) or 0.0),
+                'breachCandleClose': float(pos.get('breachCandleClose', 0.0) or 0.0),
+                'breachTrailStop': float(pos.get('breachTrailStop', 0.0) or 0.0),
+                'breachTicks': int(pos.get('breachTicks', 0) or 0),
+                'breachSeconds': float(pos.get('breachSeconds', 0.0) or 0.0),
                 # RFX-2B: Distance truth snapshot at close
                 'distance_truth': pos.get('distance_truth', {}),
             }),
