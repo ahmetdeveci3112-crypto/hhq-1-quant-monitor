@@ -4094,23 +4094,28 @@ class LiveBinanceTrader:
         try:
             # 1) Cancel existing SL orders for this symbol
             try:
-                open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
+                open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(
+                    symbol,
+                    trace_id="SET_SL_REPLACE",
+                    stop_only=True,
+                )
                 for order in open_orders:
-                    order_type = (order.get('type') or '').lower()
-                    if 'stop' not in order_type:
-                        continue
-                    # Patch E: Only cancel protective (reduce-only) conditional orders
-                    _info = order.get('info', {})
-                    _is_reduce = (
-                        order.get('reduceOnly', False)
-                        or str(_info.get('reduceOnly', 'false')).lower() == 'true'
-                        or str(_info.get('closePosition', 'false')).lower() == 'true'
+                    order_type = self._extract_conditional_order_type(order)
+                    if await self._cancel_known_conditional_order(symbol, order.get('id'), "SET_SL_REPLACE"):
+                        logger.info(
+                            f"🗑️ SET_SL_REPLACE_CANCELLED: {symbol} order={order.get('id')} "
+                            f"type={order_type}{' fallback' if used_fallback else ''}"
+                        )
+                remaining_stop_orders, _ = await self._fetch_symbol_reduce_only_conditionals(
+                    symbol,
+                    trace_id="SET_SL_REPLACE_VERIFY",
+                    stop_only=True,
+                )
+                if remaining_stop_orders:
+                    logger.warning(
+                        f"⚠️ SET_SL_REPLACE_VERIFY: {symbol} remaining_stop_orders="
+                        f"{[str(order.get('id')) for order in remaining_stop_orders[:8]]}"
                     )
-                    if _is_reduce:
-                        await self.exchange.cancel_order(order['id'], ccxt_symbol)
-                        logger.info(f"🗑️ Cancelled old SL order {order['id']} for {symbol}")
-                    else:
-                        logger.info(f"ℹ️ SET_SL_CANCEL_SKIPPED: {symbol} order={order['id']} type={order_type} — not reduceOnly")
             except Exception as cancel_err:
                 logger.warning(f"⚠️ Could not cancel old SL orders for {symbol}: {cancel_err}")
             
@@ -4196,6 +4201,115 @@ class LiveBinanceTrader:
             'closePosition': str(raw.get('closePosition', 'false')).lower() == 'true',
         }
 
+    @staticmethod
+    def _extract_conditional_order_type(order: dict) -> str:
+        order_type = (order.get('type') or '').lower()
+        if order_type:
+            return order_type
+        info = order.get('info', {}) or {}
+        return (info.get('origType') or info.get('type') or '').lower()
+
+    async def _fetch_symbol_open_orders_all_sources(
+        self,
+        symbol: str,
+        trace_id: str = None,
+    ) -> tuple[list[dict], bool]:
+        """Merge symbol open orders from CCXT symbol/all fetches and raw Binance."""
+        if not self.enabled or not self.exchange:
+            return [], False
+
+        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
+        trace_str = f" [trace={trace_id}]" if trace_id else ""
+        collected: list[dict] = []
+        seen: set[str] = set()
+        used_fallback = False
+
+        def _symbol_matches(order: dict) -> bool:
+            info = order.get('info', {}) or {}
+            raw_sym = str(info.get('symbol', '') or '')
+            if not raw_sym:
+                raw_sym = str(order.get('symbol', '')).replace('/', '').replace(':USDT', '')
+            return raw_sym == symbol
+
+        def _merge_orders(orders: list[dict], label: str, fallback: bool = False):
+            nonlocal used_fallback
+            added = 0
+            for order in orders or []:
+                order_id = str(order.get('id', '')).strip()
+                if not order_id or order_id in seen:
+                    continue
+                if not _symbol_matches(order):
+                    continue
+                seen.add(order_id)
+                collected.append(order)
+                added += 1
+            if added > 0:
+                if fallback:
+                    used_fallback = True
+                logger.info(f"🔎 OPEN_ORDER_MERGE[{label}]: {symbol} added={added}{trace_str}")
+
+        try:
+            _merge_orders(await self.exchange.fetch_open_orders(ccxt_symbol), "ccxt_symbol")
+        except Exception as fetch_err:
+            logger.warning(f"⚠️ CONDITIONAL_FETCH: fetch_open_orders({ccxt_symbol}) failed: {fetch_err}{trace_str}")
+
+        try:
+            _merge_orders(await self.exchange.fetch_open_orders(), "ccxt_all", fallback=True)
+        except Exception as fallback_err:
+            logger.warning(f"⚠️ CONDITIONAL_FETCH: global fetch_open_orders() failed: {fallback_err}{trace_str}")
+
+        try:
+            raw_orders = await self.exchange.fapiPrivateGetOpenOrders({'symbol': symbol})
+            if raw_orders:
+                _merge_orders([self._raw_to_unified(o) for o in raw_orders], "raw_binance", fallback=True)
+        except Exception as raw_err:
+            logger.warning(f"⚠️ CONDITIONAL_FETCH: raw fapiPrivateGetOpenOrders failed: {raw_err}{trace_str}")
+
+        return collected, used_fallback
+
+    async def _fetch_symbol_reduce_only_conditionals(
+        self,
+        symbol: str,
+        trace_id: str = None,
+        stop_only: bool = False,
+    ) -> tuple[list[dict], bool]:
+        """Fetch open reduce-only conditional orders for a symbol with raw fallback."""
+        if not self.enabled or not self.exchange:
+            return [], False
+
+        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market', 'trailing_stop_market'}
+        if stop_only:
+            conditional_types = {'stop', 'stop_market', 'trailing_stop_market'}
+
+        open_orders, used_fallback = await self._fetch_symbol_open_orders_all_sources(symbol, trace_id=trace_id)
+
+        filtered_orders: list[dict] = []
+        seen: set[str] = set()
+        for order in open_orders:
+            order_id = str(order.get('id', '')).strip()
+            if not order_id or order_id in seen:
+                continue
+            if self._extract_conditional_order_type(order) not in conditional_types:
+                continue
+            if not self._order_is_reduce_only(order):
+                continue
+            seen.add(order_id)
+            filtered_orders.append(order)
+        return filtered_orders, used_fallback
+
+    def _orders_all_reduce_only_conditionals(self, orders: list[dict], stop_only: bool = False) -> bool:
+        if not orders:
+            return False
+        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market', 'trailing_stop_market'}
+        if stop_only:
+            conditional_types = {'stop', 'stop_market', 'trailing_stop_market'}
+        for order in orders:
+            if not self._order_is_reduce_only(order):
+                return False
+            if self._extract_conditional_order_type(order) not in conditional_types:
+                return False
+        return True
+
     async def _cancel_known_conditional_order(self, symbol: str, order_id: str, trace_id: str = None) -> bool:
         """Cancel a known Binance conditional order id even if open-order fetch misses it."""
         if not order_id or not self.enabled or not self.exchange:
@@ -4234,109 +4348,40 @@ class LiveBinanceTrader:
         Idempotent: safe to call multiple times.
         Falls back to fetch_open_orders() (all symbols) if symbol-specific fetch fails/empty.
         """
-        result = {'cancelled': 0, 'errors': 0, 'order_ids': []}
+        result = {'cancelled': 0, 'errors': 0, 'order_ids': [], 'remaining_order_ids': [], 'remaining_count': 0}
         if not self.enabled or not self.exchange:
             return result
-        
-        ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         trace_str = f" [trace={trace_id}]" if trace_id else ""
-        norm_symbol = symbol  # e.g. "ADAUSDT"
-        
-        # Try symbol-specific fetch first
-        open_orders = []
-        used_fallback = False
-        try:
-            open_orders = await self.exchange.fetch_open_orders(ccxt_symbol)
-        except Exception as fetch_err:
-            logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fetch_open_orders({ccxt_symbol}) failed: {fetch_err}{trace_str}")
-        
-        # Fallback: fetch ALL open orders, filter by symbol
-        if not open_orders:
-            try:
-                all_orders = await self.exchange.fetch_open_orders()
-                for o in all_orders:
-                    raw_sym = o.get('symbol', '')
-                    o_norm = raw_sym.replace('/', '').replace(':USDT', '')
-                    if o_norm == norm_symbol:
-                        open_orders.append(o)
-                if open_orders:
-                    used_fallback = True
-                    logger.info(f"🔄 POST_CLOSE_CLEANUP_FALLBACK_ALL_ORDERS: {symbol} found {len(open_orders)} orders via global fetch{trace_str}")
-            except Exception as fallback_err:
-                logger.warning(f"⚠️ POST_CLOSE_CLEANUP: fallback fetch_open_orders() failed: {fallback_err}{trace_str}")
-        
-        # Raw Binance fallback: fapiPrivateGetOpenOrders
-        if not open_orders and self.exchange:
-            try:
-                raw_orders = await self.exchange.fapiPrivateGetOpenOrders({'symbol': symbol})
-                if raw_orders:
-                    open_orders = [self._raw_to_unified(o) for o in raw_orders]
-                    used_fallback = True
-                    logger.info(f"🧹 ORPHAN_SWEEP_RAW_FALLBACK: {symbol} found {len(open_orders)} orders via fapiPrivateGetOpenOrders{trace_str}")
-            except Exception as raw_err:
-                logger.warning(f"⚠️ RAW_FALLBACK_FAIL: {symbol} fapiPrivateGetOpenOrders: {raw_err}{trace_str}")
-                result['errors'] = 1
+
+        attempted_ids: set[str] = set()
+        for pass_idx in range(2):
+            open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(symbol, trace_id=trace_id)
+            if not open_orders:
+                result['remaining_order_ids'] = []
+                result['remaining_count'] = 0
                 return result
-        
-        conditional_types = {'stop', 'stop_market', 'take_profit', 'take_profit_market', 'trailing_stop_market'}
-        
-        for order in open_orders:
-            order_type = (order.get('type') or '').lower()
-            # Phase 270 P1 fix: Also check info.type / origType for Binance raw fields
-            if order_type not in conditional_types:
-                info = order.get('info', {})
-                alt_type = (info.get('origType') or info.get('type') or '').lower()
-                if alt_type in conditional_types:
-                    order_type = alt_type
-            # Phase 270 P1 fix: Strict reduceOnly parse — string 'false' must not be truthy
-            is_reduce = self._order_is_reduce_only(order)
-            
-            if not is_reduce:
-                continue  # Never cancel entry orders
-            if order_type not in conditional_types:
-                continue  # Only conditional stop/TP orders
-            
-            # Use order's own symbol for cancel (safer than constructed ccxt_symbol)
-            cancel_symbol = order.get('symbol', ccxt_symbol)
-            try:
-                await self.exchange.cancel_order(order['id'], cancel_symbol)
-                result['cancelled'] += 1
-                result['order_ids'].append(order['id'])
-                logger.info(f"🗑️ POST_CLOSE_CLEANUP: Cancelled {order_type} order {order['id']} for {symbol}{' (fallback)' if used_fallback else ''}{trace_str}")
-            except Exception as cancel_err:
-                err_str = str(cancel_err)
-                # -2011 = Unknown order / already cancelled — benign
-                if '-2011' in err_str or 'Unknown order' in err_str:
-                    logger.info(f"ℹ️ POST_CLOSE_CLEANUP: Order {order['id']} already gone for {symbol}{trace_str}")
+
+            logger.info(
+                f"🧹 POST_CLOSE_CLEANUP_SCAN: {symbol} pass={pass_idx + 1} "
+                f"orders={len(open_orders)}{' fallback' if used_fallback else ''}{trace_str}"
+            )
+            for order in open_orders:
+                order_id = str(order.get('id', '')).strip()
+                if not order_id or order_id in attempted_ids:
+                    continue
+                attempted_ids.add(order_id)
+                if await self._cancel_known_conditional_order(symbol, order_id, trace_id):
+                    result['cancelled'] += 1
+                    result['order_ids'].append(order_id)
                 else:
-                    # Retry with alternate ccxt symbol derived from order/info
-                    _alt_sym = None
-                    _order_sym = order.get('symbol', '')
-                    _info_sym = (order.get('info') or {}).get('symbol', '')
-                    if _order_sym and '/' in _order_sym and _order_sym != cancel_symbol:
-                        _alt_sym = _order_sym
-                    elif _info_sym and _info_sym.endswith('USDT'):
-                        _alt_base = _info_sym[:-4]
-                        _alt_sym = f"{_alt_base}/USDT:USDT"
-                    
-                    if _alt_sym and _alt_sym != cancel_symbol:
-                        try:
-                            logger.info(f"🔄 ORPHAN_CANCEL_RETRY: order={order['id']} from={cancel_symbol} to={_alt_sym}{trace_str}")
-                            await self.exchange.cancel_order(order['id'], _alt_sym)
-                            result['cancelled'] += 1
-                            result['order_ids'].append(order['id'])
-                            logger.info(f"✅ ORPHAN_CANCEL_RETRY_OK: order={order['id']} alt_sym={_alt_sym}{trace_str}")
-                        except Exception as retry_err:
-                            _retry_str = str(retry_err)
-                            if '-2011' in _retry_str or 'Unknown order' in _retry_str:
-                                logger.info(f"ℹ️ ORPHAN_CANCEL_RETRY: Order {order['id']} already gone{trace_str}")
-                            else:
-                                result['errors'] += 1
-                                logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym1={cancel_symbol} sym2={_alt_sym} err1={cancel_err} err2={retry_err}{trace_str}")
-                    else:
-                        result['errors'] += 1
-                        logger.error(f"❌ ORPHAN_CANCEL_HARD_FAIL: order={order['id']} sym={cancel_symbol} no_alt_available err={cancel_err}{trace_str}")
-        
+                    result['errors'] += 1
+
+        remaining_orders, _ = await self._fetch_symbol_reduce_only_conditionals(symbol, trace_id=trace_id)
+        result['remaining_order_ids'] = [str(order.get('id')) for order in remaining_orders if order.get('id')]
+        result['remaining_count'] = len(result['remaining_order_ids'])
+        if result['remaining_count'] > 0:
+            logger.error(f"❌ POST_CLOSE_VERIFY_FAILED: {symbol} remaining={result['remaining_order_ids'][:8]}{trace_str}")
+            result['errors'] += result['remaining_count']
         return result
 
     async def sweep_orphan_conditionals(self) -> dict:
@@ -4571,15 +4616,36 @@ class LiveBinanceTrader:
                 if hinted_cancelled > 0:
                     res = dict(res)
                     res['cancelled'] += hinted_cancelled
-                
-                if res['cancelled'] > 0 or res['errors'] == 0:
+
+                if attempt == len(backoffs) and res.get('remaining_count', 0) > 0:
+                    try:
+                        symbol_orders, _ = await self._fetch_symbol_open_orders_all_sources(symbol, trace_id=trace_id)
+                        if self._orders_all_reduce_only_conditionals(symbol_orders):
+                            cancel_all = getattr(self.exchange, 'fapiPrivateDeleteAllOpenOrders', None)
+                            if callable(cancel_all):
+                                await cancel_all({'symbol': symbol})
+                                logger.warning(
+                                    f"🧨 POST_CLOSE_CANCEL_ALL_PROTECTIVE: {symbol} "
+                                    f"remaining_before={res.get('remaining_order_ids', [])[:8]}{trace_str}"
+                                )
+                                res = await self.cancel_reduce_only_conditionals(symbol, trace_id)
+                    except Exception as cancel_all_err:
+                        logger.warning(f"⚠️ POST_CLOSE_CANCEL_ALL_PROTECTIVE_FAIL: {symbol} err={cancel_all_err}{trace_str}")
+
+                if res.get('remaining_count', 0) == 0 and res['errors'] == 0:
                     # P0 orphan fix: track recently-closed for sweep fallback
                     self._recently_closed_symbols.append((symbol, int(datetime.now().timestamp() * 1000)))
-                    logger.warning(f"✅ POST_CLOSE_CLEANUP_DONE: {symbol} cancelled={res['cancelled']} errors={res['errors']}{trace_str}")
+                    logger.warning(
+                        f"✅ POST_CLOSE_CLEANUP_DONE: {symbol} cancelled={res['cancelled']} "
+                        f"errors={res['errors']} remaining=0{trace_str}"
+                    )
                     return
                 
-                # If only errors (e.g. rate limit), retry
-                logger.warning(f"⚠️ POST_CLOSE_CLEANUP: {symbol} attempt {attempt} had errors={res['errors']}, retrying...{trace_str}")
+                logger.warning(
+                    f"⚠️ POST_CLOSE_CLEANUP_VERIFY_RETRY: {symbol} attempt={attempt}/{len(backoffs)} "
+                    f"cancelled={res['cancelled']} errors={res['errors']} "
+                    f"remaining={res.get('remaining_order_ids', [])[:8]}{trace_str}"
+                )
                 
             except Exception as e:
                 logger.warning(f"⚠️ POST_CLOSE_CLEANUP: {symbol} attempt {attempt} exception: {e}{trace_str}")
@@ -6370,6 +6436,8 @@ async def binance_position_sync_loop():
                                     new_pos['openTime'] = _pos_meta['open_time']
                         except Exception:
                             pass
+
+                        ensure_v3_runner_tp_ladder(new_pos, default_mode=_sync_runner_controls['mode'])
                         
                         global_paper_trader.positions.append(new_pos)
                         logger.info(f"📥 SYNCED: {bp['side']} {symbol} @ ${entry_price:.4f} | Vol:{volatility_pct:.1f}% Trail:{trail_activation_atr}x/{trail_distance_atr}x")
@@ -6420,6 +6488,7 @@ async def binance_position_sync_loop():
                                 pos.setdefault('exchange_protective_order_ids', [])
                                 if bp.get('exchange_sl_order_id'):
                                     record_position_protective_order_id(pos, bp.get('exchange_sl_order_id'))
+                                ensure_v3_runner_tp_ladder(pos, default_mode=_sync_runner_controls['mode'])
                                 
                                 # Phase 188: Cooldown after partial close — don't overwrite size
                                 # for 30 seconds to prevent duplicate reduction orders
@@ -8731,6 +8800,89 @@ def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float
     # v2 canonical: always DECI — no auto heuristic
     return float(raw_value) / 10.0
 
+
+def resolve_effective_trail_atr_bases(
+    configured_activation_atr: float,
+    configured_distance_atr: float,
+    signal_activation_atr: float = None,
+    signal_distance_atr: float = None,
+) -> dict:
+    """Resolve trail ATR bases with user-configured settings as the primary floor.
+
+    Signal/runtime dynamic trail values are allowed to widen the trail logic, but
+    they must not silently tighten below the user's configured runtime settings.
+    """
+    configured_activation = max(0.1, _to_float_safe(configured_activation_atr, 1.5))
+    configured_distance = max(0.1, _to_float_safe(configured_distance_atr, 1.0))
+    signal_activation = _to_float_safe(signal_activation_atr, 0.0)
+    signal_distance = _to_float_safe(signal_distance_atr, 0.0)
+
+    base_activation = configured_activation
+    base_distance = configured_distance
+    if signal_activation > 0:
+        base_activation = max(base_activation, signal_activation)
+    if signal_distance > 0:
+        base_distance = max(base_distance, signal_distance)
+
+    return {
+        "configured_activation_atr": round(configured_activation, 4),
+        "configured_distance_atr": round(configured_distance, 4),
+        "signal_activation_atr": round(signal_activation, 4) if signal_activation > 0 else 0.0,
+        "signal_distance_atr": round(signal_distance, 4) if signal_distance > 0 else 0.0,
+        "base_activation_atr": round(base_activation, 4),
+        "base_distance_atr": round(base_distance, 4),
+        "signal_override_applied": bool(
+            signal_activation > configured_activation or signal_distance > configured_distance
+        ),
+    }
+
+
+def apply_user_configured_exit_atr_floors(
+    configured_sl_atr: float,
+    configured_tp_atr: float,
+    base_trail_activation_atr: float,
+    base_trail_distance_atr: float,
+    adjusted_sl_atr: float,
+    adjusted_tp_atr: float,
+    adjusted_trail_activation_atr: float,
+    adjusted_trail_distance_atr: float,
+) -> dict:
+    """Prevent strategy/regime overlays from tightening below explicit user ATR settings."""
+    configured_sl = max(0.1, _to_float_safe(configured_sl_atr, 1.5))
+    configured_tp = max(0.1, _to_float_safe(configured_tp_atr, 3.0))
+    trail_base_act = max(0.1, _to_float_safe(base_trail_activation_atr, 1.5))
+    trail_base_dist = max(0.1, _to_float_safe(base_trail_distance_atr, 1.0))
+
+    raw_sl = max(0.1, _to_float_safe(adjusted_sl_atr, configured_sl))
+    raw_tp = max(0.1, _to_float_safe(adjusted_tp_atr, configured_tp))
+    raw_trail_act = max(0.1, _to_float_safe(adjusted_trail_activation_atr, trail_base_act))
+    raw_trail_dist = max(0.1, _to_float_safe(adjusted_trail_distance_atr, trail_base_dist))
+
+    final_sl = max(configured_sl, raw_sl)
+    final_tp = max(configured_tp, raw_tp)
+    final_trail_act = max(trail_base_act, raw_trail_act)
+    final_trail_dist = max(trail_base_dist, raw_trail_dist)
+
+    return {
+        "sl_atr": round(final_sl, 4),
+        "tp_atr": round(final_tp, 4),
+        "trail_activation_atr": round(final_trail_act, 4),
+        "trail_distance_atr": round(final_trail_dist, 4),
+        "raw_sl_atr": round(raw_sl, 4),
+        "raw_tp_atr": round(raw_tp, 4),
+        "raw_trail_activation_atr": round(raw_trail_act, 4),
+        "raw_trail_distance_atr": round(raw_trail_dist, 4),
+        "floor_applied": any(
+            abs(a - b) > 1e-9
+            for a, b in (
+                (final_sl, raw_sl),
+                (final_tp, raw_tp),
+                (final_trail_act, raw_trail_act),
+                (final_trail_dist, raw_trail_dist),
+            )
+        ),
+    }
+
 # Patch D: EV Gate thresholds
 EV_GATE_ENABLED = os.environ.get('EV_GATE_ENABLED', 'true').lower() == 'true'
 EV_SOFT_THRESHOLD = float(os.environ.get('EV_SOFT_THRESHOLD', '-0.002'))   # below this → soft penalty
@@ -9832,6 +9984,71 @@ def build_v3_runner_fallback_tp_ladder(
         },
         "prices": prices,
     }
+
+
+def parse_runner_close_split(raw_value, default: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    if isinstance(raw_value, (tuple, list)) and len(raw_value) >= 4:
+        values = [float(v) for v in raw_value[:4]]
+    elif isinstance(raw_value, str) and raw_value.strip():
+        try:
+            values = [float(part.strip()) for part in raw_value.split('/')[:4]]
+        except Exception:
+            values = list(default[:4])
+    else:
+        values = list(default[:4])
+    if max(values or [0.0]) > 1.0:
+        values = [v / 100.0 for v in values]
+    padded = values[:4] + list(default[len(values[:4]):4])
+    return tuple(float(v) for v in padded[:4])
+
+
+def ensure_v3_runner_tp_ladder(pos: dict, default_mode: str = STRATEGY_MODE_SMART_V3_RUNNER) -> bool:
+    if not is_v3_runner_position_payload(pos, default_mode=default_mode):
+        return bool(pos.get('tp_ladder_levels'))
+    if pos.get('tp_ladder_levels'):
+        return True
+
+    entry_price = float(pos.get('entryPrice', 0.0) or 0.0)
+    if entry_price <= 0:
+        return False
+    atr = float(pos.get('atr', entry_price * 0.01) or (entry_price * 0.01))
+    if atr <= 0:
+        atr = entry_price * 0.01
+    runner_controls = resolve_runner_exit_controls(pos, default_mode=default_mode)
+    runner_split = parse_runner_close_split(
+        pos.get('tpCloseSplit', ''),
+        runner_controls.get('tp_close_split', (0.20, 0.25, 0.25, 0.30)),
+    )
+    ladder = build_v3_runner_fallback_tp_ladder(
+        entry_price=entry_price,
+        atr=atr,
+        side=pos.get('side', 'LONG'),
+        leverage=max(1, int(pos.get('leverage', 10) or 10)),
+        spread_pct=float(pos.get('spreadPct', 0.05) or 0.05),
+        volume_ratio=float(pos.get('volumeRatio', 1.0) or 1.0),
+        adx=float(pos.get('adx', 25.0) or 25.0),
+        hurst=float(pos.get('hurst', 0.50) or 0.50),
+        coin_daily_trend=pos.get('coinDailyTrend', 'NEUTRAL'),
+        exec_score=float(pos.get('entryExecScore', pos.get('signalScore', 70.0)) or 70.0),
+        spread_level=pos.get('spreadLevel', 'Normal'),
+        tp_tighten=float(pos.get('runner_tp_tighten', runner_controls.get('tp_tighten', 1.0)) or 1.0),
+        close_split=runner_split,
+    )
+    if not ladder.get('levels'):
+        return False
+
+    pos['tp_ladder_levels'] = ladder['levels']
+    pos['tp_ladder_version'] = ladder['version']
+    pos['tpLadderVersion'] = ladder['version']
+    pos['tp_ladder_anchor_entry'] = entry_price
+    import copy
+    pos['tp_ladder_anchor_levels'] = copy.deepcopy(ladder['levels'])
+    pos['tp_ladder_runtime_mult'] = 1.0
+    pos['tp_ladder_state'] = pos.get('tp_ladder_state', {})
+    pos['tp_ladder_telemetry'] = ladder.get('telemetry', {})
+    pos['tp_ladder_prices'] = ladder.get('prices', {})
+    pos['tpCloseSplit'] = format_runner_close_split(runner_split)
+    return True
 
 
 def is_v3_runner_position_payload(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> bool:
@@ -21048,7 +21265,7 @@ class TimeBasedPositionManager:
             actions["time_closed"].append(f"{pos.get('symbol')} recovery_exit")
             return True
 
-        if not pos.get('tp_ladder_levels'):
+        if not ensure_v3_runner_tp_ladder(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER):
             pos['lastExitDecision'] = 'V3_NO_TP_LADDER'
             return True
 
@@ -28923,16 +29140,38 @@ class PaperTradingEngine:
                     15.0
                 )
                 _dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(_atr_for_levels, _entry_for_levels)
-                _adj_sl_atr = resolve_atr_multiplier(self.sl_atr) * _effective_et * _dynamic_atr_mult * _tm_sl_mult
-                _adj_tp_atr = resolve_atr_multiplier(self.tp_atr) * _effective_et * _dynamic_atr_mult * _tm_tp_mult
-                _base_trail_activation_atr = float(existing_pending.get('dynamic_trail_activation', self.trail_activation_atr))
-                _base_trail_distance_atr = float(existing_pending.get('dynamic_trail_distance', self.trail_distance_atr))
+                _configured_sl_atr = resolve_atr_multiplier(self.sl_atr)
+                _configured_tp_atr = resolve_atr_multiplier(self.tp_atr)
+                _trail_base_ctx = resolve_effective_trail_atr_bases(
+                    self.trail_activation_atr,
+                    self.trail_distance_atr,
+                    existing_pending.get('dynamic_trail_activation'),
+                    existing_pending.get('dynamic_trail_distance'),
+                )
+                _base_trail_activation_atr = _trail_base_ctx['base_activation_atr']
+                _base_trail_distance_atr = _trail_base_ctx['base_distance_atr']
+                _adj_sl_atr = _configured_sl_atr * _effective_et * _dynamic_atr_mult * _tm_sl_mult
+                _adj_tp_atr = _configured_tp_atr * _effective_et * _dynamic_atr_mult * _tm_tp_mult
                 _adj_trail_activation_atr = _base_trail_activation_atr * _effective_et * _dynamic_atr_mult * _tm_trail_act_mult
                 _adj_trail_distance_atr = _base_trail_distance_atr * _effective_et * _dynamic_atr_mult * _tm_trail_dist_mult
                 if _runner_controls.get('enabled', False):
                     _adj_tp_atr *= _runner_controls['tp_tighten']
                     _adj_trail_activation_atr *= _runner_controls['trail_act_mult']
                     _adj_trail_distance_atr *= _runner_controls['trail_dist_mult']
+                _atr_floor_ctx = apply_user_configured_exit_atr_floors(
+                    configured_sl_atr=_configured_sl_atr,
+                    configured_tp_atr=_configured_tp_atr,
+                    base_trail_activation_atr=_base_trail_activation_atr,
+                    base_trail_distance_atr=_base_trail_distance_atr,
+                    adjusted_sl_atr=_adj_sl_atr,
+                    adjusted_tp_atr=_adj_tp_atr,
+                    adjusted_trail_activation_atr=_adj_trail_activation_atr,
+                    adjusted_trail_distance_atr=_adj_trail_distance_atr,
+                )
+                _adj_sl_atr = _atr_floor_ctx['sl_atr']
+                _adj_tp_atr = _atr_floor_ctx['tp_atr']
+                _adj_trail_activation_atr = _atr_floor_ctx['trail_activation_atr']
+                _adj_trail_distance_atr = _atr_floor_ctx['trail_distance_atr']
 
                 _ord_lev = max(1, int(existing_pending.get('leverage', self.leverage)))
                 _ord_spread = float(existing_pending.get('spreadPct', 0.05))
@@ -28949,6 +29188,16 @@ class PaperTradingEngine:
                 existing_pending['takeProfit'] = _pv_levels['tp']
                 existing_pending['trailActivation'] = _pv_levels['trail_activation']
                 existing_pending['trailDistance'] = _pv_levels['trail_distance']
+                existing_pending['configuredSlAtr'] = round(_configured_sl_atr, 4)
+                existing_pending['configuredTpAtr'] = round(_configured_tp_atr, 4)
+                existing_pending['configuredTrailActivationAtr'] = _trail_base_ctx['configured_activation_atr']
+                existing_pending['configuredTrailDistanceAtr'] = _trail_base_ctx['configured_distance_atr']
+                existing_pending['signalDynamicTrailActivationAtr'] = _trail_base_ctx['signal_activation_atr']
+                existing_pending['signalDynamicTrailDistanceAtr'] = _trail_base_ctx['signal_distance_atr']
+                existing_pending['effectiveSlAtrUsed'] = round(_adj_sl_atr, 4)
+                existing_pending['effectiveTpAtrUsed'] = round(_adj_tp_atr, 4)
+                existing_pending['effectiveTrailActivationAtrUsed'] = round(_adj_trail_activation_atr, 4)
+                existing_pending['effectiveTrailDistanceAtrUsed'] = round(_adj_trail_distance_atr, 4)
             except Exception as _recalc_err:
                 logger.debug(f"Pending reinforce level recalc error ({trade_symbol}): {_recalc_err}")
         except Exception:
@@ -29364,19 +29613,19 @@ class PaperTradingEngine:
         elif signal and not _is_ct_signal:
             logger.debug(f"COUNTER_EXIT_RELAX_BYPASS: {trade_symbol} {side} (non-countertrend)")
 
-        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
-        adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
-        
-        # Use dynamic trail params from signal if available (Cloud Scanner + WebSocket parity)
-        if signal and 'dynamic_trail_activation' in signal:
-            # Use per-coin dynamic trail params
-            base_trail_activation_atr = signal['dynamic_trail_activation']
-            base_trail_distance_atr = signal['dynamic_trail_distance']
-        else:
-            # Fallback to global defaults
-            base_trail_activation_atr = self.trail_activation_atr
-            base_trail_distance_atr = self.trail_distance_atr
-        
+        configured_sl_atr = resolve_atr_multiplier(self.sl_atr)
+        configured_tp_atr = resolve_atr_multiplier(self.tp_atr)
+        trail_base_ctx = resolve_effective_trail_atr_bases(
+            self.trail_activation_atr,
+            self.trail_distance_atr,
+            signal.get('dynamic_trail_activation') if signal else None,
+            signal.get('dynamic_trail_distance') if signal else None,
+        )
+        base_trail_activation_atr = trail_base_ctx['base_activation_atr']
+        base_trail_distance_atr = trail_base_ctx['base_distance_atr']
+
+        adjusted_sl_atr = configured_sl_atr * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
+        adjusted_tp_atr = configured_tp_atr * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
 
@@ -29416,6 +29665,29 @@ class PaperTradingEngine:
                 logger.info(f"🎭 REGIME_EXEC_PROFILE_APPLIED: {trade_symbol} | TP×{r_tp_mult:.2f} SL×{r_sl_mult:.2f} Trail×{r_trail_mult:.2f} struct={regime_profile.get('profile_source')}")
         except Exception as rp_err:
             logger.debug(f"Regime profile params error: {rp_err}")
+
+        atr_floor_ctx = apply_user_configured_exit_atr_floors(
+            configured_sl_atr=configured_sl_atr,
+            configured_tp_atr=configured_tp_atr,
+            base_trail_activation_atr=base_trail_activation_atr,
+            base_trail_distance_atr=base_trail_distance_atr,
+            adjusted_sl_atr=adjusted_sl_atr,
+            adjusted_tp_atr=adjusted_tp_atr,
+            adjusted_trail_activation_atr=adjusted_trail_activation_atr,
+            adjusted_trail_distance_atr=adjusted_trail_distance_atr,
+        )
+        adjusted_sl_atr = atr_floor_ctx['sl_atr']
+        adjusted_tp_atr = atr_floor_ctx['tp_atr']
+        adjusted_trail_activation_atr = atr_floor_ctx['trail_activation_atr']
+        adjusted_trail_distance_atr = atr_floor_ctx['trail_distance_atr']
+        if atr_floor_ctx['floor_applied']:
+            logger.info(
+                f"🎛️ USER_ATR_FLOOR(open): {trade_symbol} {side} "
+                f"sl {atr_floor_ctx['raw_sl_atr']:.2f}→{adjusted_sl_atr:.2f} "
+                f"tp {atr_floor_ctx['raw_tp_atr']:.2f}→{adjusted_tp_atr:.2f} "
+                f"trail_act {atr_floor_ctx['raw_trail_activation_atr']:.2f}→{adjusted_trail_activation_atr:.2f} "
+                f"trail_dist {atr_floor_ctx['raw_trail_distance_atr']:.2f}→{adjusted_trail_distance_atr:.2f}"
+            )
         
         # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
         _sig_spread = float(signal.get('spreadPct', 0.05)) if signal else 0.05
@@ -29944,6 +30216,16 @@ class PaperTradingEngine:
             "trail_phase": "WIDE" if (COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal) else "NORMAL",
             "settingsSnapshot": settings_snapshot,
             "minConfidenceScoreSnapshot": float(self.min_confidence_score),
+            "configuredSlAtr": round(configured_sl_atr, 4),
+            "configuredTpAtr": round(configured_tp_atr, 4),
+            "configuredTrailActivationAtr": trail_base_ctx['configured_activation_atr'],
+            "configuredTrailDistanceAtr": trail_base_ctx['configured_distance_atr'],
+            "signalDynamicTrailActivationAtr": trail_base_ctx['signal_activation_atr'],
+            "signalDynamicTrailDistanceAtr": trail_base_ctx['signal_distance_atr'],
+            "effectiveSlAtrUsed": round(adjusted_sl_atr, 4),
+            "effectiveTpAtrUsed": round(adjusted_tp_atr, 4),
+            "effectiveTrailActivationAtrUsed": round(adjusted_trail_activation_atr, 4),
+            "effectiveTrailDistanceAtrUsed": round(adjusted_trail_distance_atr, 4),
             "truth_snapshot": signal.get('truth_snapshot', {}) if signal else {},
             "regime_adjustment": signal.get('regime_adjustment', '') if signal else '',
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
@@ -30890,17 +31172,19 @@ class PaperTradingEngine:
             ct_trail_dist_mult = max(CT_RELAX_TRAIL_DIST_MIN, min(CT_RELAX_TRAIL_DIST_MAX, CT_RELAX_TRAIL_DIST_MIN + (CT_RELAX_TRAIL_DIST_MAX - CT_RELAX_TRAIL_DIST_MIN) * _ct_str_ord))
             logger.info(f"COUNTER_EXIT_RELAX_APPLIED (exec): {symbol} {side} str={_ct_str_ord:.2f} sl×{ct_sl_mult:.2f} trailAct×{ct_trail_act_mult:.2f} trailDist×{ct_trail_dist_mult:.2f}")
 
-        adjusted_sl_atr = resolve_atr_multiplier(self.sl_atr) * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
-        adjusted_tp_atr = resolve_atr_multiplier(self.tp_atr) * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
-        
-        # Use dynamic trail params from order if available (Cloud Scanner + WebSocket parity)
-        if 'dynamic_trail_activation' in order:
-            base_trail_activation_atr = order['dynamic_trail_activation']
-            base_trail_distance_atr = order['dynamic_trail_distance']
-        else:
-            base_trail_activation_atr = self.trail_activation_atr
-            base_trail_distance_atr = self.trail_distance_atr
-        
+        configured_sl_atr = resolve_atr_multiplier(self.sl_atr)
+        configured_tp_atr = resolve_atr_multiplier(self.tp_atr)
+        trail_base_ctx = resolve_effective_trail_atr_bases(
+            self.trail_activation_atr,
+            self.trail_distance_atr,
+            order.get('dynamic_trail_activation'),
+            order.get('dynamic_trail_distance'),
+        )
+        base_trail_activation_atr = trail_base_ctx['base_activation_atr']
+        base_trail_distance_atr = trail_base_ctx['base_distance_atr']
+
+        adjusted_sl_atr = configured_sl_atr * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
+        adjusted_tp_atr = configured_tp_atr * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
         adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
         adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
         if _runner_controls.get('enabled', False):
@@ -30912,6 +31196,29 @@ class PaperTradingEngine:
                 f"tp×{_runner_controls['tp_tighten']:.2f} "
                 f"trail_act×{_runner_controls['trail_act_mult']:.2f} "
                 f"trail_dist×{_runner_controls['trail_dist_mult']:.2f}"
+            )
+
+        atr_floor_ctx = apply_user_configured_exit_atr_floors(
+            configured_sl_atr=configured_sl_atr,
+            configured_tp_atr=configured_tp_atr,
+            base_trail_activation_atr=base_trail_activation_atr,
+            base_trail_distance_atr=base_trail_distance_atr,
+            adjusted_sl_atr=adjusted_sl_atr,
+            adjusted_tp_atr=adjusted_tp_atr,
+            adjusted_trail_activation_atr=adjusted_trail_activation_atr,
+            adjusted_trail_distance_atr=adjusted_trail_distance_atr,
+        )
+        adjusted_sl_atr = atr_floor_ctx['sl_atr']
+        adjusted_tp_atr = atr_floor_ctx['tp_atr']
+        adjusted_trail_activation_atr = atr_floor_ctx['trail_activation_atr']
+        adjusted_trail_distance_atr = atr_floor_ctx['trail_distance_atr']
+        if atr_floor_ctx['floor_applied']:
+            logger.info(
+                f"🎛️ USER_ATR_FLOOR(exec): {symbol} {side} "
+                f"sl {atr_floor_ctx['raw_sl_atr']:.2f}→{adjusted_sl_atr:.2f} "
+                f"tp {atr_floor_ctx['raw_tp_atr']:.2f}→{adjusted_tp_atr:.2f} "
+                f"trail_act {atr_floor_ctx['raw_trail_activation_atr']:.2f}→{adjusted_trail_activation_atr:.2f} "
+                f"trail_dist {atr_floor_ctx['raw_trail_distance_atr']:.2f}→{adjusted_trail_distance_atr:.2f}"
             )
         
         # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
@@ -31042,6 +31349,16 @@ class PaperTradingEngine:
             "spreadPct": order.get('spreadPct', 0.05),
             "volumeRatio": order.get('volumeRatio', 1.0),
             "effectiveExitTightnessBase": effective_exit_tightness,
+            "configuredSlAtr": round(configured_sl_atr, 4),
+            "configuredTpAtr": round(configured_tp_atr, 4),
+            "configuredTrailActivationAtr": trail_base_ctx['configured_activation_atr'],
+            "configuredTrailDistanceAtr": trail_base_ctx['configured_distance_atr'],
+            "signalDynamicTrailActivationAtr": trail_base_ctx['signal_activation_atr'],
+            "signalDynamicTrailDistanceAtr": trail_base_ctx['signal_distance_atr'],
+            "effectiveSlAtrUsed": round(adjusted_sl_atr, 4),
+            "effectiveTpAtrUsed": round(adjusted_tp_atr, 4),
+            "effectiveTrailActivationAtrUsed": round(adjusted_trail_activation_atr, 4),
+            "effectiveTrailDistanceAtrUsed": round(adjusted_trail_distance_atr, 4),
             # Runtime trail telemetry (updated every tick)
             "effectiveExitTightness": effective_exit_tightness,
             "runtimeTrailDistance": trail_distance,
@@ -36163,10 +36480,18 @@ async def paper_trading_update_settings(
             side = pos.get('side', '')
             
             # Recalculate TP/SL with new exit_tightness via unified helper
-            adjusted_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr) * global_paper_trader.exit_tightness
-            adjusted_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr) * global_paper_trader.exit_tightness
-            adjusted_trail_activation_atr = global_paper_trader.trail_activation_atr * global_paper_trader.exit_tightness
-            adjusted_trail_distance_atr = global_paper_trader.trail_distance_atr * global_paper_trader.exit_tightness
+            configured_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr)
+            configured_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr)
+            trail_base_ctx = resolve_effective_trail_atr_bases(
+                global_paper_trader.trail_activation_atr,
+                global_paper_trader.trail_distance_atr,
+                pos.get('signalDynamicTrailActivationAtr', pos.get('dynamic_trail_activation', pos.get('dynamicTrailActivation'))),
+                pos.get('signalDynamicTrailDistanceAtr', pos.get('dynamic_trail_distance', pos.get('dynamicTrailDistance'))),
+            )
+            adjusted_sl_atr = configured_sl_atr * global_paper_trader.exit_tightness
+            adjusted_tp_atr = configured_tp_atr * global_paper_trader.exit_tightness
+            adjusted_trail_activation_atr = trail_base_ctx['base_activation_atr'] * global_paper_trader.exit_tightness
+            adjusted_trail_distance_atr = trail_base_ctx['base_distance_atr'] * global_paper_trader.exit_tightness
             _runner_controls = resolve_runner_exit_controls(
                 payload=pos,
                 default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -36174,6 +36499,20 @@ async def paper_trading_update_settings(
             adjusted_tp_atr *= _runner_controls['tp_tighten']
             adjusted_trail_activation_atr *= _runner_controls['trail_act_mult']
             adjusted_trail_distance_atr *= _runner_controls['trail_dist_mult']
+            atr_floor_ctx = apply_user_configured_exit_atr_floors(
+                configured_sl_atr=configured_sl_atr,
+                configured_tp_atr=configured_tp_atr,
+                base_trail_activation_atr=trail_base_ctx['base_activation_atr'],
+                base_trail_distance_atr=trail_base_ctx['base_distance_atr'],
+                adjusted_sl_atr=adjusted_sl_atr,
+                adjusted_tp_atr=adjusted_tp_atr,
+                adjusted_trail_activation_atr=adjusted_trail_activation_atr,
+                adjusted_trail_distance_atr=adjusted_trail_distance_atr,
+            )
+            adjusted_sl_atr = atr_floor_ctx['sl_atr']
+            adjusted_tp_atr = atr_floor_ctx['tp_atr']
+            adjusted_trail_activation_atr = atr_floor_ctx['trail_activation_atr']
+            adjusted_trail_distance_atr = atr_floor_ctx['trail_distance_atr']
             
             _s_symbol = pos.get('symbol', '')
             _s_levels = compute_sl_tp_levels(
@@ -36192,6 +36531,16 @@ async def paper_trading_update_settings(
             pos['takeProfit'] = _s_levels['tp']
             pos['trailActivation'] = _s_levels['trail_activation']
             pos['trailDistance'] = _s_levels['trail_distance']
+            pos['configuredSlAtr'] = round(configured_sl_atr, 4)
+            pos['configuredTpAtr'] = round(configured_tp_atr, 4)
+            pos['configuredTrailActivationAtr'] = trail_base_ctx['configured_activation_atr']
+            pos['configuredTrailDistanceAtr'] = trail_base_ctx['configured_distance_atr']
+            pos['signalDynamicTrailActivationAtr'] = trail_base_ctx['signal_activation_atr']
+            pos['signalDynamicTrailDistanceAtr'] = trail_base_ctx['signal_distance_atr']
+            pos['effectiveSlAtrUsed'] = round(adjusted_sl_atr, 4)
+            pos['effectiveTpAtrUsed'] = round(adjusted_tp_atr, 4)
+            pos['effectiveTrailActivationAtrUsed'] = round(adjusted_trail_activation_atr, 4)
+            pos['effectiveTrailDistanceAtrUsed'] = round(adjusted_trail_distance_atr, 4)
             
             updated_positions += 1
             
@@ -36751,10 +37100,16 @@ async def paper_trading_market_order(request: Request):
                 return JSONResponse({"success": False, "error": f"Binance leverage set failed for {symbol} → {leverage}x"}, status_code=500)
         
         # SL/TP via unified helper (gains leverage floor + cost floor + tick snap)
-        _mo_adj_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr)
-        _mo_adj_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr)
-        _mo_adj_trail_act = global_paper_trader.trail_activation_atr
-        _mo_adj_trail_dist = global_paper_trader.trail_distance_atr
+        _mo_configured_sl_atr = resolve_atr_multiplier(global_paper_trader.sl_atr)
+        _mo_configured_tp_atr = resolve_atr_multiplier(global_paper_trader.tp_atr)
+        _mo_trail_base_ctx = resolve_effective_trail_atr_bases(
+            global_paper_trader.trail_activation_atr,
+            global_paper_trader.trail_distance_atr,
+        )
+        _mo_adj_sl_atr = _mo_configured_sl_atr
+        _mo_adj_tp_atr = _mo_configured_tp_atr
+        _mo_adj_trail_act = _mo_trail_base_ctx['base_activation_atr']
+        _mo_adj_trail_dist = _mo_trail_base_ctx['base_distance_atr']
         _mo_runner_controls = resolve_runner_exit_controls(
             payload={"strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)},
             default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -36762,6 +37117,20 @@ async def paper_trading_market_order(request: Request):
         _mo_adj_tp_atr *= _mo_runner_controls['tp_tighten']
         _mo_adj_trail_act *= _mo_runner_controls['trail_act_mult']
         _mo_adj_trail_dist *= _mo_runner_controls['trail_dist_mult']
+        _mo_floor_ctx = apply_user_configured_exit_atr_floors(
+            configured_sl_atr=_mo_configured_sl_atr,
+            configured_tp_atr=_mo_configured_tp_atr,
+            base_trail_activation_atr=_mo_trail_base_ctx['base_activation_atr'],
+            base_trail_distance_atr=_mo_trail_base_ctx['base_distance_atr'],
+            adjusted_sl_atr=_mo_adj_sl_atr,
+            adjusted_tp_atr=_mo_adj_tp_atr,
+            adjusted_trail_activation_atr=_mo_adj_trail_act,
+            adjusted_trail_distance_atr=_mo_adj_trail_dist,
+        )
+        _mo_adj_sl_atr = _mo_floor_ctx['sl_atr']
+        _mo_adj_tp_atr = _mo_floor_ctx['tp_atr']
+        _mo_adj_trail_act = _mo_floor_ctx['trail_activation_atr']
+        _mo_adj_trail_dist = _mo_floor_ctx['trail_distance_atr']
         _mo_levels = compute_sl_tp_levels(
             entry_price=price, atr=atr, side=side,
             leverage=leverage, symbol=symbol,
@@ -36849,6 +37218,16 @@ async def paper_trading_market_order(request: Request):
             "fc_max_profit_pct": 0.0,
             # Runtime trail telemetry (updated every tick)
             "effectiveExitTightness": global_paper_trader.exit_tightness,
+            "configuredSlAtr": round(_mo_configured_sl_atr, 4),
+            "configuredTpAtr": round(_mo_configured_tp_atr, 4),
+            "configuredTrailActivationAtr": _mo_trail_base_ctx['configured_activation_atr'],
+            "configuredTrailDistanceAtr": _mo_trail_base_ctx['configured_distance_atr'],
+            "signalDynamicTrailActivationAtr": _mo_trail_base_ctx['signal_activation_atr'],
+            "signalDynamicTrailDistanceAtr": _mo_trail_base_ctx['signal_distance_atr'],
+            "effectiveSlAtrUsed": round(_mo_adj_sl_atr, 4),
+            "effectiveTpAtrUsed": round(_mo_adj_tp_atr, 4),
+            "effectiveTrailActivationAtrUsed": round(_mo_adj_trail_act, 4),
+            "effectiveTrailDistanceAtrUsed": round(_mo_adj_trail_dist, 4),
             "runtimeTrailDistance": _mo_levels['trail_distance'],
             "runtimeTrailDistancePct": round((_mo_levels['trail_distance'] / fill_price * 100), 4) if fill_price > 0 else 0.0,
             "runtimeTrailActivationMovePct": 0.0,

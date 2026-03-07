@@ -567,7 +567,7 @@ async def test_43_close_forwards_cleanup_order_ids(trader):
 @pytest.mark.asyncio
 async def test_44_post_close_cleanup_uses_raw_cancel_hint(trader):
     trader.get_positions = AsyncMock(return_value=[])
-    trader.exchange.fetch_open_orders = AsyncMock(side_effect=[[], []])
+    trader.exchange.fetch_open_orders = AsyncMock(side_effect=[[], [], [], []])
     trader.exchange.fapiPrivateGetOpenOrders = AsyncMock(return_value=[])
     trader.exchange.cancel_order = AsyncMock(side_effect=Exception("ccxt cancel failed"))
     trader.exchange.fapiPrivateDeleteOrder = AsyncMock(return_value={'orderId': 'sl_44'})
@@ -579,7 +579,26 @@ async def test_44_post_close_cleanup_uses_raw_cancel_hint(trader):
     assert trader._recently_closed_symbols[-1][0] == 'BTCUSDT'
 
 
-def test_45_position_cleanup_order_ids_track_all_protective_orders():
+@pytest.mark.asyncio
+async def test_45_reduce_only_conditionals_merge_raw_with_partial_ccxt(trader):
+    trader.exchange.fetch_open_orders = AsyncMock(side_effect=[
+        [{'id': 'sl_ccxt', 'symbol': 'BTC/USDT:USDT', 'type': 'stop_market', 'reduceOnly': True, 'info': {'symbol': 'BTCUSDT', 'reduceOnly': 'true'}}],
+        [],
+        [],
+        [],
+    ])
+    trader.exchange.fapiPrivateGetOpenOrders = AsyncMock(return_value=[
+        {'orderId': 'sl_ccxt', 'symbol': 'BTCUSDT', 'origType': 'STOP_MARKET', 'reduceOnly': True, 'closePosition': False},
+        {'orderId': 'sl_raw', 'symbol': 'BTCUSDT', 'origType': 'STOP_MARKET', 'reduceOnly': True, 'closePosition': False},
+    ])
+
+    orders, used_fallback = await trader._fetch_symbol_reduce_only_conditionals('BTCUSDT', trace_id='t45')
+
+    assert used_fallback is True
+    assert [o['id'] for o in orders] == ['sl_ccxt', 'sl_raw']
+
+
+def test_46_position_cleanup_order_ids_track_all_protective_orders():
     pos = {}
 
     record_position_protective_order_id(pos, "sl_open")
@@ -591,7 +610,7 @@ def test_45_position_cleanup_order_ids_track_all_protective_orders():
     assert get_position_cleanup_order_ids(pos) == ["sl_open", "sl_be"]
 
 
-def test_46_position_cleanup_order_ids_include_legacy_pointer():
+def test_47_position_cleanup_order_ids_include_legacy_pointer():
     pos = {"exchange_sl_order_id": "sl_live"}
 
     assert get_position_cleanup_order_ids(pos) == ["sl_live"]

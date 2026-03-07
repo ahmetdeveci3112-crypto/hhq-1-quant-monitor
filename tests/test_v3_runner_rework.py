@@ -145,6 +145,17 @@ def test_v3_fallback_tp_ladder_keeps_runner_split():
     assert ladder["telemetry"]["close_split"] == "15/20/25/40"
 
 
+def test_ensure_v3_runner_tp_ladder_rebuilds_missing_levels():
+    pos = _base_v3_position(tp_ladder_levels=[], tpLadderVersion="", tpCloseSplit="20/25/25/30")
+
+    rebuilt = main.ensure_v3_runner_tp_ladder(pos)
+
+    assert rebuilt is True
+    assert pos["tpLadderVersion"] == "v3-fallback-4tier"
+    assert [lv["key"] for lv in pos["tp_ladder_levels"]] == ["tp1", "tp2", "tp3", "tp_final"]
+    assert [lv["close_pct"] for lv in pos["tp_ladder_levels"]] == [0.20, 0.25, 0.25, 0.30]
+
+
 @pytest.mark.asyncio
 async def test_v3_tp1_arms_trail_without_immediate_activation():
     trader = DummyPaperTrader()

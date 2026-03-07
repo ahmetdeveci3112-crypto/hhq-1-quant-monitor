@@ -264,6 +264,40 @@ def test_market_regime_status_exposes_data_flow_and_dca_preview():
     assert status['dcaPreview']['short']['decision'] in {'STRONG_ALLOW', 'SOFT_ALLOW', 'SOFT_ALLOW_LOW_RISK', 'BLOCK'}
 
 
+def test_resolve_effective_trail_atr_bases_uses_user_values_as_floor():
+    result = main.resolve_effective_trail_atr_bases(
+        configured_activation_atr=3.0,
+        configured_distance_atr=2.0,
+        signal_activation_atr=1.4,
+        signal_distance_atr=1.65,
+    )
+
+    assert result['configured_activation_atr'] == 3.0
+    assert result['configured_distance_atr'] == 2.0
+    assert result['base_activation_atr'] == 3.0
+    assert result['base_distance_atr'] == 2.0
+    assert result['signal_override_applied'] is False
+
+
+def test_apply_user_configured_exit_atr_floors_blocks_overlay_tightening():
+    result = main.apply_user_configured_exit_atr_floors(
+        configured_sl_atr=1.2,
+        configured_tp_atr=1.5,
+        base_trail_activation_atr=3.0,
+        base_trail_distance_atr=2.0,
+        adjusted_sl_atr=1.08,
+        adjusted_tp_atr=1.38,
+        adjusted_trail_activation_atr=2.4,
+        adjusted_trail_distance_atr=1.6,
+    )
+
+    assert result['sl_atr'] == 1.2
+    assert result['tp_atr'] == 1.5
+    assert result['trail_activation_atr'] == 3.0
+    assert result['trail_distance_atr'] == 2.0
+    assert result['floor_applied'] is True
+
+
 def test_market_regime_rejects_invalid_btc_samples():
     detector = main.MarketRegimeDetector()
 
