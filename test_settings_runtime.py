@@ -298,6 +298,35 @@ def test_apply_user_configured_exit_atr_floors_blocks_overlay_tightening():
     assert result['floor_applied'] is True
 
 
+def test_resolve_effective_atr_value_uses_truth_snapshot_before_price_floor():
+    result = main.resolve_effective_atr_value(
+        raw_atr=0.0,
+        reference_price=100.0,
+        volatility_pct=None,
+        spread_pct=0.05,
+        truth_snapshot={'atr': 0.42},
+    )
+
+    assert result['atr'] == 0.42
+    assert result['source'] == 'truth_snapshot'
+    assert result['fallback_used'] is True
+
+
+def test_resolve_effective_atr_value_uses_nonzero_floor_when_atr_missing():
+    result = main.resolve_effective_atr_value(
+        raw_atr=0.0,
+        reference_price=100.0,
+        volatility_pct=0.0,
+        spread_pct=0.05,
+        truth_snapshot=None,
+    )
+
+    assert result['atr'] == pytest.approx(0.2)
+    assert result['source'] == 'price_floor_pct'
+    assert result['fallback_used'] is True
+    assert result['floor_pct'] == pytest.approx(0.2)
+
+
 def test_market_regime_rejects_invalid_btc_samples():
     detector = main.MarketRegimeDetector()
 

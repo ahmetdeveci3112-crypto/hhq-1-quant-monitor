@@ -8837,6 +8837,69 @@ def resolve_effective_trail_atr_bases(
     }
 
 
+def resolve_effective_atr_value(
+    raw_atr: float,
+    reference_price: float,
+    volatility_pct: float = None,
+    spread_pct: float = None,
+    truth_snapshot: dict = None,
+) -> dict:
+    """Resolve a non-zero ATR value for entry/exit distance calculations.
+
+    If upstream ATR is missing or zero, fall back to the best available runtime
+    proxy instead of collapsing into exchange cost-floor distances.
+    """
+    ref_price = max(0.0, _to_float_safe(reference_price, 0.0))
+    atr_value = max(0.0, _to_float_safe(raw_atr, 0.0))
+    vol_pct = max(0.0, _to_float_safe(volatility_pct, 0.0))
+    spr_pct = max(0.0, _to_float_safe(spread_pct, 0.0))
+    truth = truth_snapshot if isinstance(truth_snapshot, dict) else {}
+    truth_atr = max(0.0, _to_float_safe(truth.get('atr', 0.0), 0.0))
+
+    if atr_value > 0:
+        return {
+            "atr": atr_value,
+            "source": "raw_atr",
+            "fallback_used": False,
+            "floor_pct": 0.0,
+        }
+
+    if truth_atr > 0:
+        return {
+            "atr": truth_atr,
+            "source": "truth_snapshot",
+            "fallback_used": True,
+            "floor_pct": 0.0,
+        }
+
+    if ref_price > 0:
+        floor_pct = max(0.15, spr_pct * 4.0)
+        floor_atr = ref_price * (floor_pct / 100.0)
+        if vol_pct > 0:
+            vol_atr = ref_price * (vol_pct / 100.0)
+            atr_value = max(vol_atr, floor_atr)
+            source = "volatility_pct_floor" if atr_value == floor_atr and floor_atr > vol_atr else "volatility_pct"
+            return {
+                "atr": atr_value,
+                "source": source,
+                "fallback_used": True,
+                "floor_pct": round(floor_pct, 4),
+            }
+        return {
+            "atr": floor_atr,
+            "source": "price_floor_pct",
+            "fallback_used": True,
+            "floor_pct": round(floor_pct, 4),
+        }
+
+    return {
+        "atr": 0.0,
+        "source": "unavailable",
+        "fallback_used": True,
+        "floor_pct": 0.0,
+    }
+
+
 def apply_user_configured_exit_atr_floors(
     configured_sl_atr: float,
     configured_tp_atr: float,
@@ -10011,9 +10074,16 @@ def ensure_v3_runner_tp_ladder(pos: dict, default_mode: str = STRATEGY_MODE_SMAR
     entry_price = float(pos.get('entryPrice', 0.0) or 0.0)
     if entry_price <= 0:
         return False
-    atr = float(pos.get('atr', entry_price * 0.01) or (entry_price * 0.01))
+    atr_ctx = resolve_effective_atr_value(
+        pos.get('atr', 0.0),
+        entry_price,
+        volatility_pct=pos.get('volatility_pct', pos.get('volatilityPct')),
+        spread_pct=pos.get('spreadPct', 0.05),
+        truth_snapshot=pos.get('truth_snapshot'),
+    )
+    atr = float(atr_ctx['atr'] or 0.0)
     if atr <= 0:
-        atr = entry_price * 0.01
+        return False
     runner_controls = resolve_runner_exit_controls(pos, default_mode=default_mode)
     runner_split = parse_runner_close_split(
         pos.get('tpCloseSplit', ''),
@@ -21192,7 +21262,14 @@ class TimeBasedPositionManager:
         target = float(pos.get('protectionRetryPrice', 0.0) or 0.0)
         if retry_at <= 0 or target <= 0 or time.time() < retry_at:
             return
-        atr = float(pos.get('atr', 0) or 0)
+        atr_ctx = resolve_effective_atr_value(
+            pos.get('atr', 0.0),
+            current_price or float(pos.get('entryPrice', 0.0) or 0.0),
+            volatility_pct=pos.get('volatility_pct', pos.get('volatilityPct')),
+            spread_pct=pos.get('spreadPct', 0.05),
+            truth_snapshot=pos.get('truth_snapshot'),
+        )
+        atr = float(atr_ctx['atr'] or 0.0)
         tick = get_tick_size(pos.get('symbol', ''))
         safe_gap = max((atr * 0.15) if atr > 0 else 0.0, tick * 5)
         side = pos.get('side', 'LONG')
@@ -21219,7 +21296,17 @@ class TimeBasedPositionManager:
         pos.setdefault('internalProtectionOnly', False)
         pos.setdefault('lastExitDecision', '')
 
-        atr = float(pos.get('atr', current_price * 0.01) or (current_price * 0.01))
+        atr_ctx = resolve_effective_atr_value(
+            pos.get('atr', 0.0),
+            current_price or float(pos.get('entryPrice', 0.0) or 0.0),
+            volatility_pct=pos.get('volatility_pct', pos.get('volatilityPct')),
+            spread_pct=pos.get('spreadPct', 0.05),
+            truth_snapshot=pos.get('truth_snapshot'),
+        )
+        atr = float(atr_ctx['atr'] or 0.0)
+        if atr_ctx['fallback_used']:
+            pos['effectiveAtrSource'] = atr_ctx['source']
+            pos['effectiveAtrValueUsed'] = round(atr, 8)
         current_r = self._current_r_multiple(pos, current_price)
         pos['trailArmElapsedSec'] = int(max(0, now_ts - float(pos.get('trailArmSince', 0) or 0))) if pos.get('trailArmed') else 0
         await self._maybe_retry_v3_protection(pos, current_price)
@@ -29399,9 +29486,24 @@ class PaperTradingEngine:
             logger.info(f"🚫 OPEN_POS SKIP: Hedging disabled, opposite pos exists for {trade_symbol}")
             return None
         
-        # ATR fallback
+        atr_ctx = resolve_effective_atr_value(
+            atr,
+            price,
+            volatility_pct=signal.get('volatility_pct', signal.get('volatilityPct')) if signal else None,
+            spread_pct=signal.get('spreadPct', 0.05) if signal else 0.05,
+            truth_snapshot=signal.get('truth_snapshot') if signal else None,
+        )
+        atr = float(atr_ctx['atr'] or 0.0)
         if atr <= 0:
             atr = price * 0.01
+        if signal is not None:
+            signal['effectiveAtrSource'] = atr_ctx['source']
+            signal['effectiveAtrValueUsed'] = round(atr, 8)
+        if atr_ctx['fallback_used']:
+            logger.info(
+                f"📏 ATR_FALLBACK(open): {trade_symbol} {side} "
+                f"src={atr_ctx['source']} atr={atr:.8f} floor_pct={atr_ctx['floor_pct']:.3f}"
+            )
         
         # =========================================================================
         # PHASE 34: PENDING ORDER SYSTEM (PULLBACK ENTRY)
@@ -30578,7 +30680,16 @@ class PaperTradingEngine:
             # Same concept as trail TP but inverted for entries.
             # =================================================================
             trailing_entry_active = order.get('trailingEntryActive', False)
-            atr = order.get('atr', entry_price * 0.01)
+            atr_ctx = resolve_effective_atr_value(
+                order.get('atr', 0.0),
+                entry_price,
+                volatility_pct=order.get('volatility_pct', order.get('volatilityPct')),
+                spread_pct=order.get('spreadPct', 0.05),
+                truth_snapshot=order.get('truth_snapshot'),
+            )
+            atr = float(atr_ctx['atr'] or 0.0)
+            if atr <= 0:
+                atr = entry_price * 0.01
 
             if not trailing_entry_active:
                 # Step 1: Check if price reached pullback entry level
@@ -31124,7 +31235,23 @@ class PaperTradingEngine:
         
         # Recalculate SL/TP based on actual fill price
         # Apply exit_tightness for faster/slower exits
-        atr = order.get('atr', fill_price * 0.01)
+        atr_ctx = resolve_effective_atr_value(
+            order.get('atr', 0.0),
+            fill_price,
+            volatility_pct=order.get('volatility_pct', order.get('volatilityPct')),
+            spread_pct=order.get('spreadPct', 0.05),
+            truth_snapshot=order.get('truth_snapshot'),
+        )
+        atr = float(atr_ctx['atr'] or 0.0)
+        if atr <= 0:
+            atr = fill_price * 0.01
+        order['effectiveAtrSource'] = atr_ctx['source']
+        order['effectiveAtrValueUsed'] = round(atr, 8)
+        if atr_ctx['fallback_used'] and fill_price > 0:
+            logger.info(
+                f"📏 ATR_FALLBACK(exec): {symbol} {side} "
+                f"src={atr_ctx['source']} atr={atr:.8f} floor_pct={atr_ctx['floor_pct']:.3f}"
+            )
         side = order['side']
         
         # FIX #2: Dynamic ATR Multiplier (parity with open_position)
@@ -31359,6 +31486,8 @@ class PaperTradingEngine:
             "effectiveTpAtrUsed": round(adjusted_tp_atr, 4),
             "effectiveTrailActivationAtrUsed": round(adjusted_trail_activation_atr, 4),
             "effectiveTrailDistanceAtrUsed": round(adjusted_trail_distance_atr, 4),
+            "effectiveAtrSource": atr_ctx['source'],
+            "effectiveAtrValueUsed": round(atr, 8),
             # Runtime trail telemetry (updated every tick)
             "effectiveExitTightness": effective_exit_tightness,
             "runtimeTrailDistance": trail_distance,
@@ -36476,7 +36605,18 @@ async def paper_trading_update_settings(
                 continue
             
             # Use stored ATR or estimate from entry price (2% is typical ATR)
-            atr = pos.get('atr', entry_price * 0.02)
+            atr_ctx = resolve_effective_atr_value(
+                pos.get('atr', 0.0),
+                entry_price,
+                volatility_pct=pos.get('volatility_pct', pos.get('volatilityPct')),
+                spread_pct=pos.get('spreadPct', 0.05),
+                truth_snapshot=pos.get('truth_snapshot'),
+            )
+            atr = float(atr_ctx['atr'] or 0.0)
+            if atr <= 0:
+                atr = entry_price * 0.02
+            pos['effectiveAtrSource'] = atr_ctx['source']
+            pos['effectiveAtrValueUsed'] = round(atr, 8)
             side = pos.get('side', '')
             
             # Recalculate TP/SL with new exit_tightness via unified helper
