@@ -13,7 +13,7 @@ from datetime import datetime
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from main import LiveBinanceTrader  # noqa: E402
+from main import LiveBinanceTrader, get_position_cleanup_order_ids, record_position_protective_order_id  # noqa: E402
 
 
 # ─── helpers ───────────────────────────────────────────────────
@@ -577,3 +577,21 @@ async def test_44_post_close_cleanup_uses_raw_cancel_hint(trader):
 
     trader.exchange.fapiPrivateDeleteOrder.assert_awaited_once_with({'symbol': 'BTCUSDT', 'orderId': 'sl_44'})
     assert trader._recently_closed_symbols[-1][0] == 'BTCUSDT'
+
+
+def test_45_position_cleanup_order_ids_track_all_protective_orders():
+    pos = {}
+
+    record_position_protective_order_id(pos, "sl_open")
+    record_position_protective_order_id(pos, "sl_be")
+    record_position_protective_order_id(pos, "sl_open")
+
+    assert pos["exchange_sl_order_id"] == "sl_be"
+    assert pos["exchange_protective_order_ids"] == ["sl_open", "sl_be"]
+    assert get_position_cleanup_order_ids(pos) == ["sl_open", "sl_be"]
+
+
+def test_46_position_cleanup_order_ids_include_legacy_pointer():
+    pos = {"exchange_sl_order_id": "sl_live"}
+
+    assert get_position_cleanup_order_ids(pos) == ["sl_live"]

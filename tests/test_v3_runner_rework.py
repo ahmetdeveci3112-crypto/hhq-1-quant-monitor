@@ -311,3 +311,4 @@ async def test_v3_protection_retry_sets_internal_only_and_recovers(monkeypatch):
     assert pos["internalProtectionOnly"] is False
     assert pos["protectionRetryAt"] == 0
     assert pos["exchange_sl_order_id"] == "sl-1"
+    assert pos["exchange_protective_order_ids"] == ["sl-1"]

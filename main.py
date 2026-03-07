@@ -6353,6 +6353,11 @@ async def binance_position_sync_loop():
                             'lastExitDecision': bp.get('lastExitDecision', ''),
                             'runner_wide_profit_pct': _sync_wide_profit,
                             'runner_wide_age_sec': _sync_wide_age,
+                            'exchange_sl_order_id': bp.get('exchange_sl_order_id', ''),
+                            'exchange_protective_order_ids': _normalize_protective_order_ids(
+                                list(bp.get('exchange_protective_order_ids', []) or []) +
+                                [bp.get('exchange_sl_order_id')]
+                            ),
                         }
                         
                         # RHP-1A: Hydrate signal scores from DB (restart continuity)
@@ -6412,6 +6417,9 @@ async def binance_position_sync_loop():
                                 pos.setdefault('lastExitDecision', '')
                                 pos.setdefault('runner_wide_profit_pct', _sync_wide_profit)
                                 pos.setdefault('runner_wide_age_sec', _sync_wide_age)
+                                pos.setdefault('exchange_protective_order_ids', [])
+                                if bp.get('exchange_sl_order_id'):
+                                    record_position_protective_order_id(pos, bp.get('exchange_sl_order_id'))
                                 
                                 # Phase 188: Cooldown after partial close — don't overwrite size
                                 # for 30 seconds to prevent duplicate reduction orders
@@ -6683,9 +6691,7 @@ async def binance_position_sync_loop():
                     # P0 orphan fix: fire-and-forget cleanup for externally closed symbol
                     _ext_close_ts = int(datetime.now().timestamp() * 1000)
                     _ext_trace = f"SYNC_CLOSE_{symbol}_{_ext_close_ts}"
-                    _cleanup_order_ids = []
-                    if pos.get('exchange_sl_order_id'):
-                        _cleanup_order_ids.append(str(pos['exchange_sl_order_id']))
+                    _cleanup_order_ids = get_position_cleanup_order_ids(pos)
                     safe_create_task(live_binance_trader._post_close_cleanup(symbol, trace_id=_ext_trace, cleanup_order_ids=_cleanup_order_ids))
                     logger.info(f"SYNC_EXT_CLOSE_CLEANUP_START: {symbol} trace={_ext_trace}")
                 
@@ -9710,6 +9716,40 @@ def resolve_v3_runner_context_config(payload: dict = None, default_mode: str = S
 
 def format_runner_close_split(split: tuple[float, float, float, float]) -> str:
     return "/".join(f"{int(round(part * 100))}" for part in split)
+
+
+def _normalize_protective_order_ids(order_ids) -> list[str]:
+    """Return de-duplicated protective order ids as non-empty strings."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for order_id in order_ids or []:
+        if not order_id:
+            continue
+        value = str(order_id).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def record_position_protective_order_id(pos: dict, order_id) -> list[str]:
+    """Track every protective conditional order id ever created for a position."""
+    normalized = _normalize_protective_order_ids(
+        list(pos.get('exchange_protective_order_ids', []) or []) + [order_id]
+    )
+    pos['exchange_protective_order_ids'] = normalized
+    if normalized:
+        pos['exchange_sl_order_id'] = normalized[-1]
+    return normalized
+
+
+def get_position_cleanup_order_ids(pos: dict) -> list[str]:
+    """Return all known protective order ids that should be cancelled on full close."""
+    return _normalize_protective_order_ids(
+        list(pos.get('exchange_protective_order_ids', []) or []) +
+        [pos.get('exchange_sl_order_id')]
+    )
 
 
 def get_runner_exit_owner(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
@@ -20914,7 +20954,7 @@ class TimeBasedPositionManager:
         try:
             sl_result = await live_binance_trader.set_stop_loss(symbol, side, contracts, stop_price)
             if sl_result:
-                pos['exchange_sl_order_id'] = sl_result.get('id', pos.get('exchange_sl_order_id', ''))
+                record_position_protective_order_id(pos, sl_result.get('id'))
                 pos['exchange_sl_price'] = sl_result.get('stopPrice', stop_price)
                 pos['internalProtectionOnly'] = False
                 pos['protectionRetryAt'] = 0
@@ -21595,7 +21635,7 @@ class TimeBasedPositionManager:
                                             remaining_contracts = pos['contracts']
                                             sl_result = await live_binance_trader.set_stop_loss(symbol, side, remaining_contracts, breakeven_sl)
                                             if sl_result:
-                                                pos['exchange_sl_order_id'] = sl_result.get('id', pos.get('exchange_sl_order_id', ''))
+                                                record_position_protective_order_id(pos, sl_result.get('id'))
                                                 pos['exchange_sl_price'] = sl_result.get('stopPrice', breakeven_sl)
                                                 logger.warning(f"🔒 TP1_BREAKEVEN LIVE ✅: {symbol} SL set to ${breakeven_sl:.6f} on Binance")
                                             else:
@@ -30979,6 +31019,7 @@ class PaperTradingEngine:
             "lastExitDecision": "",
             "runner_wide_profit_pct": order.get('runner_wide_profit_pct', 0.20),
             "runner_wide_age_sec": order.get('runner_wide_age_sec', 600),
+            "exchange_protective_order_ids": _normalize_protective_order_ids(order.get('exchange_protective_order_ids', [])),
             # RFX-3A: Execution style propagation
             "execution_style": order.get('execution_style', EXEC_STYLE_MARKET),
             "structural_zone": order.get('structural_zone', {}),
@@ -31504,7 +31545,7 @@ class PaperTradingEngine:
                 
                 if _sl_result and _sl_result.get('id'):
                     # SUCCESS — record order ID and proceed to append
-                    new_position['exchange_sl_order_id'] = _sl_result['id']
+                    record_position_protective_order_id(new_position, _sl_result.get('id'))
                     new_position['exchange_sl_price'] = _sl_result.get('stopPrice', _sl_price)
                     self.pipeline_metrics.setdefault('sl_order_placed', 0)
                     self.pipeline_metrics['sl_order_placed'] += 1
@@ -33518,9 +33559,7 @@ class PaperTradingEngine:
             side = pos.get('side', 'LONG')
             # Phase 141: Use contracts with size fallback for consistency with Binance API
             amount = pos.get('contracts', pos.get('size', 0))
-            cleanup_order_ids = []
-            if pos.get('exchange_sl_order_id'):
-                cleanup_order_ids.append(str(pos['exchange_sl_order_id']))
+            cleanup_order_ids = get_position_cleanup_order_ids(pos)
             
             if pos.get('_already_closed_on_exchange', False):
                 logger.info(
@@ -36879,7 +36918,7 @@ async def paper_trading_close(position_id: str):
                     side=side,
                     amount=amount,
                     trace_id=trace_id,
-                    cleanup_order_ids=[str(pos['exchange_sl_order_id'])] if pos.get('exchange_sl_order_id') else None,
+                    cleanup_order_ids=get_position_cleanup_order_ids(pos),
                 )
                 if binance_close:
                     fill_price = float(binance_close.get('average') or binance_close.get('price') or 0)
