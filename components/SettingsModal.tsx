@@ -26,7 +26,7 @@ interface Props {
   onHyperoptRun?: (nTrials?: number, apply?: boolean, forceApply?: boolean) => void;
   onHyperoptSettings?: (s: any) => void;
   onForceApplyLast?: () => void;
-  settingsSnapshot?: { zScoreThreshold?: number; minConfidenceScore?: number; entryTightness?: number; exitTightness?: number; stopLossAtr?: number; takeProfit?: number; trailActivationAtr?: number; trailDistanceAtr?: number };
+  settingsSnapshot?: { zScoreThreshold?: number; minConfidenceScore?: number; entryTightness?: number; exitTightness?: number; stopLossAtr?: number; takeProfit?: number; trailActivationAtr?: number; trailDistanceAtr?: number; leverage?: number; atrPct?: number };
   apiUrl?: string;
 }
 
@@ -76,6 +76,10 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
       });
     }
   }, [phase193Status?.ml_governance?.auto_promote, phase193Status?.ml_governance?.auto_rollback]);
+
+  const previewLeverage = Number(settingsSnapshot?.leverage ?? localSettings.leverage ?? 10);
+  const previewAtrPct = Number(settingsSnapshot?.atrPct ?? 2.0);
+  const roiPreview = (atrMult: number) => (previewAtrPct * atrMult * Math.max(1, previewLeverage)).toFixed(1);
 
   const handleGovernanceToggle = useCallback(async (field: 'auto_promote' | 'auto_rollback', newValue: boolean) => {
     if (!apiUrl) return;
@@ -597,28 +601,81 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
 
             <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 space-y-4">
               <p className="text-[10px] text-slate-500 mb-3">
-                🛡️ Pozisyon başına zarar limitleri. Kaldıraca göre dinamik olarak ayarlanır (yüksek kaldıraç = daha sıkı limitler).
+                🛡️ Pozisyon başına kaldıraçlı ROI zarar limitleri. Eşikler artık doğrudan ROI bazlıdır; ayrıca kaldıraçla yeniden ölçeklenmez.
               </p>
+
+              <div className="rounded-lg border border-slate-700/50 bg-slate-900/40 p-3 space-y-3">
+                <div className="text-[10px] uppercase tracking-wider text-slate-400">Entry Stop Gate</div>
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="text-sm text-slate-300">Soft Band</label>
+                    <span className="text-sm font-mono text-amber-300">
+                      %{localSettings.entryStopSoftRoiPct ?? -200}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-250"
+                    max="-80"
+                    step="10"
+                    value={localSettings.entryStopSoftRoiPct ?? -200}
+                    onChange={e => setLocalSettings({ ...localSettings, entryStopSoftRoiPct: parseInt(e.target.value) })}
+                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                    <span>-250% (Çok Geniş)</span>
+                    <span>-80% (Sıkı)</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Stop ROI bu bandı aşarsa giriş küçültülür, skor ve exec eşiği sıkılaşır
+                  </p>
+                </div>
+
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="text-sm text-slate-300">Hard Band</label>
+                    <span className="text-sm font-mono text-rose-300">
+                      %{localSettings.entryStopHardRoiPct ?? -250}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-320"
+                    max="-120"
+                    step="10"
+                    value={localSettings.entryStopHardRoiPct ?? -250}
+                    onChange={e => setLocalSettings({ ...localSettings, entryStopHardRoiPct: parseInt(e.target.value) })}
+                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-400"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                    <span>-320% (Çok Geniş)</span>
+                    <span>-120% (Sıkı)</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Planlanan teknik stop bu sınırın altındaysa pozisyon hiç açılmaz
+                  </p>
+                </div>
+              </div>
 
               {/* First Reduction Threshold */}
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <label className="text-sm text-slate-300">İlk Azaltma Eşiği</label>
                   <span className="text-sm font-mono text-orange-400">
-                    %{localSettings.killSwitchFirstReduction || -70}
+                    %{localSettings.killSwitchFirstReduction || -100}
                   </span>
                 </div>
                 <input
                   type="range"
-                  min="-100"
+                  min="-200"
                   max="-30"
                   step="10"
-                  value={localSettings.killSwitchFirstReduction || -70}
+                  value={localSettings.killSwitchFirstReduction || -100}
                   onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-100% (Gevşek)</span>
+                  <span>-200% (Gevşek)</span>
                   <span>-30% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
@@ -636,7 +693,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                 </div>
                 <input
                   type="range"
-                  min="-200"
+                  min="-250"
                   max="-80"
                   step="10"
                   value={localSettings.killSwitchFullClose || -150}
@@ -644,17 +701,17 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
                 />
                 <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-200% (Gevşek)</span>
+                  <span>-250% (Gevşek)</span>
                   <span>-80% (Sıkı)</span>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Pozisyon bu zarara ulaşınca tamamen kapatılır
+                  Teknik stop hard bandın ötesine taşıyorsa bu ROI seviyesinde tamamen kapatılır
                 </p>
               </div>
 
               {/* Dynamic Threshold Info */}
               <div className="bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
-                <span className="text-amber-400">⚡ Dinamik Eşikler:</span> Yüksek kaldıraçlı pozisyonlar (75x+) için eşikler otomatik olarak sıkılaştırılır
+                <span className="text-amber-400">⚡ ROI Standardı:</span> Açık pozisyon koruması ve UI yüzdeleri kaldıraçlı ROI üzerinden yorumlanır
               </div>
             </div>
           </div>
@@ -797,6 +854,11 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                   <span className="text-slate-500 text-xs ml-2">%</span>
                 </div>
               </div>
+            </div>
+            <div className="mt-3 bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
+              <div className="text-slate-300 font-medium mb-1">Yaklaşık ROI Önizleme</div>
+              <div>SL {roiPreview(localSettings.stopLossAtr)}% • TP {roiPreview(localSettings.takeProfit)}% • Trail Akt {roiPreview(localSettings.trailActivationAtr)}% • Trail Mesafe {roiPreview(localSettings.trailDistanceAtr)}%</div>
+              <div className="text-slate-500 mt-1">Hesap: ATR snapshot ~ %{previewAtrPct.toFixed(2)} • lev {previewLeverage}x</div>
             </div>
           </div>
 

@@ -18,6 +18,8 @@ import json
 import logging
 import math
 import os
+import shutil
+import sqlite3
 import time
 import uuid
 import websockets
@@ -42,6 +44,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 LIVE_START_BALANCE_USD = float(os.getenv("LIVE_START_BALANCE_USD", "100"))
+ANALYTICS_DB_SCHEMA_VERSION = 2
+ANALYTICS_DB_RESET_REASON = "analytics_first_trade_storage_v2"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -50,6 +54,210 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _json_dumps_safe(value: Any, fallback: str = "{}") -> str:
+    """Serialize values for SQLite JSON columns without raising."""
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=True)
+    except Exception:
+        return fallback
+
+
+def _json_loads_safe(value: Any, fallback: Any = None) -> Any:
+    """Parse JSON-ish values safely for API serialization."""
+    if fallback is None:
+        fallback = {}
+    if value in (None, "", "null"):
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def _reason_group_from_reason(reason: str) -> str:
+    """Cross-strategy analytics bucket for close reasons."""
+    upper = str(reason or "").upper()
+    if upper.startswith("SLIPPAGE_EXIT("):
+        upper = upper.replace("SLIPPAGE_EXIT(", "").rstrip(")")
+    if "ENTRY_STOP_TOO_WIDE" in upper or "SIGNAL_INVALIDATION" in upper:
+        return "SIGNAL"
+    if "REGIME_DETERIORATION" in upper:
+        return "REGIME"
+    if "EXECUTION_RISK" in upper:
+        return "EXEC"
+    if "FUNDING_DECAY" in upper:
+        return "CARRY"
+    if "TIME_RECOVERY" in upper:
+        return "TIME"
+    if "BREAKEVEN" in upper or "RECLAIM_BE" in upper:
+        return "BREAKEVEN"
+    if "PROFIT_GIVEBACK" in upper:
+        return "GIVEBACK"
+    if any(token in upper for token in ("TP1_PARTIAL", "TP2_PARTIAL", "TP3_PARTIAL", "TP_FINAL_HIT")):
+        return "TP"
+    if any(token in upper for token in ("TRAIL_WIDE_EXIT", "TRAIL_NORMAL_EXIT", "TRAIL_TIGHT_EXIT")):
+        return "TRAIL"
+    if "PRE_STOP_REDUCE" in upper:
+        return "KILL"
+    if "RECOVERY" in upper:
+        return "RECOVERY"
+    if "KILL" in upper:
+        return "KILL"
+    if "TRAIL" in upper:
+        return "TRAIL"
+    if "TIME" in upper:
+        return "TIME"
+    if "MANUAL" in upper:
+        return "MANUAL"
+    if "TP" in upper:
+        return "TP"
+    if "SL" in upper or "STOP" in upper or "EMERGENCY" in upper:
+        return "SL"
+    return "OTHER"
+
+
+def _canonical_reason_core(reason: str, original_reason: str = "") -> str:
+    """Stable strategy-local reason code without the strategy prefix."""
+    raw = str(original_reason or reason or "OTHER").strip()
+    upper = raw.upper()
+    if upper.startswith("SLIPPAGE_EXIT("):
+        upper = upper.replace("SLIPPAGE_EXIT(", "").rstrip(")")
+    if "ENTRY_STOP_TOO_WIDE" in upper:
+        return "ENTRY_STOP_TOO_WIDE"
+    if "SIGNAL_INVALIDATION_REDUCE" in upper:
+        return "SIGNAL_INVALIDATION_REDUCE"
+    if "REGIME_DETERIORATION_REDUCE" in upper:
+        return "REGIME_DETERIORATION_REDUCE"
+    if "EXECUTION_RISK_REDUCE" in upper:
+        return "EXECUTION_RISK_REDUCE"
+    if "FUNDING_DECAY_REDUCE" in upper:
+        return "FUNDING_DECAY_REDUCE"
+    if "TIME_RECOVERY_STAGE1" in upper:
+        return "TIME_RECOVERY_STAGE1"
+    if "TIME_RECOVERY_STAGE2" in upper:
+        return "TIME_RECOVERY_STAGE2"
+    if "TP1_PARTIAL" in upper:
+        return "TP1_PARTIAL"
+    if "TP2_PARTIAL" in upper:
+        return "TP2_PARTIAL"
+    if "TP3_PARTIAL" in upper:
+        return "TP3_PARTIAL"
+    if "TP_FINAL_HIT" in upper:
+        return "TP_FINAL_HIT"
+    if "TRAIL_WIDE_EXIT" in upper:
+        return "TRAIL_WIDE_EXIT"
+    if "TRAIL_NORMAL_EXIT" in upper:
+        return "TRAIL_NORMAL_EXIT"
+    if "TRAIL_TIGHT_EXIT" in upper:
+        return "TRAIL_TIGHT_EXIT"
+    if "PROFIT_GIVEBACK_EXIT" in upper:
+        return "PROFIT_GIVEBACK_EXIT"
+    if "RECLAIM_BE_CLOSE" in upper:
+        return "RECLAIM_BE_CLOSE"
+    if "PRE_STOP_REDUCE" in upper:
+        return "PRE_STOP_REDUCE"
+    if "RECOVERY_REDUCE_STAGE1" in upper:
+        return "RECOVERY_REDUCE_STAGE1"
+    if "RECOVERY_REDUCE_STAGE2" in upper:
+        return "RECOVERY_REDUCE_STAGE2"
+    if "RECOVERY_TRAIL_CLOSE" in upper:
+        return "RECOVERY_TRAIL_CLOSE"
+    if "RECOVERY_EXIT" in upper:
+        return "RECOVERY_EXIT"
+    if "EMERGENCY" in upper:
+        return "EMERGENCY_SL"
+    if "BREAKEVEN" in upper:
+        return "BREAKEVEN_CLOSE"
+    if "KILL_SWITCH_FULL" in upper:
+        return "KILL_SWITCH_FULL"
+    if "KILL" in upper:
+        return "KILL_SWITCH"
+    if "TRAIL" in upper:
+        return "TRAIL_EXIT"
+    if "TIME_REDUCE_4H" in upper:
+        return "TIME_REDUCE_4H"
+    if "TIME_REDUCE_8H" in upper:
+        return "TIME_REDUCE_8H"
+    if "TIME" in upper:
+        return "TIME_EXIT"
+    if "TP" in upper:
+        return "TP_HIT"
+    if "SL" in upper or "STOP" in upper:
+        return "SL_HIT"
+    if "MANUAL" in upper:
+        return "MANUAL_CLOSE"
+    return "OTHER"
+
+
+def _reason_source_from_reason(reason: str, original_reason: str = "", default: str = "engine") -> str:
+    """Track whether the persisted reason came from engine, inference, sync, etc."""
+    raw = str(reason or "")
+    upper = raw.upper()
+    if "SYNCED FROM BINANCE" in upper or "HISTORICAL (FROM BINANCE)" in upper:
+        return "binance_sync"
+    if "INFERRED" in upper:
+        return "inferred"
+    if "MANUAL" in upper:
+        return "manual"
+    if raw and raw != original_reason and raw.startswith("SLIPPAGE_EXIT("):
+        return "post_fill_norm"
+    return default
+
+
+def _build_reason_fields(
+    strategy_mode: str,
+    reason: str,
+    original_reason: str = "",
+    reason_detail: str = "",
+    reason_source: str = "",
+) -> Dict[str, str]:
+    """Return canonical persisted reason fields."""
+    safe_mode = str(strategy_mode or "LEGACY").upper()
+    core = _canonical_reason_core(reason, original_reason)
+    group = _reason_group_from_reason(original_reason or reason)
+    source = reason_source or _reason_source_from_reason(reason, original_reason, default="engine")
+    detail = str(reason_detail or reason or original_reason or core)
+    return {
+        "reason_code": f"{safe_mode}__{core}",
+        "reason_group": group,
+        "reason_source": source,
+        "reason_detail": detail,
+    }
+
+
+def _legacy_close_reason_from_fields(reason_code: str, reason_group: str) -> str:
+    """Compatibility alias for older API consumers expecting normalized enums."""
+    code = str(reason_code or "").upper()
+    group = str(reason_group or "OTHER").upper()
+    if "EMERGENCY" in code:
+        return "EMERGENCY_SL"
+    if group == "TP":
+        return "TP_HIT"
+    if group == "SL":
+        return "SL_HIT"
+    if group == "BREAKEVEN":
+        return "BREAKEVEN_CLOSE"
+    if group == "TRAIL":
+        return "TRAIL_EXIT"
+    if group == "GIVEBACK":
+        return "TRAIL_EXIT"
+    if group == "RECOVERY":
+        return "RECOVERY_EXIT"
+    if group == "TIME":
+        return "TIMEOUT_EXIT"
+    if group == "KILL":
+        return "KILL_SWITCH"
+    if group == "MANUAL":
+        return "MANUAL_CLOSE"
+    return "OTHER"
 
 # Phase 193: pandas-ta for enhanced technical indicators
 try:
@@ -103,17 +311,99 @@ class SQLiteManager:
                 logger.info("📁 Using local SQLite: trading.db")
         self.db_path = db_path
         self._initialized = False
-    
+        self._last_archive_path = ""
+        self._last_reset_reason = ""
+
+    def _archive_path_for_reset(self) -> str:
+        """Return timestamped archive path for the current DB."""
+        archive_dir = os.path.join(os.path.dirname(self.db_path) or ".", "archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return os.path.join(archive_dir, f"trading-{stamp}.db")
+
+    def _read_schema_version_sync(self) -> int:
+        """Read schema version from db_meta if available."""
+        if not os.path.exists(self.db_path):
+            return 0
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='db_meta'"
+            ).fetchone()
+            if not row:
+                return 0
+            meta = conn.execute(
+                "SELECT value FROM db_meta WHERE key='schema_version' LIMIT 1"
+            ).fetchone()
+            return int(meta[0]) if meta and meta[0] is not None else 0
+        except Exception:
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
+    def _should_archive_and_reset_sync(self) -> bool:
+        """Detect if an old analytics DB should be archived and rebuilt."""
+        if not os.path.exists(self.db_path):
+            return False
+        current_version = self._read_schema_version_sync()
+        if current_version >= ANALYTICS_DB_SCHEMA_VERSION:
+            return False
+
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            tables = ("trades", "signals", "position_closes", "binance_trades")
+            for table in tables:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                if not row:
+                    continue
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if count > 0:
+                    return True
+            return False
+        except Exception:
+            # If the DB cannot even be inspected cleanly, rebuild it.
+            return True
+        finally:
+            if conn:
+                conn.close()
+
+    async def _archive_and_reset_db_if_needed(self):
+        """Archive old analytics DB once before initializing the new schema."""
+        if not self._should_archive_and_reset_sync():
+            return
+        archive_path = self._archive_path_for_reset()
+        shutil.copy2(self.db_path, archive_path)
+        os.remove(self.db_path)
+        self._last_archive_path = archive_path
+        self._last_reset_reason = ANALYTICS_DB_RESET_REASON
+        logger.warning(
+            f"🗃️ ANALYTICS_DB_RESET: archived legacy DB to {archive_path} "
+            f"(reason={ANALYTICS_DB_RESET_REASON}, version={ANALYTICS_DB_SCHEMA_VERSION})"
+        )
+
     async def init_db(self):
         """Initialize database tables."""
         if self._initialized:
             return
-        
+
+        await self._archive_and_reset_db_if_needed()
+
         async with aiosqlite.connect(self.db_path) as db:
             # Trades table
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id TEXT PRIMARY KEY,
+                    trade_id TEXT UNIQUE,
+                    signal_id TEXT,
+                    position_id TEXT,
+                    entry_order_id TEXT,
+                    close_order_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     entry_price REAL NOT NULL,
@@ -122,15 +412,62 @@ class SQLiteManager:
                     size_usd REAL NOT NULL,
                     pnl REAL,
                     pnl_percent REAL,
+                    margin_usd REAL DEFAULT 0,
                     open_time INTEGER NOT NULL,
                     close_time INTEGER,
+                    signal_ts INTEGER,
+                    entry_ts INTEGER,
+                    exit_ts INTEGER,
                     close_reason TEXT,
+                    reason_code TEXT DEFAULT '',
+                    reason_group TEXT DEFAULT 'OTHER',
+                    reason_source TEXT DEFAULT 'engine',
+                    reason_detail TEXT DEFAULT '',
                     leverage INTEGER DEFAULT 10,
                     signal_score INTEGER DEFAULT 0,
                     signal_score_raw INTEGER DEFAULT 0,
                     mtf_score INTEGER DEFAULT 0,
                     z_score REAL DEFAULT 0,
+                    obi_value REAL DEFAULT 0,
+                    settings_snapshot TEXT DEFAULT '{}',
+                    stop_loss REAL DEFAULT 0,
+                    take_profit REAL DEFAULT 0,
+                    hurst REAL DEFAULT 0.5,
+                    atr REAL DEFAULT 0,
+                    adx REAL DEFAULT 0,
+                    trailing_stop REAL DEFAULT 0,
+                    trail_activation REAL DEFAULT 0,
+                    is_trailing_active INTEGER DEFAULT 0,
+                    margin REAL DEFAULT 0,
+                    roi REAL DEFAULT 0,
+                    is_live INTEGER DEFAULT 0,
                     spread_level TEXT DEFAULT 'unknown',
+                    entry_spread REAL DEFAULT 0,
+                    entry_slippage REAL DEFAULT 0,
+                    exit_slippage REAL DEFAULT 0,
+                    binance_fill_price REAL DEFAULT 0,
+                    binance_order_id TEXT,
+                    pullback_pct REAL DEFAULT 0,
+                    close_metrics_json TEXT DEFAULT '{}',
+                    pnl_gross REAL DEFAULT 0,
+                    fee_cost REAL DEFAULT 0,
+                    slippage_cost REAL DEFAULT 0,
+                    funding_cost REAL DEFAULT 0,
+                    pnl_signal_alpha REAL DEFAULT 0,
+                    pnl_execution_alpha REAL DEFAULT 0,
+                    pnl_timing_alpha REAL DEFAULT 0,
+                    attribution_json TEXT DEFAULT '{}',
+                    strategy_mode TEXT DEFAULT 'LEGACY',
+                    execution_profile_source TEXT DEFAULT 'neutral',
+                    entry_method TEXT DEFAULT 'MARKET',
+                    exit_owner TEXT DEFAULT '',
+                    signal_snapshot_json TEXT DEFAULT '{}',
+                    exec_snapshot_json TEXT DEFAULT '{}',
+                    risk_snapshot_json TEXT DEFAULT '{}',
+                    close_snapshot_json TEXT DEFAULT '{}',
+                    settings_snapshot_json TEXT DEFAULT '{}',
+                    reason_context_json TEXT DEFAULT '{}',
+                    trade_schema_version INTEGER DEFAULT 2,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -140,6 +477,15 @@ class SQLiteManager:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS db_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -184,6 +530,7 @@ class SQLiteManager:
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id TEXT UNIQUE,
                     symbol TEXT NOT NULL,
                     action TEXT NOT NULL,
                     price REAL NOT NULL,
@@ -191,7 +538,10 @@ class SQLiteManager:
                     hurst REAL,
                     atr REAL,
                     signal_score INTEGER,
+                    signal_score_raw INTEGER DEFAULT 0,
                     htf_trend TEXT,
+                    strategy_mode TEXT DEFAULT 'LEGACY',
+                    execution_profile_source TEXT DEFAULT 'neutral',
                     mtf_confirmed INTEGER,
                     mtf_reason TEXT,
                     blacklisted INTEGER DEFAULT 0,
@@ -201,6 +551,13 @@ class SQLiteManager:
                     min_confidence REAL,
                     entry_tightness REAL,
                     exit_tightness REAL,
+                    telemetry_json TEXT DEFAULT '{}',
+                    entry_quality_json TEXT DEFAULT '{}',
+                    risk_gate_json TEXT DEFAULT '{}',
+                    signal_context_json TEXT DEFAULT '{}',
+                    obi_value REAL DEFAULT 0,
+                    truth_snapshot_json TEXT DEFAULT '{}',
+                    regime_adjustment TEXT DEFAULT '',
                     timestamp INTEGER NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -210,6 +567,7 @@ class SQLiteManager:
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS positions (
                     id TEXT PRIMARY KEY,
+                    signal_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     entry_price REAL NOT NULL,
@@ -225,6 +583,14 @@ class SQLiteManager:
                     hurst REAL,
                     atr REAL,
                     htf_trend TEXT,
+                    margin_usd REAL DEFAULT 0,
+                    truth_snapshot_json TEXT DEFAULT '{}',
+                    regime_adjustment TEXT DEFAULT '',
+                    strategy_mode TEXT DEFAULT 'LEGACY',
+                    execution_profile_source TEXT DEFAULT 'neutral',
+                    signal_snapshot_json TEXT DEFAULT '{}',
+                    exec_snapshot_json TEXT DEFAULT '{}',
+                    risk_snapshot_json TEXT DEFAULT '{}',
                     status TEXT DEFAULT 'OPEN',
                     close_time INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -261,6 +627,10 @@ class SQLiteManager:
                 CREATE TABLE IF NOT EXISTS binance_trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     income_id TEXT UNIQUE,
+                    trade_id TEXT,
+                    signal_id TEXT,
+                    position_id TEXT,
+                    close_order_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT,
                     entry_price REAL,
@@ -271,6 +641,10 @@ class SQLiteManager:
                     leverage INTEGER,
                     size_usd REAL,
                     close_reason TEXT,
+                    reason_code TEXT DEFAULT '',
+                    reason_group TEXT DEFAULT 'OTHER',
+                    reason_source TEXT DEFAULT 'binance_sync',
+                    reason_detail TEXT DEFAULT '',
                     close_time INTEGER NOT NULL,
                     raw_data TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -281,10 +655,15 @@ class SQLiteManager:
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS position_closes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     original_reason TEXT,
+                    reason_code TEXT DEFAULT '',
+                    reason_group TEXT DEFAULT 'OTHER',
+                    reason_source TEXT DEFAULT 'engine',
+                    reason_detail TEXT DEFAULT '',
                     entry_price REAL,
                     exit_price REAL,
                     pnl REAL,
@@ -297,6 +676,7 @@ class SQLiteManager:
                     mae_pct REAL DEFAULT 0,
                     mfe_pct REAL DEFAULT 0,
                     decision_trace TEXT DEFAULT '[]',
+                    decision_trace_json TEXT DEFAULT '[]',
                     stop_loss REAL DEFAULT 0,
                     take_profit REAL DEFAULT 0,
                     atr REAL DEFAULT 0,
@@ -312,6 +692,11 @@ class SQLiteManager:
                     binance_fill_price REAL DEFAULT 0,
                     hurst REAL DEFAULT 0.5,
                     trade_id TEXT,
+                    position_id TEXT,
+                    strategy_mode TEXT DEFAULT 'LEGACY',
+                    execution_profile_source TEXT DEFAULT 'neutral',
+                    risk_snapshot_json TEXT DEFAULT '{}',
+                    exec_snapshot_json TEXT DEFAULT '{}',
                     entry_order_id TEXT,
                     close_order_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -629,6 +1014,140 @@ class SQLiteManager:
                         await db.execute(f'ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}')
                     except:
                         pass
+
+            analytics_trade_columns = [
+                ('trade_id', 'TEXT'),
+                ('signal_id', 'TEXT'),
+                ('position_id', 'TEXT'),
+                ('entry_order_id', 'TEXT'),
+                ('close_order_id', 'TEXT'),
+                ('signal_ts', 'INTEGER'),
+                ('entry_ts', 'INTEGER'),
+                ('exit_ts', 'INTEGER'),
+                ('strategy_mode', "TEXT DEFAULT 'LEGACY'"),
+                ('execution_profile_source', "TEXT DEFAULT 'neutral'"),
+                ('exit_owner', "TEXT DEFAULT ''"),
+                ('reason_code', "TEXT DEFAULT ''"),
+                ('reason_group', "TEXT DEFAULT 'OTHER'"),
+                ('reason_source', "TEXT DEFAULT 'engine'"),
+                ('reason_detail', "TEXT DEFAULT ''"),
+                ('signal_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('exec_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('risk_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('close_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('settings_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('reason_context_json', "TEXT DEFAULT '{}'"),
+                ('trade_schema_version', 'INTEGER DEFAULT 2'),
+            ]
+            for col_name, col_type in analytics_trade_columns:
+                try:
+                    await db.execute(f'ALTER TABLE trades ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+
+            analytics_signal_columns = [
+                ('signal_id', 'TEXT'),
+                ('signal_score_raw', 'INTEGER DEFAULT 0'),
+                ('strategy_mode', "TEXT DEFAULT 'LEGACY'"),
+                ('execution_profile_source', "TEXT DEFAULT 'neutral'"),
+                ('telemetry_json', "TEXT DEFAULT '{}'"),
+                ('entry_quality_json', "TEXT DEFAULT '{}'"),
+                ('risk_gate_json', "TEXT DEFAULT '{}'"),
+                ('signal_context_json', "TEXT DEFAULT '{}'"),
+            ]
+            for col_name, col_type in analytics_signal_columns:
+                try:
+                    await db.execute(f'ALTER TABLE signals ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+
+            analytics_position_columns = [
+                ('signal_id', 'TEXT'),
+                ('strategy_mode', "TEXT DEFAULT 'LEGACY'"),
+                ('execution_profile_source', "TEXT DEFAULT 'neutral'"),
+                ('signal_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('exec_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('risk_snapshot_json', "TEXT DEFAULT '{}'"),
+            ]
+            for col_name, col_type in analytics_position_columns:
+                try:
+                    await db.execute(f'ALTER TABLE positions ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+
+            analytics_pc_columns = [
+                ('signal_id', 'TEXT'),
+                ('reason_code', "TEXT DEFAULT ''"),
+                ('reason_group', "TEXT DEFAULT 'OTHER'"),
+                ('reason_source', "TEXT DEFAULT 'engine'"),
+                ('reason_detail', "TEXT DEFAULT ''"),
+                ('decision_trace_json', "TEXT DEFAULT '[]'"),
+                ('position_id', 'TEXT'),
+                ('strategy_mode', "TEXT DEFAULT 'LEGACY'"),
+                ('execution_profile_source', "TEXT DEFAULT 'neutral'"),
+                ('risk_snapshot_json', "TEXT DEFAULT '{}'"),
+                ('exec_snapshot_json', "TEXT DEFAULT '{}'"),
+            ]
+            for col_name, col_type in analytics_pc_columns:
+                try:
+                    await db.execute(f'ALTER TABLE position_closes ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+
+            analytics_bt_columns = [
+                ('trade_id', 'TEXT'),
+                ('signal_id', 'TEXT'),
+                ('position_id', 'TEXT'),
+                ('close_order_id', 'TEXT'),
+                ('reason_code', "TEXT DEFAULT ''"),
+                ('reason_group', "TEXT DEFAULT 'OTHER'"),
+                ('reason_source', "TEXT DEFAULT 'binance_sync'"),
+                ('reason_detail', "TEXT DEFAULT ''"),
+            ]
+            for col_name, col_type in analytics_bt_columns:
+                try:
+                    await db.execute(f'ALTER TABLE binance_trades ADD COLUMN {col_name} {col_type}')
+                except:
+                    pass
+
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_trade_id ON trades(trade_id) WHERE trade_id IS NOT NULL AND trade_id != ""')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_close_order_id ON trades(close_order_id) WHERE close_order_id IS NOT NULL AND close_order_id != ""')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_trades_position_exit ON trades(position_id, exit_ts DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol_exit ON trades(symbol, exit_ts DESC)')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_signal_id ON signals(signal_id) WHERE signal_id IS NOT NULL AND signal_id != ""')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_position_closes_trade_id ON position_closes(trade_id) WHERE trade_id IS NOT NULL AND trade_id != ""')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_position_closes_close_oid ON position_closes(close_order_id) WHERE close_order_id IS NOT NULL AND close_order_id != ""')
+
+            await db.execute(
+                '''
+                INSERT INTO db_meta (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                ''',
+                ('schema_version', str(ANALYTICS_DB_SCHEMA_VERSION)),
+            )
+            await db.execute(
+                '''
+                INSERT INTO db_meta (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                ''',
+                ('reset_reason', ANALYTICS_DB_RESET_REASON),
+            )
+            await db.execute(
+                '''
+                INSERT INTO db_meta (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                ''',
+                ('archive_path', self._last_archive_path or ''),
+            )
             await db.commit()
             self._initialized = True
             logger.info("✅ SQLite database initialized with all tables")
@@ -669,97 +1188,182 @@ class SQLiteManager:
         Default/empty values (0, 'unknown', '') will NOT overwrite existing rich data.
         Only richer values replace existing ones."""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT INTO trades 
-                (id, symbol, side, entry_price, exit_price, size, size_usd, pnl, pnl_percent, 
-                 open_time, close_time, close_reason, leverage, signal_score, signal_score_raw, mtf_score, z_score, 
-                 spread_level, settings_snapshot,
-                 stop_loss, take_profit, atr, trailing_stop, trail_activation, is_trailing_active,
-                 margin, roi, is_live, entry_method, entry_slippage, exit_slippage, entry_spread, 
-                 binance_fill_price, binance_order_id, hurst, adx, pullback_pct, close_metrics_json,
-                 margin_usd)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            trade_id = trade.get('tradeId') or trade.get('trade_id') or trade.get('id')
+            if not trade_id:
+                trade_id = f"TRADE_{trade.get('symbol', 'UNKNOWN')}_{trade.get('closeTime', trade.get('close_time', int(datetime.now().timestamp() * 1000)))}"
+            strategy_mode = normalize_strategy_mode(
+                trade.get('strategyMode', trade.get('strategy_mode', STRATEGY_MODE_LEGACY))
+            )
+            raw_reason = trade.get('reason', trade.get('closeReason', trade.get('close_reason', 'Closed')))
+            original_reason = trade.get('original_reason', trade.get('originalReason', raw_reason))
+            reason_fields = _build_reason_fields(
+                strategy_mode=strategy_mode,
+                reason=raw_reason,
+                original_reason=original_reason,
+                reason_detail=trade.get('reasonDetail', trade.get('reason_detail', trade.get('closeReason', raw_reason))),
+                reason_source=trade.get('reasonSource', trade.get('reason_source', '')),
+            )
+            close_metrics_json = trade.get('close_metrics_json', '{}')
+            close_snapshot = trade.get('closeSnapshot')
+            if not close_snapshot:
+                close_snapshot = _json_loads_safe(close_metrics_json, {})
+
+            payload = {
+                'id': trade_id,
+                'trade_id': trade_id,
+                'signal_id': trade.get('signalId', trade.get('signal_id', '')),
+                'position_id': trade.get('positionId', trade.get('position_id', trade_id if str(trade_id).startswith('POS_') else '')),
+                'entry_order_id': trade.get('entryOrderId', trade.get('entry_order_id', trade.get('binance_order_id', ''))),
+                'close_order_id': trade.get('closeOrderId', trade.get('close_order_id', '')),
+                'symbol': trade.get('symbol'),
+                'side': trade.get('side'),
+                'entry_price': trade.get('entryPrice', trade.get('entry_price', 0)),
+                'exit_price': trade.get('exitPrice', trade.get('exit_price', 0)),
+                'size': trade.get('size', 0),
+                'size_usd': trade.get('sizeUsd', trade.get('size_usd', 0)),
+                'pnl': trade.get('pnl'),
+                'pnl_percent': trade.get('pnlPercent', trade.get('pnl_percent', 0)),
+                'open_time': trade.get('openTime', trade.get('open_time', 0)),
+                'close_time': trade.get('closeTime', trade.get('close_time')),
+                'signal_ts': trade.get('signalTs', trade.get('signal_ts', trade.get('openTime', trade.get('open_time', 0)))),
+                'entry_ts': trade.get('entryTs', trade.get('entry_ts', trade.get('openTime', trade.get('open_time', 0)))),
+                'exit_ts': trade.get('exitTs', trade.get('exit_ts', trade.get('closeTime', trade.get('close_time', 0)))),
+                'close_reason': reason_fields['reason_detail'],
+                'reason_code': reason_fields['reason_code'],
+                'reason_group': reason_fields['reason_group'],
+                'reason_source': reason_fields['reason_source'],
+                'reason_detail': reason_fields['reason_detail'],
+                'leverage': trade.get('leverage', 10),
+                'signal_score': trade.get('signalScore', trade.get('signal_score', 0)),
+                'signal_score_raw': trade.get('signalScoreRaw', trade.get('signal_score_raw', trade.get('signalScore', 0))),
+                'mtf_score': trade.get('mtfScore', trade.get('mtf_score', 0)),
+                'z_score': trade.get('zScore', trade.get('z_score', 0)),
+                'spread_level': trade.get('spreadLevel', trade.get('spread_level', 'unknown')),
+                'settings_snapshot': _json_dumps_safe(trade.get('settingsSnapshot', trade.get('settings_snapshot', {}))),
+                'stop_loss': trade.get('stopLoss', trade.get('stop_loss', 0)),
+                'take_profit': trade.get('takeProfit', trade.get('take_profit', 0)),
+                'atr': trade.get('atr', 0),
+                'trailing_stop': trade.get('trailingStop', trade.get('trailing_stop', 0)),
+                'trail_activation': trade.get('trailActivation', trade.get('trail_activation', 0)),
+                'is_trailing_active': 1 if trade.get('isTrailingActive', False) else 0,
+                'margin': trade.get('margin', trade.get('marginUsd', trade.get('margin_usd', 0))),
+                'roi': trade.get('roi', trade.get('pnlPercent', 0)),
+                'is_live': 1 if trade.get('isLive', trade.get('is_live', False)) else 0,
+                'entry_method': trade.get('entry_method', trade.get('entryMethod', 'MARKET')),
+                'entry_slippage': trade.get('entry_slippage', trade.get('entrySlippage', 0)),
+                'exit_slippage': trade.get('exit_slippage', trade.get('exitSlippage', 0)),
+                'entry_spread': trade.get('entry_spread', trade.get('entrySpread', 0)),
+                'binance_fill_price': trade.get('binance_fill_price', trade.get('binanceFillPrice', 0)),
+                'binance_order_id': trade.get('binance_order_id', trade.get('binanceOrderId', '')),
+                'hurst': trade.get('hurst', 0.5),
+                'adx': trade.get('adx', 0),
+                'pullback_pct': trade.get('pullbackPct', trade.get('pullback_pct', 0)),
+                'close_metrics_json': _json_dumps_safe(close_snapshot),
+                'margin_usd': trade.get('marginUsd', trade.get('margin_usd', trade.get('margin', 0))),
+                'strategy_mode': strategy_mode,
+                'execution_profile_source': trade.get('execution_profile_source', 'neutral'),
+                'exit_owner': trade.get('exitOwner', trade.get('exit_owner', '')),
+                'signal_snapshot_json': _json_dumps_safe(trade.get('signalSnapshot', trade.get('signal_snapshot', {}))),
+                'exec_snapshot_json': _json_dumps_safe(trade.get('execSnapshot', trade.get('exec_snapshot', {}))),
+                'risk_snapshot_json': _json_dumps_safe(trade.get('riskSnapshot', trade.get('risk_snapshot', {}))),
+                'close_snapshot_json': _json_dumps_safe(close_snapshot),
+                'settings_snapshot_json': _json_dumps_safe(trade.get('settingsSnapshot', trade.get('settings_snapshot', {}))),
+                'reason_context_json': _json_dumps_safe({
+                    'raw_reason': raw_reason,
+                    'original_reason': original_reason,
+                    'closeReasonNormalized': trade.get('closeReasonNormalized', ''),
+                    'exitReasonNorm': trade.get('exitReasonNorm', ''),
+                    'reason_source': reason_fields['reason_source'],
+                    'reason_owner': trade.get('reasonOwner', trade.get('reason_owner', trade.get('exitOwner', ''))),
+                    'profit_phase': trade.get('profitPhase', trade.get('profit_phase', '')),
+                    'close_scope': trade.get('closeScope', trade.get('close_scope', '')),
+                    'trigger_metric': trade.get('triggerMetric', trade.get('trigger_metric', '')),
+                    'trigger_value': trade.get('triggerValue', trade.get('trigger_value', None)),
+                    'threshold_value': trade.get('thresholdValue', trade.get('threshold_value', None)),
+                }),
+                'trade_schema_version': ANALYTICS_DB_SCHEMA_VERSION,
+            }
+
+            columns = list(payload.keys())
+            placeholders = ', '.join(['?'] * len(columns))
+            update_sql = '''
+                trade_id = COALESCE(excluded.trade_id, trades.trade_id),
+                signal_id = CASE WHEN excluded.signal_id IS NOT NULL AND excluded.signal_id != '' THEN excluded.signal_id ELSE trades.signal_id END,
+                position_id = CASE WHEN excluded.position_id IS NOT NULL AND excluded.position_id != '' THEN excluded.position_id ELSE trades.position_id END,
+                entry_order_id = CASE WHEN excluded.entry_order_id IS NOT NULL AND excluded.entry_order_id != '' THEN excluded.entry_order_id ELSE trades.entry_order_id END,
+                close_order_id = CASE WHEN excluded.close_order_id IS NOT NULL AND excluded.close_order_id != '' THEN excluded.close_order_id ELSE trades.close_order_id END,
+                symbol = COALESCE(excluded.symbol, trades.symbol),
+                side = COALESCE(excluded.side, trades.side),
+                entry_price = CASE WHEN excluded.entry_price > 0 THEN excluded.entry_price ELSE trades.entry_price END,
+                exit_price = CASE WHEN excluded.exit_price > 0 THEN excluded.exit_price ELSE trades.exit_price END,
+                size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE trades.size END,
+                size_usd = CASE WHEN excluded.size_usd > 0 THEN excluded.size_usd ELSE trades.size_usd END,
+                pnl = COALESCE(excluded.pnl, trades.pnl),
+                pnl_percent = CASE WHEN excluded.pnl_percent != 0 THEN excluded.pnl_percent ELSE trades.pnl_percent END,
+                open_time = CASE WHEN excluded.open_time > 0 THEN excluded.open_time ELSE trades.open_time END,
+                close_time = CASE WHEN excluded.close_time > 0 THEN excluded.close_time ELSE trades.close_time END,
+                signal_ts = CASE WHEN excluded.signal_ts > 0 THEN excluded.signal_ts ELSE trades.signal_ts END,
+                entry_ts = CASE WHEN excluded.entry_ts > 0 THEN excluded.entry_ts ELSE trades.entry_ts END,
+                exit_ts = CASE WHEN excluded.exit_ts > 0 THEN excluded.exit_ts ELSE trades.exit_ts END,
+                close_reason = CASE WHEN excluded.close_reason IS NOT NULL AND excluded.close_reason NOT IN ('', 'Closed', 'Synced from Binance') THEN excluded.close_reason ELSE trades.close_reason END,
+                reason_code = CASE WHEN excluded.reason_code IS NOT NULL AND excluded.reason_code != '' THEN excluded.reason_code ELSE trades.reason_code END,
+                reason_group = CASE WHEN excluded.reason_group IS NOT NULL AND excluded.reason_group != '' THEN excluded.reason_group ELSE trades.reason_group END,
+                reason_source = CASE
+                    WHEN trades.reason_source IN ('engine', 'manual', 'post_fill_norm')
+                         AND excluded.reason_source IN ('binance_sync', 'inferred')
+                    THEN trades.reason_source
+                    WHEN excluded.reason_source IS NOT NULL AND excluded.reason_source != ''
+                    THEN excluded.reason_source
+                    ELSE trades.reason_source
+                END,
+                reason_detail = CASE WHEN excluded.reason_detail IS NOT NULL AND excluded.reason_detail NOT IN ('', 'Closed', 'Synced from Binance') THEN excluded.reason_detail ELSE trades.reason_detail END,
+                leverage = CASE WHEN excluded.leverage > 0 THEN excluded.leverage ELSE trades.leverage END,
+                signal_score = CASE WHEN excluded.signal_score > 0 THEN excluded.signal_score ELSE trades.signal_score END,
+                signal_score_raw = CASE WHEN excluded.signal_score_raw > 0 THEN excluded.signal_score_raw ELSE trades.signal_score_raw END,
+                mtf_score = CASE WHEN excluded.mtf_score > 0 THEN excluded.mtf_score ELSE trades.mtf_score END,
+                z_score = CASE WHEN excluded.z_score != 0 THEN excluded.z_score ELSE trades.z_score END,
+                spread_level = CASE WHEN excluded.spread_level IS NOT NULL AND excluded.spread_level != 'unknown' THEN excluded.spread_level ELSE trades.spread_level END,
+                settings_snapshot = CASE WHEN excluded.settings_snapshot IS NOT NULL AND excluded.settings_snapshot != '{}' THEN excluded.settings_snapshot ELSE trades.settings_snapshot END,
+                stop_loss = CASE WHEN excluded.stop_loss > 0 THEN excluded.stop_loss ELSE trades.stop_loss END,
+                take_profit = CASE WHEN excluded.take_profit > 0 THEN excluded.take_profit ELSE trades.take_profit END,
+                atr = CASE WHEN excluded.atr > 0 THEN excluded.atr ELSE trades.atr END,
+                trailing_stop = CASE WHEN excluded.trailing_stop > 0 THEN excluded.trailing_stop ELSE trades.trailing_stop END,
+                trail_activation = CASE WHEN excluded.trail_activation > 0 THEN excluded.trail_activation ELSE trades.trail_activation END,
+                is_trailing_active = CASE WHEN excluded.is_trailing_active > 0 THEN excluded.is_trailing_active ELSE trades.is_trailing_active END,
+                margin = CASE WHEN excluded.margin > 0 THEN excluded.margin ELSE trades.margin END,
+                roi = CASE WHEN excluded.roi != 0 THEN excluded.roi ELSE trades.roi END,
+                is_live = CASE WHEN excluded.is_live > 0 THEN excluded.is_live ELSE trades.is_live END,
+                entry_method = CASE WHEN excluded.entry_method IS NOT NULL AND excluded.entry_method != '' THEN excluded.entry_method ELSE trades.entry_method END,
+                entry_slippage = CASE WHEN excluded.entry_slippage != 0 THEN excluded.entry_slippage ELSE trades.entry_slippage END,
+                exit_slippage = CASE WHEN excluded.exit_slippage != 0 THEN excluded.exit_slippage ELSE trades.exit_slippage END,
+                entry_spread = CASE WHEN excluded.entry_spread != 0 THEN excluded.entry_spread ELSE trades.entry_spread END,
+                binance_fill_price = CASE WHEN excluded.binance_fill_price > 0 THEN excluded.binance_fill_price ELSE trades.binance_fill_price END,
+                binance_order_id = CASE WHEN excluded.binance_order_id IS NOT NULL AND excluded.binance_order_id != '' THEN excluded.binance_order_id ELSE trades.binance_order_id END,
+                hurst = CASE WHEN excluded.hurst > 0 THEN excluded.hurst ELSE trades.hurst END,
+                adx = CASE WHEN excluded.adx > 0 THEN excluded.adx ELSE trades.adx END,
+                pullback_pct = CASE WHEN excluded.pullback_pct > 0 THEN excluded.pullback_pct ELSE trades.pullback_pct END,
+                close_metrics_json = CASE WHEN excluded.close_metrics_json IS NOT NULL AND excluded.close_metrics_json != '{}' THEN excluded.close_metrics_json ELSE trades.close_metrics_json END,
+                margin_usd = CASE WHEN excluded.margin_usd > 0 THEN excluded.margin_usd ELSE trades.margin_usd END,
+                strategy_mode = CASE WHEN excluded.strategy_mode IS NOT NULL AND excluded.strategy_mode != '' THEN excluded.strategy_mode ELSE trades.strategy_mode END,
+                execution_profile_source = CASE WHEN excluded.execution_profile_source IS NOT NULL AND excluded.execution_profile_source != '' THEN excluded.execution_profile_source ELSE trades.execution_profile_source END,
+                exit_owner = CASE WHEN excluded.exit_owner IS NOT NULL AND excluded.exit_owner != '' THEN excluded.exit_owner ELSE trades.exit_owner END,
+                signal_snapshot_json = CASE WHEN excluded.signal_snapshot_json IS NOT NULL AND excluded.signal_snapshot_json != '{}' THEN excluded.signal_snapshot_json ELSE trades.signal_snapshot_json END,
+                exec_snapshot_json = CASE WHEN excluded.exec_snapshot_json IS NOT NULL AND excluded.exec_snapshot_json != '{}' THEN excluded.exec_snapshot_json ELSE trades.exec_snapshot_json END,
+                risk_snapshot_json = CASE WHEN excluded.risk_snapshot_json IS NOT NULL AND excluded.risk_snapshot_json != '{}' THEN excluded.risk_snapshot_json ELSE trades.risk_snapshot_json END,
+                close_snapshot_json = CASE WHEN excluded.close_snapshot_json IS NOT NULL AND excluded.close_snapshot_json != '{}' THEN excluded.close_snapshot_json ELSE trades.close_snapshot_json END,
+                settings_snapshot_json = CASE WHEN excluded.settings_snapshot_json IS NOT NULL AND excluded.settings_snapshot_json != '{}' THEN excluded.settings_snapshot_json ELSE trades.settings_snapshot_json END,
+                reason_context_json = CASE WHEN excluded.reason_context_json IS NOT NULL AND excluded.reason_context_json != '{}' THEN excluded.reason_context_json ELSE trades.reason_context_json END,
+                trade_schema_version = CASE WHEN excluded.trade_schema_version > 0 THEN excluded.trade_schema_version ELSE trades.trade_schema_version END
+            '''
+            await db.execute(
+                f'''
+                INSERT INTO trades ({', '.join(columns)})
+                VALUES ({placeholders})
                 ON CONFLICT(id) DO UPDATE SET
-                  symbol = COALESCE(excluded.symbol, trades.symbol),
-                  side = COALESCE(excluded.side, trades.side),
-                  entry_price = CASE WHEN excluded.entry_price > 0 THEN excluded.entry_price ELSE trades.entry_price END,
-                  exit_price = CASE WHEN excluded.exit_price > 0 THEN excluded.exit_price ELSE trades.exit_price END,
-                  size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE trades.size END,
-                  size_usd = CASE WHEN excluded.size_usd > 0 THEN excluded.size_usd ELSE trades.size_usd END,
-                  pnl = COALESCE(excluded.pnl, trades.pnl),
-                  pnl_percent = CASE WHEN excluded.pnl_percent != 0 THEN excluded.pnl_percent ELSE trades.pnl_percent END,
-                  open_time = CASE WHEN excluded.open_time > 0 THEN excluded.open_time ELSE trades.open_time END,
-                  close_time = COALESCE(excluded.close_time, trades.close_time),
-                  close_reason = CASE WHEN excluded.close_reason IS NOT NULL AND excluded.close_reason != 'Closed' AND excluded.close_reason != 'Synced from Binance' THEN excluded.close_reason ELSE COALESCE(trades.close_reason, excluded.close_reason) END,
-                  leverage = CASE WHEN excluded.leverage > 0 AND excluded.leverage != 10 THEN excluded.leverage WHEN trades.leverage > 0 THEN trades.leverage ELSE excluded.leverage END,
-                  signal_score = CASE WHEN excluded.signal_score > 0 THEN excluded.signal_score ELSE trades.signal_score END,
-                  signal_score_raw = CASE WHEN excluded.signal_score_raw > 0 THEN excluded.signal_score_raw ELSE trades.signal_score_raw END,
-                  mtf_score = CASE WHEN excluded.mtf_score > 0 THEN excluded.mtf_score ELSE trades.mtf_score END,
-                  z_score = CASE WHEN excluded.z_score != 0 THEN excluded.z_score ELSE trades.z_score END,
-                  spread_level = CASE WHEN excluded.spread_level IS NOT NULL AND excluded.spread_level != 'unknown' THEN excluded.spread_level ELSE COALESCE(trades.spread_level, excluded.spread_level) END,
-                  settings_snapshot = CASE WHEN excluded.settings_snapshot IS NOT NULL AND excluded.settings_snapshot != '{}' THEN excluded.settings_snapshot ELSE COALESCE(trades.settings_snapshot, excluded.settings_snapshot) END,
-                  stop_loss = CASE WHEN excluded.stop_loss > 0 THEN excluded.stop_loss ELSE trades.stop_loss END,
-                  take_profit = CASE WHEN excluded.take_profit > 0 THEN excluded.take_profit ELSE trades.take_profit END,
-                  atr = CASE WHEN excluded.atr > 0 THEN excluded.atr ELSE trades.atr END,
-                  trailing_stop = CASE WHEN excluded.trailing_stop > 0 THEN excluded.trailing_stop ELSE trades.trailing_stop END,
-                  trail_activation = CASE WHEN excluded.trail_activation > 0 THEN excluded.trail_activation ELSE trades.trail_activation END,
-                  is_trailing_active = CASE WHEN excluded.is_trailing_active > 0 THEN excluded.is_trailing_active ELSE trades.is_trailing_active END,
-                  margin = CASE WHEN excluded.margin > 0 THEN excluded.margin ELSE trades.margin END,
-                  roi = CASE WHEN excluded.roi != 0 THEN excluded.roi ELSE trades.roi END,
-                  is_live = CASE WHEN excluded.is_live > 0 THEN excluded.is_live ELSE trades.is_live END,
-                  entry_method = CASE WHEN excluded.entry_method IS NOT NULL AND excluded.entry_method != 'MARKET' THEN excluded.entry_method ELSE COALESCE(trades.entry_method, excluded.entry_method) END,
-                  entry_slippage = CASE WHEN excluded.entry_slippage != 0 THEN excluded.entry_slippage ELSE trades.entry_slippage END,
-                  exit_slippage = CASE WHEN excluded.exit_slippage != 0 THEN excluded.exit_slippage ELSE trades.exit_slippage END,
-                  entry_spread = CASE WHEN excluded.entry_spread != 0 THEN excluded.entry_spread ELSE trades.entry_spread END,
-                  binance_fill_price = CASE WHEN excluded.binance_fill_price > 0 THEN excluded.binance_fill_price ELSE trades.binance_fill_price END,
-                  binance_order_id = CASE WHEN excluded.binance_order_id IS NOT NULL AND excluded.binance_order_id != '' THEN excluded.binance_order_id ELSE COALESCE(trades.binance_order_id, excluded.binance_order_id) END,
-                  hurst = CASE WHEN excluded.hurst != 0.5 AND excluded.hurst > 0 THEN excluded.hurst WHEN trades.hurst != 0.5 AND trades.hurst > 0 THEN trades.hurst ELSE excluded.hurst END,
-                  adx = CASE WHEN excluded.adx > 0 THEN excluded.adx ELSE trades.adx END,
-                  pullback_pct = CASE WHEN excluded.pullback_pct > 0 THEN excluded.pullback_pct ELSE trades.pullback_pct END,
-                  close_metrics_json = CASE WHEN excluded.close_metrics_json IS NOT NULL AND excluded.close_metrics_json != '{}' THEN excluded.close_metrics_json ELSE COALESCE(trades.close_metrics_json, excluded.close_metrics_json) END,
-                  margin_usd = CASE WHEN excluded.margin_usd > 0 THEN excluded.margin_usd ELSE trades.margin_usd END
-            ''', (
-                trade.get('id'),
-                trade.get('symbol'),
-                trade.get('side'),
-                trade.get('entryPrice'),
-                trade.get('exitPrice'),
-                trade.get('size', 0),
-                trade.get('sizeUsd', 0),
-                trade.get('pnl'),
-                trade.get('pnlPercent', 0),
-                trade.get('openTime', 0),
-                trade.get('closeTime'),
-                trade.get('reason', trade.get('closeReason')),
-                trade.get('leverage', 10),
-                trade.get('signalScore', 0),
-                trade.get('signalScoreRaw', trade.get('signalScore', 0)),
-                trade.get('mtfScore', 0),
-                trade.get('zScore', 0),
-                trade.get('spreadLevel', 'unknown'),
-                json.dumps(trade.get('settingsSnapshot', {})),
-                # Phase 186: New fields
-                trade.get('stopLoss', 0),
-                trade.get('takeProfit', 0),
-                trade.get('atr', 0),
-                trade.get('trailingStop', 0),
-                trade.get('trailActivation', 0),
-                1 if trade.get('isTrailingActive', False) else 0,
-                trade.get('margin', trade.get('marginUsd', 0)),
-                trade.get('roi', 0),
-                1 if trade.get('isLive', False) else 0,
-                trade.get('entry_method', 'MARKET'),
-                trade.get('entry_slippage', 0),
-                trade.get('exit_slippage', 0),
-                trade.get('entry_spread', 0),
-                trade.get('binance_fill_price', 0),
-                trade.get('binance_order_id', ''),
-                trade.get('hurst', 0.5),
-                trade.get('adx', 0),
-                trade.get('pullbackPct', 0),
-                trade.get('close_metrics_json', '{}'),
-                trade.get('marginUsd', trade.get('margin', 0)),  # P0-2: margin_usd column
-            ))
+                {update_sql}
+                ''',
+                [payload[col] for col in columns],
+            )
             await db.commit()
     
     async def get_recent_trades(self, limit: int = 50) -> list:
@@ -793,12 +1397,18 @@ class SQLiteManager:
                     trades = []
                     for row in rows:
                         d = dict(row)
-                        # Parse settings_snapshot from JSON string
-                        try:
-                            if d.get('settings_snapshot') and isinstance(d['settings_snapshot'], str):
-                                d['settings_snapshot'] = json.loads(d['settings_snapshot'])
-                        except:
-                            d['settings_snapshot'] = {}
+                        settings_snapshot = _json_loads_safe(
+                            d.get('settings_snapshot_json', d.get('settings_snapshot', '{}')),
+                            {}
+                        )
+                        signal_snapshot = _json_loads_safe(d.get('signal_snapshot_json', '{}'), {})
+                        exec_snapshot = _json_loads_safe(d.get('exec_snapshot_json', '{}'), {})
+                        risk_snapshot = _json_loads_safe(d.get('risk_snapshot_json', '{}'), {})
+                        close_snapshot = _json_loads_safe(
+                            d.get('close_snapshot_json', d.get('close_metrics_json', '{}')),
+                            {}
+                        )
+                        reason_context = _json_loads_safe(d.get('reason_context_json', '{}'), {})
                         
                         # Frontend-compatible format
                         turkey_tz = pytz.timezone('Europe/Istanbul')
@@ -814,9 +1424,19 @@ class SQLiteManager:
                         pnl = d.get('pnl', 0) or 0
                         margin = d.get('margin', 0) or 0
                         roi = d.get('roi', 0) or 0
+                        reason_code = d.get('reason_code', '') or ''
+                        reason_group = d.get('reason_group', '') or 'OTHER'
+                        reason_source = d.get('reason_source', '') or 'engine'
+                        reason_detail = d.get('reason_detail', d.get('close_reason', 'Closed')) or 'Closed'
+                        close_reason_normalized = _legacy_close_reason_from_fields(reason_code, reason_group)
                         
                         trade = {
-                            'id': d.get('id', ''),
+                            'id': d.get('trade_id', d.get('id', '')) or d.get('id', ''),
+                            'tradeId': d.get('trade_id', d.get('id', '')) or d.get('id', ''),
+                            'signalId': d.get('signal_id', '') or '',
+                            'positionId': d.get('position_id', '') or '',
+                            'entryOrderId': d.get('entry_order_id', '') or '',
+                            'closeOrderId': d.get('close_order_id', '') or '',
                             'symbol': (d.get('symbol', '') or '').replace('USDT', ''),
                             'symbolFull': d.get('symbol', ''),
                             'side': d.get('side', 'LONG'),
@@ -831,11 +1451,24 @@ class SQLiteManager:
                             'sizeUsd': round(d.get('size_usd', 0) or 0, 2),
                             'closeTime': close_ts,
                             'openTime': d.get('open_time', 0) or 0,
+                            'signalTs': d.get('signal_ts', d.get('open_time', 0)) or 0,
+                            'entryTs': d.get('entry_ts', d.get('open_time', 0)) or 0,
+                            'exitTs': d.get('exit_ts', close_ts) or 0,
                             'time': time_str,
                             'date': date_str,
                             'timestamp': close_ts,
-                            'closeReason': d.get('close_reason', 'Closed') or 'Closed',
-                            'reason': d.get('close_reason', 'Closed') or 'Closed',
+                            'closeReason': reason_detail,
+                            'reason': reason_detail,
+                            'closeReasonNormalized': close_reason_normalized,
+                            'reasonCode': reason_code,
+                            'reasonGroup': reason_group,
+                            'reasonSource': reason_source,
+                            'reasonOwner': reason_context.get('reason_owner', d.get('exit_owner', '')) or d.get('exit_owner', ''),
+                            'profitPhase': reason_context.get('profit_phase', close_snapshot.get('runtimeProfitPhase', '')) or close_snapshot.get('runtimeProfitPhase', ''),
+                            'closeScope': reason_context.get('close_scope', ''),
+                            'triggerMetric': reason_context.get('trigger_metric', ''),
+                            'triggerValue': reason_context.get('trigger_value'),
+                            'thresholdValue': reason_context.get('threshold_value'),
                             'type': 'CLOSE',
                             # Phase 187b: Full data
                             'stopLoss': d.get('stop_loss', 0) or 0,
@@ -857,11 +1490,23 @@ class SQLiteManager:
                             'binanceFillPrice': d.get('binance_fill_price', 0) or 0,
                             'isLive': bool(d.get('is_live', 0)),
                             'hurst': d.get('hurst', 0.5) or 0.5,
-                            'settingsSnapshot': d.get('settings_snapshot', {}),
+                            'adx': d.get('adx', 0) or 0,
+                            'pullbackPct': d.get('pullback_pct', 0) or 0,
+                            'settingsSnapshot': settings_snapshot,
+                            'signalSnapshot': signal_snapshot,
+                            'execSnapshot': exec_snapshot,
+                            'riskSnapshot': risk_snapshot,
+                            'closeSnapshot': close_snapshot,
+                            'reasonContext': reason_context,
+                            'strategyMode': d.get('strategy_mode', STRATEGY_MODE_LEGACY) or STRATEGY_MODE_LEGACY,
+                            'execution_profile_source': d.get('execution_profile_source', 'neutral') or 'neutral',
+                            'executionProfileSource': d.get('execution_profile_source', 'neutral') or 'neutral',
+                            'exitOwner': d.get('exit_owner', '') or '',
+                            'tradeSchemaVersion': d.get('trade_schema_version', ANALYTICS_DB_SCHEMA_VERSION) or ANALYTICS_DB_SCHEMA_VERSION,
                             # P0-2: marginUsd from DB (margin_usd col) or fallback to computed
                             'marginUsd': d.get('margin_usd', 0) or (d.get('margin', 0) or ((d.get('size_usd', 0) or 0) / max(d.get('leverage', 10) or 10, 1))),
                             # Phase 232: Close metrics snapshot
-                            'close_metrics_json': d.get('close_metrics_json', '{}'),
+                            'close_metrics_json': _json_dumps_safe(close_snapshot),
                         }
                         trades.append(trade)
                     
@@ -922,6 +1567,12 @@ class SQLiteManager:
     async def save_signal(self, signal_data: dict):
         """Save a signal (accepted or rejected) for performance analysis."""
         async with aiosqlite.connect(self.db_path) as db:
+            signal_ts = signal_data.get('timestamp', int(datetime.now().timestamp() * 1000))
+            signal_id = (
+                signal_data.get('signal_id')
+                or signal_data.get('signalId')
+                or f"SIG_{signal_data.get('symbol', 'UNKNOWN')}_{signal_ts}"
+            )
             # RFX-1D: serialize truth_snapshot if present
             _ts_json = '{}'
             _ts_raw = signal_data.get('truth_snapshot')
@@ -933,13 +1584,16 @@ class SQLiteManager:
                     _ts_json = '{}'
             await db.execute('''
                 INSERT INTO signals (
-                    symbol, action, price, zscore, hurst, atr, signal_score,
-                    htf_trend, mtf_confirmed, mtf_reason, blacklisted, accepted,
+                    signal_id, symbol, action, price, zscore, hurst, atr, signal_score,
+                    signal_score_raw, htf_trend, strategy_mode, execution_profile_source,
+                    mtf_confirmed, mtf_reason, blacklisted, accepted,
                     reject_reason, z_threshold, min_confidence, entry_tightness,
                     exit_tightness, timestamp, obi_value,
-                    truth_snapshot_json, regime_adjustment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    truth_snapshot_json, regime_adjustment, telemetry_json,
+                    entry_quality_json, risk_gate_json, signal_context_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
+                signal_id,
                 signal_data.get('symbol'),
                 signal_data.get('action'),
                 signal_data.get('price', 0),
@@ -947,7 +1601,10 @@ class SQLiteManager:
                 signal_data.get('hurst', 0),
                 signal_data.get('atr', 0),
                 signal_data.get('signal_score', 0),
+                signal_data.get('signal_score_raw', signal_data.get('signalScoreRaw', signal_data.get('signal_score', 0))),
                 signal_data.get('htf_trend', 'NEUTRAL'),
+                signal_data.get('strategy_mode', signal_data.get('strategyMode', STRATEGY_MODE_LEGACY)),
+                signal_data.get('execution_profile_source', 'neutral'),
                 1 if signal_data.get('mtf_confirmed', False) else 0,
                 signal_data.get('mtf_reason', ''),
                 1 if signal_data.get('blacklisted', False) else 0,
@@ -957,10 +1614,14 @@ class SQLiteManager:
                 signal_data.get('min_confidence', 0),
                 signal_data.get('entry_tightness', 1.0),
                 signal_data.get('exit_tightness', 1.0),
-                signal_data.get('timestamp', int(datetime.now().timestamp() * 1000)),
+                signal_ts,
                 signal_data.get('obi_value', 0),  # Phase 211: OBI depth value
                 _ts_json,  # RFX-1D: truth snapshot JSON
                 signal_data.get('regime_adjustment', ''),  # RFX-1D: regime adjustment
+                _json_dumps_safe(signal_data.get('telemetry', {})),
+                _json_dumps_safe(signal_data.get('entry_quality', signal_data.get('entryQuality', {}))),
+                _json_dumps_safe(signal_data.get('risk_gate', signal_data.get('riskGate', {}))),
+                _json_dumps_safe(signal_data.get('signal_context', signal_data)),
             ))
             await db.commit()
     
@@ -1000,8 +1661,10 @@ class SQLiteManager:
                     id, symbol, side, entry_price, size, size_usd,
                     stop_loss, take_profit, leverage, open_time,
                     signal_score, signal_score_raw, zscore, hurst, atr, htf_trend, status,
-                    margin_usd, truth_snapshot_json, regime_adjustment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    margin_usd, truth_snapshot_json, regime_adjustment, signal_id,
+                    strategy_mode, execution_profile_source, signal_snapshot_json,
+                    exec_snapshot_json, risk_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pos.get('id'),
                 pos.get('symbol'),
@@ -1023,6 +1686,24 @@ class SQLiteManager:
                 pos.get('marginUsd', 0),
                 _pos_ts_json,  # RFX-1D
                 pos.get('regime_adjustment', ''),  # RFX-1D
+                pos.get('signalId', pos.get('signal_id', '')),
+                pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+                pos.get('execution_profile_source', 'neutral'),
+                _json_dumps_safe(pos.get('signal_snapshot', pos)),
+                _json_dumps_safe(pos.get('exec_snapshot', {
+                    'entry_method': pos.get('entry_method', 'MARKET'),
+                    'entry_spread': pos.get('entry_spread', 0),
+                    'entry_slippage': pos.get('entry_slippage', 0),
+                    'execution_profile_source': pos.get('execution_profile_source', 'neutral'),
+                })),
+                _json_dumps_safe(pos.get('risk_snapshot', {
+                    'stopLoss': pos.get('stopLoss', 0),
+                    'takeProfit': pos.get('takeProfit', 0),
+                    'trailActivation': pos.get('trailActivation', 0),
+                    'trailingStop': pos.get('trailingStop', 0),
+                    'leverage': pos.get('leverage', 10),
+                    'marginUsd': pos.get('marginUsd', 0),
+                })),
             ))
             await db.commit()
     
@@ -1374,51 +2055,109 @@ class SQLiteManager:
     async def save_position_close(self, close_data: dict):
         """Phase 187: Save position close with ALL trade data + settings."""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT INTO position_closes (
-                    symbol, side, reason, original_reason, entry_price, exit_price,
-                    pnl, leverage, size_usd, margin, roi, timestamp,
-                    stop_loss, take_profit, atr, trailing_stop, trail_activation,
-                    settings_snapshot, entry_method, entry_slippage, exit_slippage, entry_spread,
-                    signal_score, spread_level, binance_fill_price, hurst, trade_id,
-                    mae_pct, mfe_pct, decision_trace,
-                    entry_order_id, close_order_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
+            strategy_mode = normalize_strategy_mode(
+                close_data.get('strategyMode', close_data.get('strategy_mode', STRATEGY_MODE_LEGACY))
+            )
+            raw_reason = close_data.get('reason', 'Closed')
+            original_reason = close_data.get('original_reason', close_data.get('originalReason', raw_reason))
+            reason_fields = _build_reason_fields(
+                strategy_mode=strategy_mode,
+                reason=raw_reason,
+                original_reason=original_reason,
+                reason_detail=close_data.get('reasonDetail', close_data.get('reason_detail', raw_reason)),
+                reason_source=close_data.get('reasonSource', close_data.get('reason_source', '')),
+            )
+            trade_id = close_data.get('trade_id', close_data.get('tradeId', ''))
+            close_order_id = close_data.get('close_order_id', close_data.get('closeOrderId', ''))
+            decision_trace = close_data.get('decision_trace_json', close_data.get('decision_trace', []))
+            decision_trace_json = _json_dumps_safe(decision_trace, fallback='[]')
+            existing_id = None
+            if close_order_id:
+                async with db.execute(
+                    "SELECT id FROM position_closes WHERE close_order_id = ? LIMIT 1",
+                    (close_order_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        existing_id = row[0]
+            if existing_id is None and trade_id:
+                async with db.execute(
+                    "SELECT id FROM position_closes WHERE trade_id = ? LIMIT 1",
+                    (trade_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        existing_id = row[0]
+            matched_to_income = int(close_data.get('matched_to_income', 0) or 0)
+            if existing_id is not None:
+                async with db.execute(
+                    "SELECT matched_to_income FROM position_closes WHERE id = ? LIMIT 1",
+                    (existing_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        matched_to_income = max(matched_to_income, int(row[0] or 0))
+                await db.execute("DELETE FROM position_closes WHERE id = ?", (existing_id,))
+
+            payload = (
+                close_data.get('signalId', close_data.get('signal_id', '')),
                 close_data.get('symbol'),
                 close_data.get('side'),
-                close_data.get('reason', 'Closed'),
-                close_data.get('original_reason', 'Closed'),
-                close_data.get('entryPrice', 0),
-                close_data.get('exitPrice', 0),
+                reason_fields['reason_detail'],
+                original_reason,
+                reason_fields['reason_code'],
+                reason_fields['reason_group'],
+                reason_fields['reason_source'],
+                reason_fields['reason_detail'],
+                close_data.get('entryPrice', close_data.get('entry_price', 0)),
+                close_data.get('exitPrice', close_data.get('exit_price', 0)),
                 close_data.get('pnl', 0),
                 close_data.get('leverage', 10),
-                close_data.get('sizeUsd', 0),
-                close_data.get('margin', 0),
-                close_data.get('roi', 0),
+                close_data.get('sizeUsd', close_data.get('size_usd', 0)),
+                close_data.get('margin', close_data.get('marginUsd', close_data.get('margin_usd', 0))),
+                close_data.get('roi', close_data.get('pnlPercent', 0)),
                 close_data.get('timestamp', int(datetime.now().timestamp() * 1000)),
-                # Phase 187: Settings + execution data
-                close_data.get('stopLoss', 0),
-                close_data.get('takeProfit', 0),
-                close_data.get('atr', 0),
-                close_data.get('trailingStop', 0),
-                close_data.get('trailActivation', 0),
-                json.dumps(close_data.get('settingsSnapshot', {})),
-                close_data.get('entry_method', 'MARKET'),
-                close_data.get('entry_slippage', 0),
-                close_data.get('exit_slippage', 0),
-                close_data.get('entry_spread', 0),
-                close_data.get('signalScore', 0),
-                close_data.get('spreadLevel', 'unknown'),
-                close_data.get('binance_fill_price', 0),
-                close_data.get('hurst', 0.5),
-                close_data.get('trade_id', ''),
+                matched_to_income,
                 close_data.get('mae_pct', 0),
                 close_data.get('mfe_pct', 0),
-                close_data.get('decision_trace', '[]'),
-                close_data.get('entry_order_id', ''),
-                close_data.get('close_order_id', ''),
-            ))
+                decision_trace_json,
+                decision_trace_json,
+                close_data.get('stopLoss', close_data.get('stop_loss', 0)),
+                close_data.get('takeProfit', close_data.get('take_profit', 0)),
+                close_data.get('atr', 0),
+                close_data.get('trailingStop', close_data.get('trailing_stop', 0)),
+                close_data.get('trailActivation', close_data.get('trail_activation', 0)),
+                _json_dumps_safe(close_data.get('settingsSnapshot', close_data.get('settings_snapshot', {}))),
+                close_data.get('entry_method', close_data.get('entryMethod', 'MARKET')),
+                close_data.get('entry_slippage', close_data.get('entrySlippage', 0)),
+                close_data.get('exit_slippage', close_data.get('exitSlippage', 0)),
+                close_data.get('entry_spread', close_data.get('entrySpread', 0)),
+                close_data.get('signalScore', close_data.get('signal_score', 0)),
+                close_data.get('spreadLevel', close_data.get('spread_level', 'unknown')),
+                close_data.get('binance_fill_price', close_data.get('binanceFillPrice', 0)),
+                close_data.get('hurst', 0.5),
+                trade_id,
+                close_data.get('positionId', close_data.get('position_id', '')),
+                strategy_mode,
+                close_data.get('execution_profile_source', close_data.get('executionProfileSource', 'neutral')),
+                _json_dumps_safe(close_data.get('riskSnapshot', close_data.get('risk_snapshot', {}))),
+                _json_dumps_safe(close_data.get('execSnapshot', close_data.get('exec_snapshot', {}))),
+                close_data.get('entry_order_id', close_data.get('entryOrderId', '')),
+                close_order_id,
+            )
+            await db.execute('''
+                INSERT INTO position_closes (
+                    signal_id, symbol, side, reason, original_reason,
+                    reason_code, reason_group, reason_source, reason_detail,
+                    entry_price, exit_price, pnl, leverage, size_usd, margin, roi, timestamp,
+                    matched_to_income, mae_pct, mfe_pct, decision_trace, decision_trace_json,
+                    stop_loss, take_profit, atr, trailing_stop, trail_activation,
+                    settings_snapshot, entry_method, entry_slippage, exit_slippage, entry_spread,
+                    signal_score, spread_level, binance_fill_price, hurst, trade_id, position_id,
+                    strategy_mode, execution_profile_source, risk_snapshot_json, exec_snapshot_json,
+                    entry_order_id, close_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', payload)
             await db.commit()
             logger.info(f"💾 Position close saved to SQLite: {close_data.get('symbol')} - {close_data.get('reason')} | entry_oid={close_data.get('entry_order_id', '')[:12]} close_oid={close_data.get('close_order_id', '')[:12]}")
     
@@ -1497,66 +2236,179 @@ class SQLiteManager:
     
     async def save_binance_trade(self, trade_data: dict):
         """
-        Phase 152: Save Binance trade with enrichment from position_closes.
-        Before saving, try to match with position_closes for better close reason.
+        Phase 152 / analytics-v2: save raw Binance sync row and reconcile an
+        existing canonical trade only when exact identifiers are available.
         """
         async with aiosqlite.connect(self.db_path) as db:
             symbol = trade_data.get('symbol')
             close_time = trade_data.get('closeTime', 0)
-            close_reason = trade_data.get('closeReason', 'Closed')
+            close_order_id = trade_data.get('closeOrderId', trade_data.get('close_order_id', ''))
+            trade_id = trade_data.get('tradeId', trade_data.get('trade_id', ''))
+            signal_id = trade_data.get('signalId', trade_data.get('signal_id', ''))
+            position_id = trade_data.get('positionId', trade_data.get('position_id', ''))
+            close_reason = trade_data.get('closeReason', trade_data.get('close_reason', 'Closed'))
+            raw_reason = trade_data.get('reason', close_reason)
+            original_reason = trade_data.get('original_reason', trade_data.get('originalReason', close_reason))
             entry_price = trade_data.get('entryPrice', 0)
             exit_price = trade_data.get('exitPrice', 0)
             side = trade_data.get('side', 'LONG')
             leverage = trade_data.get('leverage', 1)
             size_usd = trade_data.get('sizeUsd', 0)
-            
-            # Phase 152: Enrich from position_closes if close_reason is generic
-            if close_reason in ('Closed', 'Position closed on Binance', 'Historical (from Binance)'):
-                try:
-                    db.row_factory = aiosqlite.Row
+            margin = trade_data.get('margin', trade_data.get('marginUsd', 0))
+            roi = trade_data.get('roi', trade_data.get('pnlPercent', 0))
+            strategy_mode = normalize_strategy_mode(
+                trade_data.get('strategyMode', trade_data.get('strategy_mode', STRATEGY_MODE_LEGACY))
+            )
+            execution_profile_source = trade_data.get('execution_profile_source', trade_data.get('executionProfileSource', 'neutral'))
+            canonical_trade = None
+            matched_pc = None
+            allow_canonical_reconcile = False
+
+            db.row_factory = aiosqlite.Row
+            try:
+                if close_order_id:
+                    async with db.execute(
+                        "SELECT * FROM trades WHERE close_order_id = ? LIMIT 1",
+                        (close_order_id,),
+                    ) as cursor:
+                        canonical_trade = await cursor.fetchone()
+                if canonical_trade is None and trade_id:
+                    async with db.execute(
+                        "SELECT * FROM trades WHERE trade_id = ? OR id = ? LIMIT 1",
+                        (trade_id, trade_id),
+                    ) as cursor:
+                        canonical_trade = await cursor.fetchone()
+                if close_order_id:
+                    async with db.execute(
+                        "SELECT * FROM position_closes WHERE close_order_id = ? LIMIT 1",
+                        (close_order_id,),
+                    ) as cursor:
+                        matched_pc = await cursor.fetchone()
+                if matched_pc is None and trade_id:
+                    async with db.execute(
+                        "SELECT * FROM position_closes WHERE trade_id = ? LIMIT 1",
+                        (trade_id,),
+                    ) as cursor:
+                        matched_pc = await cursor.fetchone()
+                if matched_pc is None and symbol and close_time:
                     async with db.execute('''
-                        SELECT * FROM position_closes 
+                        SELECT * FROM position_closes
                         WHERE symbol = ? AND ABS(timestamp - ?) < 3600000
                         ORDER BY ABS(timestamp - ?) ASC LIMIT 1
                     ''', (symbol, close_time, close_time)) as cursor:
-                        pc = await cursor.fetchone()
-                        if pc:
-                            close_reason = pc['original_reason'] or pc['reason'] or close_reason
-                            if pc['entry_price'] and pc['entry_price'] > 0:
-                                entry_price = pc['entry_price']
-                            if pc['exit_price'] and pc['exit_price'] > 0:
-                                exit_price = pc['exit_price']
-                            if pc['side']:
-                                side = pc['side']
-                            if pc['leverage'] and pc['leverage'] > 0:
-                                leverage = pc['leverage']
-                            if pc['size_usd'] and pc['size_usd'] > 0:
-                                size_usd = pc['size_usd']
-                            logger.info(f"📋 Enriched trade {symbol} with close reason: {close_reason}")
-                except Exception as e:
-                    logger.debug(f"Enrichment lookup failed: {e}")
-            
+                        matched_pc = await cursor.fetchone()
+            except Exception as e:
+                logger.debug(f"save_binance_trade canonical lookup failed: {e}")
+
+            if matched_pc:
+                trade_id = trade_id or matched_pc['trade_id'] or ''
+                signal_id = signal_id or matched_pc['signal_id'] or ''
+                position_id = position_id or matched_pc['position_id'] or ''
+                strategy_mode = normalize_strategy_mode(matched_pc['strategy_mode'] or strategy_mode)
+                execution_profile_source = matched_pc['execution_profile_source'] or execution_profile_source
+                close_reason = matched_pc['reason_detail'] or matched_pc['reason'] or close_reason
+                original_reason = matched_pc['original_reason'] or original_reason
+                if matched_pc['entry_price'] and matched_pc['entry_price'] > 0:
+                    entry_price = matched_pc['entry_price']
+                if matched_pc['exit_price'] and matched_pc['exit_price'] > 0:
+                    exit_price = matched_pc['exit_price']
+                if matched_pc['side']:
+                    side = matched_pc['side']
+                if matched_pc['leverage'] and matched_pc['leverage'] > 0:
+                    leverage = matched_pc['leverage']
+                if matched_pc['size_usd'] and matched_pc['size_usd'] > 0:
+                    size_usd = matched_pc['size_usd']
+                if matched_pc['margin'] and matched_pc['margin'] > 0:
+                    margin = matched_pc['margin']
+                if matched_pc['roi'] and matched_pc['roi'] != 0:
+                    roi = matched_pc['roi']
+
+            if canonical_trade:
+                trade_id = trade_id or canonical_trade['trade_id'] or canonical_trade['id']
+                signal_id = signal_id or canonical_trade['signal_id'] or ''
+                position_id = position_id or canonical_trade['position_id'] or ''
+                strategy_mode = normalize_strategy_mode(canonical_trade['strategy_mode'] or strategy_mode)
+                execution_profile_source = canonical_trade['execution_profile_source'] or execution_profile_source
+                close_order_id = close_order_id or canonical_trade['close_order_id'] or ''
+                allow_canonical_reconcile = True
+            elif matched_pc:
+                pc_trade_id = matched_pc['trade_id'] or ''
+                pc_close_order_id = matched_pc['close_order_id'] or ''
+                if (close_order_id and pc_close_order_id and close_order_id == pc_close_order_id) or (
+                    trade_id and pc_trade_id and trade_id == pc_trade_id
+                ):
+                    allow_canonical_reconcile = True
+
+            reason_fields = _build_reason_fields(
+                strategy_mode=strategy_mode,
+                reason=raw_reason or close_reason,
+                original_reason=original_reason,
+                reason_detail=trade_data.get('reasonDetail', trade_data.get('reason_detail', close_reason)),
+                reason_source='binance_sync',
+            )
             await db.execute('''
                 INSERT OR REPLACE INTO binance_trades (
-                    income_id, symbol, side, entry_price, exit_price, pnl, pnl_percent,
-                    margin, leverage, size_usd, close_reason, close_time, raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    income_id, trade_id, signal_id, position_id, close_order_id,
+                    symbol, side, entry_price, exit_price, pnl, pnl_percent,
+                    margin, leverage, size_usd, close_reason,
+                    reason_code, reason_group, reason_source, reason_detail,
+                    close_time, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_data.get('incomeId', str(close_time)),
+                trade_id,
+                signal_id,
+                position_id,
+                close_order_id,
                 symbol,
                 side,
                 entry_price,
                 exit_price,
                 trade_data.get('pnl', 0),
-                trade_data.get('roi', 0),
-                trade_data.get('margin', 0),
+                roi,
+                margin,
                 leverage,
                 size_usd,
-                close_reason,
+                reason_fields['reason_detail'],
+                reason_fields['reason_code'],
+                reason_fields['reason_group'],
+                reason_fields['reason_source'],
+                reason_fields['reason_detail'],
                 close_time,
-                json.dumps(trade_data)
+                _json_dumps_safe(trade_data)
             ))
             await db.commit()
+
+        if allow_canonical_reconcile and (trade_id or close_order_id):
+            try:
+                reconcile_trade = {
+                    'id': trade_id or (canonical_trade['id'] if canonical_trade else ''),
+                    'tradeId': trade_id or (canonical_trade['trade_id'] if canonical_trade else ''),
+                    'signalId': signal_id,
+                    'positionId': position_id,
+                    'closeOrderId': close_order_id,
+                    'symbol': symbol,
+                    'side': side,
+                    'entryPrice': entry_price,
+                    'exitPrice': exit_price,
+                    'pnl': trade_data.get('pnl', 0),
+                    'roi': roi,
+                    'pnlPercent': roi,
+                    'margin': margin,
+                    'marginUsd': margin,
+                    'leverage': leverage,
+                    'sizeUsd': size_usd,
+                    'closeTime': close_time,
+                    'reason': reason_fields['reason_detail'],
+                    'closeReason': reason_fields['reason_detail'],
+                    'original_reason': original_reason,
+                    'reasonSource': 'binance_sync',
+                    'strategyMode': strategy_mode,
+                    'execution_profile_source': execution_profile_source,
+                }
+                await self.save_trade(reconcile_trade)
+            except Exception as e:
+                logger.debug(f"save_binance_trade canonical reconcile failed: {e}")
     
     async def get_binance_trades(self, limit: int = 200) -> list:
         """
@@ -2433,13 +3285,18 @@ class LiveBinanceTrader:
             return []
             
         try:
-            # Use Binance fapiPrivateV2GetPositionRisk directly - fapiPrivateGetAccount returns 404
+            # Prefer positionRisk V3 because it exposes breakEvenPrice. Fall back to
+            # V2 and then CCXT if the direct endpoint is unavailable.
             raw_positions = None
             try:
-                raw_positions = await self.exchange.fapiPrivateV2GetPositionRisk()
-                logger.info(f"Binance API returned {len(raw_positions)} position entries")
+                if hasattr(self.exchange, 'fapiPrivateV3GetPositionRisk'):
+                    raw_positions = await self.exchange.fapiPrivateV3GetPositionRisk()
+                    logger.info(f"Binance API V3 returned {len(raw_positions)} position entries")
+                else:
+                    raw_positions = await self.exchange.fapiPrivateV2GetPositionRisk()
+                    logger.info(f"Binance API V2 returned {len(raw_positions)} position entries")
             except Exception as e:
-                logger.warning(f"Direct API failed ({e}), using CCXT fetch_positions")
+                logger.warning(f"Direct positionRisk fetch failed ({e}), using CCXT fetch_positions")
                 raw_positions = None
             
             if raw_positions:
@@ -2453,6 +3310,7 @@ class LiveBinanceTrader:
                         symbol = p.get('symbol', '')
                         side = 'LONG' if position_amt > 0 else 'SHORT'
                         entry_price = float(p.get('entryPrice', 0) or 0)
+                        exchange_be_price = float(p.get('breakEvenPrice', 0) or 0)
                         unrealized_pnl = float(p.get('unRealizedProfit', 0) or 0)
                         notional = abs(float(p.get('notional', 0) or 0))
                         leverage = int(p.get('leverage', 1) or 1)
@@ -2478,6 +3336,7 @@ class LiveBinanceTrader:
                             'pnlPercent': pnl_percent,
                             'leverage': leverage,
                             'initialMargin': position_margin,
+                            'exchangeBreakEvenPrice': exchange_be_price,
                             'size': abs(position_amt),           # Phase 149: Fix missing size field
                             'contracts': abs(position_amt),
                             'markPrice': float(p.get('markPrice', entry_price) or entry_price),  # Phase 149: Add markPrice
@@ -2582,6 +3441,11 @@ class LiveBinanceTrader:
                     position_amount = abs(contracts) if abs(contracts) > 0 else abs(raw_position_amt)
                     entry_price = float(p.get('entryPrice') or 0)
                     mark_price = float(p.get('markPrice') or 0)
+                    exchange_be_price = float(
+                        p.get('breakEvenPrice')
+                        or raw_info.get('breakEvenPrice')
+                        or 0
+                    )
                     
                     # Phase 204: Use currentPrice from engine position (scanner/WS close price)
                     # instead of markPrice for exit decisions — markPrice can spike with wicks
@@ -2594,6 +3458,18 @@ class LiveBinanceTrader:
                     current_price = float(engine_pos.get('currentPrice', 0)) if engine_pos else 0
                     if current_price <= 0:
                         current_price = mark_price  # Fallback to markPrice if no engine price
+
+                    fallback_profit_pos = dict(engine_pos or {})
+                    fallback_profit_pos.setdefault('symbol', symbol)
+                    fallback_profit_pos.setdefault('side', side)
+                    fallback_profit_pos.setdefault('entryPrice', entry_price)
+                    fallback_profit_pos.setdefault('markPrice', current_price)
+                    fallback_profit_pos.setdefault('currentPrice', current_price)
+                    fallback_profit_pos.setdefault('leverage', calculated_leverage if calculated_leverage > 0 else final_leverage)
+                    fallback_profit_pos.setdefault('trailDistance', 0.0)
+                    fallback_profit_pos.setdefault('spreadPct', _coerce_float(raw_info.get('bidAskSpread', 0.05), 0.05))
+                    fallback_profit_pos.setdefault('spreadLevel', engine_pos.get('spreadLevel', 'Low') if engine_pos else 'Low')
+                    fallback_profit_pos.setdefault('exchangeBreakEvenPrice', exchange_be_price)
                     
                     # ================================================================
                     # Phase 145: Calculate dynamic TP/SL/Trail for live positions
@@ -2663,21 +3539,43 @@ class LiveBinanceTrader:
                         fb_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                     
                     # Phase 231h → 238A: Dynamic breakeven prices
-                    _fb_buf = compute_breakeven_buffer_pct(spread_pct=p.get('spreadPct', 0.05), spread_level=p.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FB')
-                    be_long = entry_price * (1 + _fb_buf)
-                    be_short = entry_price * (1 - _fb_buf)
+                    _fb_buf = compute_breakeven_buffer_pct(spread_pct=fallback_profit_pos.get('spreadPct', 0.05), spread_level=fallback_profit_pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FB')
+                    _fb_be_ctx = compute_buffered_breakeven_price(fallback_profit_pos, buffer_pct=_fb_buf, reason='TRAIL_CLAMP_FB')
+                    be_long = _fb_be_ctx.get('price', entry_price)
+                    be_short = _fb_be_ctx.get('price', entry_price)
+                    fallback_profit_pos['trailDistance'] = trail_distance
+                    fallback_profit_pos['isTrailingActive'] = trail_state.get('isActive', False)
+                    fallback_profit_ladder = build_position_profit_ladder(fallback_profit_pos, current_price=candle_close_price)
+                    fallback_profit_authority = engine_pos is None
+
+                    if engine_pos:
+                        trail_state['isActive'] = bool(engine_pos.get('isTrailingActive', False))
+                        trail_state['trailingStop'] = _coerce_float(
+                            engine_pos.get('trailingStop', engine_pos.get('stopLoss', trail_state.get('trailingStop', sl))),
+                            trail_state.get('trailingStop', sl),
+                        )
+                        trail_state['peakPrice'] = _coerce_float(
+                            engine_pos.get('peakPrice', trail_state.get('peakPrice', current_price)),
+                            current_price,
+                        )
+                        trailing_stop = trail_state['trailingStop']
                     
-                    # Phase 231j: price_move >= 0.75 OR roi >= 5.0
-                    if not trail_state['isActive'] and (fb_price_move >= 0.75 or roi_pct >= 5.0):
+                    if fallback_profit_authority and not trail_state['isActive'] and should_activate_trailing_by_roi(
+                        roi_pct,
+                        _coerce_float(fallback_profit_ladder.get('breakeven_arm_roi_pct', 5.0), 5.0),
+                    ):
                         trail_state['isActive'] = True
                         trail_state['activatedAt'] = datetime.now().isoformat()
                         trail_state['peakPrice'] = current_price
-                        logger.info(f"🔄 TRAIL+BE(fallback): {symbol} pm={fb_price_move:.2f}% roi={roi_pct:.1f}%")
+                        logger.info(
+                            f"🔄 TRAIL+BE(fallback): {symbol} pm={fb_price_move:.2f}% roi={roi_pct:.1f}% "
+                            f"be_arm={fallback_profit_ladder.get('breakeven_arm_roi_pct', 0.0):.1f}%"
+                        )
                     
                     is_trailing_active = trail_state['isActive']
                     
                     # Update trailing stop if active
-                    if is_trailing_active:
+                    if fallback_profit_authority and is_trailing_active:
                         if side == 'LONG':
                             # Track peak price using candle close (Phase 205)
                             if candle_close_price > trail_state['peakPrice']:
@@ -2766,12 +3664,22 @@ class LiveBinanceTrader:
                             # LONG: candle close drops below trailing stop
                             if candle_close_price <= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} <= trail ${trailing_stop:.6f}"
+                                _fallback_reason = derive_profit_exit_reason(
+                                    fallback_profit_pos,
+                                    current_price=candle_close_price,
+                                    profit_ladder=fallback_profit_ladder,
+                                )
+                                close_reason = f"{_fallback_reason}: close ${candle_close_price:.6f} <= trail ${trailing_stop:.6f}"
                         else:  # SHORT
                             # SHORT: candle close rises above trailing stop
                             if candle_close_price >= trailing_stop:
                                 should_close = True
-                                close_reason = f"TRAIL_EXIT: close ${candle_close_price:.6f} >= trail ${trailing_stop:.6f}"
+                                _fallback_reason = derive_profit_exit_reason(
+                                    fallback_profit_pos,
+                                    current_price=candle_close_price,
+                                    profit_ladder=fallback_profit_ladder,
+                                )
+                                close_reason = f"{_fallback_reason}: close ${candle_close_price:.6f} >= trail ${trailing_stop:.6f}"
                         
                         # Phase 212: Duplicate Emergency SL removed — pre-guard version handles this
                         # (See L1527-1557 above)
@@ -2822,6 +3730,7 @@ class LiveBinanceTrader:
                         'contracts': position_amount,   # Phase 141: Binance-compatible field
                         'sizeUsd': notional,
                         'entryPrice': entry_price,
+                        'exchangeBreakEvenPrice': exchange_be_price,
                         'markPrice': mark_price,
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
@@ -5301,9 +6210,11 @@ class LiveBinanceTrader:
                     synced_count += 1
                     existing_ids.add(trade_id)
                     
-                    # Save to SQLite
+                    # Save raw Binance sync row; canonical trades are reconciled by exact IDs only.
                     try:
-                        safe_create_task(sqlite_manager.save_trade(trade))
+                        trade_for_sqlite = trade.copy()
+                        trade_for_sqlite['incomeId'] = trade_id
+                        safe_create_task(sqlite_manager.save_binance_trade(trade_for_sqlite))
                     except Exception as e:
                         logger.debug(f"SQLite sync save error: {e}")
             
@@ -6219,10 +7130,8 @@ async def binance_position_sync_loop():
                         if breakeven_actions.get('breakeven_activated') or breakeven_actions.get('breakeven_closed'):
                             logger.info(f"🔒 Breakeven: activated={breakeven_actions['breakeven_activated']}, closed={breakeven_actions['breakeven_closed']}")
                         
-                        # Check loss recovery trail conditions
-                        recovery_actions = await loss_recovery_trail_manager.check_positions(binance_positions, live_binance_trader)
-                        if recovery_actions.get('recovery_trail_activated') or recovery_actions.get('recovery_closed'):
-                            logger.info(f"🔄 Recovery: trail_activated={recovery_actions['recovery_trail_activated']}, closed={recovery_actions['recovery_closed']}")
+                        # ROI-first protection ladder is the sole recovery authority for open positions.
+                        # Legacy Binance-only recovery manager is kept for diagnostics only.
                 except Exception as mgr_err:
                     logger.warning(f"Position manager error: {mgr_err}")
                 
@@ -6361,6 +7270,7 @@ async def binance_position_sync_loop():
                             'sizeUsd': bp.get('sizeUsd', 0),
                             'entryPrice': entry_price,
                             'markPrice': bp.get('markPrice', entry_price),
+                            'exchangeBreakEvenPrice': float(bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', 0.0)) or 0.0),
                             'leverage': bp.get('leverage', 10),
                             'margin': bp.get('margin', 0),
                             'initialMargin': bp.get('margin', 0),
@@ -6504,6 +7414,9 @@ async def binance_position_sync_loop():
                                 else:
                                     logger.info(f"⏸️ SYNC_COOLDOWN: {symbol} skipping size sync ({30 - (datetime.now().timestamp() - partial_close_ts):.0f}s remaining)")
                                 pos['markPrice'] = bp.get('markPrice', pos.get('markPrice'))
+                                pos['exchangeBreakEvenPrice'] = float(
+                                    bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', pos.get('exchangeBreakEvenPrice', 0.0))) or 0.0
+                                )
                                 pos['unrealizedPnl'] = bp.get('unrealizedPnl', 0)
                                 pos['unrealizedPnlPercent'] = bp.get('unrealizedPnlPercent', 0)
                                 
@@ -6583,24 +7496,24 @@ async def binance_position_sync_loop():
                                         sync_price_move = ((entry_price - current_price_sync) / entry_price) * 100
                                     sync_roi = sync_price_move * sync_leverage
                                     
-                                    # Phase 231h: Only price_move check + breakeven on activation
-                                    sync_min_move = 0.75 * _sync_runner_live['trail_act_mult']
-                                    sync_min_roi = 5.0 * _sync_runner_live['trail_act_mult']
-                                    if (sync_price_move >= sync_min_move or sync_roi >= sync_min_roi) and not pos.get('isTrailingActive', False):
+                                    # ROI-first trail activation: use fallback sync only for non-ladder positions.
+                                    sync_min_roi = _coerce_float(pos.get('runtimeTrailActivationRoiPct', 0.0), 0.0)
+                                    if sync_min_roi <= 0:
+                                        sync_min_roi = 5.0 * _sync_runner_live['trail_act_mult']
+                                    if (
+                                        not uses_profit_ladder_authority(pos)
+                                        and should_activate_trailing_by_roi(sync_roi, sync_min_roi)
+                                        and not pos.get('isTrailingActive', False)
+                                    ):
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         # Breakeven on BOTH stopLoss AND trailingStop
-                                        if pos['side'] == 'LONG':
-                                            _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
-                                            _sync_buf = apply_runner_be_buffer(_sync_buf, _sync_runner_live)
-                                            be_price = entry_price * (1 + _sync_buf)
-                                            apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
-                                        else:
-                                            _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
-                                            _sync_buf = apply_runner_be_buffer(_sync_buf, _sync_runner_live)
-                                            be_price = entry_price * (1 - _sync_buf)
-                                            apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
-                                        logger.info(f"📊 TRAIL+BE(sync): {symbol} {pos['side']} price_move={sync_price_move:.2f}%, SL+Trail→breakeven")
+                                        _sync_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_SYNC')
+                                        _sync_buf = apply_runner_be_buffer(_sync_buf, _sync_runner_live)
+                                        _sync_be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=_sync_buf, reason='TRAIL_CLAMP_SYNC')
+                                        be_price = _sync_be_ctx.get('price', entry_price)
+                                        apply_sl_floor(pos, be_price, 'WS_SYNC_BE')
+                                        logger.info(f"📊 TRAIL+BE(sync-fallback): {symbol} {pos['side']} roi={sync_roi:.2f}% → breakeven")
                                 break
                 
                 # ================================================================
@@ -7784,7 +8697,19 @@ REJECT_ATTRIBUTION_ENABLED = False
 ENTRY_FORECAST_ENABLED = True  # Phase 262: Optimistic Entry Forecast v1
 EXIT_FORECAST_ENABLED = False  # Phase 262: Optimistic Exit Forecast v1 (Dark Launch)
 EXIT_FORECAST_HOLD_MIN_SEC = 20
-EXIT_FORECAST_BLOCK_REASONS = {'EMERGENCY_SL', 'KILL_SWITCH', 'PROTECTION_LOCK', 'SL_HIT', 'TP_HIT'}
+EXIT_FORECAST_BLOCK_REASONS = {
+    'EMERGENCY_SL',
+    'KILL_SWITCH',
+    'PROTECTION_LOCK',
+    'SL_HIT',
+    'TP_HIT',
+    'TP_FINAL_HIT',
+    'TRAIL_WIDE_EXIT',
+    'TRAIL_NORMAL_EXIT',
+    'TRAIL_TIGHT_EXIT',
+    'PROFIT_GIVEBACK_EXIT',
+    'RECLAIM_BE_CLOSE',
+}
 EXIT_FORECAST_MIN_HOLD_PROB = 0.62
 EXIT_FORECAST_MAX_DELAY_SEC = 45
 
@@ -8149,6 +9074,756 @@ def compute_sl_tp_levels(
     except Exception:
         _result['distance_truth'] = {}
     return _result
+
+
+def price_move_pct_to_roi_pct(price_move_pct: float, leverage: float) -> float:
+    """Convert raw price move percent to leveraged ROI percent."""
+    try:
+        return round(float(price_move_pct or 0.0) * max(1.0, float(leverage or 1.0)), 4)
+    except Exception:
+        return 0.0
+
+
+def price_distance_to_roi_pct(distance: float, entry_price: float, leverage: float) -> float:
+    """Convert absolute price distance to leveraged ROI percent."""
+    try:
+        safe_entry = float(entry_price or 0.0)
+        if safe_entry <= 0:
+            return 0.0
+        distance_pct = (float(distance or 0.0) / safe_entry) * 100.0
+        return price_move_pct_to_roi_pct(distance_pct, leverage)
+    except Exception:
+        return 0.0
+
+
+def compute_target_roi_pct(entry_price: float, target_price: float, side: str, leverage: float) -> float:
+    """Compute leveraged ROI target for a given target price."""
+    try:
+        safe_entry = float(entry_price or 0.0)
+        safe_target = float(target_price or 0.0)
+        safe_leverage = max(1.0, float(leverage or 1.0))
+        if safe_entry <= 0 or safe_target <= 0:
+            return 0.0
+        if str(side).upper() == 'SHORT':
+            move_pct = ((safe_entry - safe_target) / safe_entry) * 100.0
+        else:
+            move_pct = ((safe_target - safe_entry) / safe_entry) * 100.0
+        return round(move_pct * safe_leverage, 4)
+    except Exception:
+        return 0.0
+
+
+def compute_target_price_from_roi(entry_price: float, roi_pct: float, side: str, leverage: float) -> float:
+    """Invert leveraged ROI back into a price level."""
+    try:
+        safe_entry = float(entry_price or 0.0)
+        safe_roi = float(roi_pct or 0.0)
+        safe_leverage = max(1.0, float(leverage or 1.0))
+        if safe_entry <= 0:
+            return 0.0
+        move_pct = safe_roi / safe_leverage
+        if str(side).upper() == 'SHORT':
+            return round(safe_entry * (1.0 - (move_pct / 100.0)), 8)
+        return round(safe_entry * (1.0 + (move_pct / 100.0)), 8)
+    except Exception:
+        return 0.0
+
+
+def should_activate_trailing_by_roi(current_roi_pct: float, min_roi_pct: float) -> bool:
+    """Single-authority trail activation rule in leveraged ROI space."""
+    try:
+        return float(current_roi_pct or 0.0) >= max(0.0, float(min_roi_pct or 0.0))
+    except Exception:
+        return False
+
+
+PROTECTION_PRE_STOP_REDUCTION_CLOSE_PCT = 0.25
+RECOVERY_STAGE1_REDUCE_PCT = 0.20
+RECOVERY_STAGE2_REDUCE_PCT = 0.25
+RECOVERY_ARM_MIN_ROI_PCT = -35.0
+RECOVERY_STAGE1_PROGRESS = 0.35
+RECOVERY_STAGE2_PROGRESS = 0.55
+RECOVERY_TRAIL_GIVEBACK_CLOSE_PCT = 0.40
+ENTRY_STOP_SOFT_ROI_DEFAULT = -200.0
+ENTRY_STOP_HARD_ROI_DEFAULT = -250.0
+SIGNAL_INVALIDATION_REDUCE_PCT = 0.15
+REGIME_DETERIORATION_REDUCE_PCT = 0.10
+EXECUTION_RISK_REDUCE_PCT = 0.10
+FUNDING_DECAY_REDUCE_PCT = 0.10
+PROFIT_MATURITY_MIN_ROI_PCT = 8.0
+PROFIT_MATURITY_COST_MULT = 3.0
+PROFIT_BREAKEVEN_COST_MULT = 4.0
+PROFIT_TRAIL_WIDE_LOCK_RATIO = 0.22
+PROFIT_TRAIL_NORMAL_LOCK_RATIO = 0.38
+PROFIT_TRAIL_TIGHT_LOCK_RATIO = 0.58
+PROFIT_RUNNER_LOCK_RATIO = 0.68
+PROFIT_GIVEBACK_MIN_ROI_PCT = 6.0
+PROFIT_GIVEBACK_PEAK_MULT = 0.35
+LOSS_GATE_COOLDOWN_SEC = 90.0
+SIGNAL_INVALIDATION_CONFIRM_COUNT = 3
+SIGNAL_INVALIDATION_CONFIRM_WINDOW_SEC = 90.0
+SIGNAL_INVALIDATION_SCORE_DROP = 18.0
+SIGNAL_INVALIDATION_OPPOSITE_BUFFER = 8.0
+REGIME_SPREAD_MULT_THRESHOLD = 2.5
+REGIME_ATR_MULT_THRESHOLD = 1.8
+REGIME_DEPTH_DECAY_THRESHOLD = 0.5
+REGIME_IMBALANCE_THRESHOLD = 12.0
+EXECUTION_RISK_MIN_ROI_PCT = 12.0
+EXECUTION_RISK_MIN_DEPTH_COVER = 1.5
+FUNDING_DECAY_MIN_AGE_SEC = 8 * 60 * 60
+FUNDING_DECAY_CARRY_HARD_ROI_PCT = 10.0
+FUNDING_DECAY_CARRY_SOFT_ROI_PCT = 6.0
+FUNDING_DECAY_RECOVERY_LOOKBACK_SEC = 2 * 60 * 60
+MEANINGFUL_RECOVERY_ROI_PCT = 12.0
+SOFT_LOSS_GATE_PHASE_BY_REASON = {
+    'SIGNAL_INVALIDATION_REDUCE': 'INVALIDATION',
+    'REGIME_DETERIORATION_REDUCE': 'REGIME',
+    'EXECUTION_RISK_REDUCE': 'EXEC-RISK',
+    'FUNDING_DECAY_REDUCE': 'CARRY',
+}
+SPREAD_LEVEL_RANKS = {
+    'VERY LOW': 0,
+    'LOW': 1,
+    'NORMAL': 2,
+    'HIGH': 3,
+    'VERY HIGH': 4,
+    'EXTREME': 5,
+    'ULTRA': 6,
+}
+WIDE_SPREAD_LEVELS = {'VERY HIGH', 'EXTREME', 'ULTRA'}
+
+
+def _coerce_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else fallback
+    except Exception:
+        return fallback
+
+
+def _spread_level_rank(level: str) -> int:
+    return SPREAD_LEVEL_RANKS.get(str(level or '').strip().upper(), SPREAD_LEVEL_RANKS['NORMAL'])
+
+
+def _resolve_entry_depth_usd(pos: dict, current: bool = False) -> float:
+    signal_snapshot = pos.get('signal_snapshot', {}) if isinstance(pos.get('signal_snapshot'), dict) else {}
+    exec_snapshot = pos.get('exec_snapshot', {}) if isinstance(pos.get('exec_snapshot'), dict) else {}
+    if current:
+        candidates = (
+            pos.get('currentDepthUsd'),
+            pos.get('depthUsd'),
+            pos.get('depth_usd'),
+            pos.get('tradeabilityDepthUsd'),
+            exec_snapshot.get('depth_usd'),
+        )
+    else:
+        candidates = (
+            pos.get('entryDepthUsd'),
+            pos.get('entryDepthEstimateUsd'),
+            signal_snapshot.get('tradeabilityDepthUsd'),
+            signal_snapshot.get('depth_usd'),
+            exec_snapshot.get('depth_usd'),
+        )
+    for candidate in candidates:
+        resolved = _coerce_float(candidate, 0.0)
+        if resolved > 0:
+            return resolved
+    return 0.0
+
+
+def compute_carry_cost_roi_pct(pos: dict) -> float:
+    initial_margin = _coerce_float(pos.get('initialMargin', pos.get('marginUsd', 0.0)), 0.0)
+    leverage = max(1.0, _coerce_float(pos.get('leverage', 1), 1.0))
+    if initial_margin <= 0:
+        size_usd = _coerce_float(pos.get('sizeUsd', 0.0), 0.0)
+        initial_margin = size_usd / leverage if size_usd > 0 else 0.0
+    if initial_margin <= 0:
+        return 0.0
+    carry_value = abs(
+        _coerce_float(pos.get('accumulated_funding', 0.0), 0.0)
+        + _coerce_float(pos.get('estimatedFundingCost', 0.0), 0.0)
+    )
+    return round((carry_value / initial_margin) * 100.0, 4)
+
+
+def estimate_position_exit_risk_roi_pct(pos: dict, current_price: float = None) -> float:
+    spread_pct = _coerce_float(
+        pos.get('currentSpreadPct', pos.get('spreadPct', 0.05)),
+        _coerce_float(pos.get('spreadPct', 0.05), 0.05),
+    )
+    leverage = max(1, int(_coerce_float(pos.get('leverage', 1), 1)))
+    exec_snapshot = pos.get('exec_snapshot', {}) if isinstance(pos.get('exec_snapshot'), dict) else {}
+    spread_level = str(
+        pos.get(
+            'currentSpreadLevel',
+            pos.get(
+                'spreadLevel',
+                calculate_spread_level(
+                    atr_pct=_coerce_float(
+                        pos.get('currentAtrPct', pos.get('volatility_pct', 2.0)),
+                        2.0,
+                    )
+                ),
+            ),
+        )
+    ).upper()
+    projected_cost = estimate_trade_cost(
+        spread_pct=spread_pct,
+        leverage=leverage,
+        expected_hold_hours=0.5,
+        is_live=bool(pos.get('isLive', False)),
+    )
+    observed_slippage_pct = max(
+        abs(_coerce_float(pos.get('entry_slippage', pos.get('entrySlippage', 0.0)), 0.0)),
+        abs(_coerce_float(pos.get('exit_slippage', pos.get('exitSlippage', 0.0)), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('exit_slippage_p90', 0.0), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('rolling_exit_slippage_p90', 0.0), 0.0)),
+    )
+    observed_slippage_roi = price_move_pct_to_roi_pct(observed_slippage_pct, leverage)
+    stress_mult = 1.25 if spread_level in WIDE_SPREAD_LEVELS else 1.0
+    return round(max(projected_cost.get('roi_pct', 0.0) * stress_mult, observed_slippage_roi), 4)
+
+
+def compute_regime_deterioration_flags(pos: dict, current_price: float = None) -> list:
+    side = str(pos.get('side', 'LONG')).upper()
+    entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
+    safe_current_price = _coerce_float(
+        current_price if current_price is not None else pos.get('currentPrice', pos.get('markPrice', entry_price)),
+        entry_price,
+    )
+    entry_spread_pct = _coerce_float(pos.get('entrySpreadPct', pos.get('spreadPct', 0.05)), 0.05)
+    current_spread_pct = _coerce_float(pos.get('currentSpreadPct', pos.get('spreadPct', entry_spread_pct)), entry_spread_pct)
+    entry_atr_pct = _coerce_float(pos.get('entryAtrPct', pos.get('volatility_pct', 0.0)), 0.0)
+    if entry_atr_pct <= 0 and entry_price > 0:
+        entry_atr_pct = (_coerce_float(pos.get('atr', 0.0), 0.0) / entry_price) * 100.0
+    current_atr_pct = _coerce_float(pos.get('currentAtrPct', 0.0), 0.0)
+    if current_atr_pct <= 0 and safe_current_price > 0:
+        current_atr_pct = (_coerce_float(pos.get('atr', 0.0), 0.0) / safe_current_price) * 100.0
+
+    entry_spread_level = str(
+        pos.get(
+            'entrySpreadLevel',
+            pos.get('spreadLevel', calculate_spread_level(atr_pct=entry_atr_pct if entry_atr_pct > 0 else None)),
+        )
+    )
+    current_spread_level = str(
+        pos.get(
+            'currentSpreadLevel',
+            calculate_spread_level(
+                atr_pct=current_atr_pct if current_atr_pct > 0 else entry_atr_pct if entry_atr_pct > 0 else None
+            ),
+        )
+    )
+    entry_depth_usd = _resolve_entry_depth_usd(pos, current=False)
+    current_depth_usd = _resolve_entry_depth_usd(pos, current=True)
+    entry_imbalance = _coerce_float(pos.get('entryImbalance', pos.get('imbalance', 0.0)), 0.0)
+    current_imbalance = _coerce_float(pos.get('currentImbalance', pos.get('imbalance', entry_imbalance)), entry_imbalance)
+
+    flags = []
+    if entry_spread_pct > 0 and current_spread_pct >= entry_spread_pct * REGIME_SPREAD_MULT_THRESHOLD:
+        flags.append('spread_x2_5')
+    if _spread_level_rank(current_spread_level) >= (_spread_level_rank(entry_spread_level) + 2):
+        flags.append('spread_bucket_down2')
+    if entry_atr_pct > 0 and current_atr_pct >= entry_atr_pct * REGIME_ATR_MULT_THRESHOLD:
+        flags.append('atr_x1_8')
+    if entry_depth_usd > 0 and current_depth_usd > 0 and current_depth_usd <= entry_depth_usd * REGIME_DEPTH_DECAY_THRESHOLD:
+        flags.append('depth_half')
+    if abs(current_imbalance) >= REGIME_IMBALANCE_THRESHOLD:
+        if side == 'LONG' and current_imbalance <= -REGIME_IMBALANCE_THRESHOLD:
+            flags.append('imbalance_flip')
+        elif side == 'SHORT' and current_imbalance >= REGIME_IMBALANCE_THRESHOLD:
+            flags.append('imbalance_flip')
+    return flags
+
+
+def build_runtime_loss_gate_state(pos: dict) -> Dict[str, Any]:
+    now_ts = time.time()
+    last_action_ts = _coerce_float(pos.get('lastLossGateActionTs', 0.0), 0.0)
+    cooldown_remaining = 0
+    if last_action_ts > 0:
+        cooldown_remaining = max(0, int(math.ceil(LOSS_GATE_COOLDOWN_SEC - max(0.0, now_ts - last_action_ts))))
+    return {
+        'lastAction': str(pos.get('lastLossGateActionReason', '') or ''),
+        'lastActionTs': int(last_action_ts * 1000) if last_action_ts > 0 else 0,
+        'lastActionPhase': str(pos.get('lastLossGateActionPhase', '') or ''),
+        'lastActionDetail': str(pos.get('lastLossGateActionDetail', '') or ''),
+        'cooldownRemainingSec': cooldown_remaining,
+        'firedGates': {
+            'signalInvalidation': bool(pos.get('signalInvalidationReduced', False)),
+            'regimeDeterioration': bool(pos.get('regimeDeteriorationReduced', False)),
+            'executionRisk': bool(pos.get('executionRiskReduced', False)),
+            'fundingDecay': bool(pos.get('fundingDecayReduced', False)),
+        },
+    }
+
+
+def compute_position_roi_pct(pos: dict, current_price: float = None) -> float:
+    """Return current leveraged ROI for a position."""
+    try:
+        cached = pos.get('unrealizedPnlPercent')
+        if isinstance(cached, (int, float)) and math.isfinite(cached):
+            if cached != 0 or float(pos.get('unrealizedPnl', 0) or 0) == 0:
+                return float(cached)
+        entry_price = float(pos.get('entryPrice', 0) or 0)
+        if current_price is None:
+            current_price = pos.get('currentPrice', pos.get('markPrice', entry_price))
+        current_price = float(current_price or 0)
+        if entry_price <= 0 or current_price <= 0:
+            return 0.0
+        side = str(pos.get('side', 'LONG')).upper()
+        leverage = float(pos.get('leverage', 1) or 1)
+        if side == 'SHORT':
+            price_move_pct = ((entry_price - current_price) / entry_price) * 100.0
+        else:
+            price_move_pct = ((current_price - entry_price) / entry_price) * 100.0
+        return round(price_move_pct * max(1.0, leverage), 4)
+    except Exception:
+        return 0.0
+
+
+def normalize_tp_ladder_levels(pos: dict, levels: list = None) -> list:
+    """Return TP ladder levels with canonical ROI and price fields."""
+    entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
+    leverage = max(1.0, _coerce_float(pos.get('leverage', 1), 1.0))
+    side = str(pos.get('side', 'LONG')).upper()
+    price_map = pos.get('tp_ladder_prices', {}) if isinstance(pos.get('tp_ladder_prices'), dict) else {}
+    normalized = []
+    for raw_level in list(levels if levels is not None else pos.get('tp_ladder_levels', [])):
+        level = dict(raw_level or {})
+        key = str(level.get('key', '') or '')
+        price_pct = _coerce_float(level.get('price_pct', level.get('pct', 0.0)), 0.0)
+        roi_pct = _coerce_float(level.get('roi_pct', price_move_pct_to_roi_pct(price_pct, leverage)), 0.0)
+        target_price = _coerce_float(level.get('price', price_map.get(key, 0.0)), 0.0)
+        if target_price <= 0 and entry_price > 0:
+            target_price = compute_target_price_from_roi(entry_price, roi_pct, side, leverage)
+        level['pct'] = round(price_pct, 4)
+        level['price_pct'] = round(price_pct, 4)
+        level['roi_pct'] = round(roi_pct, 4)
+        level['price'] = round(target_price, 8) if target_price > 0 else 0.0
+        normalized.append(level)
+    return normalized
+
+
+def uses_profit_ladder_authority(pos: dict) -> bool:
+    """Return True when the canonical TP ladder owns profit exits for this position."""
+    if not TP_LADDER_ADAPTIVE_ENABLED:
+        return False
+    try:
+        return bool(normalize_tp_ladder_levels(pos))
+    except Exception:
+        return False
+
+
+def resolve_position_break_even_anchor(pos: dict) -> tuple[float, str]:
+    """Return the best available break-even anchor price and its source."""
+    exchange_be = _coerce_float(
+        pos.get('exchangeBreakEvenPrice', pos.get('breakEvenPrice', pos.get('exchange_break_even_price', 0.0))),
+        0.0,
+    )
+    entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
+    if exchange_be > 0:
+        return exchange_be, 'exchange'
+    return entry_price, 'entry'
+
+
+def compute_buffered_breakeven_price(pos: dict, buffer_pct: float = None, reason: str = 'BREAKEVEN') -> Dict[str, Any]:
+    """Build a tradeable breakeven floor around exchange/accounting break-even."""
+    anchor_price, anchor_source = resolve_position_break_even_anchor(pos)
+    side = str(pos.get('side', 'LONG')).upper()
+    symbol = str(pos.get('symbol', '') or '')
+    if anchor_price <= 0:
+        return {
+            'price': 0.0,
+            'anchor_price': 0.0,
+            'anchor_source': anchor_source,
+            'buffer_pct': 0.0,
+            'buffer_delta': 0.0,
+        }
+    resolved_buffer_pct = _coerce_float(
+        buffer_pct,
+        compute_breakeven_buffer_pct(
+            spread_pct=_coerce_float(pos.get('spreadPct', 0.05), 0.05),
+            spread_level=str(pos.get('spreadLevel', pos.get('spread_level', 'LOW')) or 'LOW'),
+            is_live=bool(pos.get('isLive', False)),
+            reason=reason,
+        ),
+    )
+    tick_size = get_tick_size(symbol)
+    safe_delta = ensure_tick_safe_buffer(anchor_price, resolved_buffer_pct, tick_size, side)
+    if side == 'SHORT':
+        price = snap_to_tick(anchor_price - safe_delta, tick_size, 'down')
+    else:
+        price = snap_to_tick(anchor_price + safe_delta, tick_size, 'up')
+    return {
+        'price': float(price or 0.0),
+        'anchor_price': anchor_price,
+        'anchor_source': anchor_source,
+        'buffer_pct': resolved_buffer_pct,
+        'buffer_delta': safe_delta,
+    }
+
+
+def get_effective_stop_price(pos: dict) -> float:
+    """Return the active technical stop price for the position."""
+    trailing_stop = float(pos.get('trailingStop', 0) or 0)
+    stop_loss = float(pos.get('stopLoss', 0) or 0)
+    if bool(pos.get('isTrailingActive', False)) and trailing_stop > 0:
+        return trailing_stop
+    return stop_loss if stop_loss > 0 else trailing_stop
+
+
+def build_position_profit_ladder(pos: dict, current_price: float = None) -> Dict[str, Any]:
+    """Build effective profit thresholds and owners in canonical ROI space."""
+    entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
+    leverage = max(1.0, _coerce_float(pos.get('leverage', 1), 1.0))
+    side = str(pos.get('side', 'LONG')).upper()
+    current_roi_pct = compute_position_roi_pct(pos, current_price=current_price)
+    spread_pct = _coerce_float(pos.get('spreadPct', 0.05), 0.05)
+    trade_cost = estimate_trade_cost(
+        spread_pct=spread_pct,
+        leverage=int(max(1.0, leverage)),
+        expected_hold_hours=max(0.5, _coerce_float(pos.get('expectedHoldHours', 0.0), 0.0) or 0.5),
+        is_live=bool(pos.get('isLive', False)),
+    )
+    cost_roi_pct = _coerce_float(trade_cost.get('roi_pct', 0.0), 0.0)
+    trail_activation_roi_pct = _coerce_float(
+        pos.get(
+            'runtimeTrailActivationRoiPct',
+            compute_target_roi_pct(entry_price, _coerce_float(pos.get('trailActivation', 0.0), 0.0), side, leverage),
+        ),
+        0.0,
+    )
+    trail_distance_roi_pct = _coerce_float(
+        pos.get(
+            'runtimeTrailDistanceRoiPct',
+            price_distance_to_roi_pct(_coerce_float(pos.get('trailDistance', 0.0), 0.0), entry_price, leverage),
+        ),
+        0.0,
+    )
+    maturity_floor_roi_pct = max(
+        PROFIT_MATURITY_MIN_ROI_PCT,
+        cost_roi_pct * PROFIT_MATURITY_COST_MULT,
+        trail_activation_roi_pct * 0.45,
+    )
+    tp_levels = normalize_tp_ladder_levels(pos)
+    tp_lookup = {str(level.get('key', '') or ''): level for level in tp_levels}
+    tp1_roi_pct = _coerce_float(tp_lookup.get('tp1', {}).get('roi_pct', 0.0), 0.0)
+    tp2_roi_pct = _coerce_float(tp_lookup.get('tp2', {}).get('roi_pct', 0.0), 0.0)
+    tp3_roi_pct = _coerce_float(tp_lookup.get('tp3', {}).get('roi_pct', 0.0), 0.0)
+    tp_final_roi_pct = _coerce_float(tp_lookup.get('tp_final', {}).get('roi_pct', 0.0), 0.0)
+    partial_tp_state = pos.get('partial_tp_state', {}) if isinstance(pos.get('partial_tp_state'), dict) else {}
+    hit_count = sum(1 for key in ('tp1', 'tp2', 'tp3') if bool(partial_tp_state.get(key, False)))
+
+    be_arm_roi_pct = max(
+        maturity_floor_roi_pct,
+        cost_roi_pct * PROFIT_BREAKEVEN_COST_MULT,
+        tp1_roi_pct * 0.75 if tp1_roi_pct > 0 else maturity_floor_roi_pct,
+    )
+    be_ctx = compute_buffered_breakeven_price(pos, reason='PROFIT_LADDER')
+    breakeven_floor_roi_pct = compute_target_roi_pct(entry_price, be_ctx.get('price', 0.0), side, leverage)
+
+    previous_peak = _coerce_float(pos.get('profitPeakRoiPct', 0.0), 0.0)
+    profit_peak_roi_pct = max(previous_peak, current_roi_pct if current_roi_pct > 0 else 0.0)
+    profit_giveback_roi_pct = max(0.0, profit_peak_roi_pct - max(current_roi_pct, 0.0))
+    profit_giveback_pct = (profit_giveback_roi_pct / profit_peak_roi_pct) if profit_peak_roi_pct > 0 else 0.0
+
+    phase = 'WAIT'
+    if current_roi_pct > 0:
+        if current_roi_pct < maturity_floor_roi_pct:
+            phase = 'MATURITY'
+        elif hit_count >= 2 or (tp3_roi_pct > 0 and current_roi_pct >= tp3_roi_pct):
+            phase = 'TIGHT_TRAIL'
+        elif hit_count >= 1 or (tp2_roi_pct > 0 and current_roi_pct >= tp2_roi_pct):
+            phase = 'NORMAL_TRAIL'
+        else:
+            phase = 'WIDE_TRAIL'
+        if tp_final_roi_pct > 0 and current_roi_pct >= tp_final_roi_pct:
+            phase = 'RUNNER'
+
+    if phase == 'WIDE_TRAIL':
+        lock_ratio = PROFIT_TRAIL_WIDE_LOCK_RATIO
+    elif phase == 'NORMAL_TRAIL':
+        lock_ratio = PROFIT_TRAIL_NORMAL_LOCK_RATIO
+    elif phase == 'TIGHT_TRAIL':
+        lock_ratio = PROFIT_TRAIL_TIGHT_LOCK_RATIO
+    elif phase == 'RUNNER':
+        lock_ratio = PROFIT_RUNNER_LOCK_RATIO
+    else:
+        lock_ratio = 0.0
+
+    profit_lock_roi_pct = None
+    profit_lock_price = 0.0
+    if lock_ratio > 0 and profit_peak_roi_pct > 0 and entry_price > 0:
+        raw_lock_roi = max(breakeven_floor_roi_pct, profit_peak_roi_pct * lock_ratio)
+        max_lock_roi = current_roi_pct - max(2.0, trail_distance_roi_pct * 0.40)
+        effective_lock_roi = min(raw_lock_roi, max_lock_roi) if current_roi_pct > 0 else raw_lock_roi
+        floor_lock_roi = max(breakeven_floor_roi_pct, effective_lock_roi)
+        if floor_lock_roi > 0:
+            profit_lock_roi_pct = round(floor_lock_roi, 4)
+            profit_lock_price = compute_target_price_from_roi(entry_price, profit_lock_roi_pct, side, leverage)
+
+    giveback_arm_roi_pct = max(
+        PROFIT_GIVEBACK_MIN_ROI_PCT,
+        trail_distance_roi_pct,
+        profit_peak_roi_pct * PROFIT_GIVEBACK_PEAK_MULT if profit_peak_roi_pct > 0 else 0.0,
+    )
+    giveback_trail_ready = bool(
+        current_roi_pct > 0
+        and not bool(pos.get('isTrailingActive', False))
+        and profit_peak_roi_pct >= max(trail_activation_roi_pct, maturity_floor_roi_pct * 1.35)
+        and profit_giveback_roi_pct >= giveback_arm_roi_pct
+    )
+
+    profit_owner = 'NONE'
+    if current_roi_pct > 0:
+        if bool(pos.get('isTrailingActive', False)):
+            profit_owner = phase
+        elif current_roi_pct >= be_arm_roi_pct:
+            profit_owner = 'BREAKEVEN'
+        else:
+            profit_owner = 'TP_LADDER'
+
+    return {
+        'current_profit_roi_pct': round(current_roi_pct, 4),
+        'maturity_floor_roi_pct': round(maturity_floor_roi_pct, 4),
+        'tp1_roi_pct': round(tp1_roi_pct, 4),
+        'tp2_roi_pct': round(tp2_roi_pct, 4),
+        'tp3_roi_pct': round(tp3_roi_pct, 4),
+        'tp_final_roi_pct': round(tp_final_roi_pct, 4),
+        'breakeven_arm_roi_pct': round(be_arm_roi_pct, 4),
+        'breakeven_floor_roi_pct': round(breakeven_floor_roi_pct, 4),
+        'exchange_break_even_price': round(_coerce_float(be_ctx.get('anchor_price', 0.0), 0.0), 8),
+        'breakeven_anchor_source': str(be_ctx.get('anchor_source', 'entry') or 'entry'),
+        'profit_peak_roi_pct': round(profit_peak_roi_pct, 4),
+        'profit_giveback_roi_pct': round(profit_giveback_roi_pct, 4),
+        'profit_giveback_pct': round(profit_giveback_pct, 4),
+        'profit_giveback_arm_roi_pct': round(giveback_arm_roi_pct, 4),
+        'profit_lock_roi_pct': round(profit_lock_roi_pct, 4) if profit_lock_roi_pct is not None else None,
+        'profit_lock_price': round(profit_lock_price, 8) if profit_lock_price > 0 else 0.0,
+        'profit_phase': phase,
+        'profit_owner': profit_owner,
+        'giveback_trail_ready': giveback_trail_ready,
+        'tp_levels': tp_levels,
+    }
+
+
+def derive_profit_exit_reason(
+    pos: dict,
+    current_price: float = None,
+    profit_ladder: Dict[str, Any] = None,
+) -> str:
+    """Return the canonical profit-side owner for a full profitable exit."""
+    ladder = profit_ladder or build_position_profit_ladder(pos, current_price=current_price)
+    giveback_ready = bool(ladder.get('giveback_trail_ready', False))
+    giveback_roi = _coerce_float(ladder.get('profit_giveback_roi_pct', 0.0), 0.0)
+    giveback_arm = _coerce_float(ladder.get('profit_giveback_arm_roi_pct', 0.0), 0.0)
+    profit_peak = _coerce_float(ladder.get('profit_peak_roi_pct', 0.0), 0.0)
+    maturity_floor = _coerce_float(ladder.get('maturity_floor_roi_pct', 0.0), 0.0)
+    if (
+        (giveback_ready or bool(pos.get('isTrailingActive', False)))
+        and profit_peak >= maturity_floor
+        and giveback_roi >= max(giveback_arm, PROFIT_GIVEBACK_MIN_ROI_PCT)
+    ):
+        return 'PROFIT_GIVEBACK_EXIT'
+
+    phase = str(ladder.get('profit_phase', 'WAIT') or 'WAIT').upper()
+    if phase == 'WIDE_TRAIL':
+        return 'TRAIL_WIDE_EXIT'
+    if phase == 'NORMAL_TRAIL':
+        return 'TRAIL_NORMAL_EXIT'
+    if phase in ('TIGHT_TRAIL', 'RUNNER'):
+        return 'TRAIL_TIGHT_EXIT'
+
+    owner = str(ladder.get('profit_owner', 'NONE') or 'NONE').upper()
+    if owner == 'BREAKEVEN':
+        return 'RECLAIM_BE_CLOSE'
+    return 'TRAIL_EXIT'
+
+
+def build_position_protection_ladder(
+    pos: dict,
+    user_first_reduction_roi: float,
+    user_full_close_roi: float,
+    current_price: float = None,
+    entry_stop_hard_roi: float = ENTRY_STOP_HARD_ROI_DEFAULT,
+) -> Dict[str, Any]:
+    """Build effective per-position protection thresholds in canonical ROI space."""
+    current_roi_pct = compute_position_roi_pct(pos, current_price=current_price)
+    entry_price = float(pos.get('entryPrice', 0) or 0)
+    leverage = float(pos.get('leverage', 1) or 1)
+    side = str(pos.get('side', 'LONG')).upper()
+    take_profit = float(pos.get('takeProfit', 0) or 0)
+    trail_activation = float(pos.get('trailActivation', 0) or 0)
+    trail_distance = float(pos.get('runtimeTrailDistance', pos.get('trailDistance', 0)) or 0)
+    effective_stop_price = get_effective_stop_price(pos)
+
+    target_tp_roi_pct = compute_target_roi_pct(entry_price, take_profit, side, leverage)
+    effective_stop_roi_pct = compute_target_roi_pct(entry_price, effective_stop_price, side, leverage)
+    trail_activation_roi_pct = float(
+        pos.get('runtimeTrailActivationRoiPct')
+        or compute_target_roi_pct(entry_price, trail_activation, side, leverage)
+    )
+    trail_distance_roi_pct = float(
+        pos.get('runtimeTrailDistanceRoiPct')
+        or price_distance_to_roi_pct(trail_distance, entry_price, leverage)
+    )
+
+    first_reduction_roi = max(-200.0, min(-20.0, float(user_first_reduction_roi or -100.0)))
+    full_close_roi = max(-250.0, min(-40.0, float(user_full_close_roi or -150.0)))
+    effective_entry_stop_hard_roi = max(
+        -320.0,
+        min(-80.0, float(pos.get('entryStopHardRoiPct', entry_stop_hard_roi) or entry_stop_hard_roi)),
+    )
+
+    pre_stop_reduce_roi_pct = None
+    kill_switch_full_roi_pct = None
+    recovery_arm_roi_pct = None
+    if effective_stop_roi_pct < 0:
+        pre_stop_reduce_roi_pct = max(first_reduction_roi, effective_stop_roi_pct * 0.60)
+        recovery_arm_roi_pct = min(RECOVERY_ARM_MIN_ROI_PCT, effective_stop_roi_pct * 0.50)
+        if effective_stop_roi_pct < effective_entry_stop_hard_roi:
+            kill_switch_full_roi_pct = full_close_roi
+
+    recovery_armed = bool(pos.get('recoveryArmed', False))
+    recovery_stage = int(pos.get('recoveryStage', 0) or 0)
+    recovery_worst_roi_pct = float(pos.get('recoveryWorstRoiPct', current_roi_pct) or current_roi_pct)
+    recovery_peak_roi_pct = float(pos.get('recoveryPeakRoiPct', current_roi_pct) or current_roi_pct)
+    recovery_trail_active = bool(pos.get('recoveryTrailActive', False))
+
+    recovery_progress = 0.0
+    if recovery_armed and recovery_worst_roi_pct < 0:
+        recovery_progress = max(0.0, (current_roi_pct - recovery_worst_roi_pct) / abs(recovery_worst_roi_pct))
+
+    recovery_giveback_pct = 0.0
+    if recovery_trail_active and recovery_peak_roi_pct > recovery_worst_roi_pct:
+        recovery_range = recovery_peak_roi_pct - recovery_worst_roi_pct
+        current_recovery = current_roi_pct - recovery_worst_roi_pct
+        if recovery_range > 0:
+            recovery_giveback_pct = max(0.0, 1.0 - (current_recovery / recovery_range))
+
+    loss_gate_state = build_runtime_loss_gate_state(pos)
+    soft_phase = str(loss_gate_state.get('lastActionPhase', '') or '')
+    time_recovery_active = any(bool(pos.get(key, False)) for key in (
+        'timeRecovery4HArmed',
+        'timeRecovery8HArmed',
+        'timeRecovery4HDone',
+        'timeRecovery8HDone',
+    ))
+    phase = 'SL-PRIMARY'
+    if current_roi_pct >= 0 and bool(pos.get('isTrailingActive', False)):
+        phase = 'TRAIL'
+    elif recovery_stage > 0 or recovery_armed or recovery_trail_active:
+        phase = 'RECOVERY'
+    elif time_recovery_active and current_roi_pct < 0:
+        phase = 'TIME-RECOVERY'
+    elif bool(pos.get('preStopReduced', False)):
+        phase = 'PRE-REDUCE'
+    elif soft_phase and current_roi_pct < 0:
+        phase = soft_phase
+    elif kill_switch_full_roi_pct is not None:
+        phase = 'KS-CAP'
+
+    carry_cost_roi_pct = compute_carry_cost_roi_pct(pos)
+    exit_risk_roi_pct = estimate_position_exit_risk_roi_pct(pos, current_price=current_price)
+    regime_flags = compute_regime_deterioration_flags(pos, current_price=current_price)
+    signal_invalidation_state = pos.get('runtimeSignalInvalidationState', {})
+    entry_stop_gate_mode = str(
+        pos.get(
+            'runtimeEntryStopGateMode',
+            pos.get('entryStopGateMode', 'normal'),
+        ) or 'normal'
+    )
+    entry_stop_roi_pct = _coerce_float(
+        pos.get('runtimeEntryStopRoiPct', pos.get('entryStopRoiPct', effective_stop_roi_pct)),
+        effective_stop_roi_pct,
+    )
+
+    return {
+        "current_roi_pct": round(current_roi_pct, 4),
+        "target_tp_roi_pct": round(target_tp_roi_pct, 4),
+        "effective_stop_roi_pct": round(effective_stop_roi_pct, 4),
+        "trail_activation_roi_pct": round(trail_activation_roi_pct, 4),
+        "trail_distance_roi_pct": round(trail_distance_roi_pct, 4),
+        "pre_stop_reduce_roi_pct": round(pre_stop_reduce_roi_pct, 4) if pre_stop_reduce_roi_pct is not None else None,
+        "kill_switch_full_roi_pct": round(kill_switch_full_roi_pct, 4) if kill_switch_full_roi_pct is not None else None,
+        "recovery_arm_roi_pct": round(recovery_arm_roi_pct, 4) if recovery_arm_roi_pct is not None else None,
+        "recovery_progress": round(recovery_progress, 4),
+        "recovery_giveback_pct": round(recovery_giveback_pct, 4),
+        "recovery_state": {
+            "armed": recovery_armed,
+            "stage": recovery_stage,
+            "worstRoiPct": round(recovery_worst_roi_pct, 4),
+            "peakRoiPct": round(recovery_peak_roi_pct, 4),
+            "progress": round(recovery_progress, 4),
+            "givebackPct": round(recovery_giveback_pct, 4),
+            "trailActive": recovery_trail_active,
+            "owner": "NORMAL_TRAIL" if current_roi_pct >= 0 and bool(pos.get('isTrailingActive', False)) else ("RECOVERY_TRAIL" if recovery_trail_active else "NONE"),
+        },
+        "entry_stop_gate_mode": entry_stop_gate_mode,
+        "entry_stop_roi_pct": round(entry_stop_roi_pct, 4),
+        "loss_gate_state": loss_gate_state,
+        "carry_cost_roi_pct": round(carry_cost_roi_pct, 4),
+        "exit_risk_roi_pct": round(exit_risk_roi_pct, 4),
+        "regime_flags": regime_flags,
+        "signal_invalidation_state": signal_invalidation_state if isinstance(signal_invalidation_state, dict) else {},
+        "protection_phase": phase,
+    }
+
+
+def update_runtime_protection_telemetry(
+    pos: dict,
+    current_price: float,
+    user_first_reduction_roi: float,
+    user_full_close_roi: float,
+    entry_stop_hard_roi: float = ENTRY_STOP_HARD_ROI_DEFAULT,
+) -> Dict[str, Any]:
+    """Persist effective protection ladder/runtime state for UI and decision layers."""
+    ladder = build_position_protection_ladder(
+        pos=pos,
+        user_first_reduction_roi=user_first_reduction_roi,
+        user_full_close_roi=user_full_close_roi,
+        current_price=current_price,
+        entry_stop_hard_roi=entry_stop_hard_roi,
+    )
+    profit_ladder = build_position_profit_ladder(pos=pos, current_price=current_price)
+    pos['runtimeTpRoiPct'] = ladder['target_tp_roi_pct']
+    pos['runtimeStopRoiPct'] = ladder['effective_stop_roi_pct']
+    pos['runtimeTrailActivationRoiPct'] = ladder['trail_activation_roi_pct']
+    pos['runtimeTrailDistanceRoiPct'] = ladder['trail_distance_roi_pct']
+    pos['runtimePreStopReduceRoiPct'] = ladder['pre_stop_reduce_roi_pct']
+    pos['runtimeKillSwitchFullRoiPct'] = ladder['kill_switch_full_roi_pct']
+    pos['runtimeRecoveryState'] = ladder['recovery_state']
+    pos['runtimeEntryStopGateMode'] = ladder['entry_stop_gate_mode']
+    pos['runtimeEntryStopRoiPct'] = ladder['entry_stop_roi_pct']
+    pos['runtimeLossGateState'] = ladder['loss_gate_state']
+    pos['runtimeCarryCostRoiPct'] = ladder['carry_cost_roi_pct']
+    pos['runtimeExitRiskRoiPct'] = ladder['exit_risk_roi_pct']
+    pos['runtimeRegimeFlags'] = ladder['regime_flags']
+    pos['runtimeSignalInvalidationState'] = ladder['signal_invalidation_state']
+    pos['runtimeProtectionPhase'] = ladder['protection_phase']
+    pos['runtimeTp1RoiPct'] = profit_ladder['tp1_roi_pct']
+    pos['runtimeTp2RoiPct'] = profit_ladder['tp2_roi_pct']
+    pos['runtimeTp3RoiPct'] = profit_ladder['tp3_roi_pct']
+    pos['runtimeTpFinalRoiPct'] = profit_ladder['tp_final_roi_pct']
+    pos['runtimeBreakevenArmRoiPct'] = profit_ladder['breakeven_arm_roi_pct']
+    pos['runtimeBreakevenFloorRoiPct'] = profit_ladder['breakeven_floor_roi_pct']
+    pos['runtimeExchangeBreakEvenPrice'] = profit_ladder['exchange_break_even_price']
+    pos['runtimeBreakevenAnchorSource'] = profit_ladder['breakeven_anchor_source']
+    pos['profitPeakRoiPct'] = profit_ladder['profit_peak_roi_pct']
+    pos['runtimeProfitPeakRoiPct'] = profit_ladder['profit_peak_roi_pct']
+    pos['runtimeProfitGivebackRoiPct'] = profit_ladder['profit_giveback_roi_pct']
+    pos['runtimeProfitGivebackPct'] = profit_ladder['profit_giveback_pct']
+    pos['runtimeProfitGivebackArmRoiPct'] = profit_ladder['profit_giveback_arm_roi_pct']
+    pos['runtimeProfitLockRoiPct'] = profit_ladder['profit_lock_roi_pct']
+    pos['runtimeProfitLockPrice'] = profit_ladder['profit_lock_price']
+    pos['runtimeProfitPhase'] = profit_ladder['profit_phase']
+    pos['runtimeProfitOwner'] = profit_ladder['profit_owner']
+    pos['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
+    pos['runtimeTpLevels'] = profit_ladder['tp_levels']
+    pos['runtimeGivebackTrailReady'] = profit_ladder['giveback_trail_ready']
+    merged = dict(ladder)
+    merged.update(profit_ladder)
+    return merged
 
 
 # =========================================================================
@@ -9900,7 +11575,12 @@ def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEG
     if explicit in V3_RUNNER_CONTEXT_CONFIGS:
         return explicit
 
-    if bool(data.get('recovery_mode', False)) or int(data.get('recoveryStage', data.get('recovery_stage', 0)) or 0) > 0:
+    runtime_recovery = data.get('runtimeRecoveryState', {}) or {}
+    if (
+        int(data.get('recoveryStage', data.get('recovery_stage', 0)) or 0) > 0
+        or bool(runtime_recovery.get('armed', False))
+        or bool(runtime_recovery.get('trailActive', False))
+    ):
         return V3_RUNNER_CONTEXT_RECOVERY
 
     side = str(data.get('side', data.get('action', '')) or '').upper()
@@ -10022,14 +11702,25 @@ def build_v3_runner_fallback_tp_ladder(
     safe_entry = max(float(entry_price or 0), 1e-8)
     safe_tick = get_tick_size("") if False else 0.0
     for level in raw_levels:
+        adjusted_pct = round(float(level.get('price_pct', level.get('pct', 0))) * float(tp_tighten), 4)
         levels.append({
             'key': level.get('key'),
-            'pct': round(float(level.get('pct', 0)) * float(tp_tighten), 4),
+            'pct': adjusted_pct,
+            'price_pct': adjusted_pct,
+            'roi_pct': round(price_move_pct_to_roi_pct(adjusted_pct, leverage), 4),
+            'price': 0.0,
             'close_pct': level.get('close_pct', 0),
         })
     last_pct = max(levels[-1].get('pct', 0), levels[-2].get('pct', 0) if len(levels) > 1 else 0)
     final_pct = round(max(last_pct * 1.35, last_pct + 0.25), 4)
-    levels.append({'key': 'tp_final', 'pct': final_pct, 'close_pct': 0.0})
+    levels.append({
+        'key': 'tp_final',
+        'pct': final_pct,
+        'price_pct': final_pct,
+        'roi_pct': round(price_move_pct_to_roi_pct(final_pct, leverage), 4),
+        'price': 0.0,
+        'close_pct': 0.0,
+    })
     levels = apply_runner_tp_close_split(levels, close_split)
     for level in levels:
         pct = float(level.get('pct', 0))
@@ -10037,9 +11728,10 @@ def build_v3_runner_fallback_tp_ladder(
             prices[level['key']] = round(safe_entry * (1 + pct / 100), 8)
         else:
             prices[level['key']] = round(safe_entry * (1 - pct / 100), 8)
+        level['price'] = prices[level['key']]
     return {
         "levels": levels,
-        "version": "v3-fallback-4tier",
+        "version": "v3-fallback-4tier-roi",
         "telemetry": {
             **base.get('telemetry', {}),
             "tp_tighten_mult": round(float(tp_tighten), 3),
@@ -10615,10 +12307,10 @@ def compute_adaptive_tp_ladder(
     exec_score: float = 70.0,
     spread_level: str = 'Normal',
 ) -> dict:
-    """Phase 250: Compute adaptive 3-tier TP ladder.
+    """Phase 250: Compute adaptive runner-friendly 4-tier TP ladder.
     
-    Base formula: atr_pct * spread_mult → tp1/tp2/tp3 with ROI floors.
-    Close ratios adapt: low quality → 50/30/20, strong trend → 30/30/40.
+    Base formula: atr_pct * spread_mult → tp1/tp2/tp3/tp_final with ROI floors.
+    Close ratios adapt: low quality → 25/20/15/40, strong trend → 15/15/20/50.
     Cost floor: each TP >= N× estimated trade cost.
     
     Returns:
@@ -10650,24 +12342,27 @@ def compute_adaptive_tp_ladder(
     base_tp_pct = atr_pct * s_mult
     
     # ── TP levels with leverage-normalized ROI floors ──
-    tp1_pct = max(base_tp_pct * 1.0, 8.0 / safe_lev)    # ~8% ROI minimum
-    tp2_pct = max(base_tp_pct * 2.0, 20.0 / safe_lev)   # ~20% ROI minimum
-    tp3_pct = max(base_tp_pct * 3.5, 40.0 / safe_lev)   # ~40% ROI minimum
+    tp1_pct = max(base_tp_pct * 1.0, 8.0 / safe_lev)      # ~8% ROI minimum
+    tp2_pct = max(base_tp_pct * 2.0, 20.0 / safe_lev)     # ~20% ROI minimum
+    tp3_pct = max(base_tp_pct * 3.5, 40.0 / safe_lev)     # ~40% ROI minimum
+    tp_final_pct = max(base_tp_pct * 5.0, 65.0 / safe_lev)  # runner target
     
     # ── Cost floor ──
     # Estimate: 2× taker fee (0.04%) + spread → minimum profitable move
     est_cost_pct = (0.04 * 2) + float(spread_pct or 0.05)
-    tp1_pct = max(tp1_pct, est_cost_pct * 2.0)   # TP1 >= 2× cost
-    tp2_pct = max(tp2_pct, est_cost_pct * 3.0)   # TP2 >= 3× cost
-    tp3_pct = max(tp3_pct, est_cost_pct * 4.0)   # TP3 >= 4× cost
-    
-    # Ensure ordering: tp1 < tp2 < tp3
+    tp1_pct = max(tp1_pct, est_cost_pct * 2.0)       # TP1 >= 2× cost
+    tp2_pct = max(tp2_pct, est_cost_pct * 3.0)       # TP2 >= 3× cost
+    tp3_pct = max(tp3_pct, est_cost_pct * 4.0)       # TP3 >= 4× cost
+    tp_final_pct = max(tp_final_pct, est_cost_pct * 5.5)  # Final runner >= 5.5× cost
+
+    # Ensure ordering: tp1 < tp2 < tp3 < tp_final
     tp2_pct = max(tp2_pct, tp1_pct * 1.3)
     tp3_pct = max(tp3_pct, tp2_pct * 1.3)
-    
+    tp_final_pct = max(tp_final_pct, tp3_pct * 1.25)
+
     # ── Adaptive close ratios ──
-    # Default: 40/30/30
-    close1, close2, close3 = 0.40, 0.30, 0.30
+    # Default: 20/20/15/45
+    close1, close2, close3, close4 = 0.20, 0.20, 0.15, 0.45
     
     # Check trend alignment
     trend_aligned = (
@@ -10675,43 +12370,64 @@ def compute_adaptive_tp_ladder(
         (side == 'SHORT' and coin_daily_trend in ('BEARISH', 'STRONG_BEARISH'))
     )
     
-    # Low quality → close more early (50/30/20)
+    # Low quality → de-risk earlier but keep a meaningful runner alive.
     if safe_exec < 60 or safe_vol_ratio < 0.9:
-        close1, close2, close3 = 0.50, 0.30, 0.20
-    # Strong aligned trend → hold more for TP3 (30/30/40)
+        close1, close2, close3, close4 = 0.25, 0.20, 0.15, 0.40
+    # Strong aligned trend → maximize runner tail.
     elif safe_adx > 30 and trend_aligned:
-        close1, close2, close3 = 0.30, 0.30, 0.40
-    
+        close1, close2, close3, close4 = 0.15, 0.15, 0.20, 0.50
+
     # Assert sum = 1.0
-    total = close1 + close2 + close3
-    close1, close2, close3 = close1/total, close2/total, close3/total
+    total = close1 + close2 + close3 + close4
+    close1, close2, close3, close4 = (
+        close1 / total,
+        close2 / total,
+        close3 / total,
+        close4 / total,
+    )
     
-    levels = [
-        {'key': 'tp1', 'pct': round(tp1_pct, 4), 'close_pct': round(close1, 2)},
-        {'key': 'tp2', 'pct': round(tp2_pct, 4), 'close_pct': round(close2, 2)},
-        {'key': 'tp3', 'pct': round(tp3_pct, 4), 'close_pct': round(close3, 2)},
-    ]
+    levels = []
+    for key, pct, close_pct in (
+        ('tp1', tp1_pct, close1),
+        ('tp2', tp2_pct, close2),
+        ('tp3', tp3_pct, close3),
+        ('tp_final', tp_final_pct, close4),
+    ):
+        roi_pct = price_move_pct_to_roi_pct(pct, safe_lev)
+        if side == 'LONG':
+            price = round(safe_entry * (1 + pct / 100.0), 8)
+        else:
+            price = round(safe_entry * (1 - pct / 100.0), 8)
+        levels.append({
+            'key': key,
+            'pct': round(pct, 4),
+            'price_pct': round(pct, 4),
+            'roi_pct': round(roi_pct, 4),
+            'price': price,
+            'close_pct': round(close_pct, 2),
+        })
     
     telemetry = {
         'atr_pct': round(atr_pct, 3),
         'spread_mult': s_mult,
         'base_tp_pct': round(base_tp_pct, 3),
         'cost_floor_pct': round(est_cost_pct, 4),
-        'close_split': f"{close1:.0%}/{close2:.0%}/{close3:.0%}",
+        'close_split': format_runner_close_split((close1, close2, close3, close4)),
         'trend_aligned': trend_aligned,
         'exec_score': safe_exec,
+        'tp_final_target_roi': round(price_move_pct_to_roi_pct(tp_final_pct, safe_lev), 3),
     }
     
     logger.info(
         f"📊 TP_LADDER_INIT: {side} entry={safe_entry:.4f} "
         f"tp1={tp1_pct:.3f}%({close1:.0%}) tp2={tp2_pct:.3f}%({close2:.0%}) "
-        f"tp3={tp3_pct:.3f}%({close3:.0%}) "
+        f"tp3={tp3_pct:.3f}%({close3:.0%}) tp_final={tp_final_pct:.3f}%({close4:.0%}) "
         f"base={base_tp_pct:.3f}% cost_floor={est_cost_pct:.4f}%"
     )
     
     return {
         'levels': levels,
-        'version': TP_LADDER_VERSION,
+        'version': "v3_roi_profit_ladder_4tier",
         'telemetry': telemetry,
     }
 
@@ -11625,10 +13341,12 @@ def update_runtime_trail_telemetry(
     try:
         safe_entry = float(entry_price or 0)
         safe_distance = float(dynamic_trail_distance or 0)
+        safe_leverage = float(pos.get('leverage', 1) or 1)
         distance_pct = (safe_distance / safe_entry * 100.0) if safe_entry > 0 else 0.0
         pos['effectiveExitTightness'] = round(float(effective_exit_tightness or 1.0), 3)
         pos['runtimeTrailDistance'] = round(safe_distance, 8)
         pos['runtimeTrailDistancePct'] = round(distance_pct, 4)
+        pos['runtimeTrailDistanceRoiPct'] = round(price_move_pct_to_roi_pct(distance_pct, safe_leverage), 2)
         pos['runtimeTrailActivationMovePct'] = round(float(min_price_move_pct or 0), 3)
         pos['runtimeTrailActivationRoiPct'] = round(float(min_roi_pct or 0), 2)
         pos['runtimeTrailThresholdMult'] = round(float(threshold_mult or 1.0), 3)
@@ -14222,10 +15940,15 @@ class UIStateCache:
         """Return complete UI state for WebSocket - instant, no API calls."""
         # Phase 259: Generate persistent signals array for UI
         persistent_signals = get_persistent_active_signals_snapshot()
-        
-        # Phase 259: Update activeSignals count to use persistent array length
         stats_copy = self.stats.copy()
-        stats_copy['activeSignals'] = len(persistent_signals)
+        persistent_long = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
+        persistent_short = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
+        stats_copy.setdefault('currentLongSignals', stats_copy.get('longSignals', 0))
+        stats_copy.setdefault('currentShortSignals', stats_copy.get('shortSignals', 0))
+        stats_copy.setdefault('currentActiveSignals', stats_copy.get('activeSignals', 0))
+        stats_copy['persistentLongSignals'] = persistent_long
+        stats_copy['persistentShortSignals'] = persistent_short
+        stats_copy['persistentActiveSignals'] = len(persistent_signals)
 
         return {
             "type": "scanner_update",
@@ -14257,6 +15980,49 @@ class UIStateCache:
 
 # Global UI State Cache instance
 ui_state_cache = UIStateCache()
+
+
+def _build_ui_signal_stats(opportunities: list, persistent_signals: list) -> dict:
+    """Build separate live/current and persistent signal counters for UI."""
+    current_long = sum(1 for o in opportunities if o.get('signalAction') == 'LONG')
+    current_short = sum(1 for o in opportunities if o.get('signalAction') == 'SHORT')
+    persistent_long = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
+    persistent_short = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
+    return {
+        "longSignals": current_long,
+        "shortSignals": current_short,
+        "activeSignals": current_long + current_short,
+        "currentLongSignals": current_long,
+        "currentShortSignals": current_short,
+        "currentActiveSignals": current_long + current_short,
+        "persistentLongSignals": persistent_long,
+        "persistentShortSignals": persistent_short,
+        "persistentActiveSignals": len(persistent_signals),
+    }
+
+
+def _resolve_live_positions_for_ui(prefer_cache: bool = False) -> tuple[list, str]:
+    """
+    Resolve live-mode positions for UI truth.
+
+    Once Binance sync has produced at least one snapshot, an empty Binance list is
+    authoritative and must not fall back to stale engine memory.
+    """
+    if prefer_cache and getattr(ui_state_cache, 'trading_mode', '') == 'live':
+        cached_positions = list(getattr(ui_state_cache, 'positions', []) or [])
+        if cached_positions:
+            return cached_positions, 'ui_cache'
+        if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
+            return [], 'ui_cache_empty'
+
+    binance_positions = list(getattr(live_binance_trader, 'last_positions', []) or [])
+    if binance_positions:
+        return binance_positions, 'binance_sync'
+    if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
+        return [], 'binance_sync_empty'
+
+    fallback_positions = [dict(p) for p in global_paper_trader.positions if p.get('isLive')]
+    return fallback_positions, 'engine_fallback'
 
 
 # ============================================================================
@@ -15199,11 +16965,8 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 _top150_symbols.add(opp.get('symbol'))
         ui_state_cache.opportunities = _top150
         
-        # Phase 263: Keep UI counters consistent with Active Signals tab.
-        # Long/Short/Active should come from persistent active signals, not opportunities.
         persistent_signals = get_persistent_active_signals_snapshot()
-        long_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
-        short_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
+        signal_stats = _build_ui_signal_stats(filtered_opportunities, persistent_signals)
         
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
@@ -15212,9 +16975,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
             "marketUniverseCoins": stats.get('marketUniverseCoins', len(multi_coin_scanner.coins)),
             "scannedCoins": stats.get('scannedCoins', len(ui_state_cache.opportunities)),
             "effectiveMaxCoins": stats.get('effectiveMaxCoins', len(ui_state_cache.opportunities)),
-            "longSignals": long_count,
-            "shortSignals": short_count,
-            "activeSignals": len(persistent_signals),
+            **signal_stats,
             "btcState": btc_filter.get_state(),
             "lastUpdate": datetime.now().timestamp()
         }
@@ -15235,9 +16996,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         "availableBalance": global_paper_trader.balance,
                         "unrealizedPnl": 0.0,
                     }
-                positions = list(getattr(live_binance_trader, 'last_positions', []) or [])
-                if not positions:
-                    positions = [dict(p) for p in global_paper_trader.positions if p.get('isLive')]
+                positions, position_source = _resolve_live_positions_for_ui()
                 
                 # Phase 155: Merge Binance positions with exit params from global_paper_trader
                 # global_paper_trader.positions has TP/SL/Trail data from sync loop
@@ -15261,6 +17020,23 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['effectiveExitTightness'] = paper_pos.get('effectiveExitTightness', global_paper_trader.exit_tightness)
                         merged['runtimeTrailDistance'] = paper_pos.get('runtimeTrailDistance', paper_pos.get('trailDistance', 0))
                         merged['runtimeTrailDistancePct'] = paper_pos.get('runtimeTrailDistancePct', 0.0)
+                        merged['runtimeTrailDistanceRoiPct'] = paper_pos.get(
+                            'runtimeTrailDistanceRoiPct',
+                            price_move_pct_to_roi_pct(paper_pos.get('runtimeTrailDistancePct', 0.0), paper_pos.get('leverage', bp.get('leverage', 1))),
+                        )
+                        merged['runtimeTpRoiPct'] = paper_pos.get('runtimeTpRoiPct', 0.0)
+                        merged['runtimeStopRoiPct'] = paper_pos.get('runtimeStopRoiPct', 0.0)
+                        merged['runtimeEntryStopGateMode'] = paper_pos.get('runtimeEntryStopGateMode', 'normal')
+                        merged['runtimeEntryStopRoiPct'] = paper_pos.get('runtimeEntryStopRoiPct', merged['runtimeStopRoiPct'])
+                        merged['runtimePreStopReduceRoiPct'] = paper_pos.get('runtimePreStopReduceRoiPct')
+                        merged['runtimeKillSwitchFullRoiPct'] = paper_pos.get('runtimeKillSwitchFullRoiPct')
+                        merged['runtimeRecoveryState'] = paper_pos.get('runtimeRecoveryState', {})
+                        merged['runtimeLossGateState'] = paper_pos.get('runtimeLossGateState', {})
+                        merged['runtimeCarryCostRoiPct'] = paper_pos.get('runtimeCarryCostRoiPct', 0.0)
+                        merged['runtimeExitRiskRoiPct'] = paper_pos.get('runtimeExitRiskRoiPct', 0.0)
+                        merged['runtimeRegimeFlags'] = paper_pos.get('runtimeRegimeFlags', [])
+                        merged['runtimeSignalInvalidationState'] = paper_pos.get('runtimeSignalInvalidationState', {})
+                        merged['runtimeProtectionPhase'] = paper_pos.get('runtimeProtectionPhase', 'SL-PRIMARY')
                         merged['runtimeTrailActivationMovePct'] = paper_pos.get('runtimeTrailActivationMovePct', 0.0)
                         merged['runtimeTrailActivationRoiPct'] = paper_pos.get('runtimeTrailActivationRoiPct', 0.0)
                         merged['runtimeTrailThresholdMult'] = paper_pos.get('runtimeTrailThresholdMult', 1.0)
@@ -15301,6 +17077,23 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['effectiveExitTightness'] = getattr(global_paper_trader, 'exit_tightness', 1.0)
                         merged['runtimeTrailDistance'] = merged.get('trailDistance', 0)
                         merged['runtimeTrailDistancePct'] = round((merged.get('trailDistance', 0) / entry * 100), 4) if entry > 0 else 0.0
+                        merged['runtimeTrailDistanceRoiPct'] = round(
+                            price_move_pct_to_roi_pct(merged.get('runtimeTrailDistancePct', 0.0), merged.get('leverage', 1)),
+                            2,
+                        )
+                        merged['runtimeTpRoiPct'] = compute_target_roi_pct(entry, merged.get('takeProfit', 0), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                        merged['runtimeStopRoiPct'] = compute_target_roi_pct(entry, get_effective_stop_price(merged), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                        merged['runtimeEntryStopGateMode'] = merged.get('entryStopGateMode', 'normal')
+                        merged['runtimeEntryStopRoiPct'] = merged['runtimeStopRoiPct']
+                        merged['runtimePreStopReduceRoiPct'] = None
+                        merged['runtimeKillSwitchFullRoiPct'] = None
+                        merged['runtimeRecoveryState'] = {}
+                        merged['runtimeLossGateState'] = {}
+                        merged['runtimeCarryCostRoiPct'] = 0.0
+                        merged['runtimeExitRiskRoiPct'] = 0.0
+                        merged['runtimeRegimeFlags'] = []
+                        merged['runtimeSignalInvalidationState'] = {}
+                        merged['runtimeProtectionPhase'] = 'SL-PRIMARY'
                         merged['runtimeTrailActivationMovePct'] = 0.0
                         merged['runtimeTrailActivationRoiPct'] = 0.0
                         merged['runtimeTrailThresholdMult'] = 1.0
@@ -15315,7 +17108,10 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 _deduped, _ = dedupe_trades_for_ui(global_paper_trader.trades)
                 ui_state_cache.trades = _deduped
                 ui_state_cache.trading_mode = "live"
-                logger.info(f"📊 UI Cache updated: {len(merged_positions)} positions, balance=${balance_data.get('walletBalance', 0):.2f}")
+                logger.info(
+                    f"📊 UI Cache updated: {len(merged_positions)} positions"
+                    f" source={position_source}, balance=${balance_data.get('walletBalance', 0):.2f}"
+                )
                 cached_pnl = getattr(live_binance_trader, 'cached_pnl', None)
                 if cached_pnl:
                     ui_state_cache.pnl_data = {
@@ -15823,6 +17619,7 @@ async def background_scanner_loop():
                             sl = pos.get('stopLoss', 0)
                             tp = pos.get('takeProfit', 0)
                             trailing_stop = pos.get('trailingStop', sl)
+                            profit_ladder = build_position_profit_ladder(pos, current_price=candle_close_price)
                             
                             # Phase 221: Breakeven SL varsa, trailing_stop'u breakeven seviyesinde tut
                             if pos.get('breakeven_activated', False) and sl > 0:
@@ -15833,53 +17630,34 @@ async def background_scanner_loop():
                                 apply_sl_floor(pos, trailing_stop, 'BE_CLAMP')
                             
                             # =========================================================
-                            # Phase 202: STEPPED SL LOCK for Trend Mode positions
-                            # Freqtrade custom_stoploss pattern — lock profits as they grow
+                            # ROI-first profit lock. Uses peak leveraged ROI and current
+                            # profit phase instead of raw price-percentage steps.
                             # =========================================================
-                            # Phase 221: Stepped SL tüm trail-aktif pozisyonlara uygulanır (was trend_mode only)
                             if pos.get('isTrailingActive', False) and entry_price > 0:
-                                if pos['side'] == 'LONG':
-                                    current_roi = (candle_close_price - entry_price) / entry_price * 100
-                                else:
-                                    current_roi = (entry_price - candle_close_price) / entry_price * 100
-                                
-                                stepped_sl = None
-                                if current_roi >= 10:
-                                    # Lock %7 profit
-                                    if pos['side'] == 'LONG':
-                                        stepped_sl = entry_price * 1.07
-                                    else:
-                                        stepped_sl = entry_price * 0.93
-                                elif current_roi >= 5:
-                                    # Lock %3 profit
-                                    if pos['side'] == 'LONG':
-                                        stepped_sl = entry_price * 1.03
-                                    else:
-                                        stepped_sl = entry_price * 0.97
-                                elif current_roi >= 2:
-                                    # Lock %1 profit
-                                    if pos['side'] == 'LONG':
-                                        stepped_sl = entry_price * 1.01
-                                    else:
-                                        stepped_sl = entry_price * 0.99
-                                elif current_roi >= 0.5:
-                                    # Breakeven lock
-                                    stepped_sl = entry_price
-                                
-                                if stepped_sl is not None:
-                                    # Only ratchet UP (LONG) or DOWN (SHORT) — never weaken
-                                    if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
+                                current_profit_roi = compute_position_roi_pct(pos, current_price=candle_close_price)
+                                profit_lock_price = _coerce_float(profit_ladder.get('profit_lock_price', 0.0), 0.0)
+                                profit_phase = str(profit_ladder.get('profit_phase', 'WAIT') or 'WAIT')
+                                if profit_lock_price > 0:
+                                    if pos['side'] == 'LONG' and profit_lock_price > trailing_stop:
                                         old_sl = trailing_stop
-                                        trailing_stop = stepped_sl
-                                        apply_sl_floor(pos, stepped_sl, 'STEPPED_SL')
-                                        if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
-                                            logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
-                                    elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
+                                        trailing_stop = profit_lock_price
+                                        apply_sl_floor(pos, profit_lock_price, f"PROFIT_LOCK_{profit_phase}")
+                                        if abs(old_sl - profit_lock_price) / entry_price * 100 > 0.5:
+                                            logger.info(
+                                                f"🔒 PROFIT_LOCK: {pos.get('symbol','?')} LONG phase={profit_phase} "
+                                                f"ROI={current_profit_roi:.1f}% peak={profit_ladder.get('profit_peak_roi_pct', 0.0):.1f}% "
+                                                f"SL ${old_sl:.6f} → ${profit_lock_price:.6f}"
+                                            )
+                                    elif pos['side'] == 'SHORT' and profit_lock_price < trailing_stop:
                                         old_sl = trailing_stop
-                                        trailing_stop = stepped_sl
-                                        apply_sl_floor(pos, stepped_sl, 'STEPPED_SL')
-                                        if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
-                                            logger.info(f"🔒 STEPPED_SL: {pos.get('symbol','?')} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
+                                        trailing_stop = profit_lock_price
+                                        apply_sl_floor(pos, profit_lock_price, f"PROFIT_LOCK_{profit_phase}")
+                                        if abs(old_sl - profit_lock_price) / entry_price * 100 > 0.5:
+                                            logger.info(
+                                                f"🔒 PROFIT_LOCK: {pos.get('symbol','?')} SHORT phase={profit_phase} "
+                                                f"ROI={current_profit_roi:.1f}% peak={profit_ladder.get('profit_peak_roi_pct', 0.0):.1f}% "
+                                                f"SL ${old_sl:.6f} → ${profit_lock_price:.6f}"
+                                            )
                             
                             # =========================================================
                             # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
@@ -15943,7 +17721,11 @@ async def background_scanner_loop():
                                         seconds=trail_breach_dur,
                                     )
                                     if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
-                                        reason = 'TRAIL_EXIT'
+                                        reason = derive_profit_exit_reason(
+                                            pos,
+                                            current_price=current_price,
+                                            profit_ladder=profit_ladder,
+                                        )
                                         logger.info(
                                             f"🔴 TRAIL EXIT (confirmed): {pos_symbol} {pos['side']} "
                                             f"| current=${current_price:.6f} close=${candle_close_price:.6f} trail=${trailing_stop:.6f} "
@@ -15980,25 +17762,29 @@ async def background_scanner_loop():
                                                     'order_id': limit_result['id'],
                                                     'placed_at': datetime.now().timestamp(),
                                                     'limit_price': trailing_stop,
-                                                    'reason': 'TRAIL_EXIT',
+                                                    'reason': reason,
                                                     'timeout_seconds': 45,
                                                 }
                                                 logger.warning(f"📙 TRAIL_LIMIT: {pos_symbol} {pos['side']} limit @ ${trailing_stop:.6f} (liquid coin, saves slippage)")
                                                 continue
                                             else:
                                                 logger.warning(f"📙 TRAIL_LIMIT_FAIL: {pos_symbol} limit failed, market close")
-                                                exit_engine.request_exit(pos, current_price, 'TRAIL_EXIT')
+                                                exit_engine.request_exit(pos, current_price, reason)
                                                 continue
                                         except Exception as e:
                                             logger.error(f"Trail limit error {pos_symbol}: {e}")
-                                            exit_engine.request_exit(pos, current_price, 'TRAIL_EXIT')
+                                            exit_engine.request_exit(pos, current_price, reason)
                                             continue
                                     else:
                                         # Illiquid coin or regular SL → market close (execution certainty)
                                         logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
                                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                                         pos_roi = pos.get('unrealizedPnlPercent', 0)
-                                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive', False) and pos_roi >= 0) else 'SL_HIT'
+                                        reason = (
+                                            derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder)
+                                            if (pos.get('isTrailingActive', False) and pos_roi >= 0)
+                                            else 'SL_HIT'
+                                        )
                                         exit_engine.request_exit(pos, current_price, reason)
                                         continue
                             else:
@@ -16024,7 +17810,7 @@ async def background_scanner_loop():
                             elif pos['side'] == 'SHORT' and candle_close_price <= tp:
                                 tp_hit = True
                             
-                            if tp_hit and not pos.get('pending_limit_close'):
+                            if tp_hit and not pos.get('pending_limit_close') and not uses_profit_ladder_authority(pos):
                                 # RMP-1: TP Cost-Floor Guard — check net ROI before TP fire
                                 _tp_cf = check_tp_cost_floor(pos, candle_close_price)
                                 _tp_cf_snap = (
@@ -16174,20 +17960,24 @@ async def background_scanner_loop():
                                 threshold_mult=threshold_mult,
                                 entry_price=entry_price,
                             )
+                            update_runtime_protection_telemetry(
+                                pos=pos,
+                                current_price=candle_close_price,
+                                user_first_reduction_roi=daily_kill_switch.first_reduction_pct,
+                                user_full_close_roi=daily_kill_switch.full_close_pct,
+                                entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                            )
                             
                             # Phase 231h → 238A: Dynamic fee buffer for breakeven
                             _sc_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP')
                             _sc_buf = apply_runner_be_buffer(_sc_buf, _runner_controls)
-                            be_long = entry_price * (1 + _sc_buf)
-                            be_short = entry_price * (1 - _sc_buf)
+                            _be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=_sc_buf, reason='TRAIL_CLAMP')
+                            be_long = _be_ctx.get('price', entry_price)
+                            be_short = _be_ctx.get('price', entry_price)
                             
                             if pos['side'] == 'LONG':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                # Hybrid rule: price_move >= min OR (roi >= min_roi AND price_move >= min*0.6)
-                                trail_should_activate = (
-                                    price_move_pct >= min_price_move_for_trail or
-                                    (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
-                                )
+                                trail_should_activate = should_activate_trailing_by_roi(roi_pct, min_roi_for_trail)
                                 if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                                     trail_should_activate = False
                                 if trail_should_activate or trail_already_active:
@@ -16204,10 +17994,7 @@ async def background_scanner_loop():
                                             logger.info(f"📊 TRAIL_DYN: {pos_symbol} LONG trail ON | move={price_move_pct:.2f}% roi={roi_pct:.1f}% | thresh: move>={min_price_move_for_trail:.2f}% roi>={min_roi_for_trail:.1f}% | vr={pos_vol_ratio:.1f} sp={pos_spread:.3f}% atr={pos_atr_pct:.1f}%")
                             elif pos['side'] == 'SHORT':
                                 trail_already_active = pos.get('isTrailingActive', False)
-                                trail_should_activate = (
-                                    price_move_pct >= min_price_move_for_trail or
-                                    (roi_pct >= min_roi_for_trail and price_move_pct >= min_price_move_for_trail * 0.6)
-                                )
+                                trail_should_activate = should_activate_trailing_by_roi(roi_pct, min_roi_for_trail)
                                 if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                                     trail_should_activate = False
                                 if trail_should_activate or trail_already_active:
@@ -16487,46 +18274,31 @@ async def on_position_price_update(symbol: str, ticker: dict):
         tp = pos.get('takeProfit', 0)
         trailing_stop = pos.get('trailingStop', sl)
         
-        # Phase 231i: Stepped SL for ALL trail-active positions (was trend_mode only)
-        # Aligned with scanner path (L7816) which already uses isTrailingActive
+        # ROI-first profit lock replaces the raw price% stepped SL path.
+        profit_ladder_ws = build_position_profit_ladder(pos, current_price=candle_close_price)
         if pos.get('isTrailingActive', False) and entry_price > 0:
-            if pos['side'] == 'LONG':
-                current_roi = (candle_close_price - entry_price) / entry_price * 100
-            else:
-                current_roi = (entry_price - candle_close_price) / entry_price * 100
-            
-            stepped_sl = None
-            if current_roi >= 10:
-                if pos['side'] == 'LONG':
-                    stepped_sl = entry_price * 1.07
-                else:
-                    stepped_sl = entry_price * 0.93
-            elif current_roi >= 5:
-                if pos['side'] == 'LONG':
-                    stepped_sl = entry_price * 1.03
-                else:
-                    stepped_sl = entry_price * 0.97
-            elif current_roi >= 2:
-                if pos['side'] == 'LONG':
-                    stepped_sl = entry_price * 1.01
-                else:
-                    stepped_sl = entry_price * 0.99
-            elif current_roi >= 0.5:
-                stepped_sl = entry_price
-            
-            if stepped_sl is not None:
-                if pos['side'] == 'LONG' and stepped_sl > trailing_stop:
+            profit_lock_price = _coerce_float(profit_ladder_ws.get('profit_lock_price', 0.0), 0.0)
+            profit_phase = str(profit_ladder_ws.get('profit_phase', 'WAIT') or 'WAIT')
+            current_profit_roi = _coerce_float(profit_ladder_ws.get('current_profit_roi_pct', 0.0), 0.0)
+            if profit_lock_price > 0:
+                if pos['side'] == 'LONG' and profit_lock_price > trailing_stop:
                     old_sl = trailing_stop
-                    trailing_stop = stepped_sl
-                    apply_sl_floor(pos, stepped_sl, 'STEPPED_SL_WS')
-                    if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
-                        logger.info(f"🔒 STEPPED_SL(WS): {symbol} LONG ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
-                elif pos['side'] == 'SHORT' and stepped_sl < trailing_stop:
+                    trailing_stop = profit_lock_price
+                    apply_sl_floor(pos, profit_lock_price, f'PROFIT_LOCK_{profit_phase}')
+                    if abs(old_sl - profit_lock_price) / entry_price * 100 > 0.5:
+                        logger.info(
+                            f"🔒 PROFIT_LOCK(WS): {symbol} LONG phase={profit_phase} "
+                            f"ROI={current_profit_roi:.1f}% | SL ${old_sl:.6f} → ${profit_lock_price:.6f}"
+                        )
+                elif pos['side'] == 'SHORT' and profit_lock_price < trailing_stop:
                     old_sl = trailing_stop
-                    trailing_stop = stepped_sl
-                    apply_sl_floor(pos, stepped_sl, 'STEPPED_SL_WS')
-                    if abs(old_sl - stepped_sl) / entry_price * 100 > 0.5:
-                        logger.info(f"🔒 STEPPED_SL(WS): {symbol} SHORT ROI={current_roi:.1f}% | SL ${old_sl:.6f} → ${stepped_sl:.6f}")
+                    trailing_stop = profit_lock_price
+                    apply_sl_floor(pos, profit_lock_price, f'PROFIT_LOCK_{profit_phase}')
+                    if abs(old_sl - profit_lock_price) / entry_price * 100 > 0.5:
+                        logger.info(
+                            f"🔒 PROFIT_LOCK(WS): {symbol} SHORT phase={profit_phase} "
+                            f"ROI={current_profit_roi:.1f}% | SL ${old_sl:.6f} → ${profit_lock_price:.6f}"
+                        )
         
         SL_CONFIRMATION_TICKS = 3
         SL_CONFIRMATION_SECONDS = 15
@@ -16578,7 +18350,8 @@ async def on_position_price_update(symbol: str, ticker: dict):
                     seconds=trail_breach_dur,
                 )
                 if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
-                    reason = 'TRAIL_EXIT'
+                    profit_ladder_ws = build_position_profit_ladder(pos, current_price=current_price)
+                    reason = derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder_ws)
                     logger.info(
                         f"🔴 TRAIL EXIT (confirmed, WS): {symbol} {pos['side']} "
                         f"| current=${current_price:.6f} close=${candle_close_price:.6f} trail=${trailing_stop:.6f} "
@@ -16601,7 +18374,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 continue
             elif breach_duration >= SL_MAX_WAIT_SECONDS:
                 # Phase 217: Sakin piyasada tick gelmese bile süre doldu
-                reason = 'TRAIL_EXIT' if pos.get('isTrailingActive', False) else 'SL_HIT'
+                profit_ladder_ws = build_position_profit_ladder(pos, current_price=current_price)
+                reason = (
+                    derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder_ws)
+                    if pos.get('isTrailingActive', False)
+                    else 'SL_HIT'
+                )
                 logger.info(f"🔴 SL TIMEOUT (WS): {symbol} @ ${current_price:.6f} | {breach_duration:.0f}s timeout")
                 exit_engine.request_exit(pos, current_price, reason)
                 continue
@@ -16618,12 +18396,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
         
         # TP Hit Check (Phase 268: use conservative exit price)
         # Phase 205: Use candle close for TP decision
-        if pos['side'] == 'LONG' and candle_close_price >= tp:
+        if pos['side'] == 'LONG' and candle_close_price >= tp and not uses_profit_ladder_authority(pos):
             tp_exit_price = min(candle_close_price, current_price)  # Phase 268: conservative
             exit_engine.request_exit(pos, tp_exit_price, 'TP_HIT')
             logger.info(f"✅ TP triggered (WS): LONG {symbol} @ ${tp_exit_price:.6f} (candle ${candle_close_price:.6f}, tick ${current_price:.6f})")
             continue
-        elif pos['side'] == 'SHORT' and candle_close_price <= tp:
+        elif pos['side'] == 'SHORT' and candle_close_price <= tp and not uses_profit_ladder_authority(pos):
             tp_exit_price = max(candle_close_price, current_price)  # Phase 268: conservative
             exit_engine.request_exit(pos, tp_exit_price, 'TP_HIT')
             logger.info(f"✅ TP triggered (WS): SHORT {symbol} @ ${tp_exit_price:.6f} (candle ${candle_close_price:.6f}, tick ${current_price:.6f})")
@@ -16709,20 +18487,24 @@ async def on_position_price_update(symbol: str, ticker: dict):
             threshold_mult=threshold_mult,
             entry_price=entry_price,
         )
+        update_runtime_protection_telemetry(
+            pos=pos,
+            current_price=candle_close_price,
+            user_first_reduction_roi=daily_kill_switch.first_reduction_pct,
+            user_full_close_roi=daily_kill_switch.full_close_pct,
+            entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+        )
         
         # Phase 231h → 238A: Dynamic fee buffer for breakeven
         _ws_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_WS')
         _ws_buf = apply_runner_be_buffer(_ws_buf, _runner_controls)
-        be_long = entry_price * (1 + _ws_buf)
-        be_short = entry_price * (1 - _ws_buf)
+        _ws_be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=_ws_buf, reason='TRAIL_CLAMP_WS')
+        be_long = _ws_be_ctx.get('price', entry_price)
+        be_short = _ws_be_ctx.get('price', entry_price)
         
         ws_trail_already_active = pos.get('isTrailingActive', False)
         if pos['side'] == 'LONG':
-            # Hybrid rule: price_move >= min OR (roi >= min_roi AND price_move >= min*0.6)
-            ws_should_activate = (
-                ws_price_move_pct >= ws_min_price_move or
-                (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
-            )
+            ws_should_activate = should_activate_trailing_by_roi(ws_roi_pct, ws_min_roi)
             if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                 ws_should_activate = False
             if ws_should_activate or ws_trail_already_active:
@@ -16737,10 +18519,7 @@ async def on_position_price_update(symbol: str, ticker: dict):
                         apply_sl_floor(pos, be_long, 'TRAIL_DYN_WS_BE')
                         logger.info(f"📊 TRAIL_DYN(WS): {pos.get('symbol')} LONG trail ON | move={ws_price_move_pct:.2f}% roi={ws_roi_pct:.1f}% | thresh: move>={ws_min_price_move:.2f}% roi>={ws_min_roi:.1f}% | vr={ws_vol_ratio:.1f} sp={ws_spread:.3f}%")
         elif pos['side'] == 'SHORT':
-            ws_should_activate = (
-                ws_price_move_pct >= ws_min_price_move or
-                (ws_roi_pct >= ws_min_roi and ws_price_move_pct >= ws_min_price_move * 0.6)
-            )
+            ws_should_activate = should_activate_trailing_by_roi(ws_roi_pct, ws_min_roi)
             if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                 ws_should_activate = False
             if ws_should_activate or ws_trail_already_active:
@@ -16973,19 +18752,24 @@ async def position_price_update_loop():
                             threshold_mult=threshold_mult,
                             entry_price=entry_price,
                         )
+                        update_runtime_protection_telemetry(
+                            pos=pos,
+                            current_price=current_price,
+                            user_first_reduction_roi=daily_kill_switch.first_reduction_pct,
+                            user_full_close_roi=daily_kill_switch.full_close_pct,
+                            entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                        )
                         
                         # Phase 231h → 238A: Dynamic fee buffer for breakeven
                         _fast_buf = compute_breakeven_buffer_pct(spread_pct=pos.get('spreadPct', 0.05), spread_level=pos.get('spreadLevel', 'Low'), reason='TRAIL_CLAMP_FAST')
                         _fast_buf = apply_runner_be_buffer(_fast_buf, _runner_controls)
-                        be_long = entry_price * (1 + _fast_buf)
-                        be_short = entry_price * (1 - _fast_buf)
+                        _fast_be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=_fast_buf, reason='TRAIL_CLAMP_FAST')
+                        be_long = _fast_be_ctx.get('price', entry_price)
+                        be_short = _fast_be_ctx.get('price', entry_price)
                         
                         fast_trail_already_active = pos.get('isTrailingActive', False)
                         if pos['side'] == 'LONG':
-                            fast_should_activate = (
-                                fast_price_move >= fast_min_price_move or
-                                (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
-                            )
+                            fast_should_activate = should_activate_trailing_by_roi(fast_roi, fast_min_roi)
                             if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                                 fast_should_activate = False
                             if fast_should_activate or fast_trail_already_active:
@@ -16999,10 +18783,7 @@ async def position_price_update_loop():
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
                                         apply_sl_floor(pos, be_long, 'TRAIL_DYN_FAST_BE')
                         elif pos['side'] == 'SHORT':
-                            fast_should_activate = (
-                                fast_price_move >= fast_min_price_move or
-                                (fast_roi >= fast_min_roi and fast_price_move >= fast_min_price_move * 0.6)
-                            )
+                            fast_should_activate = should_activate_trailing_by_roi(fast_roi, fast_min_roi)
                             if is_v3_trail_arm_pending(pos, default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)):
                                 fast_should_activate = False
                             if fast_should_activate or fast_trail_already_active:
@@ -17165,9 +18946,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Phase 127: Log signal processing entry for tracing
     logger.info(f"🔄 PROC_SIGNAL: Processing {symbol} {action} @ ${price:.4f}")
+
+    signal_id = signal.get('signalId') or signal.get('signal_id') or f"SIG_{symbol}_{int(datetime.now().timestamp() * 1000)}"
+    signal['signalId'] = signal_id
+    signal['signal_id'] = signal_id
     
     # Prepare signal data for logging
     signal_log_data = {
+        'signal_id': signal_id,
         'symbol': symbol,
         'action': action,
         'price': price,
@@ -17175,6 +18961,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'hurst': signal.get('hurst', 0),
         'atr': atr,
         'signal_score': signal.get('confidenceScore', 0),
+        'signal_score_raw': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
         'z_threshold': global_paper_trader.z_score_threshold,
         'min_confidence': global_paper_trader.min_confidence_score,
         'entry_tightness': global_paper_trader.entry_tightness,
@@ -17188,6 +18975,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'blacklisted': False,
         'obi_value': 0.0,  # Phase 211: OBI depth value (updated before save)
         'telemetry': signal.get('telemetry', {}), # Phase 211: Full parameter telemetry
+        'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', STRATEGY_MODE_LEGACY)),
+        'execution_profile_source': signal.get('execution_profile_source', 'neutral'),
+        'entry_quality': {
+            'pass': signal.get('entryQualityPass'),
+            'reasons': signal.get('entryQualityReasons', []),
+            'entry_price_backend': signal.get('entryPriceBackend', 0),
+        },
+        'risk_gate': signal.get('risk_gate', {}),
+        'signal_context': signal,
     }
     signal_memory_ctx = {
         "reinforce_count": 0,
@@ -20789,27 +22585,25 @@ stoploss_frequency_guard = StoplossFrequencyGuard()
 
 class PositionBasedKillSwitch:
     """
-    Dynamic Kill Switch - thresholds calculated per-position based on leverage.
-    
-    Base thresholds (at 10x leverage):
-    - First Reduction: -30% of invested margin → close 50% of position
-    - Full Close: -60% of invested margin → close entire position
-    
-    Leverage adjustment:
-    - Higher leverage (>10x): Looser thresholds (more room)
-    - Lower leverage (<10x): Tighter thresholds (less room)
-    
-    Formula: threshold = base_threshold * sqrt(leverage / 10)
-    - 25x leverage: -30% * sqrt(2.5) = -47% first, -95% full
-    - 10x leverage: -30% * 1.0 = -30% first, -60% full  
-    - 5x leverage: -30% * sqrt(0.5) = -21% first, -42% full
+    Position kill switch in leveraged ROI space.
+
+    User-configured thresholds are already comparable across leverage because
+    ROI = price_move_pct * leverage. We therefore keep thresholds canonical
+    and do not rescale them again by leverage.
     """
     
     def __init__(self, reduction_size: float = 0.5):
-        # Base thresholds at 10x leverage (reference point)
-        self.base_first_reduction = -30.0  # -30% of invested margin
-        self.base_full_close = -60.0       # -60% of invested margin
-        self.reduction_size = reduction_size  # 50% reduction at first level
+        # Defaults are leveraged ROI thresholds.
+        self.base_first_reduction = -100.0
+        self.base_full_close = -150.0
+        self.reduction_size = reduction_size  # Legacy compat; canonical ladder uses dedicated sizes
+        self.pre_stop_reduction_size = PROTECTION_PRE_STOP_REDUCTION_CLOSE_PCT
+        self.recovery_stage1_reduction_size = RECOVERY_STAGE1_REDUCE_PCT
+        self.recovery_stage2_reduction_size = RECOVERY_STAGE2_REDUCE_PCT
+        self.recovery_stage1_progress = RECOVERY_STAGE1_PROGRESS
+        self.recovery_stage2_progress = RECOVERY_STAGE2_PROGRESS
+        self.recovery_giveback_close_pct = RECOVERY_TRAIL_GIVEBACK_CLOSE_PCT
+        self.recovery_arm_min_roi_pct = RECOVERY_ARM_MIN_ROI_PCT
         
         # Track which positions have been partially closed
         self.partially_closed = {}  # {position_id: reduction_count}
@@ -20822,31 +22616,19 @@ class PositionBasedKillSwitch:
         self.first_reduction_pct = self.base_first_reduction
         self.full_close_pct = self.base_full_close
         
-        logger.info(f"🚨 Dynamic Kill Switch initialized: Base thresholds {self.base_first_reduction}%/{self.base_full_close}% (adjusted by leverage)")
+        logger.info(
+            f"🚨 ROI Kill Switch initialized: thresholds {self.base_first_reduction}%/{self.base_full_close}%"
+        )
     
     def get_dynamic_thresholds(self, leverage: int) -> tuple:
         """
-        Calculate dynamic thresholds based on position's leverage.
-        Phase 203: Leverage factor scaling removed. 
-        A 30% loss of invested margin is 30% regardless of leverage.
-        Returns strict Portfolio Margin Risk thresholds.
-        
-        Returns: (first_reduction_pct, full_close_pct)
+        Return canonical ROI thresholds.
+
+        Thresholds are stored and evaluated directly in leveraged ROI space, so
+        leverage is accepted for compatibility but not used for additional scaling.
         """
-        if leverage <= 0:
-            leverage = 10  # Default
-        
-        # Phase 244: Restore sqrt-based leverage scaling (was factor=1.0 in Phase 204)
-        # Higher leverage = looser threshold, lower leverage = tighter
-        factor = max(0.8, min(1.5, (leverage / 10.0) ** 0.5))
-        
-        first_reduction = self.first_reduction_pct * factor
-        full_close = self.full_close_pct * factor
-        
-        # Clamp to reasonable bounds
-        first_reduction = max(-150.0, min(-20.0, first_reduction))
-        full_close = max(-200.0, min(-40.0, full_close))
-        
+        first_reduction = max(-200.0, min(-20.0, float(self.first_reduction_pct)))
+        full_close = max(-250.0, min(-40.0, float(self.full_close_pct)))
         return (first_reduction, full_close)
 
     
@@ -20869,12 +22651,276 @@ class PositionBasedKillSwitch:
             except Exception:
                 self.partially_closed.clear()
             logger.info(f"📅 New trading day (Turkey): Starting balance ${current_balance:.2f}")
-    
+
+    @staticmethod
+    def _position_age_sec(pos: dict) -> float:
+        open_time_ms = float(pos.get('openTime', 0) or 0)
+        if open_time_ms <= 0:
+            return 999999.0
+        return max(0.0, time.time() - (open_time_ms / 1000.0))
+
+    def _sync_recovery_ladder(self, pos: dict, ladder: Dict[str, Any]) -> None:
+        recovery_state = ladder.get('recovery_state', {})
+        pos['runtimeRecoveryState'] = recovery_state
+        pos['runtimeProtectionPhase'] = ladder.get('protection_phase', 'SL-PRIMARY')
+        if ladder.get('recovery_arm_roi_pct') is not None:
+            pos['recoveryArmRoiPct'] = ladder.get('recovery_arm_roi_pct')
+
+    @staticmethod
+    def _cooldown_remaining_sec(pos: dict) -> int:
+        last_action_ts = _coerce_float(pos.get('lastLossGateActionTs', 0.0), 0.0)
+        if last_action_ts <= 0:
+            return 0
+        return max(0, int(math.ceil(LOSS_GATE_COOLDOWN_SEC - max(0.0, time.time() - last_action_ts))))
+
+    @staticmethod
+    def _soft_gate_flag_key(reason: str) -> str:
+        return {
+            'SIGNAL_INVALIDATION_REDUCE': 'signalInvalidationReduced',
+            'REGIME_DETERIORATION_REDUCE': 'regimeDeteriorationReduced',
+            'EXECUTION_RISK_REDUCE': 'executionRiskReduced',
+            'FUNDING_DECAY_REDUCE': 'fundingDecayReduced',
+        }.get(reason, '')
+
+    @staticmethod
+    def _runtime_phase_for_reason(reason: str) -> str:
+        return SOFT_LOSS_GATE_PHASE_BY_REASON.get(reason, 'SL-PRIMARY')
+
+    def _mark_loss_gate_action(self, pos: dict, reason: str, detail: str = "") -> None:
+        flag_key = self._soft_gate_flag_key(reason)
+        if flag_key:
+            pos[flag_key] = True
+        pos['lastLossGateActionTs'] = time.time()
+        pos['lastLossGateActionReason'] = reason
+        pos['lastLossGateActionPhase'] = self._runtime_phase_for_reason(reason)
+        pos['lastLossGateActionDetail'] = detail
+        pos['runtimeProtectionPhase'] = pos['lastLossGateActionPhase']
+        pos.setdefault('decision_trace', []).append({
+            't': int(time.time()),
+            'mgr': reason,
+            'roi': round(compute_position_roi_pct(pos), 1),
+            'detail': detail[:160] if detail else '',
+        })
+        pos['decision_trace'] = pos.get('decision_trace', [])[-20:]
+        pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
+
+    @staticmethod
+    def _refresh_underwater_recovery_memory(pos: dict, current_roi: float) -> None:
+        if current_roi >= 0:
+            pos.pop('underwaterWorstRoiPct', None)
+            pos['underwaterMeaningfulRecoveryTs'] = time.time()
+            return
+        worst_roi = min(
+            _coerce_float(pos.get('underwaterWorstRoiPct', current_roi), current_roi),
+            current_roi,
+        )
+        pos['underwaterWorstRoiPct'] = worst_roi
+        if (current_roi - worst_roi) >= MEANINGFUL_RECOVERY_ROI_PCT:
+            pos['underwaterMeaningfulRecoveryTs'] = time.time()
+
+    def _refresh_runtime_loss_gate_telemetry(self, pos: dict, current_price: float, current_roi: float) -> None:
+        self._refresh_underwater_recovery_memory(pos, current_roi)
+        pos['runtimeCarryCostRoiPct'] = compute_carry_cost_roi_pct(pos)
+        pos['runtimeExitRiskRoiPct'] = estimate_position_exit_risk_roi_pct(pos, current_price=current_price)
+        pos['runtimeRegimeFlags'] = compute_regime_deterioration_flags(pos, current_price=current_price)
+        if not isinstance(pos.get('runtimeSignalInvalidationState'), dict):
+            pos['runtimeSignalInvalidationState'] = {}
+        pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
+
+    def _evaluate_signal_invalidation_gate(self, pos: dict, current_roi: float) -> Optional[Dict[str, Any]]:
+        symbol = pos.get('symbol', '')
+        side = str(pos.get('side', 'LONG')).upper()
+        min_conf_floor = float(
+            pos.get(
+                'minConfidenceScoreSnapshot',
+                getattr(global_paper_trader, 'min_confidence_score', 74),
+            ) or getattr(global_paper_trader, 'min_confidence_score', 74)
+        )
+        entry_score = float(
+            pos.get(
+                'entrySignalScoreSnapshot',
+                pos.get('signalScoreRaw', pos.get('signalScore', 0)),
+            ) or pos.get('signalScoreRaw', pos.get('signalScore', 0))
+        )
+        now_ts = time.time()
+        active_sig = active_signals.get(symbol, {}) if 'active_signals' in globals() else {}
+        state = {
+            'mode': 'idle',
+            'activeSide': str(active_sig.get('side', '') or ''),
+            'currentScore': float(active_sig.get('score', 0) or 0),
+            'entryScore': round(entry_score, 2),
+            'floor': round(min_conf_floor, 2),
+            'oppositeCount': int(pos.get('lossGateOppositeCount', 0) or 0),
+            'persistenceSec': 0,
+            'scoreDrop': 0.0,
+            'triggerReady': False,
+        }
+
+        if not active_sig:
+            pos['lossGateOppositeCount'] = 0
+            pos['lossGateOppositeFirstTs'] = 0
+            pos['runtimeSignalInvalidationState'] = state
+            return None
+
+        sig_age = max(0.0, now_ts - _coerce_float(active_sig.get('last_refresh_ts', active_sig.get('created_ts', now_ts)), now_ts))
+        if sig_age > SIGNAL_INVALIDATION_CONFIRM_WINDOW_SEC:
+            pos['lossGateOppositeCount'] = 0
+            pos['lossGateOppositeFirstTs'] = 0
+            state['mode'] = 'stale'
+            state['signalAgeSec'] = round(sig_age, 1)
+            pos['runtimeSignalInvalidationState'] = state
+            return None
+
+        current_score = float(active_sig.get('score', 0) or 0)
+        active_side = str(active_sig.get('side', '') or '').upper()
+        state['signalAgeSec'] = round(sig_age, 1)
+
+        if active_side and active_side != side and current_score >= (min_conf_floor + SIGNAL_INVALIDATION_OPPOSITE_BUFFER):
+            first_ts = _coerce_float(pos.get('lossGateOppositeFirstTs', 0.0), 0.0)
+            if first_ts <= 0 or (now_ts - first_ts) > SIGNAL_INVALIDATION_CONFIRM_WINDOW_SEC:
+                pos['lossGateOppositeFirstTs'] = now_ts
+                pos['lossGateOppositeCount'] = 1
+            else:
+                pos['lossGateOppositeCount'] = int(pos.get('lossGateOppositeCount', 0) or 0) + 1
+            persistence_sec = max(0.0, now_ts - _coerce_float(pos.get('lossGateOppositeFirstTs', now_ts), now_ts))
+            state['mode'] = 'opposite_signal'
+            state['oppositeCount'] = int(pos.get('lossGateOppositeCount', 0) or 0)
+            state['persistenceSec'] = round(persistence_sec, 1)
+            state['triggerReady'] = state['oppositeCount'] >= SIGNAL_INVALIDATION_CONFIRM_COUNT
+            pos['runtimeSignalInvalidationState'] = state
+            if state['triggerReady']:
+                return {
+                    'reason': 'SIGNAL_INVALIDATION_REDUCE',
+                    'reduction_pct': SIGNAL_INVALIDATION_REDUCE_PCT,
+                    'trade_suffix': 'SIG_INV',
+                    'detail': (
+                        f"opposite={active_side} score={current_score:.1f} "
+                        f"count={state['oppositeCount']} age={persistence_sec:.0f}s"
+                    ),
+                }
+            return None
+
+        pos['lossGateOppositeCount'] = 0
+        pos['lossGateOppositeFirstTs'] = 0
+        score_drop = max(0.0, entry_score - current_score)
+        state['scoreDrop'] = round(score_drop, 2)
+        state['mode'] = 'score_follow'
+        if active_side == side and score_drop >= SIGNAL_INVALIDATION_SCORE_DROP and current_score < min_conf_floor:
+            state['mode'] = 'score_collapse'
+            state['triggerReady'] = True
+            pos['runtimeSignalInvalidationState'] = state
+            return {
+                'reason': 'SIGNAL_INVALIDATION_REDUCE',
+                'reduction_pct': SIGNAL_INVALIDATION_REDUCE_PCT,
+                'trade_suffix': 'SIG_COLLAPSE',
+                'detail': f"score_drop={score_drop:.1f} current={current_score:.1f} floor={min_conf_floor:.1f}",
+            }
+
+        pos['runtimeSignalInvalidationState'] = state
+        return None
+
+    def _evaluate_regime_deterioration_gate(self, pos: dict, current_price: float) -> Optional[Dict[str, Any]]:
+        flags = compute_regime_deterioration_flags(pos, current_price=current_price)
+        pos['runtimeRegimeFlags'] = flags
+        if len(flags) < 2:
+            return None
+        return {
+            'reason': 'REGIME_DETERIORATION_REDUCE',
+            'reduction_pct': REGIME_DETERIORATION_REDUCE_PCT,
+            'trade_suffix': 'REGIME',
+            'detail': ','.join(flags[:4]),
+        }
+
+    def _evaluate_execution_risk_gate(self, pos: dict, current_price: float) -> Optional[Dict[str, Any]]:
+        exit_risk_roi = estimate_position_exit_risk_roi_pct(pos, current_price=current_price)
+        pos['runtimeExitRiskRoiPct'] = exit_risk_roi
+        size_usd = max(1.0, _coerce_float(pos.get('sizeUsd', 0.0), 0.0))
+        current_depth_usd = _resolve_entry_depth_usd(pos, current=True)
+        depth_cover = (current_depth_usd / size_usd) if current_depth_usd > 0 else 0.0
+        spread_level = str(
+            pos.get(
+                'currentSpreadLevel',
+                calculate_spread_level(
+                    atr_pct=_coerce_float(
+                        pos.get('currentAtrPct', pos.get('volatility_pct', 2.0)),
+                        2.0,
+                    )
+                ),
+            )
+        ).upper()
+        exec_snapshot = pos.get('exec_snapshot', {}) if isinstance(pos.get('exec_snapshot'), dict) else {}
+        rolling_slippage_p90 = max(
+            abs(_coerce_float(exec_snapshot.get('rolling_exit_slippage_p90', 0.0), 0.0)),
+            abs(_coerce_float(exec_snapshot.get('exit_slippage_p90', 0.0), 0.0)),
+            abs(_coerce_float(pos.get('exit_slippage', 0.0), 0.0)),
+        )
+        if (
+            exit_risk_roi >= EXECUTION_RISK_MIN_ROI_PCT
+            or (depth_cover > 0 and depth_cover < EXECUTION_RISK_MIN_DEPTH_COVER)
+            or (spread_level in WIDE_SPREAD_LEVELS and rolling_slippage_p90 >= 0.60)
+        ):
+            detail_parts = [f"risk_roi={exit_risk_roi:.1f}"]
+            if depth_cover > 0:
+                detail_parts.append(f"depth_cover={depth_cover:.2f}x")
+            if rolling_slippage_p90 > 0:
+                detail_parts.append(f"slip_p90={rolling_slippage_p90:.2f}%")
+            return {
+                'reason': 'EXECUTION_RISK_REDUCE',
+                'reduction_pct': EXECUTION_RISK_REDUCE_PCT,
+                'trade_suffix': 'EXEC',
+                'detail': ' '.join(detail_parts),
+            }
+        return None
+
+    def _evaluate_funding_decay_gate(self, pos: dict, current_roi: float, age_sec: float) -> Optional[Dict[str, Any]]:
+        if age_sec < FUNDING_DECAY_MIN_AGE_SEC:
+            return None
+        carry_cost_roi_pct = compute_carry_cost_roi_pct(pos)
+        pos['runtimeCarryCostRoiPct'] = carry_cost_roi_pct
+        last_meaningful_recovery_ts = _coerce_float(pos.get('underwaterMeaningfulRecoveryTs', 0.0), 0.0)
+        stale_recovery = (
+            last_meaningful_recovery_ts <= 0
+            or (time.time() - last_meaningful_recovery_ts) >= FUNDING_DECAY_RECOVERY_LOOKBACK_SEC
+        )
+        if (
+            carry_cost_roi_pct >= FUNDING_DECAY_CARRY_HARD_ROI_PCT
+            or (carry_cost_roi_pct >= FUNDING_DECAY_CARRY_SOFT_ROI_PCT and stale_recovery)
+        ):
+            return {
+                'reason': 'FUNDING_DECAY_REDUCE',
+                'reduction_pct': FUNDING_DECAY_REDUCE_PCT,
+                'trade_suffix': 'CARRY',
+                'detail': (
+                    f"carry_roi={carry_cost_roi_pct:.1f} age_h={age_sec/3600.0:.1f} "
+                    f"stale_recovery={int(stale_recovery)}"
+                ),
+            }
+        return None
+
+    async def _apply_soft_gate_reduce(
+        self,
+        paper_trader,
+        pos: dict,
+        current_price: float,
+        gate: Dict[str, Any],
+    ) -> bool:
+        reason = str(gate.get('reason', '') or '')
+        detail = str(gate.get('detail', '') or '')
+        reduced = await self._reduce_position(
+            paper_trader,
+            pos,
+            current_price,
+            float(gate.get('reduction_pct', 0.0) or 0.0),
+            reason=reason,
+            trade_suffix=str(gate.get('trade_suffix', reason))[:24] or 'LOSS_GATE',
+        )
+        if reduced:
+            self._mark_loss_gate_action(pos, reason, detail)
+        return reduced
+
     async def check_positions(self, paper_trader) -> dict:
         """
-        Check all positions and apply gradual reduction or close.
-        Uses POSITION-BASED UNLEVERAGED LOSS percentage: (PnL / invested_margin) * 100
-        This means -10% threshold triggers when you've lost 10% of your invested capital.
+        Check all positions and apply gradual reduction or close in leveraged ROI space.
         Returns summary of actions taken.
         """
         self.reset_for_new_day(paper_trader.balance)
@@ -20887,14 +22933,12 @@ class PositionBasedKillSwitch:
         
         for pos in list(paper_trader.positions):
             try:
-                pos_id = pos.get('id', '')
                 symbol = pos.get('symbol', '')
                 side = pos.get('side', '')
-                entry_price = pos.get('entryPrice', 0)
-                current_price = pos.get('currentPrice', entry_price)
+                entry_price = float(pos.get('entryPrice', 0) or 0)
+                current_price = float(pos.get('currentPrice', pos.get('markPrice', entry_price)) or entry_price)
                 unrealized_pnl = pos.get('unrealizedPnl', 0)
                 
-                # Get invested margin (actual capital at risk, not leveraged size)
                 initial_margin = pos.get('initialMargin', 0)
                 leverage = pos.get('leverage', 10)
                 size_usd = pos.get('sizeUsd', 0)
@@ -20908,66 +22952,173 @@ class PositionBasedKillSwitch:
                     logger.warning(f"Kill switch: {symbol} has no margin data, skipping")
                     continue
                 
-                # Skip profitable positions (don't touch winners!)
-                if unrealized_pnl >= 0:
+                ladder = update_runtime_protection_telemetry(
+                    pos=pos,
+                    current_price=current_price,
+                    user_first_reduction_roi=self.first_reduction_pct,
+                    user_full_close_roi=self.full_close_pct,
+                    entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                )
+                self._sync_recovery_ladder(pos, ladder)
+                current_roi = float(ladder.get('current_roi_pct', 0.0) or 0.0)
+                age_sec = self._position_age_sec(pos)
+                self._refresh_runtime_loss_gate_telemetry(pos, current_price, current_roi)
+
+                # Skip profitable positions for loss-side ladder actions, but keep telemetry fresh.
+                if unrealized_pnl >= 0 or current_roi >= 0:
                     actions["skipped_profitable"].append(symbol)
+                    if current_roi >= 0 and pos.get('recoveryArmed', False):
+                        pos['recoveryTrailActive'] = False
+                        pos['runtimeProtectionPhase'] = 'TRAIL' if pos.get('isTrailingActive', False) else 'SL-PRIMARY'
                     continue
-                
-                # Phase 152: Use LEVERAGED ROI instead of unleveraged margin loss
-                # unrealizedPnlPercent is already leveraged (pnl / sizeUsd * 100 * leverage)
-                position_loss_pct = pos.get('unrealizedPnlPercent', 0)
-                # Phase 221: Fallback calculation for paper positions where unrealizedPnlPercent=0
-                if position_loss_pct == 0 and unrealized_pnl < 0 and initial_margin > 0:
-                    position_loss_pct = (unrealized_pnl / initial_margin) * 100
-                
-                # Get DYNAMIC thresholds based on this position's leverage
-                first_threshold, full_threshold = self.get_dynamic_thresholds(leverage)
-                
-                # Phase 222: Kill Switch must not trigger before SL
-                sl_price = pos.get('stopLoss', 0)
-                if sl_price > 0 and entry_price > 0:
-                    if side == 'LONG':
-                        sl_roi = ((sl_price - entry_price) / entry_price) * 100 * leverage
+
+                # New soft loss gates: one gate per cycle, one fire per gate, 90s cooldown.
+                if age_sec >= MIN_POSITION_MATURITY_SEC and not pos.get('_closing'):
+                    if self._cooldown_remaining_sec(pos) <= 0:
+                        soft_gate = None
+                        if not pos.get('signalInvalidationReduced', False):
+                            soft_gate = self._evaluate_signal_invalidation_gate(pos, current_roi)
+                        if soft_gate is None and not pos.get('regimeDeteriorationReduced', False):
+                            soft_gate = self._evaluate_regime_deterioration_gate(pos, current_price)
+                        if soft_gate is None and not pos.get('executionRiskReduced', False):
+                            soft_gate = self._evaluate_execution_risk_gate(pos, current_price)
+                        if soft_gate is None and not pos.get('fundingDecayReduced', False):
+                            soft_gate = self._evaluate_funding_decay_gate(pos, current_roi, age_sec)
+                        if soft_gate is not None:
+                            reduced = await self._apply_soft_gate_reduce(
+                                paper_trader,
+                                pos,
+                                current_price,
+                                soft_gate,
+                            )
+                            if reduced:
+                                actions["reduced"].append(
+                                    f"{symbol} {soft_gate['reason'].lower()} ({current_roi:.1f}%)"
+                                )
+                                logger.warning(
+                                    f"🪜 LOSS_GATE [{leverage}x]: {side} {symbol} {soft_gate['reason']} "
+                                    f"reduced {float(soft_gate['reduction_pct']) * 100:.0f}% | {soft_gate.get('detail', '')}"
+                                )
+                                continue
+
+                # Pre-stop reduction: always active before the technical stop.
+                pre_stop_reduce_roi = ladder.get('pre_stop_reduce_roi_pct')
+                if pre_stop_reduce_roi is not None and current_roi <= pre_stop_reduce_roi and not pos.get('preStopReduced', False):
+                    pos['preStopReduced'] = True
+                    await self._reduce_position(
+                        paper_trader,
+                        pos,
+                        current_price,
+                        self.pre_stop_reduction_size,
+                        reason='PRE_STOP_REDUCE',
+                        trade_suffix='PRE_STOP',
+                    )
+                    actions["reduced"].append(f"{symbol} pre-stop ({current_roi:.1f}%)")
+                    logger.warning(
+                        f"🛡️ PRE_STOP_REDUCE [{leverage}x]: {side} {symbol} reduced {self.pre_stop_reduction_size*100:.0f}% "
+                        f"at ROI {current_roi:.1f}% (threshold: {pre_stop_reduce_roi:.0f}%)"
+                    )
+                    continue
+
+                # Recovery arm and staged reductions.
+                recovery_arm_roi = ladder.get('recovery_arm_roi_pct')
+                if recovery_arm_roi is not None and age_sec >= MIN_POSITION_MATURITY_SEC and current_roi <= recovery_arm_roi:
+                    if not pos.get('recoveryArmed', False):
+                        pos['recoveryArmed'] = True
+                        pos['recoveryWorstRoiPct'] = current_roi
+                        pos['recoveryPeakRoiPct'] = current_roi
                     else:
-                        sl_roi = ((entry_price - sl_price) / entry_price) * 100 * leverage
-                    # SL ROI is negative for losses — if SL would close at a tighter loss than kill switch, let SL handle it
-                    if -sl_roi > -full_threshold:
-                        continue
-                
-                # Log for debugging with dynamic thresholds
-                logger.info(f"🎯 Kill switch check {symbol} [{leverage}x]: ROI={position_loss_pct:.1f}% | Thresholds: {first_threshold:.0f}%/{full_threshold:.0f}%")
-                
-                # Check loss thresholds using POSITION LOSS with DYNAMIC thresholds
-                if position_loss_pct <= full_threshold:
-                    # Full close threshold reached
+                        pos['recoveryWorstRoiPct'] = min(float(pos.get('recoveryWorstRoiPct', current_roi) or current_roi), current_roi)
+
+                if pos.get('recoveryArmed', False):
+                    pos['recoveryWorstRoiPct'] = min(float(pos.get('recoveryWorstRoiPct', current_roi) or current_roi), current_roi)
+                    pos['recoveryPeakRoiPct'] = max(float(pos.get('recoveryPeakRoiPct', current_roi) or current_roi), current_roi)
+                    ladder = update_runtime_protection_telemetry(
+                        pos=pos,
+                        current_price=current_price,
+                        user_first_reduction_roi=self.first_reduction_pct,
+                        user_full_close_roi=self.full_close_pct,
+                        entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                    )
+                    self._sync_recovery_ladder(pos, ladder)
+                    recovery_progress = float(ladder.get('recovery_progress', 0.0) or 0.0)
+                    recovery_stage = int(pos.get('recoveryStage', 0) or 0)
+
+                    if recovery_stage < 1 and recovery_progress >= self.recovery_stage1_progress:
+                        reduced = await self._reduce_position(
+                            paper_trader,
+                            pos,
+                            current_price,
+                            self.recovery_stage1_reduction_size,
+                            reason='RECOVERY_REDUCE_STAGE1',
+                            trade_suffix='RECOVERY_S1',
+                        )
+                        if reduced:
+                            pos['recoveryStage'] = 1
+                            actions["reduced"].append(f"{symbol} recovery_s1 ({current_roi:.1f}%)")
+                            continue
+
+                    recovery_stage = int(pos.get('recoveryStage', 0) or 0)
+                    if recovery_stage < 2 and recovery_progress >= self.recovery_stage2_progress:
+                        reduced = await self._reduce_position(
+                            paper_trader,
+                            pos,
+                            current_price,
+                            self.recovery_stage2_reduction_size,
+                            reason='RECOVERY_REDUCE_STAGE2',
+                            trade_suffix='RECOVERY_S2',
+                        )
+                        if reduced:
+                            pos['recoveryStage'] = 2
+                            pos['recoveryTrailActive'] = True
+                            pos['recoveryPeakRoiPct'] = current_roi
+                            actions["reduced"].append(f"{symbol} recovery_s2 ({current_roi:.1f}%)")
+                            continue
+
+                    if pos.get('recoveryTrailActive', False):
+                        pos['recoveryPeakRoiPct'] = max(float(pos.get('recoveryPeakRoiPct', current_roi) or current_roi), current_roi)
+                        ladder = update_runtime_protection_telemetry(
+                            pos=pos,
+                            current_price=current_price,
+                            user_first_reduction_roi=self.first_reduction_pct,
+                            user_full_close_roi=self.full_close_pct,
+                            entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                        )
+                        self._sync_recovery_ladder(pos, ladder)
+                        giveback_pct = float(ladder.get('recovery_giveback_pct', 0.0) or 0.0)
+                        if current_roi < 0 and giveback_pct >= self.recovery_giveback_close_pct:
+                            paper_trader.close_via_engine(pos, current_price, 'RECOVERY_TRAIL_CLOSE', 'RECOVERY')
+                            actions["closed"].append(f"{symbol} recovery_trail ({current_roi:.1f}%)")
+                            logger.warning(
+                                f"🔄 RECOVERY_TRAIL_CLOSE [{leverage}x]: {side} {symbol} ROI={current_roi:.1f}% giveback={giveback_pct*100:.0f}%"
+                            )
+                            continue
+
+                # Full close cap only when the technical stop is wider than user max tolerated ROI.
+                full_threshold = ladder.get('kill_switch_full_roi_pct')
+                if full_threshold is not None and current_roi <= full_threshold:
                     paper_trader.close_via_engine(pos, current_price, 'KILL_SWITCH_FULL', 'KILL_SWITCH')
-                    # Note: close_position already handles Binance close for isLive positions
-                    actions["closed"].append(f"{symbol} ({position_loss_pct:.1f}%)")
-                    logger.warning(f"🚨 KILL SWITCH FULL [{leverage}x]: Closed {side} {symbol} at {position_loss_pct:.1f}% loss (threshold: {full_threshold:.0f}%)")
-                    # Phase 48: Record fault for this coin
+                    actions["closed"].append(f"{symbol} ({current_roi:.1f}%)")
+                    logger.warning(
+                        f"🚨 KILL SWITCH FULL [{leverage}x]: Closed {side} {symbol} at {current_roi:.1f}% loss "
+                        f"(threshold: {full_threshold:.0f}%)"
+                    )
                     kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_FULL')
-                    
-                elif position_loss_pct <= first_threshold:
-                    # First reduction threshold - close 50% (only once per position)
-                    already_reduced = pos.get('kill_switch_reduced', False)
-                    
-                    if not already_reduced:
-                        # First reduction - close 50%
-                        pos['kill_switch_reduced'] = True  # Mark as reduced
-                        await self._reduce_position(paper_trader, pos, current_price, self.reduction_size)
-                        self.partially_closed[pos_id] = 1  # Keep for backwards compat
-                        actions["reduced"].append(f"{symbol} ({position_loss_pct:.1f}%)")
-                        logger.warning(f"⚠️ KILL SWITCH REDUCE [{leverage}x]: Reduced {side} {symbol} by 50% at {position_loss_pct:.1f}% loss (threshold: {first_threshold:.0f}%)")
-                        # Phase 48: Record fault for this coin
-                        kill_switch_fault_tracker.record_fault(symbol, 'KILL_SWITCH_PARTIAL')
-                    # If already_reduced, wait for full_threshold to trigger
                         
             except Exception as e:
                 logger.error(f"Kill switch check error for {pos.get('symbol', 'unknown')}: {e}")
         
         return actions
     
-    async def _reduce_position(self, paper_trader, pos: dict, current_price: float, reduction_pct: float):
+    async def _reduce_position(
+        self,
+        paper_trader,
+        pos: dict,
+        current_price: float,
+        reduction_pct: float,
+        reason: str = 'KILL_SWITCH_PARTIAL',
+        trade_suffix: str = 'PARTIAL',
+    ) -> bool:
         """
         Reduce position size by specified percentage.
         Records partial close in trade history.
@@ -20978,6 +23129,8 @@ class PositionBasedKillSwitch:
         original_size_usd = pos.get('sizeUsd', 0)
         reduction_size = original_size * reduction_pct
         reduction_size_usd = original_size_usd * reduction_pct
+        if reduction_size <= 0 or reduction_size_usd <= 0:
+            return False
         
         # Calculate PnL for the reduced portion
         entry_price = pos.get('entryPrice', current_price)
@@ -20990,7 +23143,9 @@ class PositionBasedKillSwitch:
             price_diff = entry_price - current_price
         
         pnl = reduction_size * price_diff
-        pnl_pct = (price_diff / entry_price) * 100 if entry_price > 0 else 0
+        leverage = pos.get('leverage', 10)
+        reduction_initial_margin = reduction_size_usd / leverage if leverage > 0 else reduction_size_usd
+        pnl_pct = (pnl / reduction_initial_margin * 100) if reduction_initial_margin > 0 else 0
         
         # LIVE positions: Execute actual Binance partial close
         if pos.get('isLive', False) and reduction_size > 0:
@@ -21011,36 +23166,59 @@ class PositionBasedKillSwitch:
         
         # Update balance with initial margin portion + PnL
         # Initial Margin = sizeUsd / leverage
-        leverage = pos.get('leverage', 10)
-        reduction_initial_margin = reduction_size_usd / leverage
         paper_trader.balance += reduction_initial_margin + pnl
         
         # Update position with reduced size
         pos['size'] = original_size - reduction_size
+        if 'contracts' in pos:
+            pos['contracts'] = pos['size']
         pos['sizeUsd'] = original_size_usd - reduction_size_usd
         # Update initialMargin proportionally
         if 'initialMargin' in pos:
             pos['initialMargin'] = pos['initialMargin'] * (1 - reduction_pct)
-        
+        pos['runtimeProtectionPhase'] = SOFT_LOSS_GATE_PHASE_BY_REASON.get(
+            reason,
+            'PRE-REDUCE' if reason == 'PRE_STOP_REDUCE' else 'RECOVERY'
+        )
+        pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
+
         # Record partial close in trade history
         partial_trade = {
-            "id": f"{pos.get('id', '')}_PARTIAL",
+            "id": f"{pos.get('id', '')}_{trade_suffix}",
+            "tradeId": f"{pos.get('id', '')}_{trade_suffix}",
+            "positionId": pos.get('id', ''),
+            "signalId": pos.get('signalId', pos.get('signal_id', '')),
             "symbol": symbol,
             "side": side,
             "entryPrice": entry_price,
             "exitPrice": current_price,
             "size": reduction_size,
             "sizeUsd": reduction_size_usd,
+            "marginUsd": reduction_initial_margin,
             "pnl": pnl,
             "pnlPercent": pnl_pct,
+            "roi": pnl_pct,
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
-            "reason": "KILL_SWITCH_PARTIAL",
-            "closeReason": "KILL_SWITCH_PARTIAL",
-            "leverage": pos.get('leverage', 10)
+            "reason": reason,
+            "closeReason": reason,
+            "closeReasonNormalized": paper_trader._normalize_close_reason(reason),
+            "reasonSource": "engine",
+            "leverage": pos.get('leverage', 10),
+            "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+            "exitOwner": pos.get('exitOwner', ''),
+            "signalSnapshot": pos.get('signal_snapshot', {}),
+            "execSnapshot": pos.get('exec_snapshot', {}),
+            "riskSnapshot": pos.get('risk_snapshot', {}),
+            "decision_trace": pos.get('decision_trace', [])[-10:],
         }
         paper_trader.trades.append(partial_trade)
-        paper_trader.add_log(f"⚠️ PARTIAL CLOSE: {side} {symbol} reduced by {reduction_pct*100:.0f}% | PnL: ${pnl:.2f}")
+        safe_create_task(sqlite_manager.save_trade(partial_trade))
+        paper_trader.add_log(
+            f"⚠️ PARTIAL CLOSE: {side} {symbol} {reason} reduced by {reduction_pct*100:.0f}% | PnL: ${pnl:.2f}"
+        )
+        return True
     
     def get_status(self, current_balance: float) -> dict:
         """Get kill switch status for UI."""
@@ -21077,28 +23255,141 @@ class TimeBasedPositionManager:
     - If in profit but hasn't moved in favor for 30+ minutes, activate trailing stop early
     
     STAGNANT LOSING POSITIONS:
-    - Gradually reduce position size if not recovering:
-      - 1 hour without profit: reduce 10%
-      - 2 hours without profit: reduce 20%
-      - 4 hours without profit: reduce 20%
-      - 8 hours without profit: reduce 20%
+    - Arm separate time-recovery reducers when a position stays underwater:
+      - 4 hours underwater: cut 20% on the first recovery wave
+      - 8 hours underwater: cut 30% on the next recovery wave
+    - These are isolated from the normal recovery ladder.
     """
     
     def __init__(self):
-        # Track position reductions: {pos_id: {'1h': bool, '2h': bool, '4h': bool, '8h': bool}}
+        # Track completed time-recovery reductions per position.
         self.time_reductions = {}
         
-        # Time thresholds and reduction percentages
-        # 4h = 10% reduce, 8h = 10% reduce (less aggressive with kill switch active)
+        # Time thresholds arm an independent recovery trigger.
         self.reduction_schedule = [
-            {'hours': 4, 'reduction_pct': 0.10, 'key': '4h'},   # 4 hours: 10% reduce
-            {'hours': 8, 'reduction_pct': 0.10, 'key': '8h'},   # 8 hours: 10% reduce
+            {'hours': 4, 'reduction_pct': 0.20, 'key': '4h', 'reason': 'TIME_RECOVERY_STAGE1', 'progress': RECOVERY_STAGE1_PROGRESS},
+            {'hours': 8, 'reduction_pct': 0.30, 'key': '8h', 'reason': 'TIME_RECOVERY_STAGE2', 'progress': RECOVERY_STAGE1_PROGRESS},
         ]
         
         # Trail activation settings for stagnant profitable positions
         self.early_trail_minutes = 30  # Activate trail if profitable but stagnant for 30 min
         
         logger.info("📊 TimeBasedPositionManager initialized")
+
+    @staticmethod
+    def _time_recovery_fields(key: str) -> Dict[str, str]:
+        suffix = str(key or '').lower().replace('h', 'H')
+        return {
+            'done': f"timeRecovery{suffix}Done",
+            'armed': f"timeRecovery{suffix}Armed",
+            'worst': f"timeRecovery{suffix}WorstRoiPct",
+            'peak': f"timeRecovery{suffix}PeakRoiPct",
+        }
+
+    @staticmethod
+    def _compute_recovery_progress(current_roi: float, worst_roi: float) -> float:
+        safe_worst = float(worst_roi or 0.0)
+        if safe_worst >= 0:
+            return 0.0
+        return max(0.0, (float(current_roi or 0.0) - safe_worst) / abs(safe_worst))
+
+    async def _execute_time_recovery_partial_close(
+        self,
+        paper_trader,
+        pos: dict,
+        current_price: float,
+        reduction_pct: float,
+        reason: str,
+        trade_suffix: str,
+    ) -> bool:
+        original_size = float(pos.get('contracts', pos.get('size', 0)) or 0)
+        original_size_usd = float(pos.get('sizeUsd', 0) or 0)
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', 'LONG')
+        entry_price = float(pos.get('entryPrice', current_price) or current_price)
+        if original_size <= 0 or reduction_pct <= 0:
+            return False
+
+        reduction_size = min(original_size, max(0.0, original_size * float(reduction_pct)))
+        if reduction_size <= 0:
+            return False
+        reduction_size_usd = original_size_usd * float(reduction_pct)
+        leverage = float(pos.get('leverage', 10) or 10)
+        released_margin = reduction_size_usd / leverage if leverage > 0 else reduction_size_usd
+
+        if side == 'LONG':
+            pnl = reduction_size * (current_price - entry_price)
+        else:
+            pnl = reduction_size * (entry_price - current_price)
+        pnl_pct = (pnl / released_margin * 100) if released_margin > 0 else 0.0
+
+        if pos.get('isLive', False):
+            try:
+                result = await live_binance_trader.close_position(symbol, side, reduction_size, close_scope="PARTIAL")
+                if not result:
+                    logger.error(f"❌ TIME_RECOVERY LIVE FAILED: {symbol} - close_position returned None")
+                    return False
+                pos['_partial_close_ts'] = datetime.now().timestamp()
+                close_oid = str(result.get('id', ''))
+                if close_oid:
+                    safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
+                logger.warning(
+                    f"⏰ TIME_RECOVERY LIVE ✅: {symbol} reason={reason} size={reduction_size:.4f} pct={reduction_pct*100:.0f}%"
+                )
+            except Exception as e:
+                logger.error(f"❌ TIME_RECOVERY LIVE ERROR: {symbol} - {e}")
+                return False
+
+        paper_trader.balance += released_margin + pnl
+        pos['size'] = max(0.0, original_size - reduction_size)
+        if 'contracts' in pos:
+            pos['contracts'] = pos['size']
+        pos['sizeUsd'] = max(0.0, original_size_usd - reduction_size_usd)
+        if 'initialMargin' in pos:
+            pos['initialMargin'] = max(0.0, float(pos.get('initialMargin', 0) or 0) * (1 - float(reduction_pct)))
+        pos['lastExitDecision'] = reason
+        pos['runtimeProtectionPhase'] = 'TIME-RECOVERY'
+
+        partial_trade = {
+            "id": f"{pos.get('id', '')}_{trade_suffix}",
+            "tradeId": f"{pos.get('id', '')}_{trade_suffix}",
+            "positionId": pos.get('id', ''),
+            "signalId": pos.get('signalId', pos.get('signal_id', '')),
+            "symbol": symbol,
+            "side": side,
+            "entryPrice": entry_price,
+            "exitPrice": current_price,
+            "size": reduction_size,
+            "sizeUsd": reduction_size_usd,
+            "marginUsd": released_margin,
+            "margin": released_margin,
+            "pnl": pnl,
+            "pnlPercent": pnl_pct,
+            "roi": pnl_pct,
+            "openTime": pos.get('openTime', 0),
+            "closeTime": int(datetime.now().timestamp() * 1000),
+            "reason": reason,
+            "closeReason": reason,
+            "closeReasonNormalized": paper_trader._normalize_close_reason(reason),
+            "leverage": leverage,
+            "isPartialClose": True,
+        }
+        paper_trader.trades.append(partial_trade)
+        safe_create_task(sqlite_manager.save_trade(partial_trade))
+
+        stats = getattr(paper_trader, 'stats', None)
+        if isinstance(stats, dict):
+            stats['totalTrades'] = int(stats.get('totalTrades', 0) or 0) + 1
+            if pnl > 0:
+                stats['winningTrades'] = int(stats.get('winningTrades', 0) or 0) + 1
+
+        if hasattr(paper_trader, 'add_log'):
+            paper_trader.add_log(
+                f"⏰ TIME RECOVERY: {side} {symbol} {reason} %{reduction_pct*100:.0f} azaltıldı | ROI {pnl_pct:+.1f}%"
+            )
+        if hasattr(paper_trader, 'save_state'):
+            paper_trader.save_state()
+        return True
 
     @staticmethod
     def _is_v3_runner_position(pos: dict) -> bool:
@@ -21188,25 +23479,46 @@ class TimeBasedPositionManager:
 
         partial_trade = {
             "id": f"{pos.get('id', '')}_{label}",
+            "tradeId": f"{pos.get('tradeId', pos.get('id', ''))}_{label}",
+            "signalId": pos.get('signalId', pos.get('signal_id', '')),
+            "positionId": pos.get('positionId', pos.get('position_id', pos.get('id', ''))),
+            "entryOrderId": pos.get('entryOrderId', pos.get('entry_order_id', pos.get('binance_order_id', ''))),
+            "closeOrderId": close_oid if pos.get('isLive', False) else '',
             "symbol": symbol,
             "side": side,
             "entryPrice": entry_price,
             "exitPrice": current_price,
             "size": close_contracts,
             "sizeUsd": close_contracts * current_price,
+            "marginUsd": released_margin,
+            "margin": released_margin,
             "pnl": pnl,
-            "pnlPercent": ((current_price - entry_price) / entry_price * 100) if entry_price > 0 and side == 'LONG' else ((entry_price - current_price) / entry_price * 100 if entry_price > 0 else 0),
+            "pnlPercent": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+            "roi": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
             "closeReason": reason,
             "closeReasonNormalized": paper_trader._normalize_close_reason(reason),
+            "reasonSource": "engine",
             "leverage": pos.get('leverage', 10),
+            "isPartialClose": True,
             "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+            "signalSnapshot": pos.get('signal_snapshot', pos.get('signalSnapshot', {})),
+            "execSnapshot": pos.get('exec_snapshot', pos.get('execSnapshot', {})),
+            "riskSnapshot": pos.get('risk_snapshot', pos.get('riskSnapshot', {})),
             "runnerContext": pos.get('runnerContext', ''),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
+            "closeSnapshot": {
+                "tp_label": label,
+                "close_pct": close_pct,
+                "current_roi_pct": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+                "runner_context": pos.get('runnerContext', ''),
+            },
         }
         paper_trader.trades.append(partial_trade)
+        safe_create_task(sqlite_manager.save_trade(partial_trade))
         logger.warning(f"💰 V3_RUNNER_PARTIAL: {symbol} {side} {label} close={close_pct*100:.0f}% @ ${current_price:.6f} reason={reason} oid={close_oid[:12]}")
         return True
 
@@ -21329,52 +23641,29 @@ class TimeBasedPositionManager:
                     pos['recoveryStage'] = 0
                     pos['runnerContext'] = pos.get('baseRunnerContext', pos.get('runnerContext', V3_RUNNER_CONTEXT_COUNTER))
 
+        # ROI-first ladder owns recovery logic for all strategies, including V3 runner.
         recovery_stage = int(pos.get('recoveryStage', 0) or 0)
-        if current_r <= -0.30 and int(pos.get('oppositePressureCount', 0) or 0) >= 2 and recovery_stage < 1:
-            if self._tighten_v3_stop_distance(pos, current_price, 0.25, 'RECOVERY_TIGHTEN_STAGE1'):
-                pos['recoveryStage'] = 1
-                pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
-                actions["time_reduced"].append(f"{pos.get('symbol')} recovery_stage1")
-                return True
-        if current_r <= -0.50 and int(pos.get('oppositePressureCount', 0) or 0) >= 4 and recovery_stage < 2:
-            reduced = await self._execute_v3_partial_close(paper_trader, pos, current_price, 0.25, 'RECOVERY_REDUCE', 'RECOVERY_S2')
-            if reduced:
-                self._tighten_v3_stop_distance(pos, current_price, 0.25, 'RECOVERY_TIGHTEN_STAGE2')
-                pos['recoveryStage'] = 2
-                pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
-                actions["time_reduced"].append(f"{pos.get('symbol')} recovery_stage2")
-                return True
-        if current_r <= -0.80 and int(pos.get('oppositePressureCount', 0) or 0) >= 6 and recovery_stage < 3:
-            pos['recoveryStage'] = 3
+        if recovery_stage > 0:
             pos['runnerContext'] = V3_RUNNER_CONTEXT_RECOVERY
-            pos['lastExitDecision'] = 'RECOVERY_EXIT'
-            paper_trader.close_via_engine(pos, current_price, 'RECOVERY_EXIT', 'V3_RUNNER')
-            actions["time_closed"].append(f"{pos.get('symbol')} recovery_exit")
-            return True
 
         if not ensure_v3_runner_tp_ladder(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER):
             pos['lastExitDecision'] = 'V3_NO_TP_LADDER'
             return True
 
         entry_price = float(pos.get('entryPrice', current_price) or current_price)
-        if entry_price > 0:
-            if pos.get('side') == 'LONG':
-                profit_pct = ((current_price - entry_price) / entry_price) * 100
-            else:
-                profit_pct = ((entry_price - current_price) / entry_price) * 100
-        else:
-            profit_pct = 0.0
+        current_roi = compute_position_roi_pct(pos, current_price=current_price)
 
         partial_state = pos.get('partial_tp_state', {})
-        for level in pos.get('tp_ladder_levels', []):
+        for level in normalize_tp_ladder_levels(pos):
             level_key = level.get('key')
             if not level_key or partial_state.get(level_key, False):
                 continue
-            if profit_pct < float(level.get('pct', 0) or 0):
+            level_roi = _coerce_float(level.get('roi_pct', 0.0), 0.0)
+            if current_roi < level_roi:
                 continue
             if level_key == 'tp_final':
-                pos['lastExitDecision'] = 'TP_FINAL_EXIT'
-                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_EXIT', 'V3_RUNNER')
+                pos['lastExitDecision'] = 'TP_FINAL_HIT'
+                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'V3_RUNNER')
                 actions["time_closed"].append(f"{pos.get('symbol')} tp_final")
                 return True
             close_pct = float(level.get('close_pct', 0) or 0)
@@ -21382,14 +23671,15 @@ class TimeBasedPositionManager:
                 continue
             partial_state[level_key] = True
             pos['partial_tp_state'] = partial_state
-            ok = await self._execute_v3_partial_close(paper_trader, pos, current_price, close_pct, f"TP_PARTIAL_{level_key.upper()}", level_key.upper())
+            partial_reason = f"{level_key.upper()}_PARTIAL"
+            ok = await self._execute_v3_partial_close(paper_trader, pos, current_price, close_pct, partial_reason, level_key.upper())
             if not ok:
                 partial_state[level_key] = False
                 pos['partial_tp_state'] = partial_state
                 pos['lastExitDecision'] = f"PARTIAL_FAILED_{level_key}"
                 return True
-            actions["partial_tp"].append(f"{pos.get('symbol')}_{level_key}({profit_pct:.1f}%)")
-            pos['lastExitDecision'] = f"TP_PARTIAL_{level_key.upper()}"
+            actions["partial_tp"].append(f"{pos.get('symbol')}_{level_key}({current_roi:.1f}%)")
+            pos['lastExitDecision'] = partial_reason
             if level_key == 'tp1':
                 pos['trailArmed'] = True
                 pos['trailArmReason'] = f"TP1_{pos.get('runnerContext', '')}"
@@ -21425,12 +23715,8 @@ class TimeBasedPositionManager:
                         "enabled": True,
                         "be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
                     })
-                    _tick = get_tick_size(pos.get('symbol', ''))
-                    safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, pos.get('side', 'LONG'))
-                    if pos.get('side') == 'LONG':
-                        breakeven_sl = snap_to_tick(entry_price + safe_delta, _tick, 'up')
-                    else:
-                        breakeven_sl = snap_to_tick(entry_price - safe_delta, _tick, 'down')
+                    be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=fee_buffer, reason='V3_BE_AFTER_TRAIL')
+                    breakeven_sl = be_ctx.get('price', 0.0)
                     apply_sl_floor(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
                     pos['breakeven_activated'] = True
                     await self._sync_v3_protective_order(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
@@ -21466,6 +23752,7 @@ class TimeBasedPositionManager:
                 current_price = pos.get('currentPrice', pos.get('entryPrice', 0))
                 entry_price = pos.get('entryPrice', current_price)
                 contracts = pos.get('contracts', 0)
+                current_roi = compute_position_roi_pct(pos, current_price)
                 
                 # Calculate position age in hours
                 age_hours = (current_time_ms - open_time) / (1000 * 60 * 60)
@@ -21759,7 +24046,7 @@ class TimeBasedPositionManager:
                     if pos.get('tp_ladder_levels') and TP_LADDER_ADAPTIVE_ENABLED:
                         # Phase 253: Always derive from anchor (immutable), never from mutable tp_ladder_levels
                         _anchor_src = pos.get('tp_ladder_anchor_levels', pos.get('tp_ladder_levels', []))
-                        tp_levels = [lv.copy() for lv in _anchor_src]
+                        tp_levels = normalize_tp_ladder_levels(pos, [lv.copy() for lv in _anchor_src])
                         # base_tp_pct from locked telemetry (for log line below)
                         base_tp_pct = pos.get('tp_ladder_telemetry', {}).get('base_tp_pct', 0)
                         
@@ -21781,55 +24068,68 @@ class TimeBasedPositionManager:
                             pos['tp_ladder_runtime_mult'] = runtime_mult
                             
                             # Apply runtime_mult to unhit levels with clamps
-                            lock_clamps = {'tp1': (0.85, 1.10), 'tp2': (0.85, 1.20), 'tp3': (0.85, 1.30)}
+                            lock_clamps = {
+                                'tp1': (0.85, 1.10),
+                                'tp2': (0.85, 1.20),
+                                'tp3': (0.85, 1.30),
+                                'tp_final': (0.90, 1.40),
+                            }
                             for lv in tp_levels:
                                 if not partial_tp_state.get(lv['key']):
                                     lo, hi = lock_clamps.get(lv['key'], (0.85, 1.30))
                                     clamped_mult = max(lo, min(hi, runtime_mult))
                                     lv['pct'] = round(lv['pct'] * clamped_mult, 4)
-                        
+                                    lv['price_pct'] = lv['pct']
+                                    lv['roi_pct'] = round(price_move_pct_to_roi_pct(lv['pct'], leverage), 4)
+                                    lv['price'] = compute_target_price_from_roi(entry_price, lv['roi_pct'], side, leverage)
+
                         # Phase 253: Write effective TP levels to telemetry
                         _tp_telem = pos.get('tp_ladder_telemetry', {})
-                        _tp_telem['effective_tp_levels'] = [{'key': lv['key'], 'pct': lv['pct']} for lv in tp_levels]
+                        _tp_telem['effective_tp_levels'] = [
+                            {'key': lv['key'], 'pct': lv['pct'], 'roi_pct': lv.get('roi_pct', 0)}
+                            for lv in tp_levels
+                        ]
                         _tp_telem['runtime_mult'] = pos.get('tp_ladder_runtime_mult', 1.0)
                         pos['tp_ladder_telemetry'] = _tp_telem
                     else:
                         # --- Legacy fallback for old positions ---
-                        atr_pct = (atr / current_price * 100) if current_price > 0 else 2.0
-                        spread_mults = {
-                            'Very Low': 0.5, 'Low': 0.75, 'Normal': 1.0,
-                            'High': 1.5, 'Very High': 2.5, 'Extreme': 3.5, 'Ultra': 5.0,
-                        }
-                        mult = spread_mults.get(spread_level, 1.0)
-                        base_tp_pct = atr_pct * mult
-                        tp1_price_pct = max(base_tp_pct * 1.0, 8.0 / leverage)
-                        tp2_price_pct = max(base_tp_pct * 2.0, 20.0 / leverage)
-                        tp3_price_pct = max(base_tp_pct * 3.5, 40.0 / leverage)
-                        tp_levels = [
-                            {'pct': tp1_price_pct, 'close_pct': 0.40, 'key': 'tp1'},
-                            {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
-                            {'pct': tp3_price_pct, 'close_pct': 0.30, 'key': 'tp3'},
-                        ]
-                        # Phase 271A: Trend mode → runner-heavy 30/30/40 profile
-                        if TREND_RUNNER_TUNING_ENABLED and pos.get('trend_mode'):
-                            tp_levels = [
-                                {'pct': tp1_price_pct, 'close_pct': 0.30, 'key': 'tp1'},
-                                {'pct': tp2_price_pct, 'close_pct': 0.30, 'key': 'tp2'},
-                                {'pct': tp3_price_pct, 'close_pct': 0.40, 'key': 'tp3'},
-                            ]
-                    
-                    # Current profit percentage
+                        fallback_ladder = compute_adaptive_tp_ladder(
+                            side=side,
+                            entry_price=entry_price,
+                            atr=atr,
+                            leverage=leverage,
+                            spread_pct=pos.get('spreadPct', 0.05),
+                            volume_ratio=pos.get('volumeRatio', 1.0),
+                            adx=pos.get('adx', 25.0),
+                            hurst=pos.get('hurst', 0.50),
+                            coin_daily_trend=pos.get('coinDailyTrend', 'NEUTRAL'),
+                            exec_score=pos.get('entryExecScore', pos.get('signalScore', 70.0)),
+                            spread_level=spread_level,
+                        )
+                        tp_levels = normalize_tp_ladder_levels(pos, fallback_ladder.get('levels', []))
+                        base_tp_pct = fallback_ladder.get('telemetry', {}).get('base_tp_pct', 0)
+
+                    # Current profit ROI
                     if entry_price > 0:
-                        if side == 'LONG':
-                            profit_pct = (current_price - entry_price) / entry_price * 100
-                        else:  # SHORT
-                            profit_pct = (entry_price - current_price) / entry_price * 100
-                        
                         # Track which TPs have been hit
                         partial_tp_state = pos.get('partial_tp_state', {})
+                        tp_final_closed = False
                         
                         for level in tp_levels:
-                            if profit_pct >= level['pct'] and not partial_tp_state.get(level['key'], False):
+                            level_roi = _coerce_float(
+                                level.get('roi_pct', price_move_pct_to_roi_pct(level.get('pct', 0), leverage)),
+                                0.0,
+                            )
+                            if current_roi >= level_roi and not partial_tp_state.get(level['key'], False):
+                                if level.get('key') == 'tp_final':
+                                    partial_tp_state[level['key']] = True
+                                    pos['partial_tp_state'] = partial_tp_state
+                                    pos['lastExitDecision'] = 'TP_FINAL_HIT'
+                                    paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'TP_LADDER')
+                                    actions["time_closed"].append(f"{symbol} tp_final")
+                                    tp_final_closed = True
+                                    break
+
                                 # TP level hit - mark as closed
                                 partial_tp_state[level['key']] = True
                                 pos['partial_tp_state'] = partial_tp_state
@@ -21840,6 +24140,7 @@ class TimeBasedPositionManager:
                                 if original_contracts == 0:
                                     original_contracts = contracts
                                 close_contracts = original_contracts * level['close_pct']
+                                close_oid = ''
                                 
                                 # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False) and close_contracts > 0:
@@ -21851,7 +24152,7 @@ class TimeBasedPositionManager:
                                             # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                                             pos['_partial_close_ts'] = datetime.now().timestamp()
                                             close_oid = str(result.get('id', ''))
-                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at {profit_pct:.2f}% profit | Order: {close_oid[:12]}")
+                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at ROI {current_roi:.2f}% | Order: {close_oid[:12]}")
                                             # Phase 229b: Persist close order ID
                                             if close_oid:
                                                 safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
@@ -21884,54 +24185,84 @@ class TimeBasedPositionManager:
                                 pos['size'] = new_contracts  # size = contracts (same unit)
                                 pos['sizeUsd'] = pos.get('sizeUsd', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
                                 pos['initialMargin'] = pos.get('initialMargin', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
+                                level_reason = f"{str(level['key']).upper()}_PARTIAL"
+                                released_margin = float(pos.get('original_initialMargin', pos.get('initialMargin', 0)) or 0) * float(level['close_pct'] or 0)
+                                price_profit_pct = ((current_price - entry_price) / entry_price * 100) if side == 'LONG' else ((entry_price - current_price) / entry_price * 100)
+                                partial_trade = {
+                                    "id": f"{pos.get('id', '')}_{level_reason}",
+                                    "tradeId": f"{pos.get('tradeId', pos.get('id', ''))}_{level_reason}",
+                                    "signalId": pos.get('signalId', pos.get('signal_id', '')),
+                                    "positionId": pos.get('positionId', pos.get('position_id', pos.get('id', ''))),
+                                    "entryOrderId": pos.get('entryOrderId', pos.get('entry_order_id', pos.get('binance_order_id', ''))),
+                                    "closeOrderId": close_oid if pos.get('isLive', False) else '',
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "entryPrice": entry_price,
+                                    "exitPrice": current_price,
+                                    "size": close_contracts,
+                                    "sizeUsd": close_contracts * current_price,
+                                    "marginUsd": released_margin,
+                                    "margin": released_margin,
+                                    "pnl": (current_price - entry_price) * close_contracts if side == 'LONG' else (entry_price - current_price) * close_contracts,
+                                    "pnlPercent": current_roi,
+                                    "roi": current_roi,
+                                    "openTime": pos.get('openTime', 0),
+                                    "closeTime": int(datetime.now().timestamp() * 1000),
+                                    "reason": level_reason,
+                                    "closeReason": level_reason,
+                                    "closeReasonNormalized": paper_trader._normalize_close_reason(level_reason),
+                                    "original_reason": level_reason,
+                                    "reasonSource": "engine",
+                                    "leverage": leverage,
+                                    "isPartialClose": True,
+                                    "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+                                    "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+                                    "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
+                                    "signalSnapshot": pos.get('signal_snapshot', pos.get('signalSnapshot', {})),
+                                    "execSnapshot": pos.get('exec_snapshot', pos.get('execSnapshot', {})),
+                                    "riskSnapshot": pos.get('risk_snapshot', pos.get('riskSnapshot', {})),
+                                    "closeSnapshot": {
+                                        "tp_key": level['key'],
+                                        "tp_roi_pct": level_roi,
+                                        "tp_price": level.get('price', 0),
+                                        "close_pct": level['close_pct'],
+                                        "current_roi_pct": current_roi,
+                                        "price_profit_pct": round(price_profit_pct, 4),
+                                    },
+                                }
+                                paper_trader.trades.append(partial_trade)
+                                safe_create_task(sqlite_manager.save_trade(partial_trade))
                                 
                                 # =====================================================
-                                # Phase 220: TP1 → Force Trail + Breakeven SL
-                                # Kalan pozisyonu trail ile koru, SL'i entry+fee'ye taşı
+                                # Phase 220+: TP1 → delayed trail arm + buffered breakeven floor.
                                 # =====================================================
                                 if level['key'] == 'tp1':
-                                    # Phase 271B: Delayed trail for trend_mode positions
-                                    if TREND_RUNNER_TUNING_ENABLED and pos.get('trend_mode'):
-                                        # Arm trail delay — don't activate yet
-                                        pos['tp1_hit_time'] = datetime.now().timestamp()
-                                        pos['tp1_hit_price'] = current_price
-                                        pos['tp1_trail_armed'] = True
-                                        logger.warning(f"⏳ TP1_TRAIL_ARMED: {symbol} {side} price=${current_price:.6f} | trail deferred (90s + 0.4ATR)")
-                                        # NOTE: breakeven SL still applied below for protection
-                                    else:
-                                        # Original behavior: immediate trail activation
-                                        # 1) Force-activate trailing stop for remaining position
-                                        trail_dist = pos.get('trailDistance', atr * 1.5)
-                                        if side == 'LONG':
-                                            new_trail_stop = current_price - trail_dist
-                                            new_trail_stop = max(new_trail_stop, entry_price)
-                                            apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL')
-                                        else:  # SHORT
-                                            new_trail_stop = current_price + trail_dist
-                                            new_trail_stop = min(new_trail_stop, entry_price)
-                                            apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL')
-                                        pos['isTrailingActive'] = True
-                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                                        logger.warning(f"📊 TP1_TRAIL: {symbol} {side} trail FORCED ON | stop=${pos['trailingStop']:.6f} dist=${trail_dist:.6f}")
-                                    
-                                    # 2) Move SL to breakeven (entry + fee buffer)
+                                    pos['tp1_hit_time'] = datetime.now().timestamp()
+                                    pos['tp1_hit_price'] = current_price
+                                    pos['tp1_trail_armed'] = True
+                                    pos.setdefault('tp1ArmDelaySec', 90 if bool(pos.get('trend_mode')) else 45)
+                                    pos.setdefault('tp1ArmAtrReq', 0.4 if bool(pos.get('trend_mode')) else 0.2)
+                                    logger.warning(
+                                        f"⏳ TP1_TRAIL_ARMED: {symbol} {side} price=${current_price:.6f} "
+                                        f"| delay={pos.get('tp1ArmDelaySec')}s atr_req={pos.get('tp1ArmAtrReq')}"
+                                    )
+
+                                    # 2) Move SL to buffered breakeven (exchange BE if available)
                                     fee_buffers = {
                                         'Very Low': 0.005, 'Low': 0.005, 'Normal': 0.006,
                                         'High': 0.008, 'Very High': 0.010,
                                         'Extreme': 0.015, 'Ultra': 0.020
                                     }
                                     fee_buffer = fee_buffers.get(spread_level, 0.006)
-                                    # Phase 258: Use ensure_tick_safe_buffer to handle micro-price coins
-                                    _tick = get_tick_size(symbol)
-                                    safe_delta = ensure_tick_safe_buffer(entry_price, fee_buffer, _tick, side)
-                                    if side == 'LONG':
-                                        breakeven_sl = snap_to_tick(entry_price + safe_delta, _tick, 'up')
-                                        apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
-                                    else:  # SHORT
-                                        breakeven_sl = snap_to_tick(entry_price - safe_delta, _tick, 'down')
+                                    be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=fee_buffer, reason='TP1_BREAKEVEN')
+                                    breakeven_sl = be_ctx.get('price', 0.0)
+                                    if breakeven_sl > 0:
                                         apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
                                     pos['breakeven_activated'] = True
-                                    logger.warning(f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → breakeven ${breakeven_sl:.6f} (delta=${safe_delta:.6f}, tick={_tick})")
+                                    logger.warning(
+                                        f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → ${breakeven_sl:.6f} "
+                                        f"(anchor={be_ctx.get('anchor_source', 'entry')} ${be_ctx.get('anchor_price', 0.0):.6f})"
+                                    )
                                     
                                     # 3) For LIVE positions: Update SL on Binance
                                     if pos.get('isLive', False):
@@ -21948,17 +24279,20 @@ class TimeBasedPositionManager:
                                             logger.warning(f"⚠️ TP1_BREAKEVEN LIVE SKIP: {symbol} - {be_err} (will use internal SL)")
                                 
                                 # Log partial TP
-                                logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at {profit_pct:.2f}% profit (level: {level['key']}, base: {base_tp_pct:.2f}%)")
-                                actions["partial_tp"].append(f"{symbol}_{level['key']}({profit_pct:.1f}%)")
+                                logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at ROI {current_roi:.2f}% (level: {level['key']}, base: {base_tp_pct:.2f}%)")
+                                actions["partial_tp"].append(f"{symbol}_{level['key']}({current_roi:.1f}%)")
                                 
                                 # Phase 220b: Update local contracts for next TP level calculation
                                 contracts = pos['contracts']
+
+                        if tp_final_closed:
+                            continue
                         
                         # =============================================================
                         # Phase 271B: TP1 TRAIL DELAYED ACTIVATION CHECK
                         # If tp1_trail_armed, check 90s elapsed + 0.4 ATR favorable move
                         # =============================================================
-                        if TREND_RUNNER_TUNING_ENABLED and pos.get('tp1_trail_armed') and not pos.get('isTrailingActive'):
+                        if pos.get('tp1_trail_armed') and not pos.get('isTrailingActive'):
                             _now_ts = datetime.now().timestamp()
                             _tp1_hit_time = pos.get('tp1_hit_time', _now_ts)
                             _tp1_hit_price = pos.get('tp1_hit_price', current_price)
@@ -21971,9 +24305,11 @@ class TimeBasedPositionManager:
                             
                             # Phase 271B fix: safe_atr guards against atr=0
                             _safe_atr = atr if atr and atr > 0 else max(current_price * 0.01, 1e-8)
-                            _atr_threshold = 0.4 * _safe_atr
+                            _atr_req = _coerce_float(pos.get('tp1ArmAtrReq', 0.4 if bool(pos.get('trend_mode')) else 0.2), 0.2)
+                            _delay_sec = max(0, int(pos.get('tp1ArmDelaySec', 90 if bool(pos.get('trend_mode')) else 45) or 0))
+                            _atr_threshold = _atr_req * _safe_atr
                             _move_atr = _favorable / _safe_atr
-                            _should_activate = (_elapsed >= 90 and _favorable >= _atr_threshold)
+                            _should_activate = (_elapsed >= _delay_sec and _favorable >= _atr_threshold)
                             _is_timeout = (_elapsed >= 1200)  # 20 min
                             
                             if _should_activate or _is_timeout:
@@ -21988,11 +24324,11 @@ class TimeBasedPositionManager:
                                 
                                 if side == 'LONG':
                                     new_trail_stop = current_price - trail_dist
-                                    new_trail_stop = max(new_trail_stop, entry_price)
+                                    new_trail_stop = max(new_trail_stop, _coerce_float(pos.get('stopLoss', entry_price), entry_price))
                                     apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 else:
                                     new_trail_stop = current_price + trail_dist
-                                    new_trail_stop = min(new_trail_stop, entry_price)
+                                    new_trail_stop = min(new_trail_stop, _coerce_float(pos.get('stopLoss', entry_price), entry_price))
                                     apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 
                                 pos['isTrailingActive'] = True
@@ -22008,167 +24344,111 @@ class TimeBasedPositionManager:
                 
 
                 # ===============================================
-                # CASE 1: PROFITABLE - DYNAMIC PULLBACK TRAIL
-                # Phase 51: Spread-based dynamic pullback threshold
+                # CASE 1: PROFITABLE - ROI GIVEBACK TRAIL ARM
+                # Single-authority profit ladder arms trail only after a meaningful
+                # run-up and giveback, instead of dollar-based pullback heuristics.
                 # ===============================================
                 if unrealized_pnl > 0 and not is_trailing_active:
                     age_minutes = age_hours * 60
-                    
-                    # Only consider early trail after 30 minutes
                     if age_minutes >= self.early_trail_minutes:
-                        # Get ATR and spread level from position
-                        atr = pos.get('atr', current_price * 0.02)  # Default 2% if no ATR
-                        spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))  # Phase 223b
-                        
-                        # Dynamic pullback multiplier based on spread
-                        spread_multipliers = {
-                            'Very Low': 0.5,   # BTC, ETH - small pullback triggers trail
-                            'Low': 0.75,
-                            'Normal': 1.0,
-                            'High': 1.5,
-                            'Very High': 2.0,  # Meme coins - wait for larger pullback
-                            'Extreme': 3.0,    # Hyper-volatile
-                            'Ultra': 4.0       # Extreme edge cases
-                        }
-                        multiplier = spread_multipliers.get(spread_level, 1.0)
-                        pullback_threshold = atr * multiplier
-                        
-                        # Track highest profit reached
-                        highest_profit = pos.get('highestProfit', unrealized_pnl)
-                        if unrealized_pnl > highest_profit:
-                            pos['highestProfit'] = unrealized_pnl
-                            highest_profit = unrealized_pnl
-                        
-                        # Calculate pullback from highest profit
-                        profit_pullback = highest_profit - unrealized_pnl
-                        
-                        # Activate trail if pullback exceeds threshold
-                        if profit_pullback >= pullback_threshold:
-                            pos['isTrailingActive'] = True
-                            pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()  # Phase 268
-                            apply_sl_floor(pos, current_price, 'EARLY_TRAIL')
-                            actions["trail_activated"].append(f"{symbol} (pullback ${profit_pullback:.2f})")
-                            logger.info(f"📊 EARLY TRAIL: {symbol} activated - pullback ${profit_pullback:.2f} >= threshold ${pullback_threshold:.2f} (spread: {spread_level})")
+                        profit_ladder = build_position_profit_ladder(pos, current_price=current_price)
+                        if profit_ladder.get('giveback_trail_ready', False):
+                            candidate_stop = _coerce_float(profit_ladder.get('profit_lock_price', 0.0), 0.0)
+                            if candidate_stop > 0:
+                                apply_sl_floor(pos, candidate_stop, 'PROFIT_GIVEBACK_ARM')
+                                pos['isTrailingActive'] = True
+                                pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                is_trailing_active = True
+                                actions["trail_activated"].append(
+                                    f"{symbol} (giveback ROI {profit_ladder.get('profit_giveback_roi_pct', 0.0):.1f}%)"
+                                )
+                                logger.info(
+                                    f"📊 PROFIT_GIVEBACK_ARM: {symbol} phase={profit_ladder.get('profit_phase')} "
+                                    f"peak_roi={profit_ladder.get('profit_peak_roi_pct', 0.0):.1f}% "
+                                    f"giveback_roi={profit_ladder.get('profit_giveback_roi_pct', 0.0):.1f}% "
+                                    f"lock_roi={profit_ladder.get('profit_lock_roi_pct')}"
+                                )
                 
                 # ===============================================
-                # CASE 2: LOSING AND STAGNANT - GRADUAL REDUCTION
-                # Phase 137 FIX: Changed elif to if - CASE 2 should run independently
-                # Phase 188: SKIP for LIVE positions — Kill Switch handles risk management
-                # Time-based reduction on live causes duplicate Binance orders due to sync overwrite
+                # CASE 2: UNDERWATER TIME-RECOVERY
+                # Arms a distinct recovery trigger after 4h/8h underwater and
+                # only reduces on the first meaningful rebound after each arm.
+                # This state is fully isolated from the normal recovery ladder.
                 # ===============================================
-                # Phase 190: Enabled for LIVE positions (was paper-only)
-                if unrealized_pnl < 0:
-                    # Initialize tracking for this position
+                if unrealized_pnl < 0 and current_roi < 0:
                     if pos_id not in self.time_reductions:
                         self.time_reductions[pos_id] = {item['key']: False for item in self.reduction_schedule}
-                    
-                    # Phase 137 ONE-TIME FIX: Reset broken flags from old code
-                    # Old code used 'size' (always 0), never reduced, but flags got set somehow
-                    # Reset flags if position has contracts but hasn't actually been reduced
-                    if not hasattr(self, '_flags_reset_done'):
-                        self._flags_reset_done = True
-                        for p in paper_trader.positions:
-                            # If position has contracts (not reduced) but flags are True, reset them
-                            if p.get('contracts', 0) > 0:
-                                if p.get('time_reduced_4h', False) or p.get('time_reduced_8h', False):
-                                    logger.warning(f"📊 FLAG_RESET: {p.get('symbol')} resetting broken time reduction flags")
-                                    p['time_reduced_4h'] = False
-                                    p['time_reduced_8h'] = False
-                    
-                    # Phase 137 DEBUG: Trace log for CASE 2 entry
-                    logger.info(f"📊 TIME_CHECK: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} flags={pos.get('time_reduced_4h', False)}/{pos.get('time_reduced_8h', False)}")
-                    
-                    # Check each time threshold
+
+                    underwater_since = int(pos.get('timeUnderwaterSince', 0) or 0)
+                    if underwater_since <= 0:
+                        underwater_since = current_time_ms
+                        pos['timeUnderwaterSince'] = underwater_since
+                    underwater_hours = max(0.0, (current_time_ms - underwater_since) / (1000 * 60 * 60))
+
+                    logger.info(
+                        f"📊 TIME_CHECK: {symbol} age={age_hours:.1f}h underwater={underwater_hours:.1f}h "
+                        f"roi={current_roi:.1f}% flags={pos.get('timeRecovery4HDone', False)}/{pos.get('timeRecovery8HDone', False)}"
+                    )
+
                     for schedule in self.reduction_schedule:
-                        threshold_hours = schedule['hours']
-                        reduction_pct = schedule['reduction_pct']
-                        key = schedule['key']
-                        
-                        # Phase 55: Use position-internal flag to survive restarts
-                        pos_flag_key = f"time_reduced_{key}"
-                        already_reduced_flag = pos.get(pos_flag_key, False)
-                        
-                        # Check if we've passed this threshold and haven't reduced yet
-                        if age_hours >= threshold_hours and not already_reduced_flag:
-                            # Phase 137 FIX: Use 'contracts' (from Binance) instead of 'size'
-                            position_contracts = pos.get('contracts', pos.get('size', 0))
-                            position_notional = pos.get('notional', pos.get('sizeUsd', 0))
-                            
-                            reduction_amount = position_contracts * reduction_pct
-                            reduction_usd = position_notional * reduction_pct
-                            
-                            if reduction_amount > 0:
-                                # Calculate partial close PnL
-                                if side == 'LONG':
-                                    partial_pnl = (current_price - pos['entryPrice']) * reduction_amount
-                                else:
-                                    partial_pnl = (pos['entryPrice'] - current_price) * reduction_amount
-                                
-                                # Update position size
-                                pos['size'] -= reduction_amount
-                                pos['sizeUsd'] -= reduction_usd
-                                
-                                # Return margin proportionally
-                                initial_margin = pos.get('initialMargin', 0)
-                                margin_return = initial_margin * reduction_pct
-                                pos['initialMargin'] = initial_margin - margin_return
-                                paper_trader.balance += margin_return + partial_pnl
-                                
-                                # Mark as reduced - BOTH in dictionary and position
-                                self.time_reductions[pos_id][key] = True
-                                pos[pos_flag_key] = True  # Position-internal flag
-                                
-                                actions["time_reduced"].append(f"{symbol} {key} (-{reduction_pct*100:.0f}%)")
-                                logger.warning(f"📊 TIME REDUCE: {symbol} reduced {reduction_pct*100:.0f}% after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
-                                
-                                # LIVE positions: Execute actual Binance partial close
-                                if pos.get('isLive', False):
-                                    try:
-                                        result = await live_binance_trader.close_position(symbol, side, reduction_amount, close_scope="PARTIAL")
-                                        if result:
-                                            close_oid = str(result.get('id', ''))
-                                            logger.warning(f"📊 TIME REDUCE LIVE ✅: {symbol} closed {reduction_pct*100:.0f}% on Binance ({reduction_amount:.4f} contracts) | Order: {close_oid[:12]}")
-                                            # Phase 229b: Persist close order ID
-                                            if close_oid:
-                                                safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
-                                        else:
-                                            logger.error(f"❌ TIME REDUCE LIVE FAILED: {symbol} - close_position returned None")
-                                    except Exception as e:
-                                        logger.error(f"❌ TIME REDUCE LIVE ERROR: {symbol} - {e}")
-                                
-                                # Phase 152: Don't spam UI logs — summary log added at end of cycle
-                                
-                                # ===== RECORD AS TRADE FOR HISTORY =====
-                                close_reason = f"TIME_REDUCE_{key.upper()}"
-                                trade_record = {
-                                    'symbol': symbol,
-                                    'side': side,
-                                    'entryPrice': pos['entryPrice'],
-                                    'exitPrice': current_price,
-                                    'size': reduction_amount,
-                                    'sizeUsd': reduction_usd,
-                                    'pnl': partial_pnl,
-                                    'pnlPercent': (partial_pnl / margin_return * 100) if margin_return > 0 else 0,
-                                    'openTime': pos.get('openTime', 0),
-                                    'closeTime': int(datetime.now().timestamp() * 1000),
-                                    'closeReason': close_reason,
-                                    'reason': close_reason,
-                                    'leverage': pos.get('leverage', 10),
-                                    'margin': margin_return,
-                                    'isPartialClose': reduction_pct < 1.0  # Only partial if not 100%
-                                }
-                                paper_trader.trades.append(trade_record)
-                                paper_trader.stats['totalTrades'] += 1
-                                if partial_pnl > 0:
-                                    paper_trader.stats['winningTrades'] += 1  # Phase 223: was 'winTrades' (KeyError)
-                                
-                                # Phase 56: If 100% reduction, mark position for removal
-                                if reduction_pct >= 1.0 or pos.get('size', 0) <= 0 or pos.get('sizeUsd', 0) <= 0.01:
-                                    positions_to_remove.append(pos_id)
-                                    logger.warning(f"📊 TIME CLOSE: {symbol} fully closed after {threshold_hours}h (PnL: ${partial_pnl:.2f})")
-                                    paper_trader.add_log(f"⏰ TIME CLOSE: {symbol} fully closed after {threshold_hours}h")
-                                
-                                paper_trader.save_state()
+                        threshold_hours = float(schedule['hours'])
+                        reduction_pct = float(schedule['reduction_pct'])
+                        key = str(schedule['key'])
+                        reason = str(schedule['reason'])
+                        required_progress = float(schedule.get('progress', RECOVERY_STAGE1_PROGRESS) or RECOVERY_STAGE1_PROGRESS)
+                        fields = self._time_recovery_fields(key)
+
+                        already_done = bool(pos.get(fields['done'], False))
+                        if underwater_hours < threshold_hours or already_done:
+                            continue
+
+                        if not pos.get(fields['armed'], False):
+                            pos[fields['armed']] = True
+                            pos[fields['worst']] = current_roi
+                            pos[fields['peak']] = current_roi
+                            pos['runtimeProtectionPhase'] = 'TIME-RECOVERY'
+                            logger.warning(
+                                f"⏰ TIME_RECOVERY_ARM: {symbol} {reason} armed after {underwater_hours:.1f}h underwater "
+                                f"roi={current_roi:.1f}%"
+                            )
+                            continue
+
+                        pos[fields['worst']] = min(float(pos.get(fields['worst'], current_roi) or current_roi), current_roi)
+                        pos[fields['peak']] = max(float(pos.get(fields['peak'], current_roi) or current_roi), current_roi)
+                        recovery_progress = self._compute_recovery_progress(
+                            current_roi,
+                            float(pos.get(fields['worst'], current_roi) or current_roi),
+                        )
+                        if recovery_progress < required_progress:
+                            continue
+
+                        reduced = await self._execute_time_recovery_partial_close(
+                            paper_trader,
+                            pos,
+                            current_price,
+                            reduction_pct,
+                            reason,
+                            trade_suffix=f"TIME_{key.upper()}",
+                        )
+                        if not reduced:
+                            continue
+
+                        self.time_reductions[pos_id][key] = True
+                        pos[fields['done']] = True
+                        pos[fields['armed']] = False
+                        actions["time_reduced"].append(f"{symbol} {key} ({reason}, -{reduction_pct*100:.0f}%)")
+                        logger.warning(
+                            f"⏰ TIME_RECOVERY_FIRE: {symbol} {reason} reduced {reduction_pct*100:.0f}% "
+                            f"after {underwater_hours:.1f}h underwater | progress={recovery_progress*100:.0f}% roi={current_roi:.1f}%"
+                        )
+                        break
+                else:
+                    pos['timeUnderwaterSince'] = 0
+                    for schedule in self.reduction_schedule:
+                        fields = self._time_recovery_fields(schedule['key'])
+                        pos[fields['armed']] = False
+                        pos[fields['worst']] = 0.0
+                        pos[fields['peak']] = 0.0
                 
             except Exception as e:
                 logger.error(f"Error in time-based position check: {e}")
@@ -24378,6 +26658,8 @@ class PerformanceAnalyzer:
 PARAM_LIMITS = {
     'entry_tightness':    {'min': 0.5, 'max': 4.0,  'step': 0.1},
     'exit_tightness':     {'min': 0.3, 'max': 3.0,  'step': 0.1},
+    'entry_stop_soft_roi_pct': {'min': -250.0, 'max': -80.0, 'step': 10.0},
+    'entry_stop_hard_roi_pct': {'min': -320.0, 'max': -120.0, 'step': 10.0},
     'z_score_threshold':  {'min': 0.8, 'max': 2.5,  'step': 0.1},
     'min_confidence_score': {'min': 50, 'max': 95,  'step': 1},
     'min_score_low':      {'min': 30,  'max': 60,   'step': 1},
@@ -28408,6 +30690,8 @@ class PaperTradingEngine:
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
         self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
+        self.entry_stop_soft_roi_pct = ENTRY_STOP_SOFT_ROI_DEFAULT
+        self.entry_stop_hard_roi_pct = ENTRY_STOP_HARD_ROI_DEFAULT
         # Strategy engine mode
         self.strategy_mode = STRATEGY_MODE_LEGACY  # LEGACY | SMART_V2 | SMART_V3_RUNNER
         # Phase 200: Counter-signal adaptive exit tightness cache TTL
@@ -30089,6 +32373,8 @@ class PaperTradingEngine:
             'min_score_low': self.min_score_low,
             'min_score_high': self.min_score_high,
             'max_positions': self.max_positions,
+            'entry_stop_soft_roi_pct': getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT),
+            'entry_stop_hard_roi_pct': getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
             'strategy_mode': self.strategy_mode,
             'market_regime': 'UNKNOWN',
         }
@@ -30260,6 +32546,7 @@ class PaperTradingEngine:
         # OVP-1: _pending_id already generated above (before sizing)
         pending_order = {
             "id": _pending_id,
+            "signalId": signal.get('signalId', signal.get('signal_id', '')) if signal else '',
             "symbol": trade_symbol,
             "side": side,
             "signalPrice": signal_price,
@@ -30304,7 +32591,9 @@ class PaperTradingEngine:
             "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
             "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
             "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
+            "entryExecScoreMinSnapshot": float(getattr(live_binance_trader, 'exec_entry_score_min', 0.0) or 0.0),
             "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+            "entrySignalScoreSnapshot": signal.get('confidenceScore', 0) if signal else 0,
             "strategyMode": _runner_controls.get('mode', STRATEGY_MODE_LEGACY),
             "activeStrategy": signal.get('activeStrategy', 'legacy') if signal else 'legacy',
             "strategyLabel": signal.get('strategyLabel', 'Legacy') if signal else 'Legacy',
@@ -30318,6 +32607,18 @@ class PaperTradingEngine:
             "trail_phase": "WIDE" if (COUNTER_EXIT_RELAX_ENABLED and _is_ct_signal) else "NORMAL",
             "settingsSnapshot": settings_snapshot,
             "minConfidenceScoreSnapshot": float(self.min_confidence_score),
+            "entryStopGateMode": "normal",
+            "entryStopRoiPct": round(compute_target_roi_pct(entry_price, sl, side, adjusted_leverage), 2),
+            "entryStopSoftRoiPct": float(getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
+            "entryStopHardRoiPct": float(getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT)),
+            "entrySpreadPct": float(signal.get('spreadPct', 0.05) if signal else 0.05),
+            "entrySpreadLevel": spread_level,
+            "entryAtrPct": round((atr / entry_price * 100), 4) if entry_price > 0 else 0.0,
+            "entryDepthUsd": _coerce_float(
+                signal.get('tradeabilityDepthUsd', signal.get('depth_usd', signal.get('depthUsd', 0.0))) if signal else 0.0,
+                0.0,
+            ),
+            "entryImbalance": _coerce_float(signal.get('imbalance', 0.0) if signal else 0.0, 0.0),
             "configuredSlAtr": round(configured_sl_atr, 4),
             "configuredTpAtr": round(configured_tp_atr, 4),
             "configuredTrailActivationAtr": trail_base_ctx['configured_activation_atr'],
@@ -30330,6 +32631,24 @@ class PaperTradingEngine:
             "effectiveTrailDistanceAtrUsed": round(adjusted_trail_distance_atr, 4),
             "truth_snapshot": signal.get('truth_snapshot', {}) if signal else {},
             "regime_adjustment": signal.get('regime_adjustment', '') if signal else '',
+            "signal_snapshot": signal if signal else {},
+            "exec_snapshot": {
+                "entry_method": signal.get('entry_method', 'MARKET') if signal else 'MARKET',
+                "execution_profile_source": signal.get('execution_profile_source', 'neutral') if signal else 'neutral',
+                "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
+                "entryExecScoreMin": float(getattr(live_binance_trader, 'exec_entry_score_min', 0.0) or 0.0),
+                "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+            },
+            "risk_snapshot": {
+                "stopLoss": sl,
+                "takeProfit": tp,
+                "trailActivation": trail_activation,
+                "trailDistance": trail_distance,
+                "leverage": adjusted_leverage,
+                "sizeUsd": position_size_usd,
+                "entryStopRoiPct": round(compute_target_roi_pct(entry_price, sl, side, adjusted_leverage), 2),
+                "entryStopGateMode": "normal",
+            },
             "is_canary": _is_canary,  # OVP-1: pre-computed from hoisted _pending_id
             # SMART_V3_RUNNER: execution profile propagation
             "execution_profile_source": signal.get('execution_profile_source', 'neutral') if signal else 'neutral',
@@ -31247,12 +33566,12 @@ class PaperTradingEngine:
             atr = fill_price * 0.01
         order['effectiveAtrSource'] = atr_ctx['source']
         order['effectiveAtrValueUsed'] = round(atr, 8)
+        side = order['side']
         if atr_ctx['fallback_used'] and fill_price > 0:
             logger.info(
                 f"📏 ATR_FALLBACK(exec): {symbol} {side} "
                 f"src={atr_ctx['source']} atr={atr:.8f} floor_pct={atr_ctx['floor_pct']:.3f}"
             )
-        side = order['side']
         
         # FIX #2: Dynamic ATR Multiplier (parity with open_position)
         dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, fill_price)
@@ -31374,10 +33693,151 @@ class PaperTradingEngine:
         tp = _levels['tp']
         trail_activation = _levels['trail_activation']
         trail_distance = _levels['trail_distance']
+
+        planned_stop_roi_pct = round(
+            compute_target_roi_pct(fill_price, sl, side, max(1, int(order.get('leverage', 10) or 10))),
+            2,
+        )
+        entry_stop_soft_roi_pct = float(
+            order.get(
+                'entryStopSoftRoiPct',
+                getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT),
+            ) or getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)
+        )
+        entry_stop_hard_roi_pct = float(
+            order.get(
+                'entryStopHardRoiPct',
+                getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+            ) or getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT)
+        )
+        order['entryStopRoiPct'] = planned_stop_roi_pct
+        order['entryStopGateMode'] = 'normal'
+
+        if planned_stop_roi_pct < entry_stop_hard_roi_pct:
+            self.set_execution_feedback(symbol, "ENTRY_STOP_TOO_WIDE")
+            self.pipeline_metrics.setdefault('open_rejected', 0)
+            self.pipeline_metrics.setdefault('open_reject_reasons', {})
+            self.pipeline_metrics['open_rejected'] += 1
+            self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_TOO_WIDE'] = (
+                self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_TOO_WIDE', 0) + 1
+            )
+            safe_create_task(
+                sqlite_manager.update_signal_outcome(
+                    symbol,
+                    int(order.get('createdAt', now_ms) or now_ms),
+                    reject_reason='ENTRY_STOP_TOO_WIDE',
+                )
+            )
+            self._finalize_forecast_event(
+                order.get('id', ''),
+                'CANCELLED',
+                0,
+                'entry_stop_too_wide',
+                now_ms,
+                fill_price=fill_price,
+                force_market=1 if force_market else 0,
+            )
+            self.add_log(
+                f"🚫 ENTRY STOP GATE: {side} {symbol} reddedildi | "
+                f"planlanan stop ROI {planned_stop_roi_pct:.1f}% < hard {entry_stop_hard_roi_pct:.0f}%"
+            )
+            logger.warning(
+                f"🚫 ENTRY_STOP_TOO_WIDE: {side} {symbol} stop_roi={planned_stop_roi_pct:.1f}% "
+                f"< hard={entry_stop_hard_roi_pct:.1f}%"
+            )
+            return
+
+        if planned_stop_roi_pct < entry_stop_soft_roi_pct:
+            tightened_score_floor = float(order.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score) + 6.0
+            candidate_signal_score = float(order.get('recheckScore', order.get('signalScore', 0)) or order.get('signalScore', 0))
+            if candidate_signal_score < tightened_score_floor:
+                self.set_execution_feedback(symbol, "ENTRY_STOP_WIDE_SCORE_LOW")
+                self.pipeline_metrics.setdefault('open_rejected', 0)
+                self.pipeline_metrics.setdefault('open_reject_reasons', {})
+                self.pipeline_metrics['open_rejected'] += 1
+                self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_WIDE_SCORE_LOW'] = (
+                    self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_WIDE_SCORE_LOW', 0) + 1
+                )
+                safe_create_task(
+                    sqlite_manager.update_signal_outcome(
+                        symbol,
+                        int(order.get('createdAt', now_ms) or now_ms),
+                        reject_reason='ENTRY_STOP_WIDE_SCORE_LOW',
+                    )
+                )
+                self._finalize_forecast_event(
+                    order.get('id', ''),
+                    'CANCELLED',
+                    0,
+                    'entry_stop_wide_score_low',
+                    now_ms,
+                    fill_price=fill_price,
+                    force_market=1 if force_market else 0,
+                )
+                logger.warning(
+                    f"🚫 ENTRY_STOP_WIDE_SCORE_LOW: {side} {symbol} score={candidate_signal_score:.1f} "
+                    f"< tightened_floor={tightened_score_floor:.1f}"
+                )
+                return
+
+            tightened_exec_floor = float(order.get('entryExecScoreMinSnapshot', getattr(live_binance_trader, 'exec_entry_score_min', 0.0)) or getattr(live_binance_trader, 'exec_entry_score_min', 0.0)) + 0.05
+            candidate_exec_score = float(order.get('entryExecScore', 0.0) or 0.0)
+            if candidate_exec_score > 0 and candidate_exec_score < tightened_exec_floor:
+                self.set_execution_feedback(symbol, "ENTRY_STOP_WIDE_EXEC_LOW")
+                self.pipeline_metrics.setdefault('open_rejected', 0)
+                self.pipeline_metrics.setdefault('open_reject_reasons', {})
+                self.pipeline_metrics['open_rejected'] += 1
+                self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_WIDE_EXEC_LOW'] = (
+                    self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_WIDE_EXEC_LOW', 0) + 1
+                )
+                safe_create_task(
+                    sqlite_manager.update_signal_outcome(
+                        symbol,
+                        int(order.get('createdAt', now_ms) or now_ms),
+                        reject_reason='ENTRY_STOP_WIDE_EXEC_LOW',
+                    )
+                )
+                self._finalize_forecast_event(
+                    order.get('id', ''),
+                    'CANCELLED',
+                    0,
+                    'entry_stop_wide_exec_low',
+                    now_ms,
+                    fill_price=fill_price,
+                    force_market=1 if force_market else 0,
+                )
+                logger.warning(
+                    f"🚫 ENTRY_STOP_WIDE_EXEC_LOW: {side} {symbol} exec={candidate_exec_score:.3f} "
+                    f"< tightened_floor={tightened_exec_floor:.3f}"
+                )
+                return
+
+            order['entryStopGateMode'] = 'wide_stop_soft'
+            order['minConfidenceScoreSnapshot'] = tightened_score_floor
+            order['entryExecScoreMinSnapshot'] = tightened_exec_floor
+            order['size'] = float(order.get('size', 0.0) or 0.0) * 0.75
+            order['sizeUsd'] = float(order.get('sizeUsd', 0.0) or 0.0) * 0.75
+            order['marginUsd'] = float(order.get('marginUsd', 0.0) or 0.0) * 0.75
+            if isinstance(order.get('risk_snapshot'), dict):
+                order['risk_snapshot']['sizeUsd'] = order['sizeUsd']
+                order['risk_snapshot']['marginUsd'] = order['marginUsd']
+                order['risk_snapshot']['entryStopRoiPct'] = planned_stop_roi_pct
+                order['risk_snapshot']['entryStopGateMode'] = 'wide_stop_soft'
+            if isinstance(order.get('exec_snapshot'), dict):
+                order['exec_snapshot']['entryExecScoreMin'] = tightened_exec_floor
+            if isinstance(order.get('signal_snapshot'), dict):
+                order['signal_snapshot']['entryStopGateMode'] = 'wide_stop_soft'
+                order['signal_snapshot']['entryStopRoiPct'] = planned_stop_roi_pct
+            logger.warning(
+                f"🛡️ ENTRY_STOP_SOFT: {side} {symbol} stop_roi={planned_stop_roi_pct:.1f}% "
+                f"band=({entry_stop_hard_roi_pct:.0f},{entry_stop_soft_roi_pct:.0f}] "
+                f"size→75% score_floor={tightened_score_floor:.1f} exec_floor={tightened_exec_floor:.3f}"
+            )
         
         # Create actual position
         new_position = {
             "id": order['id'].replace('PO_', 'POS_'),
+            "signalId": order.get('signalId', ''),
             "symbol": order['symbol'],
             "side": order['side'],
             "entryPrice": fill_price,
@@ -31414,11 +33874,24 @@ class PaperTradingEngine:
             # Phase 49: Carry forward analysis data from pending order
             "signalScore": order.get('signalScore', 0),
             "signalScoreRaw": order.get('signalScoreRaw', order.get('signalScore', 0)),
+            "entrySignalScoreSnapshot": order.get('entrySignalScoreSnapshot', order.get('signalScoreRaw', order.get('signalScore', 0))),
             "mtfScore": order.get('mtfScore', 0),
             "zScore": order.get('zScore', 0),
+            "minConfidenceScoreSnapshot": order.get('minConfidenceScoreSnapshot', self.min_confidence_score),
+            "entryExecScoreSnapshot": order.get('entryExecScore', 0.0),
+            "entryExecScoreMinSnapshot": order.get('entryExecScoreMinSnapshot', getattr(live_binance_trader, 'exec_entry_score_min', 0.0)),
             "strategyMode": order.get('strategyMode', STRATEGY_MODE_LEGACY),
             "activeStrategy": order.get('activeStrategy', 'legacy'),
             "strategyLabel": order.get('strategyLabel', 'Legacy'),
+            "entrySpreadPct": order.get('entrySpreadPct', order.get('spreadPct', 0.05)),
+            "entrySpreadLevel": order.get('entrySpreadLevel', order.get('spreadLevel', 'Normal')),
+            "entryAtrPct": order.get('entryAtrPct', 0.0),
+            "entryDepthUsd": order.get('entryDepthUsd', 0.0),
+            "entryImbalance": order.get('entryImbalance', 0.0),
+            "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
+            "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
+            "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
+            "entryStopHardRoiPct": order.get('entryStopHardRoiPct', getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT)),
             # Phase 202: Trend Mode flag for stepped SL
             "trend_mode": is_trend_mode,
             # RFX-2D: Counter-Trend + Two-Phase Trail (carry from order)
@@ -31447,6 +33920,14 @@ class PaperTradingEngine:
             "oppositeLastSeenTs": 0,
             "recoveryStage": 0,
             "recoveryReason": "",
+            "signalInvalidationReduced": False,
+            "regimeDeteriorationReduced": False,
+            "executionRiskReduced": False,
+            "fundingDecayReduced": False,
+            "lastLossGateActionTs": 0,
+            "lastLossGateActionReason": "",
+            "lastLossGateActionPhase": "",
+            "lastLossGateActionDetail": "",
             "internalProtectionOnly": False,
             "protectionRetryAt": 0,
             "protectionRetryPrice": 0.0,
@@ -31492,6 +33973,20 @@ class PaperTradingEngine:
             "effectiveExitTightness": effective_exit_tightness,
             "runtimeTrailDistance": trail_distance,
             "runtimeTrailDistancePct": round((trail_distance / fill_price * 100), 4) if fill_price > 0 else 0.0,
+            "runtimeTrailDistanceRoiPct": round(price_distance_to_roi_pct(trail_distance, fill_price, order.get('leverage', 1)), 2),
+            "runtimeTpRoiPct": round(compute_target_roi_pct(fill_price, tp, side, order.get('leverage', 1)), 2),
+            "runtimeStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, order.get('leverage', 1)), 2),
+            "runtimeEntryStopGateMode": order.get('entryStopGateMode', 'normal'),
+            "runtimeEntryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
+            "runtimePreStopReduceRoiPct": None,
+            "runtimeKillSwitchFullRoiPct": None,
+            "runtimeRecoveryState": {},
+            "runtimeLossGateState": {},
+            "runtimeCarryCostRoiPct": 0.0,
+            "runtimeExitRiskRoiPct": 0.0,
+            "runtimeRegimeFlags": [],
+            "runtimeSignalInvalidationState": {},
+            "runtimeProtectionPhase": "SL-PRIMARY",
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -31504,6 +33999,9 @@ class PaperTradingEngine:
             # RFX-1D: Truth snapshot + regime adjustment propagation
             "truth_snapshot": order.get('truth_snapshot', {}),
             "regime_adjustment": order.get('regime_adjustment', ''),
+            "signal_snapshot": order.get('signal_snapshot', {}),
+            "exec_snapshot": order.get('exec_snapshot', {}),
+            "risk_snapshot": order.get('risk_snapshot', {}),
             # RFX-2B: Distance truth telemetry (recalculated at fill)
             "distance_truth": _levels.get('distance_truth', order.get('distance_truth', {})),
         }
@@ -32128,68 +34626,22 @@ class PaperTradingEngine:
         return base_trail * roi_mult
     
     def update_progressive_sl(self, pos: dict, current_price: float, atr: float):
-        """Move SL progressively as position goes into profit.
-        
-        Phase 275: Leverage-aware ROI thresholds.
-        Thresholds are in ROI% (leverage-scaled) so they work consistently
-        regardless of leverage level.
-        """
-        entry = pos['entryPrice']
-        leverage = pos.get('leverage', 10)
-        
-        # Apply exit_tightness to thresholds - lower = earlier activation
-        t = self.get_effective_exit_tightness(pos)
-        
-        if pos['side'] == 'LONG':
-            profit_atr = (current_price - entry) / atr if atr > 0 else 0
-            # Phase 275: ROI-based thresholds (leverage-aware)
-            price_move_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0
-            profit_roi = price_move_pct * leverage
-            
-            # ROI thresholds scaled by exit_tightness
-            if profit_roi >= 15.0 * t:
-                new_sl = entry + (2.0 * atr)  # Lock in 2 ATR profit
-            elif profit_roi >= 10.0 * t:
-                new_sl = entry + (1.5 * atr)  # Lock in 1.5 ATR profit
-            elif profit_roi >= 7.0 * t:
-                new_sl = entry + (1.0 * atr)  # Lock in 1 ATR profit
-            elif profit_roi >= 4.0 * t:
-                new_sl = entry + (0.5 * atr)  # Lock in 0.5 ATR profit
-            elif profit_roi >= 2.0 * t:
-                new_sl = entry  # Breakeven
-            else:
-                return False  # No change
-                
-            old_sl = pos['stopLoss']
-            if apply_sl_floor(pos, new_sl, 'PROGRESSIVE_SL'):
-                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${pos['stopLoss']:.6f} (ROI={profit_roi:.1f}%, {leverage}x)")
-                return True
-                
-        elif pos['side'] == 'SHORT':
-            profit_atr = (entry - current_price) / atr if atr > 0 else 0
-            # Phase 275: ROI-based thresholds (leverage-aware)
-            price_move_pct = ((entry - current_price) / entry * 100) if entry > 0 else 0
-            profit_roi = price_move_pct * leverage
-            
-            # ROI thresholds scaled by exit_tightness
-            if profit_roi >= 15.0 * t:
-                new_sl = entry - (2.0 * atr)
-            elif profit_roi >= 10.0 * t:
-                new_sl = entry - (1.5 * atr)
-            elif profit_roi >= 7.0 * t:
-                new_sl = entry - (1.0 * atr)
-            elif profit_roi >= 4.0 * t:
-                new_sl = entry - (0.5 * atr)
-            elif profit_roi >= 2.0 * t:
-                new_sl = entry  # Breakeven
-            else:
-                return False
-                
-            old_sl = pos['stopLoss']
-            if apply_sl_floor(pos, new_sl, 'PROGRESSIVE_SL'):
-                self.add_log(f"📈 PROGRESSIVE SL: ${old_sl:.6f} → ${pos['stopLoss']:.6f} (ROI={profit_roi:.1f}%, {leverage}x)")
-                return True
-        
+        """Profit-side lock ratchet using the canonical ROI profit ladder."""
+        profit_ladder = build_position_profit_ladder(pos, current_price=current_price)
+        candidate_stop = _coerce_float(profit_ladder.get('profit_lock_price', 0.0), 0.0)
+        profit_phase = str(profit_ladder.get('profit_phase', 'WAIT') or 'WAIT')
+        current_profit_roi = _coerce_float(profit_ladder.get('current_profit_roi_pct', 0.0), 0.0)
+        maturity_floor = _coerce_float(profit_ladder.get('maturity_floor_roi_pct', 0.0), 0.0)
+        if candidate_stop <= 0 or current_profit_roi < maturity_floor:
+            return False
+
+        old_sl = float(pos.get('stopLoss', 0) or 0)
+        if apply_sl_floor(pos, candidate_stop, f'PROFIT_LOCK_{profit_phase}'):
+            self.add_log(
+                f"📈 PROFIT LOCK: ${old_sl:.6f} → ${pos.get('stopLoss', 0):.6f} "
+                f"({profit_phase}, ROI={current_profit_roi:.1f}%)"
+            )
+            return True
         return False
     
     def check_loss_recovery(self, pos: dict, current_price: float, atr: float) -> bool:
@@ -32256,10 +34708,22 @@ class PaperTradingEngine:
         return False
     
     def check_time_based_exit(self, pos: dict, current_price: float, atr: float = None) -> bool:
-        """Gradually liquidate positions that are open too long - close on bounces."""
+        """Gradually liquidate stale non-losing positions only.
+
+        Loss-side ownership now belongs to the ROI-first protection ladder and
+        time-recovery reducer. Legacy time exits must not front-run underwater
+        recovery / pre-stop / SL logic.
+        """
         open_time = pos.get('openTime', 0)
         age_ms = int(datetime.now().timestamp() * 1000) - open_time
         age_hours = age_ms / (1000 * 60 * 60)
+        current_roi = compute_position_roi_pct(pos, current_price)
+
+        if current_roi < 0:
+            pos['gradual_exit_mode'] = False
+            pos.pop('gradual_high', None)
+            pos.pop('gradual_low', None)
+            return False
         
         if atr is None:
             atr = current_price * 0.01
@@ -32392,65 +34856,12 @@ class PaperTradingEngine:
     
     def check_adverse_position_exit(self, pos: dict, current_price: float, atr: float = None) -> bool:
         """
-        4 saat boyunca terste kalan pozisyonları kontrol et.
-        
-        Kapatma kriterleri:
-        1. Pozisyon 4+ saat terste (giriş fiyatının ters tarafında)
-        2. Fiyat, pullback seviyesinden daha fazla düşmemişse kapat
-        
-        Bu sayede:
-        - Dönmeyecek pozisyonlardan erken çıkılır
-        - Daha fazla düşmemişse zarar minimize edilir
+        Legacy adverse exit is disabled for underwater positions.
+
+        The ROI-first protection ladder now owns all loss-side behavior:
+        pre-stop reduction, staged recovery, technical SL, KS cap, emergency.
+        Keeping this legacy direct-close path active would bypass that ladder.
         """
-        open_time = pos.get('openTime', 0)
-        age_ms = int(datetime.now().timestamp() * 1000) - open_time
-        age_hours = age_ms / (1000 * 60 * 60)
-        
-        # exit_tightness ile ölçeklendir: yüksek = daha sabırlı (4h * 2.7 = 10.8h)
-        et = self.get_effective_exit_tightness(pos)
-        adverse_hours = 4 * et
-        if age_hours < adverse_hours:
-            return False
-        
-        entry = pos['entryPrice']
-        leverage = pos.get('leverage', 10)
-        # Phase 275: Leverage-aware pullback — scale by leverage for ROI-based tolerance
-        # Raw pullbackPct is price-based, divide by leverage for meaningful ROI comparison
-        raw_pullback_pct = pos.get('pullbackPct', 1.0) * et
-        pullback_pct = max(raw_pullback_pct, 5.0 / max(leverage, 1))  # At least 5% ROI / leverage as price%
-        
-        if pos['side'] == 'LONG':
-            # Terste mi? (fiyat entry'nin altında)
-            if current_price >= entry:
-                return False  # Kârda, kontrol etme
-            
-            # Pullback threshold: entry'den ne kadar aşağı düşebilir
-            pullback_threshold = entry * (1 - pullback_pct / 100)
-            
-            # Fiyat pullback threshold'unun üstündeyse (çok fazla düşmediyse) kapat
-            if current_price >= pullback_threshold:
-                loss_pct = ((entry - current_price) / entry) * 100
-                self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
-                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
-                self.close_via_engine(pos, current_price, 'ADVERSE_TIME_EXIT', 'ADVERSE')
-                return True
-                
-        elif pos['side'] == 'SHORT':
-            # Terste mi? (fiyat entry'nin üstünde)
-            if current_price <= entry:
-                return False  # Kârda, kontrol etme
-            
-            # Pullback threshold: entry'den ne kadar yukarı çıkabilir
-            pullback_threshold = entry * (1 + pullback_pct / 100)
-            
-            # Fiyat pullback threshold'unun altındaysa (çok fazla yükselmemişse) kapat
-            if current_price <= pullback_threshold:
-                loss_pct = ((current_price - entry) / entry) * 100
-                self.add_log(f"⏰ ADVERSE EXIT: {pos['symbol']} {age_hours:.1f}h terste | Zarar: %{loss_pct:.2f}")
-                pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': 'ADVERSE_TIME', 'roi': round(-loss_pct, 1)})
-                self.close_via_engine(pos, current_price, 'ADVERSE_TIME_EXIT', 'ADVERSE')
-                return True
-        
         return False
 
     
@@ -32595,6 +35006,19 @@ class PaperTradingEngine:
                     # Phase 36: Load entry/exit tightness
                     self.entry_tightness = data.get('entry_tightness', 1.8)  # Default: Gevşek
                     self.exit_tightness = data.get('exit_tightness', 1.2)  # Default: 1.2x
+                    self.entry_stop_soft_roi_pct = _clamp_param(
+                        'entry_stop_soft_roi_pct',
+                        float(data.get('entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT) or ENTRY_STOP_SOFT_ROI_DEFAULT),
+                    )
+                    self.entry_stop_hard_roi_pct = _clamp_param(
+                        'entry_stop_hard_roi_pct',
+                        float(data.get('entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT) or ENTRY_STOP_HARD_ROI_DEFAULT),
+                    )
+                    if self.entry_stop_soft_roi_pct <= self.entry_stop_hard_roi_pct:
+                        self.entry_stop_hard_roi_pct = min(
+                            self.entry_stop_hard_roi_pct,
+                            self.entry_stop_soft_roi_pct - 10.0,
+                        )
                     self.strategy_mode = normalize_strategy_mode(data.get('strategy_mode', STRATEGY_MODE_LEGACY))
                     # Phase 57: Load Kill Switch settings
                     if 'kill_switch_first_reduction' in data:
@@ -32671,6 +35095,8 @@ class PaperTradingEngine:
                 # Phase 36: Save entry/exit tightness
                 "entry_tightness": self.entry_tightness,
                 "exit_tightness": self.exit_tightness,
+                "entry_stop_soft_roi_pct": getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT),
+                "entry_stop_hard_roi_pct": getattr(self, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
                 "strategy_mode": self.strategy_mode,
                 # Phase 57: Kill Switch settings
                 "kill_switch_first_reduction": daily_kill_switch.first_reduction_pct,
@@ -33127,6 +35553,13 @@ class PaperTradingEngine:
             "effectiveExitTightness": self.exit_tightness,
             "runtimeTrailDistance": signal.get('trailDistance', 0),
             "runtimeTrailDistancePct": round((signal.get('trailDistance', 0) / current_price * 100), 4) if current_price > 0 else 0.0,
+            "runtimeTrailDistanceRoiPct": round(price_distance_to_roi_pct(signal.get('trailDistance', 0), current_price, adjusted_leverage), 2),
+            "runtimeTpRoiPct": round(compute_target_roi_pct(current_price, signal.get('tp', 0), signal['action'], adjusted_leverage), 2),
+            "runtimeStopRoiPct": round(compute_target_roi_pct(current_price, signal.get('sl', 0), signal['action'], adjusted_leverage), 2),
+            "runtimePreStopReduceRoiPct": None,
+            "runtimeKillSwitchFullRoiPct": None,
+            "runtimeRecoveryState": {},
+            "runtimeProtectionPhase": "SL-PRIMARY",
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -33241,6 +35674,13 @@ class PaperTradingEngine:
             
             pos['unrealizedPnl'] = pnl
             pos['unrealizedPnlPercent'] = pnl_percent
+            update_runtime_protection_telemetry(
+                pos=pos,
+                current_price=current_price,
+                user_first_reduction_roi=daily_kill_switch.first_reduction_pct,
+                user_full_close_roi=daily_kill_switch.full_close_pct,
+                entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+            )
             
             # Phase 224A: MAE/MFE update
             if pnl_percent < pos.get('mae_pct', 0):
@@ -33305,28 +35745,26 @@ class PaperTradingEngine:
             # ================================================================
             # Phase 144: ROI-Based Trail Activation (with leverage + exit_tightness)
             # ================================================================
-            # Phase 151: Spread-based trail activation ROI
-            # Low volatility coins → earlier activation, high volatility → later
-            spread_activation_map = {
-                'Very Low': 2.0,   # BTC/ETH — low vol, early trail
-                'Low':      3.0,
-                'Normal':   4.0,
-                'High':     6.0,   # High spread = later trail
-                'Very High': 8.0,  # Meme — very volatile, late trail
-                'Extreme':  12.0,  # Hyper-volatile
-                'Ultra':    16.0   # Extreme edge cases
-            }
-            base_activation_roi = spread_activation_map.get(pos.get('spreadLevel', pos.get('spread_level', 'Normal')), 4.0)  # Phase 223c
-            # Phase 218: Trail threshold must account for leverage — otherwise tiny price moves
-            # on high leverage (e.g. 0.42% on 20x = 8.5% ROI) falsely trigger trail
-            pos_leverage = pos.get('leverage', 10)
-            activation_threshold = base_activation_roi * self.get_effective_exit_tightness(pos) * pos_leverage
+            profit_tp_authority = uses_profit_ladder_authority(pos)
+            activation_threshold = _coerce_float(pos.get('runtimeTrailActivationRoiPct', 0.0), 0.0)
+            if activation_threshold <= 0:
+                spread_activation_map = {
+                    'Very Low': 2.0,
+                    'Low': 3.0,
+                    'Normal': 4.0,
+                    'High': 6.0,
+                    'Very High': 8.0,
+                    'Extreme': 12.0,
+                    'Ultra': 16.0,
+                }
+                base_activation_roi = spread_activation_map.get(pos.get('spreadLevel', pos.get('spread_level', 'Normal')), 4.0)
+                activation_threshold = base_activation_roi * self.get_effective_exit_tightness(pos)
             
             if pos['side'] == 'LONG':
                 # LONG: ROI must be >= threshold (positive ROI)
-                if roi_pct >= activation_threshold:
+                if (not profit_tp_authority) and should_activate_trailing_by_roi(roi_pct, activation_threshold):
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAIL_LEGACY_SYNC: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                        self.add_log(f"🔄 TRAIL_FALLBACK_SYNC: {pos['symbol']} LONG ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                     if not pos.get('trailActiveSince'):
                         pos['trailActiveSince'] = datetime.now().timestamp()
@@ -33348,7 +35786,11 @@ class PaperTradingEngine:
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
-                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
+                        reason = (
+                            derive_profit_exit_reason(pos, current_price=current_price)
+                            if (pos.get('isTrailingActive') and roi_pct >= 0)
+                            else 'SL_HIT'
+                        )
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
                         self.close_via_engine(pos, current_price, reason, 'TRAILING')
                 else:
@@ -33356,7 +35798,7 @@ class PaperTradingEngine:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} LONG | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
-                    if current_price >= pos['takeProfit']:
+                    if current_price >= pos['takeProfit'] and not profit_tp_authority:
                         # RMP-1: TP Cost-Floor Guard
                         _tp_cf = check_tp_cost_floor(pos, current_price)
                         _tp_cf_snap = (f"symbol={pos.get('symbol')} side=LONG net_roi={_tp_cf['net_roi_pct']:.2f}% "
@@ -33382,9 +35824,9 @@ class PaperTradingEngine:
                     
             elif pos['side'] == 'SHORT':
                 # SHORT: ROI must be >= threshold (positive ROI means price went down)
-                if roi_pct >= activation_threshold:
+                if (not profit_tp_authority) and should_activate_trailing_by_roi(roi_pct, activation_threshold):
                     if not pos['isTrailingActive']:
-                        self.add_log(f"🔄 TRAIL_LEGACY_SYNC: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
+                        self.add_log(f"🔄 TRAIL_FALLBACK_SYNC: {pos['symbol']} SHORT ROI={roi_pct:.1f}% >= {activation_threshold:.1f}%")
                     pos['isTrailingActive'] = True
                     if not pos.get('trailActiveSince'):
                         pos['trailActiveSince'] = datetime.now().timestamp()
@@ -33406,7 +35848,11 @@ class PaperTradingEngine:
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
-                        reason = 'TRAIL_EXIT' if (pos.get('isTrailingActive') and roi_pct >= 0) else 'SL_HIT'
+                        reason = (
+                            derive_profit_exit_reason(pos, current_price=current_price)
+                            if (pos.get('isTrailingActive') and roi_pct >= 0)
+                            else 'SL_HIT'
+                        )
                         pos.setdefault('decision_trace', []).append({'t': int(datetime.now().timestamp()), 'mgr': reason, 'roi': round(roi_pct, 1)})
                         self.close_via_engine(pos, current_price, reason, 'TRAILING')
                 else:
@@ -33414,7 +35860,7 @@ class PaperTradingEngine:
                         self.add_log(f"⚡ Spike bypassed: {pos['symbol']} SHORT | {pos['slConfirmCount']} ticks")
                     pos['slConfirmCount'] = 0
                     pos['slBreachStartTime'] = 0
-                    if current_price <= pos['takeProfit']:
+                    if current_price <= pos['takeProfit'] and not profit_tp_authority:
                         # RMP-1: TP Cost-Floor Guard
                         _tp_cf = check_tp_cost_floor(pos, current_price)
                         _tp_cf_snap = (f"symbol={pos.get('symbol')} side=SHORT net_roi={_tp_cf['net_roi_pct']:.2f}% "
@@ -33448,6 +35894,44 @@ class PaperTradingEngine:
         r = reason.upper() if reason else 'OTHER'
         if 'EMERGENCY' in r:
             return 'EMERGENCY_SL'
+        if 'SIGNAL_INVALIDATION_REDUCE' in r:
+            return 'SIGNAL_INVALIDATION_REDUCE'
+        if 'REGIME_DETERIORATION_REDUCE' in r:
+            return 'REGIME_DETERIORATION_REDUCE'
+        if 'EXECUTION_RISK_REDUCE' in r:
+            return 'EXECUTION_RISK_REDUCE'
+        if 'FUNDING_DECAY_REDUCE' in r:
+            return 'FUNDING_DECAY_REDUCE'
+        if 'TIME_RECOVERY_STAGE1' in r:
+            return 'TIME_RECOVERY_STAGE1'
+        if 'TIME_RECOVERY_STAGE2' in r:
+            return 'TIME_RECOVERY_STAGE2'
+        if 'TP1_PARTIAL' in r:
+            return 'TP1_PARTIAL'
+        if 'TP2_PARTIAL' in r:
+            return 'TP2_PARTIAL'
+        if 'TP3_PARTIAL' in r:
+            return 'TP3_PARTIAL'
+        if 'TP_FINAL_HIT' in r:
+            return 'TP_FINAL_HIT'
+        if 'TRAIL_WIDE_EXIT' in r:
+            return 'TRAIL_WIDE_EXIT'
+        if 'TRAIL_NORMAL_EXIT' in r:
+            return 'TRAIL_NORMAL_EXIT'
+        if 'TRAIL_TIGHT_EXIT' in r:
+            return 'TRAIL_TIGHT_EXIT'
+        if 'PROFIT_GIVEBACK_EXIT' in r:
+            return 'PROFIT_GIVEBACK_EXIT'
+        if 'RECLAIM_BE_CLOSE' in r:
+            return 'RECLAIM_BE_CLOSE'
+        if 'PRE_STOP_REDUCE' in r:
+            return 'PRE_STOP_REDUCE'
+        if 'RECOVERY_REDUCE_STAGE1' in r:
+            return 'RECOVERY_REDUCE_STAGE1'
+        if 'RECOVERY_REDUCE_STAGE2' in r:
+            return 'RECOVERY_REDUCE_STAGE2'
+        if 'RECOVERY_TRAIL_CLOSE' in r:
+            return 'RECOVERY_TRAIL_CLOSE'
         if r.startswith('SL') or 'STOP_LOSS' in r or r == 'SL_HIT':
             return 'SL_HIT'
         if r.startswith('TP') or 'TAKE_PROFIT' in r or r == 'TP_HIT':
@@ -33513,17 +35997,32 @@ class PaperTradingEngine:
             # Take Profit variants
             'TP': f"🟢 TP: Take Profit Hedefi ({pnl_percent:+.1f}%)",
             'TP_HIT': f"🟢 TP: Take Profit Tetiklendi @ ${exit_price:.4f} ({pnl_percent:+.1f}%)",
+            'TP1_PARTIAL': f"🟢 TP1: İlk ROI hedefi kısmi realize ({pnl_percent:+.1f}%)",
+            'TP2_PARTIAL': f"🟢 TP2: İkinci ROI hedefi kısmi realize ({pnl_percent:+.1f}%)",
+            'TP3_PARTIAL': f"🟢 TP3: Üçüncü ROI hedefi kısmi realize ({pnl_percent:+.1f}%)",
+            'TP_FINAL_HIT': f"🟢 TP FINAL: Runner hedefi kapandı @ ${exit_price:.4f} ({pnl_percent:+.1f}%)",
             
             # Trailing Stop
             'TRAIL': f"📈 TRAIL: Trailing Stop ({pnl_percent:+.1f}%, peak'ten çekilme)",
             'TRAIL_EXIT': f"📈 TRAIL: Trailing Stop Çıkışı ({pnl_percent:+.1f}%)",
             'TRAILING_STOP': f"📈 TRAIL: Trailing Stop Tetiklendi ({pnl_percent:+.1f}%)",
-            
+            'TRAIL_WIDE_EXIT': f"📈 TRAIL WIDE: Geniş runner trail çıkışı ({pnl_percent:+.1f}%)",
+            'TRAIL_NORMAL_EXIT': f"📈 TRAIL NORMAL: Ana kâr koruma çıkışı ({pnl_percent:+.1f}%)",
+            'TRAIL_TIGHT_EXIT': f"📈 TRAIL TIGHT: Sıkı kâr koruma çıkışı ({pnl_percent:+.1f}%)",
+            'PROFIT_GIVEBACK_EXIT': f"📈 GIVEBACK: Zirveden kontrollü geri verme çıkışı ({pnl_percent:+.1f}%)",
+
             # Kill Switch
             'KILL_SWITCH_FULL': f"⚠️ KILL: Kill Switch Tam Kapatma ({pnl_percent:+.1f}%)",
             'KILL_SWITCH_PARTIAL': f"⚠️ KILL: Kill Switch Kısmi (%50, {pnl_percent:+.1f}%)",
-            
+            'PRE_STOP_REDUCE': f"🛡️ PRE-REDUCE: Stop öncesi risk azaltma ({pnl_percent:+.1f}%)",
+            'SIGNAL_INVALIDATION_REDUCE': f"📡 SIGNAL INVALIDATION: Sinyal bozuldu, %15 azaltma ({pnl_percent:+.1f}%)",
+            'REGIME_DETERIORATION_REDUCE': f"🌪️ REGIME: Piyasa rejimi bozuldu, %10 azaltma ({pnl_percent:+.1f}%)",
+            'EXECUTION_RISK_REDUCE': f"🧵 EXEC RISK: Çıkış kalitesi zayıf, %10 azaltma ({pnl_percent:+.1f}%)",
+            'FUNDING_DECAY_REDUCE': f"💸 CARRY: Funding maliyeti arttı, %10 azaltma ({pnl_percent:+.1f}%)",
+
             # Time-based
+            'TIME_RECOVERY_STAGE1': f"⏰ TIME RECOVERY S1: 4 saat zararda kaldıktan sonraki ilk toparlanma azaltması ({pnl_percent:+.1f}%)",
+            'TIME_RECOVERY_STAGE2': f"⏰ TIME RECOVERY S2: 8 saat zararda kaldıktan sonraki toparlanma azaltması ({pnl_percent:+.1f}%)",
             'TIME_REDUCE_4H': f"⏰ TIME: 4 Saat Kuralı (-10%, {pnl_percent:+.1f}%)",
             'TIME_REDUCE_8H': f"⏰ TIME: 8 Saat Kuralı (-10%, {pnl_percent:+.1f}%)",
             'TIME_GRADUAL': f"⏰ TIME: Kademeli Zaman Çıkışı ({pnl_percent:+.1f}%)",
@@ -33531,6 +36030,9 @@ class PaperTradingEngine:
             
             # Recovery & Adverse
             'RECOVERY_EXIT': f"🔄 RECOVERY: Toparlanma Çıkışı ({pnl_percent:+.1f}%)",
+            'RECOVERY_REDUCE_STAGE1': f"🔄 RECOVERY S1: İlk toparlanma azaltması ({pnl_percent:+.1f}%)",
+            'RECOVERY_REDUCE_STAGE2': f"🔄 RECOVERY S2: İkinci toparlanma azaltması ({pnl_percent:+.1f}%)",
+            'RECOVERY_TRAIL_CLOSE': f"🔄 RECOVERY TRAIL: Toparlanma geri verildi ({pnl_percent:+.1f}%)",
             'ADVERSE_TIME_EXIT': f"⚡ ADVERSE: Olumsuz Zaman Çıkışı ({pnl_percent:+.1f}%)",
             
             # Manual
@@ -33538,6 +36040,7 @@ class PaperTradingEngine:
             
             # Signal Reversal
             'SIGNAL_REVERSAL_PROFIT': f"🔄 REVERSAL: Sinyal Değişimi Karlı Çıkış ({pnl_percent:+.1f}%)",
+            'RECLAIM_BE_CLOSE': f"🔒 RECLAIM BE: Kâr korunarak başabaş tabanından çıkış ({pnl_percent:+.1f}%)",
             
             # Phase 214: Failed Continuation
             'FAILED_CONTINUATION': f"🔄 FAILED_CONT: Kalıcılık Sağlanamadı — {pos.get('fc_failed_count', 0)} başarısız deneme ({pnl_percent:+.1f}%)",
@@ -33640,7 +36143,17 @@ class PaperTradingEngine:
             elif side == 'SHORT' and exit_price > tp_price:
                 reason = f"SLIPPAGE_EXIT({original_reason})"
                 logger.warning(f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} but exit ${exit_price:.6f} > TP ${tp_price:.6f} → {reason}")
-        elif reason in ['SL_HIT', 'TRAIL_EXIT', 'EMERGENCY_SL'] and sl_price > 0:
+        elif reason in [
+            'SL_HIT',
+            'TRAIL_EXIT',
+            'TRAIL_WIDE_EXIT',
+            'TRAIL_NORMAL_EXIT',
+            'TRAIL_TIGHT_EXIT',
+            'PROFIT_GIVEBACK_EXIT',
+            'BREAKEVEN_CLOSE',
+            'RECLAIM_BE_CLOSE',
+            'EMERGENCY_SL',
+        ] and sl_price > 0:
             if side == 'LONG' and exit_price > sl_price:
                 reason = f"SLIPPAGE_EXIT({original_reason})"
             elif side == 'SHORT' and exit_price < sl_price:
@@ -33649,6 +36162,11 @@ class PaperTradingEngine:
         # Record trade
         trade = {
             "id": pos.get('id', f"trade_{int(datetime.now().timestamp())}"),
+            "tradeId": pos.get('tradeId', pos.get('trade_id', pos.get('id', f"trade_{int(datetime.now().timestamp())}"))),
+            "signalId": pos.get('signalId', pos.get('signal_id', '')),
+            "positionId": pos.get('positionId', pos.get('position_id', pos.get('id', ''))),
+            "entryOrderId": pos.get('entryOrderId', pos.get('entry_order_id', pos.get('binance_order_id', ''))),
+            "closeOrderId": pos.get('closeOrderId', pos.get('close_order_id', '')),
             "symbol": pos.get('symbol', 'UNKNOWN'),
             "side": pos.get('side', 'LONG'),
             "entryPrice": effective_entry,  # Phase 246: PNL ile aynı entry (fill price if live)
@@ -33684,6 +36202,9 @@ class PaperTradingEngine:
             "tpMultiplier": pos.get('tpMultiplier', 0),
             # Phase 155: AI Optimizer settings snapshot from open time
             "settingsSnapshot": pos.get('settingsSnapshot', {}),
+            "signalSnapshot": pos.get('signal_snapshot', pos.get('signalSnapshot', {})),
+            "execSnapshot": pos.get('exec_snapshot', pos.get('execSnapshot', {})),
+            "riskSnapshot": pos.get('risk_snapshot', pos.get('riskSnapshot', {})),
             # SMART_V3_RUNNER: close telemetry
             "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
             "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
@@ -33726,6 +36247,8 @@ class PaperTradingEngine:
             "exitForecastAggressiveness": pos.get('exitForecastAggressiveness', 0.5),
             "exitDeferredCount": pos.get('_exit_deferred_count', 0),
             "exitReasonNorm": pos.get('exitReasonNorm', reason),
+            "reasonOwner": pos.get('runtimeProfitOwner', pos.get('exitOwner', source)),
+            "profitPhase": pos.get('runtimeProfitPhase', 'WAIT'),
             # Phase 232 / 261: Canonical reason + legacy closeReason
             "closeReason": reason,
             "original_reason": original_reason,
@@ -33753,6 +36276,14 @@ class PaperTradingEngine:
                 'recoveryStage': int(pos.get('recoveryStage', 0) or 0),
                 'internalProtectionOnly': bool(pos.get('internalProtectionOnly', False)),
                 'lastExitDecision': pos.get('lastExitDecision', ''),
+                'runtimeProfitPhase': pos.get('runtimeProfitPhase', 'WAIT'),
+                'runtimeProfitOwner': pos.get('runtimeProfitOwner', 'NONE'),
+                'runtimeProfitPeakRoiPct': float(pos.get('runtimeProfitPeakRoiPct', pos.get('profitPeakRoiPct', 0.0)) or 0.0),
+                'runtimeProfitGivebackRoiPct': float(pos.get('runtimeProfitGivebackRoiPct', 0.0) or 0.0),
+                'runtimeProfitLockRoiPct': pos.get('runtimeProfitLockRoiPct'),
+                'runtimeBreakevenArmRoiPct': float(pos.get('runtimeBreakevenArmRoiPct', 0.0) or 0.0),
+                'runtimeBreakevenFloorRoiPct': float(pos.get('runtimeBreakevenFloorRoiPct', 0.0) or 0.0),
+                'runtimeExchangeBreakEvenPrice': float(pos.get('runtimeExchangeBreakEvenPrice', pos.get('exchangeBreakEvenPrice', 0.0)) or 0.0),
                 'breachCurrentPrice': float(pos.get('breachCurrentPrice', 0.0) or 0.0),
                 'breachCandleClose': float(pos.get('breachCandleClose', 0.0) or 0.0),
                 'breachTrailStop': float(pos.get('breachTrailStop', 0.0) or 0.0),
@@ -33910,6 +36441,10 @@ class PaperTradingEngine:
                     'binance_fill_price': pos.get('binance_fill_price', 0),
                     'hurst': pos.get('hurst', 0.5),
                     'trade_id': trade.get('id', ''),
+                    'signal_id': trade.get('signalId', ''),
+                    'position_id': trade.get('positionId', pos.get('id', '')),
+                    'strategy_mode': trade.get('strategyMode', STRATEGY_MODE_LEGACY),
+                    'execution_profile_source': trade.get('execution_profile_source', 'neutral'),
                     # Phase 224A
                     'mae_pct': round(pos.get('mae_pct', 0), 2),
                     'mfe_pct': round(pos.get('mfe_pct', 0), 2),
@@ -33917,6 +36452,9 @@ class PaperTradingEngine:
                     'decision_trace': json.dumps(pos.get('decision_trace', [])[-10:]),
                     # Phase 229: Order ID-based matching
                     'entry_order_id': pos.get('binance_order_id', ''),
+                    'close_order_id': pos.get('close_order_id', ''),
+                    'risk_snapshot': pos.get('risk_snapshot', {}),
+                    'exec_snapshot': pos.get('exec_snapshot', {}),
                 }
                 safe_create_task(sqlite_manager.save_position_close(close_data))
             except Exception as e:
@@ -34946,11 +37484,19 @@ class ExitDecisionEngine:
         'EMERGENCY_SL': 100,
         'KILL_SWITCH': 95,
         'RECOVERY_CLOSE_ALL': 93,
+        'RECOVERY_TRAIL_CLOSE': 92,
         'RECOVERY_EXIT': 90,
         'SL_HIT': 88,            # FIX #4 (Joint Audit): SL must outrank PROTECTION_LOCK and below
         'PROTECTION_LOCK': 85,
+        'BREAKEVEN_CLOSE': 73,
+        'RECLAIM_BE_CLOSE': 72,
         'FAILED_CONTINUATION': 70,
+        'PROFIT_GIVEBACK_EXIT': 66,
+        'TRAIL_WIDE_EXIT': 62,
+        'TRAIL_NORMAL_EXIT': 61,
+        'TRAIL_TIGHT_EXIT': 60,
         'TRAIL_EXIT': 60,
+        'TP_FINAL_HIT': 52,
         'TP_HIT': 50,
         'TIME_GRADUAL': 40,
         'TIME_EXIT': 35,
@@ -34969,10 +37515,20 @@ class ExitDecisionEngine:
         if 'ERROR_TIMEOUT' in reason_upper: return 'EXEC_TIMEOUT', 'TIME'
         if 'TIMEOUT' in reason_upper: return 'TIMEOUT', 'TIME'
         if 'TIME' in reason_upper: return 'TIME_EXIT', 'TIME'
+        if 'BREAKEVEN_CLOSE' in reason_upper: return 'BREAKEVEN_CLOSE', 'PROFIT'
+        if 'TP_FINAL_HIT' in reason_upper: return 'TP_FINAL_HIT', 'PROFIT'
         if 'TP_HIT' in reason_upper: return 'TP_HIT', 'PROFIT'
+        if any(token in reason_upper for token in ('TP1_PARTIAL', 'TP2_PARTIAL', 'TP3_PARTIAL')):
+            return reason_upper.split('(')[0].strip(), 'PROFIT'
         if 'SL_HIT' in reason_upper: return 'SL_HIT', 'LOSS'
         if 'EMERGENCY_SL' in reason_upper: return 'EMERGENCY_SL', 'LOSS'
+        if 'RECLAIM_BE_CLOSE' in reason_upper: return 'RECLAIM_BE_CLOSE', 'PROFIT'
+        if 'PROFIT_GIVEBACK_EXIT' in reason_upper: return 'PROFIT_GIVEBACK_EXIT', 'PROFIT'
+        if 'RECOVERY_TRAIL_CLOSE' in reason_upper: return 'RECOVERY_TRAIL_CLOSE', 'LOSS'
         if 'KILL_SWITCH' in reason_upper: return 'KILL_SWITCH', 'LOSS'
+        if 'TRAIL_WIDE_EXIT' in reason_upper: return 'TRAIL_WIDE_EXIT', 'PROFIT'
+        if 'TRAIL_NORMAL_EXIT' in reason_upper: return 'TRAIL_NORMAL_EXIT', 'PROFIT'
+        if 'TRAIL_TIGHT_EXIT' in reason_upper: return 'TRAIL_TIGHT_EXIT', 'PROFIT'
         if 'TRAIL' in reason_upper: return 'TRAIL_EXIT', 'PROFIT'
         return reason_upper.split('(')[0].strip(), 'OTHER'
     
@@ -35655,19 +38211,169 @@ async def live_trading_status():
     try:
         balance = await live_binance_trader.get_balance()
         positions = await live_binance_trader.get_positions()
+        paper_positions = {p.get('symbol'): p for p in getattr(global_paper_trader, 'positions', [])}
+        merged_positions = []
+        for bp in positions:
+            symbol = bp.get('symbol', '')
+            paper_pos = paper_positions.get(symbol, {})
+            merged = dict(bp)
+            merged['exchangeBreakEvenPrice'] = float(
+                paper_pos.get('exchangeBreakEvenPrice', bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', 0.0))) or 0.0
+            )
+            if paper_pos:
+                merged['stopLoss'] = paper_pos.get('stopLoss', bp.get('stopLoss', 0))
+                merged['takeProfit'] = paper_pos.get('takeProfit', bp.get('takeProfit', 0))
+                merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
+                merged['trailActivation'] = paper_pos.get('trailActivation', 0)
+                merged['atr'] = paper_pos.get('atr', 0)
+                merged['effectiveExitTightness'] = paper_pos.get('effectiveExitTightness', global_paper_trader.exit_tightness)
+                merged['runtimeTrailDistance'] = paper_pos.get('runtimeTrailDistance', paper_pos.get('trailDistance', 0))
+                merged['runtimeTrailDistancePct'] = paper_pos.get('runtimeTrailDistancePct', 0.0)
+                merged['runtimeTrailDistanceRoiPct'] = paper_pos.get(
+                    'runtimeTrailDistanceRoiPct',
+                    price_move_pct_to_roi_pct(paper_pos.get('runtimeTrailDistancePct', 0.0), paper_pos.get('leverage', bp.get('leverage', 1))),
+                )
+                merged['runtimeTpRoiPct'] = paper_pos.get('runtimeTpRoiPct', 0.0)
+                merged['runtimeStopRoiPct'] = paper_pos.get('runtimeStopRoiPct', 0.0)
+                merged['runtimeEntryStopGateMode'] = paper_pos.get('runtimeEntryStopGateMode', 'normal')
+                merged['runtimeEntryStopRoiPct'] = paper_pos.get('runtimeEntryStopRoiPct', merged['runtimeStopRoiPct'])
+                merged['runtimePreStopReduceRoiPct'] = paper_pos.get('runtimePreStopReduceRoiPct')
+                merged['runtimeKillSwitchFullRoiPct'] = paper_pos.get('runtimeKillSwitchFullRoiPct')
+                merged['runtimeRecoveryState'] = paper_pos.get('runtimeRecoveryState', {})
+                merged['runtimeLossGateState'] = paper_pos.get('runtimeLossGateState', {})
+                merged['runtimeCarryCostRoiPct'] = paper_pos.get('runtimeCarryCostRoiPct', 0.0)
+                merged['runtimeExitRiskRoiPct'] = paper_pos.get('runtimeExitRiskRoiPct', 0.0)
+                merged['runtimeRegimeFlags'] = paper_pos.get('runtimeRegimeFlags', [])
+                merged['runtimeSignalInvalidationState'] = paper_pos.get('runtimeSignalInvalidationState', {})
+                merged['runtimeProtectionPhase'] = paper_pos.get('runtimeProtectionPhase', 'SL-PRIMARY')
+                merged['runtimeTrailActivationMovePct'] = paper_pos.get('runtimeTrailActivationMovePct', 0.0)
+                merged['runtimeTrailActivationRoiPct'] = paper_pos.get('runtimeTrailActivationRoiPct', 0.0)
+                merged['runtimeTrailThresholdMult'] = paper_pos.get('runtimeTrailThresholdMult', 1.0)
+                merged['runtimeTrailLastUpdateTs'] = paper_pos.get('runtimeTrailLastUpdateTs', 0)
+                merged['runtimeTp1RoiPct'] = paper_pos.get('runtimeTp1RoiPct', 0.0)
+                merged['runtimeTp2RoiPct'] = paper_pos.get('runtimeTp2RoiPct', 0.0)
+                merged['runtimeTp3RoiPct'] = paper_pos.get('runtimeTp3RoiPct', 0.0)
+                merged['runtimeTpFinalRoiPct'] = paper_pos.get('runtimeTpFinalRoiPct', 0.0)
+                merged['runtimeBreakevenArmRoiPct'] = paper_pos.get('runtimeBreakevenArmRoiPct', 0.0)
+                merged['runtimeBreakevenFloorRoiPct'] = paper_pos.get('runtimeBreakevenFloorRoiPct', 0.0)
+                merged['runtimeExchangeBreakEvenPrice'] = paper_pos.get('runtimeExchangeBreakEvenPrice', merged['exchangeBreakEvenPrice'])
+                merged['runtimeBreakevenAnchorSource'] = paper_pos.get('runtimeBreakevenAnchorSource', 'entry')
+                merged['runtimeProfitPeakRoiPct'] = paper_pos.get('runtimeProfitPeakRoiPct', 0.0)
+                merged['runtimeProfitGivebackRoiPct'] = paper_pos.get('runtimeProfitGivebackRoiPct', 0.0)
+                merged['runtimeProfitGivebackPct'] = paper_pos.get('runtimeProfitGivebackPct', 0.0)
+                merged['runtimeProfitGivebackArmRoiPct'] = paper_pos.get('runtimeProfitGivebackArmRoiPct', 0.0)
+                merged['runtimeProfitLockRoiPct'] = paper_pos.get('runtimeProfitLockRoiPct')
+                merged['runtimeProfitLockPrice'] = paper_pos.get('runtimeProfitLockPrice', 0.0)
+                merged['runtimeProfitPhase'] = paper_pos.get('runtimeProfitPhase', 'WAIT')
+                merged['runtimeProfitOwner'] = paper_pos.get('runtimeProfitOwner', 'NONE')
+                merged['runtimeProfitLadderVersion'] = paper_pos.get('runtimeProfitLadderVersion', 'v2_roi_profit_ladder')
+                merged['runtimeTpLevels'] = paper_pos.get('runtimeTpLevels', [])
+                merged['runtimeGivebackTrailReady'] = paper_pos.get('runtimeGivebackTrailReady', False)
+                merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
+                if paper_pos.get('openTime', 0) > 0:
+                    merged['openTime'] = paper_pos['openTime']
+            else:
+                entry = merged.get('entryPrice', 0)
+                merged['runtimeTpRoiPct'] = compute_target_roi_pct(entry, merged.get('takeProfit', 0), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                merged['runtimeStopRoiPct'] = compute_target_roi_pct(entry, get_effective_stop_price(merged), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                merged['runtimeEntryStopGateMode'] = merged.get('entryStopGateMode', 'normal')
+                merged['runtimeEntryStopRoiPct'] = merged['runtimeStopRoiPct']
+                merged['runtimePreStopReduceRoiPct'] = None
+                merged['runtimeKillSwitchFullRoiPct'] = None
+                merged['runtimeRecoveryState'] = {}
+                merged['runtimeLossGateState'] = {}
+                merged['runtimeCarryCostRoiPct'] = 0.0
+                merged['runtimeExitRiskRoiPct'] = 0.0
+                merged['runtimeRegimeFlags'] = []
+                merged['runtimeSignalInvalidationState'] = {}
+                merged['runtimeProtectionPhase'] = 'SL-PRIMARY'
+                merged['runtimeTp1RoiPct'] = 0.0
+                merged['runtimeTp2RoiPct'] = 0.0
+                merged['runtimeTp3RoiPct'] = 0.0
+                merged['runtimeTpFinalRoiPct'] = merged['runtimeTpRoiPct']
+                merged['runtimeBreakevenArmRoiPct'] = 0.0
+                merged['runtimeBreakevenFloorRoiPct'] = 0.0
+                merged['runtimeExchangeBreakEvenPrice'] = merged['exchangeBreakEvenPrice']
+                merged['runtimeBreakevenAnchorSource'] = 'entry'
+                merged['runtimeProfitPeakRoiPct'] = 0.0
+                merged['runtimeProfitGivebackRoiPct'] = 0.0
+                merged['runtimeProfitGivebackPct'] = 0.0
+                merged['runtimeProfitGivebackArmRoiPct'] = 0.0
+                merged['runtimeProfitLockRoiPct'] = None
+                merged['runtimeProfitLockPrice'] = 0.0
+                merged['runtimeProfitPhase'] = 'WAIT'
+                merged['runtimeProfitOwner'] = 'NONE'
+                merged['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
+                merged['runtimeTpLevels'] = []
+                merged['runtimeGivebackTrailReady'] = False
+
+            merged_price = float(merged.get('markPrice', merged.get('currentPrice', merged.get('entryPrice', 0.0))) or 0.0)
+            profit_ladder = build_position_profit_ladder(merged, current_price=merged_price)
+            if paper_pos:
+                merged.setdefault('runtimeTp1RoiPct', profit_ladder.get('tp1_roi_pct', 0.0))
+                merged.setdefault('runtimeTp2RoiPct', profit_ladder.get('tp2_roi_pct', 0.0))
+                merged.setdefault('runtimeTp3RoiPct', profit_ladder.get('tp3_roi_pct', 0.0))
+                merged.setdefault('runtimeTpFinalRoiPct', profit_ladder.get('tp_final_roi_pct', merged.get('runtimeTpRoiPct', 0.0)))
+                merged.setdefault('runtimeBreakevenArmRoiPct', profit_ladder.get('breakeven_arm_roi_pct', 0.0))
+                merged.setdefault('runtimeBreakevenFloorRoiPct', profit_ladder.get('breakeven_floor_roi_pct', 0.0))
+                merged.setdefault('runtimeExchangeBreakEvenPrice', profit_ladder.get('exchange_break_even_price', merged['exchangeBreakEvenPrice']))
+                merged.setdefault('runtimeBreakevenAnchorSource', profit_ladder.get('breakeven_anchor_source', 'entry'))
+                merged.setdefault('runtimeProfitPeakRoiPct', profit_ladder.get('profit_peak_roi_pct', 0.0))
+                merged.setdefault('runtimeProfitGivebackRoiPct', profit_ladder.get('profit_giveback_roi_pct', 0.0))
+                merged.setdefault('runtimeProfitGivebackPct', profit_ladder.get('profit_giveback_pct', 0.0))
+                merged.setdefault('runtimeProfitGivebackArmRoiPct', profit_ladder.get('profit_giveback_arm_roi_pct', 0.0))
+                merged.setdefault('runtimeProfitLockRoiPct', profit_ladder.get('profit_lock_roi_pct'))
+                merged.setdefault('runtimeProfitLockPrice', profit_ladder.get('profit_lock_price', 0.0))
+                merged.setdefault('runtimeProfitPhase', profit_ladder.get('profit_phase', 'WAIT'))
+                merged.setdefault('runtimeProfitOwner', profit_ladder.get('profit_owner', 'NONE'))
+                merged.setdefault('runtimeProfitLadderVersion', 'v2_roi_profit_ladder')
+                merged.setdefault('runtimeTpLevels', profit_ladder.get('tp_levels', []))
+                merged.setdefault('runtimeGivebackTrailReady', profit_ladder.get('giveback_trail_ready', False))
+            else:
+                merged['runtimeTp1RoiPct'] = profit_ladder.get('tp1_roi_pct', 0.0)
+                merged['runtimeTp2RoiPct'] = profit_ladder.get('tp2_roi_pct', 0.0)
+                merged['runtimeTp3RoiPct'] = profit_ladder.get('tp3_roi_pct', 0.0)
+                merged['runtimeTpFinalRoiPct'] = profit_ladder.get('tp_final_roi_pct', merged.get('runtimeTpRoiPct', 0.0))
+                merged['runtimeBreakevenArmRoiPct'] = profit_ladder.get('breakeven_arm_roi_pct', 0.0)
+                merged['runtimeBreakevenFloorRoiPct'] = profit_ladder.get('breakeven_floor_roi_pct', 0.0)
+                merged['runtimeExchangeBreakEvenPrice'] = profit_ladder.get('exchange_break_even_price', merged['exchangeBreakEvenPrice'])
+                merged['runtimeBreakevenAnchorSource'] = profit_ladder.get('breakeven_anchor_source', 'entry')
+                merged['runtimeProfitPeakRoiPct'] = profit_ladder.get('profit_peak_roi_pct', 0.0)
+                merged['runtimeProfitGivebackRoiPct'] = profit_ladder.get('profit_giveback_roi_pct', 0.0)
+                merged['runtimeProfitGivebackPct'] = profit_ladder.get('profit_giveback_pct', 0.0)
+                merged['runtimeProfitGivebackArmRoiPct'] = profit_ladder.get('profit_giveback_arm_roi_pct', 0.0)
+                merged['runtimeProfitLockRoiPct'] = profit_ladder.get('profit_lock_roi_pct')
+                merged['runtimeProfitLockPrice'] = profit_ladder.get('profit_lock_price', 0.0)
+                merged['runtimeProfitPhase'] = profit_ladder.get('profit_phase', 'WAIT')
+                merged['runtimeProfitOwner'] = profit_ladder.get('profit_owner', 'NONE')
+                merged['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
+                merged['runtimeTpLevels'] = profit_ladder.get('tp_levels', [])
+                merged['runtimeGivebackTrailReady'] = profit_ladder.get('giveback_trail_ready', False)
+            merged_positions.append(merged)
         pnl_data = await live_binance_trader.get_pnl_from_binance()
         # Phase 187b: Trade history from SQLite (full data, no limit)
         # Previously: get_trade_history(limit=50, days_back=7) from Binance Income API
         # Now: all trades from SQLite with entry/exit prices, reasons, settings
-        trades = await sqlite_manager.get_full_trade_history(limit=0)
-        logger.info(f"Phase 187b: Got {len(trades)} trades from SQLite")
+        trades_raw = await sqlite_manager.get_full_trade_history(limit=0)
+        deduped_trades, dedup_stats = dedupe_trades_for_ui(trades_raw)
+        # Hide synthetic Binance sync rows from the live UI unless they contain
+        # enough data to stand on their own. This keeps mirror records from
+        # overwhelming the recent trade list while preserving rich close rows.
+        trades = [
+            t for t in deduped_trades
+            if t.get('source_type') != 'BINANCE' or _trade_is_analytics_valid(t)
+        ]
+        logger.info(
+            f"Phase 187b: Got {len(trades_raw)} raw live trades from SQLite "
+            f"→ {len(trades)} UI rows (dedup={dedup_stats})"
+        )
         
         return JSONResponse({
             "enabled": True,
             "trading_mode": "live",
             "balance": balance,
-            "positions": positions,
-            "position_count": len(positions),
+            "positions": merged_positions,
+            "position_count": len(merged_positions),
             "last_sync": live_binance_trader.last_sync_time,
             "status": live_binance_trader.get_status(),
             "lastOrderError": live_binance_trader.last_order_error,
@@ -35680,6 +38386,8 @@ async def live_trading_status():
             # Phase 187b: Full trade history from SQLite
             "trades": trades,
             "tradeCount": len(trades),
+            "rawTradeCount": len(trades_raw),
+            "tradeDedup": dedup_stats,
         })
     except Exception as e:
         return JSONResponse({
@@ -36397,6 +39105,8 @@ async def paper_trading_get_settings():
         # Phase 36: Entry/Exit tightness
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
+        "entryStopSoftRoiPct": getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT),
+        "entryStopHardRoiPct": getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
         "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         # Server-side logs
         "logs": global_paper_trader.logs[-50:],
@@ -36438,6 +39148,8 @@ async def paper_trading_update_settings(
     minScoreHigh: int = None,
     entryTightness: float = None,
     exitTightness: float = None,
+    entryStopSoftRoiPct: float = None,
+    entryStopHardRoiPct: float = None,
     strategyMode: str = None,
     killSwitchFirstReduction: float = None,
     killSwitchFullClose: float = None,
@@ -36451,6 +39163,8 @@ async def paper_trading_update_settings(
     old_min_score_low = int(getattr(global_paper_trader, 'min_score_low', 60) or 60)
     old_min_score_high = int(getattr(global_paper_trader, 'min_score_high', 90) or 90)
     old_entry_tightness = float(getattr(global_paper_trader, 'entry_tightness', 1.8) or 1.8)
+    old_entry_stop_soft = float(getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT) or ENTRY_STOP_SOFT_ROI_DEFAULT)
+    old_entry_stop_hard = float(getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT) or ENTRY_STOP_HARD_ROI_DEFAULT)
     old_strategy_mode = str(getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY))
     old_lev_mult = float(getattr(global_paper_trader, 'leverage_multiplier', 1.0) or 1.0)
     pending_clear_reasons = []
@@ -36535,6 +39249,25 @@ async def paper_trading_update_settings(
     if exitTightness is not None:
         exitTightness = _clamp_param('exit_tightness', exitTightness)
         global_paper_trader.exit_tightness = exitTightness
+    if entryStopSoftRoiPct is not None:
+        global_paper_trader.entry_stop_soft_roi_pct = _clamp_param('entry_stop_soft_roi_pct', entryStopSoftRoiPct)
+    if entryStopHardRoiPct is not None:
+        global_paper_trader.entry_stop_hard_roi_pct = _clamp_param('entry_stop_hard_roi_pct', entryStopHardRoiPct)
+    if getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT) <= getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT):
+        global_paper_trader.entry_stop_hard_roi_pct = _clamp_param(
+            'entry_stop_hard_roi_pct',
+            float(global_paper_trader.entry_stop_soft_roi_pct) - 10.0,
+        )
+        logger.warning(
+            f"SETTINGS_NORMALIZED: entry stop band adjusted → "
+            f"soft={global_paper_trader.entry_stop_soft_roi_pct:.0f} "
+            f"hard={global_paper_trader.entry_stop_hard_roi_pct:.0f}"
+        )
+    if (
+        abs(old_entry_stop_soft - float(getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT))) > 0.009
+        or abs(old_entry_stop_hard - float(getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT))) > 0.009
+    ):
+        _mark_pending_clear('entry_stop_gate')
     if strategyMode is not None:
         normalized_mode = str(strategyMode).upper()
         if normalized_mode not in VALID_STRATEGY_MODES:
@@ -36548,10 +39281,10 @@ async def paper_trading_update_settings(
     
     # Phase 57: Kill Switch settings
     if killSwitchFirstReduction is not None:
-        daily_kill_switch.first_reduction_pct = killSwitchFirstReduction
+        daily_kill_switch.first_reduction_pct = max(-200.0, min(-20.0, float(killSwitchFirstReduction)))
         logger.info(f"🚨 Kill Switch First Reduction updated: {killSwitchFirstReduction}%")
     if killSwitchFullClose is not None:
-        daily_kill_switch.full_close_pct = killSwitchFullClose
+        daily_kill_switch.full_close_pct = max(-250.0, min(-40.0, float(killSwitchFullClose)))
         logger.info(f"🚨 Kill Switch Full Close updated: {killSwitchFullClose}%")
     
     # Phase 216: Leverage multiplier
@@ -36579,6 +39312,8 @@ async def paper_trading_update_settings(
         f"⚙️ Ayarlar güncellendi: SL:{global_paper_trader.sl_atr} "
         f"TP:{global_paper_trader.tp_atr} Z:{global_paper_trader.z_score_threshold} "
         f"Giriş:{global_paper_trader.entry_tightness:.2f} Çıkış:{global_paper_trader.exit_tightness:.2f} "
+        f"EntryStop:{getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT):.0f}/"
+        f"{getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT):.0f} "
         f"Str:{getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)} "
         f"LevM:{getattr(global_paper_trader, 'leverage_multiplier', 1.0):.2f} "
         f"KS:{daily_kill_switch.first_reduction_pct}/{daily_kill_switch.full_close_pct}"
@@ -36711,6 +39446,8 @@ async def paper_trading_update_settings(
         "minScoreHigh": global_paper_trader.min_score_high,
         "entryTightness": global_paper_trader.entry_tightness,
         "exitTightness": global_paper_trader.exit_tightness,
+        "entryStopSoftRoiPct": getattr(global_paper_trader, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT),
+        "entryStopHardRoiPct": getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
         "strategyMode": getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
         "killSwitchFirstReduction": daily_kill_switch.first_reduction_pct,
         "killSwitchFullClose": daily_kill_switch.full_close_pct,
@@ -36748,12 +39485,18 @@ async def phase193_status():
     freqai_status['min_samples_for_train'] = 30
     hyperopt_status = hhq_hyperoptimizer.get_status() if hhq_hyperoptimizer else {"enabled": False, "error": "not installed"}
     hyperopt_status['runtime_owner'] = 'ai_optimizer' if parameter_optimizer.enabled else 'manual_or_hyperopt'
+    try:
+        regime_status = market_regime_detector.get_status()
+    except Exception as e:
+        logger.warning(f"Phase193 status regime payload fallback: {e}")
+        regime_status = None
     
     return JSONResponse({
         "stoploss_guard": stoploss_frequency_guard.get_status(),
         "freqai": freqai_status,
         "hyperopt": hyperopt_status,
         "ws_manager": ccxt_ws_manager.get_status() if ccxt_ws_manager else {"enabled": False, "error": "not installed"},
+        "marketRegime": regime_status,
         "pandas_ta": PANDAS_TA_AVAILABLE,
         "ml_diagnostics": {
             "has_ml_tables": has_ml_tables,
@@ -37370,6 +40113,13 @@ async def paper_trading_market_order(request: Request):
             "effectiveTrailDistanceAtrUsed": round(_mo_adj_trail_dist, 4),
             "runtimeTrailDistance": _mo_levels['trail_distance'],
             "runtimeTrailDistancePct": round((_mo_levels['trail_distance'] / fill_price * 100), 4) if fill_price > 0 else 0.0,
+            "runtimeTrailDistanceRoiPct": round(price_distance_to_roi_pct(_mo_levels['trail_distance'], fill_price, leverage), 2),
+            "runtimeTpRoiPct": round(compute_target_roi_pct(fill_price, tp, side, leverage), 2),
+            "runtimeStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, leverage), 2),
+            "runtimePreStopReduceRoiPct": None,
+            "runtimeKillSwitchFullRoiPct": None,
+            "runtimeRecoveryState": {},
+            "runtimeProtectionPhase": "SL-PRIMARY",
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -37542,7 +40292,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
             opps = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
 
             if live_binance_trader.enabled:
-                positions = ui_state_cache.positions or global_paper_trader.positions
+                positions, _position_source = _resolve_live_positions_for_ui(prefer_cache=True)
                 balance = ui_state_cache.balance or (ui_state_cache.live_balance or {}).get('walletBalance', 0)
             else:
                 positions = ui_state_cache.positions or global_paper_trader.positions
@@ -37550,10 +40300,8 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
 
             trades = ui_state_cache.trades or global_paper_trader.trades
 
-            # Phase 259: Generate persistent signals array for UI
             persistent_signals = get_persistent_active_signals_snapshot()
-            long_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
-            short_count = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
+            signal_stats = _build_ui_signal_stats(opps, persistent_signals)
 
             return {
                 "type": "scanner_update",
@@ -37566,9 +40314,7 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     "marketUniverseCoins": scanner_stats.get('marketUniverseCoins', len(getattr(multi_coin_scanner, 'coins', []))),
                     "scannedCoins": scanner_stats.get('scannedCoins', scanner_stats.get('analyzedCoins', 0)),
                     "effectiveMaxCoins": scanner_stats.get('effectiveMaxCoins', scanner_stats.get('analyzedCoins', 0)),
-                    "longSignals": long_count,
-                    "shortSignals": short_count,
-                    "activeSignals": len(persistent_signals), # Phase 259
+                    **signal_stats,
                     "lastUpdate": datetime.now().timestamp()
                 },
                 "portfolio": {
@@ -37608,7 +40354,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     if sym:
                         signal_symbols.add(sym)
 
-            source_positions = ui_state_cache.positions or global_paper_trader.positions
+            if live_binance_trader.enabled:
+                source_positions, _ = _resolve_live_positions_for_ui(prefer_cache=True)
+            else:
+                source_positions = ui_state_cache.positions or global_paper_trader.positions
             position_symbols = set()
             for pos in source_positions:
                 sym = pos.get('symbol')

@@ -72,14 +72,104 @@ export interface Position {
   unrealizedPnl: number;
   unrealizedPnlPercent: number;
   openTime: number;
+  exchangeBreakEvenPrice?: number;
   tp1Hit?: boolean;
   sl1Hit?: boolean;
   // Runtime trail telemetry from backend (updated on each price loop)
   effectiveExitTightness?: number;
   runtimeTrailDistance?: number;
   runtimeTrailDistancePct?: number;
+  runtimeTrailDistanceRoiPct?: number;
   runtimeTrailActivationMovePct?: number;
   runtimeTrailActivationRoiPct?: number;
+  runtimeTpRoiPct?: number;
+  runtimeStopRoiPct?: number;
+  runtimeTp1RoiPct?: number;
+  runtimeTp2RoiPct?: number;
+  runtimeTp3RoiPct?: number;
+  runtimeTpFinalRoiPct?: number;
+  runtimeBreakevenArmRoiPct?: number;
+  runtimeBreakevenFloorRoiPct?: number;
+  runtimeExchangeBreakEvenPrice?: number;
+  runtimeBreakevenAnchorSource?: 'exchange' | 'entry' | string;
+  runtimeProfitPeakRoiPct?: number;
+  runtimeProfitGivebackRoiPct?: number;
+  runtimeProfitGivebackPct?: number;
+  runtimeProfitGivebackArmRoiPct?: number;
+  runtimeProfitLockRoiPct?: number | null;
+  runtimeProfitLockPrice?: number;
+  runtimeProfitPhase?:
+    | 'WAIT'
+    | 'MATURITY'
+    | 'WIDE_TRAIL'
+    | 'NORMAL_TRAIL'
+    | 'TIGHT_TRAIL'
+    | 'RUNNER'
+    | string;
+  runtimeProfitOwner?: 'NONE' | 'TP_LADDER' | 'BREAKEVEN' | 'WIDE_TRAIL' | 'NORMAL_TRAIL' | 'TIGHT_TRAIL' | 'RUNNER' | string;
+  runtimeProfitLadderVersion?: string;
+  runtimeTpLevels?: Array<{
+    key: string;
+    price_pct?: number;
+    roi_pct?: number;
+    price?: number;
+    close_pct?: number;
+  }>;
+  runtimeGivebackTrailReady?: boolean;
+  runtimeEntryStopGateMode?: 'normal' | 'wide_stop_soft' | string;
+  runtimeEntryStopRoiPct?: number;
+  runtimePreStopReduceRoiPct?: number | null;
+  runtimeKillSwitchFullRoiPct?: number | null;
+  runtimeRecoveryState?: {
+    armed?: boolean;
+    stage?: number;
+    worstRoiPct?: number;
+    peakRoiPct?: number;
+    progress?: number;
+    givebackPct?: number;
+    trailActive?: boolean;
+    owner?: string;
+  };
+  runtimeLossGateState?: {
+    lastAction?: string;
+    lastActionTs?: number;
+    lastActionPhase?: string;
+    lastActionDetail?: string;
+    cooldownRemainingSec?: number;
+    firedGates?: {
+      signalInvalidation?: boolean;
+      regimeDeterioration?: boolean;
+      executionRisk?: boolean;
+      fundingDecay?: boolean;
+    };
+  };
+  runtimeCarryCostRoiPct?: number;
+  runtimeExitRiskRoiPct?: number;
+  runtimeRegimeFlags?: string[];
+  runtimeSignalInvalidationState?: {
+    mode?: string;
+    activeSide?: string;
+    currentScore?: number;
+    entryScore?: number;
+    floor?: number;
+    oppositeCount?: number;
+    persistenceSec?: number;
+    signalAgeSec?: number;
+    scoreDrop?: number;
+    triggerReady?: boolean;
+  };
+  runtimeProtectionPhase?:
+    | 'INVALIDATION'
+    | 'REGIME'
+    | 'EXEC-RISK'
+    | 'CARRY'
+    | 'PRE-REDUCE'
+    | 'RECOVERY'
+    | 'TIME-RECOVERY'
+    | 'TRAIL'
+    | 'SL-PRIMARY'
+    | 'KS-CAP'
+    | string;
   runtimeTrailThresholdMult?: number;
   runtimeTrailLastUpdateTs?: number;
 }
@@ -89,17 +179,27 @@ export type CloseReason =
   // Stop Loss variants
   | 'SL' | 'SL_HIT' | 'EMERGENCY_SL'
   // Take Profit variants  
-  | 'TP' | 'TP_HIT' | 'TP1'
+  | 'TP' | 'TP_HIT' | 'TP1' | 'TP1_PARTIAL' | 'TP2_PARTIAL' | 'TP3_PARTIAL' | 'TP_FINAL_HIT'
   // Trailing Stop
   | 'TRAILING' | 'TRAILING_STOP' | 'TRAIL_EXIT'
+  | 'TRAIL_WIDE_EXIT' | 'TRAIL_NORMAL_EXIT' | 'TRAIL_TIGHT_EXIT'
+  | 'PROFIT_GIVEBACK_EXIT' | 'RECLAIM_BE_CLOSE'
   // Kill Switch
   | 'KILL_SWITCH_FULL' | 'KILL_SWITCH_PARTIAL'
   // Time-based position management
   | 'TIME_GRADUAL' | 'TIME_FORCE' | 'TIME_REDUCE_4H' | 'TIME_REDUCE_8H'
+  | 'TIME_RECOVERY_STAGE1' | 'TIME_RECOVERY_STAGE2'
   // Recovery & Adverse conditions
   | 'RECOVERY_EXIT' | 'ADVERSE_TIME_EXIT'
   // Phase 142: Portfolio Recovery Close
   | 'RECOVERY_CLOSE_ALL'
+  | 'PRE_STOP_REDUCE'
+  | 'SIGNAL_INVALIDATION_REDUCE'
+  | 'REGIME_DETERIORATION_REDUCE'
+  | 'EXECUTION_RISK_REDUCE'
+  | 'FUNDING_DECAY_REDUCE'
+  | 'RECOVERY_REDUCE_STAGE1'
+  | 'RECOVERY_REDUCE_STAGE2'
   // Phase 232 / Phase 206: New reasons
   | 'FAILED_CONTINUATION' | 'PORTFOLIO_DRAWDOWN'
   | 'BREAKEVEN_CLOSE' | 'RECOVERY_TRAIL_CLOSE' | 'TRAILING_DD_LOCK'
@@ -135,6 +235,15 @@ export interface Trade {
   // Phase 139: Support both 'reason' (new) and 'closeReason' (legacy)
   reason?: string;           // Primary field from backend
   closeReason?: CloseReason; // Legacy compatibility
+  reasonCode?: string;
+  reasonGroup?: string;
+  reasonSource?: string;
+  reasonOwner?: string;
+  profitPhase?: string;
+  closeScope?: string;
+  triggerMetric?: string;
+  triggerValue?: number | null;
+  thresholdValue?: number | null;
   // SMART_V3_RUNNER: execution profile telemetry
   strategyMode?: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER';
   execution_profile_source?: string;
@@ -189,10 +298,12 @@ export interface SystemSettings {
   // Entry/Exit control settings
   entryTightness: number;       // 0.5-15.0: Pullback multiplier (lower = tighter entry, higher = looser)
   exitTightness: number;        // 0.5-15.0: SL/TP multiplier (lower = quick exit, higher = hold longer)
+  entryStopSoftRoiPct: number;  // Wide-stop soft entry band in leveraged ROI
+  entryStopHardRoiPct: number;  // Hard reject band in leveraged ROI
   strategyMode: 'LEGACY' | 'SMART_V2' | 'SMART_V3_RUNNER'; // Strategy engine mode
   // Kill Switch settings
-  killSwitchFirstReduction: number;  // -5 to -30: First reduction threshold (default -15)
-  killSwitchFullClose: number;       // -10 to -50: Full close threshold (default -20)
+  killSwitchFirstReduction: number;  // Leveraged ROI threshold for first reduction (default -100)
+  killSwitchFullClose: number;       // Leveraged ROI threshold for full close (default -150)
   // Phase 216: Leverage multiplier
   leverageMultiplier: number;        // 0.3-3.0: User-controlled leverage multiplier (default 1.0)
 }
@@ -375,6 +486,12 @@ export interface ScannerStats {
   longSignals: number;
   shortSignals: number;
   activeSignals: number;
+  currentLongSignals?: number;
+  currentShortSignals?: number;
+  currentActiveSignals?: number;
+  persistentLongSignals?: number;
+  persistentShortSignals?: number;
+  persistentActiveSignals?: number;
   lastUpdate: number;
 }
 

@@ -67,6 +67,8 @@ const DEFAULT_SETTINGS: SystemSettings = {
   minScoreHigh: 90,
   entryTightness: 1.8,
   exitTightness: 1.2,
+  entryStopSoftRoiPct: -200,
+  entryStopHardRoiPct: -250,
   strategyMode: 'LEGACY',
   killSwitchFirstReduction: -100,
   killSwitchFullClose: -150,
@@ -111,11 +113,78 @@ const mapBackendSettingsToUI = (data: any, fallback: SystemSettings): SystemSett
   minScoreHigh: toFiniteNumber(data?.minScoreHigh, fallback.minScoreHigh || 90),
   entryTightness: toFiniteNumber(data?.entryTightness, fallback.entryTightness),
   exitTightness: toFiniteNumber(data?.exitTightness, fallback.exitTightness),
+  entryStopSoftRoiPct: toFiniteNumber(data?.entryStopSoftRoiPct, fallback.entryStopSoftRoiPct),
+  entryStopHardRoiPct: toFiniteNumber(data?.entryStopHardRoiPct, fallback.entryStopHardRoiPct),
   strategyMode: normalizeStrategyMode(data?.strategyMode, fallback.strategyMode),
   killSwitchFirstReduction: toFiniteNumber(data?.killSwitchFirstReduction, fallback.killSwitchFirstReduction),
   killSwitchFullClose: toFiniteNumber(data?.killSwitchFullClose, fallback.killSwitchFullClose),
   leverageMultiplier: toFiniteNumber(data?.leverageMultiplier, fallback.leverageMultiplier),
 });
+
+const computeTargetRoiPct = (entryPrice: number, targetPrice: number, side: 'LONG' | 'SHORT', leverage: number): number => {
+  if (!(entryPrice > 0) || !(targetPrice > 0)) return 0;
+  const safeLeverage = Math.max(1, leverage || 1);
+  const movePct = side === 'SHORT'
+    ? ((entryPrice - targetPrice) / entryPrice) * 100
+    : ((targetPrice - entryPrice) / entryPrice) * 100;
+  return movePct * safeLeverage;
+};
+
+const computeTrailDistanceRoiPct = (pos: any): number => {
+  const explicit = Number((pos as any).runtimeTrailDistanceRoiPct);
+  if (Number.isFinite(explicit)) return explicit;
+  const entry = Number(pos.entryPrice || 0);
+  const distance = Number((pos as any).runtimeTrailDistance ?? (pos as any).trailDistance ?? 0);
+  const leverage = Number(pos.leverage || 1);
+  if (!(entry > 0)) return 0;
+  return (distance / entry) * 100 * Math.max(1, leverage);
+};
+
+const clampKillSwitchThreshold = (value: number, minValue: number, maxValue: number, fallback: number): number => {
+  const resolved = Number.isFinite(value) ? value : fallback;
+  return Math.max(minValue, Math.min(maxValue, resolved));
+};
+
+const getProtectionPhaseTone = (phase: string): string => {
+  switch (phase) {
+    case 'INVALIDATION':
+      return 'bg-fuchsia-500/15 text-fuchsia-300';
+    case 'REGIME':
+      return 'bg-cyan-500/15 text-cyan-300';
+    case 'EXEC-RISK':
+      return 'bg-orange-500/15 text-orange-300';
+    case 'CARRY':
+      return 'bg-violet-500/15 text-violet-300';
+    case 'PRE-REDUCE':
+      return 'bg-amber-500/15 text-amber-300';
+    case 'RECOVERY':
+    case 'TIME-RECOVERY':
+      return 'bg-sky-500/15 text-sky-300';
+    case 'TRAIL':
+      return 'bg-emerald-500/15 text-emerald-300';
+    case 'KS-CAP':
+      return 'bg-rose-500/15 text-rose-300';
+    default:
+      return 'bg-slate-700/50 text-slate-400';
+  }
+};
+
+const getProfitPhaseTone = (phase: string): string => {
+  switch (phase) {
+    case 'MATURITY':
+      return 'bg-slate-700/50 text-slate-300';
+    case 'WIDE_TRAIL':
+      return 'bg-emerald-500/15 text-emerald-300';
+    case 'NORMAL_TRAIL':
+      return 'bg-lime-500/15 text-lime-300';
+    case 'TIGHT_TRAIL':
+      return 'bg-amber-500/15 text-amber-300';
+    case 'RUNNER':
+      return 'bg-fuchsia-500/15 text-fuchsia-300';
+    default:
+      return 'bg-slate-800/50 text-slate-500';
+  }
+};
 
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
 
@@ -144,7 +213,11 @@ const resolveExecutionSourceForUI = (
   // Step 1: First open position's source
   const pos = (positions || []).find((p: any) => p.execution_profile_source);
   if (pos) return formatExecutionSourceLabel(pos.execution_profile_source, marketRegime);
-  // Step 2: Latest active signal (sort by timestamp descending)
+  // Step 2: Market regime execution profile is more trustworthy than stale signal memory.
+  if (marketRegime?.executionProfile?.profile_source) {
+    return formatExecutionSourceLabel(marketRegime.executionProfile.profile_source, marketRegime);
+  }
+  // Step 3: Latest persistent active signal (best-effort fallback)
   const activeSignals = (signals || [])
     .filter((s: any) => s.signalAction !== 'NONE' && s.execution_profile_source)
     .sort((a: any, b: any) => {
@@ -153,10 +226,6 @@ const resolveExecutionSourceForUI = (
       return tsB - tsA;
     });
   if (activeSignals.length > 0) return formatExecutionSourceLabel(activeSignals[0].execution_profile_source, marketRegime);
-  // Step 3: Market regime execution profile
-  if (marketRegime?.executionProfile?.profile_source) {
-    return formatExecutionSourceLabel(marketRegime.executionProfile.profile_source, marketRegime);
-  }
   // Step 4: Fallback
   return 'bekleniyor';
 };
@@ -210,12 +279,12 @@ const getReasonTooltip = (trade: any): string => {
   } else if (reason.includes('KILL_SWITCH')) {
     lines.push('');
     lines.push('━━━ KILL SWITCH KRİTERİ ━━━');
-    lines.push('Dinamik eşikler (leverage bazlı):');
+    lines.push('Doğrudan kaldıraçlı ROI eşikleri:');
     if (reason.includes('PARTIAL')) {
-      lines.push(`• %30 margin kaybı → %50 küçültme`);
+      lines.push('• İlk ROI eşiği → %50 küçültme');
       lines.push('• Kalan pozisyon %50 devam etti');
     } else {
-      lines.push(`• %50 margin kaybı → TAM KAPATMA`);
+      lines.push('• Tam kapanış ROI eşiği → TAM KAPATMA');
       lines.push('• Tüm pozisyon likide edildi');
     }
     lines.push(`Gerçekleşen Kayıp: ${pnlPct.toFixed(1)}%`);
@@ -387,6 +456,7 @@ export default function App() {
     freqai: { enabled: boolean; is_trained: boolean; accuracy?: number; f1_score?: number; training_samples?: number; last_training?: string; sklearn_available?: boolean; lightgbm_available?: boolean };
     hyperopt: { enabled: boolean; optuna_available?: boolean; is_optimized: boolean; best_score?: number; improvement_pct?: number; last_run?: string; auto_apply_enabled?: boolean; min_apply_improvement_pct?: number; apply_cooldown_sec?: number; min_trades_for_apply?: number; last_optimize_time?: number; last_apply_time?: number; last_apply_result?: string; last_apply_reason?: string; last_apply_params_count?: number; trade_data_count?: number; run_apply_result?: string; run_apply_reason?: string; run_apply_ts?: number; params_applied_live?: boolean; runtime_owner?: string };
     ws_manager: { enabled: boolean; connected?: boolean };
+    marketRegime?: any;
     ml_governance?: { enabled: boolean; auto_promote: boolean; auto_rollback: boolean; models: Record<string, any>; event_count: number };
     pandas_ta: boolean;
   } | null>(null);
@@ -827,6 +897,8 @@ export default function App() {
       minScoreHigh: String(nextSettings.minScoreHigh || 90),
       entryTightness: String(nextSettings.entryTightness),
       exitTightness: String(nextSettings.exitTightness),
+      entryStopSoftRoiPct: String(nextSettings.entryStopSoftRoiPct),
+      entryStopHardRoiPct: String(nextSettings.entryStopHardRoiPct),
       strategyMode: String(nextSettings.strategyMode || 'LEGACY'),
       killSwitchFirstReduction: String(nextSettings.killSwitchFirstReduction),
       killSwitchFullClose: String(nextSettings.killSwitchFullClose),
@@ -928,8 +1000,6 @@ export default function App() {
 
   // Phase 53: Fetch optimizer status when AI tab is active
   useEffect(() => {
-    if (activeTab !== 'ai') return;
-
     const fetchOptimizerStatus = async () => {
       try {
         const res = await fetch(`${BACKEND_API_URL}/optimizer/status`);
@@ -961,7 +1031,7 @@ export default function App() {
     fetchOptimizerStatus();
     const interval = setInterval(fetchOptimizerStatus, 30000); // Her 30 saniye güncelle
     return () => clearInterval(interval);
-  }, [activeTab]);
+  }, []);
 
   // Phase 193: Fetch module status
   useEffect(() => {
@@ -971,6 +1041,9 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
           setPhase193Status(data);
+          if (data.marketRegime) {
+            setMarketRegime(data.marketRegime);
+          }
         }
       } catch (err) {
         console.error('Phase 193 status fetch error:', err);
@@ -1374,6 +1447,13 @@ export default function App() {
   }, [isRunning]);
 
   const fastTickFresh = lastFastTickMs > 0 && (Date.now() - lastFastTickMs) <= 1200;
+  const settingsAtrPreviewPct = (() => {
+    const atrPcts = portfolio.positions
+      .map((pos: any) => Number(pos.volatility_pct ?? pos.volatilityPct ?? ((pos.atr && pos.entryPrice) ? (pos.atr / pos.entryPrice) * 100 : NaN)))
+      .filter((value: number) => Number.isFinite(value) && value > 0);
+    if (atrPcts.length === 0) return 2.0;
+    return atrPcts.reduce((sum, value) => sum + value, 0) / atrPcts.length;
+  })();
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-slate-300 font-sans selection:bg-indigo-500/30">
@@ -1392,7 +1472,7 @@ export default function App() {
           onHyperoptRun={handleHyperoptRun}
           onHyperoptSettings={handleHyperoptSettings}
           onForceApplyLast={handleForceApplyLast}
-          settingsSnapshot={settings}
+          settingsSnapshot={{ ...settings, leverage: settings.leverage, atrPct: settingsAtrPreviewPct }}
           apiUrl={BACKEND_API_URL}
         />
       )}
@@ -1425,10 +1505,10 @@ export default function App() {
                 <span className="text-slate-600">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span> Varlık
               </span>
               <span className="text-emerald-400">
-                🟢 <span className="font-bold">{scannerStats.longSignals}</span>
+                🟢 <span className="font-bold">{scannerStats.currentLongSignals ?? scannerStats.longSignals}</span>
               </span>
               <span className="text-rose-400">
-                🔴 <span className="font-bold">{scannerStats.shortSignals}</span>
+                🔴 <span className="font-bold">{scannerStats.currentShortSignals ?? scannerStats.shortSignals}</span>
               </span>
               {lastUpdateTime && (
                 <span className="text-slate-500 border-l border-slate-700 pl-3">
@@ -1526,11 +1606,11 @@ export default function App() {
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
-            <span className="text-sm font-bold text-emerald-400">{scannerStats.longSignals}</span>
+            <span className="text-sm font-bold text-emerald-400">{scannerStats.currentLongSignals ?? scannerStats.longSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Kısa</span>
-            <span className="text-sm font-bold text-rose-400">{scannerStats.shortSignals}</span>
+            <span className="text-sm font-bold text-rose-400">{scannerStats.currentShortSignals ?? scannerStats.shortSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Pozisyon</span>
@@ -1694,23 +1774,43 @@ export default function App() {
                     const sl = (pos as any).stopLoss || 0;
                     const trailingStop = (pos as any).trailingStop || sl;
                     const isTrailingActive = (pos as any).isTrailingActive || false;
-                    const runtimeTrailDistancePctRaw = Number(
-                      (pos as any).runtimeTrailDistancePct ??
-                      (((pos as any).trailDistance || 0) / (pos.entryPrice || 1)) * 100
-                    );
-                    const runtimeTrailDistancePct = Number.isFinite(runtimeTrailDistancePctRaw) ? runtimeTrailDistancePctRaw : 0;
-                    const runtimeTrailMovePctRaw = Number((pos as any).runtimeTrailActivationMovePct ?? 0);
-                    const runtimeTrailMovePct = Number.isFinite(runtimeTrailMovePctRaw) ? runtimeTrailMovePctRaw : 0;
+                    const activeStop = isTrailingActive ? trailingStop : sl;
+                    const runtimeTrailDistanceRoiPct = computeTrailDistanceRoiPct(pos);
                     const runtimeTrailRoiPctRaw = Number((pos as any).runtimeTrailActivationRoiPct ?? 0);
                     const runtimeTrailRoiPct = Number.isFinite(runtimeTrailRoiPctRaw) ? runtimeTrailRoiPctRaw : 0;
                     const effectiveExitTightnessRaw = Number((pos as any).effectiveExitTightness ?? settings.exitTightness ?? 1.0);
                     const effectiveExitTightness = Number.isFinite(effectiveExitTightnessRaw) ? effectiveExitTightnessRaw : 1.0;
-                    const tpRoi = tp > 0 && pos.entryPrice > 0
-                      ? isLong
-                        ? ((tp - pos.entryPrice) / pos.entryPrice) * 100 * (pos.leverage || 10)
-                        : ((pos.entryPrice - tp) / pos.entryPrice) * 100 * (pos.leverage || 10)
-                      : 0;
+                    const leverage = pos.leverage || 10;
+                    const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
+                    const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
                     const tpDistance = tpRoi - roi; // TP'ye kaç % kaldı
+                    const stopRoiRaw = Number((pos as any).runtimeStopRoiPct);
+                    const stopRoi = Number.isFinite(stopRoiRaw) ? stopRoiRaw : computeTargetRoiPct(pos.entryPrice, activeStop, pos.side, leverage);
+                    const preStopRaw = (pos as any).runtimePreStopReduceRoiPct == null ? Number.NaN : Number((pos as any).runtimePreStopReduceRoiPct);
+                    const ksFullRaw = (pos as any).runtimeKillSwitchFullRoiPct == null ? Number.NaN : Number((pos as any).runtimeKillSwitchFullRoiPct);
+                    const entryStopGateMode = String((pos as any).runtimeEntryStopGateMode || 'normal');
+                    const lossGateState = ((pos as any).runtimeLossGateState || {}) as any;
+                    const lastLossGateAction = String(lossGateState.lastAction || '');
+                    const carryCostRoiPct = Number((pos as any).runtimeCarryCostRoiPct ?? 0);
+                    const exitRiskRoiPct = Number((pos as any).runtimeExitRiskRoiPct ?? 0);
+                    const regimeFlags = Array.isArray((pos as any).runtimeRegimeFlags) ? ((pos as any).runtimeRegimeFlags as string[]) : [];
+                    const ksFirst = Number.isFinite(preStopRaw)
+                      ? preStopRaw
+                      : clampKillSwitchThreshold(settings.killSwitchFirstReduction, -200, -20, -100);
+                    const ksFull = Number.isFinite(ksFullRaw) ? ksFullRaw : null;
+                    const protectionPhase = String((pos as any).runtimeProtectionPhase || 'SL-PRIMARY');
+                    const recoveryState = ((pos as any).runtimeRecoveryState || {}) as any;
+                    const recoveryProgressPct = Number(recoveryState.progress || 0) * 100;
+                    const recoveryGivebackPct = Number(recoveryState.givebackPct || 0) * 100;
+                    const profitPhase = String((pos as any).runtimeProfitPhase || 'WAIT');
+                    const profitOwner = String((pos as any).runtimeProfitOwner || 'NONE');
+                    const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
+                    const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
+                    const profitLockRoiPct = Number((pos as any).runtimeProfitLockRoiPct ?? 0);
+                    const tp1RoiPct = Number((pos as any).runtimeTp1RoiPct ?? 0);
+                    const tp2RoiPct = Number((pos as any).runtimeTp2RoiPct ?? 0);
+                    const tp3RoiPct = Number((pos as any).runtimeTp3RoiPct ?? 0);
+                    const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
 
                     return (
                       <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
@@ -1720,6 +1820,8 @@ export default function App() {
                             <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
                             {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TAKİP</span>}
+                            <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
+                            <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
                           </div>
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
                         </div>
@@ -1729,16 +1831,48 @@ export default function App() {
                           <div><span className="text-slate-500">Anlık</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
-                          <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
-                          <div><span className="text-rose-400">SL: ${formatPrice(isTrailingActive ? trailingStop : sl)}</span></div>
+                          <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">(ROI {tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
+                          <div><span className="text-rose-400">SL: ${formatPrice(activeStop)}</span> <span className="text-slate-600">(ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
-                          <div className="text-cyan-400">Takip Mesafe: {runtimeTrailDistancePct.toFixed(2)}%</div>
+                          <div className="text-cyan-400">Takip ROI: {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
                           <div className="text-slate-400">Çıkış Çarpanı: x{effectiveExitTightness.toFixed(2)}</div>
                         </div>
                         <div className="text-[10px] text-slate-500 mt-1">
-                          Aktivasyon: {runtimeTrailMovePct.toFixed(2)}% / ROI {runtimeTrailRoiPct.toFixed(1)}%
+                          Aktivasyon ROI: {runtimeTrailRoiPct.toFixed(1)}%
                         </div>
+                        {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
+                          <div className="text-[10px] text-emerald-300 mt-1">
+                            Peak {profitPeakRoiPct.toFixed(1)}% • Giveback {profitGivebackRoiPct.toFixed(1)}% • Lock {profitLockRoiPct.toFixed(1)}%
+                          </div>
+                        )}
+                        {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
+                          <div className="text-[10px] text-slate-400 mt-1">
+                            TP1 {tp1RoiPct.toFixed(0)} • TP2 {tp2RoiPct.toFixed(0)} • TP3 {tp3RoiPct.toFixed(0)} • {profitOwner}
+                          </div>
+                        )}
+                        {runtimeExchangeBreakEvenPrice > 0 && (
+                          <div className="text-[10px] text-slate-500 mt-1">
+                            Exchange BE ${formatPrice(runtimeExchangeBreakEvenPrice)}
+                          </div>
+                        )}
+                        {entryStopGateMode === 'wide_stop_soft' && (
+                          <div className="text-[10px] text-amber-300 mt-1">
+                            Entry Stop Gate: WIDE-SOFT
+                          </div>
+                        )}
+                        {(recoveryState.armed || recoveryState.stage > 0) && (
+                          <div className="text-[10px] text-sky-300 mt-1">
+                            Recovery S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}% toparlanma • {recoveryGivebackPct.toFixed(0)}% giveback
+                          </div>
+                        )}
+                        {(lastLossGateAction || regimeFlags.length > 0 || carryCostRoiPct > 0 || exitRiskRoiPct > 0) && (
+                          <div className="text-[10px] text-slate-400 mt-1">
+                            {lastLossGateAction ? `Gate: ${translateReason(lastLossGateAction)} • ` : ''}
+                            ExitRisk {exitRiskRoiPct.toFixed(1)}% • Carry {carryCostRoiPct.toFixed(1)}%
+                            {regimeFlags.length > 0 ? ` • ${regimeFlags.join(', ')}` : ''}
+                          </div>
+                        )}
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
@@ -1748,15 +1882,13 @@ export default function App() {
                           </span>
                           {/* Kill Switch indicator */}
                           {(() => {
-                            const lev = pos.leverage || 10;
-                            const factor = Math.sqrt(lev / 10);
-                            const ksFirst = Math.max(-120, Math.min(-40, -70 * factor));
                             const marginLoss = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
-                            const isCritical = marginLoss <= ksFirst;
+                            const activeFullThreshold = ksFull ?? Number.NEGATIVE_INFINITY;
+                            const isCritical = ksFull !== null && marginLoss <= activeFullThreshold;
                             const isNear = marginLoss <= ksFirst * 0.7;
                             return marginLoss < 0 ? (
                               <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNear ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
-                                KS:{ksFirst.toFixed(0)}%
+                                KS:{ksFirst.toFixed(0)} / {ksFull !== null ? ksFull.toFixed(0) : 'SL'}
                               </span>
                             ) : null;
                           })()}
@@ -1805,13 +1937,8 @@ export default function App() {
                         const sl = (pos as any).stopLoss || 0;
                         const trailingStop = (pos as any).trailingStop || sl;
                         const isTrailingActive = (pos as any).isTrailingActive || false;
-                        const runtimeTrailDistancePctRaw = Number(
-                          (pos as any).runtimeTrailDistancePct ??
-                          (((pos as any).trailDistance || 0) / (pos.entryPrice || 1)) * 100
-                        );
-                        const runtimeTrailDistancePct = Number.isFinite(runtimeTrailDistancePctRaw) ? runtimeTrailDistancePctRaw : 0;
-                        const runtimeTrailMovePctRaw = Number((pos as any).runtimeTrailActivationMovePct ?? 0);
-                        const runtimeTrailMovePct = Number.isFinite(runtimeTrailMovePctRaw) ? runtimeTrailMovePctRaw : 0;
+                        const activeStop = isTrailingActive ? trailingStop : sl;
+                        const runtimeTrailDistanceRoiPct = computeTrailDistanceRoiPct(pos);
                         const runtimeTrailRoiPctRaw = Number((pos as any).runtimeTrailActivationRoiPct ?? 0);
                         const runtimeTrailRoiPct = Number.isFinite(runtimeTrailRoiPctRaw) ? runtimeTrailRoiPctRaw : 0;
                         const effectiveExitTightnessRaw = Number((pos as any).effectiveExitTightness ?? settings.exitTightness ?? 1.0);
@@ -1819,14 +1946,38 @@ export default function App() {
 
                         // TP'ye ulaşınca elde edilecek ROI (kaldıraç dahil)
                         const leverage = pos.leverage || 10;
-                        const tpRoi = tp > 0 && pos.entryPrice > 0
-                          ? isLong
-                            ? ((tp - pos.entryPrice) / pos.entryPrice) * 100 * leverage
-                            : ((pos.entryPrice - tp) / pos.entryPrice) * 100 * leverage
-                          : 0;
+                        const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
+                        const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
                         // Şu anki fiyattan TP'ye kalan mesafe (kaldıraçlı ROI farkı)
                         const currentRoi = roi; // zaten kaldıraçlı
                         const tpDistance = tpRoi - currentRoi; // TP'ye kaç % kaldı
+                        const stopRoiRaw = Number((pos as any).runtimeStopRoiPct);
+                        const stopRoi = Number.isFinite(stopRoiRaw) ? stopRoiRaw : computeTargetRoiPct(pos.entryPrice, activeStop, pos.side, leverage);
+                        const preStopRaw = (pos as any).runtimePreStopReduceRoiPct == null ? Number.NaN : Number((pos as any).runtimePreStopReduceRoiPct);
+                        const ksFullRaw = (pos as any).runtimeKillSwitchFullRoiPct == null ? Number.NaN : Number((pos as any).runtimeKillSwitchFullRoiPct);
+                        const entryStopGateMode = String((pos as any).runtimeEntryStopGateMode || 'normal');
+                        const lossGateState = ((pos as any).runtimeLossGateState || {}) as any;
+                        const lastLossGateAction = String(lossGateState.lastAction || '');
+                        const carryCostRoiPct = Number((pos as any).runtimeCarryCostRoiPct ?? 0);
+                        const exitRiskRoiPct = Number((pos as any).runtimeExitRiskRoiPct ?? 0);
+                        const regimeFlags = Array.isArray((pos as any).runtimeRegimeFlags) ? ((pos as any).runtimeRegimeFlags as string[]) : [];
+                        const ksFirst = Number.isFinite(preStopRaw)
+                          ? preStopRaw
+                          : clampKillSwitchThreshold(settings.killSwitchFirstReduction, -200, -20, -100);
+                        const ksFull = Number.isFinite(ksFullRaw) ? ksFullRaw : null;
+                        const protectionPhase = String((pos as any).runtimeProtectionPhase || 'SL-PRIMARY');
+                        const recoveryState = ((pos as any).runtimeRecoveryState || {}) as any;
+                        const recoveryProgressPct = Number(recoveryState.progress || 0) * 100;
+                        const recoveryGivebackPct = Number(recoveryState.givebackPct || 0) * 100;
+                        const profitPhase = String((pos as any).runtimeProfitPhase || 'WAIT');
+                        const profitOwner = String((pos as any).runtimeProfitOwner || 'NONE');
+                        const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
+                        const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
+                        const profitLockRoiPct = Number((pos as any).runtimeProfitLockRoiPct ?? 0);
+                        const tp1RoiPct = Number((pos as any).runtimeTp1RoiPct ?? 0);
+                        const tp2RoiPct = Number((pos as any).runtimeTp2RoiPct ?? 0);
+                        const tp3RoiPct = Number((pos as any).runtimeTp3RoiPct ?? 0);
+                        const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
@@ -1840,6 +1991,8 @@ export default function App() {
                                 />
                                 <span className="font-medium text-white">{pos.symbol.replace('USDT', '')}</span>
                                 <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
+                                <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
+                                <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
                               </div>
                             </td>
                             <td className="py-3 px-2">
@@ -1852,8 +2005,8 @@ export default function App() {
                             <td className={`py-3 px-2 text-right font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-slate-300'}`}>${formatPrice(currentPrice)}</td>
                             <td className="py-3 px-2 text-right">
                               <div className="text-[10px] space-y-0.5">
-                                <div className="text-emerald-400">TP: ${formatPrice(tp)} <span className="text-slate-500">({tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
-                                <div className="text-rose-400">SL: ${formatPrice(isTrailingActive ? trailingStop : sl)}</div>
+                                <div className="text-emerald-400">TP: ${formatPrice(tp)} <span className="text-slate-500">(ROI {tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
+                                <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
@@ -1863,9 +2016,30 @@ export default function App() {
                                 ) : (
                                   <span className="inline-block bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">KAPALI</span>
                                 )}
-                                <div className="font-mono text-cyan-400">Mesafe {runtimeTrailDistancePct.toFixed(2)}%</div>
-                                <div className="font-mono text-slate-400">Akt: {runtimeTrailMovePct.toFixed(2)}% / {runtimeTrailRoiPct.toFixed(1)}%</div>
+                                <div className="font-mono text-cyan-400">Mesafe ROI {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
+                                <div className="font-mono text-slate-400">Akt ROI {runtimeTrailRoiPct.toFixed(1)}%</div>
                                 <div className="font-mono text-slate-500">Çıkış x{effectiveExitTightness.toFixed(2)}</div>
+                                {entryStopGateMode === 'wide_stop_soft' && (
+                                  <div className="font-mono text-amber-300">Entry WIDE-SOFT</div>
+                                )}
+                                {(recoveryState.armed || recoveryState.stage > 0) && (
+                                  <div className="font-mono text-sky-300">Rec S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)} / {recoveryGivebackPct.toFixed(0)}</div>
+                                )}
+                                {(lastLossGateAction || regimeFlags.length > 0) && (
+                                  <div className="font-mono text-slate-500">
+                                    {lastLossGateAction ? translateReason(lastLossGateAction) : 'Gate beklemede'}
+                                  </div>
+                                )}
+                                <div className="font-mono text-slate-500">Exec {exitRiskRoiPct.toFixed(1)}% • Carry {carryCostRoiPct.toFixed(1)}%</div>
+                                {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
+                                  <div className="font-mono text-emerald-300">Peak {profitPeakRoiPct.toFixed(1)} • Giveback {profitGivebackRoiPct.toFixed(1)} • Lock {profitLockRoiPct.toFixed(1)}</div>
+                                )}
+                                {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
+                                  <div className="font-mono text-slate-400">TP {tp1RoiPct.toFixed(0)}/{tp2RoiPct.toFixed(0)}/{tp3RoiPct.toFixed(0)} • {profitOwner}</div>
+                                )}
+                                {runtimeExchangeBreakEvenPrice > 0 && (
+                                  <div className="font-mono text-slate-500">BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
+                                )}
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
@@ -1892,17 +2066,13 @@ export default function App() {
                             </td>
                             <td className="py-3 px-2 text-center">
                               {(() => {
-                                // Dynamic Kill Switch thresholds: sqrt(leverage/10) factor
-                                const lev = pos.leverage || 10;
-                                const factor = Math.sqrt(lev / 10);
-                                const ksFirst = Math.max(-120, Math.min(-40, -70 * factor));
-                                const ksFull = Math.max(-200, Math.min(-80, -150 * factor));
                                 const marginLoss = margin > 0 ? (pos.unrealizedPnl / margin) * 100 : 0;
                                 const isNearKS = marginLoss <= ksFirst * 0.7; // %70'ine yaklaştıysa uyar
-                                const isCritical = marginLoss <= ksFirst;
+                                const isCritical = ksFull !== null && marginLoss <= ksFull;
                                 return (
                                   <div className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNearKS ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
                                     <div>{ksFirst.toFixed(0)}%</div>
+                                    <div className="text-[8px] opacity-70">{ksFull !== null ? `${ksFull.toFixed(0)}%` : 'SL'}</div>
                                     <div className="text-[8px] opacity-70">({marginLoss.toFixed(0)}%)</div>
                                   </div>
                                 );
