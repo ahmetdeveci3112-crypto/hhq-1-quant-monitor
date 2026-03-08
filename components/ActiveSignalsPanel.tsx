@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter } from 'lucide-react';
-import { CoinOpportunity } from '../types';
+import { CoinOpportunity, PendingEntry } from '../types';
 import { buildDisplayActiveSignals } from '../utils/activeSignalsUtils';
 
 interface ActiveSignalsPanelProps {
-    signals: any[]; // Phase 259: Accepts persistentSignals (or opportunities fallback)
+    signals: any[]; // Executable signals only
+    pendingEntries?: PendingEntry[];
     opportunities?: CoinOpportunity[]; // Phase 259: Real-time telemetry source
     onMarketOrder?: (symbol: string, side: 'LONG' | 'SHORT', price: number, signalLeverage: number) => Promise<void>;
     entryTightness?: number;
@@ -412,7 +413,7 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
     return <div className="flex items-center gap-0.5 flex-wrap">{badges}</div>;
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, opportunities = [], onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, pendingEntries = [], opportunities = [], onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
@@ -440,6 +441,19 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
             }
             return sortAsc ? compare : -compare;
         });
+    const pendingSignals = (Array.isArray(pendingEntries) ? pendingEntries : []).map((entry) => {
+        const liveOpp = opportunities.find(o => o.symbol === entry.symbol);
+        const currentPrice = liveOpp?.price || entry.signalPrice || entry.entryPrice || 0;
+        return {
+            ...entry,
+            price: currentPrice,
+            currentPrice,
+            spreadPct: liveOpp?.spreadPct ?? null,
+        };
+    });
+    const pendingLongCount = pendingSignals.filter(entry => entry.signalAction === 'LONG').length;
+    const pendingShortCount = pendingSignals.filter(entry => entry.signalAction === 'SHORT').length;
+    const pendingConfirmedCount = pendingSignals.filter(entry => entry.confirmed).length;
 
     const handleSort = (key: SortKey) => {
         if (sortKey === key) setSortAsc(!sortAsc);
@@ -676,6 +690,67 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     </div>
                     <div className="text-[10px] text-slate-400">Kalite bazlı boyut</div>
                 </div>
+            </div>
+
+            <div className="border-b border-slate-800/30 bg-slate-950/30 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-cyan-400" />
+                        <div>
+                            <div className="text-xs font-semibold text-white">Bekleyen Girişler</div>
+                            <div className="text-[10px] text-slate-400">
+                                İşlenebilir sinyalden ayrı izlenir; stale/recheck kararları burada tutulur
+                            </div>
+                        </div>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs">
+                        <span className="text-slate-300">{pendingSignals.length}</span>
+                        <span className="text-emerald-400">{pendingLongCount}</span>
+                        <span className="text-rose-400">{pendingShortCount}</span>
+                        <span className="text-cyan-400">{pendingConfirmedCount} onaylı</span>
+                    </div>
+                </div>
+                {pendingSignals.length > 0 ? (
+                    <div className="mt-3 grid gap-2 lg:grid-cols-3">
+                        {pendingSignals.slice(0, 6).map((entry) => (
+                            <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`} className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2">
+                                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${entry.signalAction === 'LONG' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
+                                            {entry.signalAction}
+                                        </span>
+                                        <span className="text-sm font-semibold text-white">{entry.symbol}</span>
+                                    </div>
+                                    <span className={`text-[10px] font-medium ${entry.confirmed ? 'text-cyan-300' : 'text-amber-300'}`}>
+                                        {entry.confirmed ? 'Onaylandı' : 'Bekliyor'}
+                                    </span>
+                                </div>
+                                <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+                                    <div>
+                                        <div className="text-slate-500">Entry</div>
+                                        <div className="font-mono text-slate-200">${formatPrice(entry.entryPrice || 0)}</div>
+                                    </div>
+                                    <div>
+                                        <div className="text-slate-500">Anlık</div>
+                                        <div className="font-mono text-slate-200">${formatPrice(entry.currentPrice || 0)}</div>
+                                    </div>
+                                    <div>
+                                        <div className="text-slate-500">Skor</div>
+                                        <div className="font-semibold text-white">
+                                            {Number(entry.recheckScore ?? entry.signalScore ?? 0).toFixed(0)}
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <div className="text-slate-500">Karar</div>
+                                        <div className="text-slate-300">{entry.decisionCode || 'PENDING__WAIT'}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                ) : (
+                    <div className="mt-3 text-[11px] text-slate-500">Bekleyen giriş yok.</div>
+                )}
             </div>
 
             {/* MOBILE: Card Layout */}

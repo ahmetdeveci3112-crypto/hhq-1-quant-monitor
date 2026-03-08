@@ -17,6 +17,7 @@ from main import (
     compute_buffered_breakeven_price,
     compute_target_roi_pct,
     derive_profit_exit_reason,
+    get_persistent_active_signals_snapshot,
     price_distance_to_roi_pct,
     price_move_pct_to_roi_pct,
     should_activate_trailing_by_roi,
@@ -190,26 +191,80 @@ def test_kill_switch_thresholds_are_canonical_roi_values():
     assert ks.get_dynamic_thresholds(25) == (-90.0, -140.0)
 
 
-def test_ui_signal_stats_keep_current_and_persistent_counts_separate():
+def test_ui_signal_stats_separate_raw_executable_and_pending_counts():
     opportunities = [
         {"symbol": "AAAUSDT", "signalAction": "LONG"},
         {"symbol": "BBBUSDT", "signalAction": "SHORT"},
         {"symbol": "CCCUSDT", "signalAction": "NONE"},
     ]
-    persistent = [
+    executable = [
         {"symbol": "AAAUSDT", "signalAction": "LONG"},
         {"symbol": "DDDUSDT", "signalAction": "LONG"},
         {"symbol": "EEEUSDT", "signalAction": "SHORT"},
     ]
+    pending = [
+        {"symbol": "FFFUSDT", "signalAction": "LONG", "confirmed": True},
+        {"symbol": "GGGUSDT", "signalAction": "SHORT", "confirmed": False},
+    ]
 
-    stats = _build_ui_signal_stats(opportunities, persistent)
+    stats = _build_ui_signal_stats(opportunities, executable, pending)
 
-    assert stats["longSignals"] == 1
+    assert stats["longSignals"] == 2
     assert stats["shortSignals"] == 1
-    assert stats["activeSignals"] == 2
+    assert stats["activeSignals"] == 3
     assert stats["persistentLongSignals"] == 2
     assert stats["persistentShortSignals"] == 1
     assert stats["persistentActiveSignals"] == 3
+    assert stats["pendingLongSignals"] == 1
+    assert stats["pendingShortSignals"] == 1
+    assert stats["pendingActiveSignals"] == 2
+    assert stats["rawSignalStats"]["activeSignals"] == 2
+    assert stats["executableSignalStats"]["activeSignals"] == 3
+    assert stats["pendingEntryStats"]["confirmed"] == 1
+    assert stats["pendingEntryStats"]["waiting"] == 1
+
+
+def test_executable_signal_snapshot_excludes_pending_and_opened_states(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "active_signals",
+        {
+            "EXECUSDT": {
+                "signal_id": "SIG_EXEC",
+                "side": "LONG",
+                "score": 91,
+                "raw_score": 89,
+                "post_gate_score": 91,
+                "created_ts": 1000.0,
+                "last_refresh_ts": 1005.0,
+                "state": main.SIGNAL_STAGE_EXECUTABLE,
+                "last_price": 1.23,
+            },
+            "PENDINGUSDT": {
+                "signal_id": "SIG_PENDING",
+                "side": "SHORT",
+                "score": 88,
+                "created_ts": 1000.0,
+                "last_refresh_ts": 1005.0,
+                "state": main.SIGNAL_STAGE_PENDING,
+                "last_price": 2.34,
+            },
+            "OPENUSDT": {
+                "signal_id": "SIG_OPEN",
+                "side": "LONG",
+                "score": 84,
+                "created_ts": 1000.0,
+                "last_refresh_ts": 1005.0,
+                "state": main.SIGNAL_STAGE_OPENED,
+                "last_price": 3.45,
+            },
+        },
+    )
+
+    snapshot = get_persistent_active_signals_snapshot(now_ts=1010.0)
+
+    assert [item["symbol"] for item in snapshot] == ["EXECUSDT"]
+    assert snapshot[0]["stage"] == main.SIGNAL_STAGE_EXECUTABLE
 
 
 def test_live_ui_positions_prefer_empty_binance_snapshot_over_engine_fallback(monkeypatch):
@@ -861,3 +916,101 @@ def test_regime_deterioration_execution_risk_and_funding_decay_gates(monkeypatch
     asyncio.run(ks.check_positions(funding_trader))
     assert funding_trader.trades[-1]["reason"] == "FUNDING_DECAY_REDUCE"
     assert round(funding_pos["contracts"], 4) == 0.9
+
+
+def test_dedupe_position_snapshots_prefers_real_leverage_margin_and_tp_state():
+    deduped = main.dedupe_position_snapshots([
+        {
+            "id": "bad-aevo",
+            "symbol": "AEVOUSDT",
+            "side": "LONG",
+            "sizeUsd": 32.15,
+            "initialMargin": 32.15,
+            "leverage": 1,
+            "entryPrice": 0.02335,
+            "markPrice": 0.02348,
+            "unrealizedPnl": 0.15,
+            "isLive": True,
+        },
+        {
+            "id": "good-aevo",
+            "symbol": "AEVOUSDT",
+            "side": "LONG",
+            "sizeUsd": 32.0,
+            "initialMargin": 4.0,
+            "leverage": 8,
+            "entryPrice": 0.02334,
+            "markPrice": 0.02348,
+            "unrealizedPnl": 0.16,
+            "isLive": True,
+            "partial_tp_state": {"tp1": True},
+            "binance_order_id": "ENTRY1",
+        },
+    ])
+
+    assert len(deduped) == 1
+    pos = deduped[0]
+    assert pos["symbol"] == "AEVOUSDT"
+    assert pos["leverage"] == 8
+    assert round(pos["initialMargin"], 2) == 4.00
+    assert round(pos["marginUsd"], 2) == 4.00
+    assert pos["tp1Hit"] is True
+
+
+def test_v3_partial_close_records_net_pnl_after_fee_allocation(monkeypatch):
+    manager = main.TimeBasedPositionManager.__new__(main.TimeBasedPositionManager)
+
+    class DummyTrader:
+        def __init__(self):
+            self.balance = 100.0
+            self.trades = []
+
+        def _normalize_close_reason(self, reason):
+            return reason
+
+    trader = DummyTrader()
+
+    async def _close_position(_symbol, _side, _amount, close_scope="FULL"):
+        return {"id": "close-1", "fee": 0.5}
+
+    async def _noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "safe_create_task", lambda coro, name=None: coro.close() if hasattr(coro, "close") else None)
+    monkeypatch.setattr(main.sqlite_manager, "save_trade", _noop_async)
+    monkeypatch.setattr(main.sqlite_manager, "update_close_order_id", _noop_async)
+    monkeypatch.setattr(main, "live_binance_trader", SimpleNamespace(close_position=_close_position))
+
+    pos = {
+        "id": "pos-1",
+        "tradeId": "pos-1",
+        "symbol": "NETUSDT",
+        "side": "LONG",
+        "contracts": 100.0,
+        "size": 100.0,
+        "sizeUsd": 1000.0,
+        "initialMargin": 40.0,
+        "entryPrice": 10.0,
+        "leverage": 25,
+        "isLive": True,
+        "entryFeePaidUsd": 1.0,
+    }
+
+    ok = asyncio.run(
+        manager._execute_v3_partial_close(
+            trader,
+            pos,
+            current_price=11.0,
+            close_pct=0.25,
+            reason="TP1_PARTIAL",
+            label="TP1",
+        )
+    )
+
+    assert ok is True
+    assert len(trader.trades) == 1
+    trade = trader.trades[0]
+    assert round(trade["fee_cost"], 2) == 0.75
+    assert round(trade["pnl"], 2) == 24.25
+    assert round(trade["roi"], 2) == 242.5
+    assert round(pos["entryFeePaidUsd"], 2) == 0.75

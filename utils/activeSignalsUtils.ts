@@ -4,7 +4,7 @@ export const enrichSignalsWithOpportunities = (
   signals: any[],
   opportunities: CoinOpportunity[] = []
 ): CoinOpportunity[] => {
-  const signalList = Array.isArray(signals) && signals.length > 0 ? signals : opportunities;
+  const signalList = Array.isArray(signals) ? signals : [];
 
   return signalList.map((sig: any) => {
     if (sig?.price !== undefined && !sig?.state) {
@@ -42,6 +42,6 @@ export const buildDisplayActiveSignals = (
 ): CoinOpportunity[] => {
   const enrichedSignals = enrichSignalsWithOpportunities(signals, opportunities);
   return enrichedSignals.filter(s =>
-    s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.state === 'ACTIVE')
+    s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.stage === 'EXECUTABLE' || s.state === 'ACTIVE')
   );
 };

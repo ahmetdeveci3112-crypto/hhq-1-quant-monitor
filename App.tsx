@@ -136,9 +136,23 @@ const computeTrailDistanceRoiPct = (pos: any): number => {
   if (Number.isFinite(explicit)) return explicit;
   const entry = Number(pos.entryPrice || 0);
   const distance = Number((pos as any).runtimeTrailDistance ?? (pos as any).trailDistance ?? 0);
-  const leverage = Number(pos.leverage || 1);
+  const leverage = resolvePositionLeverage(pos);
   if (!(entry > 0)) return 0;
   return (distance / entry) * 100 * Math.max(1, leverage);
+};
+
+const resolvePositionLeverage = (pos: any): number => {
+  const explicit = Number(pos?.leverage || 0);
+  if (Number.isFinite(explicit) && explicit > 1) return explicit;
+  const margin = getPositionMargin(pos || {});
+  const notional = Number(pos?.sizeUsd || 0);
+  if (margin > 0 && notional > 0) {
+    const derived = notional / margin;
+    if (Number.isFinite(derived) && derived > 1) {
+      return derived;
+    }
+  }
+  return Math.max(1, explicit || 1);
 };
 
 const clampKillSwitchThreshold = (value: number, minValue: number, maxValue: number, fallback: number): number => {
@@ -392,8 +406,8 @@ export default function App() {
 
   // Phase 31: Multi-Coin Scanner State
   const [opportunities, setOpportunities] = useState<CoinOpportunity[]>([]);
-  // Phase 259: Persistent Active Signals UI state
-  const [persistentSignals, setPersistentSignals] = useState<any[]>([]);
+  const [executableSignals, setExecutableSignals] = useState<any[]>([]);
+  const [pendingEntries, setPendingEntries] = useState<any[]>([]);
   const [scannerStats, setScannerStats] = useState<ScannerStats>({
     totalCoins: 0,
     analyzedCoins: 0,
@@ -548,7 +562,7 @@ export default function App() {
   }, [addLog]);
 
   const displayActiveSignals = buildDisplayActiveSignals(
-    persistentSignals || [],
+    executableSignals || [],
     opportunities || [],
     settings.minConfidenceScore || 40
   );
@@ -592,14 +606,16 @@ export default function App() {
         setAutoTradeEnabled(data.enabled);
       }
 
-      // Update opportunities from scanner (instant data on connect)
-      if (data.opportunities && data.opportunities.length > 0) {
+      if (Array.isArray(data.opportunities)) {
         setOpportunities(data.opportunities);
       }
 
-      // Phase 259: Update persistent signals array
-      if (data.persistentActiveSignals) {
-        setPersistentSignals(data.persistentActiveSignals);
+      const nextExecutableSignals = data.executableSignals ?? data.persistentActiveSignals;
+      if (Array.isArray(nextExecutableSignals)) {
+        setExecutableSignals(nextExecutableSignals);
+      }
+      if (Array.isArray(data.pendingEntries)) {
+        setPendingEntries(data.pendingEntries);
       }
 
       // Update scanner stats
@@ -817,18 +833,20 @@ export default function App() {
         const entry = Number(pos.entryPrice || px);
         const sizeUsd = Number(pos.sizeUsd || 0);
         const size = Number(pos.size || (entry > 0 ? sizeUsd / entry : 0));
-        const lev = Number(pos.leverage || 1);
+        const margin = getPositionMargin(pos as any);
+        const lev = resolvePositionLeverage(pos as any);
 
         let pnl = Number(pos.unrealizedPnl || 0);
         if (size > 0 && entry > 0) {
           pnl = pos.side === 'LONG' ? (px - entry) * size : (entry - px) * size;
         }
-        const pnlPct = sizeUsd > 0 ? (pnl / sizeUsd) * 100 * lev : Number(pos.unrealizedPnlPercent || 0);
+        const pnlPct = margin > 0 ? (pnl / margin) * 100 : Number(pos.unrealizedPnlPercent || 0);
 
         changed = true;
 
         return {
           ...pos,
+          leverage: lev,
           currentPrice: px,
           markPrice: px,
           unrealizedPnl: Number(pnl.toFixed(6)),
@@ -1298,14 +1316,16 @@ export default function App() {
               }
             }
 
-            // Update opportunities
-            if (data.opportunities) {
+            if (Array.isArray(data.opportunities)) {
               setOpportunities(data.opportunities);
             }
 
-            // Phase 259: Update persistent signals array
-            if (data.persistentActiveSignals) {
-              setPersistentSignals(data.persistentActiveSignals);
+            const nextExecutableSignals = data.executableSignals ?? data.persistentActiveSignals;
+            if (Array.isArray(nextExecutableSignals)) {
+              setExecutableSignals(nextExecutableSignals);
+            }
+            if (Array.isArray(data.pendingEntries)) {
+              setPendingEntries(data.pendingEntries);
             }
 
             // Update scanner stats
@@ -1552,7 +1572,7 @@ export default function App() {
             <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
             <span>{settings.strategyMode}</span>
             <span className="text-[8px] font-normal normal-case opacity-70">
-              profil: {resolveExecutionSourceForUI(portfolio.positions, persistentSignals, marketRegime)}
+              profil: {resolveExecutionSourceForUI(portfolio.positions, executableSignals, marketRegime)}
             </span>
           </div>
         </div>
@@ -1790,7 +1810,7 @@ export default function App() {
                     const runtimeTrailRoiPct = Number.isFinite(runtimeTrailRoiPctRaw) ? runtimeTrailRoiPctRaw : 0;
                     const effectiveExitTightnessRaw = Number((pos as any).effectiveExitTightness ?? settings.exitTightness ?? 1.0);
                     const effectiveExitTightness = Number.isFinite(effectiveExitTightnessRaw) ? effectiveExitTightnessRaw : 1.0;
-                    const leverage = pos.leverage || 10;
+                    const leverage = resolvePositionLeverage(pos);
                     const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
                     const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
                     const tpDistance = tpRoi - roi; // TP'ye kaç % kaldı
@@ -1827,7 +1847,7 @@ export default function App() {
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center gap-2">
                             <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
-                            <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
+                            <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
                             {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TAKİP</span>}
                             <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
@@ -1955,7 +1975,7 @@ export default function App() {
                         const effectiveExitTightness = Number.isFinite(effectiveExitTightnessRaw) ? effectiveExitTightnessRaw : 1.0;
 
                         // TP'ye ulaşınca elde edilecek ROI (kaldıraç dahil)
-                        const leverage = pos.leverage || 10;
+                        const leverage = resolvePositionLeverage(pos);
                         const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
                         const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
                         // Şu anki fiyattan TP'ye kalan mesafe (kaldıraçlı ROI farkı)
@@ -2000,7 +2020,7 @@ export default function App() {
                                   onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                                 />
                                 <span className="font-medium text-white">{pos.symbol.replace('USDT', '')}</span>
-                                <span className="text-[10px] text-slate-500">{pos.leverage}x</span>
+                                <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
                                 <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
                                 <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
                               </div>
@@ -2229,7 +2249,8 @@ export default function App() {
           activeTab === 'signals' && (
             <div className="grid grid-cols-1 gap-4">
               <ActiveSignalsPanel
-                signals={true /* USE_PERSISTENT_SIGNALS_UI */ ? (persistentSignals || []) : opportunities}
+                signals={executableSignals || []}
+                pendingEntries={pendingEntries || []}
                 opportunities={opportunities} /* Pass opportunities for real-time telemetry merge */
                 onMarketOrder={handleMarketOrder}
                 entryTightness={settings.entryTightness}

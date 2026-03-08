@@ -555,9 +555,46 @@ class SQLiteManager:
                     entry_quality_json TEXT DEFAULT '{}',
                     risk_gate_json TEXT DEFAULT '{}',
                     signal_context_json TEXT DEFAULT '{}',
+                    stage TEXT DEFAULT 'RAW_GENERATED',
+                    decision TEXT DEFAULT 'WAIT',
+                    decision_source TEXT DEFAULT 'engine',
+                    decision_code TEXT DEFAULT 'RAW__GENERATED',
+                    decision_detail TEXT DEFAULT '',
+                    pending_entry_id TEXT DEFAULT '',
+                    executable INTEGER DEFAULT 0,
+                    is_pending INTEGER DEFAULT 0,
+                    is_opened INTEGER DEFAULT 0,
+                    decision_trace_json TEXT DEFAULT '{}',
                     obi_value REAL DEFAULT 0,
                     truth_snapshot_json TEXT DEFAULT '{}',
                     regime_adjustment TEXT DEFAULT '',
+                    timestamp INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS signal_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE,
+                    signal_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    decision_source TEXT DEFAULT 'engine',
+                    decision_code TEXT DEFAULT '',
+                    decision_detail TEXT DEFAULT '',
+                    accepted INTEGER DEFAULT 0,
+                    executable INTEGER DEFAULT 0,
+                    pending_entry_id TEXT DEFAULT '',
+                    score_before REAL DEFAULT 0,
+                    score_after REAL DEFAULT 0,
+                    leverage_before REAL DEFAULT 0,
+                    leverage_after REAL DEFAULT 0,
+                    size_mult REAL DEFAULT 1.0,
+                    cooldown_sec REAL DEFAULT 0,
+                    trace_json TEXT DEFAULT '{}',
                     timestamp INTEGER NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1054,12 +1091,26 @@ class SQLiteManager:
                 ('entry_quality_json', "TEXT DEFAULT '{}'"),
                 ('risk_gate_json', "TEXT DEFAULT '{}'"),
                 ('signal_context_json', "TEXT DEFAULT '{}'"),
+                ('stage', "TEXT DEFAULT 'RAW_GENERATED'"),
+                ('decision', "TEXT DEFAULT 'WAIT'"),
+                ('decision_source', "TEXT DEFAULT 'engine'"),
+                ('decision_code', "TEXT DEFAULT 'RAW__GENERATED'"),
+                ('decision_detail', "TEXT DEFAULT ''"),
+                ('pending_entry_id', "TEXT DEFAULT ''"),
+                ('executable', 'INTEGER DEFAULT 0'),
+                ('is_pending', 'INTEGER DEFAULT 0'),
+                ('is_opened', 'INTEGER DEFAULT 0'),
+                ('decision_trace_json', "TEXT DEFAULT '{}'"),
             ]
             for col_name, col_type in analytics_signal_columns:
                 try:
                     await db.execute(f'ALTER TABLE signals ADD COLUMN {col_name} {col_type}')
                 except:
                     pass
+
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_events_event_id ON signal_events(event_id) WHERE event_id IS NOT NULL AND event_id != ""')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_signal_events_signal_ts ON signal_events(signal_id, timestamp DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_signal_events_symbol_ts ON signal_events(symbol, timestamp DESC)')
 
             analytics_position_columns = [
                 ('signal_id', 'TEXT'),
@@ -1582,6 +1633,15 @@ class SQLiteManager:
                     _ts_json = _json.dumps(_ts_raw)
                 except Exception:
                     _ts_json = '{}'
+            stage = str(signal_data.get('stage', 'RAW_GENERATED') or 'RAW_GENERATED')
+            decision = str(signal_data.get('decision', 'WAIT') or 'WAIT')
+            decision_source = str(signal_data.get('decision_source', 'engine') or 'engine')
+            decision_code = str(signal_data.get('decision_code', 'RAW__GENERATED') or 'RAW__GENERATED')
+            decision_detail = str(signal_data.get('decision_detail', signal_data.get('reject_reason', '')) or '')
+            executable = 1 if signal_data.get('executable', signal_data.get('accepted', False)) else 0
+            is_pending = 1 if signal_data.get('is_pending', False) else 0
+            is_opened = 1 if signal_data.get('is_opened', False) else 0
+            accepted = 1 if signal_data.get('accepted', executable) else 0
             await db.execute('''
                 INSERT INTO signals (
                     signal_id, symbol, action, price, zscore, hurst, atr, signal_score,
@@ -1590,8 +1650,49 @@ class SQLiteManager:
                     reject_reason, z_threshold, min_confidence, entry_tightness,
                     exit_tightness, timestamp, obi_value,
                     truth_snapshot_json, regime_adjustment, telemetry_json,
-                    entry_quality_json, risk_gate_json, signal_context_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_quality_json, risk_gate_json, signal_context_json,
+                    stage, decision, decision_source, decision_code, decision_detail,
+                    pending_entry_id, executable, is_pending, is_opened, decision_trace_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signal_id) DO UPDATE SET
+                    symbol=excluded.symbol,
+                    action=excluded.action,
+                    price=excluded.price,
+                    zscore=excluded.zscore,
+                    hurst=excluded.hurst,
+                    atr=excluded.atr,
+                    signal_score=excluded.signal_score,
+                    signal_score_raw=excluded.signal_score_raw,
+                    htf_trend=excluded.htf_trend,
+                    strategy_mode=excluded.strategy_mode,
+                    execution_profile_source=excluded.execution_profile_source,
+                    mtf_confirmed=excluded.mtf_confirmed,
+                    mtf_reason=excluded.mtf_reason,
+                    blacklisted=excluded.blacklisted,
+                    accepted=excluded.accepted,
+                    reject_reason=excluded.reject_reason,
+                    z_threshold=excluded.z_threshold,
+                    min_confidence=excluded.min_confidence,
+                    entry_tightness=excluded.entry_tightness,
+                    exit_tightness=excluded.exit_tightness,
+                    timestamp=excluded.timestamp,
+                    obi_value=excluded.obi_value,
+                    truth_snapshot_json=excluded.truth_snapshot_json,
+                    regime_adjustment=excluded.regime_adjustment,
+                    telemetry_json=excluded.telemetry_json,
+                    entry_quality_json=excluded.entry_quality_json,
+                    risk_gate_json=excluded.risk_gate_json,
+                    signal_context_json=excluded.signal_context_json,
+                    stage=excluded.stage,
+                    decision=excluded.decision,
+                    decision_source=excluded.decision_source,
+                    decision_code=excluded.decision_code,
+                    decision_detail=excluded.decision_detail,
+                    pending_entry_id=excluded.pending_entry_id,
+                    executable=excluded.executable,
+                    is_pending=excluded.is_pending,
+                    is_opened=excluded.is_opened,
+                    decision_trace_json=excluded.decision_trace_json
             ''', (
                 signal_id,
                 signal_data.get('symbol'),
@@ -1608,21 +1709,135 @@ class SQLiteManager:
                 1 if signal_data.get('mtf_confirmed', False) else 0,
                 signal_data.get('mtf_reason', ''),
                 1 if signal_data.get('blacklisted', False) else 0,
-                1 if signal_data.get('accepted', False) else 0,
+                accepted,
                 signal_data.get('reject_reason', ''),
                 signal_data.get('z_threshold', 0),
                 signal_data.get('min_confidence', 0),
                 signal_data.get('entry_tightness', 1.0),
                 signal_data.get('exit_tightness', 1.0),
                 signal_ts,
-                signal_data.get('obi_value', 0),  # Phase 211: OBI depth value
-                _ts_json,  # RFX-1D: truth snapshot JSON
-                signal_data.get('regime_adjustment', ''),  # RFX-1D: regime adjustment
+                signal_data.get('obi_value', 0),
+                _ts_json,
+                signal_data.get('regime_adjustment', ''),
                 _json_dumps_safe(signal_data.get('telemetry', {})),
                 _json_dumps_safe(signal_data.get('entry_quality', signal_data.get('entryQuality', {}))),
                 _json_dumps_safe(signal_data.get('risk_gate', signal_data.get('riskGate', {}))),
                 _json_dumps_safe(signal_data.get('signal_context', signal_data)),
+                stage,
+                decision,
+                decision_source,
+                decision_code,
+                decision_detail,
+                signal_data.get('pending_entry_id', ''),
+                executable,
+                is_pending,
+                is_opened,
+                _json_dumps_safe(signal_data.get('decision_trace', signal_data.get('decisionTrace', {}))),
             ))
+            await db.commit()
+
+    async def save_signal_event(self, event_data: dict):
+        """Append-only signal lifecycle event."""
+        async with aiosqlite.connect(self.db_path) as db:
+            ts = int(event_data.get('timestamp', int(datetime.now().timestamp() * 1000)))
+            signal_id = str(event_data.get('signal_id') or event_data.get('signalId') or '')
+            symbol = str(event_data.get('symbol') or '')
+            action = str(event_data.get('action') or 'NONE')
+            stage = str(event_data.get('stage') or 'RAW_GENERATED')
+            decision = str(event_data.get('decision') or 'WAIT')
+            decision_code = str(event_data.get('decision_code') or 'RAW__GENERATED')
+            event_id = (
+                event_data.get('event_id')
+                or event_data.get('eventId')
+                or f"{signal_id}:{stage}:{decision_code}:{ts}"
+            )
+            await db.execute(
+                '''
+                INSERT OR IGNORE INTO signal_events (
+                    event_id, signal_id, symbol, action, stage, decision,
+                    decision_source, decision_code, decision_detail, accepted,
+                    executable, pending_entry_id, score_before, score_after,
+                    leverage_before, leverage_after, size_mult, cooldown_sec,
+                    trace_json, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    event_id,
+                    signal_id,
+                    symbol,
+                    action,
+                    stage,
+                    decision,
+                    str(event_data.get('decision_source', 'engine') or 'engine'),
+                    decision_code,
+                    str(event_data.get('decision_detail', '') or ''),
+                    1 if event_data.get('accepted', False) else 0,
+                    1 if event_data.get('executable', False) else 0,
+                    str(event_data.get('pending_entry_id', '') or ''),
+                    float(event_data.get('score_before', event_data.get('signal_score', 0)) or 0),
+                    float(event_data.get('score_after', event_data.get('signal_score', 0)) or 0),
+                    float(event_data.get('leverage_before', 0) or 0),
+                    float(event_data.get('leverage_after', 0) or 0),
+                    float(event_data.get('size_mult', 1.0) or 1.0),
+                    float(event_data.get('cooldown_sec', 0) or 0),
+                    _json_dumps_safe(event_data.get('trace', event_data.get('decision_trace', {}))),
+                    ts,
+                )
+            )
+            await db.commit()
+
+    async def update_signal_decision(
+        self,
+        signal_id: str,
+        *,
+        stage: str,
+        decision: str,
+        decision_code: str,
+        decision_source: str = 'engine',
+        decision_detail: str = '',
+        accepted: bool = False,
+        reject_reason: str = '',
+        pending_entry_id: str = '',
+        executable: bool = False,
+        is_pending: bool = False,
+        is_opened: bool = False,
+        decision_trace: Optional[dict] = None,
+    ):
+        """Update canonical signal lifecycle state."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                '''
+                UPDATE signals
+                SET stage = ?,
+                    decision = ?,
+                    decision_source = ?,
+                    decision_code = ?,
+                    decision_detail = ?,
+                    accepted = ?,
+                    reject_reason = ?,
+                    pending_entry_id = ?,
+                    executable = ?,
+                    is_pending = ?,
+                    is_opened = ?,
+                    decision_trace_json = ?
+                WHERE signal_id = ?
+                ''',
+                (
+                    stage,
+                    decision,
+                    decision_source,
+                    decision_code,
+                    decision_detail,
+                    1 if accepted else 0,
+                    reject_reason,
+                    pending_entry_id,
+                    1 if executable else 0,
+                    1 if is_pending else 0,
+                    1 if is_opened else 0,
+                    _json_dumps_safe(decision_trace or {}),
+                    signal_id,
+                )
+            )
             await db.commit()
     
     async def update_signal_outcome(self, symbol: str, timestamp: int, reject_reason: str = '', position_id: str = ''):
@@ -1633,13 +1848,36 @@ class SQLiteManager:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute('''
                     UPDATE signals 
-                    SET reject_reason = ?, accepted = CASE WHEN ? != '' THEN 0 ELSE accepted END
+                    SET reject_reason = ?,
+                        accepted = CASE WHEN ? != '' THEN 0 ELSE accepted END,
+                        executable = CASE WHEN ? != '' THEN executable ELSE 1 END,
+                        is_pending = CASE WHEN ? != '' THEN 0 ELSE is_pending END,
+                        is_opened = CASE WHEN ? != '' THEN 0 ELSE 1 END,
+                        stage = CASE WHEN ? != '' THEN 'HARD_REJECT' ELSE 'OPENED' END,
+                        decision = CASE WHEN ? != '' THEN 'HARD_REJECT' ELSE 'PASS' END,
+                        decision_code = CASE WHEN ? != '' THEN ? ELSE 'OPEN__FILLED' END,
+                        decision_detail = CASE WHEN ? != '' THEN ? ELSE ? END
                     WHERE rowid = (
                         SELECT rowid FROM signals 
                         WHERE symbol = ? AND timestamp >= ? - 5000 AND timestamp <= ? + 5000
                         ORDER BY timestamp DESC LIMIT 1
                     )
-                ''', (reject_reason or f'FILLED:{position_id}', reject_reason, symbol, timestamp, timestamp))
+                ''', (
+                    reject_reason or f'FILLED:{position_id}',
+                    reject_reason,
+                    reject_reason,
+                    reject_reason,
+                    reject_reason,
+                    reject_reason,
+                    reject_reason,
+                    reject_reason or 'OPEN__REJECTED',
+                    reject_reason,
+                    reject_reason or f'FILLED:{position_id}',
+                    f'FILLED:{position_id}',
+                    symbol,
+                    timestamp,
+                    timestamp,
+                ))
                 await db.commit()
         except Exception as e:
             logger.debug(f"update_signal_outcome error: {e}")
@@ -3310,11 +3548,32 @@ class LiveBinanceTrader:
                         symbol = p.get('symbol', '')
                         side = 'LONG' if position_amt > 0 else 'SHORT'
                         entry_price = float(p.get('entryPrice', 0) or 0)
+                        mark_price = float(p.get('markPrice', entry_price) or entry_price)
                         exchange_be_price = float(p.get('breakEvenPrice', 0) or 0)
                         unrealized_pnl = float(p.get('unRealizedProfit', 0) or 0)
                         notional = abs(float(p.get('notional', 0) or 0))
-                        leverage = int(p.get('leverage', 1) or 1)
-                        position_margin = float(p.get('isolatedMargin', 0) or p.get('initialMargin', 0) or 0)
+                        position_margin = float(
+                            p.get('positionInitialMargin', 0)
+                            or p.get('initialMargin', 0)
+                            or p.get('isolatedMargin', 0)
+                            or 0
+                        )
+                        raw_leverage = _to_float_safe(p.get('leverage', 0), 0.0)
+                        if raw_leverage <= 1.0 and position_margin > 0 and notional > 0:
+                            raw_leverage = notional / position_margin
+                        if raw_leverage <= 1.0 and global_paper_trader:
+                            engine_match = next(
+                                (
+                                    ep for ep in global_paper_trader.positions
+                                    if ep.get('symbol') == symbol and str(ep.get('side', '')).upper() == side
+                                ),
+                                None,
+                            )
+                            if engine_match:
+                                raw_leverage = max(raw_leverage, _position_effective_leverage(engine_match))
+                                if position_margin <= 0:
+                                    position_margin = _position_margin_usd(engine_match)
+                        leverage = max(1, int(round(raw_leverage if raw_leverage > 0 else 1.0)))
                         if position_margin == 0 and notional > 0 and leverage > 0:
                             position_margin = notional / leverage
                         
@@ -3327,21 +3586,25 @@ class LiveBinanceTrader:
                             open_time_val = db_ot if db_ot else int(p.get('updateTime', datetime.now().timestamp() * 1000))
                         except:
                             open_time_val = int(p.get('updateTime', datetime.now().timestamp() * 1000))
-                        result.append({
+                        result.append(_normalize_position_snapshot({
                             'symbol': symbol,
                             'side': side,
                             'entryPrice': entry_price,
                             'sizeUsd': notional,
                             'unrealizedPnl': unrealized_pnl,
                             'pnlPercent': pnl_percent,
+                            'unrealizedPnlPercent': pnl_percent,
                             'leverage': leverage,
+                            'marginUsd': position_margin,
+                            'margin': position_margin,
                             'initialMargin': position_margin,
                             'exchangeBreakEvenPrice': exchange_be_price,
                             'size': abs(position_amt),           # Phase 149: Fix missing size field
                             'contracts': abs(position_amt),
-                            'markPrice': float(p.get('markPrice', entry_price) or entry_price),  # Phase 149: Add markPrice
+                            'markPrice': mark_price,  # Phase 149: Add markPrice
+                            'currentPrice': mark_price,
                             'openTime': open_time_val
-                        })
+                        }))
                     else:
                         # Track symbols with 0 positionAmt
                         if symbol.endswith('USDT'):
@@ -3465,7 +3728,7 @@ class LiveBinanceTrader:
                     fallback_profit_pos.setdefault('entryPrice', entry_price)
                     fallback_profit_pos.setdefault('markPrice', current_price)
                     fallback_profit_pos.setdefault('currentPrice', current_price)
-                    fallback_profit_pos.setdefault('leverage', calculated_leverage if calculated_leverage > 0 else final_leverage)
+                    fallback_profit_pos.setdefault('leverage', final_leverage if final_leverage > 0 else calculated_leverage)
                     fallback_profit_pos.setdefault('trailDistance', 0.0)
                     fallback_profit_pos.setdefault('spreadPct', _coerce_float(raw_info.get('bidAskSpread', 0.05), 0.05))
                     fallback_profit_pos.setdefault('spreadLevel', engine_pos.get('spreadLevel', 'Low') if engine_pos else 'Low')
@@ -3494,7 +3757,7 @@ class LiveBinanceTrader:
                     
                     # Calculate TP/SL based on side
                     # Phase 275: Leverage-aware SL/TP
-                    _ws_leverage = calculated_leverage if calculated_leverage > 0 else 10
+                    _ws_leverage = final_leverage if final_leverage > 0 else calculated_leverage if calculated_leverage > 0 else 10
                     _ws_sl_dist_lev = entry_price * (30.0 / max(_ws_leverage, 1) / 100)
                     _ws_tp_dist_lev = entry_price * (5.0 / max(_ws_leverage, 1) / 100)
                     _ws_sl_dist_atr = estimated_atr * adjusted_sl_atr
@@ -3631,7 +3894,7 @@ class LiveBinanceTrader:
                                     'entryPrice': entry_price,
                                     'exitPrice': current_price,
                                     'unrealizedPnl': unrealized_pnl,
-                                    'leverage': calculated_leverage,
+                                    'leverage': final_leverage,
                                     'sizeUsd': notional,
                                     'margin': position_margin,
                                     'stopLoss': sl,
@@ -3702,7 +3965,7 @@ class LiveBinanceTrader:
                                     'entryPrice': entry_price,
                                     'exitPrice': candle_close_price,
                                     'unrealizedPnl': unrealized_pnl,
-                                    'leverage': calculated_leverage,
+                                    'leverage': final_leverage,
                                     'sizeUsd': notional,
                                     'margin': position_margin,
                                     'stopLoss': sl,
@@ -3722,7 +3985,7 @@ class LiveBinanceTrader:
                             # Clear trailing state after close triggered
                             del self.trailing_state[symbol]
                     
-                    result.append({
+                    result.append(_normalize_position_snapshot({
                         'id': f"BIN_{symbol}_{int(datetime.now().timestamp())}",
                         'symbol': symbol,
                         'side': side,  # Use calculated side from CCXT/raw info
@@ -3732,10 +3995,13 @@ class LiveBinanceTrader:
                         'entryPrice': entry_price,
                         'exchangeBreakEvenPrice': exchange_be_price,
                         'markPrice': mark_price,
+                        'currentPrice': current_price,
                         'unrealizedPnl': unrealized_pnl,
                         'unrealizedPnlPercent': pnl_percent,
-                        'leverage': calculated_leverage,  # notional/margin - accurate for cross margin
+                        'leverage': final_leverage,  # raw/inferred Binance leverage
+                        'marginUsd': position_margin,
                         'margin': position_margin,  # Add margin for UI
+                        'initialMargin': position_margin,
                         'liquidationPrice': float(p.get('liquidationPrice') or 0),
                         'marginType': p.get('marginMode', 'cross'),
                         'openTime': open_time,  # Actual position open time from trade history
@@ -3748,7 +4014,7 @@ class LiveBinanceTrader:
                         'trailDistance': trail_distance,
                         'isTrailingActive': is_trailing_active,
                         'atr': estimated_atr
-                    })
+                    }))
             
             # Phase 147: Process pending closes
             if hasattr(self, 'pending_closes') and self.pending_closes:
@@ -15938,23 +16204,23 @@ class UIStateCache:
     
     def get_state(self) -> dict:
         """Return complete UI state for WebSocket - instant, no API calls."""
-        # Phase 259: Generate persistent signals array for UI
-        persistent_signals = get_persistent_active_signals_snapshot()
+        executable_signals = get_persistent_active_signals_snapshot()
+        pending_entries = get_pending_entries_snapshot()
+        signal_stats = _build_ui_signal_stats(self.opportunities, executable_signals, pending_entries)
         stats_copy = self.stats.copy()
-        persistent_long = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
-        persistent_short = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
-        stats_copy.setdefault('currentLongSignals', stats_copy.get('longSignals', 0))
-        stats_copy.setdefault('currentShortSignals', stats_copy.get('shortSignals', 0))
-        stats_copy.setdefault('currentActiveSignals', stats_copy.get('activeSignals', 0))
-        stats_copy['persistentLongSignals'] = persistent_long
-        stats_copy['persistentShortSignals'] = persistent_short
-        stats_copy['persistentActiveSignals'] = len(persistent_signals)
+        stats_copy.update(signal_stats)
 
         return {
             "type": "scanner_update",
             "opportunities": self.opportunities,
-            "persistentActiveSignals": persistent_signals,
+            "executableSignals": executable_signals,
+            "persistentActiveSignals": executable_signals,
+            "pendingEntries": pending_entries,
             "stats": stats_copy,
+            "rawSignalStats": signal_stats.get("rawSignalStats", {}),
+            "executableSignalStats": signal_stats.get("executableSignalStats", {}),
+            "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
+            "signalEventsSummary": get_signal_events_summary(),
             "portfolio": {
                 "balance": self.balance,
                 "positions": self.positions,
@@ -15982,22 +16248,46 @@ class UIStateCache:
 ui_state_cache = UIStateCache()
 
 
-def _build_ui_signal_stats(opportunities: list, persistent_signals: list) -> dict:
-    """Build separate live/current and persistent signal counters for UI."""
-    current_long = sum(1 for o in opportunities if o.get('signalAction') == 'LONG')
-    current_short = sum(1 for o in opportunities if o.get('signalAction') == 'SHORT')
-    persistent_long = sum(1 for s in persistent_signals if s.get('signalAction') == 'LONG')
-    persistent_short = sum(1 for s in persistent_signals if s.get('signalAction') == 'SHORT')
+def _build_ui_signal_stats(opportunities: list, executable_signals: list, pending_entries: Optional[list] = None) -> dict:
+    """Build separated raw/executable/pending counters for UI."""
+    pending_entries = pending_entries or []
+    raw_long = sum(1 for o in opportunities if o.get('signalAction') == 'LONG')
+    raw_short = sum(1 for o in opportunities if o.get('signalAction') == 'SHORT')
+    executable_long = sum(1 for s in executable_signals if s.get('signalAction') == 'LONG')
+    executable_short = sum(1 for s in executable_signals if s.get('signalAction') == 'SHORT')
+    pending_long = sum(1 for p in pending_entries if p.get('signalAction') == 'LONG')
+    pending_short = sum(1 for p in pending_entries if p.get('signalAction') == 'SHORT')
+    confirmed_pending = sum(1 for p in pending_entries if bool(p.get('confirmed')))
     return {
-        "longSignals": current_long,
-        "shortSignals": current_short,
-        "activeSignals": current_long + current_short,
-        "currentLongSignals": current_long,
-        "currentShortSignals": current_short,
-        "currentActiveSignals": current_long + current_short,
-        "persistentLongSignals": persistent_long,
-        "persistentShortSignals": persistent_short,
-        "persistentActiveSignals": len(persistent_signals),
+        "longSignals": executable_long,
+        "shortSignals": executable_short,
+        "activeSignals": executable_long + executable_short,
+        "currentLongSignals": executable_long,
+        "currentShortSignals": executable_short,
+        "currentActiveSignals": executable_long + executable_short,
+        "persistentLongSignals": executable_long,
+        "persistentShortSignals": executable_short,
+        "persistentActiveSignals": len(executable_signals),
+        "pendingLongSignals": pending_long,
+        "pendingShortSignals": pending_short,
+        "pendingActiveSignals": len(pending_entries),
+        "rawSignalStats": {
+            "longSignals": raw_long,
+            "shortSignals": raw_short,
+            "activeSignals": raw_long + raw_short,
+        },
+        "executableSignalStats": {
+            "longSignals": executable_long,
+            "shortSignals": executable_short,
+            "activeSignals": executable_long + executable_short,
+        },
+        "pendingEntryStats": {
+            "longSignals": pending_long,
+            "shortSignals": pending_short,
+            "activeSignals": len(pending_entries),
+            "confirmed": confirmed_pending,
+            "waiting": max(0, len(pending_entries) - confirmed_pending),
+        },
     }
 
 
@@ -16015,14 +16305,209 @@ def _resolve_live_positions_for_ui(prefer_cache: bool = False) -> tuple[list, st
         if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
             return [], 'ui_cache_empty'
 
-    binance_positions = list(getattr(live_binance_trader, 'last_positions', []) or [])
+    binance_positions = dedupe_position_snapshots(list(getattr(live_binance_trader, 'last_positions', []) or []))
     if binance_positions:
         return binance_positions, 'binance_sync'
     if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
         return [], 'binance_sync_empty'
 
-    fallback_positions = [dict(p) for p in global_paper_trader.positions if p.get('isLive')]
+    fallback_positions = dedupe_position_snapshots([dict(p) for p in global_paper_trader.positions if p.get('isLive')])
     return fallback_positions, 'engine_fallback'
+
+
+def _position_notional_usd(pos: dict) -> float:
+    return max(0.0, _to_float_safe(pos.get('sizeUsd', pos.get('notional', 0.0)), 0.0))
+
+
+def _position_margin_usd(pos: dict) -> float:
+    for key in ('marginUsd', 'margin', 'initialMargin', 'positionInitialMargin'):
+        value = max(0.0, _to_float_safe(pos.get(key, 0.0), 0.0))
+        if value > 0:
+            return value
+    notional = _position_notional_usd(pos)
+    leverage = _to_float_safe(pos.get('leverage', 0.0), 0.0)
+    if notional > 0 and leverage > 0:
+        return notional / leverage
+    return 0.0
+
+
+def _position_effective_leverage(pos: dict) -> float:
+    raw_leverage = _to_float_safe(pos.get('leverage', 0.0), 0.0)
+    if raw_leverage > 1.0:
+        return raw_leverage
+    signal_leverage = _to_float_safe(pos.get('signalLeverageEffective', 0.0), 0.0)
+    if signal_leverage > 1.0:
+        return signal_leverage
+    notional = _position_notional_usd(pos)
+    margin = _position_margin_usd(pos)
+    if notional > 0 and margin > 0:
+        derived = notional / margin
+        if derived >= 1.0:
+            return derived
+    return raw_leverage if raw_leverage > 0 else 1.0
+
+
+def _position_snapshot_score(pos: dict) -> float:
+    leverage = _position_effective_leverage(pos)
+    margin = _position_margin_usd(pos)
+    notional = _position_notional_usd(pos)
+    score = 0.0
+    if pos.get('isLive'):
+        score += 10.0
+    if leverage > 1.25:
+        score += 25.0
+    if margin > 0:
+        score += 10.0
+    if notional > 0 and margin > 0 and (notional / margin) > 1.25:
+        score += 15.0
+    if pos.get('partial_tp_state'):
+        score += 20.0
+    if pos.get('tp1Hit') or pos.get('tp1_hit_time'):
+        score += 8.0
+    if pos.get('binance_order_id') or pos.get('entryOrderId') or pos.get('entry_order_id'):
+        score += 6.0
+    if pos.get('signalId') or pos.get('signal_id'):
+        score += 6.0
+    if pos.get('stopLoss') or pos.get('takeProfit'):
+        score += 4.0
+    if pos.get('openTime'):
+        score += 2.0
+    return score
+
+
+def _normalize_position_snapshot(pos: dict) -> dict:
+    normalized = dict(pos or {})
+    leverage = _position_effective_leverage(normalized)
+    notional = _position_notional_usd(normalized)
+    margin = _position_margin_usd(normalized)
+    if margin <= 0 and leverage > 0 and notional > 0:
+        margin = notional / leverage
+    normalized['leverage'] = max(1, int(round(leverage))) if leverage > 0 else 1
+    if margin > 0:
+        normalized['marginUsd'] = margin
+        normalized['margin'] = margin
+        normalized['initialMargin'] = margin
+    partial_state = normalized.get('partial_tp_state')
+    if isinstance(partial_state, dict):
+        normalized['tp1Hit'] = bool(partial_state.get('tp1') or normalized.get('tp1Hit', False))
+    if not normalized.get('currentPrice') and normalized.get('markPrice'):
+        normalized['currentPrice'] = normalized.get('markPrice')
+    return normalized
+
+
+def dedupe_position_snapshots(positions: list) -> list:
+    grouped: Dict[tuple, list] = {}
+    for raw_pos in positions or []:
+        pos = dict(raw_pos or {})
+        key = (
+            str(pos.get('symbol', '')).upper(),
+            str(pos.get('side', '')).upper(),
+        )
+        grouped.setdefault(key, []).append(pos)
+
+    deduped = []
+    for group in grouped.values():
+        if len(group) == 1:
+            deduped.append(_normalize_position_snapshot(group[0]))
+            continue
+
+        ranked = sorted(group, key=_position_snapshot_score, reverse=True)
+        merged = _normalize_position_snapshot(ranked[0])
+
+        merged_partial_state = dict(merged.get('partial_tp_state') or {})
+        merged_tp1 = bool(merged.get('tp1Hit', False))
+        best_leverage = _position_effective_leverage(merged)
+        best_notional = _position_notional_usd(merged)
+        best_margin = _position_margin_usd(merged)
+
+        for other_raw in ranked[1:]:
+            other = _normalize_position_snapshot(other_raw)
+            other_partial_state = dict(other.get('partial_tp_state') or {})
+            if other_partial_state:
+                merged_partial_state.update(other_partial_state)
+            merged_tp1 = merged_tp1 or bool(other.get('tp1Hit', False))
+
+            other_leverage = _position_effective_leverage(other)
+            other_notional = _position_notional_usd(other)
+            other_margin = _position_margin_usd(other)
+            if other_leverage > best_leverage:
+                best_leverage = other_leverage
+            if other_notional > best_notional:
+                best_notional = other_notional
+            if other_margin > 0 and (
+                best_margin <= 0
+                or abs((best_notional / max(best_margin, 1e-9)) - best_leverage) > 0.75
+            ):
+                best_margin = other_margin
+
+            for field in (
+                'signalId', 'signal_id', 'positionId', 'position_id', 'entryOrderId',
+                'entry_order_id', 'binance_order_id', 'exchangeBreakEvenPrice',
+                'runtimeExchangeBreakEvenPrice', 'currentPrice', 'markPrice', 'openTime',
+                'stopLoss', 'takeProfit', 'trailingStop', 'trailActivation', 'trailDistance',
+                'isTrailingActive', 'runtimeTpRoiPct', 'runtimeStopRoiPct',
+                'runtimeProfitPhase', 'runtimeProfitOwner', 'runtimeProfitPeakRoiPct',
+                'runtimeProfitGivebackRoiPct', 'runtimeTrailDistanceRoiPct',
+                'runtimeTrailActivationRoiPct', 'unrealizedPnl', 'unrealizedPnlPercent',
+                'entryFeePaidUsd', 'feesPaidUsd',
+            ):
+                if merged.get(field) in (None, '', 0, 0.0, False) and other.get(field) not in (None, '', 0, 0.0, False):
+                    merged[field] = other.get(field)
+
+        if best_notional > 0:
+            merged['sizeUsd'] = best_notional
+        if best_leverage > 0:
+            merged['leverage'] = max(1, int(round(best_leverage)))
+        if best_margin <= 0 and best_notional > 0 and best_leverage > 0:
+            best_margin = best_notional / best_leverage
+        if best_margin > 0:
+            merged['marginUsd'] = best_margin
+            merged['margin'] = best_margin
+            merged['initialMargin'] = best_margin
+        if merged_partial_state:
+            merged['partial_tp_state'] = merged_partial_state
+        merged['tp1Hit'] = bool(merged_tp1 or merged_partial_state.get('tp1', False))
+        deduped.append(_normalize_position_snapshot(merged))
+
+    return sorted(deduped, key=lambda p: p.get('openTime', 0), reverse=True)
+
+
+def build_position_snapshot_index(positions: list) -> Dict[str, dict]:
+    return {
+        str(pos.get('symbol', '')): pos
+        for pos in dedupe_position_snapshots(positions)
+        if pos.get('symbol')
+    }
+
+
+def allocate_partial_realization_costs(
+    pos: dict,
+    close_contracts: float,
+    current_contracts: float,
+    close_fee: float = 0.0,
+) -> dict:
+    original_contracts = max(
+        _to_float_safe(pos.get('original_contracts', current_contracts), current_contracts),
+        current_contracts,
+        close_contracts,
+        1e-9,
+    )
+    entry_fee_remaining = max(0.0, _to_float_safe(pos.get('entryFeePaidUsd', 0.0), 0.0))
+    entry_fee_alloc = min(entry_fee_remaining, entry_fee_remaining * (close_contracts / original_contracts))
+
+    funding_total = _to_float_safe(pos.get('accumulated_funding', 0.0), 0.0)
+    funding_alloc = funding_total * (close_contracts / current_contracts) if current_contracts > 0 else 0.0
+
+    pos['entryFeePaidUsd'] = max(0.0, entry_fee_remaining - entry_fee_alloc)
+    pos['closeFeesPaidUsd'] = max(0.0, _to_float_safe(pos.get('closeFeesPaidUsd', 0.0), 0.0)) + max(0.0, close_fee)
+    pos['accumulated_funding'] = funding_total - funding_alloc
+
+    return {
+        'entry_fee_alloc': entry_fee_alloc,
+        'close_fee': max(0.0, close_fee),
+        'funding_alloc': funding_alloc,
+        'total_fee': entry_fee_alloc + max(0.0, close_fee),
+    }
 
 
 # ============================================================================
@@ -16675,7 +17160,8 @@ class MultiCoinScanner:
                 whale_tracker.update(symbol, price, volume, ticker.get('percentage', 0))
                 
                 # Analyze for signal with BTC basis and L1 imbalance (uses bookTicker imbalance if available)
-                signal = analyzer.analyze(imbalance=imbalance, basis_pct=self.btc_basis_pct)
+                macro_basis_pct = self.btc_basis_pct if symbol == 'BTCUSDT' else 0.0
+                signal = analyzer.analyze(imbalance=imbalance, basis_pct=macro_basis_pct)
                 
                 if signal:
                     signal['symbol'] = symbol
@@ -16965,8 +17451,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 _top150_symbols.add(opp.get('symbol'))
         ui_state_cache.opportunities = _top150
         
-        persistent_signals = get_persistent_active_signals_snapshot()
-        signal_stats = _build_ui_signal_stats(filtered_opportunities, persistent_signals)
+        executable_signals = get_persistent_active_signals_snapshot()
+        pending_entries = get_pending_entries_snapshot()
+        signal_stats = _build_ui_signal_stats(filtered_opportunities, executable_signals, pending_entries)
         
         ui_state_cache.stats = {
             "totalCoins": stats.get('totalCoins', len(multi_coin_scanner.coins)),
@@ -17001,7 +17488,7 @@ async def update_ui_cache(opportunities: list, stats: dict):
                 # Phase 155: Merge Binance positions with exit params from global_paper_trader
                 # global_paper_trader.positions has TP/SL/Trail data from sync loop
                 merged_positions = []
-                paper_positions = {p.get('symbol'): p for p in global_paper_trader.positions}
+                paper_positions = build_position_snapshot_index(global_paper_trader.positions)
                 
                 for bp in positions:
                     symbol = bp.get('symbol', '')
@@ -17012,6 +17499,17 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     
                     # Merge exit parameters from paper trader (if available)
                     if paper_pos:
+                        paper_leverage = _position_effective_leverage(paper_pos)
+                        binance_leverage = _position_effective_leverage(merged)
+                        paper_margin = _position_margin_usd(paper_pos)
+                        if paper_leverage > binance_leverage:
+                            merged['leverage'] = max(1, int(round(paper_leverage)))
+                        if paper_margin > 0 and (
+                            _position_margin_usd(merged) <= 0 or paper_leverage > binance_leverage + 0.5
+                        ):
+                            merged['marginUsd'] = paper_margin
+                            merged['margin'] = paper_margin
+                            merged['initialMargin'] = paper_margin
                         merged['stopLoss'] = paper_pos.get('stopLoss', bp.get('stopLoss', 0))
                         merged['takeProfit'] = paper_pos.get('takeProfit', bp.get('takeProfit', 0))
                         merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
@@ -17057,6 +17555,11 @@ async def update_ui_cache(opportunities: list, stats: dict):
                             merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
                         else:
                             merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
+                        merged['partial_tp_state'] = paper_pos.get('partial_tp_state', merged.get('partial_tp_state', {}))
+                        merged['tp1Hit'] = bool(
+                            paper_pos.get('tp1Hit', False)
+                            or (paper_pos.get('partial_tp_state', {}) or {}).get('tp1', False)
+                        )
                     else:
                         # No paper position - calculate default exit params
                         entry = bp.get('entryPrice', 0)
@@ -17099,8 +17602,9 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['runtimeTrailThresholdMult'] = 1.0
                         merged['runtimeTrailLastUpdateTs'] = int(datetime.now().timestamp() * 1000)
                     
-                    merged_positions.append(merged)
-                
+                    merged_positions.append(_normalize_position_snapshot(merged))
+
+                merged_positions = dedupe_position_snapshots(merged_positions)
                 ui_state_cache.balance = balance_data.get('walletBalance', 0)
                 ui_state_cache.live_balance = balance_data
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
@@ -18912,46 +19416,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         _sig = active_signals.get(symbol)
         if _sig:
             _sig['execution_reject_reason'] = reason
-    
-    # ================================================================
-    # Phase 142: Block signals during recovery cooldown
-    # ================================================================
-    if portfolio_recovery_manager.is_in_cooldown():
-        cooldown_remaining = portfolio_recovery_manager.get_cooldown_remaining()
-        logger.info(f"⏸️ RECOVERY COOLDOWN: Skipping signal {signal.get('symbol', '?')}, {cooldown_remaining:.1f}h remaining")
-        reject_feedback("RECOVERY_COOLDOWN")
-        return None
-    
-    # Phase 225: Block signals during price shock (trade execution level gate)
-    try:
-        shock_blocked, shock_reason = price_shock_manager.should_block_signal(action, signal.get('symbol', ''))
-        if shock_blocked:
-            logger.info(f"⚡ SHOCK_BLOCK: {signal.get('symbol', '?')} {action} blocked at execution — {shock_reason}")
-            reject_feedback(f"SHOCK_BLOCK:{shock_reason}")
-            return None
-    except Exception:
-        pass
-    
-    # Phase 254: Protection Manager — SL streak lock gate
-    try:
-        prot_blocked, prot_reason = protection_manager.should_block_signal(symbol, action)
-        if prot_blocked:
-            logger.info(f"🔒 PROT_BLOCK: {symbol} {action} blocked — {prot_reason}")
-            reject_feedback(f"PROT_BLOCK:{prot_reason}")
-            return None
-    except Exception:
-        pass
 
     atr = signal.get('atr', 0)
-    
-    # Phase 127: Log signal processing entry for tracing
-    logger.info(f"🔄 PROC_SIGNAL: Processing {symbol} {action} @ ${price:.4f}")
-
     signal_id = signal.get('signalId') or signal.get('signal_id') or f"SIG_{symbol}_{int(datetime.now().timestamp() * 1000)}"
     signal['signalId'] = signal_id
     signal['signal_id'] = signal_id
-    
-    # Prepare signal data for logging
     signal_log_data = {
         'signal_id': signal_id,
         'symbol': symbol,
@@ -18973,8 +19442,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'mtf_reason': '',
         'htf_trend': 'NEUTRAL',
         'blacklisted': False,
-        'obi_value': 0.0,  # Phase 211: OBI depth value (updated before save)
-        'telemetry': signal.get('telemetry', {}), # Phase 211: Full parameter telemetry
+        'obi_value': 0.0,
+        'telemetry': signal.get('telemetry', {}),
         'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', STRATEGY_MODE_LEGACY)),
         'execution_profile_source': signal.get('execution_profile_source', 'neutral'),
         'entry_quality': {
@@ -18984,7 +19453,200 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         },
         'risk_gate': signal.get('risk_gate', {}),
         'signal_context': signal,
+        'stage': SIGNAL_STAGE_RAW,
+        'decision': 'WAIT',
+        'decision_source': 'engine',
+        'decision_code': 'RAW__GENERATED',
+        'decision_detail': '',
+        'pending_entry_id': '',
+        'executable': False,
+        'is_pending': False,
+        'is_opened': False,
+        'decision_trace': {},
     }
+
+    def queue_signal_state(
+        *,
+        stage: str,
+        decision: str,
+        decision_code: str,
+        decision_detail: str = '',
+        reject_reason: Optional[str] = None,
+        accepted: Optional[bool] = None,
+        pending_entry_id: str = '',
+        executable: Optional[bool] = None,
+        is_pending: bool = False,
+        is_opened: bool = False,
+        score_before: Optional[float] = None,
+        score_after: Optional[float] = None,
+        leverage_before: Optional[float] = None,
+        leverage_after: Optional[float] = None,
+        size_mult: Optional[float] = None,
+        cooldown_sec: float = 0.0,
+        trace: Optional[dict] = None,
+    ):
+        payload = build_signal_event_payload(
+            signal_log_data,
+            stage=stage,
+            decision=decision,
+            decision_code=decision_code,
+            decision_detail=decision_detail,
+            reject_reason=reject_reason,
+            accepted=accepted,
+            pending_entry_id=pending_entry_id,
+            executable=executable,
+            is_pending=is_pending,
+            is_opened=is_opened,
+            score_before=score_before,
+            score_after=score_after,
+            leverage_before=leverage_before,
+            leverage_after=leverage_after,
+            size_mult=size_mult,
+            cooldown_sec=cooldown_sec,
+            trace=trace,
+        )
+        signal_log_data.update({
+            'accepted': payload.get('accepted', False),
+            'reject_reason': payload.get('reject_reason', ''),
+            'stage': payload.get('stage', SIGNAL_STAGE_RAW),
+            'decision': payload.get('decision', 'WAIT'),
+            'decision_source': payload.get('decision_source', 'engine'),
+            'decision_code': payload.get('decision_code', 'RAW__GENERATED'),
+            'decision_detail': payload.get('decision_detail', ''),
+            'pending_entry_id': payload.get('pending_entry_id', ''),
+            'executable': payload.get('executable', False),
+            'is_pending': payload.get('is_pending', False),
+            'is_opened': payload.get('is_opened', False),
+            'decision_trace': payload.get('decision_trace', {}),
+        })
+        record_signal_event_memory(payload)
+        payload_stage = payload.get('stage', SIGNAL_STAGE_RAW)
+        if payload_stage in (SIGNAL_STAGE_EXECUTABLE, SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK, SIGNAL_STAGE_OPEN_ATTEMPT, SIGNAL_STAGE_OPENED):
+            set_signal_memory_state(
+                symbol,
+                stage=payload_stage,
+                signal_id=signal_id,
+                pending_entry_id=payload.get('pending_entry_id', ''),
+                score=payload.get('score_after'),
+                last_price=price if price and price > 0 else None,
+            )
+        elif payload_stage in (SIGNAL_STAGE_HARD_REJECT, SIGNAL_STAGE_PENDING_CANCELLED, SIGNAL_STAGE_EXPIRED):
+            drop_signal_memory(symbol, signal_id=signal_id)
+        safe_create_task(sqlite_manager.save_signal(payload))
+        safe_create_task(sqlite_manager.save_signal_event(payload))
+        return payload
+
+    def hard_reject_signal(code: str, detail: str = '', trace: Optional[dict] = None):
+        queue_signal_state(
+            stage=SIGNAL_STAGE_HARD_REJECT,
+            decision='HARD_REJECT',
+            decision_code=code,
+            decision_detail=detail,
+            reject_reason=detail or code,
+            accepted=False,
+            executable=False,
+            score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+            score_after=signal.get('confidenceScore', 0),
+            leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+            leverage_after=signal.get('leverage', 0),
+            size_mult=signal.get('sizeMultiplier', 1.0),
+            trace=trace,
+        )
+
+    def queue_pass_stage(code: str, stage: str, detail: str = '', trace: Optional[dict] = None):
+        is_executable_stage = stage in (
+            SIGNAL_STAGE_EXECUTABLE,
+            SIGNAL_STAGE_PENDING,
+            SIGNAL_STAGE_PENDING_RECHECK,
+            SIGNAL_STAGE_OPEN_ATTEMPT,
+            SIGNAL_STAGE_OPENED,
+        )
+        queue_signal_state(
+            stage=stage,
+            decision='PASS',
+            decision_code=code,
+            decision_detail=detail,
+            accepted=is_executable_stage,
+            executable=is_executable_stage,
+            is_pending=(stage in (SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK)),
+            is_opened=(stage == SIGNAL_STAGE_OPENED),
+            score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+            score_after=signal.get('confidenceScore', 0),
+            leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+            leverage_after=signal.get('leverage', 0),
+            size_mult=signal.get('sizeMultiplier', 1.0),
+            trace=trace,
+        )
+
+    queue_signal_state(
+        stage=SIGNAL_STAGE_RAW,
+        decision='WAIT',
+        decision_code='RAW__GENERATED',
+        score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+        score_after=signal.get('confidenceScore', 0),
+        leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+        leverage_after=signal.get('leverage', 0),
+        size_mult=signal.get('sizeMultiplier', 1.0),
+    )
+    
+    # ================================================================
+    # Phase 142: Block signals during recovery cooldown
+    # ================================================================
+    if portfolio_recovery_manager.is_in_cooldown():
+        cooldown_remaining = portfolio_recovery_manager.get_cooldown_remaining()
+        logger.info(f"⏸️ RECOVERY COOLDOWN: Skipping signal {signal.get('symbol', '?')}, {cooldown_remaining:.1f}h remaining")
+        hard_reject_signal(
+            'PRECHECK__RECOVERY_COOLDOWN',
+            'RECOVERY_COOLDOWN',
+            trace={'cooldown_hours_remaining': round(cooldown_remaining, 3)},
+        )
+        reject_feedback("RECOVERY_COOLDOWN")
+        return None
+    
+    # Phase 225: Block signals during price shock (trade execution level gate)
+    try:
+        shock_blocked, shock_reason = price_shock_manager.should_block_signal(action, signal.get('symbol', ''))
+        if shock_blocked:
+            logger.info(f"⚡ SHOCK_BLOCK: {signal.get('symbol', '?')} {action} blocked at execution — {shock_reason}")
+            hard_reject_signal(
+                'PRECHECK__SHOCK_BLOCK',
+                f"SHOCK_BLOCK:{shock_reason}",
+                trace={'shock_reason': shock_reason},
+            )
+            reject_feedback(f"SHOCK_BLOCK:{shock_reason}")
+            return None
+    except Exception:
+        pass
+    
+    # Phase 254: Protection Manager — SL streak lock gate
+    try:
+        prot_blocked, prot_reason = protection_manager.should_block_signal(symbol, action)
+        if prot_blocked:
+            logger.info(f"🔒 PROT_BLOCK: {symbol} {action} blocked — {prot_reason}")
+            hard_reject_signal(
+                'PRECHECK__PROTECTION_BLOCK',
+                f"PROT_BLOCK:{prot_reason}",
+                trace={'protection_reason': prot_reason},
+            )
+            reject_feedback(f"PROT_BLOCK:{prot_reason}")
+            return None
+    except Exception:
+        pass
+
+    # Phase 127: Log signal processing entry for tracing
+    logger.info(f"🔄 PROC_SIGNAL: Processing {symbol} {action} @ ${price:.4f}")
+    signal_log_data.update({
+        'price': price,
+        'atr': atr,
+        'signal_score': signal.get('confidenceScore', 0),
+        'signal_score_raw': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+        'entry_quality': {
+            'pass': signal.get('entryQualityPass'),
+            'reasons': signal.get('entryQualityReasons', []),
+            'entry_price_backend': signal.get('entryPriceBackend', 0),
+        },
+        'signal_context': signal,
+    })
     signal_memory_ctx = {
         "reinforce_count": 0,
         "score_bonus": 0,
@@ -18992,6 +19654,57 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         "pending_extend_sec": 0,
         "flip_recent": False,
     }
+    import copy as _signal_copy
+    _had_active_signal_before = symbol in active_signals
+    _active_signal_snapshot = _signal_copy.deepcopy(active_signals.get(symbol)) if _had_active_signal_before else None
+
+    def rollback_signal_memory():
+        if _had_active_signal_before:
+            active_signals[symbol] = _signal_copy.deepcopy(_active_signal_snapshot)
+        else:
+            active_signals.pop(symbol, None)
+
+    def reject_signal(
+        code: str,
+        detail: str,
+        *,
+        feedback_reason: Optional[str] = None,
+        trace: Optional[dict] = None,
+        attribution_reason: Optional[str] = None,
+        attribution_score: Optional[float] = None,
+        metric_key: Optional[str] = None,
+        hard_reject_count: bool = False,
+    ):
+        rollback_signal_memory()
+        hard_reject_signal(code, detail, trace=trace)
+        if metric_key:
+            global_paper_trader.pipeline_metrics.setdefault(metric_key, 0)
+            global_paper_trader.pipeline_metrics[metric_key] += 1
+        if hard_reject_count:
+            global_paper_trader.pipeline_metrics.setdefault('hard_reject_count', 0)
+            global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
+        if feedback_reason:
+            reject_feedback(feedback_reason)
+        if attribution_reason:
+            track_reject_for_attribution(
+                symbol,
+                action,
+                signal.get('entryPrice', signal.get('entry', 0)),
+                attribution_score if attribution_score is not None else signal.get('confidenceScore', 0),
+                attribution_reason,
+                signal.get('atr', 0),
+            )
+        return None
+
+    queue_pass_stage('PRECHECK__PASS', SIGNAL_STAGE_PRECHECK)
+    queue_pass_stage(
+        'SCORED__RAW_SIGNAL_READY',
+        SIGNAL_STAGE_SCORED,
+        trace={
+            'raw_score': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+            'post_score': signal.get('confidenceScore', 0),
+        },
+    )
     
     # Check if we already have a position in this symbol
     existing_position = None
@@ -19009,7 +19722,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     if PERSISTENT_SIGNAL_MODE:
         # TTL guard: active signal expires after 60 minutes unless refreshed.
         stale_signal = active_signals.get(symbol)
-        if stale_signal and stale_signal.get('state') == 'ACTIVE':
+        if stale_signal and is_executable_signal_state(stale_signal.get('state')):
             last_refresh = float(stale_signal.get('last_refresh_ts', stale_signal.get('created_ts', now_ts)) or now_ts)
             age = now_ts - last_refresh
             if age > PERSISTENT_SIGNAL_TTL_SEC:
@@ -19024,7 +19737,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 # ─── SAME DIRECTION: Refresh signal ───
                 existing_signal['last_refresh_ts'] = now_ts
                 existing_signal['score'] = signal.get('confidenceScore', existing_signal['score'])
-                existing_signal['state'] = 'ACTIVE'
+                existing_signal['state'] = existing_signal.get('state', SIGNAL_STAGE_SCORED)
                 existing_signal['counter_count'] = 0  # Reset counter
                 existing_signal['counter_first_ts'] = 0
                 # P0: Enrich snapshot on refresh
@@ -19038,9 +19751,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 existing_signal['last_price'] = _refresh_price
                 existing_signal['leverage'] = signal.get('leverage', existing_signal.get('leverage', 10))
                 existing_signal['strategy_mode'] = signal.get('strategyMode', signal.get('activeStrategy', existing_signal.get('strategy_mode', '')))
+                existing_signal['execution_profile_source'] = signal.get('execution_profile_source', existing_signal.get('execution_profile_source', 'neutral'))
+                existing_signal['execution_style'] = signal.get('execution_style', existing_signal.get('execution_style', EXEC_STYLE_MARKET))
+                existing_signal['structural_fallback_stage'] = signal.get('structural_fallback_stage', existing_signal.get('structural_fallback_stage', ''))
                 existing_signal['entry_quality_pass'] = signal.get('entryQualityPass', existing_signal.get('entry_quality_pass'))
                 existing_signal['entry_quality_reasons'] = signal.get('entryQualityReasons', existing_signal.get('entry_quality_reasons', []))
                 existing_signal['entry_price_backend'] = signal.get('entryPriceBackend', existing_signal.get('entry_price_backend', 0))
+                existing_signal['raw_score'] = signal.get('_rawConfidenceScore', existing_signal.get('raw_score', existing_signal.get('score', 0)))
+                existing_signal['post_gate_score'] = signal.get('confidenceScore', existing_signal.get('post_gate_score', existing_signal.get('score', 0)))
                 logger.info(
                     f"🔄 SIGNAL_REFRESH: {symbol} {action} score={existing_signal['score']:.0f} "
                     f"age={now_ts - existing_signal['created_ts']:.0f}s"
@@ -19048,8 +19766,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 
                 if existing_position:
                     # Already have same-direction position — skip
-                    signal_log_data['reject_reason'] = 'EXISTING_POSITION_SIGNAL_REFRESH'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    rollback_signal_memory()
+                    hard_reject_signal('EXEC__EXISTING_POSITION_SIGNAL_REFRESH', 'EXISTING_POSITION_SIGNAL_REFRESH')
                     reject_feedback("EXISTING_POSITION")
                     return
             else:
@@ -19064,8 +19782,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         f"⚡ FLIP_STORM_GUARD: {symbol} {action} vs {_old_side} "
                         f"cooldown {_remaining:.0f}s remaining"
                     )
-                    signal_log_data['reject_reason'] = 'FLIP_STORM_COOLDOWN'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    rollback_signal_memory()
+                    hard_reject_signal(
+                        'EXEC__FLIP_STORM_COOLDOWN',
+                        'FLIP_STORM_COOLDOWN',
+                        trace={'cooldown_sec_remaining': round(_remaining, 2)},
+                    )
                     reject_feedback("FLIP_STORM_COOLDOWN")
                     return
 
@@ -19106,12 +19828,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
 
                     # Create new active signal (flip)
                     active_signals[symbol] = {
+                        'signal_id': signal_id,
                         'side': action,
                         'score': signal.get('confidenceScore', 0),
                         'created_ts': now_ts,
                         'last_refresh_ts': now_ts,
                         'ttl_sec': 600,
-                        'state': 'ACTIVE',
+                        'state': SIGNAL_STAGE_SCORED,
                         'counter_count': 0,
                         'counter_first_ts': 0,
                         'reentry_count': 0,
@@ -19121,14 +19844,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         'entry_price_backend': signal.get('entryPriceBackend', 0),
                         'leverage': signal.get('leverage', 10),
                         'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                        'execution_profile_source': signal.get('execution_profile_source', 'neutral'),
+                        'execution_style': signal.get('execution_style', EXEC_STYLE_MARKET),
+                        'structural_fallback_stage': signal.get('structural_fallback_stage', ''),
                         'entry_quality_pass': signal.get('entryQualityPass', False),
                         'entry_quality_reasons': signal.get('entryQualityReasons', []),
                         'execution_reject_reason': '',
+                        'raw_score': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                        'post_gate_score': signal.get('confidenceScore', 0),
                     }
 
                     if existing_position:
-                        signal_log_data['reject_reason'] = 'COUNTER_FLIP_EXISTING_POS'
-                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        rollback_signal_memory()
+                        hard_reject_signal('EXEC__COUNTER_FLIP_EXISTING_POS', 'COUNTER_FLIP_EXISTING_POS')
                         reject_feedback("COUNTER_FLIP_EXISTING_POS")
                         return
                     # No position → fall through to re-entry check below
@@ -19176,12 +19904,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
 
                         # Create new active signal (flip)
                         active_signals[symbol] = {
+                            'signal_id': signal_id,
                             'side': action,
                             'score': signal.get('confidenceScore', 0),
                             'created_ts': now_ts,
                             'last_refresh_ts': now_ts,
                             'ttl_sec': 600,
-                            'state': 'ACTIVE',
+                            'state': SIGNAL_STAGE_SCORED,
                             'counter_count': 0,
                             'counter_first_ts': 0,
                             'reentry_count': 0,
@@ -19191,14 +19920,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                             'entry_price_backend': signal.get('entryPriceBackend', 0),
                             'leverage': signal.get('leverage', 10),
                             'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                            'execution_profile_source': signal.get('execution_profile_source', 'neutral'),
+                            'execution_style': signal.get('execution_style', EXEC_STYLE_MARKET),
+                            'structural_fallback_stage': signal.get('structural_fallback_stage', ''),
                             'entry_quality_pass': signal.get('entryQualityPass', False),
                             'entry_quality_reasons': signal.get('entryQualityReasons', []),
                             'execution_reject_reason': '',
+                            'raw_score': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                            'post_gate_score': signal.get('confidenceScore', 0),
                         }
 
                         if existing_position:
-                            signal_log_data['reject_reason'] = 'COUNTER_FLIP_EXISTING_POS'
-                            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                            rollback_signal_memory()
+                            hard_reject_signal('EXEC__COUNTER_FLIP_EXISTING_POS', 'COUNTER_FLIP_EXISTING_POS')
                             reject_feedback("COUNTER_FLIP_EXISTING_POS")
                             return
                         # No position → fall through to re-entry check below
@@ -19211,8 +19945,16 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                             f"⏳ COUNTER_RESET: {symbol} {action} vs {existing_signal['side']} "
                             f"window expired ({counter_age:.0f}s > {COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s), reset to 1"
                         )
-                        signal_log_data['reject_reason'] = 'COUNTER_PENDING'
-                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        rollback_signal_memory()
+                        queue_signal_state(
+                            stage=SIGNAL_STAGE_SUPERSEDED,
+                            decision='WAIT',
+                            decision_code='EXEC__COUNTER_PENDING',
+                            decision_detail='COUNTER_PENDING',
+                            accepted=False,
+                            executable=False,
+                            trace={'counter_count': existing_signal['counter_count'], 'counter_age_sec': round(counter_age, 2)},
+                        )
                         reject_feedback("COUNTER_PENDING")
                         return
                     else:
@@ -19222,19 +19964,28 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                             f"count={existing_signal['counter_count']}/{COUNTER_SIGNAL_CONFIRM_COUNT} "
                             f"window={counter_age:.0f}s/{COUNTER_SIGNAL_CONFIRM_WINDOW_SEC}s"
                         )
-                        signal_log_data['reject_reason'] = 'COUNTER_PENDING'
-                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                        rollback_signal_memory()
+                        queue_signal_state(
+                            stage=SIGNAL_STAGE_SUPERSEDED,
+                            decision='WAIT',
+                            decision_code='EXEC__COUNTER_PENDING',
+                            decision_detail='COUNTER_PENDING',
+                            accepted=False,
+                            executable=False,
+                            trace={'counter_count': existing_signal['counter_count'], 'counter_age_sec': round(counter_age, 2)},
+                        )
                         reject_feedback("COUNTER_PENDING")
                         return
         else:
             # ─── NO EXISTING SIGNAL: Register new signal ───
             active_signals[symbol] = {
+                'signal_id': signal_id,
                 'side': action,
                 'score': signal.get('confidenceScore', 0),
                 'created_ts': now_ts,
                 'last_refresh_ts': now_ts,
                 'ttl_sec': 600,
-                'state': 'ACTIVE',
+                'state': SIGNAL_STAGE_SCORED,
                 'counter_count': 0,
                 'counter_first_ts': 0,
                 'reentry_count': 0,
@@ -19244,9 +19995,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 'entry_price_backend': signal.get('entryPriceBackend', 0),
                 'leverage': signal.get('leverage', 10),
                 'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', '')),
+                'execution_profile_source': signal.get('execution_profile_source', 'neutral'),
+                'execution_style': signal.get('execution_style', EXEC_STYLE_MARKET),
+                'structural_fallback_stage': signal.get('structural_fallback_stage', ''),
                 'entry_quality_pass': signal.get('entryQualityPass', False),
                 'entry_quality_reasons': signal.get('entryQualityReasons', []),
                 'execution_reject_reason': '',
+                'raw_score': signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                'post_gate_score': signal.get('confidenceScore', 0),
             }
             logger.info(f"📡 SIGNAL_NEW: {symbol} {action} registered, score={signal.get('confidenceScore', 0):.0f}")
         
@@ -19257,15 +20013,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 # Check re-entry limits
                 if sig['reentry_count'] >= MAX_REENTRY_PER_SIGNAL:
                     logger.info(f"🚫 REENTRY_LIMIT: {symbol} {action} max re-entries reached ({sig['reentry_count']}/{MAX_REENTRY_PER_SIGNAL})")
-                    signal_log_data['reject_reason'] = 'REENTRY_LIMIT'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    rollback_signal_memory()
+                    hard_reject_signal('EXEC__REENTRY_LIMIT', 'REENTRY_LIMIT')
                     reject_feedback("REENTRY_LIMIT")
                     return
                 if sig['last_close_ts'] > 0 and (now_ts - sig['last_close_ts']) < MIN_REENTRY_COOLDOWN_SEC:
                     remaining = MIN_REENTRY_COOLDOWN_SEC - (now_ts - sig['last_close_ts'])
                     logger.info(f"🚫 REENTRY_COOLDOWN: {symbol} {action} cooldown {remaining:.0f}s remaining")
-                    signal_log_data['reject_reason'] = 'REENTRY_COOLDOWN'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                    rollback_signal_memory()
+                    hard_reject_signal(
+                        'EXEC__REENTRY_COOLDOWN',
+                        'REENTRY_COOLDOWN',
+                        trace={'cooldown_sec_remaining': round(remaining, 2)},
+                    )
                     reject_feedback("REENTRY_COOLDOWN")
                     return
                 # Mark as re-entry attempt (count incremented after fill in execute_pending_order)
@@ -19275,8 +20035,8 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         elif existing_position:
             # Phase 257: P1 fix — existing position guard in persistent mode
             # Without this, code falls through to open a duplicate position
-            signal_log_data['reject_reason'] = 'EXISTING_POSITION'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            rollback_signal_memory()
+            hard_reject_signal('EXEC__EXISTING_POSITION', 'EXISTING_POSITION')
             reject_feedback("EXISTING_POSITION")
             logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')}) [persistent mode]")
             return
@@ -19305,16 +20065,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     effective_et = global_paper_trader.exit_tightness * modifier
                     logger.info(f"⚡ COUNTER SIGNAL: {symbol} {action} (skor:{signal_score}) vs açık {existing_side} → exit_tightness {global_paper_trader.exit_tightness:.1f}→{effective_et:.1f} (x{modifier})")
             
-            signal_log_data['reject_reason'] = 'EXISTING_POSITION'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            hard_reject_signal('EXEC__EXISTING_POSITION', 'EXISTING_POSITION')
             reject_feedback("EXISTING_POSITION")
             logger.info(f"🚫 SKIPPING {symbol}: Already have position ({existing_position.get('side', 'UNKNOWN')})")
             return
     
     # Check max positions
     if len(global_paper_trader.positions) >= global_paper_trader.max_positions:
-        signal_log_data['reject_reason'] = 'MAX_POSITIONS'
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        rollback_signal_memory()
+        hard_reject_signal('EXEC__MAX_POSITIONS', 'MAX_POSITIONS')
         reject_feedback("MAX_POSITIONS")
         logger.info(f"🚫 SKIPPING {symbol}: Max positions reached ({len(global_paper_trader.positions)})")
         return
@@ -19339,8 +20098,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         )
         max_dir_exposure = global_paper_trader.balance * _DIRECTION_EXPOSURE_PCT
         if same_dir_margin >= max_dir_exposure:
-            signal_log_data['reject_reason'] = 'DIRECTION_EXPOSURE'
-            safe_create_task(sqlite_manager.save_signal(signal_log_data))
+            rollback_signal_memory()
+            hard_reject_signal(
+                'EXEC__DIRECTION_EXPOSURE',
+                'DIRECTION_EXPOSURE',
+                trace={'same_dir_margin': round(same_dir_margin, 4), 'max_dir_exposure': round(max_dir_exposure, 4)},
+            )
             reject_feedback("DIRECTION_EXPOSURE")
             logger.info(f"🚫 SKIPPING {symbol}: {signal_side} exposure ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of balance)")
             return
@@ -19371,8 +20134,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 f"positions={len(_cluster_positions)}"
             )
             if RMP_CLUSTER_CAP_MODE == 'enforce':
-                signal_log_data['reject_reason'] = 'CLUSTER_CAP'
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                rollback_signal_memory()
+                hard_reject_signal(
+                    'EXEC__CLUSTER_CAP',
+                    'CLUSTER_CAP',
+                    trace={'cluster': _cluster, 'cluster_margin': round(_cluster_margin, 4), 'new_margin': round(_new_margin, 4), 'cluster_cap': round(_cluster_cap, 4)},
+                )
                 reject_feedback("CLUSTER_CAP")
                 logger.warning(f"🚫 CLUSTER_CAP_BLOCK: {_cl_snap}")
                 return
@@ -19385,9 +20152,10 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
     # Check blacklist
     if global_paper_trader.is_coin_blacklisted(symbol):
+        rollback_signal_memory()
         signal_log_data['reject_reason'] = 'BLACKLISTED'
         signal_log_data['blacklisted'] = True
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
+        hard_reject_signal('EXEC__BLACKLISTED', 'BLACKLISTED')
         reject_feedback("BLACKLISTED")
         logger.info(f"🚫 SKIPPING {symbol}: Blacklisted")
         return
@@ -19424,8 +20192,12 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     f"composite={_composite:+.3f} → allowed with 50% penalty"
                 )
             else:
-                signal_log_data['reject_reason'] = f'BTC_FILTER:{btc_reason}'
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
+                rollback_signal_memory()
+                hard_reject_signal(
+                    'MACRO__BTC_FILTER_BLOCK',
+                    f'BTC_FILTER:{btc_reason}',
+                    trace={'btc_reason': btc_reason, 'composite_score': round(_composite, 4)},
+                )
                 reject_feedback(f"BTC_FILTER:{btc_reason}")
                 logger.info(f"🚫 BTC FILTER RED: {action} {symbol} - {btc_reason} (composite={_composite:+.3f})")
                 return
@@ -19734,30 +20506,46 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
                         logger.info(f"🛡️ RISK_GATE: {action} {symbol} THIN_BOOK→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg['reason_code']}")
                     else:
-                        signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                         signal_log_data['obi_value'] = round(obi_value, 4)
-                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                        global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
-                        global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
-                        reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
                         logger.info(
                             f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
                             f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                         )
-                        track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'THIN_BOOK', signal.get('atr', 0))
-                        return
+                        return reject_signal(
+                            'MICRO__THIN_BOOK_REJECT',
+                            f'THIN_BOOK:depth_${total_depth:.0f}',
+                            feedback_reason=f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}",
+                            trace={
+                                'depth_usd': round(total_depth, 4),
+                                'dynamic_depth_threshold': round(dynamic_depth_threshold, 4),
+                                'score': signal_score,
+                                'leverage': signal_leverage,
+                            },
+                            attribution_reason='THIN_BOOK',
+                            attribution_score=signal_score,
+                            metric_key='thin_book_rejected',
+                            hard_reject_count=True,
+                        )
                 else:
-                    signal_log_data['reject_reason'] = f'THIN_BOOK:depth_${total_depth:.0f}'
                     signal_log_data['obi_value'] = round(obi_value, 4)
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    global_paper_trader.pipeline_metrics['thin_book_rejected'] += 1
-                    reject_feedback(f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}")
                     logger.info(
                         f"📊 THIN_BOOK: {action} {symbol} | Depth=${total_depth:.0f} < ${dynamic_depth_threshold/1000:.0f}K "
                         f"(score={signal_score}, lev={signal_leverage}x) → BLOCKED"
                     )
-                    track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'THIN_BOOK', signal.get('atr', 0))
-                    return
+                    return reject_signal(
+                        'MICRO__THIN_BOOK_REJECT',
+                        f'THIN_BOOK:depth_${total_depth:.0f}',
+                        feedback_reason=f"THIN_BOOK:${total_depth:.0f}<${dynamic_depth_threshold:.0f}",
+                        trace={
+                            'depth_usd': round(total_depth, 4),
+                            'dynamic_depth_threshold': round(dynamic_depth_threshold, 4),
+                            'score': signal_score,
+                            'leverage': signal_leverage,
+                        },
+                        attribution_reason='THIN_BOOK',
+                        attribution_score=signal_score,
+                        metric_key='thin_book_rejected',
+                    )
             elif near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
                 if near_threshold_soft_pass:
@@ -19846,12 +20634,18 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 _adaptive_obi_veto = 0.80  # Low vol: OBI may be noise, relaxed
             if abs(obi_value) > _adaptive_obi_veto:
                 # Strong opposing pressure → VETO
-                signal_log_data['reject_reason'] = f'OBI_VETO:opposing_{obi_value:.3f}'
                 signal_log_data['obi_value'] = round(obi_value, 4)
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                reject_feedback(f"OBI_VETO:{obi_value:+.3f}")
                 logger.info(f"📊 OBI_VETO: {action} {symbol} | OBI={obi_value:+.3f} > {_adaptive_obi_veto:.2f} (vol24h=${_vol24h/1e6:.1f}M) | Opposing pressure → BLOCKED")
-                return
+                return reject_signal(
+                    'MICRO__OBI_VETO',
+                    f'OBI_VETO:opposing_{obi_value:.3f}',
+                    feedback_reason=f"OBI_VETO:{obi_value:+.3f}",
+                    trace={
+                        'obi_value': round(obi_value, 6),
+                        'adaptive_veto': round(_adaptive_obi_veto, 4),
+                        'volume24h': round(_vol24h, 4),
+                    },
+                )
             else:
                 # Moderate opposing pressure → Soft penalty (-15)
                 original_score = signal.get('confidenceScore', 60)
@@ -19911,20 +20705,24 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                             global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
                             logger.info(f"🛡️ RISK_GATE: {action} {symbol} OBI→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg_obi['reason_code']}")
                         else:
-                            signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
-                            safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                            global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
-                            reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
                             logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
-                            track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal.get('confidenceScore', 0), 'OBI_NEUTRAL_LOW_VOL', signal.get('atr', 0))
-                            return
+                            return reject_signal(
+                                'MICRO__OBI_NEUTRAL_LOW_VOL',
+                                f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}',
+                                feedback_reason=f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}",
+                                trace={'obi_value': round(obi_value, 6), 'volume_ratio': round(vol_ratio_val, 4)},
+                                attribution_reason='OBI_NEUTRAL_LOW_VOL',
+                                hard_reject_count=True,
+                            )
                     else:
-                        signal_log_data['reject_reason'] = f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}'
-                        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                        reject_feedback(f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}")
                         logger.info(f"📊 OBI_NEUTRAL_LOW_VOL: {action} {symbol} | OBI={obi_value:+.3f} vol_ratio={vol_ratio_val:.1f} → BLOCKED")
-                        track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal.get('confidenceScore', 0), 'OBI_NEUTRAL_LOW_VOL', signal.get('atr', 0))
-                        return
+                        return reject_signal(
+                            'MICRO__OBI_NEUTRAL_LOW_VOL',
+                            f'OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}',
+                            feedback_reason=f"OBI_NEUTRAL_LOW_VOL:obi={obi_value:.3f},vr={vol_ratio_val:.1f}",
+                            trace={'obi_value': round(obi_value, 6), 'volume_ratio': round(vol_ratio_val, 4)},
+                            attribution_reason='OBI_NEUTRAL_LOW_VOL',
+                        )
             logger.debug(f"📊 OBI_NEUTRAL: {action} {symbol} | OBI={obi_value:+.3f}")
         
     except Exception as obi_err:
@@ -19952,12 +20750,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             if _entry_regime == "TRENDING_DOWN" and action == "LONG":
                 long_penalty = regime_params.get('long_penalty', 0.5)
                 if long_penalty >= 0.5:
-                    signal_log_data['reject_reason'] = f'REGIME_BLOCKED:TRENDING_DOWN'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    reject_feedback("REGIME_BLOCKED:TRENDING_DOWN")
                     _regime_action = 'BLOCK'
                     logger.info(f"🚫 REGIME_ENTRY_DECISION: {action} {symbol} fast={_entry_regime} struct={_struct_regime} action=BLOCK")
-                    return
+                    return reject_signal(
+                        'MACRO__REGIME_BLOCKED',
+                        'REGIME_BLOCKED:TRENDING_DOWN',
+                        feedback_reason='REGIME_BLOCKED:TRENDING_DOWN',
+                        trace={'fast_regime': _entry_regime, 'struct_regime': _struct_regime},
+                    )
                 else:
                     original_score = signal.get('confidenceScore', 60)
                     penalty_amount = int(original_score * long_penalty)
@@ -20015,11 +20815,20 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     logger.warning(f"👻 DUAL_REGIME_SHADOW_MISS: {action} {symbol} align={_dca_align} reason={_dca_reason} | Would have blocked")
                 else:
                     # Enforce: reject signal
-                    signal_log_data['reject_reason'] = f'REGIME_CONFLICT_BLOCK:{_dca_reason}'
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    reject_feedback(f"REGIME_CONFLICT_BLOCK:{_dca_reason}")
                     logger.warning(f"🚫 DUAL_REGIME_BLOCK: {action} {symbol} align={_dca_align} fast={_entry_regime}({_entry_dir}) struct={_struct_regime}({_struct_dir}) reason={_dca_reason}")
-                    return
+                    return reject_signal(
+                        'MACRO__DCA_CONFLICT_BLOCK',
+                        f'REGIME_CONFLICT_BLOCK:{_dca_reason}',
+                        feedback_reason=f"REGIME_CONFLICT_BLOCK:{_dca_reason}",
+                        trace={
+                            'alignment': _dca_align,
+                            'reason': _dca_reason,
+                            'fast_regime': _entry_regime,
+                            'fast_dir': _entry_dir,
+                            'struct_regime': _struct_regime,
+                            'struct_dir': _struct_dir,
+                        },
+                    )
             else:
                 # Apply adjustments (score, size, leverage)
                 _pre_score = signal.get('confidenceScore', 60)
@@ -20152,11 +20961,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # ================================================================
     ma_vetoed, ma_veto_reason = check_ma_alignment_veto(symbol, action)
     if ma_vetoed:
-        signal_log_data['reject_reason'] = f"MA_ALIGNMENT_VETO:{ma_veto_reason}"
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-        reject_feedback(f"MA_ALIGNMENT_VETO:{ma_veto_reason}")
         logger.warning(f"🚫 MA_VETO: {action} {symbol} — {ma_veto_reason}")
-        return
+        return reject_signal(
+            'MACRO__MA_ALIGNMENT_VETO',
+            f"MA_ALIGNMENT_VETO:{ma_veto_reason}",
+            feedback_reason=f"MA_ALIGNMENT_VETO:{ma_veto_reason}",
+            trace={'reason': ma_veto_reason},
+        )
     
     # MULTI-TIMEFRAME CONFIRMATION CHECK
     # Verify signal aligns with higher timeframe (1h) trend
@@ -20266,25 +21077,40 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     global_paper_trader.pipeline_metrics['soft_pass_count'] += 1
                     logger.info(f"🛡️ RISK_GATE: {action} {symbol} MTF→SOFT_PASS score {_old_s}→{signal['confidenceScore']} {_rg_mtf['reason_code']}")
                 else:
-                    signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
-                    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                    global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
-                    global_paper_trader.pipeline_metrics['hard_reject_count'] += 1
-                    reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
                     logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
-                    track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'MTF_REJECTED', signal.get('atr', 0))
-                    return
+                    return reject_signal(
+                        'MACRO__MTF_REJECT',
+                        f"MTF_REJECTED:{mtf_result['reason']}",
+                        feedback_reason=f"MTF_REJECTED:{mtf_result['reason']}",
+                        trace={'mtf_score': mtf_result.get('mtf_score', 0), 'reason': mtf_result.get('reason', '')},
+                        attribution_reason='MTF_REJECTED',
+                        attribution_score=signal_score,
+                        metric_key='mtf_rejected',
+                        hard_reject_count=True,
+                    )
             else:
-                signal_log_data['reject_reason'] = f"MTF_REJECTED:{mtf_result['reason']}"
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
-                global_paper_trader.pipeline_metrics['mtf_rejected'] += 1
-                reject_feedback(f"MTF_REJECTED:{mtf_result['reason']}")
                 logger.info(f"🚫 MTF RED: {action} {symbol} (skor: {mtf_result.get('mtf_score', 0)}) - {mtf_result['reason']}")
-                track_reject_for_attribution(symbol, action, signal.get('entryPrice', signal.get('entry', 0)), signal_score, 'MTF_REJECTED', signal.get('atr', 0))
-                return
+                return reject_signal(
+                    'MACRO__MTF_REJECT',
+                    f"MTF_REJECTED:{mtf_result['reason']}",
+                    feedback_reason=f"MTF_REJECTED:{mtf_result['reason']}",
+                    trace={'mtf_score': mtf_result.get('mtf_score', 0), 'reason': mtf_result.get('reason', '')},
+                    attribution_reason='MTF_REJECTED',
+                    attribution_score=signal_score,
+                    metric_key='mtf_rejected',
+                )
     
     # Phase 127: Log MTF confirmation pass
     logger.info(f"✅ MTF_CONFIRMATION PASS: {symbol} {action} (score: {mtf_result.get('mtf_score', 0)})")
+    queue_pass_stage(
+        'MACRO__GATES_PASS',
+        SIGNAL_STAGE_MACRO,
+        trace={
+            'mtf_score': mtf_result.get('mtf_score', 0),
+            'htf_trend': mtf_result.get('htf_trend', 'NEUTRAL'),
+            'regime_adjustment': signal.get('regime_adjustment', ''),
+        },
+    )
     
     # Phase 237B: Entry Tradeability Score — BEFORE marking accepted
     if ENTRY_TRADEABILITY_ENABLED:
@@ -20304,12 +21130,14 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             signal['tradeabilityDecision'] = _td['decision']
             signal['tradeabilityReasons'] = _td['components']
             if _td['decision'] == 'REJECT':
-                global_paper_trader.pipeline_metrics['tradeability_reject_count'] += 1
-                signal_log_data['reject_reason'] = f"TRADEABILITY_REJECT:score={_td['score']}"
-                signal_log_data['accepted'] = False
-                safe_create_task(sqlite_manager.save_signal(signal_log_data))
                 logger.info(f"📉 TRADEABILITY: {action} {symbol} score={_td['score']} → REJECT (components={_td['components']})")
-                return  # Tradeability too low
+                return reject_signal(
+                    'MICRO__TRADEABILITY_REJECT',
+                    f"TRADEABILITY_REJECT:score={_td['score']}",
+                    feedback_reason=f"TRADEABILITY_REJECT:score={_td['score']}",
+                    trace={'tradeability_score': _td['score'], 'components': _td['components']},
+                    metric_key='tradeability_reject_count',
+                )
             elif _td['decision'] == 'SOFT_PASS' and SOFT_RISK_GATE_ENABLED:
                 _old_s = signal.get('confidenceScore', 60)
                 signal['confidenceScore'] = max(40, int(_old_s) - 4)
@@ -20320,11 +21148,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 logger.debug(f"📈 TRADEABILITY: {action} {symbol} score={_td['score']} → PASS")
         except Exception as _td_err:
             logger.debug(f"Tradeability error: {_td_err}")
-    
-    # Signal is ACCEPTED
-    signal_log_data['accepted'] = True
-    safe_create_task(sqlite_manager.save_signal(signal_log_data))
-    global_paper_trader.clear_execution_feedback(symbol)
+    queue_pass_stage(
+        'MICRO__GATES_PASS',
+        SIGNAL_STAGE_MICRO,
+        trace={
+            'tradeability_score': signal.get('tradeabilityScore', 0),
+            'tradeability_decision': signal.get('tradeabilityDecision', 'PASS'),
+            'obi_value': signal_log_data.get('obi_value', 0.0),
+        },
+    )
     
     # Log MTF score info
     mtf_score = mtf_result.get('mtf_score', 0)
@@ -20499,7 +21331,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             global_paper_trader.pipeline_metrics.setdefault('open_reject_reasons', {})
             global_paper_trader.pipeline_metrics['open_reject_reasons']['EV_HARD_BLOCK'] = \
                 global_paper_trader.pipeline_metrics['open_reject_reasons'].get('EV_HARD_BLOCK', 0) + 1
-            return  # reject signal entirely
+            return reject_signal(
+                'EXEC__EV_HARD_BLOCK',
+                f'EV_HARD_BLOCK:{_ev_val:.4f}',
+                feedback_reason=f"EV_HARD_BLOCK:{_ev_val:.4f}",
+                trace={'ev': round(float(_ev_val), 6), 'hard_threshold': EV_HARD_THRESHOLD},
+                metric_key='ev_hard_block',
+            )
         elif _ev_val < EV_SOFT_THRESHOLD:
             _old_score = signal.get('confidenceScore', 0)
             _new_score = _old_score * EV_SOFT_PENALTY_FACTOR
@@ -20516,16 +21354,36 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     final_signal_score = float(signal.get('confidenceScore', 0) or 0)
     min_signal_score = float(getattr(global_paper_trader, 'min_confidence_score', 74) or 74)
     if final_signal_score < min_signal_score:
-        signal_log_data['reject_reason'] = f'FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}<{min_signal_score:.1f}'
-        safe_create_task(sqlite_manager.save_signal(signal_log_data))
-        global_paper_trader.pipeline_metrics.setdefault('late_score_rejected', 0)
-        global_paper_trader.pipeline_metrics['late_score_rejected'] += 1
-        reject_feedback(f"FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}")
         logger.info(
             f"🚫 FINAL_SCORE_BELOW_MIN: {action} {symbol} score={final_signal_score:.1f} "
             f"< min={min_signal_score:.1f} after late penalties"
         )
-        return
+        return reject_signal(
+            'EXEC__FINAL_SCORE_BELOW_MIN',
+            f'FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}<{min_signal_score:.1f}',
+            feedback_reason=f"FINAL_SCORE_BELOW_MIN:{final_signal_score:.1f}",
+            trace={'final_signal_score': round(final_signal_score, 4), 'min_signal_score': round(min_signal_score, 4)},
+            metric_key='late_score_rejected',
+        )
+
+    upsert_executable_signal_memory(
+        symbol=symbol,
+        action=action,
+        score=final_signal_score,
+        price=price,
+        signal=signal,
+        existing_signal=active_signals.get(symbol),
+        now_ts=time.time(),
+    )
+    queue_pass_stage(
+        'EXEC__EXECUTABLE_SIGNAL',
+        SIGNAL_STAGE_EXECUTABLE,
+        trace={
+            'final_signal_score': round(final_signal_score, 4),
+            'min_signal_score': round(min_signal_score, 4),
+            'strategy_mode': signal.get('strategyMode', STRATEGY_MODE_LEGACY),
+        },
+    )
     
     # Execute trade
     global_paper_trader.pipeline_metrics.setdefault('signal_accepted', 0)
@@ -20535,6 +21393,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     global_paper_trader.pipeline_metrics.setdefault('open_reject_reasons', {})
     global_paper_trader.pipeline_metrics['signal_accepted'] += 1
     global_paper_trader.pipeline_metrics['open_attempted'] += 1
+    queue_pass_stage(
+        'OPEN__ATTEMPT',
+        SIGNAL_STAGE_OPEN_ATTEMPT,
+        trace={'attempt_price': price, 'atr': atr},
+    )
     pos = None  # FIX #6 Rev: prevent UnboundLocalError if try raises
     try:
         pos = await global_paper_trader.open_position(
@@ -20548,6 +21411,36 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             global_paper_trader.pipeline_metrics['open_created'] += 1
             trends = mtf_result.get('trends', {})
             logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
+            is_pending_entry = bool(pos.get('expiresAt') and not pos.get('openTime'))
+            if is_pending_entry:
+                queue_signal_state(
+                    stage=SIGNAL_STAGE_PENDING,
+                    decision='PASS',
+                    decision_code='PENDING__CREATED',
+                    pending_entry_id=str(pos.get('id', '') or ''),
+                    accepted=True,
+                    executable=True,
+                    is_pending=True,
+                    is_opened=False,
+                    score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                    score_after=final_signal_score,
+                    leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+                    leverage_after=signal.get('leverage', 0),
+                    size_mult=signal.get('sizeMultiplier', 1.0),
+                    trace={
+                        'pending_entry_id': pos.get('id', ''),
+                        'entry_price': pos.get('entryPrice', 0),
+                        'signal_price': pos.get('signalPrice', 0),
+                        'expires_at': pos.get('expiresAt', 0),
+                        'confirm_after': pos.get('confirmAfter', 0),
+                    },
+                )
+            else:
+                queue_pass_stage(
+                    'OPEN__FILLED',
+                    SIGNAL_STAGE_OPENED,
+                    trace={'position_id': pos.get('id', ''), 'fill_price': pos.get('entryPrice', price)},
+                )
         else:
             feedback = global_paper_trader.get_execution_feedback(symbol) or {}
             reject_reason = str(feedback.get('reason') or 'UNKNOWN')
@@ -20559,24 +21452,44 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             global_paper_trader.pipeline_metrics['open_reject_reasons'] = reject_map
             global_paper_trader.pipeline_metrics['open_rejected'] += 1
             logger.warning(f"🚫 OPEN_POS_REJECT: {symbol} {action} reason={reject_reason}")
-            if not signal_log_data.get('reject_reason'):
-                signal_log_data['reject_reason'] = f"OPEN_POS:{reject_reason}"
-                # Keep a single signal row in DB (accepted/rejected at signal gate).
-                # Open-position stage rejections are tracked in pipeline metrics/logs.
+            rollback_signal_memory()
+            queue_signal_state(
+                stage=SIGNAL_STAGE_HARD_REJECT,
+                decision='HARD_REJECT',
+                decision_code=f"OPEN__{reject_key}",
+                decision_detail=f"OPEN_POS:{reject_reason}",
+                reject_reason=f"OPEN_POS:{reject_reason}",
+                accepted=False,
+                executable=False,
+                is_pending=False,
+                is_opened=False,
+                score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                score_after=final_signal_score,
+                leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+                leverage_after=signal.get('leverage', 0),
+                size_mult=signal.get('sizeMultiplier', 1.0),
+                trace={'feedback_reason': reject_reason},
+            )
     except Exception as e:
         logger.error(f"Auto-trade execution error: {e}")
-        signal_log_data['reject_reason'] = f"OPEN_POS:EXCEPTION:{type(e).__name__}"
-    
-    # FIX #6 (Joint Audit): Finalize signal log with execution outcome
-    _sig_ts = signal_log_data.get('timestamp', 0)
-    if pos:
-        safe_create_task(sqlite_manager.update_signal_outcome(
-            symbol, _sig_ts, position_id=pos.get('id', '')
-        ))
-    elif signal_log_data.get('reject_reason'):
-        safe_create_task(sqlite_manager.update_signal_outcome(
-            symbol, _sig_ts, reject_reason=signal_log_data['reject_reason']
-        ))
+        rollback_signal_memory()
+        queue_signal_state(
+            stage=SIGNAL_STAGE_HARD_REJECT,
+            decision='HARD_REJECT',
+            decision_code='OPEN__EXCEPTION',
+            decision_detail=f"OPEN_POS:EXCEPTION:{type(e).__name__}",
+            reject_reason=f"OPEN_POS:EXCEPTION:{type(e).__name__}",
+            accepted=False,
+            executable=False,
+            is_pending=False,
+            is_opened=False,
+            score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+            score_after=final_signal_score,
+            leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+            leverage_after=signal.get('leverage', 0),
+            size_mult=signal.get('sizeMultiplier', 1.0),
+            trace={'exception': type(e).__name__},
+        )
 
 
 # ============================================================================
@@ -23446,12 +24359,14 @@ class TimeBasedPositionManager:
 
         live_success = True
         close_oid = ''
+        close_fee = 0.0
         if pos.get('isLive', False):
             try:
                 result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
                 if result:
                     pos['_partial_close_ts'] = datetime.now().timestamp()
                     close_oid = str(result.get('id', ''))
+                    close_fee = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
                     if close_oid:
                         safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
                 else:
@@ -23464,9 +24379,16 @@ class TimeBasedPositionManager:
 
         entry_price = float(pos.get('entryPrice', current_price) or current_price)
         if side == 'LONG':
-            pnl = (current_price - entry_price) * close_contracts
+            gross_pnl = (current_price - entry_price) * close_contracts
         else:
-            pnl = (entry_price - current_price) * close_contracts
+            gross_pnl = (entry_price - current_price) * close_contracts
+        cost_bundle = allocate_partial_realization_costs(
+            pos,
+            close_contracts=close_contracts,
+            current_contracts=contracts,
+            close_fee=close_fee,
+        )
+        pnl = gross_pnl - cost_bundle['total_fee'] + cost_bundle['funding_alloc']
         ratio = max(0.0, (contracts - close_contracts) / contracts) if contracts > 0 else 0.0
         released_margin = current_initial_margin * (1.0 - ratio)
         pos['contracts'] = max(0.0, contracts - close_contracts)
@@ -23495,6 +24417,8 @@ class TimeBasedPositionManager:
             "pnl": pnl,
             "pnlPercent": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
             "roi": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+            "fee_cost": cost_bundle['total_fee'],
+            "feesPaidUsd": cost_bundle['total_fee'],
             "openTime": pos.get('openTime', 0),
             "closeTime": int(datetime.now().timestamp() * 1000),
             "reason": reason,
@@ -23515,6 +24439,10 @@ class TimeBasedPositionManager:
                 "close_pct": close_pct,
                 "current_roi_pct": ((pnl / released_margin) * 100) if released_margin > 0 else 0.0,
                 "runner_context": pos.get('runnerContext', ''),
+                "gross_pnl": gross_pnl,
+                "entry_fee_alloc": cost_bundle['entry_fee_alloc'],
+                "close_fee": cost_bundle['close_fee'],
+                "funding_alloc": cost_bundle['funding_alloc'],
             },
         }
         paper_trader.trades.append(partial_trade)
@@ -24141,6 +25069,7 @@ class TimeBasedPositionManager:
                                     original_contracts = contracts
                                 close_contracts = original_contracts * level['close_pct']
                                 close_oid = ''
+                                close_fee = 0.0
                                 
                                 # LIVE positions: Execute actual Binance partial close
                                 if pos.get('isLive', False) and close_contracts > 0:
@@ -24152,6 +25081,7 @@ class TimeBasedPositionManager:
                                             # Phase 188: Set cooldown to prevent Binance sync from restoring old size
                                             pos['_partial_close_ts'] = datetime.now().timestamp()
                                             close_oid = str(result.get('id', ''))
+                                            close_fee = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
                                             logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at ROI {current_roi:.2f}% | Order: {close_oid[:12]}")
                                             # Phase 229b: Persist close order ID
                                             if close_oid:
@@ -24188,6 +25118,15 @@ class TimeBasedPositionManager:
                                 level_reason = f"{str(level['key']).upper()}_PARTIAL"
                                 released_margin = float(pos.get('original_initialMargin', pos.get('initialMargin', 0)) or 0) * float(level['close_pct'] or 0)
                                 price_profit_pct = ((current_price - entry_price) / entry_price * 100) if side == 'LONG' else ((entry_price - current_price) / entry_price * 100)
+                                gross_pnl = (current_price - entry_price) * close_contracts if side == 'LONG' else (entry_price - current_price) * close_contracts
+                                cost_bundle = allocate_partial_realization_costs(
+                                    pos,
+                                    close_contracts=close_contracts,
+                                    current_contracts=contracts,
+                                    close_fee=close_fee,
+                                )
+                                realized_pnl = gross_pnl - cost_bundle['total_fee'] + cost_bundle['funding_alloc']
+                                paper_trader.balance += released_margin + realized_pnl
                                 partial_trade = {
                                     "id": f"{pos.get('id', '')}_{level_reason}",
                                     "tradeId": f"{pos.get('tradeId', pos.get('id', ''))}_{level_reason}",
@@ -24203,9 +25142,11 @@ class TimeBasedPositionManager:
                                     "sizeUsd": close_contracts * current_price,
                                     "marginUsd": released_margin,
                                     "margin": released_margin,
-                                    "pnl": (current_price - entry_price) * close_contracts if side == 'LONG' else (entry_price - current_price) * close_contracts,
-                                    "pnlPercent": current_roi,
-                                    "roi": current_roi,
+                                    "pnl": realized_pnl,
+                                    "pnlPercent": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+                                    "roi": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+                                    "fee_cost": cost_bundle['total_fee'],
+                                    "feesPaidUsd": cost_bundle['total_fee'],
                                     "openTime": pos.get('openTime', 0),
                                     "closeTime": int(datetime.now().timestamp() * 1000),
                                     "reason": level_reason,
@@ -24226,8 +25167,12 @@ class TimeBasedPositionManager:
                                         "tp_roi_pct": level_roi,
                                         "tp_price": level.get('price', 0),
                                         "close_pct": level['close_pct'],
-                                        "current_roi_pct": current_roi,
+                                        "current_roi_pct": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
                                         "price_profit_pct": round(price_profit_pct, 4),
+                                        "gross_pnl": gross_pnl,
+                                        "entry_fee_alloc": cost_bundle['entry_fee_alloc'],
+                                        "close_fee": cost_bundle['close_fee'],
+                                        "funding_alloc": cost_bundle['funding_alloc'],
                                     },
                                 }
                                 paper_trader.trades.append(partial_trade)
@@ -28903,8 +29848,8 @@ class SignalGenerator:
         # Log signal direction determination
         logger.debug(f"Phase 108: {symbol} H={hurst:.2f} Z={zscore:.2f} → {signal_side}")
             
-        # Layer 2: Order Book Imbalance (Confirmation) - Max 20 pts
-        # Graduated scoring based on imbalance strength
+        # Layer 2: Order Book Imbalance (Execution Context)
+        # Raw alpha score'a yazmayız; micro/executability gate bunu daha sonra kullanır.
         ob_aligned = False
         ob_score = 0
         if signal_side == "LONG" and imbalance > 0:
@@ -28915,9 +29860,8 @@ class SignalGenerator:
             elif imbalance >= 2:
                 ob_score = 10  # Moderate buying pressure
             if ob_score > 0:
-                score += ob_score
                 ob_aligned = True
-                reasons.append(f"OB(+{imbalance:.1f}%={ob_score}p)")
+                reasons.append(f"OB_CTX(+{imbalance:.1f}%)")
         elif signal_side == "SHORT" and imbalance < 0:
             if imbalance <= -10:
                 ob_score = 20  # Strong selling pressure
@@ -28926,9 +29870,8 @@ class SignalGenerator:
             elif imbalance <= -2:
                 ob_score = 10  # Moderate selling pressure
             if ob_score > 0:
-                score += ob_score
                 ob_aligned = True
-                reasons.append(f"OB({imbalance:.1f}%={ob_score}p)")
+                reasons.append(f"OB_CTX({imbalance:.1f}%)")
             
         # Layer 3: VWAP Z-Score (Mean Reversion Check) - Max 20 pts
         # RELAXED: 1.0 -> 0.7 threshold for easier confirmation
@@ -28950,30 +29893,24 @@ class SignalGenerator:
         # Observability: sadece log, skor etkisi yok
         reasons.append(f"D1({coin_daily_trend})")
         
-        # Layer 5: Liquidation Cascade (Bonus) - Max 15 pts
-        # Uses real-time liquidation stream from Binance
+        # Layer 5: Liquidation Cascade (Macro event context)
+        # Event overlay olarak tutulur; primary raw alpha puanı değildir.
         liq_score, liq_reason = liquidation_tracker.get_cascade_score(symbol if symbol else 'BTCUSDT', signal_side)
         if liq_score > 0:
-            score += liq_score
-            reasons.append(liq_reason)
+            reasons.append(f"LIQ_CTX({liq_reason})")
 
-        # Layer 6: Spot-Futures Basis (Sentiment) - Max 10 pts
-        # Contango (Basis > 0) favors Longs, Backwardation favors Shorts
-        # Threshold: 0.02% (2 bps)
+        # Layer 6: Spot-Futures Basis (BTC macro context)
+        # Altcoin raw alpha'sına BTC basis enjekte edilmez.
         if signal_side == "LONG" and basis_pct > 0.02:
-            score += 10
-            reasons.append(f"Basis(+{basis_pct:.2f}%)")
+            reasons.append(f"BTC_PREM_CTX(+{basis_pct:.2f}%)")
         elif signal_side == "SHORT" and basis_pct < -0.02:
-            score += 10
-            reasons.append(f"Basis({basis_pct:.2f}%)")
+            reasons.append(f"BTC_PREM_CTX({basis_pct:.2f}%)")
 
-        # Layer 7: Whale Sentiment (Real-Time AggTrades) - Max 15 pts
+        # Layer 7: Whale Sentiment (Observability only)
         if signal_side == "LONG" and whale_zscore > 2.0:
-            score += 15
-            reasons.append(f"WhaleBuy(Z:{whale_zscore:.1f})")
+            reasons.append(f"WHALE_CTX_BUY(Z:{whale_zscore:.1f})")
         elif signal_side == "SHORT" and whale_zscore < -2.0:
-            score += 15
-            reasons.append(f"WhaleSell(Z:{whale_zscore:.1f})")
+            reasons.append(f"WHALE_CTX_SELL(Z:{whale_zscore:.1f})")
 
         # Layer 8: SMC Fair Value Gaps (Magnets/Filters) - Max +/- 20 pts
         # Layer 8: SMC Fair Value Gaps and Order Blocks (Phase 208) - Max +/- 30 pts
@@ -29079,32 +30016,24 @@ class SignalGenerator:
         # =====================================================================
         if abs(ob_imbalance_trend) > 2.0:
             if signal_side == "LONG" and ob_imbalance_trend > 2.0:
-                ib_bonus = 8 if ob_imbalance_trend > 5.0 else 5
-                score += ib_bonus
-                reasons.append(f"IB_TREND(+{ob_imbalance_trend:.1f})+{ib_bonus}")
+                reasons.append(f"IB_CTX(+{ob_imbalance_trend:.1f})")
             elif signal_side == "SHORT" and ob_imbalance_trend < -2.0:
-                ib_bonus = 8 if ob_imbalance_trend < -5.0 else 5
-                score += ib_bonus
-                reasons.append(f"IB_TREND({ob_imbalance_trend:.1f})+{ib_bonus}")
+                reasons.append(f"IB_CTX({ob_imbalance_trend:.1f})")
             elif signal_side == "LONG" and ob_imbalance_trend < -5.0:
-                score -= 5
-                reasons.append(f"IB_CONTRA({ob_imbalance_trend:.1f})-5")
+                reasons.append(f"IB_CONTRA_CTX({ob_imbalance_trend:.1f})")
             elif signal_side == "SHORT" and ob_imbalance_trend > 5.0:
-                score -= 5
-                reasons.append(f"IB_CONTRA({ob_imbalance_trend:.1f})-5")
+                reasons.append(f"IB_CONTRA_CTX({ob_imbalance_trend:.1f})")
         
         # =====================================================================
-        # PHASE 157: LAYER 17 — FUNDING RATE CONTRARIAN SCORING
-        # Funding rate'e göre contrarian bonus/penalty/veto
+        # PHASE 157: LAYER 17 — FUNDING RATE CROWDING CONTEXT
+        # Funding primary alpha değildir; crowding/carry observability olarak tutulur.
         # =====================================================================
         if funding_rate != 0:
             fr_adj, fr_reason, fr_veto = funding_oi_tracker.get_funding_signal(symbol, signal_side)
             if fr_veto:
-                logger.info(f"🚫 FUNDING_VETO: {symbol} {signal_side} — {fr_reason}")
-                return None
-            if fr_adj != 0:
-                score += fr_adj
-                reasons.append(f"{fr_reason}{'+' if fr_adj > 0 else ''}{fr_adj}")
+                reasons.append(f"FUNDING_CTX_VETO({fr_reason})")
+            elif fr_adj != 0:
+                reasons.append(f"FUNDING_CTX({fr_reason}{'+' if fr_adj > 0 else ''}{fr_adj})")
         
         # =====================================================================
         # PHASE 157: LAYER 18 — TRADE PATTERN PENALTY/BONUS
@@ -29450,7 +30379,7 @@ class SignalGenerator:
         # Phase 137 DEBUG: Trace log to confirm signals reach this point
         # Phase 245: Cost-aware min score bump — high-cost trades need higher conviction
         try:
-            _cost_spread = float(spread_pct) if 'spread_pct' in dir() else 0.05
+            _cost_spread = float(spread_pct if spread_pct is not None else 0.05)
             _cost_info = estimate_trade_cost(_cost_spread, leverage)
             if _cost_info['total_pct'] > 0.20:  # High-cost trade
                 cost_score_bump = int((_cost_info['total_pct'] - 0.15) * 50)  # +2.5 per 0.05% extra
@@ -30139,10 +31068,19 @@ class SignalGenerator:
         _structural_zone_dict = {}
         _fallback_stage = ''
         if _exec_profile.exec_style_enabled and RFX3_EXEC_STYLE_ENABLED:
-            _regime_for_style = regime_label if 'regime_label' in dir() else 'RANGING'
-            _structure_for_style = smc_structure if 'smc_structure' in dir() else 'NONE'
-            _hurst_for_style = hurst if 'hurst' in dir() else 0.5
-            _zscore_for_style = z_score if 'z_score' in dir() else 0.0
+            _regime_for_style = str(market_regime or 'RANGING').upper()
+            _structure_for_style = 'NONE'
+            if smc_data:
+                if smc_data.get('ob_bullish') or smc_data.get('ob_bearish'):
+                    _structure_for_style = 'ORDER_BLOCK'
+                elif smc_data.get('fvg_bullish') or smc_data.get('fvg_bearish'):
+                    _structure_for_style = 'FVG'
+                elif smc_data.get('fvgs'):
+                    _structure_for_style = 'STRUCTURAL'
+            _hurst_for_style = float(hurst or 0.5)
+            _zscore_for_style = float(zscore or 0.0)
+            _tick_size_for_style = get_tick_size(symbol) if symbol else 0.0
+            _spread_for_style = float(spread_pct or 0.0)
             _exec_style = classify_execution_style(
                 regime=_regime_for_style,
                 structure=_structure_for_style,
@@ -30160,9 +31098,9 @@ class SignalGenerator:
                 fvgs=_fvgs_for_zone,
                 price=price,
                 side=signal_side,
-                atr=atr if 'atr' in dir() else 0,
-                tick_size=tick_size if 'tick_size' in dir() else 0,
-                spread=spread_actual if 'spread_actual' in dir() else 0,
+                atr=float(atr or 0),
+                tick_size=_tick_size_for_style,
+                spread=_spread_for_style,
             )
             if _structural_zone:
                 _structural_zone_dict = _structural_zone.to_dict()
@@ -30211,6 +31149,13 @@ class SignalGenerator:
             'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
             'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
             'spreadLevel': spread_params['level'],
+            'btcMacroPremiumPct': round(float(basis_pct or 0.0), 6),
+            'symbolPremiumPct': round(float(basis_pct or 0.0), 6) if symbol == 'BTCUSDT' else 0.0,
+            'orderBookContextImbalance': round(float(imbalance or 0.0), 4),
+            'orderBookContextTrend': round(float(ob_imbalance_trend or 0.0), 4),
+            'liquidationContextScore': round(float(liq_score or 0.0), 4),
+            'whaleContextZScore': round(float(whale_zscore or 0.0), 4),
+            'fundingContextRate': round(float(funding_rate or 0.0), 6),
             # RFX-3A: Execution style telemetry
             'execution_style': _exec_style,
             'structural_zone': _structural_zone_dict,
@@ -32744,6 +33689,81 @@ class PaperTradingEngine:
         STALE_GRACE_MIN = 5
         STALE_PENALTY_PER_MIN = 1
         STALE_MIN_SCORE_BUFFER = 5
+
+        def _queue_pending_signal_state(
+            order: dict,
+            *,
+            stage: str,
+            decision: str,
+            decision_code: str,
+            decision_detail: str = '',
+            accepted: bool = True,
+            executable: bool = True,
+            is_pending: bool = False,
+            is_opened: bool = False,
+            trace: Optional[dict] = None,
+        ):
+            signal_id = str(order.get('signalId') or '')
+            if not signal_id:
+                return
+            event_payload = build_signal_event_payload(
+                {
+                    'signal_id': signal_id,
+                    'signalId': signal_id,
+                    'symbol': order.get('symbol', ''),
+                    'action': order.get('side', 'NONE'),
+                    'timestamp': current_time,
+                    'signal_score': order.get('signalScore', 0),
+                    'signal_score_raw': order.get('signalScoreRaw', order.get('signalScore', 0)),
+                },
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                pending_entry_id=str(order.get('id', '') or ''),
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                score_before=order.get('signalScoreRaw', order.get('signalScore', 0)),
+                score_after=order.get('recheckScore', order.get('signalScore', 0)),
+                leverage_before=order.get('signalLeverageRaw', order.get('leverage', 0)),
+                leverage_after=order.get('leverage', 0),
+                size_mult=order.get('sizeMultiplier', 1.0),
+                trace=trace,
+            )
+            record_signal_event_memory(event_payload)
+            symbol = str(order.get('symbol') or '')
+            if stage in (SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK):
+                set_signal_memory_state(
+                    symbol,
+                    stage=stage,
+                    signal_id=signal_id,
+                    pending_entry_id=str(order.get('id', '') or ''),
+                    score=order.get('recheckScore', order.get('signalScore', 0)),
+                    last_price=order.get('entryPrice', 0),
+                )
+            elif stage in (SIGNAL_STAGE_PENDING_CANCELLED, SIGNAL_STAGE_EXPIRED, SIGNAL_STAGE_HARD_REJECT):
+                drop_signal_memory(
+                    symbol,
+                    signal_id=signal_id,
+                    allowed_states=SIGNAL_PENDING_STATES.union({SIGNAL_STAGE_OPEN_ATTEMPT}),
+                )
+            safe_create_task(sqlite_manager.update_signal_decision(
+                signal_id,
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                reject_reason=decision_detail if decision != 'PASS' else '',
+                pending_entry_id=str(order.get('id', '') or '') if is_pending else '',
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                decision_trace=trace or {},
+            ))
+            safe_create_task(sqlite_manager.save_signal_event(event_payload))
         
         for order in list(self.pending_orders):
             symbol = order.get('symbol', '')
@@ -32759,7 +33779,7 @@ class PaperTradingEngine:
                     current_price = opp.get('price', 0)
                     break
             
-            signal_score = order.get('signalScore', 0)
+            signal_score = float(order.get('recheckScore', order.get('signalScore', 0)) or order.get('signalScore', 0))
             is_confirmed = order.get('confirmed', False)
             forecast_prob = order.get('forecastProb', 0.5)
             
@@ -32792,6 +33812,17 @@ class PaperTradingEngine:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics['pending_expired'] += 1
                 self.set_pending_execution_feedback(order, "PENDING_EXPIRED")
+                _queue_pending_signal_state(
+                    order,
+                    stage=SIGNAL_STAGE_EXPIRED,
+                    decision='HARD_REJECT',
+                    decision_code='PENDING__EXPIRED',
+                    decision_detail='PENDING_EXPIRED',
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace={'entry_price': entry_price, 'expires_at': expires_at},
+                )
                 self.add_log(f"⏰ PENDING EXPIRED: {side} {symbol} @ ${entry_price:.4f} (30dk timeout)")
                 logger.info(f"Pending order expired: {order['id']}")
                 self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'timeout', current_time)
@@ -32817,10 +33848,51 @@ class PaperTradingEngine:
                 original_score = order.get('signalScore', 70)
                 stale_floor = max(40, self.min_confidence_score - STALE_MIN_SCORE_BUFFER - min(8, reinforced_count * 2))
                 adjusted_score = max(stale_floor, original_score - stale_penalty)
+                previous_recheck_score = float(order.get('recheckScore', original_score) or original_score)
+                order['recheckScore'] = adjusted_score
+                order['recheckDecision'] = 'PENDING__STALE_SCORE_DROP'
+                order['recheckReasons'] = [
+                    f"age={pending_age_min:.1f}m",
+                    f"score:{original_score:.0f}->{adjusted_score:.0f}",
+                    f"reinforce={reinforced_count}",
+                ]
+                signal_score = adjusted_score
+                if adjusted_score != previous_recheck_score:
+                    _queue_pending_signal_state(
+                        order,
+                        stage=SIGNAL_STAGE_PENDING_RECHECK,
+                        decision='WAIT',
+                        decision_code='PENDING__STALE_SCORE_DROP',
+                        decision_detail=f"PENDING__STALE_SCORE_DROP:{adjusted_score:.1f}",
+                        accepted=True,
+                        executable=True,
+                        is_pending=True,
+                        trace={
+                            'age_min': round(pending_age_min, 3),
+                            'original_score': round(original_score, 3),
+                            'adjusted_score': round(adjusted_score, 3),
+                            'reinforced_count': reinforced_count,
+                        },
+                    )
                 if pending_age_min > (stale_threshold_min + stale_grace_min) and adjusted_score < self.min_confidence_score:
                     self.pending_orders.remove(order)
                     self.pipeline_metrics['stale_dropped'] += 1
                     self.set_pending_execution_feedback(order, "STALE_SIGNAL")
+                    _queue_pending_signal_state(
+                        order,
+                        stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                        decision='HARD_REJECT',
+                        decision_code='PENDING__STALE_SIGNAL',
+                        decision_detail='STALE_SIGNAL',
+                        accepted=True,
+                        executable=True,
+                        is_pending=False,
+                        trace={
+                            'age_min': round(pending_age_min, 3),
+                            'adjusted_score': round(adjusted_score, 3),
+                            'min_confidence_score': self.min_confidence_score,
+                        },
+                    )
                     self.add_log(f"⏳ STALE_SIGNAL: {side} {symbol} removed (score {original_score}→{adjusted_score} < min {self.min_confidence_score}, age={pending_age_min:.0f}min)")
                     logger.info(
                         f"⏳ STALE_SIGNAL: {order['id']} removed (age={pending_age_min:.0f}min, "
@@ -32840,6 +33912,21 @@ class PaperTradingEngine:
                 self.pipeline_metrics.setdefault('low_score_pending_dropped', 0)
                 self.pipeline_metrics['low_score_pending_dropped'] += 1
                 self.set_pending_execution_feedback(order, "PENDING_SCORE_BELOW_MIN")
+                _queue_pending_signal_state(
+                    order,
+                    stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                    decision='HARD_REJECT',
+                    decision_code='PENDING__SCORE_BELOW_MIN',
+                    decision_detail='PENDING_SCORE_BELOW_MIN',
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace={
+                        'score': round(signal_score, 3),
+                        'score_floor': round(score_floor, 3),
+                        'age_min': round(pending_age_min, 3),
+                    },
+                )
                 self.add_log(
                     f"🧹 PENDING_SCORE_DROP: {side} {symbol} "
                     f"score={signal_score:.0f} < min={score_floor:.0f} (age={pending_age_min:.0f}m)"
@@ -32864,7 +33951,7 @@ class PaperTradingEngine:
             if not is_confirmed:
                 if current_time < confirm_after:
                     # Henüz konfirmasyon süresi dolmadı - fiyat hala doğru yönde mi kontrol et
-                    signal_price = order.get('signalPrice', entry_price)
+                    signal_price = entry_price or order.get('entryPrice', order.get('signalPrice', 0))
                     
                     # FIX #3: Signal Invalidation Logic Corrected
                     # LONG sinyal: Eğer fiyat ÇOK FAZLA DÜŞTÜYSE (entry'i geçip gitti), sinyal geçersiz
@@ -32878,6 +33965,17 @@ class PaperTradingEngine:
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
                             self.set_pending_execution_feedback(order, "SIGNAL_MISSED")
+                            _queue_pending_signal_state(
+                                order,
+                                stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                                decision='HARD_REJECT',
+                                decision_code='PENDING__SIGNAL_MISSED_ENTRY',
+                                decision_detail='SIGNAL_MISSED',
+                                accepted=True,
+                                executable=True,
+                                is_pending=False,
+                                trace={'entry_price': signal_price, 'current_price': current_price, 'price_drop_pct': round(price_drop_pct, 4)},
+                            )
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (-{price_drop_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price dropped too far below entry")
                             self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
@@ -32889,6 +33987,17 @@ class PaperTradingEngine:
                             self.pending_orders.remove(order)
                             self.pipeline_metrics['signal_missed'] += 1
                             self.set_pending_execution_feedback(order, "SIGNAL_MISSED")
+                            _queue_pending_signal_state(
+                                order,
+                                stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                                decision='HARD_REJECT',
+                                decision_code='PENDING__SIGNAL_MISSED_ENTRY',
+                                decision_detail='SIGNAL_MISSED',
+                                accepted=True,
+                                executable=True,
+                                is_pending=False,
+                                trace={'entry_price': signal_price, 'current_price': current_price, 'price_rise_pct': round(price_rise_pct, 4)},
+                            )
                             self.add_log(f"❌ SIGNAL MISSED: {side} {symbol} - fiyat entry'den çok uzaklaştı (+{price_rise_pct:.1f}%)")
                             logger.info(f"Signal missed: {order['id']} - price rose too far above entry")
                             self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'signal_missed', current_time)
@@ -33536,6 +34645,89 @@ class PaperTradingEngine:
                 f"⏳ PENDING_REQUEUE: {order.get('side','')} {order.get('symbol','')} "
                 f"reason={reason} wait_ms={effective_wait_ms}"
             )
+
+        def _queue_order_signal_state(
+            *,
+            stage: str,
+            decision: str,
+            decision_code: str,
+            decision_detail: str = '',
+            accepted: bool = True,
+            executable: bool = True,
+            is_pending: bool = False,
+            is_opened: bool = False,
+            trace: Optional[dict] = None,
+        ):
+            signal_id = str(order.get('signalId') or '')
+            if not signal_id:
+                return
+            event_payload = build_signal_event_payload(
+                {
+                    'signal_id': signal_id,
+                    'signalId': signal_id,
+                    'symbol': order.get('symbol', ''),
+                    'action': order.get('side', 'NONE'),
+                    'timestamp': now_ms,
+                    'signal_score': order.get('signalScore', 0),
+                    'signal_score_raw': order.get('signalScoreRaw', order.get('signalScore', 0)),
+                },
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                pending_entry_id=str(order.get('id', '') or '') if is_pending else '',
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                score_before=order.get('signalScoreRaw', order.get('signalScore', 0)),
+                score_after=order.get('recheckScore', order.get('signalScore', 0)),
+                leverage_before=order.get('signalLeverageRaw', order.get('leverage', 0)),
+                leverage_after=order.get('leverage', 0),
+                size_mult=order.get('sizeMultiplier', 1.0),
+                trace=trace,
+            )
+            record_signal_event_memory(event_payload)
+            symbol = str(order.get('symbol') or '')
+            if stage in (SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK):
+                set_signal_memory_state(
+                    symbol,
+                    stage=stage,
+                    signal_id=signal_id,
+                    pending_entry_id=str(order.get('id', '') or ''),
+                    score=order.get('recheckScore', order.get('signalScore', 0)),
+                    last_price=fill_price if fill_price > 0 else order.get('entryPrice', 0),
+                )
+            elif stage == SIGNAL_STAGE_OPENED:
+                set_signal_memory_state(
+                    symbol,
+                    stage=SIGNAL_STAGE_OPENED,
+                    signal_id=signal_id,
+                    pending_entry_id='',
+                    score=order.get('recheckScore', order.get('signalScore', 0)),
+                    last_price=fill_price if fill_price > 0 else order.get('entryPrice', 0),
+                )
+            elif stage in (SIGNAL_STAGE_PENDING_CANCELLED, SIGNAL_STAGE_EXPIRED, SIGNAL_STAGE_HARD_REJECT):
+                drop_signal_memory(
+                    symbol,
+                    signal_id=signal_id,
+                    allowed_states=SIGNAL_PENDING_STATES.union({SIGNAL_STAGE_OPEN_ATTEMPT}),
+                )
+            safe_create_task(sqlite_manager.update_signal_decision(
+                signal_id,
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                reject_reason=decision_detail if decision != 'PASS' else '',
+                pending_entry_id=str(order.get('id', '') or '') if is_pending else '',
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                decision_trace=trace or {},
+            ))
+            safe_create_task(sqlite_manager.save_signal_event(event_payload))
         
         # Phase 55: Check if already have position in this coin
         symbol = order.get('symbol', '')
@@ -33544,6 +34736,16 @@ class PaperTradingEngine:
         if existing_position:
             self.add_log(f"⚠️ {symbol}'de zaten pozisyon var, yeni order iptal edildi")
             logger.info(f"⚠️ SKIP ORDER: {symbol} already has open position")
+            _queue_order_signal_state(
+                stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                decision='HARD_REJECT',
+                decision_code='PENDING__DUPLICATE_POSITION',
+                decision_detail='duplicate_position',
+                accepted=True,
+                executable=True,
+                is_pending=False,
+                trace={'existing_position_id': existing_position.get('id', '')},
+            )
             # P1 fix: label as cancelled, not filled (no real position was created)
             self._finalize_forecast_event(
                 order.get('id', ''), 'CANCELLED', 0, 'duplicate_position',
@@ -33721,12 +34923,15 @@ class PaperTradingEngine:
             self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_TOO_WIDE'] = (
                 self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_TOO_WIDE', 0) + 1
             )
-            safe_create_task(
-                sqlite_manager.update_signal_outcome(
-                    symbol,
-                    int(order.get('createdAt', now_ms) or now_ms),
-                    reject_reason='ENTRY_STOP_TOO_WIDE',
-                )
+            _queue_order_signal_state(
+                stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                decision='HARD_REJECT',
+                decision_code='EXEC__ENTRY_STOP_TOO_WIDE',
+                decision_detail='ENTRY_STOP_TOO_WIDE',
+                accepted=True,
+                executable=True,
+                is_pending=False,
+                trace={'planned_stop_roi_pct': planned_stop_roi_pct, 'hard_band': entry_stop_hard_roi_pct},
             )
             self._finalize_forecast_event(
                 order.get('id', ''),
@@ -33758,12 +34963,18 @@ class PaperTradingEngine:
                 self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_WIDE_SCORE_LOW'] = (
                     self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_WIDE_SCORE_LOW', 0) + 1
                 )
-                safe_create_task(
-                    sqlite_manager.update_signal_outcome(
-                        symbol,
-                        int(order.get('createdAt', now_ms) or now_ms),
-                        reject_reason='ENTRY_STOP_WIDE_SCORE_LOW',
-                    )
+                _queue_order_signal_state(
+                    stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                    decision='HARD_REJECT',
+                    decision_code='EXEC__ENTRY_STOP_WIDE_SCORE_LOW',
+                    decision_detail='ENTRY_STOP_WIDE_SCORE_LOW',
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace={
+                        'candidate_signal_score': candidate_signal_score,
+                        'tightened_score_floor': tightened_score_floor,
+                    },
                 )
                 self._finalize_forecast_event(
                     order.get('id', ''),
@@ -33790,12 +35001,18 @@ class PaperTradingEngine:
                 self.pipeline_metrics['open_reject_reasons']['ENTRY_STOP_WIDE_EXEC_LOW'] = (
                     self.pipeline_metrics['open_reject_reasons'].get('ENTRY_STOP_WIDE_EXEC_LOW', 0) + 1
                 )
-                safe_create_task(
-                    sqlite_manager.update_signal_outcome(
-                        symbol,
-                        int(order.get('createdAt', now_ms) or now_ms),
-                        reject_reason='ENTRY_STOP_WIDE_EXEC_LOW',
-                    )
+                _queue_order_signal_state(
+                    stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                    decision='HARD_REJECT',
+                    decision_code='EXEC__ENTRY_STOP_WIDE_EXEC_LOW',
+                    decision_detail='ENTRY_STOP_WIDE_EXEC_LOW',
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace={
+                        'candidate_exec_score': candidate_exec_score,
+                        'tightened_exec_floor': tightened_exec_floor,
+                    },
                 )
                 self._finalize_forecast_event(
                     order.get('id', ''),
@@ -34233,6 +35450,8 @@ class PaperTradingEngine:
                     new_position['entry_method'] = result.get('entry_method', 'MARKET')
                     new_position['entry_slippage'] = result.get('slippage_pct', 0)
                     new_position['entry_spread'] = result.get('spread_pct', 0)
+                    new_position['entryFeePaidUsd'] = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
+                    new_position['entryFeeSource'] = result.get('fee_source', 'unknown')
                     logger.info(f"✅ BINANCE ORDER SUCCESS: {result.get('id')} | method={result.get('entry_method', 'MARKET')} | slippage={fill_slippage:.3f}%")
                     
                     # Phase 186: Update entryPrice + SL/TP if actual fill differs
@@ -34353,6 +35572,8 @@ class PaperTradingEngine:
                     new_position['entry_method'] = 'MARKET_FALLBACK'
                     new_position['entry_slippage'] = result.get('slippage_pct', 0)
                     new_position['entry_spread'] = result.get('spread_pct', 0)
+                    new_position['entryFeePaidUsd'] = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
+                    new_position['entryFeeSource'] = result.get('fee_source', 'unknown')
                     logger.info(f"✅ FORCE MARKET SUCCESS: {result.get('id')} | slippage={abs(result.get('slippage_pct', 0)):.3f}%")
                     # Recalculate SL/TP with actual fill via unified helper
                     if abs(actual_fill - fill_price) / fill_price > 0.001:
@@ -34580,6 +35801,22 @@ class PaperTradingEngine:
             'market_fallback' if force_market else 'limit_fill',
             int(datetime.now().timestamp() * 1000),
             fill_price=fill_price, force_market=_efe_force
+        )
+        _queue_order_signal_state(
+            stage=SIGNAL_STAGE_OPENED,
+            decision='PASS',
+            decision_code='OPEN__MARKET_FALLBACK_FILLED' if force_market else 'OPEN__FILLED',
+            decision_detail='MARKET_FALLBACK_FILLED' if force_market else 'FILLED',
+            accepted=True,
+            executable=True,
+            is_pending=False,
+            is_opened=True,
+            trace={
+                'fill_price': fill_price,
+                'position_id': new_position.get('id', ''),
+                'force_market': bool(force_market),
+                'entry_stop_gate_mode': order.get('entryStopGateMode', 'normal'),
+            },
         )
         
         # Calculate how much better than signal price we got
@@ -38007,10 +39244,280 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 # Phase 252: Active signal lifecycle tracking
 # Signals persist until invalidated by confirmed counter-signal
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
+signal_event_buffer = deque(maxlen=2000)
+
+SIGNAL_STAGE_RAW = 'RAW_GENERATED'
+SIGNAL_STAGE_PRECHECK = 'PRECHECK'
+SIGNAL_STAGE_SCORED = 'SCORED'
+SIGNAL_STAGE_MACRO = 'MACRO_GATED'
+SIGNAL_STAGE_MICRO = 'MICRO_GATED'
+SIGNAL_STAGE_EXECUTABLE = 'EXECUTABLE'
+SIGNAL_STAGE_PENDING = 'PENDING_CREATED'
+SIGNAL_STAGE_PENDING_RECHECK = 'PENDING_RECHECK'
+SIGNAL_STAGE_PENDING_CANCELLED = 'PENDING_CANCELLED'
+SIGNAL_STAGE_OPEN_ATTEMPT = 'OPEN_ATTEMPT'
+SIGNAL_STAGE_OPENED = 'OPENED'
+SIGNAL_STAGE_HARD_REJECT = 'HARD_REJECT'
+SIGNAL_STAGE_SUPERSEDED = 'SUPERSEDED'
+SIGNAL_STAGE_EXPIRED = 'EXPIRED'
+
+SIGNAL_EXECUTABLE_STATES = {'ACTIVE', SIGNAL_STAGE_EXECUTABLE}
+SIGNAL_PENDING_STATES = {SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK}
+SIGNAL_OPEN_STATES = {SIGNAL_STAGE_OPEN_ATTEMPT, SIGNAL_STAGE_OPENED}
+
+
+def is_executable_signal_state(state: Any) -> bool:
+    return str(state or '') in SIGNAL_EXECUTABLE_STATES
+
+
+def is_pending_signal_state(state: Any) -> bool:
+    return str(state or '') in SIGNAL_PENDING_STATES
+
+
+def is_opened_signal_state(state: Any) -> bool:
+    return str(state or '') in SIGNAL_OPEN_STATES
+
+
+def _signal_memory_matches(signal_state: Optional[dict], signal_id: str = '') -> bool:
+    if not signal_state:
+        return False
+    if not signal_id:
+        return True
+    existing_id = str(signal_state.get('signal_id') or signal_state.get('signalId') or '')
+    return existing_id == str(signal_id)
+
+
+def record_signal_event_memory(event_payload: dict) -> None:
+    signal_event_buffer.append({
+        "timestamp": int(event_payload.get('timestamp') or int(datetime.now().timestamp() * 1000)),
+        "signalId": str(event_payload.get('signal_id') or event_payload.get('signalId') or ''),
+        "symbol": event_payload.get('symbol', ''),
+        "stage": str(event_payload.get('stage', '') or ''),
+        "decision": str(event_payload.get('decision', '') or ''),
+        "decisionCode": str(event_payload.get('decision_code', '') or ''),
+    })
+
+
+def get_signal_events_summary(now_ts: Optional[float] = None, window_sec: int = 900) -> dict:
+    now_ts = float(now_ts or datetime.now().timestamp())
+    cutoff_ms = int((now_ts - max(60, window_sec)) * 1000)
+    recent = [evt for evt in signal_event_buffer if int(evt.get('timestamp', 0) or 0) >= cutoff_ms]
+
+    by_stage: dict[str, int] = {}
+    by_decision: dict[str, int] = {}
+    by_code: dict[str, int] = {}
+    for evt in recent:
+        stage = str(evt.get('stage', '') or 'UNKNOWN')
+        decision = str(evt.get('decision', '') or 'UNKNOWN')
+        code = str(evt.get('decisionCode', '') or 'UNKNOWN')
+        by_stage[stage] = by_stage.get(stage, 0) + 1
+        by_decision[decision] = by_decision.get(decision, 0) + 1
+        by_code[code] = by_code.get(code, 0) + 1
+
+    top_codes = sorted(by_code.items(), key=lambda item: item[1], reverse=True)[:8]
+    return {
+        "windowSec": window_sec,
+        "total": len(recent),
+        "byStage": by_stage,
+        "byDecision": by_decision,
+        "topCodes": [{"code": code, "count": count} for code, count in top_codes],
+    }
+
+
+def set_signal_memory_state(
+    symbol: str,
+    *,
+    stage: str,
+    signal_id: str = '',
+    pending_entry_id: str = '',
+    score: Optional[float] = None,
+    last_price: Optional[float] = None,
+    extra: Optional[dict] = None,
+) -> Optional[dict]:
+    sig = active_signals.get(symbol)
+    if not sig or not _signal_memory_matches(sig, signal_id):
+        return None
+    sig['state'] = stage
+    if signal_id:
+        sig['signal_id'] = signal_id
+    if pending_entry_id or sig.get('pending_entry_id'):
+        sig['pending_entry_id'] = pending_entry_id
+    if score is not None:
+        sig['score'] = float(score)
+    if last_price is not None and last_price > 0:
+        sig['last_price'] = last_price
+    sig['last_state_ts'] = datetime.now().timestamp()
+    if stage == SIGNAL_STAGE_OPENED:
+        sig['pending_entry_id'] = ''
+    if extra:
+        sig.update(extra)
+    return sig
+
+
+def drop_signal_memory(
+    symbol: str,
+    *,
+    signal_id: str = '',
+    allowed_states: Optional[set[str]] = None,
+) -> bool:
+    sig = active_signals.get(symbol)
+    if not sig or not _signal_memory_matches(sig, signal_id):
+        return False
+    if allowed_states and str(sig.get('state') or '') not in allowed_states:
+        return False
+    active_signals.pop(symbol, None)
+    return True
+
+
+def build_signal_event_payload(
+    signal_row: dict,
+    *,
+    stage: str,
+    decision: str,
+    decision_code: str,
+    decision_source: str = 'engine',
+    decision_detail: str = '',
+    accepted: Optional[bool] = None,
+    reject_reason: Optional[str] = None,
+    pending_entry_id: str = '',
+    executable: Optional[bool] = None,
+    is_pending: bool = False,
+    is_opened: bool = False,
+    score_before: Optional[float] = None,
+    score_after: Optional[float] = None,
+    leverage_before: Optional[float] = None,
+    leverage_after: Optional[float] = None,
+    size_mult: Optional[float] = None,
+    cooldown_sec: float = 0.0,
+    trace: Optional[dict] = None,
+) -> dict:
+    payload = dict(signal_row)
+    payload['stage'] = stage
+    payload['decision'] = decision
+    payload['decision_source'] = decision_source
+    payload['decision_code'] = decision_code
+    payload['decision_detail'] = decision_detail
+    payload['reject_reason'] = reject_reason if reject_reason is not None else payload.get('reject_reason', '')
+    payload['pending_entry_id'] = pending_entry_id or payload.get('pending_entry_id', '')
+    payload['accepted'] = bool(accepted if accepted is not None else (decision == 'PASS' and stage in (
+        SIGNAL_STAGE_EXECUTABLE,
+        SIGNAL_STAGE_PENDING,
+        SIGNAL_STAGE_PENDING_RECHECK,
+        SIGNAL_STAGE_OPEN_ATTEMPT,
+        SIGNAL_STAGE_OPENED,
+    )))
+    payload['executable'] = bool(executable if executable is not None else payload['accepted'])
+    payload['is_pending'] = bool(is_pending)
+    payload['is_opened'] = bool(is_opened)
+    payload['decision_trace'] = trace or {}
+    payload['score_before'] = float(score_before if score_before is not None else payload.get('signal_score', 0) or 0)
+    payload['score_after'] = float(score_after if score_after is not None else payload.get('signal_score', 0) or 0)
+    payload['leverage_before'] = float(leverage_before if leverage_before is not None else payload.get('leverage_before', 0) or 0)
+    payload['leverage_after'] = float(leverage_after if leverage_after is not None else payload.get('leverage_after', 0) or 0)
+    payload['size_mult'] = float(size_mult if size_mult is not None else payload.get('sizeMultiplier', payload.get('size_mult', 1.0)) or 1.0)
+    payload['cooldown_sec'] = float(cooldown_sec or 0)
+    return payload
+
+
+def _prune_stale_executable_signal(symbol: str, now_ts: Optional[float] = None) -> Optional[dict]:
+    now_ts = float(now_ts or datetime.now().timestamp())
+    sig = active_signals.get(symbol)
+    if not sig or not is_executable_signal_state(sig.get('state')):
+        return None
+    last_refresh = float(sig.get('last_refresh_ts', sig.get('created_ts', now_ts)) or now_ts)
+    age = now_ts - last_refresh
+    if age > PERSISTENT_SIGNAL_TTL_SEC:
+        logger.info(f"⌛ SIGNAL_EXPIRED: {symbol} {sig.get('side')} age={age:.0f}s > {PERSISTENT_SIGNAL_TTL_SEC}s")
+        active_signals.pop(symbol, None)
+        return None
+    return sig
+
+
+def upsert_executable_signal_memory(
+    *,
+    symbol: str,
+    action: str,
+    score: float,
+    price: float,
+    signal: dict,
+    existing_signal: Optional[dict] = None,
+    now_ts: Optional[float] = None,
+) -> dict:
+    now_ts = float(now_ts or datetime.now().timestamp())
+    anchor_price = price if price and price > 0 else last_candle_close.get(symbol, 0)
+    base = existing_signal.copy() if existing_signal else {}
+    base.update({
+        'signal_id': signal.get('signalId', signal.get('signal_id', base.get('signal_id', ''))),
+        'side': action,
+        'score': score,
+        'created_ts': base.get('created_ts', now_ts),
+        'last_refresh_ts': now_ts,
+        'ttl_sec': 600,
+        'state': SIGNAL_STAGE_EXECUTABLE,
+        'counter_count': 0,
+        'counter_first_ts': 0,
+        'last_price': anchor_price,
+        'entry_price_backend': signal.get('entryPriceBackend', base.get('entry_price_backend', 0)),
+        'leverage': signal.get('leverage', base.get('leverage', 10)),
+        'strategy_mode': signal.get('strategyMode', signal.get('activeStrategy', base.get('strategy_mode', ''))),
+        'execution_profile_source': signal.get('execution_profile_source', base.get('execution_profile_source', 'neutral')),
+        'execution_style': signal.get('execution_style', base.get('execution_style', EXEC_STYLE_MARKET)),
+        'structural_fallback_stage': signal.get('structural_fallback_stage', base.get('structural_fallback_stage', '')),
+        'entry_quality_pass': signal.get('entryQualityPass', base.get('entry_quality_pass', False)),
+        'entry_quality_reasons': signal.get('entryQualityReasons', base.get('entry_quality_reasons', [])),
+        'execution_reject_reason': '',
+        'raw_score': signal.get('_rawConfidenceScore', signal.get('confidenceScore', score)),
+        'post_gate_score': signal.get('confidenceScore', score),
+    })
+    if not existing_signal:
+        base.setdefault('reentry_count', 0)
+        base.setdefault('last_close_ts', 0)
+    active_signals[symbol] = base
+    return base
+
+
+def get_pending_entries_snapshot(now_ms: Optional[int] = None) -> list:
+    now_ms = int(now_ms or int(datetime.now().timestamp() * 1000))
+    pending_obs = build_pending_orders_observability(
+        global_paper_trader.pending_orders,
+        execution_feedback=getattr(global_paper_trader, 'execution_feedback', {}),
+        now_ms=now_ms,
+        min_confidence_score=getattr(global_paper_trader, 'min_confidence_score', 74),
+    )
+    entries = []
+    for order, diag in zip(global_paper_trader.pending_orders, pending_obs["orders"]):
+        entries.append({
+            "id": order.get("id"),
+            "signalId": order.get("signalId", ""),
+            "symbol": order.get("symbol"),
+            "signalAction": order.get("side"),
+            "side": order.get("side"),
+            "state": order.get("state"),
+            "pendingEntryId": order.get("id"),
+            "stage": SIGNAL_STAGE_PENDING_RECHECK if diag.get("recheckInSec", 0) > 0 else SIGNAL_STAGE_PENDING,
+            "decision": "WAIT",
+            "decisionCode": str(order.get("recheckDecision") or order.get("lastWaitReason") or "PENDING__WAIT"),
+            "signalScore": order.get("signalScore", 0),
+            "signalScoreRaw": order.get("signalScoreRaw", order.get("signalScore", 0)),
+            "recheckScore": order.get("recheckScore", order.get("signalScore", 0)),
+            "recheckReasons": order.get("recheckReasons", []),
+            "signalPrice": order.get("signalPrice", 0),
+            "entryPrice": order.get("entryPrice", 0),
+            "createdAt": order.get("createdAt", 0),
+            "confirmAfter": order.get("confirmAfter", 0),
+            "expiresAt": order.get("expiresAt", 0),
+            "confirmed": bool(order.get("confirmed", False)),
+            "leverage": order.get("leverage", 0),
+            "strategyMode": order.get("strategyMode"),
+            "executionStyle": order.get("execution_style"),
+            "structuralFallbackStage": order.get("structural_fallback_stage"),
+            **diag,
+        })
+    return entries
 
 def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> list:
     """
-    Build UI snapshot of ACTIVE signals and prune stale entries by TTL.
+    Build UI snapshot of executable signals and prune stale entries by TTL.
 
     TTL is measured from last refresh when available; otherwise created time.
     """
@@ -38024,7 +39531,7 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
     stale_symbols = []
 
     for sym, sig in list(active_signals.items()):
-        if sig.get('state') != 'ACTIVE':
+        if not is_executable_signal_state(sig.get('state')):
             continue
 
         anchor_ts = sig.get('last_refresh_ts') or sig.get('created_ts') or now_ts
@@ -38043,11 +39550,17 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
 
         persistent_signals.append({
             "symbol": sym,
+            "signalId": sig.get('signal_id', ''),
             "signalAction": sig.get('side', 'NONE'),
             "signalScore": sig.get('score', 0),
+            "signalScoreRaw": sig.get('raw_score', sig.get('score', 0)),
+            "postGateScore": sig.get('post_gate_score', sig.get('score', 0)),
             "createdTs": sig.get('created_ts', 0),
             "lastRefreshTs": sig.get('last_refresh_ts', 0),
             "state": sig.get('state'),
+            "stage": sig.get('state', SIGNAL_STAGE_EXECUTABLE),
+            "decision": "PASS",
+            "decisionCode": "EXEC__EXECUTABLE_SIGNAL",
             "counterCount": sig.get('counter_count', 0),
             "reentryCount": sig.get('reentry_count', 0),
             "lastCloseTs": sig.get('last_close_ts', 0),
@@ -38067,7 +39580,7 @@ def get_persistent_active_signals_snapshot(now_ts: Optional[float] = None) -> li
 
     for sym in stale_symbols:
         sig = active_signals.get(sym)
-        if sig and sig.get('state') == 'ACTIVE':
+        if sig and is_executable_signal_state(sig.get('state')):
             logger.info(
                 f"⌛ SIGNAL_EXPIRED_SNAPSHOT: {sym} {sig.get('side')} > {PERSISTENT_SIGNAL_TTL_SEC}s (UI prune)"
             )
@@ -38094,11 +39607,18 @@ async def paper_trading_status():
     for order, diag in zip(global_paper_trader.pending_orders, pending_obs["orders"]):
         pending_orders.append({
             "id": order.get("id"),
+            "pendingEntryId": order.get("id"),
+            "signalId": order.get("signalId", ""),
             "symbol": order.get("symbol"),
+            "signalAction": order.get("side"),
             "side": order.get("side"),
             "state": order.get("state"),
+            "stage": SIGNAL_STAGE_PENDING_RECHECK if diag.get("recheckInSec", 0) > 0 else SIGNAL_STAGE_PENDING,
+            "decision": "WAIT",
+            "decisionCode": str(order.get("recheckDecision") or order.get("lastWaitReason") or "PENDING__WAIT"),
             "confirmed": bool(order.get("confirmed", False)),
             "signalScore": order.get("signalScore", 0),
+            "signalScoreRaw": order.get("signalScoreRaw", order.get("signalScore", 0)),
             "signalPrice": order.get("signalPrice", 0),
             "entryPrice": order.get("entryPrice", 0),
             "pullbackLocked": order.get("pullbackLocked", 0),
@@ -38106,8 +39626,11 @@ async def paper_trading_status():
             "confirmAfter": order.get("confirmAfter", 0),
             "recheckNextAt": order.get("recheckNextAt", 0),
             "recheckDecision": order.get("recheckDecision"),
+            "recheckScore": order.get("recheckScore", order.get("signalScore", 0)),
+            "recheckReasons": order.get("recheckReasons", []),
             "expiresAt": order.get("expiresAt", 0),
             "reinforcedCount": int(order.get("reinforcedCount", 0) or 0),
+            "leverage": order.get("leverage", 0),
             "strategyMode": order.get("strategyMode"),
             "executionStyle": order.get("execution_style"),
             "structuralFallbackStage": order.get("structural_fallback_stage"),
@@ -38116,6 +39639,13 @@ async def paper_trading_status():
             "distanceTruth": order.get("distance_truth", {}),  # RFX-2B
             **diag,
         })
+    executable_signals = get_persistent_active_signals_snapshot()
+    display_positions = dedupe_position_snapshots(global_paper_trader.positions)
+    signal_stats = _build_ui_signal_stats(
+        ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or [],
+        executable_signals,
+        pending_orders,
+    )
     
     # Phase 239: Data quality metrics
     try:
@@ -38128,7 +39658,7 @@ async def paper_trading_status():
     
     return JSONResponse({
         "balance": global_paper_trader.balance,
-        "positions": global_paper_trader.positions,
+        "positions": display_positions,
         "trades": _deduped_trades,  # P1: deduplicated trades
         "stats": stats_with_today,
         "enabled": global_paper_trader.enabled,
@@ -38139,7 +39669,14 @@ async def paper_trading_status():
         "pipelineMetrics": global_paper_trader.pipeline_metrics,
         "pendingOrdersCount": len(global_paper_trader.pending_orders),
         "pendingOrders": pending_orders,
+        "pendingEntries": pending_orders,
+        "executableSignals": executable_signals,
+        "persistentActiveSignals": executable_signals,
         "pendingSummary": pending_obs["summary"],
+        "rawSignalStats": signal_stats.get("rawSignalStats", {}),
+        "executableSignalStats": signal_stats.get("executableSignalStats", {}),
+        "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
+        "signalEventsSummary": get_signal_events_summary(),
         "lastOrderError": live_binance_trader.last_order_error,
         "executionDiagnostics": build_execution_diagnostics_snapshot(live_binance_trader),
         # Phase 237D: Reject attribution summary
@@ -38210,8 +39747,8 @@ async def live_trading_status():
     
     try:
         balance = await live_binance_trader.get_balance()
-        positions = await live_binance_trader.get_positions()
-        paper_positions = {p.get('symbol'): p for p in getattr(global_paper_trader, 'positions', [])}
+        positions = dedupe_position_snapshots(await live_binance_trader.get_positions())
+        paper_positions = build_position_snapshot_index(getattr(global_paper_trader, 'positions', []))
         merged_positions = []
         for bp in positions:
             symbol = bp.get('symbol', '')
@@ -38221,6 +39758,17 @@ async def live_trading_status():
                 paper_pos.get('exchangeBreakEvenPrice', bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', 0.0))) or 0.0
             )
             if paper_pos:
+                paper_leverage = _position_effective_leverage(paper_pos)
+                binance_leverage = _position_effective_leverage(merged)
+                paper_margin = _position_margin_usd(paper_pos)
+                if paper_leverage > binance_leverage:
+                    merged['leverage'] = max(1, int(round(paper_leverage)))
+                if paper_margin > 0 and (
+                    _position_margin_usd(merged) <= 0 or paper_leverage > binance_leverage + 0.5
+                ):
+                    merged['marginUsd'] = paper_margin
+                    merged['margin'] = paper_margin
+                    merged['initialMargin'] = paper_margin
                 merged['stopLoss'] = paper_pos.get('stopLoss', bp.get('stopLoss', 0))
                 merged['takeProfit'] = paper_pos.get('takeProfit', bp.get('takeProfit', 0))
                 merged['trailingStop'] = paper_pos.get('trailingStop', paper_pos.get('stopLoss', 0))
@@ -38270,6 +39818,11 @@ async def live_trading_status():
                 merged['runtimeTpLevels'] = paper_pos.get('runtimeTpLevels', [])
                 merged['runtimeGivebackTrailReady'] = paper_pos.get('runtimeGivebackTrailReady', False)
                 merged['isTrailingActive'] = paper_pos.get('isTrailingActive', False)
+                merged['partial_tp_state'] = paper_pos.get('partial_tp_state', merged.get('partial_tp_state', {}))
+                merged['tp1Hit'] = bool(
+                    paper_pos.get('tp1Hit', False)
+                    or (paper_pos.get('partial_tp_state', {}) or {}).get('tp1', False)
+                )
                 if paper_pos.get('openTime', 0) > 0:
                     merged['openTime'] = paper_pos['openTime']
             else:
@@ -38349,7 +39902,7 @@ async def live_trading_status():
                 merged['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
                 merged['runtimeTpLevels'] = profit_ladder.get('tp_levels', [])
                 merged['runtimeGivebackTrailReady'] = profit_ladder.get('giveback_trail_ready', False)
-            merged_positions.append(merged)
+            merged_positions.append(_normalize_position_snapshot(merged))
         pnl_data = await live_binance_trader.get_pnl_from_binance()
         # Phase 187b: Trade history from SQLite (full data, no limit)
         # Previously: get_trade_history(limit=50, days_back=7) from Binance Income API
@@ -38367,6 +39920,7 @@ async def live_trading_status():
             f"Phase 187b: Got {len(trades_raw)} raw live trades from SQLite "
             f"→ {len(trades)} UI rows (dedup={dedup_stats})"
         )
+        merged_positions = dedupe_position_snapshots(merged_positions)
         
         return JSONResponse({
             "enabled": True,
@@ -39031,6 +40585,10 @@ async def scanner_status():
 
     # UF-1: get_scanner_stats() provides totalCoins, analyzedCoins, prefilterMetrics etc.
     scanner_stats = multi_coin_scanner.get_scanner_stats()
+    opportunities = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
+    executable_signals = get_persistent_active_signals_snapshot()
+    pending_entries = get_pending_entries_snapshot()
+    signal_stats = _build_ui_signal_stats(opportunities, executable_signals, pending_entries)
     return JSONResponse({
         "running": effective_running,
         "runningFlag": multi_coin_scanner.running,
@@ -39040,7 +40598,12 @@ async def scanner_status():
         "autoRestarted": auto_restarted,
         "staleRestarted": stale_restarted,
         "staleThresholdSec": SCANNER_STALE_CACHE_SEC,
-        **scanner_stats
+        **scanner_stats,
+        **signal_stats,
+        "rawSignalStats": signal_stats.get("rawSignalStats", {}),
+        "executableSignalStats": signal_stats.get("executableSignalStats", {}),
+        "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
+        "signalEventsSummary": get_signal_events_summary(),
     })
 
 # Phase 17: Settings endpoints
@@ -40300,13 +41863,16 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
 
             trades = ui_state_cache.trades or global_paper_trader.trades
 
-            persistent_signals = get_persistent_active_signals_snapshot()
-            signal_stats = _build_ui_signal_stats(opps, persistent_signals)
+            executable_signals = get_persistent_active_signals_snapshot()
+            pending_entries = get_pending_entries_snapshot()
+            signal_stats = _build_ui_signal_stats(opps, executable_signals, pending_entries)
 
             return {
                 "type": "scanner_update",
                 "opportunities": opps,
-                "persistentActiveSignals": persistent_signals,
+                "executableSignals": executable_signals,
+                "persistentActiveSignals": executable_signals,
+                "pendingEntries": pending_entries,
                 "stats": {
                     "totalCoins": scanner_stats.get('totalCoins', len(getattr(multi_coin_scanner, 'coins', []))),
                     "analyzedCoins": scanner_stats.get('analyzedCoins', len(getattr(multi_coin_scanner, 'analyzers', {}))),
@@ -40317,6 +41883,10 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
                     **signal_stats,
                     "lastUpdate": datetime.now().timestamp()
                 },
+                "rawSignalStats": signal_stats.get("rawSignalStats", {}),
+                "executableSignalStats": signal_stats.get("executableSignalStats", {}),
+                "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
+                "signalEventsSummary": get_signal_events_summary(),
                 "portfolio": {
                     "balance": balance,
                     "positions": positions,
@@ -40347,12 +41917,18 @@ async def scanner_websocket_endpoint(websocket: WebSocket):
 
             min_score = global_paper_trader.min_confidence_score if 'global_paper_trader' in globals() else 40
             source_opps = ui_state_cache.opportunities or getattr(multi_coin_scanner, 'opportunities', []) or []
+            executable_signals = get_persistent_active_signals_snapshot()
+            pending_entries = get_pending_entries_snapshot()
             signal_symbols = set()
-            for opp in source_opps:
-                if opp.get('signalAction') != 'NONE' and opp.get('signalScore', 0) >= min_score:
-                    sym = opp.get('symbol')
+            for sig in executable_signals:
+                if sig.get('signalAction') != 'NONE' and sig.get('signalScore', 0) >= min_score:
+                    sym = sig.get('symbol')
                     if sym:
                         signal_symbols.add(sym)
+            for pending in pending_entries:
+                sym = pending.get('symbol')
+                if sym:
+                    signal_symbols.add(sym)
 
             if live_binance_trader.enabled:
                 source_positions, _ = _resolve_live_positions_for_ui(prefer_cache=True)

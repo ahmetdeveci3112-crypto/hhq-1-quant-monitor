@@ -62,7 +62,10 @@ export interface Position {
   size: number;           // Position size in base currency (internal usage)
   contracts?: number;     // Phase 141: Binance-compatible field (same as size)
   sizeUsd: number;        // Position size in USD
+  leverage?: number;
   marginUsd?: number;     // P1: Explicit margin (authoritative)
+  margin?: number;
+  initialMargin?: number;
   stopLoss: number;
   takeProfit: number;
   trailingStop: number;
@@ -73,6 +76,8 @@ export interface Position {
   unrealizedPnlPercent: number;
   openTime: number;
   exchangeBreakEvenPrice?: number;
+  entryFeePaidUsd?: number;
+  closeFeesPaidUsd?: number;
   tp1Hit?: boolean;
   sl1Hit?: boolean;
   // Runtime trail telemetry from backend (updated on each price loop)
@@ -476,6 +481,50 @@ export interface CoinOpportunity {
   chopIndex?: number;
 }
 
+export interface PendingEntry {
+  id: string;
+  pendingEntryId?: string;
+  signalId?: string;
+  symbol: string;
+  signalAction: 'LONG' | 'SHORT' | 'NONE';
+  side?: 'LONG' | 'SHORT';
+  state?: string;
+  stage?: string;
+  decision?: string;
+  decisionCode?: string;
+  signalScore?: number;
+  signalScoreRaw?: number;
+  recheckScore?: number;
+  recheckReasons?: string[];
+  signalPrice?: number;
+  entryPrice?: number;
+  createdAt?: number;
+  confirmAfter?: number;
+  expiresAt?: number;
+  confirmed?: boolean;
+  leverage?: number;
+  strategyMode?: string;
+  executionStyle?: string;
+  structuralFallbackStage?: string;
+  recheckInSec?: number;
+}
+
+export interface SignalCounterBreakdown {
+  longSignals: number;
+  shortSignals: number;
+  activeSignals: number;
+  confirmed?: number;
+  waiting?: number;
+}
+
+export interface SignalEventsSummary {
+  windowSec: number;
+  total: number;
+  byStage: Record<string, number>;
+  byDecision: Record<string, number>;
+  topCodes: Array<{ code: string; count: number }>;
+}
+
 export interface ScannerStats {
   totalCoins: number;
   analyzedCoins: number;
@@ -492,13 +541,26 @@ export interface ScannerStats {
   persistentLongSignals?: number;
   persistentShortSignals?: number;
   persistentActiveSignals?: number;
+  pendingLongSignals?: number;
+  pendingShortSignals?: number;
+  pendingActiveSignals?: number;
+  rawSignalStats?: SignalCounterBreakdown;
+  executableSignalStats?: SignalCounterBreakdown;
+  pendingEntryStats?: SignalCounterBreakdown;
   lastUpdate: number;
 }
 
 export interface ScannerUpdate {
   type: 'scanner_update';
   opportunities: CoinOpportunity[];
+  executableSignals?: CoinOpportunity[];
+  persistentActiveSignals?: CoinOpportunity[];
+  pendingEntries?: PendingEntry[];
   stats: ScannerStats;
+  rawSignalStats?: SignalCounterBreakdown;
+  executableSignalStats?: SignalCounterBreakdown;
+  pendingEntryStats?: SignalCounterBreakdown;
+  signalEventsSummary?: SignalEventsSummary;
   portfolio: {
     balance: number;
     positions: Position[];
