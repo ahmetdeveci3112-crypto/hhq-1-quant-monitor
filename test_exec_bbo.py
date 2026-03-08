@@ -614,3 +614,68 @@ def test_47_position_cleanup_order_ids_include_legacy_pointer():
     pos = {"exchange_sl_order_id": "sl_live"}
 
     assert get_position_cleanup_order_ids(pos) == ["sl_live"]
+
+
+@pytest.mark.asyncio
+async def test_48_set_stop_loss_reuses_exact_existing_stop(trader):
+    trader.exchange.load_markets = AsyncMock(return_value={'BTC/USDT:USDT': {}})
+    trader.exchange.price_to_precision = MagicMock(return_value='65000')
+    trader.exchange.amount_to_precision = MagicMock(return_value='0.001')
+    trader.exchange.create_order = AsyncMock()
+    trader._cancel_known_conditional_order = AsyncMock()
+    trader._fetch_symbol_reduce_only_conditionals = AsyncMock(return_value=([
+        {
+            'id': 'sl_existing',
+            'symbol': 'BTC/USDT:USDT',
+            'type': 'stop_market',
+            'amount': 0.001,
+            'reduceOnly': True,
+            'status': 'open',
+            'info': {'symbol': 'BTCUSDT', 'reduceOnly': 'true', 'stopPrice': '65000'},
+        }
+    ], False))
+
+    result = await trader.set_stop_loss('BTCUSDT', 'LONG', 0.001, 65000.0)
+
+    assert result['id'] == 'sl_existing'
+    trader._cancel_known_conditional_order.assert_not_called()
+    trader.exchange.create_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_49_set_stop_loss_aborts_when_stale_stops_remain(trader):
+    trader.exchange.load_markets = AsyncMock(return_value={'BTC/USDT:USDT': {}})
+    trader.exchange.price_to_precision = MagicMock(return_value='65000')
+    trader.exchange.amount_to_precision = MagicMock(return_value='0.001')
+    trader.exchange.create_order = AsyncMock()
+    trader._cancel_known_conditional_order = AsyncMock(return_value=False)
+    trader.cancel_reduce_only_conditionals = AsyncMock(return_value={
+        'cancelled': 0,
+        'errors': 1,
+        'remaining_order_ids': ['sl_stale'],
+        'remaining_count': 1,
+    })
+    stale_order = {
+        'id': 'sl_stale',
+        'symbol': 'BTC/USDT:USDT',
+        'type': 'stop_market',
+        'amount': 0.002,
+        'reduceOnly': True,
+        'status': 'open',
+        'info': {'symbol': 'BTCUSDT', 'reduceOnly': 'true', 'stopPrice': '64000'},
+    }
+    trader._fetch_symbol_reduce_only_conditionals = AsyncMock(side_effect=[
+        ([stale_order], False),
+        ([stale_order], False),
+        ([stale_order], False),
+    ])
+
+    result = await trader.set_stop_loss('BTCUSDT', 'LONG', 0.001, 65000.0)
+
+    assert result is None
+    trader.cancel_reduce_only_conditionals.assert_awaited_once_with(
+        'BTCUSDT',
+        trace_id='SET_SL_FORCE_CLEAR',
+        stop_only=True,
+    )
+    trader.exchange.create_order.assert_not_awaited()

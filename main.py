@@ -5267,41 +5267,113 @@ class LiveBinanceTrader:
         ccxt_symbol = f"{symbol[:-4]}/USDT:USDT"
         
         try:
-            # 1) Cancel existing SL orders for this symbol
-            try:
-                open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(
-                    symbol,
-                    trace_id="SET_SL_REPLACE",
-                    stop_only=True,
-                )
-                for order in open_orders:
-                    order_type = self._extract_conditional_order_type(order)
-                    if await self._cancel_known_conditional_order(symbol, order.get('id'), "SET_SL_REPLACE"):
-                        logger.info(
-                            f"🗑️ SET_SL_REPLACE_CANCELLED: {symbol} order={order.get('id')} "
-                            f"type={order_type}{' fallback' if used_fallback else ''}"
-                        )
-                remaining_stop_orders, _ = await self._fetch_symbol_reduce_only_conditionals(
-                    symbol,
-                    trace_id="SET_SL_REPLACE_VERIFY",
-                    stop_only=True,
-                )
-                if remaining_stop_orders:
-                    logger.warning(
-                        f"⚠️ SET_SL_REPLACE_VERIFY: {symbol} remaining_stop_orders="
-                        f"{[str(order.get('id')) for order in remaining_stop_orders[:8]]}"
-                    )
-            except Exception as cancel_err:
-                logger.warning(f"⚠️ Could not cancel old SL orders for {symbol}: {cancel_err}")
-            
-            # 2) Snap price to market precision
+            # 1) Snap price/amount to market precision before dedupe/replace checks
             markets = await self.exchange.load_markets()
             market = markets.get(ccxt_symbol)
             if market:
                 stop_price = float(self.exchange.price_to_precision(ccxt_symbol, stop_price))
                 amount = float(self.exchange.amount_to_precision(ccxt_symbol, amount))
-            
-            # 3) Place STOP_MARKET order (reduceOnly)
+
+            def _matching_orders(orders: list[dict]) -> list[dict]:
+                return [
+                    order for order in orders
+                    if self._conditional_order_matches_target(order, amount, stop_price)
+                ]
+
+            # 2) Detect exact-stop reuse before attempting any cancel/replace.
+            open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(
+                symbol,
+                trace_id="SET_SL_SCAN",
+                stop_only=True,
+            )
+            matching_orders = _matching_orders(open_orders)
+            if len(open_orders) == 1 and len(matching_orders) == 1:
+                existing = matching_orders[0]
+                order_id = str(existing.get('id', '') or 'N/A')
+                logger.info(
+                    f"♻️ SET_SL_REUSE: {side} {symbol} | SL @ ${stop_price} | Amount: {amount} | "
+                    f"Order: {order_id}{' fallback' if used_fallback else ''}"
+                )
+                return {
+                    'id': order_id,
+                    'symbol': symbol,
+                    'side': side,
+                    'amount': amount,
+                    'stopPrice': stop_price,
+                    'status': existing.get('status', 'open'),
+                    'timestamp': int(datetime.now().timestamp() * 1000)
+                }
+
+            # 3) Cancel existing SL orders for this symbol.
+            for order in open_orders:
+                order_type = self._extract_conditional_order_type(order)
+                if await self._cancel_known_conditional_order(symbol, order.get('id'), "SET_SL_REPLACE"):
+                    logger.info(
+                        f"🗑️ SET_SL_REPLACE_CANCELLED: {symbol} order={order.get('id')} "
+                        f"type={order_type}{' fallback' if used_fallback else ''}"
+                    )
+
+            remaining_stop_orders, _ = await self._fetch_symbol_reduce_only_conditionals(
+                symbol,
+                trace_id="SET_SL_REPLACE_VERIFY",
+                stop_only=True,
+            )
+
+            if remaining_stop_orders:
+                remaining_matches = _matching_orders(remaining_stop_orders)
+                if len(remaining_stop_orders) == 1 and len(remaining_matches) == 1:
+                    existing = remaining_matches[0]
+                    order_id = str(existing.get('id', '') or 'N/A')
+                    logger.warning(
+                        f"⚠️ SET_SL_REPLACE_VERIFY_MATCH: {symbol} existing stop survived replace; "
+                        f"reusing order={order_id}"
+                    )
+                    return {
+                        'id': order_id,
+                        'symbol': symbol,
+                        'side': side,
+                        'amount': amount,
+                        'stopPrice': stop_price,
+                        'status': existing.get('status', 'open'),
+                        'timestamp': int(datetime.now().timestamp() * 1000)
+                    }
+
+                logger.warning(
+                    f"⚠️ SET_SL_REPLACE_VERIFY: {symbol} remaining_stop_orders="
+                    f"{[str(order.get('id')) for order in remaining_stop_orders[:8]]}"
+                )
+                force_clear = await self.cancel_reduce_only_conditionals(
+                    symbol,
+                    trace_id="SET_SL_FORCE_CLEAR",
+                    stop_only=True,
+                )
+                remaining_stop_orders, _ = await self._fetch_symbol_reduce_only_conditionals(
+                    symbol,
+                    trace_id="SET_SL_FORCE_VERIFY",
+                    stop_only=True,
+                )
+                if remaining_stop_orders:
+                    remaining_matches = _matching_orders(remaining_stop_orders)
+                    if len(remaining_stop_orders) == 1 and len(remaining_matches) == 1:
+                        existing = remaining_matches[0]
+                        order_id = str(existing.get('id', '') or 'N/A')
+                        logger.warning(
+                            f"⚠️ SET_SL_FORCE_VERIFY_MATCH: {symbol} reusing surviving stop order={order_id}"
+                        )
+                        return {
+                            'id': order_id,
+                            'symbol': symbol,
+                            'side': side,
+                            'amount': amount,
+                            'stopPrice': stop_price,
+                            'status': existing.get('status', 'open'),
+                            'timestamp': int(datetime.now().timestamp() * 1000)
+                        }
+                    raise RuntimeError(
+                        f"SET_SL_REPLACE_ABORT: stale_stop_orders_remain={force_clear.get('remaining_order_ids', [])[:8]}"
+                    )
+
+            # 4) Place STOP_MARKET order (reduceOnly)
             close_side = 'sell' if side == 'LONG' else 'buy'
             order = await self.exchange.create_order(
                 ccxt_symbol,
@@ -5383,6 +5455,51 @@ class LiveBinanceTrader:
             return order_type
         info = order.get('info', {}) or {}
         return (info.get('origType') or info.get('type') or '').lower()
+
+    @staticmethod
+    def _extract_conditional_stop_price(order: dict) -> float:
+        """Best-effort stop/trigger price extraction across CCXT + raw Binance fields."""
+        info = order.get('info', {}) or {}
+        for value in (
+            order.get('stopPrice'),
+            order.get('triggerPrice'),
+            info.get('stopPrice'),
+            info.get('triggerPrice'),
+            info.get('activatePrice'),
+        ):
+            price = _coerce_float(value, 0.0)
+            if price > 0:
+                return price
+        return 0.0
+
+    @staticmethod
+    def _extract_conditional_amount(order: dict) -> float:
+        """Best-effort contract amount extraction across CCXT + raw Binance fields."""
+        info = order.get('info', {}) or {}
+        for value in (
+            order.get('remaining'),
+            order.get('amount'),
+            info.get('origQty'),
+            info.get('quantity'),
+            info.get('qty'),
+        ):
+            amount = _coerce_float(value, 0.0)
+            if amount > 0:
+                return amount
+        return 0.0
+
+    @staticmethod
+    def _conditional_order_matches_target(order: dict, amount: float, stop_price: float) -> bool:
+        existing_amount = LiveBinanceTrader._extract_conditional_amount(order)
+        existing_stop = LiveBinanceTrader._extract_conditional_stop_price(order)
+        if existing_amount <= 0 or existing_stop <= 0:
+            return False
+        amount_tol = max(abs(amount) * 1e-6, 1e-8)
+        price_tol = max(abs(stop_price) * 1e-8, 1e-10)
+        return (
+            math.isclose(existing_amount, amount, rel_tol=1e-9, abs_tol=amount_tol)
+            and math.isclose(existing_stop, stop_price, rel_tol=1e-9, abs_tol=price_tol)
+        )
 
     async def _fetch_symbol_open_orders_all_sources(
         self,
@@ -5516,7 +5633,7 @@ class LiveBinanceTrader:
             logger.warning(f"⚠️ POST_CLOSE_HINT_CANCEL_FAILED: {symbol} order={order_id} err={raw_err}{trace_str}")
             return False
     
-    async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None) -> dict:
+    async def cancel_reduce_only_conditionals(self, symbol: str, trace_id: str = None, stop_only: bool = False) -> dict:
         """Phase 270: Cancel all reduceOnly conditional orders for a symbol.
         Only targets STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT types.
         Never cancels entry (non-reduceOnly) orders.
@@ -5530,7 +5647,11 @@ class LiveBinanceTrader:
 
         attempted_ids: set[str] = set()
         for pass_idx in range(2):
-            open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(symbol, trace_id=trace_id)
+            open_orders, used_fallback = await self._fetch_symbol_reduce_only_conditionals(
+                symbol,
+                trace_id=trace_id,
+                stop_only=stop_only,
+            )
             if not open_orders:
                 result['remaining_order_ids'] = []
                 result['remaining_count'] = 0
@@ -5551,7 +5672,11 @@ class LiveBinanceTrader:
                 else:
                     result['errors'] += 1
 
-        remaining_orders, _ = await self._fetch_symbol_reduce_only_conditionals(symbol, trace_id=trace_id)
+        remaining_orders, _ = await self._fetch_symbol_reduce_only_conditionals(
+            symbol,
+            trace_id=trace_id,
+            stop_only=stop_only,
+        )
         result['remaining_order_ids'] = [str(order.get('id')) for order in remaining_orders if order.get('id')]
         result['remaining_count'] = len(result['remaining_order_ids'])
         if result['remaining_count'] > 0:
@@ -24094,6 +24219,7 @@ class PositionBasedKillSwitch:
             'PRE-REDUCE' if reason == 'PRE_STOP_REDUCE' else 'RECOVERY'
         )
         pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
+        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
 
         # Record partial close in trade history
         partial_trade = {
@@ -24262,6 +24388,7 @@ class TimeBasedPositionManager:
             pos['initialMargin'] = max(0.0, float(pos.get('initialMargin', 0) or 0) * (1 - float(reduction_pct)))
         pos['lastExitDecision'] = reason
         pos['runtimeProtectionPhase'] = 'TIME-RECOVERY'
+        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
 
         partial_trade = {
             "id": f"{pos.get('id', '')}_{trade_suffix}",
@@ -24398,6 +24525,7 @@ class TimeBasedPositionManager:
             pos['initialMargin'] = current_initial_margin * ratio
         paper_trader.balance += released_margin + pnl
         pos['lastExitDecision'] = reason
+        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
 
         partial_trade = {
             "id": f"{pos.get('id', '')}_{label}",
@@ -24495,6 +24623,47 @@ class TimeBasedPositionManager:
             pos['lastExitDecision'] = f"{reason}_RETRY"
             logger.warning(f"⚠️ V3_PROTECTION_RETRY: {symbol} {side} stop=${stop_price:.6f} reason={reason} err={e}")
 
+    @staticmethod
+    def _resolve_live_protective_stop_price(pos: dict) -> float:
+        side = pos.get('side', 'LONG')
+        candidates = [
+            _coerce_float(pos.get('trailingStop', 0.0), 0.0),
+            _coerce_float(pos.get('stopLoss', 0.0), 0.0),
+            _coerce_float(pos.get('exchange_sl_price', 0.0), 0.0),
+        ]
+        candidates = [price for price in candidates if price > 0]
+        if not candidates:
+            return 0.0
+        return max(candidates) if side == 'LONG' else min(candidates)
+
+    async def _sync_live_protection_to_current_stop(self, pos: dict, reason: str) -> None:
+        if not pos.get('isLive', False) or not live_binance_trader:
+            return
+        stop_price = self._resolve_live_protective_stop_price(pos)
+        if stop_price <= 0:
+            logger.warning(
+                f"⚠️ LIVE_PROTECTION_SKIP: {pos.get('symbol', '?')} "
+                f"reason={reason} no_valid_stop_price"
+            )
+            return
+        await self._sync_v3_protective_order(pos, stop_price, reason)
+
+    async def _resync_live_protection_after_partial(self, pos: dict, reason: str) -> None:
+        if not pos.get('isLive', False) or not live_binance_trader:
+            return
+        symbol = pos.get('symbol', '')
+        if not symbol:
+            return
+        remaining = float(pos.get('contracts', pos.get('size', 0)) or 0)
+        if remaining <= 0.00001:
+            cleanup_order_ids = get_position_cleanup_order_ids(pos)
+            try:
+                await live_binance_trader._post_close_cleanup(symbol, trace_id=reason, cleanup_order_ids=cleanup_order_ids)
+            except Exception as cleanup_err:
+                logger.warning(f"⚠️ PARTIAL_PROTECTION_CLEANUP_FAIL: {symbol} reason={reason} err={cleanup_err}")
+            return
+        await self._sync_live_protection_to_current_stop(pos, reason)
+
     async def _maybe_retry_v3_protection(self, pos: dict, current_price: float) -> None:
         if not pos.get('internalProtectionOnly', False):
             return
@@ -24549,7 +24718,6 @@ class TimeBasedPositionManager:
             pos['effectiveAtrValueUsed'] = round(atr, 8)
         current_r = self._current_r_multiple(pos, current_price)
         pos['trailArmElapsedSec'] = int(max(0, now_ts - float(pos.get('trailArmSince', 0) or 0))) if pos.get('trailArmed') else 0
-        await self._maybe_retry_v3_protection(pos, current_price)
 
         has_opp, opp_score = self._get_v3_opposite_pressure(pos)
         if has_opp:
@@ -24681,6 +24849,11 @@ class TimeBasedPositionManager:
                 entry_price = pos.get('entryPrice', current_price)
                 contracts = pos.get('contracts', 0)
                 current_roi = compute_position_roi_pct(pos, current_price)
+                if pos.get('isLive', False):
+                    pos.setdefault('internalProtectionOnly', False)
+                    pos.setdefault('protectionRetryAt', 0)
+                    pos.setdefault('protectionRetryPrice', 0.0)
+                    await self._maybe_retry_v3_protection(pos, current_price)
                 
                 # Calculate position age in hours
                 age_hours = (current_time_ms - open_time) / (1000 * 60 * 60)
@@ -24757,16 +24930,20 @@ class TimeBasedPositionManager:
                             elif _action == RFX_ExitAction.SET_BREAKEVEN:
                                 # B3: SL write via apply_sl_floor only
                                 if _decision.suggested_price > 0:
-                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_BE')
+                                    _moved = apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_BE')
                                     pos['breakeven_activated'] = True
+                                    if _moved:
+                                        await self._sync_live_protection_to_current_stop(pos, 'RFX1B_BE')
                                     logger.info(f"🔧 RFX1B_SM_BE: {symbol} BE=${_decision.suggested_price:.6f} | {_decision.reason}")
                             
                             elif _action == RFX_ExitAction.ARM_PT:
                                 pos['isTrailingActive'] = True
                                 pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
                                 if RFX1B_BE_ON_TRAIL and _decision.suggested_price > 0:
-                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_PT_BE')
+                                    _moved = apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_PT_BE')
                                     pos['breakeven_activated'] = True
+                                    if _moved:
+                                        await self._sync_live_protection_to_current_stop(pos, 'RFX1B_PT_BE')
                                 logger.info(f"🔧 RFX1B_SM_PT: {symbol} trail armed | {_decision.reason}")
                             
                             elif _action == RFX_ExitAction.ARM_LRT:
@@ -24778,7 +24955,9 @@ class TimeBasedPositionManager:
                             elif _action == RFX_ExitAction.TIGHTEN_TRAIL:
                                 # B3: Trail tighten via apply_sl_floor only
                                 if _decision.suggested_price > 0:
-                                    apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_TRAIL_TIGHTEN')
+                                    _moved = apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_TRAIL_TIGHTEN')
+                                    if _moved:
+                                        await self._sync_live_protection_to_current_stop(pos, 'RFX1B_TRAIL_TIGHTEN')
                                     logger.debug(f"🔧 RFX1B_SM_TRAIL: {symbol} tighten→${_decision.suggested_price:.6f}")
                             
                             elif _action == RFX_ExitAction.PARTIAL_TP:
@@ -24822,6 +25001,7 @@ class TimeBasedPositionManager:
                                         pos['breakeven_activated'] = True
                                         pos['isTrailingActive'] = True
                                         pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                    await self._resync_live_protection_after_partial(pos, f"RFX1B_{str(_tp_key).upper()}_SYNC")
                                     logger.warning(f"💰 RFX1B_TP {_tp_key}: {symbol} {side} partial {_close_pct*100:.0f}% | {_decision.reason}")
                                     actions["partial_tp"].append({'symbol': symbol, 'tp': _tp_key, 'source': 'SM'})
                             
@@ -25208,20 +25388,7 @@ class TimeBasedPositionManager:
                                         f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → ${breakeven_sl:.6f} "
                                         f"(anchor={be_ctx.get('anchor_source', 'entry')} ${be_ctx.get('anchor_price', 0.0):.6f})"
                                     )
-                                    
-                                    # 3) For LIVE positions: Update SL on Binance
-                                    if pos.get('isLive', False):
-                                        try:
-                                            remaining_contracts = pos['contracts']
-                                            sl_result = await live_binance_trader.set_stop_loss(symbol, side, remaining_contracts, breakeven_sl)
-                                            if sl_result:
-                                                record_position_protective_order_id(pos, sl_result.get('id'))
-                                                pos['exchange_sl_price'] = sl_result.get('stopPrice', breakeven_sl)
-                                                logger.warning(f"🔒 TP1_BREAKEVEN LIVE ✅: {symbol} SL set to ${breakeven_sl:.6f} on Binance")
-                                            else:
-                                                logger.error(f"❌ TP1_BREAKEVEN LIVE FAILED: {symbol} - set_stop_loss returned None")
-                                        except Exception as be_err:
-                                            logger.warning(f"⚠️ TP1_BREAKEVEN LIVE SKIP: {symbol} - {be_err} (will use internal SL)")
+                                await self._resync_live_protection_after_partial(pos, f"{level_reason}_SYNC")
                                 
                                 # Log partial TP
                                 logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at ROI {current_roi:.2f}% (level: {level['key']}, base: {base_tp_pct:.2f}%)")
@@ -25270,15 +25437,17 @@ class TimeBasedPositionManager:
                                 if side == 'LONG':
                                     new_trail_stop = current_price - trail_dist
                                     new_trail_stop = max(new_trail_stop, _coerce_float(pos.get('stopLoss', entry_price), entry_price))
-                                    apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
+                                    _moved = apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 else:
                                     new_trail_stop = current_price + trail_dist
                                     new_trail_stop = min(new_trail_stop, _coerce_float(pos.get('stopLoss', entry_price), entry_price))
-                                    apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
+                                    _moved = apply_sl_floor(pos, new_trail_stop, 'TP1_TRAIL_DELAYED')
                                 
                                 pos['isTrailingActive'] = True
                                 pos['trailActiveSince'] = datetime.now().timestamp()
                                 pos['tp1_trail_armed'] = False
+                                if _moved:
+                                    await self._sync_live_protection_to_current_stop(pos, 'TP1_TRAIL_DELAYED')
                                 # Phase 271B fix: Refresh stale local variable to prevent
                                 # downstream exit blocks from running in the same tick
                                 is_trailing_active = True
@@ -25300,9 +25469,11 @@ class TimeBasedPositionManager:
                         if profit_ladder.get('giveback_trail_ready', False):
                             candidate_stop = _coerce_float(profit_ladder.get('profit_lock_price', 0.0), 0.0)
                             if candidate_stop > 0:
-                                apply_sl_floor(pos, candidate_stop, 'PROFIT_GIVEBACK_ARM')
+                                _moved = apply_sl_floor(pos, candidate_stop, 'PROFIT_GIVEBACK_ARM')
                                 pos['isTrailingActive'] = True
                                 pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
+                                if _moved:
+                                    await self._sync_live_protection_to_current_stop(pos, 'PROFIT_GIVEBACK_ARM')
                                 is_trailing_active = True
                                 actions["trail_activated"].append(
                                     f"{symbol} (giveback ROI {profit_ladder.get('profit_giveback_roi_pct', 0.0):.1f}%)"

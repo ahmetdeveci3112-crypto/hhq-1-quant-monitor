@@ -323,3 +323,82 @@ async def test_v3_protection_retry_sets_internal_only_and_recovers(monkeypatch):
     assert pos["protectionRetryAt"] == 0
     assert pos["exchange_sl_order_id"] == "sl-1"
     assert pos["exchange_protective_order_ids"] == ["sl-1"]
+
+
+@pytest.mark.asyncio
+async def test_v3_partial_close_resyncs_exchange_stop_to_remaining_contracts(monkeypatch):
+    class PartialSyncLiveTrader:
+        def __init__(self):
+            self.close_calls = []
+            self.stop_calls = []
+
+        async def close_position(self, symbol, side, contracts, close_scope="FULL"):
+            self.close_calls.append((symbol, side, contracts, close_scope))
+            return {"id": "close-1", "fee": 0.0}
+
+        async def set_stop_loss(self, symbol, side, contracts, stop_price):
+            self.stop_calls.append((symbol, side, contracts, stop_price))
+            return {"id": "sl-sync-1", "stopPrice": stop_price}
+
+    trader = DummyPaperTrader()
+    manager = main.TimeBasedPositionManager()
+    live = PartialSyncLiveTrader()
+    monkeypatch.setattr(main, "live_binance_trader", live)
+
+    pos = _base_v3_position(
+        isLive=True,
+        contracts=10.0,
+        size=10.0,
+        sizeUsd=1000.0,
+        initialMargin=100.0,
+        stopLoss=98.0,
+        trailingStop=98.0,
+    )
+
+    ok = await manager._execute_v3_partial_close(trader, pos, 101.0, 0.25, "TP2_PARTIAL", "TP2")
+
+    assert ok is True
+    assert live.close_calls == [("TESTUSDT", "LONG", 2.5, "PARTIAL")]
+    assert live.stop_calls == [("TESTUSDT", "LONG", 7.5, 98.0)]
+    assert pos["contracts"] == pytest.approx(7.5)
+    assert pos["exchange_sl_order_id"] == "sl-sync-1"
+    assert pos["exchange_protective_order_ids"] == ["sl-sync-1"]
+
+
+@pytest.mark.asyncio
+async def test_check_positions_retries_internal_protection_for_live_non_v3(monkeypatch):
+    class RecoveryLiveTrader:
+        def __init__(self):
+            self.stop_calls = []
+
+        async def set_stop_loss(self, symbol, side, contracts, stop_price):
+            self.stop_calls.append((symbol, side, contracts, stop_price))
+            return {"id": "sl-legacy-1", "stopPrice": stop_price}
+
+    trader = DummyPaperTrader()
+    trader.positions = [
+        _base_v3_position(
+            isLive=True,
+            strategyMode=main.STRATEGY_MODE_LEGACY,
+            exitOwner=main.LEGACY_EXIT_OWNER,
+            contracts=6.0,
+            size=6.0,
+            currentPrice=101.0,
+            internalProtectionOnly=True,
+            protectionRetryAt=int(time.time()) - 1,
+            protectionRetryPrice=98.0,
+            stopLoss=98.0,
+            trailingStop=98.0,
+        )
+    ]
+    manager = main.TimeBasedPositionManager()
+    live = RecoveryLiveTrader()
+    monkeypatch.setattr(main, "live_binance_trader", live)
+
+    await manager.check_positions(trader)
+
+    pos = trader.positions[0]
+    assert live.stop_calls == [("TESTUSDT", "LONG", 6.0, 98.0)]
+    assert pos["internalProtectionOnly"] is False
+    assert pos["protectionRetryAt"] == 0
+    assert pos["exchange_sl_order_id"] == "sl-legacy-1"
