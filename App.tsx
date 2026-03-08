@@ -1813,7 +1813,7 @@ export default function App() {
                     const leverage = resolvePositionLeverage(pos);
                     const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
                     const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
-                    const tpDistance = tpRoi - roi; // TP'ye kaç % kaldı
+                    const tpRemainingRoi = tpRoi - roi;
                     const stopRoiRaw = Number((pos as any).runtimeStopRoiPct);
                     const stopRoi = Number.isFinite(stopRoiRaw) ? stopRoiRaw : computeTargetRoiPct(pos.entryPrice, activeStop, pos.side, leverage);
                     const preStopRaw = (pos as any).runtimePreStopReduceRoiPct == null ? Number.NaN : Number((pos as any).runtimePreStopReduceRoiPct);
@@ -1861,8 +1861,15 @@ export default function App() {
                           <div><span className="text-slate-500">Anlık</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
-                          <div><span className="text-emerald-400">TP: ${formatPrice(tp)}</span> <span className="text-slate-600">(ROI {tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
-                          <div><span className="text-rose-400">SL: ${formatPrice(activeStop)}</span> <span className="text-slate-600">(ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
+                          <div>
+                            <span className="text-emerald-400">TP: ${formatPrice(tp)}</span>{' '}
+                            <span className="text-slate-600">(Hedef ROI {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%)</span>
+                            <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
+                          </div>
+                          <div>
+                            <span className="text-rose-400">SL: ${formatPrice(activeStop)}</span>{' '}
+                            <span className="text-slate-600">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span>
+                          </div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
                           <div className="text-cyan-400">Takip ROI: {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
@@ -1978,9 +1985,7 @@ export default function App() {
                         const leverage = resolvePositionLeverage(pos);
                         const tpRoiRaw = Number((pos as any).runtimeTpRoiPct);
                         const tpRoi = Number.isFinite(tpRoiRaw) ? tpRoiRaw : computeTargetRoiPct(pos.entryPrice, tp, pos.side, leverage);
-                        // Şu anki fiyattan TP'ye kalan mesafe (kaldıraçlı ROI farkı)
-                        const currentRoi = roi; // zaten kaldıraçlı
-                        const tpDistance = tpRoi - currentRoi; // TP'ye kaç % kaldı
+                        const tpRemainingRoi = tpRoi - roi;
                         const stopRoiRaw = Number((pos as any).runtimeStopRoiPct);
                         const stopRoi = Number.isFinite(stopRoiRaw) ? stopRoiRaw : computeTargetRoiPct(pos.entryPrice, activeStop, pos.side, leverage);
                         const preStopRaw = (pos as any).runtimePreStopReduceRoiPct == null ? Number.NaN : Number((pos as any).runtimePreStopReduceRoiPct);
@@ -2035,8 +2040,11 @@ export default function App() {
                             <td className={`py-3 px-2 text-right font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-slate-300'}`}>${formatPrice(currentPrice)}</td>
                             <td className="py-3 px-2 text-right">
                               <div className="text-[10px] space-y-0.5">
-                                <div className="text-emerald-400">TP: ${formatPrice(tp)} <span className="text-slate-500">(ROI {tpDistance > 0 ? '+' : ''}{tpDistance.toFixed(1)}%)</span></div>
-                                <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
+                                <div className="text-emerald-400">
+                                  TP: ${formatPrice(tp)} <span className="text-slate-500">(Hedef ROI {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%)</span>
+                                </div>
+                                <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
+                                <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
