@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter } from 'lucide-react';
 import { CoinOpportunity, PendingEntry } from '../types';
 import { buildDisplayActiveSignals } from '../utils/activeSignalsUtils';
+import { getReasonTooltip, translateReason } from '../utils/reasonUtils';
 
 interface ActiveSignalsPanelProps {
     signals: any[]; // Executable signals only
@@ -74,77 +75,12 @@ const getEntryPrice = (signal: CoinOpportunity, entryTightness: number): number 
         : signal.price * (1 + spreadInfo.pullback / 100);
 };
 
-const getRejectReasonKey = (reason?: string | null): string => {
-    if (!reason) return '';
-    const key = String(reason).split(':')[0] || String(reason);
-    return key.toUpperCase();
-};
-
-// Turkish rejection label + tooltip map
-const REJECT_TR: Record<string, { label: string; tooltip: string }> = {
-    // Sinyal Filtreleme
-    'RECOVERY_COOLDOWN': { label: 'Toparlanma Bekleme', tooltip: 'Portföy toparlanma modunda — 6 saat yeni işlem yapılmıyor' },
-    'SHOCK_BLOCK': { label: 'Şok Koruma', tooltip: 'Piyasada ani düşüş/yükseliş (flash crash/pump) algılandı' },
-    'PROT_BLOCK': { label: 'Koruma Kilidi', tooltip: 'Aşırı kayıp sonrası koruma kilidi aktif' },
-    'EXISTING_POSITION': { label: 'Mevcut Pozisyon', tooltip: 'Bu coin\'de zaten açık pozisyon var' },
-    'COUNTER_FLIP_EXISTING_POS': { label: 'Ters Sinyal', tooltip: 'Mevcut pozisyona ters yönde sinyal geldi, pozisyon korunuyor' },
-    'COUNTER_PENDING': { label: 'Ters Bekleyen', tooltip: 'Ters yönde bekleyen emir mevcut' },
-    'REENTRY_LIMIT': { label: 'Tekrar Giriş Limiti', tooltip: 'Aynı sinyale maksimum 2 kez giriş yapılabilir. Limit doldu' },
-    'REENTRY_COOLDOWN': { label: 'Bekleme Süresi', tooltip: 'Aynı coin\'e 5 dk içinde tekrar giriş yapılamıyor' },
-    'MAX_POSITIONS': { label: 'Pozisyon Limiti', tooltip: 'Maksimum açık pozisyon sayısına ulaşıldı' },
-    'DIRECTION_EXPOSURE': { label: 'Yön Limiti', tooltip: 'Aynı yönde (LONG/SHORT) bakiyenin %40\'ından fazla riske edilemez' },
-    'BLACKLISTED': { label: 'Kara Liste', tooltip: 'Bu coin sürekli zarar ettiği için otomatik kara listeye alındı' },
-    'BTC_FILTER': { label: 'BTC Filtresi', tooltip: 'BTC trendi sinyal yönüne ters — yüksek risk' },
-    'THIN_BOOK': { label: 'İnce Emir Defteri', tooltip: 'Emir defterinde yeterli derinlik yok, kayma riski yüksek' },
-    'OBI_VETO': { label: 'Emir Defteri Ters', tooltip: 'Emir defteri dengesizliği (OBI) sinyal yönüne karşı güçlü' },
-    'OBI_NEUTRAL_LOW_VOL': { label: 'Düşük Hacim+OBI', tooltip: 'Emir defteri nötr ama hacim çok düşük — güvenilir giriş zor' },
-    'REGIME_BLOCKED': { label: 'Rejim Engeli', tooltip: 'Piyasa rejimi düşüş trendinde — yeni girişler engelli' },
-    'MA_ALIGNMENT_VETO': { label: 'MA Uyumsuz', tooltip: 'Hareketli ortalamalar sinyal yönüne ters dizilmiş' },
-    'MTF_REJECTED': { label: 'Çoklu TF Ret', tooltip: 'Çoklu zaman dilimi (15dk/1sa/4sa/1gün) analizi uyumsuz' },
-    'NEGATIVE_EV': { label: 'Negatif Beklenti', tooltip: 'Beklenen değer çok negatif — bu sinyal masraf karşılamaz' },
-    'LOW_NET_EDGE': { label: 'Düşük Net Kenar', tooltip: 'Komisyon+kayma düşüldükten sonra beklenen kazanç çok düşük' },
-    // Pozisyon Açma
-    'MAX_EXPOSURE': { label: 'Maks. Maruziyet', tooltip: 'Toplam açık pozisyon + bekleyen emir limiti doldu' },
-    'DIRECTION_LIMIT_LONG': { label: 'LONG Limiti', tooltip: 'Aynı yönde çok fazla LONG pozisyon açık' },
-    'DIRECTION_LIMIT_SHORT': { label: 'SHORT Limiti', tooltip: 'Aynı yönde çok fazla SHORT pozisyon açık' },
-    'RISK_BLOCK': { label: 'Risk Kontrolü', tooltip: 'Risk yönetimi sistemi bu işlemi uygun görmedi' },
-    'SCALE_LIMIT': { label: 'Ölçekleme Limiti', tooltip: 'Aynı coin\'de ek pozisyon açma limiti doldu' },
-    'HEDGING_DISABLED': { label: 'Hedge Kapalı', tooltip: 'Karşı yönde pozisyon açma (hedging) devre dışı' },
-    'MIN_NOTIONAL': { label: 'Küçük Pozisyon', tooltip: 'Pozisyon boyutu çok küçük — komisyon maliyeti kazancı aşar' },
-    'ENTRY_CORRIDOR_EXCEEDED': { label: 'Koridor Aşıldı', tooltip: 'Fiyat, giriş koridorunun dışına çıktı' },
-    // Bekleyen Emirler
-    'PENDING_EXPIRED': { label: 'Süre Doldu', tooltip: 'Bekleyen emir 30 dakika içinde gerçekleşmedi, iptal edildi' },
-    'STALE_SIGNAL': { label: 'Bayat Sinyal', tooltip: 'Sinyal skoru zamanla düştü ve minimum eşiğin altına indi' },
-    'SIGNAL_MISSED': { label: 'Fırsat Kaçtı', tooltip: 'Fiyat giriş seviyesinden uzaklaştı, sinyal artık geçerli değil' },
-    'TRAIL_ENTRY_FAIL': { label: 'Takip Başarısız', tooltip: 'Takip girişi fiyat hedefine ulaşamadı' },
-    'TRAIL_ENTRY_TIMEOUT': { label: 'Takip Zaman Aşımı', tooltip: 'Takip girişi süre içinde tamamlanamadı' },
-    'ENTRY_RECHECK_FAIL': { label: 'Tekrar Kontrol Red', tooltip: 'Giriş öncesi tekrar kontrol başarısız — koşullar değişti' },
-    'PENDING_REINFORCED': { label: 'Güçlendirme', tooltip: 'Sinyal tekrar doğrulandı, bekleme süresi kısaltıldı' },
-    // Binance Execution
-    'ENTRY_SCORE_LOW': { label: 'Düşük İcra Skoru', tooltip: 'Emir defteri kalitesi (BBO, spread) giriş için yetersiz' },
-    'BLOCK_OPEN_DRIFT': { label: 'Fiyat Kayması', tooltip: 'Fiyat sinyal anından çok uzaklaştı, giriş riskli' },
-    'BLOCK_OPEN_STALE_BBO': { label: 'Eski BBO Verisi', tooltip: 'Emir defteri verisi 1.5 saniyeden eski — güvenilir değil' },
-    'BLOCK_OPEN_SPREAD': { label: 'Yüksek Makas', tooltip: 'Alış-satış farkı (spread) çok yüksek' },
-    'BLOCK_OPEN_INVALID_BBO': { label: 'Geçersiz BBO', tooltip: 'Emir defteri verisi geçersiz veya eksik' },
-    'SLIPPAGE_REJECT': { label: 'Kayma Ret', tooltip: 'Emir dolum fiyatı beklentiden çok farklı' },
-    'BINANCE_ORDER_FAILED': { label: 'Borsa Hatası', tooltip: 'Binance emri başarısız oldu' },
-    'BINANCE_ORDER_ERROR': { label: 'Borsa Hatası', tooltip: 'Binance emir gönderiminde hata oluştu' },
-    'MARKET_FALLBACK_FAILED': { label: 'Piyasa Emri Başarısız', tooltip: 'Piyasa emri yedek planı da başarısız oldu' },
-    'MARKET_FALLBACK_ERROR': { label: 'Piyasa Emri Hatası', tooltip: 'Piyasa emri yedek planında hata oluştu' },
-};
-
 const getRejectTr = (reason?: string | null): { label: string; tooltip: string } => {
     if (!reason) return { label: '', tooltip: '' };
-    const key = String(reason).split(':')[0].toUpperCase();
-    const detail = String(reason).includes(':') ? String(reason).split(':').slice(1).join(':') : '';
-    const entry = REJECT_TR[key];
-    if (entry) {
-        return {
-            label: entry.label,
-            tooltip: `${entry.tooltip}${detail ? `\nDetay: ${detail}` : ''}`
-        };
-    }
-    return { label: key, tooltip: `Ret sebebi: ${reason}` };
+    return {
+        label: translateReason(reason),
+        tooltip: getReasonTooltip(reason),
+    };
 };
 
 const getDynamicTrailEntryThreshold = (
@@ -714,6 +650,15 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     <div className="mt-3 grid gap-2 lg:grid-cols-3">
                         {pendingSignals.slice(0, 6).map((entry) => (
                             <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`} className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                {(() => {
+                                    const rawDecisionCode = String(entry.decisionCode || entry.waitReason || 'PENDING__WAIT');
+                                    const decisionLabel = translateReason(rawDecisionCode);
+                                    const decisionTooltip = [
+                                        getReasonTooltip(rawDecisionCode),
+                                        rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
+                                    ].filter(Boolean).join('\n');
+                                    return (
+                                        <>
                                 <div className="flex items-center justify-between gap-2">
                                     <div className="flex items-center gap-2">
                                         <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${entry.signalAction === 'LONG' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
@@ -741,10 +686,13 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                         </div>
                                     </div>
                                     <div>
-                                        <div className="text-slate-500">Karar</div>
-                                        <div className="text-slate-300">{entry.decisionCode || 'PENDING__WAIT'}</div>
+                                        <div className="text-slate-500">Durum</div>
+                                        <div className="text-slate-300" title={decisionTooltip}>{decisionLabel}</div>
                                     </div>
                                 </div>
+                                        </>
+                                    );
+                                })()}
                             </div>
                         ))}
                     </div>

@@ -1,6 +1,6 @@
 /**
- * Phase 232: Single-source reason mapping for trade close reasons.
- * Used by both App.tsx (trade tab) and PerformanceDashboard.tsx (performance tab).
+ * Single-source reason and decision mapping used across the UI.
+ * Keeps backend canonical codes intact while showing Turkish operator-facing text.
  */
 
 // Canonical close reason → Turkish display string
@@ -80,6 +80,96 @@ const REASON_MAP: Record<string, string> = {
     'EXTERNAL': '🔗 Harici: Binance\'den Manuel Kapatma',
     'External Close (Binance)': '🔗 Harici: Binance\'den Kapatıldı',
     'Binance PnL': '💰 Binance: Gerçekleşen PnL',
+
+    // ===== SIGNAL / EXECUTION PIPELINE =====
+    'PRECHECK__RECOVERY_COOLDOWN': '⏸️ Ön Kontrol: Toparlanma bekleme süresi aktif',
+    'PRECHECK__SHOCK_BLOCK': '⚡ Ön Kontrol: Şok koruması nedeniyle bloklandı',
+    'PRECHECK__PROTECTION_BLOCK': '🛡️ Ön Kontrol: Koruma kilidi aktif',
+    'PRECHECK__PASS': '✅ Ön Kontrol Geçildi',
+    'MACRO__BTC_FILTER_BLOCK': '🌐 Makro: BTC filtresi nedeniyle engellendi',
+    'MACRO__REGIME_BLOCKED': '🌐 Makro: Rejim bu sinyale izin vermiyor',
+    'MACRO__DCA_CONFLICT_BLOCK': '🌐 Makro: DCA kararıyla çelişti',
+    'MACRO__MA_ALIGNMENT_VETO': '🌐 Makro: MA hizası sinyali veto etti',
+    'MACRO__MTF_REJECT': '🌐 Makro: Çoklu zaman dilimi uyumsuz',
+    'MACRO__GATES_PASS': '✅ Makro filtreler geçildi',
+    'MICRO__THIN_BOOK_REJECT': '📚 Mikro: Emir defteri çok ince',
+    'MICRO__OBI_VETO': '📚 Mikro: Emir defteri dengesi ters',
+    'MICRO__OBI_NEUTRAL_LOW_VOL': '📚 Mikro: Nötr OBI + düşük hacim',
+    'MICRO__TRADEABILITY_REJECT': '📚 Mikro: İşlenebilirlik yetersiz',
+    'MICRO__GATES_PASS': '✅ Mikro filtreler geçildi',
+    'EXEC__EXISTING_POSITION_SIGNAL_REFRESH': '🔁 Execution: Mevcut pozisyon sinyali yenilendi',
+    'EXEC__FLIP_STORM_COOLDOWN': '⏳ Execution: Flip storm cooldown aktif',
+    'EXEC__COUNTER_FLIP_EXISTING_POS': '↔️ Execution: Ters sinyal mevcut pozisyona takıldı',
+    'EXEC__COUNTER_PENDING': '↔️ Execution: Ters yönde pending zaten var',
+    'EXEC__REENTRY_LIMIT': '🚫 Execution: Tekrar giriş limiti doldu',
+    'EXEC__REENTRY_COOLDOWN': '⏳ Execution: Tekrar giriş bekleme süresi aktif',
+    'EXEC__EXISTING_POSITION': '🚫 Execution: Aynı sembolde pozisyon açık',
+    'EXEC__MAX_POSITIONS': '🚫 Execution: Maksimum pozisyon sayısı dolu',
+    'EXEC__DIRECTION_EXPOSURE': '🚫 Execution: Aynı yön maruziyet limiti dolu',
+    'EXEC__CLUSTER_CAP': '🚫 Execution: Korelasyon küme limiti dolu',
+    'EXEC__BLACKLISTED': '🚫 Execution: Coin kara listede',
+    'EXEC__EV_HARD_BLOCK': '🚫 Execution: Beklenen değer yetersiz',
+    'EXEC__FINAL_SCORE_BELOW_MIN': '🚫 Execution: Final skor minimum eşiğin altında',
+    'EXEC__EXECUTABLE_SIGNAL': '✅ İşlenebilir sinyal hazır',
+    'EXEC__ENTRY_STOP_TOO_WIDE': '🚫 Execution: Planlanan stop çok geniş',
+    'EXEC__ENTRY_STOP_WIDE_SCORE_LOW': '⚠️ Execution: Geniş stop var, skor yetersiz',
+    'EXEC__ENTRY_STOP_WIDE_EXEC_LOW': '⚠️ Execution: Geniş stop var, execution kalitesi düşük',
+
+    // ===== PENDING =====
+    'PENDING__CREATED': '🕒 Bekleyen giriş oluşturuldu',
+    'PENDING__WAIT': '🕒 Giriş fırsatı bekleniyor',
+    'PENDING__EXPIRED': '⌛ Bekleyen giriş süresi doldu',
+    'PENDING__STALE_SCORE_DROP': '📉 Bekleyen sinyal skoru zamanla düştü',
+    'PENDING__STALE_SIGNAL': '📉 Bekleyen sinyal bayatladı',
+    'PENDING__SCORE_BELOW_MIN': '📉 Bekleyen sinyal minimum skorun altına indi',
+    'PENDING__SIGNAL_MISSED_ENTRY': '🏃 Giriş bölgesi kaçırıldı',
+    'PENDING__DUPLICATE_POSITION': '🚫 Aynı sembolde pozisyon/pending zaten var',
+    'PENDING__WAIT_CONFIRM': '⏳ Onay süresi bekleniyor',
+    'WAIT_CONFIRM': '⏳ Onay süresi bekleniyor',
+    'signal_confirmed': '✅ Sinyal onaylandı',
+    'waiting_confirmation_delay': '⏳ Onay gecikmesi bekleniyor',
+    'waiting_entry_touch': '🎯 Fiyatın giriş seviyesine gelmesi bekleniyor',
+    'aged_confirmed_waiting_near_entry_opportunity': '🎯 Onaylı pending için yakın giriş fırsatı bekleniyor',
+    'waiting_trailing_reversal': '🔄 Ters dönüş teyidi bekleniyor',
+    'recheck_backoff': '⏳ Tekrar kontrol için kısa bekleme',
+    'ENTRY_SCORE_LOW': '📉 Entry execution skoru düşük, beklemede',
+    'BLOCK_OPEN_DRIFT': '🌪️ Fiyat kayması yüksek, beklemede',
+    'BLOCK_OPEN_STALE_BBO': '📡 Emir defteri verisi eski, beklemede',
+    'BLOCK_OPEN_SPREAD': '↔️ Makas yüksek, beklemede',
+    'BLOCK_OPEN_INVALID_BBO': '📡 Emir defteri verisi geçersiz, beklemede',
+    'ENTRY_RECHECK_FAIL': '🚫 Tekrar kontrolde giriş reddedildi',
+    'PENDING_REINFORCED': '🔁 Bekleyen giriş güçlendirildi',
+};
+
+const REASON_TOOLTIP_MAP: Record<string, string> = {
+    'PENDING__WAIT': 'Sinyal işlenebilir bulundu ancak giriş için uygun fiyat/koşul henüz oluşmadı.',
+    'PENDING__CREATED': 'Bekleyen giriş emri oluşturuldu ve izlenmeye başlandı.',
+    'PENDING__STALE_SCORE_DROP': 'Bekleyen emrin skoru zaman geçtikçe düştü; sistem yeniden değerlendiriyor.',
+    'PENDING__STALE_SIGNAL': 'Bekleyen sinyal yaşlandı ve artık yeterince güçlü görülmüyor.',
+    'PENDING__SIGNAL_MISSED_ENTRY': 'Fiyat giriş bölgesinden uzaklaştı; fırsat kaçmış kabul edildi.',
+    'waiting_confirmation_delay': 'İlk teyit süresi dolmadan işlem açılmıyor.',
+    'waiting_entry_touch': 'Fiyatın hedef giriş seviyesine veya uygun giriş bandına gelmesi bekleniyor.',
+    'aged_confirmed_waiting_near_entry_opportunity': 'Uzun süredir bekleyen onaylı pending için hâlâ uygun yakın giriş aranıyor.',
+    'waiting_trailing_reversal': 'Ters dönüş teyidi veya trail tabanlı giriş şartı bekleniyor.',
+    'recheck_backoff': 'Kısa süre sonra yeniden kontrol edilmek üzere beklemede.',
+    'ENTRY_SCORE_LOW': 'Emir defteri ve microstructure kalitesi şu an giriş için yeterli değil.',
+    'BLOCK_OPEN_DRIFT': 'Beklenen giriş fiyatı ile güncel fiyat arasında fazla kayma var.',
+    'BLOCK_OPEN_SPREAD': 'Spread çok yüksek olduğu için giriş kalitesi korunuyor.',
+    'EXEC__EXECUTABLE_SIGNAL': 'Bu sinyal tüm ana filtreleri geçti ve işlenebilir durumda.',
+};
+
+const normalizeCode = (reason: string | undefined): string => {
+    if (!reason) return '';
+    const raw = String(reason).trim();
+    if (!raw) return '';
+    const codePart = raw.split(/[:|]/)[0] || raw;
+    return codePart.trim().toUpperCase();
+};
+
+export const getReasonTooltip = (reason: string | undefined): string => {
+    const normalized = normalizeCode(reason);
+    if (!normalized) return '';
+    return REASON_TOOLTIP_MAP[normalized] || REASON_MAP[normalized] || reason || '';
 };
 
 /**
@@ -88,6 +178,10 @@ const REASON_MAP: Record<string, string> = {
  */
 export const translateReason = (reason: string | undefined): string => {
     if (!reason) return '-';
+    const normalized = normalizeCode(reason);
+    if (normalized && REASON_MAP[normalized]) {
+        return REASON_MAP[normalized];
+    }
 
     // Phase 138 detailed reason (emoji prefix) — already formatted
     if (reason.includes('🔴 SL:') || reason.includes('🟢 TP:') || reason.includes('📈 TRAIL:') ||
