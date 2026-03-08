@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter } from 'lucide-react';
 import { CoinOpportunity } from '../types';
+import { buildDisplayActiveSignals } from '../utils/activeSignalsUtils';
 
 interface ActiveSignalsPanelProps {
     signals: any[]; // Phase 259: Accepts persistentSignals (or opportunities fallback)
@@ -417,42 +418,8 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     const [sortAsc, setSortAsc] = useState(false);
     const [qualityFilter, setQualityFilter] = useState<QualityFilter>('all');
 
-    // Phase 259: Merge persistent signal with live opportunity telemetry
-    const enrichedSignals = signals.map(sig => {
-        // If it's already a full opportunity (fallback mode), use it directly
-        if (sig.price !== undefined && !sig.state) return sig;
-
-        // Find matching live opportunity for real-time telemetry
-        const liveOpp = opportunities.find(o => o.symbol === sig.symbol) || {} as any;
-
-        // P0: Price fallback chain — liveOpp > persistent snapshot > 0
-        const resolvedPrice = liveOpp.price || sig.lastPrice || sig.price || 0;
-
-        // Merge: Persistent state is king, liveOpp provides telemetry (prices, indicators)
-        return {
-            ...liveOpp, // Base telemetry
-            ...sig,     // Override with persistent state (symbol, signalAction, signalScore, etc.)
-            // Ensure essential UI fields have a fallback if liveOpp doesn't exist
-            price: resolvedPrice,
-            spreadPct: liveOpp.spreadPct ?? 0.05,
-            volumeRatio: liveOpp.volumeRatio ?? 1.0,
-            zscore: liveOpp.zscore ?? 0,
-            hurst: liveOpp.hurst ?? 0,
-            leverage: liveOpp.leverage || sig.leverage || 10,
-            lastSignalTime: sig.lastRefreshTs || liveOpp.lastSignalTime || (Date.now() / 1000),
-            // P0: Carry enriched snapshot fields through
-            entryPriceBackend: liveOpp.entryPriceBackend || sig.entryPriceBackend || 0,
-            strategyMode: liveOpp.strategyMode || sig.strategyMode || '',
-            entryQualityPass: liveOpp.entryQualityPass ?? sig.entryQualityPass ?? false,
-            entryQualityReasons: liveOpp.entryQualityReasons || sig.entryQualityReasons || [],
-            executionRejectReason: liveOpp.executionRejectReason || sig.executionRejectReason || '',
-            qualitySizeMult: liveOpp.qualitySizeMult ?? sig.qualitySizeMult,
-            qualityLeverageCap: liveOpp.qualityLeverageCap ?? sig.qualityLeverageCap,
-        } as CoinOpportunity;
-    });
-
-    const activeSignals = enrichedSignals
-        .filter(s => s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.state === 'ACTIVE'))
+    const allSignals = buildDisplayActiveSignals(signals, opportunities, minConfidenceScore);
+    const activeSignals = allSignals
         .filter(s => {
             switch (qualityFilter) {
                 case 'eq_pass': return s.entryQualityPass === true;
@@ -506,7 +473,6 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     );
 
     // Count for filter badges
-    const allSignals = enrichedSignals.filter(s => s.signalAction !== 'NONE' && (s.signalScore >= minConfidenceScore || s.state === 'ACTIVE'));
     const eqCount = allSignals.filter(s => s.entryQualityPass).length;
     const fibCount = allSignals.filter(s => s.fibActive).length;
     const volCount = allSignals.filter(s => s.isVolumeSpike).length;

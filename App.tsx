@@ -13,6 +13,7 @@ import {
 } from './types';
 import { formatPrice, formatCurrency, getPositionMargin } from './utils';
 import { translateReason, getCanonicalReason } from './utils/reasonUtils';
+import { buildDisplayActiveSignals } from './utils/activeSignalsUtils';
 import { SettingsModal } from './components/SettingsModal';
 import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
@@ -545,6 +546,15 @@ export default function App() {
   const handleKillSwitch = useCallback((actions: any) => {
     addLog(`🚨 Acil Durdurma: Azaltılan=${actions.reduced?.length || 0}, Kapatılan=${actions.closed?.length || 0}`);
   }, [addLog]);
+
+  const displayActiveSignals = buildDisplayActiveSignals(
+    persistentSignals || [],
+    opportunities || [],
+    settings.minConfidenceScore || 40
+  );
+  const displayLongSignals = displayActiveSignals.filter(s => s.signalAction === 'LONG').length;
+  const displayShortSignals = displayActiveSignals.filter(s => s.signalAction === 'SHORT').length;
+  const displaySignalCount = displayActiveSignals.length;
 
   const handleWsLog = useCallback((message: string) => {
     addLog(`☁️ ${message}`);
@@ -1505,10 +1515,10 @@ export default function App() {
                 <span className="text-slate-600">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span> Varlık
               </span>
               <span className="text-emerald-400">
-                🟢 <span className="font-bold">{scannerStats.currentLongSignals ?? scannerStats.longSignals}</span>
+                🟢 <span className="font-bold">{displayLongSignals}</span>
               </span>
               <span className="text-rose-400">
-                🔴 <span className="font-bold">{scannerStats.currentShortSignals ?? scannerStats.shortSignals}</span>
+                🔴 <span className="font-bold">{displayShortSignals}</span>
               </span>
               {lastUpdateTime && (
                 <span className="text-slate-500 border-l border-slate-700 pl-3">
@@ -1594,7 +1604,7 @@ export default function App() {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
-          signalCount={(persistentSignals || []).filter(s => s.signalAction !== 'NONE' && s.state === 'ACTIVE').length}
+          signalCount={displaySignalCount}
           aiTrackingCount={optimizerStats.trackingCount}
         />
 
@@ -1606,11 +1616,11 @@ export default function App() {
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
-            <span className="text-sm font-bold text-emerald-400">{scannerStats.currentLongSignals ?? scannerStats.longSignals}</span>
+            <span className="text-sm font-bold text-emerald-400">{displayLongSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Kısa</span>
-            <span className="text-sm font-bold text-rose-400">{scannerStats.currentShortSignals ?? scannerStats.shortSignals}</span>
+            <span className="text-sm font-bold text-rose-400">{displayShortSignals}</span>
           </div>
           <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
             <span className="text-[10px] text-slate-500 uppercase">Pozisyon</span>

@@ -596,122 +596,144 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
           <div className={isLocked ? 'opacity-50 pointer-events-none' : ''}>
             <h3 className="text-sm font-semibold text-rose-400 uppercase tracking-wider mb-4 flex items-center gap-2">
               <ShieldAlert className="w-4 h-4" />
-              Acil Durdurma (Pozisyon Koruma)
+              Zarar Koruma Hiyerarşisi (ROI)
             </h3>
 
             <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 space-y-4">
               <p className="text-[10px] text-slate-500 mb-3">
-                🛡️ Pozisyon başına kaldıraçlı ROI zarar limitleri. Eşikler artık doğrudan ROI bazlıdır; ayrıca kaldıraçla yeniden ölçeklenmez.
+                🛡️ Tüm eşikler kaldıraçlı ROI yüzdesiyle yorumlanır. Burada iki ayrı katman var: <span className="text-amber-300">giriş filtresi</span> ve <span className="text-rose-300">açık pozisyon koruması</span>.
               </p>
 
-              <div className="rounded-lg border border-slate-700/50 bg-slate-900/40 p-3 space-y-3">
-                <div className="text-[10px] uppercase tracking-wider text-slate-400">Entry Stop Gate</div>
-                <div>
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="text-sm text-slate-300">Soft Band</label>
-                    <span className="text-sm font-mono text-amber-300">
-                      %{localSettings.entryStopSoftRoiPct ?? -200}
-                    </span>
+              <div className="grid gap-4 lg:grid-cols-2">
+                <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-amber-300">1. Giriş Filtresi</div>
+                      <div className="text-[11px] text-slate-400 mt-1">Pozisyon açılmadan önce değerlendirilir</div>
+                    </div>
+                    <div className="text-[10px] px-2 py-1 rounded-full bg-slate-900/70 text-amber-200 border border-amber-500/20">
+                      Açılmadan Önce
+                    </div>
                   </div>
-                  <input
-                    type="range"
-                    min="-250"
-                    max="-80"
-                    step="10"
-                    value={localSettings.entryStopSoftRoiPct ?? -200}
-                    onChange={e => setLocalSettings({ ...localSettings, entryStopSoftRoiPct: parseInt(e.target.value) })}
-                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-400"
-                  />
-                  <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                    <span>-250% (Çok Geniş)</span>
-                    <span>-80% (Sıkı)</span>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <label className="text-sm text-slate-300">Soft Band</label>
+                      <span className="text-sm font-mono text-amber-300">
+                        %{localSettings.entryStopSoftRoiPct ?? -200}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-250"
+                      max="-80"
+                      step="10"
+                      value={localSettings.entryStopSoftRoiPct ?? -200}
+                      onChange={e => setLocalSettings({ ...localSettings, entryStopSoftRoiPct: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                      <span>-250% (Çok Geniş)</span>
+                      <span>-80% (Sıkı)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Planlanan teknik stop bu bandın altına düşerse giriş veto edilmez; pozisyon küçültülür, skor ve exec eşiği sıkılaşır.
+                    </p>
                   </div>
-                  <p className="text-[10px] text-slate-400 mt-1">
-                    Stop ROI bu bandı aşarsa giriş küçültülür, skor ve exec eşiği sıkılaşır
-                  </p>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <label className="text-sm text-slate-300">Hard Band</label>
+                      <span className="text-sm font-mono text-rose-300">
+                        %{localSettings.entryStopHardRoiPct ?? -250}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-320"
+                      max="-120"
+                      step="10"
+                      value={localSettings.entryStopHardRoiPct ?? -250}
+                      onChange={e => setLocalSettings({ ...localSettings, entryStopHardRoiPct: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-400"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                      <span>-320% (Çok Geniş)</span>
+                      <span>-120% (Sıkı)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Planlanan teknik stop bu sınırın da altındaysa pozisyon hiç açılmaz.
+                    </p>
+                  </div>
                 </div>
 
-                <div>
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="text-sm text-slate-300">Hard Band</label>
-                    <span className="text-sm font-mono text-rose-300">
-                      %{localSettings.entryStopHardRoiPct ?? -250}
-                    </span>
+                <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-rose-300">2. Açık Pozisyon Koruma</div>
+                      <div className="text-[11px] text-slate-400 mt-1">Pozisyon açıldıktan sonra çalışır</div>
+                    </div>
+                    <div className="text-[10px] px-2 py-1 rounded-full bg-slate-900/70 text-rose-200 border border-rose-500/20">
+                      Açıldıktan Sonra
+                    </div>
                   </div>
-                  <input
-                    type="range"
-                    min="-320"
-                    max="-120"
-                    step="10"
-                    value={localSettings.entryStopHardRoiPct ?? -250}
-                    onChange={e => setLocalSettings({ ...localSettings, entryStopHardRoiPct: parseInt(e.target.value) })}
-                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-400"
-                  />
-                  <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                    <span>-320% (Çok Geniş)</span>
-                    <span>-120% (Sıkı)</span>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <label className="text-sm text-slate-300">İlk Azaltma Eşiği</label>
+                      <span className="text-sm font-mono text-orange-400">
+                        %{localSettings.killSwitchFirstReduction || -100}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-200"
+                      max="-30"
+                      step="10"
+                      value={localSettings.killSwitchFirstReduction || -100}
+                      onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                      <span>-200% (Gevşek)</span>
+                      <span>-30% (Sıkı)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Pozisyon bu zarara yaklaşınca %50 küçültülür. Gerçek tetik, bu değer ile teknik stopun %60 derinliğinden daha sıkı olan seviyedir.
+                    </p>
                   </div>
-                  <p className="text-[10px] text-slate-400 mt-1">
-                    Planlanan teknik stop bu sınırın altındaysa pozisyon hiç açılmaz
-                  </p>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <label className="text-sm text-slate-300">Tam Kapanış Eşiği</label>
+                      <span className="text-sm font-mono text-rose-400">
+                        %{localSettings.killSwitchFullClose || -150}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-250"
+                      max="-80"
+                      step="10"
+                      value={localSettings.killSwitchFullClose || -150}
+                      onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                      <span>-250% (Gevşek)</span>
+                      <span>-80% (Sıkı)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Bu eşik her pozisyonda aktif değildir. Sadece teknik stop hard bandın ötesine taşıyorsa tam kapanış cap’i olarak devreye girer; aksi halde tam kapanışı teknik SL yapar.
+                    </p>
+                  </div>
                 </div>
               </div>
 
-              {/* First Reduction Threshold */}
-              <div>
-                <div className="flex justify-between items-center mb-2">
-                  <label className="text-sm text-slate-300">İlk Azaltma Eşiği</label>
-                  <span className="text-sm font-mono text-orange-400">
-                    %{localSettings.killSwitchFirstReduction || -100}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="-200"
-                  max="-30"
-                  step="10"
-                  value={localSettings.killSwitchFirstReduction || -100}
-                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFirstReduction: parseInt(e.target.value) })}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-200% (Gevşek)</span>
-                  <span>-30% (Sıkı)</span>
-                </div>
-                <p className="text-[10px] text-slate-400 mt-1">
-                  Pozisyon bu zarara ulaşınca %50 küçültülür
-                </p>
-              </div>
-
-              {/* Full Close Threshold */}
-              <div>
-                <div className="flex justify-between items-center mb-2">
-                  <label className="text-sm text-slate-300">Tam Kapanış Eşiği</label>
-                  <span className="text-sm font-mono text-rose-400">
-                    %{localSettings.killSwitchFullClose || -150}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="-250"
-                  max="-80"
-                  step="10"
-                  value={localSettings.killSwitchFullClose || -150}
-                  onChange={e => setLocalSettings({ ...localSettings, killSwitchFullClose: parseInt(e.target.value) })}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                  <span>-250% (Gevşek)</span>
-                  <span>-80% (Sıkı)</span>
-                </div>
-                <p className="text-[10px] text-slate-400 mt-1">
-                  Teknik stop hard bandın ötesine taşıyorsa bu ROI seviyesinde tamamen kapatılır
-                </p>
-              </div>
-
-              {/* Dynamic Threshold Info */}
-              <div className="bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
-                <span className="text-amber-400">⚡ ROI Standardı:</span> Açık pozisyon koruması ve UI yüzdeleri kaldıraçlı ROI üzerinden yorumlanır
+              <div className="bg-slate-900/50 p-3 rounded text-[10px] text-slate-400 space-y-1">
+                <div><span className="text-amber-400">Akış:</span> Soft Band → küçültülmüş giriş, Hard Band → veto.</div>
+                <div><span className="text-rose-400">Açık pozisyon:</span> İlk azaltma → gerekirse tam kapanış cap’i → teknik SL / emergency.</div>
+                <div><span className="text-cyan-400">ROI standardı:</span> Açık pozisyon koruması ve UI yüzdeleri kaldıraçlı ROI üzerinden yorumlanır.</div>
               </div>
             </div>
           </div>
