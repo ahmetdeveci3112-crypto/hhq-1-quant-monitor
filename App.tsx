@@ -566,15 +566,29 @@ export default function App() {
     opportunities || [],
     settings.minConfidenceScore || 40
   );
-  const actionableSignalCount = displayActiveSignals.length + (pendingEntries?.length || 0);
-  const displayLongSignals = displayActiveSignals.filter(s => s.signalAction === 'LONG').length;
-  const displayShortSignals = displayActiveSignals.filter(s => s.signalAction === 'SHORT').length;
+
+  // Phase UI-Redesign: Centralized signal counts — single source of truth
+  const signalCounts = {
+    executable: displayActiveSignals.length,
+    pending: (pendingEntries?.length || 0),
+    pendingConfirmed: (pendingEntries || []).filter((e: any) => e.confirmed).length,
+    pendingUnconfirmed: (pendingEntries || []).filter((e: any) => !e.confirmed).length,
+    actionable: displayActiveSignals.length + (pendingEntries?.length || 0),
+    longTotal: displayActiveSignals.filter(s => s.signalAction === 'LONG').length
+      + (pendingEntries || []).filter((e: any) => e.signalAction === 'LONG').length,
+    shortTotal: displayActiveSignals.filter(s => s.signalAction === 'SHORT').length
+      + (pendingEntries || []).filter((e: any) => e.signalAction === 'SHORT').length,
+  };
+  const actionableSignalCount = signalCounts.actionable;
+  const displayLongSignals = signalCounts.longTotal;
+  const displayShortSignals = signalCounts.shortTotal;
   const displaySignalCount = displayActiveSignals.length;
   const actionableSymbols = new Set<string>([
     ...displayActiveSignals.map((signal: any) => String(signal.symbol || '')),
     ...(pendingEntries || []).map((entry: any) => String(entry.symbol || '')),
   ].filter(Boolean));
-  const passiveOpportunityCount = (opportunities || []).filter((opp: any) => !actionableSymbols.has(String(opp.symbol || ''))).length;
+  // Phase UI-Redesign Fix 1: Badge = all remaining (not just passive)
+  const remainingOpportunityCount = (opportunities || []).filter((opp: any) => !actionableSymbols.has(String(opp.symbol || ''))).length;
 
   const handleWsLog = useCallback((message: string) => {
     addLog(`☁️ ${message}`);
@@ -1631,8 +1645,9 @@ export default function App() {
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
           signalCount={actionableSignalCount}
-          opportunitiesCount={passiveOpportunityCount}
+          opportunitiesCount={remainingOpportunityCount}
           aiTrackingCount={optimizerStats.trackingCount}
+          pendingConfirmedCount={signalCounts.pendingConfirmed}
         />
 
         {/* Scanner Stats - Always visible compact bar */}
@@ -2271,6 +2286,7 @@ export default function App() {
                 entryTightness={settings.entryTightness}
                 minConfidenceScore={settings.minConfidenceScore || 40}
                 priceFlashMap={signalPriceFlash}
+                signalCounts={signalCounts}
               />
             </div>
           )

@@ -147,15 +147,232 @@ const REASON_TOOLTIP_MAP: Record<string, string> = {
     'PENDING__STALE_SCORE_DROP': 'Bekleyen emrin skoru zaman geçtikçe düştü; sistem yeniden değerlendiriyor.',
     'PENDING__STALE_SIGNAL': 'Bekleyen sinyal yaşlandı ve artık yeterince güçlü görülmüyor.',
     'PENDING__SIGNAL_MISSED_ENTRY': 'Fiyat giriş bölgesinden uzaklaştı; fırsat kaçmış kabul edildi.',
+    'PENDING__SCORE_BELOW_MIN': 'Pending sinyalin skoru minimum eşiğin altına düştü.',
+    'PENDING__DUPLICATE_POSITION': 'Aynı sembolde zaten açık pozisyon veya pending emir var.',
+    'PENDING__EXPIRED': 'Bekleyen emrin geçerlilik süresi doldu.',
+    'PENDING__WAIT_CONFIRM': 'Teyit süresi dolmadan işlem açılmıyor; onay bekleniyor.',
     'waiting_confirmation_delay': 'İlk teyit süresi dolmadan işlem açılmıyor.',
     'waiting_entry_touch': 'Fiyatın hedef giriş seviyesine veya uygun giriş bandına gelmesi bekleniyor.',
     'aged_confirmed_waiting_near_entry_opportunity': 'Uzun süredir bekleyen onaylı pending için hâlâ uygun yakın giriş aranıyor.',
     'waiting_trailing_reversal': 'Ters dönüş teyidi veya trail tabanlı giriş şartı bekleniyor.',
     'recheck_backoff': 'Kısa süre sonra yeniden kontrol edilmek üzere beklemede.',
+    'signal_confirmed': 'Sinyal onaylandı ve giriş koşulları aranıyor.',
     'ENTRY_SCORE_LOW': 'Emir defteri ve microstructure kalitesi şu an giriş için yeterli değil.',
     'BLOCK_OPEN_DRIFT': 'Beklenen giriş fiyatı ile güncel fiyat arasında fazla kayma var.',
     'BLOCK_OPEN_SPREAD': 'Spread çok yüksek olduğu için giriş kalitesi korunuyor.',
+    'BLOCK_OPEN_STALE_BBO': 'Emir defterinden gelen veriler eski; güncel veri bekleniyor.',
+    'BLOCK_OPEN_INVALID_BBO': 'Emir defterinden gelen veriler geçersiz; güvenilir veri bekleniyor.',
+    'ENTRY_RECHECK_FAIL': 'Tekrar kontrolde giriş koşulları karşılanmadı.',
+    'PENDING_REINFORCED': 'Bekleyen emrin sinyali yeniden teyit edildi ve güçlendirildi.',
+
+    // Phase UI-Redesign Fix 4: Wait state codes from backend (main.py L31668-31686)
+    'recheck_wait': 'Giriş koşulları tekrar kontrol edilmek üzere bekleniyor.',
+    'confirm_wait': 'Sinyal onay süresi dolmadan işlem açılmıyor.',
+    'trail_reversal_wait': 'Ters dönüş teyidi veya trail tabanlı giriş şartı bekleniyor.',
+    'entry_touch_wait': 'Fiyatın belirlenmiş giriş seviyesine temas etmesi bekleniyor.',
+    'aged_entry_touch_wait': 'Uzun süredir bekleyen onaylı pending için yakın giriş fırsatı aranıyor.',
+    'expiring_soon': 'Bekleyen emrin süresi dolmak üzere.',
     'EXEC__EXECUTABLE_SIGNAL': 'Bu sinyal tüm ana filtreleri geçti ve işlenebilir durumda.',
+    'EXEC__EXISTING_POSITION': 'Bu sembolde zaten açık bir pozisyon var.',
+    'EXEC__MAX_POSITIONS': 'Sistemdeki azami eş zamanlı pozisyon sayısına ulaşıldı.',
+    'EXEC__DIRECTION_EXPOSURE': 'Aynı yönde çok fazla açık pozisyon var; maruziyet limiti doldu.',
+    'EXEC__CLUSTER_CAP': 'Birbiriyle korelasyonlu coinlerde küme limiti dolu.',
+    'EXEC__BLACKLISTED': 'Bu coin kara listeye alınmış durumda.',
+    'EXEC__EV_HARD_BLOCK': 'Beklenen değer (EV) hesabı bu sinyali engelliyor.',
+    'EXEC__FINAL_SCORE_BELOW_MIN': 'Tüm ağırlıklar hesaplandıktan sonra skor minimum eşiğin altında kaldı.',
+    'EXEC__REENTRY_LIMIT': 'Bu sembol için tekrar giriş sayısı limitine ulaşıldı.',
+    'EXEC__REENTRY_COOLDOWN': 'Önceki çıkıştan sonraki bekleme süresi henüz dolmadı.',
+    'EXEC__FLIP_STORM_COOLDOWN': 'Hızlı yön değişimi (flip storm) tespit edildi; bekleme süresi aktif.',
+    'EXEC__COUNTER_FLIP_EXISTING_POS': 'Ters yönlü sinyal mevcut açık pozisyona çelişiyor.',
+    'EXEC__COUNTER_PENDING': 'Ters yönde bekleyen emir zaten var.',
+    'EXEC__ENTRY_STOP_TOO_WIDE': 'Giriş fiyatı ile stop loss arası çok geniş; risk/ödül uygun değil.',
+    'EXEC__ENTRY_STOP_WIDE_SCORE_LOW': 'Stop mesafesi geniş ve sinyal skoru bu genişliği dengeleyecek seviyede değil.',
+    'EXEC__ENTRY_STOP_WIDE_EXEC_LOW': 'Stop mesafesi geniş ve emir defteri kalitesi yetersiz.',
+    'EXEC__EXISTING_POSITION_SIGNAL_REFRESH': 'Mevcut pozisyonun sinyali yenilendi; yeni giriş gerekmiyor.',
+    'PRECHECK__RECOVERY_COOLDOWN': 'Portfolio toparlanma sonrası bekleme süresi aktif.',
+    'PRECHECK__SHOCK_BLOCK': 'Ani piyasa şoku algılandı; yeni giriş bloklandı.',
+    'PRECHECK__PROTECTION_BLOCK': 'Koruma mekanizması aktif; yeni giriş bloklandı.',
+    'PRECHECK__PASS': 'Ön kontrol aşaması başarıyla geçildi.',
+    'MACRO__BTC_FILTER_BLOCK': 'BTC\'nin mevcut durumu bu yönde giriş yapmaya uygun değil.',
+    'MACRO__REGIME_BLOCKED': 'Piyasa rejimi bu sinyal tipine izin vermiyor.',
+    'MACRO__DCA_CONFLICT_BLOCK': 'DCA stratejisi ile yeni sinyal arasında çelişki tespit edildi.',
+    'MACRO__MA_ALIGNMENT_VETO': 'Hareketli ortalamalar bu yönde pozisyon açılmasını desteklemiyor.',
+    'MACRO__MTF_REJECT': 'Farklı zaman dilimlerinden gelen sinyaller tutarsız.',
+    'MACRO__GATES_PASS': 'Makro seviyedeki tüm filtreler başarıyla geçildi.',
+    'MICRO__THIN_BOOK_REJECT': 'Emir defteri derinliği bu coin için yeterli değil; likidite riski yüksek.',
+    'MICRO__OBI_VETO': 'Emir defterindeki alım/satım dengesi sinyal yönüne ters.',
+    'MICRO__OBI_NEUTRAL_LOW_VOL': 'Emir defteri nötr ve hacim düşük; güvenilir giriş yapılamaz.',
+    'MICRO__TRADEABILITY_REJECT': 'Genel işlenebilirlik skoru yetersiz (spread + derinlik + hacim).',
+    'MICRO__GATES_PASS': 'Mikro seviyedeki tüm filtreler başarıyla geçildi.',
+};
+
+// ============================================================================
+// Phase UI-Redesign: 3-Layer Reason Info System
+// ============================================================================
+
+export type ReasonCategory = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
+
+export interface ReasonInfo {
+    label: string;          // Short label (badge/card) — max ~20 chars
+    description: string;    // 1 sentence explanation — tooltip first line
+    category: ReasonCategory;
+    icon: string;           // Emoji
+}
+
+const REASON_INFO_MAP: Record<string, ReasonInfo> = {
+    // ===== EXECUTABLE =====
+    'EXEC__EXECUTABLE_SIGNAL': { label: 'İşleme hazır', description: 'Sinyal tüm filtreleri geçti ve işlenebilir durumda.', category: 'success', icon: '✅' },
+
+    // ===== PENDING =====
+    'PENDING__CREATED': { label: 'Emir oluşturuldu', description: 'Bekleyen giriş emri oluşturuldu ve izlenmeye başlandı.', category: 'warning', icon: '🕒' },
+    'PENDING__WAIT': { label: 'Giriş bekleniyor', description: 'Uygun giriş fırsatı aranıyor.', category: 'warning', icon: '🕒' },
+    'PENDING__WAIT_CONFIRM': { label: 'Onay bekleniyor', description: 'Teyit süresi dolmadan giriş yapılmıyor.', category: 'warning', icon: '⏳' },
+    'WAIT_CONFIRM': { label: 'Onay bekleniyor', description: 'Teyit süresi dolmadan giriş yapılmıyor.', category: 'warning', icon: '⏳' },
+    'PENDING__EXPIRED': { label: 'Süresi doldu', description: 'Bekleyen emrin geçerlilik süresi doldu.', category: 'neutral', icon: '⌛' },
+    'PENDING__STALE_SCORE_DROP': { label: 'Skor düştü', description: 'Bekleyen sinyalin skoru zaman geçtikçe düştü.', category: 'danger', icon: '📉' },
+    'PENDING__STALE_SIGNAL': { label: 'Sinyal eskidi', description: 'Bekleyen sinyal yaşlandı ve yeterince güçlü değil.', category: 'danger', icon: '📉' },
+    'PENDING__SCORE_BELOW_MIN': { label: 'Skor yetersiz', description: 'Skor minimum eşiğin altına indi.', category: 'danger', icon: '📉' },
+    'PENDING__SIGNAL_MISSED_ENTRY': { label: 'Giriş kaçırıldı', description: 'Fiyat giriş bölgesinden uzaklaştı.', category: 'danger', icon: '🏃' },
+    'PENDING__DUPLICATE_POSITION': { label: 'Zaten var', description: 'Bu sembolde açık pozisyon veya pending zaten var.', category: 'danger', icon: '🚫' },
+
+    // ===== PENDING WAIT REASONS =====
+    'signal_confirmed': { label: 'Sinyal onaylı', description: 'Sinyal onaylandı, giriş koşulları aranıyor.', category: 'success', icon: '✅' },
+    'waiting_confirmation_delay': { label: 'Onay gecikmesi', description: 'İlk teyit süresi dolmadan giriş yapılmıyor.', category: 'warning', icon: '⏳' },
+    'waiting_entry_touch': { label: 'Fiyat bekleniyor', description: 'Fiyatın giriş seviyesine gelmesi bekleniyor.', category: 'warning', icon: '🎯' },
+    'aged_confirmed_waiting_near_entry_opportunity': { label: 'Yakın giriş aranıyor', description: 'Onaylı pending için yakın giriş fırsatı bekleniyor.', category: 'warning', icon: '🎯' },
+    'waiting_trailing_reversal': { label: 'Dönüş bekleniyor', description: 'Ters dönüş teyidi bekleniyor.', category: 'warning', icon: '🔄' },
+    'recheck_backoff': { label: 'Tekrar kontrol', description: 'Kısa süre sonra yeniden kontrol edilecek.', category: 'warning', icon: '⏳' },
+    'ENTRY_SCORE_LOW': { label: 'Kalite düşük', description: 'Microstructure kalitesi giriş için yetersiz.', category: 'danger', icon: '📉' },
+    'BLOCK_OPEN_DRIFT': { label: 'Fiyat kayması', description: 'Beklenen giriş ile güncel fiyat arası çok açık.', category: 'warning', icon: '🌪️' },
+    'BLOCK_OPEN_STALE_BBO': { label: 'Eski veri', description: 'Emir defteri verisi güncellenmedi.', category: 'warning', icon: '📡' },
+    'BLOCK_OPEN_SPREAD': { label: 'Makas geniş', description: 'Spread yüksek, giriş kalitesi korunuyor.', category: 'warning', icon: '↔️' },
+    'BLOCK_OPEN_INVALID_BBO': { label: 'Geçersiz veri', description: 'Emir defteri verisi geçersiz.', category: 'warning', icon: '📡' },
+    'ENTRY_RECHECK_FAIL': { label: 'Kontrol başarısız', description: 'Tekrar kontrolde giriş koşulları karşılanmadı.', category: 'danger', icon: '🚫' },
+    'PENDING_REINFORCED': { label: 'Güçlendirildi', description: 'Bekleyen emrin sinyali yeniden teyit edildi.', category: 'success', icon: '🔁' },
+
+    // ===== BACKEND WAIT STATES (main.py L31668-31686) =====
+    'recheck_wait': { label: 'Tekrar kontrol', description: 'Giriş koşulları tekrar kontrol edilmek üzere bekleniyor.', category: 'warning', icon: '🔄' },
+    'confirm_wait': { label: 'Onay bekleniyor', description: 'Sinyal onay süresi dolmadan işlem açılmıyor.', category: 'warning', icon: '⏳' },
+    'trail_reversal_wait': { label: 'Dönüş bekleniyor', description: 'Ters dönüş teyidi veya trail tabanlı giriş bekleniyor.', category: 'warning', icon: '🔄' },
+    'entry_touch_wait': { label: 'Fiyat bekleniyor', description: 'Fiyatın giriş seviyesine temas etmesi bekleniyor.', category: 'warning', icon: '🎯' },
+    'aged_entry_touch_wait': { label: 'Yakın giriş aranıyor', description: 'Uzun süredir bekleyen onaylı pending için yakın giriş aranıyor.', category: 'warning', icon: '🎯' },
+    'expiring_soon': { label: 'Süresi doluyor', description: 'Bekleyen emrin süresi dolmak üzere.', category: 'danger', icon: '⌛' },
+
+    // ===== PRECHECK =====
+    'PRECHECK__RECOVERY_COOLDOWN': { label: 'Toparlanma bekleme', description: 'Portfolio toparlanma sonrası bekleme süresi aktif.', category: 'warning', icon: '⏸️' },
+    'PRECHECK__SHOCK_BLOCK': { label: 'Şok koruması', description: 'Ani piyasa şoku tespit edildi.', category: 'danger', icon: '⚡' },
+    'PRECHECK__PROTECTION_BLOCK': { label: 'Koruma kilidi', description: 'Koruma mekanizması aktif.', category: 'danger', icon: '🛡️' },
+    'PRECHECK__PASS': { label: 'Ön kontrol geçti', description: 'Ön kontrol aşaması başarıyla geçildi.', category: 'success', icon: '✅' },
+
+    // ===== MACRO =====
+    'MACRO__BTC_FILTER_BLOCK': { label: 'BTC filtresi', description: 'BTC koşulları sinyale izin vermiyor.', category: 'info', icon: '🌐' },
+    'MACRO__REGIME_BLOCKED': { label: 'Rejim uyumsuz', description: 'Piyasa rejimi bu sinyale izin vermiyor.', category: 'info', icon: '🌐' },
+    'MACRO__DCA_CONFLICT_BLOCK': { label: 'DCA çelişkisi', description: 'DCA kararıyla çelişki tespit edildi.', category: 'info', icon: '🌐' },
+    'MACRO__MA_ALIGNMENT_VETO': { label: 'MA hizası ters', description: 'Hareketli ortalamalar sinyali desteklemiyor.', category: 'info', icon: '🌐' },
+    'MACRO__MTF_REJECT': { label: 'MTF uyumsuz', description: 'Çoklu zaman dilimi sinyalleri tutarsız.', category: 'info', icon: '🌐' },
+    'MACRO__GATES_PASS': { label: 'Makro geçti', description: 'Makro filtreler başarıyla geçildi.', category: 'success', icon: '✅' },
+
+    // ===== MICRO =====
+    'MICRO__THIN_BOOK_REJECT': { label: 'İnce defter', description: 'Emir defteri derinliği yetersiz.', category: 'danger', icon: '📚' },
+    'MICRO__OBI_VETO': { label: 'Denge ters', description: 'Emir defteri alım/satım dengesi ters.', category: 'danger', icon: '📚' },
+    'MICRO__OBI_NEUTRAL_LOW_VOL': { label: 'Düşük hacim', description: 'Nötr emir defteri ve düşük hacim.', category: 'danger', icon: '📚' },
+    'MICRO__TRADEABILITY_REJECT': { label: 'İşlenebilirlik yok', description: 'Genel işlenebilirlik skoru yetersiz.', category: 'danger', icon: '📚' },
+    'MICRO__GATES_PASS': { label: 'Mikro geçti', description: 'Mikro filtreler başarıyla geçildi.', category: 'success', icon: '✅' },
+
+    // ===== EXEC BLOCKS =====
+    'EXEC__EXISTING_POSITION': { label: 'Pozisyon açık', description: 'Bu sembolde zaten açık pozisyon var.', category: 'danger', icon: '🚫' },
+    'EXEC__MAX_POSITIONS': { label: 'Pozisyon dolu', description: 'Azami pozisyon sayısına ulaşıldı.', category: 'danger', icon: '🚫' },
+    'EXEC__DIRECTION_EXPOSURE': { label: 'Yön limiti dolu', description: 'Aynı yönde maruziyet limiti doldu.', category: 'danger', icon: '🚫' },
+    'EXEC__CLUSTER_CAP': { label: 'Küme limiti', description: 'Korelasyon küme limiti dolu.', category: 'danger', icon: '🚫' },
+    'EXEC__BLACKLISTED': { label: 'Kara listede', description: 'Bu coin kara listeye alınmış.', category: 'danger', icon: '🚫' },
+    'EXEC__EV_HARD_BLOCK': { label: 'EV yetersiz', description: 'Beklenen değer hesabı yetersiz.', category: 'danger', icon: '🚫' },
+    'EXEC__FINAL_SCORE_BELOW_MIN': { label: 'Skor yetersiz', description: 'Final skor minimum eşiğin altında.', category: 'danger', icon: '🚫' },
+    'EXEC__REENTRY_LIMIT': { label: 'Giriş limiti', description: 'Tekrar giriş sayısı limitine ulaşıldı.', category: 'danger', icon: '🚫' },
+    'EXEC__REENTRY_COOLDOWN': { label: 'Giriş beklemede', description: 'Tekrar giriş bekleme süresi aktif.', category: 'warning', icon: '⏳' },
+    'EXEC__FLIP_STORM_COOLDOWN': { label: 'Flip bekleme', description: 'Hızlı yön değişimi tespit edildi.', category: 'warning', icon: '⏳' },
+    'EXEC__COUNTER_FLIP_EXISTING_POS': { label: 'Ters sinyal', description: 'Ters sinyal mevcut pozisyona çelişiyor.', category: 'danger', icon: '↔️' },
+    'EXEC__COUNTER_PENDING': { label: 'Ters pending', description: 'Ters yönde bekleyen emir var.', category: 'danger', icon: '↔️' },
+    'EXEC__ENTRY_STOP_TOO_WIDE': { label: 'Stop çok geniş', description: 'Giriş ile stop arası çok geniş.', category: 'danger', icon: '🚫' },
+    'EXEC__ENTRY_STOP_WIDE_SCORE_LOW': { label: 'Geniş stop, düşük skor', description: 'Stop geniş ama skor yetersiz.', category: 'danger', icon: '⚠️' },
+    'EXEC__ENTRY_STOP_WIDE_EXEC_LOW': { label: 'Geniş stop, düşük kalite', description: 'Stop geniş ama execution kalitesi düşük.', category: 'danger', icon: '⚠️' },
+    'EXEC__EXISTING_POSITION_SIGNAL_REFRESH': { label: 'Sinyal yenilendi', description: 'Mevcut pozisyonun sinyali yenilendi.', category: 'info', icon: '🔁' },
+};
+
+const DEFAULT_REASON_INFO: ReasonInfo = { label: 'Bilinmiyor', description: '', category: 'neutral', icon: '❓' };
+
+/**
+ * Get structured reason info for a given canonical code.
+ * Falls back to translateReason() for the label if code is not in REASON_INFO_MAP.
+ */
+export const getReasonInfo = (reason: string | undefined): ReasonInfo => {
+    if (!reason) return DEFAULT_REASON_INFO;
+    const normalized = normalizeCode(reason);
+
+    // Direct match
+    if (normalized && REASON_INFO_MAP[normalized]) {
+        return REASON_INFO_MAP[normalized];
+    }
+
+    // Case-sensitive match for lowercase wait reasons
+    const raw = String(reason).trim();
+    if (REASON_INFO_MAP[raw]) {
+        return REASON_INFO_MAP[raw];
+    }
+
+    // Handle compound codes: "recheck_backoff:PENDING__STALE_SCORE_DROP" or "waiting_entry_touch|expiring_soon"
+    if (raw.includes('|')) {
+        const parts = raw.split('|');
+        const base = parts[0].trim();
+        const baseInfo = REASON_INFO_MAP[base] || REASON_INFO_MAP[normalizeCode(base)];
+        const hasExpiring = parts.some(p => p.trim() === 'expiring_soon');
+        if (baseInfo) {
+            return hasExpiring
+                ? { ...baseInfo, label: `${baseInfo.label} ⌛`, description: `${baseInfo.description} Süre dolmak üzere.` }
+                : baseInfo;
+        }
+    }
+    if (raw.startsWith('recheck_backoff:') || raw.startsWith('recheck_backoff|')) {
+        return REASON_INFO_MAP['recheck_wait'] || { label: 'Tekrar kontrol', description: 'Giriş koşulları tekrar kontrol edilmek üzere bekleniyor.', category: 'warning', icon: '🔄' };
+    }
+
+    // Prefix matching for partial codes
+    if (normalized.startsWith('MACRO__')) return { label: 'Makro filtre', description: translateReason(reason), category: 'info', icon: '🌐' };
+    if (normalized.startsWith('MICRO__')) return { label: 'Mikro filtre', description: translateReason(reason), category: 'danger', icon: '📚' };
+    if (normalized.startsWith('EXEC__')) return { label: 'Execution bloğu', description: translateReason(reason), category: 'danger', icon: '🚫' };
+    if (normalized.startsWith('PENDING__')) return { label: 'Beklemede', description: translateReason(reason), category: 'warning', icon: '🕒' };
+    if (normalized.startsWith('PRECHECK__')) return { label: 'Ön kontrol', description: translateReason(reason), category: 'warning', icon: '🛡️' };
+
+    // Fallback: use translateReason for label
+    return { label: translateReason(reason), description: '', category: 'neutral', icon: '❓' };
+};
+
+/**
+ * Get the probable next step for a coin opportunity — used in Adaylar page.
+ * Language intentionally uses "ilerleyebilir" / "yaklaşabilir" instead of definitive future tense.
+ */
+export const getNextStep = (coin: { btcFilterBlocked?: string | null; executionRejectReason?: string | null; entryQualityPass?: boolean; entryExecPassed?: boolean; signalAction?: string }): string => {
+    if (coin.btcFilterBlocked) return 'BTC filtresi geçerse mikro kontrole ilerleyebilir';
+    const rej = coin.executionRejectReason || '';
+    if (rej.startsWith('MACRO__') || rej.includes('MACRO')) return 'Makro koşullar düzelirse mikro kontrole ilerleyebilir';
+    if (rej.startsWith('MICRO__') || rej.includes('MICRO')) return 'Defter güçlenirse işlenebilir duruma yaklaşabilir';
+    if (rej.startsWith('EXEC__')) return 'Blok koşulu kalkarsa yeniden değerlendirilecek';
+    if (coin.entryQualityPass === false) return 'Kalite kapıları geçerse yeniden değerlendirilecek';
+    if (coin.entryExecPassed === false) return 'Execution kalitesi yeterse yeniden değerlendirilecek';
+    if (coin.signalAction && coin.signalAction !== 'NONE') return 'Adaylar arasında izleniyor, koşullar değişirse yeniden değerlendirilecek';
+    return 'Yön sinyali üretirse aday havuzuna geçebilir';
+};
+
+/**
+ * Get the CSS classes for a reason category.
+ */
+export const getReasonCategoryStyle = (category: ReasonCategory): { text: string; bg: string; border: string } => {
+    switch (category) {
+        case 'success': return { text: 'text-emerald-400', bg: 'bg-emerald-500/15', border: 'border-emerald-500/30' };
+        case 'warning': return { text: 'text-amber-400', bg: 'bg-amber-500/15', border: 'border-amber-500/30' };
+        case 'danger': return { text: 'text-rose-400', bg: 'bg-rose-500/15', border: 'border-rose-500/30' };
+        case 'info': return { text: 'text-cyan-400', bg: 'bg-cyan-500/15', border: 'border-cyan-500/30' };
+        default: return { text: 'text-slate-400', bg: 'bg-slate-700/30', border: 'border-slate-600/40' };
+    }
 };
 
 const normalizeCode = (reason: string | undefined): string => {
@@ -167,9 +384,33 @@ const normalizeCode = (reason: string | undefined): string => {
 };
 
 export const getReasonTooltip = (reason: string | undefined): string => {
+    if (!reason) return '';
+    const raw = String(reason).trim();
+    if (!raw) return '';
+
+    // 1. Direct case-sensitive match (catches lowercase wait-state keys)
+    if (REASON_TOOLTIP_MAP[raw]) return REASON_TOOLTIP_MAP[raw];
+
+    // 2. Compound codes: "waiting_entry_touch|expiring_soon" or "recheck_backoff:PENDING__STALE"
+    if (raw.includes('|')) {
+        const parts = raw.split('|').map(p => p.trim());
+        const tooltips = parts.map(p => REASON_TOOLTIP_MAP[p] || REASON_TOOLTIP_MAP[normalizeCode(p)] || '').filter(Boolean);
+        if (tooltips.length > 0) return tooltips.join(' · ');
+    }
+    if (raw.startsWith('recheck_backoff:') || raw.startsWith('recheck_backoff|')) {
+        return REASON_TOOLTIP_MAP['recheck_wait'] || 'Giriş koşulları tekrar kontrol edilmek üzere bekleniyor.';
+    }
+
+    // 3. Normalized uppercase match
     const normalized = normalizeCode(reason);
-    if (!normalized) return '';
-    return REASON_TOOLTIP_MAP[normalized] || REASON_MAP[normalized] || reason || '';
+    if (REASON_TOOLTIP_MAP[normalized]) return REASON_TOOLTIP_MAP[normalized];
+    if (REASON_MAP[normalized]) return REASON_MAP[normalized];
+
+    // 4. Fallback: use getReasonInfo label+description instead of raw code
+    const info = REASON_INFO_MAP[raw] || REASON_INFO_MAP[normalized];
+    if (info) return `${info.label}: ${info.description}`;
+
+    return 'Açıklama bulunamadı';
 };
 
 /**

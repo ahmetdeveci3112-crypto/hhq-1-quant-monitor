@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { TrendingUp, TrendingDown, Activity, Zap, Search, Layers3, Radar } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Search, Layers3, Radar, ShieldAlert, Globe } from 'lucide-react';
 import { CoinOpportunity, PendingEntry } from '../types';
-import { getReasonTooltip, translateReason } from '../utils/reasonUtils';
+import { getReasonTooltip, translateReason, getReasonInfo, getReasonCategoryStyle, getNextStep } from '../utils/reasonUtils';
 
 interface OpportunitiesDashboardProps {
     opportunities: CoinOpportunity[];
@@ -10,7 +10,7 @@ interface OpportunitiesDashboardProps {
     isLoading?: boolean;
 }
 
-type OpportunityViewMode = 'candidates' | 'passive';
+type OpportunityTab = 'candidates' | 'gated' | 'eliminated' | 'passive';
 
 const formatPrice = (price: number): string => {
     if (price >= 1000) return price.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -31,57 +31,20 @@ const getCoinIcon = (symbol: string): string => {
     return `https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${base}.png`;
 };
 
-const getOpportunityState = (coin: CoinOpportunity): { label: string; tooltip: string; tone: string } => {
-    const rawReason = coin.executionRejectReason || coin.btcFilterBlocked || '';
-    if (rawReason) {
-        return {
-            label: translateReason(rawReason),
-            tooltip: [getReasonTooltip(rawReason), `Kod: ${rawReason}`].filter(Boolean).join('\n'),
-            tone: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
-        };
-    }
-
-    if (coin.signalAction !== 'NONE' && coin.signalScore > 0) {
-        if (coin.entryQualityPass === false) {
-            return {
-                label: '🟡 Kalite geçişi bekleniyor',
-                tooltip: 'Ham sinyal oluştu ancak kalite kapıları henüz tam geçilmedi.',
-                tone: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-            };
-        }
-        if (coin.entryExecPassed === false) {
-            return {
-                label: '🟡 Emir koşulları bekleniyor',
-                tooltip: 'Sinyal var ancak spread, defter veya giriş execution kalitesi henüz yeterli değil.',
-                tone: 'bg-orange-500/15 text-orange-300 border-orange-500/30',
-            };
-        }
-        if (coin.btcFilterNote) {
-            return {
-                label: '🌐 Makro teyit bekleniyor',
-                tooltip: coin.btcFilterNote,
-                tone: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30',
-            };
-        }
-        return {
-            label: '👀 İzlemede',
-            tooltip: 'Ham sinyal oluştu ancak henüz işlenebilir veya pending aşamasına taşınmadı.',
-            tone: 'bg-slate-700/70 text-slate-300 border-slate-600/40',
-        };
-    }
-
-    return {
-        label: '📡 Pasif fırsat',
-        tooltip: 'Şu anda işlem yönü üretmiyor; sadece tarama adayı olarak izleniyor.',
-        tone: 'bg-slate-800/80 text-slate-400 border-slate-700/40',
-    };
-};
-
+// Phase UI-Redesign: Enhanced CoinCard with "neden burada?" badge and "sonraki adım" text
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const isLong = coin.signalAction === 'LONG';
     const isShort = coin.signalAction === 'SHORT';
     const hasSignal = coin.signalScore > 0 && coin.signalAction !== 'NONE';
-    const status = getOpportunityState(coin);
+
+    // Get structured reason info
+    const rawReason = coin.executionRejectReason || coin.btcFilterBlocked || '';
+    const reasonInfo = rawReason ? getReasonInfo(rawReason) : null;
+    const reasonStyle = reasonInfo ? getReasonCategoryStyle(reasonInfo.category) : null;
+    const reasonTooltip = rawReason
+        ? [getReasonTooltip(rawReason), `Kod: ${rawReason}`].filter(Boolean).join('\n')
+        : '';
+    const nextStep = getNextStep(coin);
 
     const borderColor = isLong
         ? 'border-emerald-500/50'
@@ -174,11 +137,19 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             )}
 
-            <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                <div className="text-[10px] uppercase tracking-wider text-slate-500">Durum</div>
-                <div className={`mt-1 inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${status.tone}`} title={status.tooltip}>
-                    {status.label}
+            {/* Phase UI-Redesign: "Neden Burada?" reason badge */}
+            {reasonInfo && reasonStyle && (
+                <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Neden burada?</div>
+                    <div className={`mt-1 inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${reasonStyle.bg} ${reasonStyle.text} ${reasonStyle.border}`} title={reasonTooltip}>
+                        {reasonInfo.icon} {reasonInfo.label}
+                    </div>
                 </div>
+            )}
+
+            {/* Phase UI-Redesign: "Sonraki Adım" next-step text */}
+            <div className="mt-2 text-[10px] text-slate-500 italic">
+                ↳ {nextStep}
             </div>
 
             <div className="mt-2 text-xs text-slate-500 flex items-center gap-1">
@@ -190,7 +161,7 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
 };
 
 const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
-    const status = getOpportunityState(coin);
+    const nextStep = getNextStep(coin);
 
     return (
         <div className="rounded-xl border border-slate-800 bg-[#10151d] px-4 py-3 transition-colors hover:border-slate-700 hover:bg-slate-900/70">
@@ -226,13 +197,25 @@ const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 <span className="rounded-full bg-slate-800 px-2 py-1 text-[10px] font-medium text-slate-300">
                     H {coin.hurst.toFixed(2)}
                 </span>
-                <span className={`rounded-full border px-2 py-1 text-[10px] font-semibold ${status.tone}`} title={status.tooltip}>
-                    {status.label}
+                <span className="rounded-full border border-slate-700/40 bg-slate-800/80 px-2 py-1 text-[10px] font-semibold text-slate-400">
+                    📡 Pasif taramada
                 </span>
+            </div>
+
+            <div className="mt-2 text-[10px] text-slate-500 italic">
+                ↳ {nextStep}
             </div>
         </div>
     );
 };
+
+// Phase UI-Redesign: Tab definition for the 4-tab navigation
+const TAB_CONFIG: { key: OpportunityTab; label: string; icon: React.ReactNode; emptyText: string; emptySubtext: string }[] = [
+    { key: 'candidates', label: 'Sinyal Adayları', icon: <Layers3 className="h-3.5 w-3.5" />, emptyText: 'Sinyal adayı bulunamadı', emptySubtext: 'Şu anda yön sinyali üretmiş ama işlenebilir olmayan aday yok.' },
+    { key: 'gated', label: 'Gate Bekleyenler', icon: <Globe className="h-3.5 w-3.5" />, emptyText: 'Gate bekleyen aday yok', emptySubtext: 'Makro veya mikro filtrelerde takılan sinyal bulunmuyor.' },
+    { key: 'eliminated', label: 'Şu An Elenenler', icon: <ShieldAlert className="h-3.5 w-3.5" />, emptyText: 'Şu anda elenen aday yok', emptySubtext: 'Scanner seviyesinde bloke/reject olan coin bulunmuyor.' },
+    { key: 'passive', label: 'Pasif Tarama', icon: <Radar className="h-3.5 w-3.5" />, emptyText: 'Pasif taramada coin yok', emptySubtext: 'Arka planda izlenen ama henüz yön üretmeyen coin bulunmuyor.' },
+];
 
 export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
     opportunities,
@@ -240,98 +223,85 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
     pendingEntries = [],
     isLoading = false
 }) => {
-    const [viewMode, setViewMode] = useState<OpportunityViewMode>('candidates');
+    const [activeTab, setActiveTab] = useState<OpportunityTab>('candidates');
     const actionableSymbols = new Set<string>([
         ...executableSignals.map(signal => String(signal.symbol || '')),
         ...pendingEntries.map(entry => String(entry.symbol || '')),
     ].filter(Boolean));
 
     const remainingOpportunities = opportunities.filter(coin => !actionableSymbols.has(String(coin.symbol || '')));
+
+    // Phase UI-Redesign: 4-tab categorization
     const candidateCoins = remainingOpportunities
-        .filter(c => c.signalAction !== 'NONE' && c.signalScore > 0)
+        .filter(c => c.signalAction !== 'NONE' && c.signalScore > 0 && !isGated(c) && !isEliminated(c))
         .sort((a, b) => b.signalScore - a.signalScore)
         .slice(0, 24);
+
+    const gatedCoins = remainingOpportunities
+        .filter(c => isGated(c))
+        .sort((a, b) => b.signalScore - a.signalScore)
+        .slice(0, 24);
+
+    const eliminatedCoins = remainingOpportunities
+        .filter(c => isEliminated(c))
+        .sort((a, b) => b.signalScore - a.signalScore)
+        .slice(0, 24);
+
     const passiveCoins = remainingOpportunities
         .filter(c => c.signalAction === 'NONE' || c.signalScore === 0)
         .sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
         .slice(0, 24);
-    const activeCoins = viewMode === 'candidates' ? candidateCoins : passiveCoins;
+
+    const tabCounts: Record<OpportunityTab, number> = {
+        candidates: candidateCoins.length,
+        gated: gatedCoins.length,
+        eliminated: eliminatedCoins.length,
+        passive: passiveCoins.length,
+    };
+
+    const activeCoins = activeTab === 'candidates' ? candidateCoins
+        : activeTab === 'gated' ? gatedCoins
+            : activeTab === 'eliminated' ? eliminatedCoins
+                : passiveCoins;
+
+    const activeTabConfig = TAB_CONFIG.find(t => t.key === activeTab)!;
 
     return (
         <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
             <div className="flex items-center justify-between mb-4">
                 <h3 className="font-bold text-white flex items-center gap-2">
                     <Search className="w-5 h-5 text-amber-500" />
-                    Adaylar ve Pasif Fırsatlar
-                    {candidateCoins.length > 0 && (
-                        <span className="bg-amber-500/20 text-amber-400 text-xs font-bold px-2 py-0.5 rounded-full animate-pulse">
-                            {candidateCoins.length} aday
+                    Adaylar
+                    {remainingOpportunities.length > 0 && (
+                        <span className="text-xs font-normal text-slate-500 ml-1">
+                            ({remainingOpportunities.length} coin)
                         </span>
                     )}
                 </h3>
-                <div className="text-xs text-slate-500">
-                    {remainingOpportunities.length} actionable dışı coin
-                </div>
             </div>
 
-            <div className="mb-4 rounded-2xl border border-slate-800 bg-[linear-gradient(135deg,rgba(217,119,6,0.08),rgba(15,23,42,0.05))] px-4 py-3">
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                    <div>
-                        <div className="text-sm font-semibold text-white">Aday havuzu</div>
-                        <div className="text-[11px] text-slate-400">
-                            Actionable olmayan coinler ikiye ayrılır: yakında sinyale dönebilecek adaylar ve sadece arka planda izlenen pasif fırsatlar.
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        <button
-                            onClick={() => setViewMode('candidates')}
-                            className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
-                                viewMode === 'candidates'
-                                    ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
-                                    : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
+            {/* Phase UI-Redesign: 4-tab navigation with badges */}
+            <div className="mb-4 flex items-center gap-2 overflow-x-auto pb-1">
+                {TAB_CONFIG.map(tab => (
+                    <button
+                        key={tab.key}
+                        onClick={() => setActiveTab(tab.key)}
+                        className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${activeTab === tab.key
+                            ? tab.key === 'candidates' ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                                : tab.key === 'gated' ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
+                                    : tab.key === 'eliminated' ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                                        : 'border-slate-600/40 bg-slate-700/30 text-slate-300'
+                            : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
                             }`}
-                        >
-                            <Layers3 className="h-3.5 w-3.5" />
-                            İşlenmemiş Adaylar
-                            <span className="rounded-full bg-black/20 px-1.5 py-0.5 text-[10px]">{candidateCoins.length}</span>
-                        </button>
-                        <button
-                            onClick={() => setViewMode('passive')}
-                            className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
-                                viewMode === 'passive'
-                                    ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
-                                    : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
-                            }`}
-                        >
-                            <Radar className="h-3.5 w-3.5" />
-                            Pasif Fırsatlar
-                            <span className="rounded-full bg-black/20 px-1.5 py-0.5 text-[10px]">{passiveCoins.length}</span>
-                        </button>
-                    </div>
-                </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 mb-4 lg:grid-cols-4">
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Aday</div>
-                    <div className="mt-1 text-sm font-semibold text-amber-300">{candidateCoins.length}</div>
-                    <div className="text-[10px] text-slate-400">İşlenmemiş sinyal adayı</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Pasif</div>
-                    <div className="mt-1 text-sm font-semibold text-slate-200">{passiveCoins.length}</div>
-                    <div className="text-[10px] text-slate-400">Henüz yön üretmeyen</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">İşlenebilir</div>
-                    <div className="mt-1 text-sm font-semibold text-emerald-400">{executableSignals.length}</div>
-                    <div className="text-[10px] text-slate-400">Sinyaller tabına taşındı</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Bekleyen</div>
-                    <div className="mt-1 text-sm font-semibold text-cyan-300">{pendingEntries.length}</div>
-                    <div className="text-[10px] text-slate-400">Pending olarak izleniyor</div>
-                </div>
+                    >
+                        {tab.icon}
+                        {tab.label}
+                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${activeTab === tab.key ? 'bg-black/20' : 'bg-slate-800/80'
+                            }`}>
+                            {tabCounts[tab.key]}
+                        </span>
+                    </button>
+                ))}
             </div>
 
             {isLoading && opportunities.length === 0 && (
@@ -343,31 +313,15 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
 
             {activeCoins.length > 0 && (
                 <div className="rounded-2xl border border-slate-800 bg-slate-950/30 p-4">
-                    <div className="mb-4 flex items-center justify-between">
-                        <div>
-                            <div className="text-sm font-semibold text-white">
-                                {viewMode === 'candidates' ? 'İşlenmemiş Sinyal Adayları' : 'Pasif Fırsatlar'}
-                            </div>
-                            <div className="text-[11px] text-slate-400">
-                                {viewMode === 'candidates'
-                                    ? 'Henüz aktif veya pending aşamasına taşınmayan, yakın izlenmesi gereken adaylar'
-                                    : 'Henüz işlem yönü üretmeyen ama arka planda izlenen coinler'}
-                            </div>
-                        </div>
-                        <div className={`text-xs font-semibold ${viewMode === 'candidates' ? 'text-amber-300' : 'text-cyan-300'}`}>
-                            {activeCoins.length}
-                        </div>
-                    </div>
-
-                    {viewMode === 'candidates' ? (
+                    {(activeTab === 'candidates' || activeTab === 'gated' || activeTab === 'eliminated') ? (
                         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 max-h-[720px] overflow-y-auto pr-2 custom-scrollbar">
-                            {candidateCoins.map((coin) => (
+                            {activeCoins.map((coin) => (
                                 <CoinCard key={coin.symbol} coin={coin} />
                             ))}
                         </div>
                     ) : (
                         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 max-h-[720px] overflow-y-auto pr-2 custom-scrollbar">
-                            {passiveCoins.map((coin) => (
+                            {activeCoins.map((coin) => (
                                 <PassiveCoinCard key={coin.symbol} coin={coin} />
                             ))}
                         </div>
@@ -375,13 +329,34 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
                 </div>
             )}
 
-            {!isLoading && candidateCoins.length === 0 && passiveCoins.length === 0 && (
+            {/* Phase UI-Redesign: Empty state with explanatory text */}
+            {!isLoading && activeCoins.length === 0 && (
                 <div className="text-center py-12 text-slate-500">
                     <Activity className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                    <p>Tüm işlenebilir adaylar Sinyaller tabına taşındı</p>
-                    <p className="text-xs mt-1">Şu anda actionable dışı ek fırsat görünmüyor.</p>
+                    <p>{activeTabConfig.emptyText}</p>
+                    <p className="text-xs mt-1">{activeTabConfig.emptySubtext}</p>
                 </div>
             )}
         </div>
     );
 };
+
+// Helper: is this coin stuck at a macro/micro gate or quality gate?
+function isGated(coin: CoinOpportunity): boolean {
+    const rej = coin.executionRejectReason || '';
+    return (
+        rej.startsWith('MACRO__') ||
+        rej.startsWith('MICRO__') ||
+        rej.includes('MACRO') ||
+        rej.includes('MICRO') ||
+        !!coin.btcFilterBlocked ||
+        coin.entryQualityPass === false ||
+        coin.entryExecPassed === false
+    );
+}
+
+// Helper: is this coin currently eliminated at scanner level? (EXEC__ blocks, not lifecycle rejects)
+function isEliminated(coin: CoinOpportunity): boolean {
+    const rej = coin.executionRejectReason || '';
+    return rej.startsWith('EXEC__') && rej !== 'EXEC__EXECUTABLE_SIGNAL';
+}

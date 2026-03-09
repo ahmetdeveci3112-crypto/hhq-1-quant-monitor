@@ -8,6 +8,7 @@ interface TabsProps {
     signalCount: number;
     opportunitiesCount?: number;
     aiTrackingCount?: number;
+    pendingConfirmedCount?: number; // Phase UI-Redesign: for dynamic badge accent
 }
 
 export const TabNavigation: React.FC<TabsProps> = ({
@@ -16,7 +17,8 @@ export const TabNavigation: React.FC<TabsProps> = ({
     positionCount,
     signalCount,
     opportunitiesCount = 0,
-    aiTrackingCount = 0
+    aiTrackingCount = 0,
+    pendingConfirmedCount = 0
 }) => {
     const tabs = [
         { id: 'portfolio', label: 'Portföy', icon: Wallet, badge: positionCount > 0 ? positionCount : null },
@@ -50,7 +52,13 @@ export const TabNavigation: React.FC<TabsProps> = ({
                         {tab.badge && (
                             <span className={`
                 text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center
-                ${isActive ? 'bg-white/20 text-white' : 'bg-amber-500/20 text-amber-400'}
+                ${isActive ? 'bg-white/20 text-white'
+                                    : tab.id === 'signals' && pendingConfirmedCount > 0
+                                        ? 'bg-cyan-500/20 text-cyan-400 animate-pulse'
+                                        : tab.id === 'ai'
+                                            ? 'bg-fuchsia-500/20 text-fuchsia-400'
+                                            : 'bg-amber-500/20 text-amber-400'
+                                }
               `}>
                                 {tab.badge}
                             </span>

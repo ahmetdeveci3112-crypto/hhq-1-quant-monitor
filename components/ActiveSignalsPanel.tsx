@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter } from 'lucide-react';
-import { CoinOpportunity, PendingEntry } from '../types';
+import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp, ChevronDown, Filter, ChevronRight } from 'lucide-react';
+import { CoinOpportunity, PendingEntry, SignalCounts } from '../types';
 import { buildDisplayActiveSignals } from '../utils/activeSignalsUtils';
-import { getReasonTooltip, translateReason } from '../utils/reasonUtils';
+import { getReasonTooltip, translateReason, getReasonInfo, getReasonCategoryStyle } from '../utils/reasonUtils';
 
 interface ActiveSignalsPanelProps {
     signals: any[]; // Executable signals only
@@ -12,6 +12,7 @@ interface ActiveSignalsPanelProps {
     entryTightness?: number;
     minConfidenceScore?: number;
     priceFlashMap?: Record<string, 'up' | 'down'>;
+    signalCounts?: SignalCounts; // Phase UI-Redesign: Centralized counts from App.tsx
 }
 
 const formatPrice = (price: number): string => {
@@ -349,11 +350,12 @@ const QualityBadges: React.FC<{ signal: CoinOpportunity; qualityTooltip?: string
     return <div className="flex items-center gap-0.5 flex-wrap">{badges}</div>;
 };
 
-export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, pendingEntries = [], opportunities = [], onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {} }) => {
+export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals, pendingEntries = [], opportunities = [], onMarketOrder, entryTightness = 1.0, minConfidenceScore = 40, priceFlashMap = {}, signalCounts }) => {
     const [loadingSymbol, setLoadingSymbol] = useState<string | null>(null);
     const [sortKey, setSortKey] = useState<SortKey>('score');
     const [sortAsc, setSortAsc] = useState(false);
     const [qualityFilter, setQualityFilter] = useState<QualityFilter>('all');
+    const [showQualityStats, setShowQualityStats] = useState(false);
 
     const allSignals = buildDisplayActiveSignals(signals, opportunities, minConfidenceScore);
     const activeSignals = allSignals
@@ -387,12 +389,16 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
             spreadPct: liveOpp?.spreadPct ?? null,
         };
     });
+    // Phase UI-Redesign: Split into confirmed and unconfirmed
+    const confirmedPending = pendingSignals.filter(entry => entry.confirmed);
+    const unconfirmedPending = pendingSignals.filter(entry => !entry.confirmed);
     const pendingLongCount = pendingSignals.filter(entry => entry.signalAction === 'LONG').length;
     const pendingShortCount = pendingSignals.filter(entry => entry.signalAction === 'SHORT').length;
-    const pendingConfirmedCount = pendingSignals.filter(entry => entry.confirmed).length;
-    const actionableSignalCount = activeSignals.length + pendingSignals.length;
-    const actionableLongCount = activeSignals.filter(s => s.signalAction === 'LONG').length + pendingLongCount;
-    const actionableShortCount = activeSignals.filter(s => s.signalAction === 'SHORT').length + pendingShortCount;
+    const pendingConfirmedCount = confirmedPending.length;
+    // Use centralized counts if available, else compute locally
+    const actionableSignalCount = signalCounts?.actionable ?? (activeSignals.length + pendingSignals.length);
+    const actionableLongCount = signalCounts?.longTotal ?? (activeSignals.filter(s => s.signalAction === 'LONG').length + pendingLongCount);
+    const actionableShortCount = signalCounts?.shortTotal ?? (activeSignals.filter(s => s.signalAction === 'SHORT').length + pendingShortCount);
 
     const handleSort = (key: SortKey) => {
         if (sortKey === key) setSortAsc(!sortAsc);
@@ -577,7 +583,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <div className="flex items-center gap-3">
                     <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                         <Zap className="w-4 h-4 text-amber-500" />
-                        Aktif ve Bekleyen Sinyaller
+                        Sinyal Operasyon Merkezi
                     </h3>
                     <span className="text-xs text-slate-500">{actionableSignalCount}</span>
                 </div>
@@ -593,28 +599,67 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2 border-b border-slate-800/30 bg-slate-950/40 px-4 py-3 lg:grid-cols-4">
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">İşlenebilir</div>
-                    <div className="mt-1 text-sm font-semibold text-emerald-400">{activeSignals.length}</div>
-                    <div className="text-[10px] text-slate-400">Anında açılabilir sinyal</div>
+            {/* Phase UI-Redesign: Compact Durum Çubuğu — 4 inline stats */}
+            <div className="flex items-center gap-3 border-b border-slate-800/30 bg-slate-950/40 px-4 py-2.5 overflow-x-auto">
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="text-emerald-400 font-semibold">{activeSignals.length}</span>
+                    <span className="text-[10px] text-slate-500">İşlenebilir</span>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Bekleyen Giriş</div>
-                    <div className="mt-1 text-sm font-semibold text-cyan-300">{pendingSignals.length}</div>
-                    <div className="text-[10px] text-slate-400">Pending state</div>
+                <div className="h-4 w-px bg-slate-800"></div>
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="text-cyan-300 font-semibold">{pendingConfirmedCount}</span>
+                    <span className="text-[10px] text-slate-500">Onaylı Bekleyen</span>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Onaylı Bekleyen</div>
-                    <div className="mt-1 text-sm font-semibold text-sky-300">{pendingConfirmedCount}</div>
-                    <div className="text-[10px] text-slate-400">Giriş fırsatı arıyor</div>
+                <div className="h-4 w-px bg-slate-800"></div>
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="text-amber-300 font-semibold">{unconfirmedPending.length}</span>
+                    <span className="text-[10px] text-slate-500">Onaysız Bekleyen</span>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Toplam Actionable</div>
-                    <div className="mt-1 text-sm font-semibold text-white">{actionableSignalCount}</div>
-                    <div className="text-[10px] text-slate-400">İşlenebilir + bekleyen</div>
+                <div className="h-4 w-px bg-slate-800"></div>
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="text-white font-semibold">{actionableSignalCount}</span>
+                    <span className="text-[10px] text-slate-500">Toplam</span>
+                </div>
+                <div className="ml-auto">
+                    <button
+                        onClick={() => setShowQualityStats(!showQualityStats)}
+                        className="flex items-center gap-1 text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                    >
+                        Kalite Detayları
+                        <ChevronRight className={`w-3 h-3 transition-transform ${showQualityStats ? 'rotate-90' : ''}`} />
+                    </button>
                 </div>
             </div>
+
+            {/* Phase UI-Redesign: Collapsible Quality Stats */}
+            {showQualityStats && (
+                <div className="grid grid-cols-2 gap-2 border-b border-slate-800/30 bg-slate-950/50 px-4 py-3 lg:grid-cols-4">
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                        <div className="text-[10px] uppercase tracking-wider text-slate-500">Kalite Geçişi</div>
+                        <div className="mt-1 text-sm font-semibold text-white">{eqCount}/{allSignals.length || 0}</div>
+                        <div className="text-[10px] text-slate-400">EQ gate geçen</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                        <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Execution</div>
+                        <div className={`mt-1 text-sm font-semibold ${avgExecScore >= 66 ? 'text-emerald-400' : avgExecScore >= 58 ? 'text-amber-400' : 'text-rose-400'}`}>
+                            {avgExecScore > 0 ? avgExecScore.toFixed(1) : '—'}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Emir kalitesi skoru</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                        <div className="text-[10px] uppercase tracking-wider text-slate-500">Runner Yoğunluğu</div>
+                        <div className="mt-1 text-sm font-semibold text-amber-300">{runnerCount}</div>
+                        <div className="text-[10px] text-slate-400">Trend runner sinyali</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                        <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Boyut Çarpanı</div>
+                        <div className={`mt-1 text-sm font-semibold ${avgQualitySize >= 1 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                            x{avgQualitySize.toFixed(2)}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Kalite bazlı boyut</div>
+                    </div>
+                </div>
+            )}
 
             {/* Quality Filters */}
             <div className="px-4 py-2 border-b border-slate-800/30 flex items-center gap-2 overflow-x-auto">
@@ -638,105 +683,149 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 ))}
             </div>
 
-            <div className="grid grid-cols-2 gap-2 border-b border-slate-800/30 bg-slate-950/50 px-4 py-3 lg:grid-cols-4">
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Kalite Geçişi</div>
-                    <div className="mt-1 text-sm font-semibold text-white">{eqCount}/{allSignals.length || 0}</div>
-                    <div className="text-[10px] text-slate-400">EQ gate pass</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Exec</div>
-                    <div className={`mt-1 text-sm font-semibold ${avgExecScore >= 66 ? 'text-emerald-400' : avgExecScore >= 58 ? 'text-amber-400' : 'text-rose-400'}`}>
-                        {avgExecScore > 0 ? avgExecScore.toFixed(1) : '—'}
-                    </div>
-                    <div className="text-[10px] text-slate-400">Emir kalitesi skoru</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Runner Yoğunluğu</div>
-                    <div className="mt-1 text-sm font-semibold text-amber-300">{runnerCount}</div>
-                    <div className="text-[10px] text-slate-400">Trend runner sinyali</div>
-                </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Ort. Size Bias</div>
-                    <div className={`mt-1 text-sm font-semibold ${avgQualitySize >= 1 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                        x{avgQualitySize.toFixed(2)}
-                    </div>
-                    <div className="text-[10px] text-slate-400">Kalite bazlı boyut</div>
-                </div>
-            </div>
-
-            <div className="border-b border-slate-800/30 bg-slate-950/30 px-4 py-3">
-                <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2">
-                        <Clock className="w-4 h-4 text-cyan-400" />
-                        <div>
-                            <div className="text-xs font-semibold text-white">Bekleyen Girişler</div>
-                            <div className="text-[10px] text-slate-400">
-                                İşlenebilir sinyalden ayrı izlenir; stale/recheck kararları burada tutulur
+            {/* Phase UI-Redesign: Onaylı Bekleyenler (Vurgu Alanı) */}
+            {confirmedPending.length > 0 && (
+                <div className="border-b border-slate-800/30 bg-slate-950/30 px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                            <Clock className="w-4 h-4 text-cyan-400" />
+                            <div>
+                                <div className="text-xs font-semibold text-white">Onaylı Bekleyenler</div>
+                                <div className="text-[10px] text-slate-400">Onaylanmış, giriş fırsatı arayan sinyaller</div>
                             </div>
                         </div>
+                        <div className="flex items-center gap-3 text-xs">
+                            <span className="text-cyan-300 font-semibold">{confirmedPending.length}</span>
+                        </div>
                     </div>
-                    <div className="flex items-center gap-3 text-xs">
-                        <span className="text-slate-300">{pendingSignals.length}</span>
-                        <span className="text-emerald-400">{pendingLongCount}</span>
-                        <span className="text-rose-400">{pendingShortCount}</span>
-                        <span className="text-cyan-400">{pendingConfirmedCount} onaylı</span>
-                    </div>
-                </div>
-                {pendingSignals.length > 0 ? (
                     <div className="mt-3 grid gap-2 lg:grid-cols-3">
-                        {pendingSignals.slice(0, 6).map((entry) => (
-                            <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`} className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                        {confirmedPending.map((entry) => (
+                            <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`}
+                                className="rounded-lg border border-cyan-500/30 bg-slate-900/60 px-3 py-2 border-l-4 border-l-cyan-400">
                                 {(() => {
                                     const rawDecisionCode = String(entry.decisionCode || entry.waitReason || 'PENDING__WAIT');
-                                    const decisionLabel = translateReason(rawDecisionCode);
+                                    const reasonInfo = getReasonInfo(rawDecisionCode);
+                                    const style = getReasonCategoryStyle(reasonInfo.category);
                                     const decisionTooltip = [
                                         getReasonTooltip(rawDecisionCode),
                                         rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
                                     ].filter(Boolean).join('\n');
                                     return (
                                         <>
-                                <div className="flex items-center justify-between gap-2">
-                                    <div className="flex items-center gap-2">
-                                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${entry.signalAction === 'LONG' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
-                                            {entry.signalAction}
-                                        </span>
-                                        <span className="text-sm font-semibold text-white">{entry.symbol}</span>
-                                    </div>
-                                    <span className={`text-[10px] font-medium ${entry.confirmed ? 'text-cyan-300' : 'text-amber-300'}`}>
-                                        {entry.confirmed ? 'Onaylandı' : 'Bekliyor'}
-                                    </span>
-                                </div>
-                                <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                                    <div>
-                                        <div className="text-slate-500">Entry</div>
-                                        <div className="font-mono text-slate-200">${formatPrice(entry.entryPrice || 0)}</div>
-                                    </div>
-                                    <div>
-                                        <div className="text-slate-500">Anlık</div>
-                                        <div className="font-mono text-slate-200">${formatPrice(entry.currentPrice || 0)}</div>
-                                    </div>
-                                    <div>
-                                        <div className="text-slate-500">Skor</div>
-                                        <div className="font-semibold text-white">
-                                            {Number(entry.recheckScore ?? entry.signalScore ?? 0).toFixed(0)}
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <div className="text-slate-500">Durum</div>
-                                        <div className="text-slate-300" title={decisionTooltip}>{decisionLabel}</div>
-                                    </div>
-                                </div>
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="flex items-center gap-2">
+                                                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${entry.signalAction === 'LONG' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
+                                                        {entry.signalAction}
+                                                    </span>
+                                                    <span className="text-sm font-semibold text-white">{entry.symbol}</span>
+                                                </div>
+                                                <span className="text-[10px] font-medium text-cyan-300">✓ Onaylandı</span>
+                                            </div>
+                                            <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+                                                <div>
+                                                    <div className="text-slate-500">Entry</div>
+                                                    <div className="font-mono text-slate-200">${formatPrice(entry.entryPrice || 0)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Anlık</div>
+                                                    <div className="font-mono text-slate-200">${formatPrice(entry.currentPrice || 0)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Skor</div>
+                                                    <div className="font-semibold text-white">
+                                                        {Number(entry.recheckScore ?? entry.signalScore ?? 0).toFixed(0)}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Durum</div>
+                                                    <div className={`${style.text}`} title={decisionTooltip}>{reasonInfo.icon} {reasonInfo.label}</div>
+                                                </div>
+                                            </div>
+                                            {reasonInfo.description && (
+                                                <div className="mt-1.5 text-[10px] text-slate-500 italic">
+                                                    Ne bekleniyor: {reasonInfo.description}
+                                                </div>
+                                            )}
                                         </>
                                     );
                                 })()}
                             </div>
                         ))}
                     </div>
-                ) : (
-                    <div className="mt-3 text-[11px] text-slate-500">Bekleyen giriş yok.</div>
-                )}
-            </div>
+                </div>
+            )}
+
+            {/* Phase UI-Redesign: Onaysız Bekleyenler */}
+            {unconfirmedPending.length > 0 && (
+                <div className="border-b border-slate-800/30 bg-slate-950/20 px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                            <Clock className="w-4 h-4 text-amber-400" />
+                            <div>
+                                <div className="text-xs font-semibold text-white">Onay Bekleyen Girişler</div>
+                                <div className="text-[10px] text-slate-400">Henüz onaylanmamış, izlenen bekleyen emirler</div>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3 text-xs">
+                            <span className="text-amber-300 font-semibold">{unconfirmedPending.length}</span>
+                        </div>
+                    </div>
+                    <div className="mt-3 grid gap-2 lg:grid-cols-3">
+                        {unconfirmedPending.slice(0, 6).map((entry) => (
+                            <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`}
+                                className="rounded-lg border border-amber-500/20 bg-slate-900/60 px-3 py-2 border-l-4 border-l-amber-400">
+                                {(() => {
+                                    const rawDecisionCode = String(entry.decisionCode || entry.waitReason || 'PENDING__WAIT');
+                                    const reasonInfo = getReasonInfo(rawDecisionCode);
+                                    const style = getReasonCategoryStyle(reasonInfo.category);
+                                    const decisionTooltip = [
+                                        getReasonTooltip(rawDecisionCode),
+                                        rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
+                                    ].filter(Boolean).join('\n');
+                                    return (
+                                        <>
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="flex items-center gap-2">
+                                                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${entry.signalAction === 'LONG' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
+                                                        {entry.signalAction}
+                                                    </span>
+                                                    <span className="text-sm font-semibold text-white">{entry.symbol}</span>
+                                                </div>
+                                                <span className="text-[10px] font-medium text-amber-300">Onay bekliyor</span>
+                                            </div>
+                                            <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+                                                <div>
+                                                    <div className="text-slate-500">Entry</div>
+                                                    <div className="font-mono text-slate-200">${formatPrice(entry.entryPrice || 0)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Anlık</div>
+                                                    <div className="font-mono text-slate-200">${formatPrice(entry.currentPrice || 0)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Skor</div>
+                                                    <div className="font-semibold text-white">
+                                                        {Number(entry.recheckScore ?? entry.signalScore ?? 0).toFixed(0)}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-slate-500">Durum</div>
+                                                    <div className={`${style.text}`} title={decisionTooltip}>{reasonInfo.icon} {reasonInfo.label}</div>
+                                                </div>
+                                            </div>
+                                            {reasonInfo.description && (
+                                                <div className="mt-1.5 text-[10px] text-slate-500 italic">
+                                                    Ne bekleniyor: {reasonInfo.description}
+                                                </div>
+                                            )}
+                                        </>
+                                    );
+                                })()}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             <div className="px-4 py-3 border-b border-slate-800/30 bg-slate-950/20">
                 <div className="flex items-center justify-between gap-3">

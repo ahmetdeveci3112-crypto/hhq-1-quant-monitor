@@ -104,13 +104,13 @@ export interface Position {
   runtimeProfitLockRoiPct?: number | null;
   runtimeProfitLockPrice?: number;
   runtimeProfitPhase?:
-    | 'WAIT'
-    | 'MATURITY'
-    | 'WIDE_TRAIL'
-    | 'NORMAL_TRAIL'
-    | 'TIGHT_TRAIL'
-    | 'RUNNER'
-    | string;
+  | 'WAIT'
+  | 'MATURITY'
+  | 'WIDE_TRAIL'
+  | 'NORMAL_TRAIL'
+  | 'TIGHT_TRAIL'
+  | 'RUNNER'
+  | string;
   runtimeProfitOwner?: 'NONE' | 'TP_LADDER' | 'BREAKEVEN' | 'WIDE_TRAIL' | 'NORMAL_TRAIL' | 'TIGHT_TRAIL' | 'RUNNER' | string;
   runtimeProfitLadderVersion?: string;
   runtimeTpLevels?: Array<{
@@ -164,17 +164,17 @@ export interface Position {
     triggerReady?: boolean;
   };
   runtimeProtectionPhase?:
-    | 'INVALIDATION'
-    | 'REGIME'
-    | 'EXEC-RISK'
-    | 'CARRY'
-    | 'PRE-REDUCE'
-    | 'RECOVERY'
-    | 'TIME-RECOVERY'
-    | 'TRAIL'
-    | 'SL-PRIMARY'
-    | 'KS-CAP'
-    | string;
+  | 'INVALIDATION'
+  | 'REGIME'
+  | 'EXEC-RISK'
+  | 'CARRY'
+  | 'PRE-REDUCE'
+  | 'RECOVERY'
+  | 'TIME-RECOVERY'
+  | 'TRAIL'
+  | 'SL-PRIMARY'
+  | 'KS-CAP'
+  | string;
   runtimeTrailThresholdMult?: number;
   runtimeTrailLastUpdateTs?: number;
 }
@@ -523,6 +523,17 @@ export interface SignalEventsSummary {
   byStage: Record<string, number>;
   byDecision: Record<string, number>;
   topCodes: Array<{ code: string; count: number }>;
+}
+
+// Phase UI-Redesign: Centralized signal counts passed as props to avoid duplicate computation
+export interface SignalCounts {
+  executable: number;
+  pending: number;
+  pendingConfirmed: number;
+  pendingUnconfirmed: number;
+  actionable: number;       // executable + pending (tab badge source)
+  longTotal: number;         // executable long + pending long
+  shortTotal: number;        // executable short + pending short
 }
 
 export interface ScannerStats {
