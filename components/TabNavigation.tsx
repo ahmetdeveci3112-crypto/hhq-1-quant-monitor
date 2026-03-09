@@ -6,6 +6,7 @@ interface TabsProps {
     onTabChange: (tab: string) => void;
     positionCount: number;
     signalCount: number;
+    opportunitiesCount?: number;
     aiTrackingCount?: number;
 }
 
@@ -14,12 +15,13 @@ export const TabNavigation: React.FC<TabsProps> = ({
     onTabChange,
     positionCount,
     signalCount,
+    opportunitiesCount = 0,
     aiTrackingCount = 0
 }) => {
     const tabs = [
         { id: 'portfolio', label: 'Portföy', icon: Wallet, badge: positionCount > 0 ? positionCount : null },
         { id: 'signals', label: 'Sinyaller', icon: Zap, badge: signalCount > 0 ? signalCount : null },
-        { id: 'opportunities', label: 'Fırsatlar', icon: TrendingUp, badge: null },
+        { id: 'opportunities', label: 'Adaylar', icon: TrendingUp, badge: opportunitiesCount > 0 ? opportunitiesCount : null },
         { id: 'ai', label: 'Yapay Zeka', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
         { id: 'performance', label: 'Performans', icon: BarChart3, badge: null },
         { id: 'logs', label: 'Loglar', icon: Terminal, badge: null },

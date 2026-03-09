@@ -566,9 +566,15 @@ export default function App() {
     opportunities || [],
     settings.minConfidenceScore || 40
   );
+  const actionableSignalCount = displayActiveSignals.length + (pendingEntries?.length || 0);
   const displayLongSignals = displayActiveSignals.filter(s => s.signalAction === 'LONG').length;
   const displayShortSignals = displayActiveSignals.filter(s => s.signalAction === 'SHORT').length;
   const displaySignalCount = displayActiveSignals.length;
+  const actionableSymbols = new Set<string>([
+    ...displayActiveSignals.map((signal: any) => String(signal.symbol || '')),
+    ...(pendingEntries || []).map((entry: any) => String(entry.symbol || '')),
+  ].filter(Boolean));
+  const passiveOpportunityCount = (opportunities || []).filter((opp: any) => !actionableSymbols.has(String(opp.symbol || ''))).length;
 
   const handleWsLog = useCallback((message: string) => {
     addLog(`☁️ ${message}`);
@@ -1624,7 +1630,8 @@ export default function App() {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           positionCount={portfolio.positions.length}
-          signalCount={displaySignalCount}
+          signalCount={actionableSignalCount}
+          opportunitiesCount={passiveOpportunityCount}
           aiTrackingCount={optimizerStats.trackingCount}
         />
 
@@ -2275,6 +2282,8 @@ export default function App() {
             <div className="grid grid-cols-1 gap-4">
               <OpportunitiesDashboard
                 opportunities={opportunities}
+                executableSignals={executableSignals || []}
+                pendingEntries={pendingEntries || []}
                 isLoading={isRunning && opportunities.length === 0}
               />
             </div>

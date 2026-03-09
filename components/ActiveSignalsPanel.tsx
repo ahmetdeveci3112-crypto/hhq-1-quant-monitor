@@ -390,6 +390,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
     const pendingLongCount = pendingSignals.filter(entry => entry.signalAction === 'LONG').length;
     const pendingShortCount = pendingSignals.filter(entry => entry.signalAction === 'SHORT').length;
     const pendingConfirmedCount = pendingSignals.filter(entry => entry.confirmed).length;
+    const actionableSignalCount = activeSignals.length + pendingSignals.length;
+    const actionableLongCount = activeSignals.filter(s => s.signalAction === 'LONG').length + pendingLongCount;
+    const actionableShortCount = activeSignals.filter(s => s.signalAction === 'SHORT').length + pendingShortCount;
 
     const handleSort = (key: SortKey) => {
         if (sortKey === key) setSortAsc(!sortAsc);
@@ -469,6 +472,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
         const qualityTooltip = getQualityTooltip(signal);
         const isLoading = loadingSymbol === signal.symbol;
         const priceFlash = priceFlashMap[signal.symbol];
+        const rawDecisionCode = String((signal as any).decisionCode || (signal as any).decision_code || 'EXEC__EXECUTABLE_SIGNAL');
+        const decisionLabel = translateReason(rawDecisionCode);
+        const decisionTooltip = [
+            getReasonTooltip(rawDecisionCode),
+            rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
+        ].filter(Boolean).join('\n');
 
         return (
             <div className={`p-3 rounded-lg border transition-colors ${isLong ? 'bg-emerald-500/5 border-emerald-500/30' : 'bg-rose-500/5 border-rose-500/30'
@@ -497,6 +506,11 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 {/* Quality Badges */}
                 <div className="mb-2" title={qualityTooltip}>
                     <QualityBadges signal={signal} qualityTooltip={qualityTooltip} />
+                </div>
+
+                <div className="mb-2 rounded-md border border-slate-800 bg-slate-900/70 px-2 py-1.5">
+                    <div className="text-[9px] text-slate-500 uppercase">Durum</div>
+                    <div className="mt-1 text-[11px] text-slate-200" title={decisionTooltip}>{decisionLabel}</div>
                 </div>
 
                 {/* Middle: Price Info */}
@@ -563,19 +577,42 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <div className="flex items-center gap-3">
                     <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                         <Zap className="w-4 h-4 text-amber-500" />
-                        Aktif Sinyaller
+                        Aktif ve Bekleyen Sinyaller
                     </h3>
-                    <span className="text-xs text-slate-500">{activeSignals.length}</span>
+                    <span className="text-xs text-slate-500">{actionableSignalCount}</span>
                 </div>
                 <div className="flex items-center gap-3 text-xs">
                     <span className="flex items-center gap-1 text-emerald-400">
                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                        {activeSignals.filter(s => s.signalAction === 'LONG').length}
+                        {actionableLongCount}
                     </span>
                     <span className="flex items-center gap-1 text-rose-400">
                         <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
-                        {activeSignals.filter(s => s.signalAction === 'SHORT').length}
+                        {actionableShortCount}
                     </span>
+                </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 border-b border-slate-800/30 bg-slate-950/40 px-4 py-3 lg:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">İşlenebilir</div>
+                    <div className="mt-1 text-sm font-semibold text-emerald-400">{activeSignals.length}</div>
+                    <div className="text-[10px] text-slate-400">Anında açılabilir sinyal</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Bekleyen Giriş</div>
+                    <div className="mt-1 text-sm font-semibold text-cyan-300">{pendingSignals.length}</div>
+                    <div className="text-[10px] text-slate-400">Pending state</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Onaylı Bekleyen</div>
+                    <div className="mt-1 text-sm font-semibold text-sky-300">{pendingConfirmedCount}</div>
+                    <div className="text-[10px] text-slate-400">Giriş fırsatı arıyor</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Toplam Actionable</div>
+                    <div className="mt-1 text-sm font-semibold text-white">{actionableSignalCount}</div>
+                    <div className="text-[10px] text-slate-400">İşlenebilir + bekleyen</div>
                 </div>
             </div>
 
@@ -701,12 +738,25 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 )}
             </div>
 
+            <div className="px-4 py-3 border-b border-slate-800/30 bg-slate-950/20">
+                <div className="flex items-center justify-between gap-3">
+                    <div>
+                        <div className="text-xs font-semibold text-white">İşlenebilir Sinyaller</div>
+                        <div className="text-[10px] text-slate-400">Hemen işleme girebilecek sinyaller bu listede tutulur</div>
+                    </div>
+                    <div className="text-xs text-slate-400">{activeSignals.length} hazır</div>
+                </div>
+            </div>
+
             {/* MOBILE: Card Layout */}
             <div className="lg:hidden p-3 space-y-2 max-h-[60vh] overflow-y-auto">
                 {activeSignals.length === 0 ? (
                     <div className="text-center py-8 text-slate-600">
                         <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                        <p>Aktif sinyal yok</p>
+                        <p>Şu anda işlenebilir sinyal yok</p>
+                        {pendingSignals.length > 0 && (
+                            <p className="mt-1 text-[11px] text-slate-500">Bekleyen girişler yukarıda listeleniyor.</p>
+                        )}
                     </div>
                 ) : (
                     activeSignals.map(signal => <SignalCard key={signal.symbol} signal={signal} />)
@@ -724,6 +774,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <th className="py-3 px-3 font-medium text-right">Giriş</th>
                             <SortHeader label="Skor" sortKeyName="score" align="right" />
                             <th className="py-3 px-2 font-medium text-center">Kalite</th>
+                            <th className="py-3 px-3 font-medium text-left">Durum</th>
                             <SortHeader label="Z-Skor" sortKeyName="zScore" align="right" />
                             <SortHeader label="Hurst" sortKeyName="hurst" align="right" />
                             <th className="py-3 px-3 font-medium text-center">Kald.</th>
@@ -736,9 +787,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                     <tbody>
                         {activeSignals.length === 0 ? (
                             <tr>
-                                <td colSpan={13} className="py-16 text-center text-slate-600">
+                                <td colSpan={14} className="py-16 text-center text-slate-600">
                                     <Zap className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                                    <p>Aktif sinyal yok</p>
+                                    <p>Şu anda işlenebilir sinyal yok</p>
+                                    {pendingSignals.length > 0 && (
+                                        <p className="mt-1 text-[11px] text-slate-500">Bekleyen girişler yukarıda listeleniyor.</p>
+                                    )}
                                 </td>
                             </tr>
                         ) : (
@@ -768,6 +822,12 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                 const snapshotTrailEntryRoi = (signal.trailEntryMinRoiPct && signal.trailEntryMinRoiPct > 0) ? signal.trailEntryMinRoiPct : 0;
                                 const snapshotThresholdMult = signal.entryThresholdMult || 1.0;
                                 const hasSnapshotTrail = snapshotTrailEntryPct > 0;
+                                const rawDecisionCode = String((signal as any).decisionCode || (signal as any).decision_code || 'EXEC__EXECUTABLE_SIGNAL');
+                                const decisionLabel = translateReason(rawDecisionCode);
+                                const decisionTooltip = [
+                                    getReasonTooltip(rawDecisionCode),
+                                    rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
+                                ].filter(Boolean).join('\n');
                                 const trailTitle = getTrailEntryTooltip({
                                     signal,
                                     isLong,
@@ -819,6 +879,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                         </td>
                                         <td className="py-2.5 px-2 text-center" title={qualityTooltip}>
                                             <QualityBadges signal={signal} qualityTooltip={qualityTooltip} />
+                                        </td>
+                                        <td className="py-2.5 px-3 text-[11px] text-slate-300" title={decisionTooltip}>
+                                            {decisionLabel}
                                         </td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs ${Math.abs(signal.zscore || 0) >= 2 ? 'text-amber-400' : 'text-slate-400'}`}>
                                             {(signal.zscore || 0).toFixed(2)}

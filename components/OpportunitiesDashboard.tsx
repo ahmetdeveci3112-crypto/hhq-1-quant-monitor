@@ -1,9 +1,12 @@
 import React from 'react';
-import { TrendingUp, TrendingDown, Activity, Zap } from 'lucide-react';
-import { CoinOpportunity } from '../types';
+import { TrendingUp, TrendingDown, Activity, Zap, Search } from 'lucide-react';
+import { CoinOpportunity, PendingEntry } from '../types';
+import { getReasonTooltip, translateReason } from '../utils/reasonUtils';
 
 interface OpportunitiesDashboardProps {
     opportunities: CoinOpportunity[];
+    executableSignals?: CoinOpportunity[];
+    pendingEntries?: PendingEntry[];
     isLoading?: boolean;
 }
 
@@ -26,63 +29,57 @@ const getCoinIcon = (symbol: string): string => {
     return `https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${base}.png`;
 };
 
-const getRejectReasonKey = (reason?: string | null): string => {
-    if (!reason) return '';
-    const key = String(reason).split(':')[0] || String(reason);
-    return key.toUpperCase();
-};
-
-// Turkish rejection labels (same as ActiveSignalsPanel)
-const REJECT_TR_OD: Record<string, { label: string; tooltip: string }> = {
-    'RECOVERY_COOLDOWN': { label: 'Toparlanma Bekleme', tooltip: 'Portföy toparlanma modunda' },
-    'SHOCK_BLOCK': { label: 'Şok Koruma', tooltip: 'Piyasada ani hareket algılandı' },
-    'PROT_BLOCK': { label: 'Koruma Kilidi', tooltip: 'Koruma kilidi aktif' },
-    'EXISTING_POSITION': { label: 'Mevcut Pozisyon', tooltip: 'Bu coin\'de zaten pozisyon var' },
-    'COUNTER_FLIP_EXISTING_POS': { label: 'Ters Sinyal', tooltip: 'Mevcut pozisyona ters sinyal' },
-    'COUNTER_PENDING': { label: 'Ters Bekleyen', tooltip: 'Ters yönde bekleyen emir var' },
-    'REENTRY_LIMIT': { label: 'Tekrar Giriş Limiti', tooltip: 'Limit doldu' },
-    'REENTRY_COOLDOWN': { label: 'Bekleme Süresi', tooltip: '5 dk içinde tekrar giriş yasak' },
-    'MAX_POSITIONS': { label: 'Pozisyon Limiti', tooltip: 'Max pozisyon doldu' },
-    'DIRECTION_EXPOSURE': { label: 'Yön Limiti', tooltip: 'Aynı yönde bakiye limiti' },
-    'BLACKLISTED': { label: 'Kara Liste', tooltip: 'Coin kara listede' },
-    'BTC_FILTER': { label: 'BTC Filtresi', tooltip: 'BTC trendi ters' },
-    'THIN_BOOK': { label: 'İnce Defter', tooltip: 'Emir defteri sığ' },
-    'OBI_VETO': { label: 'Emir Defteri Ters', tooltip: 'OBI sinyal yönüne karşı' },
-    'OBI_NEUTRAL_LOW_VOL': { label: 'Düşük Hacim', tooltip: 'OBI nötr, hacim düşük' },
-    'REGIME_BLOCKED': { label: 'Rejim Engeli', tooltip: 'Piyasa rejimi ters' },
-    'MA_ALIGNMENT_VETO': { label: 'MA Uyumsuz', tooltip: 'Hareketli ortalamalar ters' },
-    'MTF_REJECTED': { label: 'Çoklu TF Ret', tooltip: 'Çoklu zaman dilimi uyumsuz' },
-    'NEGATIVE_EV': { label: 'Negatif Beklenti', tooltip: 'Beklenen değer negatif' },
-    'LOW_NET_EDGE': { label: 'Düşük Net Kenar', tooltip: 'Komisyon sonrası kazanç düşük' },
-    'MAX_EXPOSURE': { label: 'Maks. Maruziyet', tooltip: 'Limit doldu' },
-    'MIN_NOTIONAL': { label: 'Küçük Pozisyon', tooltip: 'Pozisyon boyutu yetersiz' },
-    'ENTRY_CORRIDOR_EXCEEDED': { label: 'Koridor Aşıldı', tooltip: 'Fiyat koridorun dışında' },
-    'PENDING_EXPIRED': { label: 'Süre Doldu', tooltip: 'Bekleyen emir iptal edildi' },
-    'STALE_SIGNAL': { label: 'Bayat Sinyal', tooltip: 'Skor eşiğin altına düştü' },
-    'SIGNAL_MISSED': { label: 'Fırsat Kaçtı', tooltip: 'Fiyat uzaklaştı' },
-    'ENTRY_RECHECK_FAIL': { label: 'Tekrar Kontrol Red', tooltip: 'Koşullar değişti' },
-    'ENTRY_SCORE_LOW': { label: 'Düşük İcra Skoru', tooltip: 'BBO/spread yetersiz' },
-    'BLOCK_OPEN_DRIFT': { label: 'Fiyat Kayması', tooltip: 'Fiyat çok kaydı' },
-    'BLOCK_OPEN_SPREAD': { label: 'Yüksek Makas', tooltip: 'Spread çok yüksek' },
-    'SLIPPAGE_REJECT': { label: 'Kayma Ret', tooltip: 'Dolum fiyatı beklentiden farklı' },
-    'BINANCE_ORDER_FAILED': { label: 'Borsa Hatası', tooltip: 'Binance emri başarısız' },
-};
-
-const getRejectTrOD = (reason?: string | null): { label: string; tooltip: string } => {
-    if (!reason) return { label: '', tooltip: '' };
-    const key = String(reason).split(':')[0].toUpperCase();
-    const detail = String(reason).includes(':') ? String(reason).split(':').slice(1).join(':') : '';
-    const entry = REJECT_TR_OD[key];
-    if (entry) {
-        return { label: entry.label, tooltip: `${entry.tooltip}${detail ? ` (${detail})` : ''}` };
+const getOpportunityState = (coin: CoinOpportunity): { label: string; tooltip: string; tone: string } => {
+    const rawReason = coin.executionRejectReason || coin.btcFilterBlocked || '';
+    if (rawReason) {
+        return {
+            label: translateReason(rawReason),
+            tooltip: [getReasonTooltip(rawReason), `Kod: ${rawReason}`].filter(Boolean).join('\n'),
+            tone: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
+        };
     }
-    return { label: key, tooltip: `Ret: ${reason}` };
+
+    if (coin.signalAction !== 'NONE' && coin.signalScore > 0) {
+        if (coin.entryQualityPass === false) {
+            return {
+                label: '🟡 Kalite geçişi bekleniyor',
+                tooltip: 'Ham sinyal oluştu ancak kalite kapıları henüz tam geçilmedi.',
+                tone: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+            };
+        }
+        if (coin.entryExecPassed === false) {
+            return {
+                label: '🟡 Emir koşulları bekleniyor',
+                tooltip: 'Sinyal var ancak spread, defter veya giriş execution kalitesi henüz yeterli değil.',
+                tone: 'bg-orange-500/15 text-orange-300 border-orange-500/30',
+            };
+        }
+        if (coin.btcFilterNote) {
+            return {
+                label: '🌐 Makro teyit bekleniyor',
+                tooltip: coin.btcFilterNote,
+                tone: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30',
+            };
+        }
+        return {
+            label: '👀 İzlemede',
+            tooltip: 'Ham sinyal oluştu ancak henüz işlenebilir veya pending aşamasına taşınmadı.',
+            tone: 'bg-slate-700/70 text-slate-300 border-slate-600/40',
+        };
+    }
+
+    return {
+        label: '📡 Pasif fırsat',
+        tooltip: 'Şu anda işlem yönü üretmiyor; sadece tarama adayı olarak izleniyor.',
+        tone: 'bg-slate-800/80 text-slate-400 border-slate-700/40',
+    };
 };
 
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const isLong = coin.signalAction === 'LONG';
     const isShort = coin.signalAction === 'SHORT';
     const hasSignal = coin.signalScore > 0 && coin.signalAction !== 'NONE';
+    const status = getOpportunityState(coin);
 
     const borderColor = isLong
         ? 'border-emerald-500/50'
@@ -104,7 +101,6 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
         ${borderColor} ${hasSignal ? `shadow-lg ${bgGlow}` : 'shadow-md'}
       `}
         >
-            {/* Header */}
             <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
                     <img
@@ -129,7 +125,6 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 )}
             </div>
 
-            {/* Price */}
             <div className="mb-3">
                 <div className="text-lg font-mono font-bold text-white">
                     ${formatPrice(coin.price)}
@@ -139,7 +134,6 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             </div>
 
-            {/* Metrics */}
             <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="flex items-center justify-between bg-slate-800/50 rounded px-2 py-1">
                     <span className="text-slate-500">Z-Skor</span>
@@ -160,7 +154,6 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             </div>
 
-            {/* Signal Score Bar */}
             {hasSignal && (
                 <div className="mt-3">
                     <div className="flex items-center justify-between text-xs mb-1">
@@ -179,56 +172,13 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             )}
 
-            {/* Quality Badges — Phase EQG+FIB */}
-            {hasSignal && (
-                <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {coin.entryQualityPass && (
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.entryQualityReasons?.length || 0) >= 3
-                            ? 'bg-emerald-500/20 text-emerald-400' : 'bg-cyan-500/20 text-cyan-400'}`}
-                            title={`EQ: ${coin.entryQualityReasons?.join(', ') || 'geçti'}`}>
-                            EQ{(coin.entryQualityReasons?.length || 0)}/3
-                        </span>
-                    )}
-                    {coin.fibActive && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-purple-500/20 text-purple-400"
-                            title={`Fib: ${coin.fibLevel} +${coin.fibBonus}`}>
-                            FIB{coin.fibBonus ? `+${coin.fibBonus}` : ''}
-                        </span>
-                    )}
-                    {coin.isVolumeSpike && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400"
-                            title={`Hacim: ${coin.volumeRatio}x`}>
-                            🔥{coin.volumeRatio}x
-                        </span>
-                    )}
-                    {(coin.obImbalanceTrend || 0) !== 0 && (
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${(coin.obImbalanceTrend || 0) > 0
-                            ? 'bg-emerald-500/10 text-emerald-500/70' : 'bg-rose-500/10 text-rose-500/70'}`}
-                            title={`Defter Trendi: ${coin.obImbalanceTrend}`}>
-                            OB{(coin.obImbalanceTrend || 0) > 0 ? '↑' : '↓'}
-                        </span>
-                    )}
-                    {coin.executionRejectReason && (() => {
-                        const rTr = getRejectTrOD(coin.executionRejectReason);
-                        return (
-                            <span
-                                className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-300"
-                                title={`❌ ${rTr.tooltip}`}
-                            >
-                                {rTr.label}
-                            </span>
-                        );
-                    })()}
-                    {coin.squeezeFiring && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-fuchsia-500/20 text-fuchsia-400"
-                            title="TTM Squeeze 🗜️ Patlamaya Hazır!">
-                            🗜️SQZ
-                        </span>
-                    )}
+            <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">Durum</div>
+                <div className={`mt-1 inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${status.tone}`} title={status.tooltip}>
+                    {status.label}
                 </div>
-            )}
+            </div>
 
-            {/* Volume */}
             <div className="mt-2 text-xs text-slate-500 flex items-center gap-1">
                 <Activity className="w-3 h-3" />
                 Hacim: ${formatVolume(coin.volume24h)}
@@ -239,37 +189,65 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
 
 export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
     opportunities,
+    executableSignals = [],
+    pendingEntries = [],
     isLoading = false
 }) => {
-    // Separate coins with signals from those without
-    const signalCoins = opportunities.filter(c => c.signalAction !== 'NONE' && c.signalScore > 0);
-    const otherCoins = opportunities.filter(c => c.signalAction === 'NONE' || c.signalScore === 0);
+    const actionableSymbols = new Set<string>([
+        ...executableSignals.map(signal => String(signal.symbol || '')),
+        ...pendingEntries.map(entry => String(entry.symbol || '')),
+    ].filter(Boolean));
 
-    // Sort signal coins by score
-    const sortedSignalCoins = [...signalCoins].sort((a, b) => b.signalScore - a.signalScore);
-
-    // Combine: signal coins first, then others
-    const displayCoins = [...sortedSignalCoins, ...otherCoins].slice(0, 50);
+    const remainingOpportunities = opportunities.filter(coin => !actionableSymbols.has(String(coin.symbol || '')));
+    const candidateCoins = remainingOpportunities
+        .filter(c => c.signalAction !== 'NONE' && c.signalScore > 0)
+        .sort((a, b) => b.signalScore - a.signalScore)
+        .slice(0, 24);
+    const passiveCoins = remainingOpportunities
+        .filter(c => c.signalAction === 'NONE' || c.signalScore === 0)
+        .sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
+        .slice(0, 24);
 
     return (
         <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
-            {/* Header */}
             <div className="flex items-center justify-between mb-4">
                 <h3 className="font-bold text-white flex items-center gap-2">
-                    <Zap className="w-5 h-5 text-amber-500" />
-                    Fırsatlar
-                    {signalCoins.length > 0 && (
+                    <Search className="w-5 h-5 text-amber-500" />
+                    Adaylar ve Pasif Fırsatlar
+                    {candidateCoins.length > 0 && (
                         <span className="bg-amber-500/20 text-amber-400 text-xs font-bold px-2 py-0.5 rounded-full animate-pulse">
-                            {signalCoins.length} Aktif
+                            {candidateCoins.length} aday
                         </span>
                     )}
                 </h3>
                 <div className="text-xs text-slate-500">
-                    {opportunities.length} coin taranıyor
+                    {remainingOpportunities.length} actionable dışı coin
                 </div>
             </div>
 
-            {/* Loading State */}
+            <div className="grid grid-cols-2 gap-2 mb-4 lg:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Aday</div>
+                    <div className="mt-1 text-sm font-semibold text-amber-300">{candidateCoins.length}</div>
+                    <div className="text-[10px] text-slate-400">İşlenmemiş sinyal adayı</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Pasif</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-200">{passiveCoins.length}</div>
+                    <div className="text-[10px] text-slate-400">Henüz yön üretmeyen</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">İşlenebilir</div>
+                    <div className="mt-1 text-sm font-semibold text-emerald-400">{executableSignals.length}</div>
+                    <div className="text-[10px] text-slate-400">Sinyaller tabına taşındı</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Bekleyen</div>
+                    <div className="mt-1 text-sm font-semibold text-cyan-300">{pendingEntries.length}</div>
+                    <div className="text-[10px] text-slate-400">Pending olarak izleniyor</div>
+                </div>
+            </div>
+
             {isLoading && opportunities.length === 0 && (
                 <div className="flex items-center justify-center py-12">
                     <div className="animate-spin w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full" />
@@ -277,21 +255,45 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
                 </div>
             )}
 
-            {/* Coin Grid */}
-            {displayCoins.length > 0 && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
-                    {displayCoins.map((coin) => (
-                        <CoinCard key={coin.symbol} coin={coin} />
-                    ))}
+            {candidateCoins.length > 0 && (
+                <div className="mb-5">
+                    <div className="mb-3 flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-semibold text-white">İşlenmemiş Sinyal Adayları</div>
+                            <div className="text-[11px] text-slate-400">Henüz aktif veya pending aşamasına taşınmayan sinyal adayları</div>
+                        </div>
+                        <div className="text-xs text-amber-300">{candidateCoins.length}</div>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[420px] overflow-y-auto pr-2 custom-scrollbar">
+                        {candidateCoins.map((coin) => (
+                            <CoinCard key={coin.symbol} coin={coin} />
+                        ))}
+                    </div>
                 </div>
             )}
 
-            {/* Empty State */}
-            {!isLoading && displayCoins.length === 0 && (
+            {passiveCoins.length > 0 && (
+                <div>
+                    <div className="mb-3 flex items-center justify-between">
+                        <div>
+                            <div className="text-sm font-semibold text-white">Pasif Fırsatlar</div>
+                            <div className="text-[11px] text-slate-400">Henüz işlem yönü üretmeyen ama izlenen coinler</div>
+                        </div>
+                        <div className="text-xs text-slate-300">{passiveCoins.length}</div>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 max-h-[420px] overflow-y-auto pr-2 custom-scrollbar">
+                        {passiveCoins.map((coin) => (
+                            <CoinCard key={coin.symbol} coin={coin} />
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {!isLoading && candidateCoins.length === 0 && passiveCoins.length === 0 && (
                 <div className="text-center py-12 text-slate-500">
                     <Activity className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                    <p>Henüz tarama verisi yok</p>
-                    <p className="text-xs mt-1">Scanner bağlantısı bekleniyor...</p>
+                    <p>Tüm işlenebilir adaylar Sinyaller tabına taşındı</p>
+                    <p className="text-xs mt-1">Şu anda actionable dışı ek fırsat görünmüyor.</p>
                 </div>
             )}
         </div>
