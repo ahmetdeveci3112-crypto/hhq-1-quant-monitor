@@ -3748,12 +3748,13 @@ class LiveBinanceTrader:
                     # Estimate ATR as ~1.5% of price (typical for crypto)
                     estimated_atr = entry_price * 0.015
                     
-                    # Phase 221: Apply exit_tightness + dynamic_atr_mult (was missing)
+                    # Phase 221: Apply exit_tightness + dynamic_atr_mult (SL remains intentionally damped)
                     dyn_mult = global_paper_trader.calculate_dynamic_atr_multiplier(estimated_atr, entry_price) if global_paper_trader else 1.0
-                    adjusted_sl_atr = sl_atr_mult * exit_tightness * dyn_mult
-                    adjusted_tp_atr = tp_atr_mult * exit_tightness * dyn_mult
-                    adjusted_trail_activation = trail_activation_atr * exit_tightness * dyn_mult
-                    adjusted_trail_distance = trail_distance_atr * exit_tightness * dyn_mult
+                    exit_scales = resolve_exit_tightness_scales(exit_tightness)
+                    adjusted_sl_atr = sl_atr_mult * exit_scales['sl_scale'] * dyn_mult
+                    adjusted_tp_atr = tp_atr_mult * exit_scales['tp_scale'] * dyn_mult
+                    adjusted_trail_activation = trail_activation_atr * exit_scales['trail_activation_scale'] * dyn_mult
+                    adjusted_trail_distance = trail_distance_atr * exit_scales['trail_distance_scale'] * dyn_mult
                     
                     # Calculate TP/SL based on side
                     # Phase 275: Leverage-aware SL/TP
@@ -10865,6 +10866,24 @@ def resolve_atr_multiplier(raw_value: float, scale_version: str = None) -> float
         return float(raw_value)
     # v2 canonical: always DECI — no auto heuristic
     return float(raw_value) / 10.0
+
+
+def resolve_exit_tightness_scales(raw_exit_tightness: float) -> dict:
+    """Split exit tightness into stop-loss and profit/trail scales.
+
+    Higher exit tightness should primarily widen TP and trailing behaviour.
+    Stop-loss expansion is intentionally damped so "more patient exits" does
+    not also mean "materially larger accepted loss" by default.
+    """
+    base = _clamp(_to_float_safe(raw_exit_tightness, 1.0), 0.3, 15.0)
+    sl_scale = _clamp(1.0 + ((base - 1.0) * 0.40), 0.70, 2.20)
+    return {
+        "base": round(base, 4),
+        "sl_scale": round(sl_scale, 4),
+        "tp_scale": round(base, 4),
+        "trail_activation_scale": round(base, 4),
+        "trail_distance_scale": round(base, 4),
+    }
 
 
 def resolve_effective_trail_atr_bases(
@@ -24466,6 +24485,177 @@ class TimeBasedPositionManager:
         score = float(sig.get('score', 0) or 0)
         return score >= min_required, score
 
+    @staticmethod
+    def _get_tp_slice_trail_store(pos: dict) -> dict:
+        store = pos.get('tp_slice_trails')
+        if not isinstance(store, dict):
+            store = {}
+            pos['tp_slice_trails'] = store
+        return store
+
+    @staticmethod
+    def _clear_tp_slice_trail(pos: dict, level_key: str) -> None:
+        store = pos.get('tp_slice_trails')
+        if not isinstance(store, dict):
+            return
+        store.pop(str(level_key or ''), None)
+        if not store:
+            pos['tp_slice_trails'] = {}
+
+    @staticmethod
+    def _tp_slice_trail_level_factor(level_key: str) -> float:
+        key = str(level_key or '').lower()
+        if key == 'tp1':
+            return 1.10
+        if key == 'tp2':
+            return 0.95
+        if key == 'tp3':
+            return 0.82
+        return 0.75
+
+    def _compute_tp_slice_trail_plan(
+        self,
+        pos: dict,
+        current_price: float,
+        atr: float,
+        level_key: str,
+    ) -> dict:
+        side = str(pos.get('side', 'LONG') or 'LONG').upper()
+        entry_price = max(1e-8, float(pos.get('entryPrice', current_price) or current_price or 1e-8))
+        safe_price = max(1e-8, float(current_price or entry_price))
+        safe_atr = max(1e-8, float(atr or 0.0))
+        if safe_atr <= 1e-8:
+            atr_ctx = resolve_effective_atr_value(
+                pos.get('atr', 0.0),
+                entry_price,
+                volatility_pct=pos.get('volatility_pct', pos.get('volatilityPct')),
+                spread_pct=pos.get('spreadPct', 0.05),
+                truth_snapshot=pos.get('truth_snapshot'),
+            )
+            safe_atr = max(1e-8, float(atr_ctx.get('atr', entry_price * 0.01) or (entry_price * 0.01)))
+        spread_pct = _coerce_float(pos.get('currentSpreadPct', pos.get('spreadPct', 0.05)), 0.05)
+        volume_ratio = _coerce_float(pos.get('volumeRatio', pos.get('volume_ratio', 1.0)), 1.0)
+        leverage = max(1, int(_coerce_float(pos.get('leverage', 1), 1)))
+        hurst = _coerce_float(pos.get('hurst', 0.5), 0.5)
+        volatility_pct = _coerce_float(
+            pos.get('currentAtrPct', pos.get('volatility_pct', pos.get('volatilityPct'))),
+            (safe_atr / entry_price * 100.0) if entry_price > 0 else 2.0,
+        )
+        cfg_trail_dist = _coerce_float(
+            pos.get('configuredTrailDistanceAtr', pos.get('trailDistanceAtr', 0.0)),
+            0.0,
+        )
+        _, dyn_trail_dist_atr = get_dynamic_trail_params(
+            volatility_pct=volatility_pct,
+            hurst=hurst,
+            price=safe_price,
+            spread_pct=spread_pct,
+            settings_activation=0.0,
+            settings_distance=cfg_trail_dist,
+        )
+        level_factor = self._tp_slice_trail_level_factor(level_key)
+        volume_factor = 0.88 if volume_ratio < 1.0 else (1.05 if volume_ratio >= 2.0 else 1.0)
+        trail_distance_atr = _clamp(dyn_trail_dist_atr * level_factor * volume_factor, 0.20, 3.20)
+        cost = estimate_trade_cost(spread_pct, leverage)
+        cost_floor_price = safe_price * (max(0.08, cost.get('min_profitable_move', 0.10) * 0.35) / 100.0)
+        trail_distance_price = max(safe_atr * trail_distance_atr, cost_floor_price)
+        if side == 'LONG':
+            initial_trigger = max(entry_price, safe_price - trail_distance_price)
+        else:
+            initial_trigger = min(entry_price, safe_price + trail_distance_price)
+        return {
+            'trail_distance_atr': round(trail_distance_atr, 4),
+            'trail_distance_price': round(trail_distance_price, 8),
+            'cost_floor_price': round(cost_floor_price, 8),
+            'volatility_pct': round(volatility_pct, 4),
+            'spread_pct': round(spread_pct, 4),
+            'volume_ratio': round(volume_ratio, 4),
+            'initial_trigger_price': round(initial_trigger, 8),
+        }
+
+    def _arm_tp_slice_trail(
+        self,
+        pos: dict,
+        level: dict,
+        current_price: float,
+        atr: float,
+        source: str,
+    ) -> bool:
+        level_key = str(level.get('key', '') or '')
+        if not level_key or level_key == 'tp_final':
+            return False
+        partial_state = pos.get('partial_tp_state', {})
+        if partial_state.get(level_key, False):
+            return False
+        store = self._get_tp_slice_trail_store(pos)
+        if level_key in store:
+            return False
+        close_pct = float(level.get('close_pct', 0) or 0)
+        if close_pct <= 0:
+            return False
+        plan = self._compute_tp_slice_trail_plan(pos, current_price, atr, level_key)
+        now_ts = time.time()
+        store[level_key] = {
+            'key': level_key,
+            'close_pct': close_pct,
+            'roi_pct': _coerce_float(level.get('roi_pct', 0.0), 0.0),
+            'price': _coerce_float(level.get('price', current_price), current_price),
+            'armed_at': now_ts,
+            'armed_price': float(current_price or 0.0),
+            'best_price': float(current_price or 0.0),
+            'last_price': float(current_price or 0.0),
+            'trail_distance_price': plan['trail_distance_price'],
+            'trail_distance_atr': plan['trail_distance_atr'],
+            'initial_trigger_price': plan['initial_trigger_price'],
+            'source': source,
+            'triggered': False,
+        }
+        pos['tp_slice_trails'] = store
+        pos['lastExitDecision'] = f"{level_key.upper()}_SLICE_TRAIL_ARMED"
+        logger.info(
+            f"🎯 TP_SLICE_ARM: {pos.get('symbol')} {pos.get('side')} {level_key} "
+            f"trail=${plan['trail_distance_price']:.6f} ({plan['trail_distance_atr']:.2f} ATR) "
+            f"spread={plan['spread_pct']:.3f}% vol={plan['volatility_pct']:.2f}% vr={plan['volume_ratio']:.2f}"
+        )
+        return True
+
+    def _select_triggered_tp_slice_trail(self, pos: dict, current_price: float):
+        store = self._get_tp_slice_trail_store(pos)
+        if not store:
+            return None
+        side = str(pos.get('side', 'LONG') or 'LONG').upper()
+        ordered_keys = ['tp3', 'tp2', 'tp1', 'tp_final']
+        for level_key in ordered_keys:
+            state = store.get(level_key)
+            if not isinstance(state, dict):
+                continue
+            best_price = float(state.get('best_price', current_price) or current_price or 0.0)
+            safe_current = float(current_price or 0.0)
+            if safe_current <= 0:
+                continue
+            if side == 'LONG':
+                if safe_current >= best_price:
+                    state['best_price'] = safe_current
+                    state['last_price'] = safe_current
+                    continue
+                giveback_price = max(0.0, best_price - safe_current)
+                giveback_pct = (giveback_price / best_price * 100.0) if best_price > 0 else 0.0
+            else:
+                if best_price <= 0 or safe_current <= best_price:
+                    state['best_price'] = safe_current
+                    state['last_price'] = safe_current
+                    continue
+                giveback_price = max(0.0, safe_current - best_price)
+                giveback_pct = (giveback_price / best_price * 100.0) if best_price > 0 else 0.0
+            state['last_price'] = safe_current
+            state['giveback_price'] = round(giveback_price, 8)
+            state['giveback_pct'] = round(giveback_pct, 4)
+            threshold = float(state.get('trail_distance_price', 0.0) or 0.0)
+            if threshold > 0 and giveback_price >= threshold:
+                state['triggered'] = True
+                return dict(state)
+        return None
+
     async def _execute_v3_partial_close(self, paper_trader, pos: dict, current_price: float, close_pct: float, reason: str, label: str) -> bool:
         symbol = pos.get('symbol', '')
         side = pos.get('side', 'LONG')
@@ -24576,6 +24766,170 @@ class TimeBasedPositionManager:
         paper_trader.trades.append(partial_trade)
         safe_create_task(sqlite_manager.save_trade(partial_trade))
         logger.warning(f"💰 V3_RUNNER_PARTIAL: {symbol} {side} {label} close={close_pct*100:.0f}% @ ${current_price:.6f} reason={reason} oid={close_oid[:12]}")
+        return True
+
+    async def _execute_tp_ladder_partial_close(
+        self,
+        paper_trader,
+        pos: dict,
+        current_price: float,
+        level: dict,
+        base_tp_pct: float,
+        spread_level: str,
+        leverage: int,
+        entry_price: float,
+        contracts: float,
+        actions: dict,
+    ) -> bool:
+        symbol = pos.get('symbol', '')
+        side = pos.get('side', 'LONG')
+        level_key = str(level.get('key', '') or '')
+        close_pct = float(level.get('close_pct', 0) or 0)
+        if not level_key or close_pct <= 0 or contracts <= 0:
+            return False
+
+        partial_tp_state = pos.get('partial_tp_state', {})
+        original_contracts = pos.get('original_contracts', contracts) or contracts
+        close_contracts = original_contracts * close_pct
+        close_oid = ''
+        close_fee = 0.0
+
+        if pos.get('isLive', False) and close_contracts > 0:
+            live_success = False
+            try:
+                result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
+                if result:
+                    live_success = True
+                    pos['_partial_close_ts'] = datetime.now().timestamp()
+                    close_oid = str(result.get('id', ''))
+                    close_fee = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
+                    logger.warning(
+                        f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {close_pct*100:.0f}% "
+                        f"on Binance ({close_contracts:.4f} contracts) | Order: {close_oid[:12]}"
+                    )
+                    if close_oid:
+                        safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
+                else:
+                    logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
+            except Exception as e:
+                logger.error(f"❌ PARTIAL_TP LIVE ERROR: {symbol} - {e}")
+            if not live_success:
+                logger.warning(f"⚠️ PARTIAL_TP REVERTED: {symbol} {level_key} — Binance close failed, state kept armed")
+                return False
+
+        partial_tp_state[level_key] = True
+        pos['partial_tp_state'] = partial_tp_state
+        self._clear_tp_slice_trail(pos, level_key)
+
+        if not pos.get('original_contracts'):
+            pos['original_contracts'] = contracts
+            pos['original_size'] = pos.get('size', contracts)
+            pos['original_sizeUsd'] = pos.get('sizeUsd', 0)
+            pos['original_initialMargin'] = pos.get('initialMargin', 0)
+
+        new_contracts = max(0, pos.get('contracts', contracts) - close_contracts)
+        pos['contracts'] = new_contracts
+        pos['size'] = new_contracts
+        pos['sizeUsd'] = pos.get('sizeUsd', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
+        pos['initialMargin'] = pos.get('initialMargin', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
+        level_reason = f"{level_key.upper()}_PARTIAL"
+        released_margin = float(pos.get('original_initialMargin', pos.get('initialMargin', 0)) or 0) * close_pct
+        price_profit_pct = ((current_price - entry_price) / entry_price * 100) if side == 'LONG' else ((entry_price - current_price) / entry_price * 100)
+        gross_pnl = (current_price - entry_price) * close_contracts if side == 'LONG' else (entry_price - current_price) * close_contracts
+        cost_bundle = allocate_partial_realization_costs(
+            pos,
+            close_contracts=close_contracts,
+            current_contracts=contracts,
+            close_fee=close_fee,
+        )
+        realized_pnl = gross_pnl - cost_bundle['total_fee'] + cost_bundle['funding_alloc']
+        paper_trader.balance += released_margin + realized_pnl
+        partial_trade = {
+            "id": f"{pos.get('id', '')}_{level_reason}",
+            "tradeId": f"{pos.get('tradeId', pos.get('id', ''))}_{level_reason}",
+            "signalId": pos.get('signalId', pos.get('signal_id', '')),
+            "positionId": pos.get('positionId', pos.get('position_id', pos.get('id', ''))),
+            "entryOrderId": pos.get('entryOrderId', pos.get('entry_order_id', pos.get('binance_order_id', ''))),
+            "closeOrderId": close_oid if pos.get('isLive', False) else '',
+            "symbol": symbol,
+            "side": side,
+            "entryPrice": entry_price,
+            "exitPrice": current_price,
+            "size": close_contracts,
+            "sizeUsd": close_contracts * current_price,
+            "marginUsd": released_margin,
+            "margin": released_margin,
+            "pnl": realized_pnl,
+            "pnlPercent": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+            "roi": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+            "fee_cost": cost_bundle['total_fee'],
+            "feesPaidUsd": cost_bundle['total_fee'],
+            "openTime": pos.get('openTime', 0),
+            "closeTime": int(datetime.now().timestamp() * 1000),
+            "reason": level_reason,
+            "closeReason": level_reason,
+            "closeReasonNormalized": paper_trader._normalize_close_reason(level_reason),
+            "original_reason": level_reason,
+            "reasonSource": "engine",
+            "leverage": leverage,
+            "isPartialClose": True,
+            "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+            "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
+            "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
+            "signalSnapshot": pos.get('signal_snapshot', pos.get('signalSnapshot', {})),
+            "execSnapshot": pos.get('exec_snapshot', pos.get('execSnapshot', {})),
+            "riskSnapshot": pos.get('risk_snapshot', pos.get('riskSnapshot', {})),
+            "closeSnapshot": {
+                "tp_key": level_key,
+                "tp_roi_pct": _coerce_float(level.get('roi_pct', 0.0), 0.0),
+                "tp_price": level.get('price', 0),
+                "close_pct": close_pct,
+                "trigger_mode": "TRAIL_AFTER_TOUCH",
+                "current_roi_pct": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
+                "price_profit_pct": round(price_profit_pct, 4),
+                "gross_pnl": gross_pnl,
+                "entry_fee_alloc": cost_bundle['entry_fee_alloc'],
+                "close_fee": cost_bundle['close_fee'],
+                "funding_alloc": cost_bundle['funding_alloc'],
+            },
+        }
+        paper_trader.trades.append(partial_trade)
+        safe_create_task(sqlite_manager.save_trade(partial_trade))
+
+        if level_key == 'tp1':
+            pos['tp1_hit_time'] = datetime.now().timestamp()
+            pos['tp1_hit_price'] = current_price
+            pos['tp1_trail_armed'] = True
+            pos.setdefault('tp1ArmDelaySec', 90 if bool(pos.get('trend_mode')) else 45)
+            pos.setdefault('tp1ArmAtrReq', 0.4 if bool(pos.get('trend_mode')) else 0.2)
+            logger.warning(
+                f"⏳ TP1_TRAIL_ARMED: {symbol} {side} price=${current_price:.6f} "
+                f"| delay={pos.get('tp1ArmDelaySec')}s atr_req={pos.get('tp1ArmAtrReq')}"
+            )
+
+            fee_buffers = {
+                'Very Low': 0.005, 'Low': 0.005, 'Normal': 0.006,
+                'High': 0.008, 'Very High': 0.010,
+                'Extreme': 0.015, 'Ultra': 0.020
+            }
+            fee_buffer = fee_buffers.get(spread_level, 0.006)
+            be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=fee_buffer, reason='TP1_BREAKEVEN')
+            breakeven_sl = be_ctx.get('price', 0.0)
+            if breakeven_sl > 0:
+                apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
+            pos['breakeven_activated'] = True
+            logger.warning(
+                f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → ${breakeven_sl:.6f} "
+                f"(anchor={be_ctx.get('anchor_source', 'entry')} ${be_ctx.get('anchor_price', 0.0):.6f})"
+            )
+
+        await self._resync_live_protection_after_partial(pos, f"{level_reason}_SYNC")
+        logger.info(
+            f"💰 PARTIAL_TP: {symbol} closed {close_pct*100:.0f}% at ROI "
+            f"{compute_position_roi_pct(pos, current_price):.2f}% (level: {level_key}, base: {base_tp_pct:.2f}%)"
+        )
+        actions["partial_tp"].append(f"{symbol}_{level_key}({compute_position_roi_pct(pos, current_price):.1f}%)")
+        pos['lastExitDecision'] = level_reason
         return True
 
     def _tighten_v3_stop_distance(self, pos: dict, current_price: float, tighten_fraction: float, reason: str) -> bool:
@@ -24750,38 +25104,33 @@ class TimeBasedPositionManager:
         current_roi = compute_position_roi_pct(pos, current_price=current_price)
 
         partial_state = pos.get('partial_tp_state', {})
-        for level in normalize_tp_ladder_levels(pos):
-            level_key = level.get('key')
-            if not level_key or partial_state.get(level_key, False):
-                continue
-            level_roi = _coerce_float(level.get('roi_pct', 0.0), 0.0)
-            if current_roi < level_roi:
-                continue
-            if level_key == 'tp_final':
-                pos['lastExitDecision'] = 'TP_FINAL_HIT'
-                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'V3_RUNNER')
-                actions["time_closed"].append(f"{pos.get('symbol')} tp_final")
-                return True
-            close_pct = float(level.get('close_pct', 0) or 0)
-            if close_pct <= 0:
-                continue
-            partial_state[level_key] = True
-            pos['partial_tp_state'] = partial_state
+        triggered_slice = self._select_triggered_tp_slice_trail(pos, current_price)
+        if triggered_slice:
+            level_key = str(triggered_slice.get('key', '') or '')
+            close_pct = float(triggered_slice.get('close_pct', 0) or 0)
             partial_reason = f"{level_key.upper()}_PARTIAL"
-            ok = await self._execute_v3_partial_close(paper_trader, pos, current_price, close_pct, partial_reason, level_key.upper())
-            if not ok:
-                partial_state[level_key] = False
+            ok = await self._execute_v3_partial_close(
+                paper_trader,
+                pos,
+                current_price,
+                close_pct,
+                partial_reason,
+                level_key.upper(),
+            )
+            if ok:
+                partial_state[level_key] = True
                 pos['partial_tp_state'] = partial_state
-                pos['lastExitDecision'] = f"PARTIAL_FAILED_{level_key}"
+                self._clear_tp_slice_trail(pos, level_key)
+                actions["partial_tp"].append(f"{pos.get('symbol')}_{level_key}_trail({current_roi:.1f}%)")
+                pos['lastExitDecision'] = partial_reason
+                if level_key == 'tp1':
+                    pos['trailArmed'] = True
+                    pos['trailArmReason'] = f"TP1_{pos.get('runnerContext', '')}"
+                    pos['trailArmSince'] = now_ts
+                    pos['trailArmPrice'] = current_price
+                    pos['trailArmElapsedSec'] = 0
                 return True
-            actions["partial_tp"].append(f"{pos.get('symbol')}_{level_key}({current_roi:.1f}%)")
-            pos['lastExitDecision'] = partial_reason
-            if level_key == 'tp1':
-                pos['trailArmed'] = True
-                pos['trailArmReason'] = f"TP1_{pos.get('runnerContext', '')}"
-                pos['trailArmSince'] = now_ts
-                pos['trailArmPrice'] = current_price
-                pos['trailArmElapsedSec'] = 0
+            pos['lastExitDecision'] = f"PARTIAL_FAILED_{level_key}"
             return True
 
         if pos.get('trailArmed', False) and not pos.get('isTrailingActive', False):
@@ -24817,6 +25166,27 @@ class TimeBasedPositionManager:
                     pos['breakeven_activated'] = True
                     await self._sync_v3_protective_order(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
                 return True
+
+        armed_any = False
+        for level in normalize_tp_ladder_levels(pos):
+            level_key = level.get('key')
+            if not level_key or partial_state.get(level_key, False):
+                continue
+            level_roi = _coerce_float(level.get('roi_pct', 0.0), 0.0)
+            if current_roi < level_roi:
+                continue
+            if level_key == 'tp_final':
+                pos['lastExitDecision'] = 'TP_FINAL_HIT'
+                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'V3_RUNNER')
+                actions["time_closed"].append(f"{pos.get('symbol')} tp_final")
+                return True
+            close_pct = float(level.get('close_pct', 0) or 0)
+            if close_pct <= 0:
+                continue
+            if self._arm_tp_slice_trail(pos, level, current_price, atr, 'V3_RUNNER'):
+                armed_any = True
+        if armed_any:
+            return True
 
         pos['lastExitDecision'] = f"V3_HOLD_R={current_r:.2f}"
         return True
@@ -24919,6 +25289,30 @@ class TimeBasedPositionManager:
                                 partial_tp_state=pos.get('partial_tp_state', {}),
                                 tp1_trail_armed=pos.get('tp1_trail_armed', False),
                             )
+
+                            _tp_levels_norm = normalize_tp_ladder_levels(pos, _tp_ladder)
+                            _tp_slice_trigger = self._select_triggered_tp_slice_trail(pos, current_price)
+                            if _tp_slice_trigger:
+                                _tp_key = str(_tp_slice_trigger.get('key', '') or '')
+                                _tp_level = next((lv for lv in _tp_levels_norm if lv.get('key') == _tp_key), None)
+                                if _tp_level:
+                                    _executed = await self._execute_tp_ladder_partial_close(
+                                        paper_trader,
+                                        pos,
+                                        current_price,
+                                        _tp_level,
+                                        0.0,
+                                        pos.get('spreadLevel', pos.get('spread_level', 'Normal')),
+                                        _leverage,
+                                        entry_price,
+                                        contracts,
+                                        actions,
+                                    )
+                                    if _executed:
+                                        _rfx1b_sm_handled = True
+                                        pos['_exit_sm'] = _sm.to_dict()
+                                        pos['_exit_sm_decision_source'] = 'SM_TP_SLICE_TRAIL'
+                                        continue
                             
                             _decision = _sm.evaluate(_eval_ctx)
                             _action = _decision.action
@@ -24961,49 +25355,13 @@ class TimeBasedPositionManager:
                                     logger.debug(f"🔧 RFX1B_SM_TRAIL: {symbol} tighten→${_decision.suggested_price:.6f}")
                             
                             elif _action == RFX_ExitAction.PARTIAL_TP:
-                                # Execute partial close at TP level
                                 _tp_key = _decision.tp_key
-                                _close_pct = _decision.close_pct
                                 _partial_state = pos.get('partial_tp_state', {})
                                 if not _partial_state.get(_tp_key, False):
-                                    original_contracts = pos.get('original_contracts', contracts)
-                                    close_contracts = original_contracts * _close_pct
-                                    # LIVE partial close
-                                    if pos.get('isLive', False) and close_contracts > 0:
-                                        try:
-                                            _result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
-                                            if _result:
-                                                pos['_partial_close_ts'] = datetime.now().timestamp()
-                                                logger.warning(f"💰 RFX1B_TP {_tp_key}: {symbol} closed {_close_pct*100:.0f}% LIVE")
-                                            else:
-                                                logger.error(f"❌ RFX1B_TP LIVE FAIL: {symbol} {_tp_key}")
-                                                _sm.state = _sm.history[-1].from_state if _sm.history else RFX_ExitState.OPEN
-                                                pos['_exit_sm'] = _sm.to_dict()
-                                                _rfx1b_sm_handled = True
-                                                continue
-                                        except Exception as _tp_err:
-                                            logger.error(f"❌ RFX1B_TP LIVE ERROR: {symbol} {_tp_key} {_tp_err}")
-                                            _sm.state = _sm.history[-1].from_state if _sm.history else RFX_ExitState.OPEN
-                                            pos['_exit_sm'] = _sm.to_dict()
-                                            _rfx1b_sm_handled = True
-                                            continue
-                                    # Update local state
-                                    if not pos.get('original_contracts'):
-                                        pos['original_contracts'] = contracts
-                                    _partial_state[_tp_key] = True
-                                    pos['partial_tp_state'] = _partial_state
-                                    new_contracts = max(0, contracts - close_contracts)
-                                    pos['contracts'] = new_contracts
-                                    pos['size'] = new_contracts
-                                    # BE re-confirm on TP1 (idempotent)
-                                    if _tp_key == 'tp1' and _decision.suggested_price > 0:
-                                        apply_sl_floor(pos, _decision.suggested_price, 'RFX1B_TP1_BE')
-                                        pos['breakeven_activated'] = True
-                                        pos['isTrailingActive'] = True
-                                        pos['trailActiveSince'] = pos.get('trailActiveSince') or datetime.now().timestamp()
-                                    await self._resync_live_protection_after_partial(pos, f"RFX1B_{str(_tp_key).upper()}_SYNC")
-                                    logger.warning(f"💰 RFX1B_TP {_tp_key}: {symbol} {side} partial {_close_pct*100:.0f}% | {_decision.reason}")
-                                    actions["partial_tp"].append({'symbol': symbol, 'tp': _tp_key, 'source': 'SM'})
+                                    _tp_level = next((lv for lv in _tp_levels_norm if lv.get('key') == _tp_key), None)
+                                    if _tp_level and self._arm_tp_slice_trail(pos, _tp_level, current_price, _atr, 'RFX1B_SM'):
+                                        logger.info(f"🎯 RFX1B_TP_ARM: {symbol} {side} {_tp_key} armed | {_decision.reason}")
+                                    actions["partial_tp"].append({'symbol': symbol, 'tp': _tp_key, 'source': 'SM_ARM'})
                             
                             elif _action in (RFX_ExitAction.CLOSE_TP, RFX_ExitAction.CLOSE_SL, RFX_ExitAction.CLOSE_EMERGENCY):
                                 # B4: Inflight guard — prevent duplicate close
@@ -25144,7 +25502,7 @@ class TimeBasedPositionManager:
                 # Legacy fallback for old positions without tp_ladder_levels
                 # B1: When RFX1B_EXIT_WIRING=true, SM handles above — legacy skipped
                 # ===============================================
-                if unrealized_pnl > 0 and contracts > 0:
+                if contracts > 0 and (unrealized_pnl > 0 or bool(pos.get('tp_slice_trails'))):
                     # Get spread level and ATR for TP calculation
                     spread_level = pos.get('spreadLevel', pos.get('spread_level', 'Normal'))
                     atr = pos.get('atr', current_price * 0.02)
@@ -25217,187 +25575,56 @@ class TimeBasedPositionManager:
                         tp_levels = normalize_tp_ladder_levels(pos, fallback_ladder.get('levels', []))
                         base_tp_pct = fallback_ladder.get('telemetry', {}).get('base_tp_pct', 0)
 
-                    # Current profit ROI
+                    # Current profit ROI + ladder slice trails
                     if entry_price > 0:
-                        # Track which TPs have been hit
                         partial_tp_state = pos.get('partial_tp_state', {})
                         tp_final_closed = False
-                        
+                        triggered_slice = self._select_triggered_tp_slice_trail(pos, current_price)
+                        if triggered_slice:
+                            triggered_key = str(triggered_slice.get('key', '') or '')
+                            triggered_level = next((lv for lv in tp_levels if lv.get('key') == triggered_key), None)
+                            if triggered_level and not partial_tp_state.get(triggered_key, False):
+                                executed = await self._execute_tp_ladder_partial_close(
+                                    paper_trader,
+                                    pos,
+                                    current_price,
+                                    triggered_level,
+                                    base_tp_pct,
+                                    spread_level,
+                                    leverage,
+                                    entry_price,
+                                    contracts,
+                                    actions,
+                                )
+                                if executed:
+                                    contracts = pos.get('contracts', contracts)
+                                    continue
+
+                        armed_any = False
                         for level in tp_levels:
                             level_roi = _coerce_float(
                                 level.get('roi_pct', price_move_pct_to_roi_pct(level.get('pct', 0), leverage)),
                                 0.0,
                             )
-                            if current_roi >= level_roi and not partial_tp_state.get(level['key'], False):
-                                if level.get('key') == 'tp_final':
-                                    partial_tp_state[level['key']] = True
-                                    pos['partial_tp_state'] = partial_tp_state
-                                    pos['lastExitDecision'] = 'TP_FINAL_HIT'
-                                    paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'TP_LADDER')
-                                    actions["time_closed"].append(f"{symbol} tp_final")
-                                    tp_final_closed = True
-                                    break
-
-                                # TP level hit - mark as closed
-                                partial_tp_state[level['key']] = True
+                            level_key = str(level.get('key', '') or '')
+                            if not level_key or partial_tp_state.get(level_key, False):
+                                continue
+                            if current_roi < level_roi:
+                                continue
+                            if level_key == 'tp_final':
+                                partial_tp_state[level_key] = True
                                 pos['partial_tp_state'] = partial_tp_state
-                                
-                                # Phase 231e: Use ORIGINAL contracts for percentage calc
-                                # Prevents compounding: 40/18/12.6 → correct 40/30/30
-                                original_contracts = pos.get('original_contracts', contracts)
-                                if original_contracts == 0:
-                                    original_contracts = contracts
-                                close_contracts = original_contracts * level['close_pct']
-                                close_oid = ''
-                                close_fee = 0.0
-                                
-                                # LIVE positions: Execute actual Binance partial close
-                                if pos.get('isLive', False) and close_contracts > 0:
-                                    live_success = False
-                                    try:
-                                        result = await live_binance_trader.close_position(symbol, side, close_contracts, close_scope="PARTIAL")
-                                        if result:
-                                            live_success = True
-                                            # Phase 188: Set cooldown to prevent Binance sync from restoring old size
-                                            pos['_partial_close_ts'] = datetime.now().timestamp()
-                                            close_oid = str(result.get('id', ''))
-                                            close_fee = max(0.0, _to_float_safe(result.get('fee', 0.0), 0.0))
-                                            logger.warning(f"💰 PARTIAL_TP LIVE ✅: {symbol} closed {level['close_pct']*100:.0f}% on Binance ({close_contracts:.4f} contracts) at ROI {current_roi:.2f}% | Order: {close_oid[:12]}")
-                                            # Phase 229b: Persist close order ID
-                                            if close_oid:
-                                                safe_create_task(sqlite_manager.update_close_order_id(symbol, close_oid))
-                                        else:
-                                            logger.error(f"❌ PARTIAL_TP LIVE FAILED: {symbol} - close_position returned None")
-                                    except Exception as e:
-                                        logger.error(f"❌ PARTIAL_TP LIVE ERROR: {symbol} - {e}")
-                                    
-                                    # Phase 231: Only update local state if Binance close succeeded
-                                    if not live_success:
-                                        # Revert TP state — Binance failed, don't mark as closed
-                                        partial_tp_state[level['key']] = False
-                                        pos['partial_tp_state'] = partial_tp_state
-                                        logger.warning(f"⚠️ PARTIAL_TP REVERTED: {symbol} {level['key']} — Binance close failed, state rolled back")
-                                        continue  # Skip contract update and trail activation
-                                
-                                # Phase 231e: Save original values BEFORE first reduction
-                                if not pos.get('original_contracts'):
-                                    pos['original_contracts'] = contracts
-                                    pos['original_size'] = pos.get('size', contracts)
-                                    pos['original_sizeUsd'] = pos.get('sizeUsd', 0)
-                                    pos['original_initialMargin'] = pos.get('initialMargin', 0)
-                                
-                                # Phase 231g: Clamp to prevent negative contracts
-                                new_contracts = max(0, pos.get('contracts', contracts) - close_contracts)
-                                pos['contracts'] = new_contracts
-                                
-                                # Ratio-based sync: all fields scale proportionally
-                                ratio = new_contracts / contracts if contracts > 0 else 1.0
-                                pos['size'] = new_contracts  # size = contracts (same unit)
-                                pos['sizeUsd'] = pos.get('sizeUsd', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
-                                pos['initialMargin'] = pos.get('initialMargin', 0) * (new_contracts / (new_contracts + close_contracts)) if (new_contracts + close_contracts) > 0 else 0
-                                level_reason = f"{str(level['key']).upper()}_PARTIAL"
-                                released_margin = float(pos.get('original_initialMargin', pos.get('initialMargin', 0)) or 0) * float(level['close_pct'] or 0)
-                                price_profit_pct = ((current_price - entry_price) / entry_price * 100) if side == 'LONG' else ((entry_price - current_price) / entry_price * 100)
-                                gross_pnl = (current_price - entry_price) * close_contracts if side == 'LONG' else (entry_price - current_price) * close_contracts
-                                cost_bundle = allocate_partial_realization_costs(
-                                    pos,
-                                    close_contracts=close_contracts,
-                                    current_contracts=contracts,
-                                    close_fee=close_fee,
-                                )
-                                realized_pnl = gross_pnl - cost_bundle['total_fee'] + cost_bundle['funding_alloc']
-                                paper_trader.balance += released_margin + realized_pnl
-                                partial_trade = {
-                                    "id": f"{pos.get('id', '')}_{level_reason}",
-                                    "tradeId": f"{pos.get('tradeId', pos.get('id', ''))}_{level_reason}",
-                                    "signalId": pos.get('signalId', pos.get('signal_id', '')),
-                                    "positionId": pos.get('positionId', pos.get('position_id', pos.get('id', ''))),
-                                    "entryOrderId": pos.get('entryOrderId', pos.get('entry_order_id', pos.get('binance_order_id', ''))),
-                                    "closeOrderId": close_oid if pos.get('isLive', False) else '',
-                                    "symbol": symbol,
-                                    "side": side,
-                                    "entryPrice": entry_price,
-                                    "exitPrice": current_price,
-                                    "size": close_contracts,
-                                    "sizeUsd": close_contracts * current_price,
-                                    "marginUsd": released_margin,
-                                    "margin": released_margin,
-                                    "pnl": realized_pnl,
-                                    "pnlPercent": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
-                                    "roi": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
-                                    "fee_cost": cost_bundle['total_fee'],
-                                    "feesPaidUsd": cost_bundle['total_fee'],
-                                    "openTime": pos.get('openTime', 0),
-                                    "closeTime": int(datetime.now().timestamp() * 1000),
-                                    "reason": level_reason,
-                                    "closeReason": level_reason,
-                                    "closeReasonNormalized": paper_trader._normalize_close_reason(level_reason),
-                                    "original_reason": level_reason,
-                                    "reasonSource": "engine",
-                                    "leverage": leverage,
-                                    "isPartialClose": True,
-                                    "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
-                                    "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
-                                    "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
-                                    "signalSnapshot": pos.get('signal_snapshot', pos.get('signalSnapshot', {})),
-                                    "execSnapshot": pos.get('exec_snapshot', pos.get('execSnapshot', {})),
-                                    "riskSnapshot": pos.get('risk_snapshot', pos.get('riskSnapshot', {})),
-                                    "closeSnapshot": {
-                                        "tp_key": level['key'],
-                                        "tp_roi_pct": level_roi,
-                                        "tp_price": level.get('price', 0),
-                                        "close_pct": level['close_pct'],
-                                        "current_roi_pct": ((realized_pnl / released_margin) * 100) if released_margin > 0 else 0.0,
-                                        "price_profit_pct": round(price_profit_pct, 4),
-                                        "gross_pnl": gross_pnl,
-                                        "entry_fee_alloc": cost_bundle['entry_fee_alloc'],
-                                        "close_fee": cost_bundle['close_fee'],
-                                        "funding_alloc": cost_bundle['funding_alloc'],
-                                    },
-                                }
-                                paper_trader.trades.append(partial_trade)
-                                safe_create_task(sqlite_manager.save_trade(partial_trade))
-                                
-                                # =====================================================
-                                # Phase 220+: TP1 → delayed trail arm + buffered breakeven floor.
-                                # =====================================================
-                                if level['key'] == 'tp1':
-                                    pos['tp1_hit_time'] = datetime.now().timestamp()
-                                    pos['tp1_hit_price'] = current_price
-                                    pos['tp1_trail_armed'] = True
-                                    pos.setdefault('tp1ArmDelaySec', 90 if bool(pos.get('trend_mode')) else 45)
-                                    pos.setdefault('tp1ArmAtrReq', 0.4 if bool(pos.get('trend_mode')) else 0.2)
-                                    logger.warning(
-                                        f"⏳ TP1_TRAIL_ARMED: {symbol} {side} price=${current_price:.6f} "
-                                        f"| delay={pos.get('tp1ArmDelaySec')}s atr_req={pos.get('tp1ArmAtrReq')}"
-                                    )
-
-                                    # 2) Move SL to buffered breakeven (exchange BE if available)
-                                    fee_buffers = {
-                                        'Very Low': 0.005, 'Low': 0.005, 'Normal': 0.006,
-                                        'High': 0.008, 'Very High': 0.010,
-                                        'Extreme': 0.015, 'Ultra': 0.020
-                                    }
-                                    fee_buffer = fee_buffers.get(spread_level, 0.006)
-                                    be_ctx = compute_buffered_breakeven_price(pos, buffer_pct=fee_buffer, reason='TP1_BREAKEVEN')
-                                    breakeven_sl = be_ctx.get('price', 0.0)
-                                    if breakeven_sl > 0:
-                                        apply_sl_floor(pos, breakeven_sl, 'BREAKEVEN')
-                                    pos['breakeven_activated'] = True
-                                    logger.warning(
-                                        f"🔒 TP1_BREAKEVEN: {symbol} {side} SL → ${breakeven_sl:.6f} "
-                                        f"(anchor={be_ctx.get('anchor_source', 'entry')} ${be_ctx.get('anchor_price', 0.0):.6f})"
-                                    )
-                                await self._resync_live_protection_after_partial(pos, f"{level_reason}_SYNC")
-                                
-                                # Log partial TP
-                                logger.info(f"💰 PARTIAL_TP: {symbol} closed {level['close_pct']*100:.0f}% at ROI {current_roi:.2f}% (level: {level['key']}, base: {base_tp_pct:.2f}%)")
-                                actions["partial_tp"].append(f"{symbol}_{level['key']}({current_roi:.1f}%)")
-                                
-                                # Phase 220b: Update local contracts for next TP level calculation
-                                contracts = pos['contracts']
+                                pos['lastExitDecision'] = 'TP_FINAL_HIT'
+                                paper_trader.close_via_engine(pos, current_price, 'TP_FINAL_HIT', 'TP_LADDER')
+                                actions["time_closed"].append(f"{symbol} tp_final")
+                                tp_final_closed = True
+                                break
+                            if self._arm_tp_slice_trail(pos, level, current_price, atr, 'TP_LADDER'):
+                                armed_any = True
 
                         if tp_final_closed:
+                            continue
+                        if armed_any:
                             continue
                         
                         # =============================================================
@@ -31095,17 +31322,19 @@ class SignalGenerator:
                 sources_str = '+'.join(c['source'] for c in structural_result['candidates'])
                 reasons.append(f"STRUCT({comp_vol['category']},{sources_str})")
         
+        exit_scales = resolve_exit_tightness_scales(effective_exit_tightness)
+
         # 4. SL/TP/Trail computed from ideal_entry
         if signal_side == "LONG":
-            sl = ideal_entry - (atr * atr_sl * effective_exit_tightness) - spread_buffer
-            tp = ideal_entry + (atr * atr_tp * effective_exit_tightness)
-            trail_activation = ideal_entry + (trail_act * effective_exit_tightness)
-            trail_dist = atr * trail_mult * effective_exit_tightness
+            sl = ideal_entry - (atr * atr_sl * exit_scales['sl_scale']) - spread_buffer
+            tp = ideal_entry + (atr * atr_tp * exit_scales['tp_scale'])
+            trail_activation = ideal_entry + (trail_act * exit_scales['trail_activation_scale'])
+            trail_dist = atr * trail_mult * exit_scales['trail_distance_scale']
         else:
-            sl = ideal_entry + (atr * atr_sl * effective_exit_tightness) + spread_buffer
-            tp = ideal_entry - (atr * atr_tp * effective_exit_tightness)
-            trail_activation = ideal_entry - (trail_act * effective_exit_tightness)
-            trail_dist = atr * trail_mult * effective_exit_tightness
+            sl = ideal_entry + (atr * atr_sl * exit_scales['sl_scale']) + spread_buffer
+            tp = ideal_entry - (atr * atr_tp * exit_scales['tp_scale'])
+            trail_activation = ideal_entry - (trail_act * exit_scales['trail_activation_scale'])
+            trail_dist = atr * trail_mult * exit_scales['trail_distance_scale']
         
         # 5. Structural SL validation (adjust SL if near strong S/R)
         if sr_levels and (sr_levels.get('nearest_support') or sr_levels.get('nearest_resistance')):
@@ -31805,7 +32034,7 @@ class PaperTradingEngine:
         self.min_confidence_score = 74  # Cost-aware: was 68, kademeli artış (hedef 76-78)
         # Phase 36: Entry/Exit tightness settings
         self.entry_tightness = 1.8  # 0.5-15.0: Pullback multiplier (Gevşek/Loose mode)
-        self.exit_tightness = 1.2   # 0.5-15.0: SL/TP multiplier
+        self.exit_tightness = 1.2   # 0.5-15.0: exit patience multiplier (TP/trail dominant, SL damped)
         self.entry_stop_soft_roi_pct = ENTRY_STOP_SOFT_ROI_DEFAULT
         self.entry_stop_hard_roi_pct = ENTRY_STOP_HARD_ROI_DEFAULT
         # Strategy engine mode
@@ -33064,7 +33293,7 @@ class PaperTradingEngine:
             logger.info(f"🚀 TREND_MODE SIZE: {strong_trend_size_mult:.0%} multiplier applied → size_mult={size_mult:.2f}")
         
         # Calculate SL/TP based on pullback entry price
-        # Apply exit_tightness: lower = quicker exit (smaller SL/TP), higher = hold longer (bigger SL/TP)
+        # Apply exit_tightness asymmetrically: TP/trail follows fully, SL stays more conservative.
         # DYNAMIC ATR MULTIPLIER: Adjust based on current volatility
         dynamic_atr_mult = self.calculate_dynamic_atr_multiplier(atr, price)
         
@@ -33088,6 +33317,7 @@ class PaperTradingEngine:
             0.3,
             15.0
         )
+        exit_scales = resolve_exit_tightness_scales(effective_exit_tightness)
         _runner_controls = resolve_runner_exit_controls(
             payload=signal if signal else {},
             default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -33126,10 +33356,10 @@ class PaperTradingEngine:
         base_trail_activation_atr = trail_base_ctx['base_activation_atr']
         base_trail_distance_atr = trail_base_ctx['base_distance_atr']
 
-        adjusted_sl_atr = configured_sl_atr * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
-        adjusted_tp_atr = configured_tp_atr * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
-        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
+        adjusted_sl_atr = configured_sl_atr * exit_scales['sl_scale'] * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
+        adjusted_tp_atr = configured_tp_atr * exit_scales['tp_scale'] * dynamic_atr_mult * tm_tp_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * exit_scales['trail_activation_scale'] * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * exit_scales['trail_distance_scale'] * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
 
         if _runner_controls.get('enabled', False):
             adjusted_tp_atr *= _runner_controls['tp_tighten']
@@ -34925,8 +35155,8 @@ class PaperTradingEngine:
             return  # Don't create duplicate position
         
         
-        # Recalculate SL/TP based on actual fill price
-        # Apply exit_tightness for faster/slower exits
+        # Recalculate SL/TP based on actual fill price.
+        # Apply exit_tightness asymmetrically so patient exits do not over-widen the stop.
         atr_ctx = resolve_effective_atr_value(
             order.get('atr', 0.0),
             fill_price,
@@ -34968,6 +35198,7 @@ class PaperTradingEngine:
             0.3,
             15.0
         )
+        exit_scales = resolve_exit_tightness_scales(effective_exit_tightness)
         _runner_controls = resolve_runner_exit_controls(
             payload=order,
             default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -35002,10 +35233,10 @@ class PaperTradingEngine:
         base_trail_activation_atr = trail_base_ctx['base_activation_atr']
         base_trail_distance_atr = trail_base_ctx['base_distance_atr']
 
-        adjusted_sl_atr = configured_sl_atr * effective_exit_tightness * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
-        adjusted_tp_atr = configured_tp_atr * effective_exit_tightness * dynamic_atr_mult * tm_tp_mult
-        adjusted_trail_activation_atr = base_trail_activation_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
-        adjusted_trail_distance_atr = base_trail_distance_atr * effective_exit_tightness * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
+        adjusted_sl_atr = configured_sl_atr * exit_scales['sl_scale'] * dynamic_atr_mult * tm_sl_mult * ct_sl_mult
+        adjusted_tp_atr = configured_tp_atr * exit_scales['tp_scale'] * dynamic_atr_mult * tm_tp_mult
+        adjusted_trail_activation_atr = base_trail_activation_atr * exit_scales['trail_activation_scale'] * dynamic_atr_mult * tm_trail_act_mult * ct_trail_act_mult
+        adjusted_trail_distance_atr = base_trail_distance_atr * exit_scales['trail_distance_scale'] * dynamic_atr_mult * tm_trail_dist_mult * ct_trail_dist_mult
         if _runner_controls.get('enabled', False):
             adjusted_tp_atr *= _runner_controls['tp_tighten']
             adjusted_trail_activation_atr *= _runner_controls['trail_act_mult']
@@ -41097,10 +41328,11 @@ async def paper_trading_update_settings(
                 pos.get('signalDynamicTrailActivationAtr', pos.get('dynamic_trail_activation', pos.get('dynamicTrailActivation'))),
                 pos.get('signalDynamicTrailDistanceAtr', pos.get('dynamic_trail_distance', pos.get('dynamicTrailDistance'))),
             )
-            adjusted_sl_atr = configured_sl_atr * global_paper_trader.exit_tightness
-            adjusted_tp_atr = configured_tp_atr * global_paper_trader.exit_tightness
-            adjusted_trail_activation_atr = trail_base_ctx['base_activation_atr'] * global_paper_trader.exit_tightness
-            adjusted_trail_distance_atr = trail_base_ctx['base_distance_atr'] * global_paper_trader.exit_tightness
+            exit_scales = resolve_exit_tightness_scales(global_paper_trader.exit_tightness)
+            adjusted_sl_atr = configured_sl_atr * exit_scales['sl_scale']
+            adjusted_tp_atr = configured_tp_atr * exit_scales['tp_scale']
+            adjusted_trail_activation_atr = trail_base_ctx['base_activation_atr'] * exit_scales['trail_activation_scale']
+            adjusted_trail_distance_atr = trail_base_ctx['base_distance_atr'] * exit_scales['trail_distance_scale']
             _runner_controls = resolve_runner_exit_controls(
                 payload=pos,
                 default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),

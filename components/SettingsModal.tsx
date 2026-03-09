@@ -880,7 +880,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
             <div className="mt-3 bg-slate-900/50 p-2 rounded text-[10px] text-slate-400">
               <div className="text-slate-300 font-medium mb-1">Yaklaşık ROI Önizleme</div>
               <div>SL {roiPreview(localSettings.stopLossAtr)}% • TP {roiPreview(localSettings.takeProfit)}% • Trail Akt {roiPreview(localSettings.trailActivationAtr)}% • Trail Mesafe {roiPreview(localSettings.trailDistanceAtr)}%</div>
-              <div className="text-slate-500 mt-1">Hesap: ATR snapshot ~ %{previewAtrPct.toFixed(2)} • lev {previewLeverage}x</div>
+              <div className="text-slate-500 mt-1">Ornek hesap: ATR ~ %{previewAtrPct.toFixed(2)} • lev {previewLeverage}x. Gercek seviyeler her coinin canli ATR&apos;ina gore hesaplanir.</div>
             </div>
           </div>
 

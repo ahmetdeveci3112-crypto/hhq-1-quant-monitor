@@ -20,6 +20,7 @@ from main import (
     get_persistent_active_signals_snapshot,
     price_distance_to_roi_pct,
     price_move_pct_to_roi_pct,
+    resolve_exit_tightness_scales,
     should_activate_trailing_by_roi,
     update_runtime_protection_telemetry,
     update_runtime_trail_telemetry,
@@ -180,6 +181,21 @@ def test_roi_helpers_and_runtime_trail_telemetry():
     assert pos["runtimeTrailDistancePct"] == 40.0
     assert pos["runtimeTrailDistanceRoiPct"] == 480.0
     assert pos["runtimeTrailActivationRoiPct"] == 9.6
+
+
+def test_resolve_exit_tightness_scales_keeps_sl_damped_vs_profit_controls():
+    relaxed = resolve_exit_tightness_scales(2.5)
+    tight = resolve_exit_tightness_scales(0.5)
+
+    assert relaxed["tp_scale"] == 2.5
+    assert relaxed["trail_activation_scale"] == 2.5
+    assert relaxed["trail_distance_scale"] == 2.5
+    assert relaxed["sl_scale"] == 1.6
+
+    assert tight["tp_scale"] == 0.5
+    assert tight["trail_activation_scale"] == 0.5
+    assert tight["trail_distance_scale"] == 0.5
+    assert tight["sl_scale"] == 0.8
 
 
 def test_kill_switch_thresholds_are_canonical_roi_values():

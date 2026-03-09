@@ -80,6 +80,11 @@ def _reset_globals(monkeypatch):
         "global_paper_trader",
         SimpleNamespace(min_confidence_score=74, strategy_mode=main.STRATEGY_MODE_SMART_V3_RUNNER),
     )
+    monkeypatch.setattr(
+        main,
+        "safe_create_task",
+        lambda coro: (coro.close() if hasattr(coro, "close") else None),
+    )
 
 
 def test_runner_context_resolves_trend_aligned_profile():
@@ -166,13 +171,37 @@ async def test_v3_tp1_arms_trail_without_immediate_activation():
     handled = await manager._handle_v3_runner_position(trader, pos, 101.0, actions)
 
     assert handled is True
-    assert pos["partial_tp_state"]["tp1"] is True
-    assert pos["trailArmed"] is True
+    assert pos["partial_tp_state"] == {}
+    assert "tp1" in pos["tp_slice_trails"]
+    assert pos["trailArmed"] is False
     assert pos.get("isTrailingActive", False) is False
     assert pos.get("breakeven_activated", False) is False
-    assert pos["lastExitDecision"] == "TP_PARTIAL_TP1"
+    assert pos["lastExitDecision"] == "TP1_SLICE_TRAIL_ARMED"
+    assert trader.trades == []
+    assert trader.balance == pytest.approx(1000.0)
+
+
+@pytest.mark.asyncio
+async def test_v3_tp1_slice_trail_executes_partial_after_giveback():
+    trader = DummyPaperTrader()
+    manager = main.TimeBasedPositionManager()
+    pos = _base_v3_position(currentPrice=101.0)
+    actions = {"trail_activated": [], "time_reduced": [], "time_closed": [], "partial_tp": [], "checked": 0}
+
+    handled = await manager._handle_v3_runner_position(trader, pos, 101.0, actions)
+
+    assert handled is True
+    state = pos["tp_slice_trails"]["tp1"]
+    trigger_price = state["best_price"] - state["trail_distance_price"] - 0.01
+
+    handled = await manager._handle_v3_runner_position(trader, pos, trigger_price, actions)
+
+    assert handled is True
+    assert pos["partial_tp_state"]["tp1"] is True
+    assert "tp1" not in pos.get("tp_slice_trails", {})
+    assert pos["trailArmed"] is True
     assert len(trader.trades) == 1
-    assert trader.trades[0]["reason"] == "TP_PARTIAL_TP1"
+    assert trader.trades[0]["reason"] == "TP1_PARTIAL"
     assert trader.balance > 1000.0
 
 
@@ -198,6 +227,28 @@ async def test_v3_trail_activation_waits_for_delay_and_atr_move():
     assert pos["lastExitDecision"] == "TRAIL_ARMED_ACTIVATED"
     assert pos["breakeven_activated"] is True
     assert pos["trailingStop"] >= pos["entryPrice"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_tp_ladder_arms_slice_trail_before_partial_execution():
+    trader = DummyPaperTrader()
+    trader.positions = [
+        _base_v3_position(
+            strategyMode=main.STRATEGY_MODE_LEGACY,
+            exitOwner=main.LEGACY_EXIT_OWNER,
+            currentPrice=101.0,
+            unrealizedPnl=10.0,
+        )
+    ]
+    manager = main.TimeBasedPositionManager()
+
+    actions = await manager.check_positions(trader)
+
+    pos = trader.positions[0]
+    assert actions["partial_tp"] == []
+    assert pos["partial_tp_state"] == {}
+    assert "tp1" in pos["tp_slice_trails"]
+    assert trader.trades == []
 
 
 @pytest.mark.asyncio
