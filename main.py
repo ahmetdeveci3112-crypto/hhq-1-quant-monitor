@@ -13454,6 +13454,118 @@ def build_soft_signal_allocator_plan(
     return planned
 
 
+def build_signal_payload_with_fallback(
+    core_payload: dict,
+    extra_payload_factory,
+    *,
+    symbol: str,
+    signal_side: str,
+) -> dict:
+    """Finalize a generated signal without letting late telemetry errors kill it.
+
+    The signal was already accepted by the scoring pipeline at this point.
+    If an optional runner/telemetry field raises, return the safe core payload
+    so the scanner handoff does not silently drop the signal.
+    """
+    safe_core = dict(core_payload or {})
+    try:
+        extra_payload = extra_payload_factory() or {}
+        payload = dict(safe_core)
+        payload.update(extra_payload)
+        return payload
+    except Exception as exc:
+        safe_core['signalPayloadFallback'] = True
+        safe_core['signalPayloadFallbackReason'] = _format_exception_context(exc)
+        safe_core.setdefault('execution_profile_source', 'fallback_error')
+        safe_core.setdefault('runnerContext', 'fallback_core')
+        safe_core.setdefault('exitOwner', LEGACY_EXIT_OWNER)
+        safe_core.setdefault('tpCloseSplit', '30/25/25/20')
+        safe_core.setdefault('tp1ArmDelaySec', 0)
+        safe_core.setdefault('tp1ArmAtrReq', 0.0)
+        safe_core.setdefault('beAfterTrailAtrReq', 0.0)
+        safe_core.setdefault('runner_wide_profit_pct', 0.20)
+        safe_core.setdefault('runner_wide_age_sec', 600)
+        safe_core.setdefault('execution_style', EXEC_STYLE_MARKET)
+        safe_core.setdefault('structural_zone', {})
+        safe_core.setdefault('structural_sr_levels', {})
+        safe_core.setdefault('structural_fallback_stage', '')
+        safe_core.setdefault('struct_partial_tp_pct', 0.0)
+        logger.warning(
+            f"⚠️ SIGNAL_POST_BUILD_FALLBACK: {symbol} {signal_side} "
+            f"returning core payload only ({safe_core['signalPayloadFallbackReason']})"
+        )
+        return safe_core
+
+
+def recover_scanner_signals_from_analyzers(
+    opportunities: list,
+    analyzers: dict,
+    *,
+    max_age_sec: float = 180.0,
+) -> list:
+    """Recover fresh actionable signals from analyzer cache if the handoff list is empty."""
+    opps = opportunities if isinstance(opportunities, list) else []
+    analyzer_map = analyzers if isinstance(analyzers, dict) else {}
+    now_ts = time.time()
+    recovered = []
+
+    for opp in opps:
+        symbol = str(opp.get('symbol', '') or '').upper()
+        action = str(opp.get('signalAction', '') or '').upper()
+        score = _coerce_float(opp.get('signalScore', 0.0), 0.0)
+        if not symbol or action not in ('LONG', 'SHORT') or score <= 0:
+            continue
+
+        analyzer = analyzer_map.get(symbol)
+        cached_signal = getattr(analyzer, 'last_emitted_signal', None) if analyzer else None
+        cached_ts = _coerce_float(getattr(analyzer, 'last_emitted_signal_ts', 0.0), 0.0) if analyzer else 0.0
+        if not isinstance(cached_signal, dict):
+            continue
+        if cached_ts <= 0 or (now_ts - cached_ts) > max_age_sec:
+            continue
+        if str(cached_signal.get('action', '') or '').upper() != action:
+            continue
+
+        recovered_signal = dict(cached_signal)
+        recovered_signal['symbol'] = symbol
+        recovered_signal['price'] = _coerce_float(
+            recovered_signal.get('price', opp.get('price', 0.0)),
+            _coerce_float(opp.get('price', 0.0), 0.0),
+        )
+        recovered_signal['entryPrice'] = _coerce_float(
+            recovered_signal.get('entryPrice', opp.get('entryPriceBackend', recovered_signal.get('price', 0.0))),
+            _coerce_float(opp.get('entryPriceBackend', recovered_signal.get('price', 0.0)), 0.0),
+        )
+        recovered_signal['confidenceScore'] = _coerce_float(
+            recovered_signal.get('confidenceScore', score),
+            score,
+        )
+        recovered_signal['priceChange24h'] = _coerce_float(
+            recovered_signal.get('priceChange24h', opp.get('priceChange24h', 0.0)),
+            _coerce_float(opp.get('priceChange24h', 0.0), 0.0),
+        )
+        recovered_signal['volume24h'] = _coerce_float(
+            recovered_signal.get('volume24h', opp.get('volume24h', 0.0)),
+            _coerce_float(opp.get('volume24h', 0.0), 0.0),
+        )
+        recovered_signal['volume4h'] = _coerce_float(
+            recovered_signal.get('volume4h', opp.get('volume4h', 0.0)),
+            _coerce_float(opp.get('volume4h', 0.0), 0.0),
+        )
+        recovered_signal['zscore'] = _coerce_float(
+            recovered_signal.get('zscore', opp.get('zscore', 0.0)),
+            _coerce_float(opp.get('zscore', 0.0), 0.0),
+        )
+        recovered_signal['signalRecoveredFromCache'] = True
+        recovered.append(recovered_signal)
+
+    recovered.sort(
+        key=lambda sig: _coerce_float(sig.get('confidenceScore', 0.0), 0.0),
+        reverse=True,
+    )
+    return recovered
+
+
 def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
     """
     Map BTC counter-trend penalty to risk caps.
@@ -17333,6 +17445,8 @@ class LightweightCoinAnalyzer:
         self.signal_generator = SignalGenerator()
         self.signal_generator.min_signal_interval = 60  # 1 minute per coin in multi-scan mode
         self.is_preloaded = False  # Track if historical data is loaded
+        self.last_emitted_signal: Optional[dict] = None
+        self.last_emitted_signal_ts: float = 0.0
         
         # VWAP calculation variables
         self.vwap_numerator: float = 0.0
@@ -17933,55 +18047,66 @@ class LightweightCoinAnalyzer:
         )
         
         if signal:
-            self.opportunity.signal_score = signal.get('confidenceScore', 0)
-            self.opportunity.signal_action = signal.get('action', 'NONE')
-            self.opportunity.leverage = signal.get('leverage', 10)
-            self.opportunity.pullback_pct = signal.get('pullbackPct', 0)
-            self.opportunity.dynamic_trail_activation = signal.get('dynamic_trail_activation', 1.5)
-            self.opportunity.dynamic_trail_distance = signal.get('dynamic_trail_distance', 1.0)
-            self.opportunity.last_signal_time = datetime.now().timestamp()
-            # Phase EQG + FIB: Store observability fields
-            self.opportunity.volume_ratio = signal.get('volumeRatio', 0)
-            self.opportunity.is_volume_spike = signal.get('isVolumeSpike', False)
-            self.opportunity.ob_imbalance_trend = signal.get('obImbalanceTrend', 0)
-            self.opportunity.entry_quality_pass = signal.get('entryQualityPass', False)
-            self.opportunity.entry_quality_reasons = signal.get('entryQualityReasons', [])
-            self.opportunity.fib_active = signal.get('fibActive', False)
-            self.opportunity.fib_level = signal.get('fibLevel')
-            self.opportunity.fib_bonus = signal.get('fibBonus', 0)
-            self.opportunity.fib_entry = signal.get('fibEntry', 0)
-            self.opportunity.fib_blend_alpha = signal.get('fibBlendAlpha', 0)
-            self.opportunity.entry_price = signal.get('entryPrice', 0) or signal.get('entry', 0)
-            self.opportunity.trail_entry_min_move_pct = signal.get('trailEntryMinMovePct', 0)
-            self.opportunity.trail_entry_min_roi_pct = signal.get('trailEntryMinRoiPct', 0)
-            self.opportunity.entry_threshold_mult = signal.get('entryThresholdMult', 1.0)
-            self.opportunity.entry_exec_score = signal.get('entryExecScore', signal.get('confidenceScore', 0))
-            self.opportunity.entry_exec_passed = signal.get('entryExecPassed', True)
-            self.opportunity.strategy_mode = signal.get('strategyMode', STRATEGY_MODE_LEGACY)
-            self.opportunity.active_strategy = signal.get('activeStrategy', 'legacy')
-            self.opportunity.strategy_label = signal.get('strategyLabel', 'Legacy')
-            # Execution-stage reject reason (if any) for UI observability
-            # Phase 239V2: Pullback + recheck telemetry
-            self.opportunity.pullback_dyn_base = signal.get('pullbackDynBase', 0)
-            self.opportunity.pullback_dyn_final = signal.get('pullbackDynFinal', 0)
-            self.opportunity.pullback_dyn_floor = signal.get('pullbackDynFloor', 0)
-            self.opportunity.pullback_dyn_regime_band = signal.get('pullbackDynRegimeBand', 'neutral')
-            self.opportunity.pullback_model_version = signal.get('pullbackModelVersion', 'v2')
-            self.opportunity.recheck_score = signal.get('recheckScore', 0)
-            self.opportunity.recheck_decision = signal.get('recheckDecision', '')
-            self.opportunity.recheck_reasons = signal.get('recheckReasons', [])
             try:
-                if 'global_paper_trader' in globals():
-                    feedback = global_paper_trader.get_execution_feedback(self.symbol)
-                    if feedback:
-                        self.opportunity.execution_reject_reason = feedback.get('reason')
-                        self.opportunity.execution_reject_ts = int(feedback.get('ts', 0) or 0)
-                    else:
-                        self.opportunity.execution_reject_reason = None
-                        self.opportunity.execution_reject_ts = 0
+                self.last_emitted_signal = dict(signal)
             except Exception:
-                self.opportunity.execution_reject_reason = None
-                self.opportunity.execution_reject_ts = 0
+                self.last_emitted_signal = signal
+            self.last_emitted_signal_ts = datetime.now().timestamp()
+            try:
+                self.opportunity.signal_score = signal.get('confidenceScore', 0)
+                self.opportunity.signal_action = signal.get('action', 'NONE')
+                self.opportunity.leverage = signal.get('leverage', 10)
+                self.opportunity.pullback_pct = signal.get('pullbackPct', 0)
+                self.opportunity.dynamic_trail_activation = signal.get('dynamic_trail_activation', 1.5)
+                self.opportunity.dynamic_trail_distance = signal.get('dynamic_trail_distance', 1.0)
+                self.opportunity.last_signal_time = datetime.now().timestamp()
+                # Phase EQG + FIB: Store observability fields
+                self.opportunity.volume_ratio = signal.get('volumeRatio', 0)
+                self.opportunity.is_volume_spike = signal.get('isVolumeSpike', False)
+                self.opportunity.ob_imbalance_trend = signal.get('obImbalanceTrend', 0)
+                self.opportunity.entry_quality_pass = signal.get('entryQualityPass', False)
+                self.opportunity.entry_quality_reasons = signal.get('entryQualityReasons', [])
+                self.opportunity.fib_active = signal.get('fibActive', False)
+                self.opportunity.fib_level = signal.get('fibLevel')
+                self.opportunity.fib_bonus = signal.get('fibBonus', 0)
+                self.opportunity.fib_entry = signal.get('fibEntry', 0)
+                self.opportunity.fib_blend_alpha = signal.get('fibBlendAlpha', 0)
+                self.opportunity.entry_price = signal.get('entryPrice', 0) or signal.get('entry', 0)
+                self.opportunity.trail_entry_min_move_pct = signal.get('trailEntryMinMovePct', 0)
+                self.opportunity.trail_entry_min_roi_pct = signal.get('trailEntryMinRoiPct', 0)
+                self.opportunity.entry_threshold_mult = signal.get('entryThresholdMult', 1.0)
+                self.opportunity.entry_exec_score = signal.get('entryExecScore', signal.get('confidenceScore', 0))
+                self.opportunity.entry_exec_passed = signal.get('entryExecPassed', True)
+                self.opportunity.strategy_mode = signal.get('strategyMode', STRATEGY_MODE_LEGACY)
+                self.opportunity.active_strategy = signal.get('activeStrategy', 'legacy')
+                self.opportunity.strategy_label = signal.get('strategyLabel', 'Legacy')
+                # Execution-stage reject reason (if any) for UI observability
+                # Phase 239V2: Pullback + recheck telemetry
+                self.opportunity.pullback_dyn_base = signal.get('pullbackDynBase', 0)
+                self.opportunity.pullback_dyn_final = signal.get('pullbackDynFinal', 0)
+                self.opportunity.pullback_dyn_floor = signal.get('pullbackDynFloor', 0)
+                self.opportunity.pullback_dyn_regime_band = signal.get('pullbackDynRegimeBand', 'neutral')
+                self.opportunity.pullback_model_version = signal.get('pullbackModelVersion', 'v2')
+                self.opportunity.recheck_score = signal.get('recheckScore', 0)
+                self.opportunity.recheck_decision = signal.get('recheckDecision', '')
+                self.opportunity.recheck_reasons = signal.get('recheckReasons', [])
+                try:
+                    if 'global_paper_trader' in globals():
+                        feedback = global_paper_trader.get_execution_feedback(self.symbol)
+                        if feedback:
+                            self.opportunity.execution_reject_reason = feedback.get('reason')
+                            self.opportunity.execution_reject_ts = int(feedback.get('ts', 0) or 0)
+                        else:
+                            self.opportunity.execution_reject_reason = None
+                            self.opportunity.execution_reject_ts = 0
+                except Exception:
+                    self.opportunity.execution_reject_reason = None
+                    self.opportunity.execution_reject_ts = 0
+            except Exception as signal_sync_err:
+                logger.warning(
+                    f"⚠️ SIGNAL_STATE_SYNC_FALLBACK: {self.symbol} "
+                    f"cached signal kept despite opportunity sync error ({_format_exception_context(signal_sync_err)})"
+                )
             return signal
         else:
             # Decay signal score over time if no new signal
@@ -20150,7 +20275,31 @@ class MultiCoinScanner:
                 opp['signalScore'] = event_signal.get('confidenceScore', opp.get('signalScore', 0))
                 opp['eventAlphaStandalone'] = True
                 opp['eventAlphaReason'] = event_signal.get('eventAlphaReason', trigger.get('reason', 'EVENT_ALPHA'))
-        
+
+        if not signals:
+            recovered_signals = recover_scanner_signals_from_analyzers(
+                opportunities,
+                self.analyzers,
+            )
+            if recovered_signals:
+                signals = recovered_signals
+                logger.warning(
+                    f"⚠️ SCAN_SIGNAL_RECOVERY: restored {len(recovered_signals)} signal(s) "
+                    f"from analyzer cache after empty handoff"
+                )
+            else:
+                actionable_opp_count = sum(
+                    1
+                    for opp in opportunities
+                    if str(opp.get('signalAction', '') or '').upper() in ('LONG', 'SHORT')
+                    and _coerce_float(opp.get('signalScore', 0.0), 0.0) > 0
+                )
+                if actionable_opp_count > 0:
+                    logger.warning(
+                        f"⚠️ SCAN_SIGNAL_HANDOFF_EMPTY: actionable_opps={actionable_opp_count} "
+                        f"but active signal list is empty"
+                    )
+
         # Sort by signal score (highest first)
         opportunities.sort(key=lambda x: x.get('signalScore', 0), reverse=True)
         
@@ -34644,89 +34793,11 @@ class SignalGenerator:
             return None
         
         logger.info(f"✅ SIGNAL_GEN: {symbol} {signal_side} score={score} lev={final_leverage}x entry=${ideal_entry:.4f} PB={pullback_pct*100:.2f}%")
-        
-        # SMART_V3_RUNNER: Resolve execution profile (exit/trail/BE tuning)
-        _is_ct_for_profile = 'is_counter_trend' in dir() and bool(is_counter_trend)
-        _ct_str_for_profile = float(blended_conf if ('is_counter_trend' in dir() and is_counter_trend and 'blended_conf' in dir()) else 0.0)
-        _exec_profile = resolve_strategy_execution_profile(
-            mode=strategy_mode,
-            counter_trend=_is_ct_for_profile,
-            ct_strength=_ct_str_for_profile,
-        )
-        _runner_controls_sig = resolve_runner_exit_controls(
-            payload={
-                'strategyMode': strategy_mode,
-                'side': signal_side,
-                'coinDailyTrend': coin_daily_trend,
-                'counterTrend': _is_ct_for_profile,
-                'counterTrendStrength': _ct_str_for_profile,
-            },
-            default_mode=strategy_mode,
-        )
-        if _exec_profile.mode == STRATEGY_MODE_SMART_V3_RUNNER:
-            logger.info(
-                f"🏃 STRATEGY_PROFILE_APPLIED: {symbol} {signal_side} "
-                f"mode={_exec_profile.mode} source={_exec_profile.source} "
-                f"context={_runner_controls_sig.get('runner_context', '')} "
-                f"trail_act={_runner_controls_sig.get('trail_act_mult', _exec_profile.trail_activation_mult)} "
-                f"trail_dist={_runner_controls_sig.get('trail_dist_mult', _exec_profile.trail_distance_mult)} "
-                f"tp_tighten={_runner_controls_sig.get('tp_tighten', _exec_profile.tp_tighten_intensity)} "
-                f"be_buf={_runner_controls_sig.get('be_buffer_mult', _exec_profile.be_buffer_mult)}"
-            )
-        
-        # RFX-3A: Classify execution style for SMART_V3_RUNNER
-        _exec_style = EXEC_STYLE_MARKET
-        _structural_zone = None
-        _structural_zone_dict = {}
-        _fallback_stage = ''
-        if _exec_profile.exec_style_enabled and RFX3_EXEC_STYLE_ENABLED:
-            _regime_for_style = str(market_regime or 'RANGING').upper()
-            _structure_for_style = 'NONE'
-            if smc_data:
-                if smc_data.get('ob_bullish') or smc_data.get('ob_bearish'):
-                    _structure_for_style = 'ORDER_BLOCK'
-                elif smc_data.get('fvg_bullish') or smc_data.get('fvg_bearish'):
-                    _structure_for_style = 'FVG'
-                elif smc_data.get('fvgs'):
-                    _structure_for_style = 'STRUCTURAL'
-            _hurst_for_style = float(hurst or 0.5)
-            _zscore_for_style = float(zscore or 0.0)
-            _tick_size_for_style = get_tick_size(symbol) if symbol else 0.0
-            _spread_for_style = float(spread_pct or 0.0)
-            _exec_style = classify_execution_style(
-                regime=_regime_for_style,
-                structure=_structure_for_style,
-                hurst=_hurst_for_style,
-                zscore=_zscore_for_style,
-                side=signal_side,
-            )
-            # Build structural zone from available SR/FVG data
-            _sr_supports = sr_levels.get('supports', []) if ('sr_levels' in dir() and sr_levels) else []
-            _sr_resistances = sr_levels.get('resistances', []) if ('sr_levels' in dir() and sr_levels) else []
-            _fvgs_for_zone = smc_data.get('fvgs', []) if ('smc_data' in dir() and smc_data) else []
-            _structural_zone = build_structural_zone(
-                supports=_sr_supports,
-                resistances=_sr_resistances,
-                fvgs=_fvgs_for_zone,
-                price=price,
-                side=signal_side,
-                atr=float(atr or 0),
-                tick_size=_tick_size_for_style,
-                spread=_spread_for_style,
-            )
-            if _structural_zone:
-                _structural_zone_dict = _structural_zone.to_dict()
-                _fallback_stage = _structural_zone.fallback_stage
-            logger.info(
-                f"🎯 EXEC_STYLE_SELECTED: {symbol} {signal_side} "
-                f"style={_exec_style} regime={_regime_for_style} "
-                f"fallback_stage={_fallback_stage} zone={_structural_zone_dict}"
-            )
-        
-        return {
+
+        _signal_core_payload = {
             'action': signal_side,
-            'price': price,        # Signal price
-            'entryPrice': ideal_entry, # Pending Order Price
+            'price': price,
+            'entryPrice': ideal_entry,
             'sl': sl,
             'tp': tp,
             'trailActivation': trail_activation,
@@ -34740,7 +34811,7 @@ class SignalGenerator:
             'sizeMultiplier': size_mult,
             'qualitySizeMult': quality_risk_adj.get('size_mult', 1.0),
             'qualityLeverageCap': quality_risk_adj.get('lev_cap', 0),
-            'leverage': final_leverage,  # Phase 29: Dynamic leverage
+            'leverage': final_leverage,
             'strategyMode': strategy_mode,
             'activeStrategy': active_strategy,
             'strategyLabel': strategy_label,
@@ -34750,20 +34821,6 @@ class SignalGenerator:
             'smartEntryMult': strategy_entry_mult,
             'smartExitMult': strategy_exit_mult,
             'smartLeverageMult': strategy_leverage_mult,
-            # SMART_V3_RUNNER: execution profile fields
-            'execution_profile_source': _exec_profile.source if '_exec_profile' in dir() else 'neutral',
-            'runner_trail_act_mult': _runner_controls_sig.get('trail_act_mult', 1.0),
-            'runner_trail_dist_mult': _runner_controls_sig.get('trail_dist_mult', 1.0),
-            'runner_tp_tighten': _runner_controls_sig.get('tp_tighten', 1.0),
-            'runner_be_buffer_mult': _runner_controls_sig.get('be_buffer_mult', 1.0),
-            'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct if '_exec_profile' in dir() else 0.20,
-            'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec if '_exec_profile' in dir() else 600,
-            'runnerContext': _runner_controls_sig.get('runner_context', ''),
-            'exitOwner': _runner_controls_sig.get('exit_owner', LEGACY_EXIT_OWNER),
-            'tpCloseSplit': format_runner_close_split(_runner_controls_sig.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))),
-            'tp1ArmDelaySec': _runner_controls_sig.get('trail_arm_delay_sec', 0),
-            'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
-            'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
             'spreadLevel': spread_params['level'],
             'btcMacroPremiumPct': round(float(basis_pct or 0.0), 6),
             'symbolPremiumPct': round(float(basis_pct or 0.0), 6) if symbol == 'BTCUSDT' else 0.0,
@@ -34773,36 +34830,25 @@ class SignalGenerator:
             'whaleContextZScore': round(float(whale_zscore or 0.0), 4),
             'fundingContextRate': round(float(funding_rate or 0.0), 6),
             'fundingRate': round(float(funding_rate or 0.0), 6),
-            # RFX-3A: Execution style telemetry
-            'execution_style': _exec_style,
-            'structural_zone': _structural_zone_dict,
-            'structural_sr_levels': _structural_sr_snapshot,
-            'structural_fallback_stage': _fallback_stage,
-            'struct_partial_tp_pct': _exec_profile.struct_partial_tp_pct if _exec_profile.exec_style_enabled else 0,
-            'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
-            'pullbackMinDyn': round(dyn_min_pb_pct, 4),  # Phase 239V2: Dynamic floor (percent)
-            'pullbackModelVersion': 'v2',  # Phase 239V2
+            'pullbackPct': round(pullback_pct * 100, 2),
+            'pullbackMinDyn': round(dyn_min_pb_pct, 4),
+            'pullbackModelVersion': 'v2',
             'pullbackDynBase': dyn_result.get('base', 0),
             'pullbackDynAdj': dyn_result.get('adj_total', 0),
-            'pullbackDynFinal': round(pullback_pct * 100, 4),  # locked final (percent)
-            'pullbackDynFloor': round(dyn_min_pb_pct, 4),       # dynamic floor (percent)
+            'pullbackDynFinal': round(pullback_pct * 100, 4),
+            'pullbackDynFloor': round(dyn_min_pb_pct, 4),
             'pullbackDynRegimeBand': dyn_regime_band,
-            'atrPct': round(atr_pct * 100, 2),  # Phase 160: Raw ATR% for bounce calc
-            'coinDailyTrend': coin_daily_trend,  # Phase 110: For position sizing
+            'atrPct': round(atr_pct * 100, 2),
+            'coinDailyTrend': coin_daily_trend,
             'coinDailyChangePct': round(float(coin_daily_change or 0.0), 4),
-            'trendSizeReduction': trend_size_reduction,  # Phase 110: Applied reduction
-            # Phase 153: ADX and Hurst for dynamic bounce confirmation
+            'trendSizeReduction': trend_size_reduction,
             'adx': adx,
             'hurst': hurst,
+            'zscore': zscore,
             'rsi': round(float(rsi or 50.0), 2),
-            'spreadPct': spread_pct,  # Phase 228: Real bid-ask spread for dynamic trail
-            'volatility_pct': atr_pct * 100,  # Phase 228: Volatility for dynamic trail
+            'spreadPct': spread_pct,
+            'volatility_pct': atr_pct * 100,
             'vwapZscore': round(float(vwap_zscore or 0.0), 4),
-            'bbPosition': round(float(_ei.get('bb_position', 0.0)), 4),
-            'macdHistogram': round(float(_ei.get('macd_histogram', 0.0)), 6),
-            'stochRsiK': round(float(_ei.get('stoch_rsi_k', 50.0)), 4),
-            'emaCross': str(_ei.get('ema_cross', 'NEUTRAL')),
-            # Phase FIB: Fibonacci telemetry
             'fibActive': fib_context.get('fib_active', False) if fib_context else False,
             'fibLevel': fib_context.get('fib_level') if fib_context else None,
             'fibBonus': fib_context.get('fib_score_bonus', 0) if fib_context else 0,
@@ -34811,34 +34857,139 @@ class SignalGenerator:
             'fibBlendAlpha': FIB_BLEND_ALPHA if fib_blend_applied else 0,
             'effectiveEntryTightness': effective_entry_tightness,
             'effectiveExitTightness': effective_exit_tightness,
-            # Phase EQG: Entry Quality telemetry
             'volumeRatio': round(volume_ratio, 2),
             'isVolumeSpike': is_volume_spike,
             'entryQualityCount': eq_pass_count,
             'imbalancePct': round(imbalance, 1),
             'imbalance': round(float(imbalance or 0.0), 4),
             'obImbalanceTrend': round(ob_imbalance_trend, 1),
-                'entryQualityPass': entry_quality_pass,
-                'entryQualityReasons': eq_reasons,
-                # Hybrid entry observability
-                'trailEntryMinMovePct': hybrid_entry.get('trail_entry_min_move_pct', 0.8),
-                'trailEntryMinRoiPct': hybrid_entry.get('trail_entry_min_roi_pct', 8.0),
-                'entryThresholdMult': hybrid_entry.get('entry_threshold_mult', 1.0),
-                'entryTightnessMult': hybrid_entry.get('entry_tightness_mult', 1.0),
-                'entryExecScore': exec_quality_score,
-                'entryExecPassed': exec_quality_passed,
-                'entryExecNotes': exec_quality_notes,
-                # Phase 249: Structural entry/exit telemetry
-                'compositeVolScore': comp_vol.get('score', 0),
-                'compositeVolCategory': comp_vol.get('category', 'NORMAL'),
-                'structuralMethod': structural_result.get('method', 'pullback_only') if structural_result else 'pullback_only',
-                'structuralWeight': structural_result.get('structural_weight', 0) if structural_result else 0,
-                'structuralTpAdjusted': struct_tp.get('adjusted', False),
-                'structuralTpSource': struct_tp.get('source', 'atr_only'),
-                'structuralTpLevel': struct_tp.get('structural_level'),
-                'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
-                'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
+            'entryQualityPass': entry_quality_pass,
+            'entryQualityReasons': eq_reasons,
+            'trailEntryMinMovePct': hybrid_entry.get('trail_entry_min_move_pct', 0.8),
+            'trailEntryMinRoiPct': hybrid_entry.get('trail_entry_min_roi_pct', 8.0),
+            'entryThresholdMult': hybrid_entry.get('entry_threshold_mult', 1.0),
+            'entryTightnessMult': hybrid_entry.get('entry_tightness_mult', 1.0),
+            'entryExecScore': exec_quality_score,
+            'entryExecPassed': exec_quality_passed,
+            'entryExecNotes': exec_quality_notes,
+            'compositeVolScore': comp_vol.get('score', 0),
+            'compositeVolCategory': comp_vol.get('category', 'NORMAL'),
+            'structuralMethod': structural_result.get('method', 'pullback_only') if structural_result else 'pullback_only',
+            'structuralWeight': structural_result.get('structural_weight', 0) if structural_result else 0,
+            'structuralTpAdjusted': struct_tp.get('adjusted', False),
+            'structuralTpSource': struct_tp.get('source', 'atr_only'),
+            'structuralTpLevel': struct_tp.get('structural_level'),
+            'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
+            'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
+        }
+
+        def _build_full_signal_payload() -> dict:
+            _is_ct_for_profile = 'is_counter_trend' in dir() and bool(is_counter_trend)
+            _ct_str_for_profile = float(blended_conf if ('is_counter_trend' in dir() and is_counter_trend and 'blended_conf' in dir()) else 0.0)
+            _exec_profile = resolve_strategy_execution_profile(
+                mode=strategy_mode,
+                counter_trend=_is_ct_for_profile,
+                ct_strength=_ct_str_for_profile,
+            )
+            _runner_controls_sig = resolve_runner_exit_controls(
+                payload={
+                    'strategyMode': strategy_mode,
+                    'side': signal_side,
+                    'coinDailyTrend': coin_daily_trend,
+                    'counterTrend': _is_ct_for_profile,
+                    'counterTrendStrength': _ct_str_for_profile,
+                },
+                default_mode=strategy_mode,
+            )
+            if _exec_profile.mode == STRATEGY_MODE_SMART_V3_RUNNER:
+                logger.info(
+                    f"🏃 STRATEGY_PROFILE_APPLIED: {symbol} {signal_side} "
+                    f"mode={_exec_profile.mode} source={_exec_profile.source} "
+                    f"context={_runner_controls_sig.get('runner_context', '')} "
+                    f"trail_act={_runner_controls_sig.get('trail_act_mult', _exec_profile.trail_activation_mult)} "
+                    f"trail_dist={_runner_controls_sig.get('trail_dist_mult', _exec_profile.trail_distance_mult)} "
+                    f"tp_tighten={_runner_controls_sig.get('tp_tighten', _exec_profile.tp_tighten_intensity)} "
+                    f"be_buf={_runner_controls_sig.get('be_buffer_mult', _exec_profile.be_buffer_mult)}"
+                )
+
+            _exec_style = EXEC_STYLE_MARKET
+            _structural_zone = None
+            _structural_zone_dict = {}
+            _fallback_stage = ''
+            if _exec_profile.exec_style_enabled and RFX3_EXEC_STYLE_ENABLED:
+                _regime_for_style = str(market_regime or 'RANGING').upper()
+                _structure_for_style = 'NONE'
+                if smc_data:
+                    if smc_data.get('ob_bullish') or smc_data.get('ob_bearish'):
+                        _structure_for_style = 'ORDER_BLOCK'
+                    elif smc_data.get('fvg_bullish') or smc_data.get('fvg_bearish'):
+                        _structure_for_style = 'FVG'
+                    elif smc_data.get('fvgs'):
+                        _structure_for_style = 'STRUCTURAL'
+                _hurst_for_style = float(hurst or 0.5)
+                _zscore_for_style = float(zscore or 0.0)
+                _tick_size_for_style = get_tick_size(symbol) if symbol else 0.0
+                _spread_for_style = float(spread_pct or 0.0)
+                _exec_style = classify_execution_style(
+                    regime=_regime_for_style,
+                    structure=_structure_for_style,
+                    hurst=_hurst_for_style,
+                    zscore=_zscore_for_style,
+                    side=signal_side,
+                )
+                _sr_supports = sr_levels.get('supports', []) if ('sr_levels' in dir() and sr_levels) else []
+                _sr_resistances = sr_levels.get('resistances', []) if ('sr_levels' in dir() and sr_levels) else []
+                _fvgs_for_zone = smc_data.get('fvgs', []) if ('smc_data' in dir() and smc_data) else []
+                _structural_zone = build_structural_zone(
+                    supports=_sr_supports,
+                    resistances=_sr_resistances,
+                    fvgs=_fvgs_for_zone,
+                    price=price,
+                    side=signal_side,
+                    atr=float(atr or 0),
+                    tick_size=_tick_size_for_style,
+                    spread=_spread_for_style,
+                )
+                if _structural_zone:
+                    _structural_zone_dict = _structural_zone.to_dict()
+                    _fallback_stage = _structural_zone.fallback_stage
+                logger.info(
+                    f"🎯 EXEC_STYLE_SELECTED: {symbol} {signal_side} "
+                    f"style={_exec_style} regime={_regime_for_style} "
+                    f"fallback_stage={_fallback_stage} zone={_structural_zone_dict}"
+                )
+
+            return {
+                'execution_profile_source': _exec_profile.source,
+                'runner_trail_act_mult': _runner_controls_sig.get('trail_act_mult', 1.0),
+                'runner_trail_dist_mult': _runner_controls_sig.get('trail_dist_mult', 1.0),
+                'runner_tp_tighten': _runner_controls_sig.get('tp_tighten', 1.0),
+                'runner_be_buffer_mult': _runner_controls_sig.get('be_buffer_mult', 1.0),
+                'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct,
+                'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec,
+                'runnerContext': _runner_controls_sig.get('runner_context', ''),
+                'exitOwner': _runner_controls_sig.get('exit_owner', LEGACY_EXIT_OWNER),
+                'tpCloseSplit': format_runner_close_split(_runner_controls_sig.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))),
+                'tp1ArmDelaySec': _runner_controls_sig.get('trail_arm_delay_sec', 0),
+                'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
+                'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
+                'execution_style': _exec_style,
+                'structural_zone': _structural_zone_dict,
+                'structural_sr_levels': _structural_sr_snapshot,
+                'structural_fallback_stage': _fallback_stage,
+                'struct_partial_tp_pct': _exec_profile.struct_partial_tp_pct if _exec_profile.exec_style_enabled else 0,
+                'bbPosition': round(float(_ei.get('bb_position', 0.0)), 4),
+                'macdHistogram': round(float(_ei.get('macd_histogram', 0.0)), 6),
+                'stochRsiK': round(float(_ei.get('stoch_rsi_k', 50.0)), 4),
+                'emaCross': str(_ei.get('ema_cross', 'NEUTRAL')),
             }
+
+        return build_signal_payload_with_fallback(
+            _signal_core_payload,
+            _build_full_signal_payload,
+            symbol=symbol,
+            signal_side=signal_side,
+        )
 
 
 # ============================================================================

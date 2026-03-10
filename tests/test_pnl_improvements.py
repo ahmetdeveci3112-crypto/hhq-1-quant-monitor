@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 
 import main
 from hyperopt import hhq_hyperoptimizer
@@ -620,3 +621,68 @@ def test_evaluate_event_alpha_trigger_prefers_liquidation_echo_for_long():
     assert trigger["side"] == "LONG"
     assert trigger["score_bonus"] >= 8
     assert "LIQ_ECHO" in trigger["reason"]
+
+
+def test_build_signal_payload_with_fallback_returns_core_on_extra_failure():
+    core = {
+        "action": "LONG",
+        "price": 100.0,
+        "entryPrice": 99.2,
+        "sl": 97.5,
+        "tp": 104.5,
+        "trailActivation": 101.5,
+        "trailDistance": 1.2,
+        "confidenceScore": 88,
+    }
+
+    def _boom():
+        raise RuntimeError("post-build exploded")
+
+    payload = main.build_signal_payload_with_fallback(
+        core,
+        _boom,
+        symbol="TESTUSDT",
+        signal_side="LONG",
+    )
+
+    assert payload["action"] == "LONG"
+    assert payload["signalPayloadFallback"] is True
+    assert "RuntimeError" in payload["signalPayloadFallbackReason"]
+    assert payload["tpCloseSplit"] == "30/25/25/20"
+    assert payload["execution_style"] == main.EXEC_STYLE_MARKET
+
+
+def test_recover_scanner_signals_from_analyzers_restores_fresh_cached_signal():
+    now_ts = time.time()
+    analyzers = {
+        "AAAUSDT": SimpleNamespace(
+            last_emitted_signal={
+                "action": "LONG",
+                "price": 100.0,
+                "entryPrice": 99.1,
+                "confidenceScore": 93,
+            },
+            last_emitted_signal_ts=now_ts,
+        )
+    }
+    opportunities = [
+        {
+            "symbol": "AAAUSDT",
+            "signalAction": "LONG",
+            "signalScore": 93,
+            "price": 100.0,
+            "entryPriceBackend": 99.1,
+            "volume24h": 12_000_000,
+            "volume4h": 1_400_000,
+            "priceChange24h": 3.2,
+            "zscore": -2.4,
+        }
+    ]
+
+    recovered = main.recover_scanner_signals_from_analyzers(opportunities, analyzers, max_age_sec=180.0)
+
+    assert len(recovered) == 1
+    assert recovered[0]["symbol"] == "AAAUSDT"
+    assert recovered[0]["action"] == "LONG"
+    assert recovered[0]["signalRecoveredFromCache"] is True
+    assert recovered[0]["volume24h"] == 12_000_000
