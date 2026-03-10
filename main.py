@@ -17801,6 +17801,7 @@ class LightweightCoinAnalyzer:
                 sweep_result=ctx.get('sweep_result'),
                 coin_stats=ctx.get('coin_stats'),
                 coin_daily_trend=ctx.get('coin_daily_trend', 'NEUTRAL'),
+                coin_daily_change=ctx.get('coin_daily_change', 0.0),
                 volume_24h=ctx.get('volume_24h', 0.0),
                 volume_4h=ctx.get('volume_4h', 0.0),
                 adx=ctx.get('adx', 25.0),
@@ -18001,6 +18002,7 @@ class LightweightCoinAnalyzer:
             'sweep_result': sweep_result,
             'coin_stats': coin_stats,
             'coin_daily_trend': coin_daily_trend,
+            'coin_daily_change': coin_daily_change,
             'volume_24h': self.opportunity.volume_24h,
             'volume_4h': self.opportunity.volume_4h,
             'adx': adx,
@@ -18032,6 +18034,7 @@ class LightweightCoinAnalyzer:
             sweep_result=sweep_result,  # Liquidity Sweep for Layer 13
             coin_stats=coin_stats,  # Coin-specific statistics for dynamic thresholds
             coin_daily_trend=coin_daily_trend,  # Coin's own daily trend (not BTC's)
+            coin_daily_change=coin_daily_change,
             volume_24h=self.opportunity.volume_24h,  # Phase 123: Pass 24h volume
             volume_4h=self.opportunity.volume_4h,    # Cond C hybrid volume
             adx=adx,  # ADX value for trend strength
@@ -33169,6 +33172,7 @@ class SignalGenerator:
         sweep_result: Optional[Dict] = None,  # Liquidity sweep detection result
         coin_stats: Optional[Dict] = None,  # Coin-specific stats for dynamic thresholds
         coin_daily_trend: str = "NEUTRAL",  # Coin's own daily trend
+        coin_daily_change: float = 0.0,  # Coin's own daily % change
         volume_24h: float = 0.0,  # Phase 123: 24h Volume for liquidity check
         volume_4h: float = 0.0,   # Cond C hybrid volume
         adx: float = 25.0,  # ADX value for trend strength
