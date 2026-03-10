@@ -12696,7 +12696,115 @@ def compute_structural_sl(
             f"→ adjusted={result['sl']:.6f} "
             f"({result['source']} @ {structural_level:.6f})"
         )
-    
+
+    return result
+
+
+def compute_structural_tp(
+    base_tp: float,
+    signal_side: str,
+    current_price: float,
+    entry_price: float,
+    sr_levels: dict,
+    composite_vol: dict,
+    atr: float,
+) -> dict:
+    """Anchor TP to a nearby structural S/R level when it is sensible.
+
+    Uses the same 4H-derived S/R set as structural entry. The structural target
+    must stay close to the ATR-based TP, keep a minimum profit distance from the
+    entry, and remain in the profitable direction.
+    """
+    result = {
+        'tp': base_tp,
+        'adjusted': False,
+        'structural_level': None,
+        'source': 'atr_only',
+    }
+
+    if composite_vol.get('category') == 'WILD':
+        return result
+
+    if (
+        not sr_levels
+        or atr <= 0
+        or base_tp <= 0
+        or current_price <= 0
+        or entry_price <= 0
+    ):
+        return result
+
+    buffer = atr * 0.12
+    max_base_deviation = atr * 1.5
+    min_target_distance = max(atr * 0.5, entry_price * 0.0025)
+
+    best_tp = None
+    best_level = None
+    best_distance = float("inf")
+
+    if signal_side == 'LONG':
+        for res in sr_levels.get('resistances', []):
+            res_price = float(res.get('price', 0) or 0)
+            if res_price <= current_price or res_price <= entry_price:
+                continue
+            if int(res.get('touches', 0) or 0) < 2:
+                continue
+
+            target_tp = res_price - buffer
+            if target_tp <= max(current_price, entry_price):
+                continue
+            if (target_tp - entry_price) < min_target_distance:
+                continue
+
+            dist = abs(target_tp - base_tp)
+            if dist > max_base_deviation:
+                continue
+            if dist < best_distance:
+                best_distance = dist
+                best_tp = target_tp
+                best_level = res_price
+
+        if best_tp is not None:
+            result['tp'] = best_tp
+            result['adjusted'] = True
+            result['structural_level'] = best_level
+            result['source'] = 'resistance_target'
+
+    elif signal_side == 'SHORT':
+        for sup in sr_levels.get('supports', []):
+            sup_price = float(sup.get('price', 0) or 0)
+            if sup_price >= current_price or sup_price >= entry_price:
+                continue
+            if int(sup.get('touches', 0) or 0) < 2:
+                continue
+
+            target_tp = sup_price + buffer
+            if target_tp >= min(current_price, entry_price):
+                continue
+            if (entry_price - target_tp) < min_target_distance:
+                continue
+
+            dist = abs(target_tp - base_tp)
+            if dist > max_base_deviation:
+                continue
+            if dist < best_distance:
+                best_distance = dist
+                best_tp = target_tp
+                best_level = sup_price
+
+        if best_tp is not None:
+            result['tp'] = best_tp
+            result['adjusted'] = True
+            result['structural_level'] = best_level
+            result['source'] = 'support_target'
+
+    if result['adjusted']:
+        logger.info(
+            f"📐 STRUCTURAL_TP: {signal_side} base={base_tp:.6f} "
+            f"→ adjusted={result['tp']:.6f} "
+            f"({result['source']} @ {best_level:.6f})"
+        )
+
     return result
 
 
@@ -31349,6 +31457,26 @@ class SignalGenerator:
             if struct_sl['adjusted']:
                 sl = struct_sl['sl']
                 reasons.append(f"SL_SR({struct_sl['source']})")
+
+        struct_tp = {
+            'tp': tp,
+            'adjusted': False,
+            'structural_level': None,
+            'source': 'atr_only',
+        }
+        if sr_levels and (sr_levels.get('nearest_support') or sr_levels.get('nearest_resistance')):
+            struct_tp = compute_structural_tp(
+                base_tp=tp,
+                signal_side=signal_side,
+                current_price=price,
+                entry_price=ideal_entry,
+                sr_levels=sr_levels,
+                composite_vol=comp_vol,
+                atr=atr,
+            )
+            if struct_tp['adjusted']:
+                tp = struct_tp['tp']
+                reasons.append(f"TP_SR({struct_tp['source']})")
         
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
@@ -31606,6 +31734,9 @@ class SignalGenerator:
                 'compositeVolCategory': comp_vol.get('category', 'NORMAL'),
                 'structuralMethod': structural_result.get('method', 'pullback_only') if structural_result else 'pullback_only',
                 'structuralWeight': structural_result.get('structural_weight', 0) if structural_result else 0,
+                'structuralTpAdjusted': struct_tp.get('adjusted', False),
+                'structuralTpSource': struct_tp.get('source', 'atr_only'),
+                'structuralTpLevel': struct_tp.get('structural_level'),
                 'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
                 'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
             }
