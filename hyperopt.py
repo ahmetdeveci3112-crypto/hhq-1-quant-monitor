@@ -759,6 +759,14 @@ class HHQHyperOptimizer:
     
     def get_status(self) -> dict:
         """Get optimizer status for monitoring."""
+        reject_feedback = {"enabled": False, "fn_rate": 0.0, "candidate_hints": []}
+        try:
+            import sys
+            main_mod = sys.modules.get('main')
+            if main_mod and hasattr(main_mod, 'get_reject_attribution_optimizer_hints'):
+                reject_feedback = main_mod.get_reject_attribution_optimizer_hints()
+        except Exception:
+            pass
         return {
             'enabled': self.enabled,
             'optuna_available': OPTUNA_AVAILABLE,
@@ -788,6 +796,7 @@ class HHQHyperOptimizer:
             'run_apply_result': self.last_run_apply_result,
             'run_apply_reason': self.last_run_apply_reason,
             'run_apply_ts': self.last_run_ts,
+            'reject_feedback': reject_feedback,
         }
 
 

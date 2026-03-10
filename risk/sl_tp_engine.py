@@ -363,6 +363,8 @@ def compute_tp_ladder_v2(
     exec_score: float = 70.0,
     spread_level: str = 'Normal',
     tp_tighten_mult: float = 1.0,
+    structural_target_price: float = 0.0,
+    structural_target_source: str = '',
 ) -> dict:
     """RFX-1B: 4-tier TP ladder with TP_FINAL and monotonic guarantee.
 
@@ -430,6 +432,28 @@ def compute_tp_ladder_v2(
     tp2_pct *= tighten
     tp3_pct *= tighten
     tp_final_pct *= tighten
+
+    structural_anchor_applied = False
+    structural_target_pct = 0.0
+    structural_scale = 1.0
+    safe_target = float(structural_target_price or 0.0)
+    target_in_profit = (
+        (side == 'LONG' and safe_target > safe_entry) or
+        (side != 'LONG' and 0 < safe_target < safe_entry)
+    )
+    baseline_final_pct = max(tp_final_pct, tp3_pct * 1.10)
+    if target_in_profit and baseline_final_pct > 0:
+        structural_target_pct = abs(safe_target - safe_entry) / safe_entry * 100.0
+        if structural_target_pct > 0:
+            structural_scale = structural_target_pct / baseline_final_pct
+            if structural_target_pct > (tp3_pct * 1.02) and 0.65 <= structural_scale <= 1.35:
+                tp1_pct *= structural_scale
+                tp2_pct *= structural_scale
+                tp3_pct *= structural_scale
+                tp_final_pct = structural_target_pct
+                structural_anchor_applied = True
+            else:
+                structural_scale = 1.0
 
     # ── Convert to absolute prices ──
     if side == 'LONG':
@@ -521,6 +545,10 @@ def compute_tp_ladder_v2(
         'epsilon_fixes': epsilon_fixes,
         'profile': risk_params.profile.value if risk_params else 'NONE',
         'tp_tighten_mult': round(tighten, 3),
+        'structural_anchor_applied': structural_anchor_applied,
+        'structural_target_source': structural_target_source if structural_anchor_applied else '',
+        'structural_target_pct': round(structural_target_pct, 4) if structural_anchor_applied else 0.0,
+        'structural_scale': round(structural_scale, 4),
     }
 
     return {

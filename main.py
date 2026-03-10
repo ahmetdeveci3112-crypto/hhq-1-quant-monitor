@@ -9623,6 +9623,31 @@ def _resolve_entry_depth_usd(pos: dict, current: bool = False) -> float:
     return 0.0
 
 
+def _resolve_observed_slippage_pct(pos: dict) -> float:
+    exec_snapshot = pos.get('exec_snapshot', {}) if isinstance(pos.get('exec_snapshot'), dict) else {}
+    return max(
+        abs(_coerce_float(pos.get('entry_slippage', pos.get('entrySlippage', 0.0)), 0.0)),
+        abs(_coerce_float(pos.get('exit_slippage', pos.get('exitSlippage', 0.0)), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('entry_slippage_p90', 0.0), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('rolling_entry_slippage_p90', 0.0), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('exit_slippage_p90', 0.0), 0.0)),
+        abs(_coerce_float(exec_snapshot.get('rolling_exit_slippage_p90', 0.0), 0.0)),
+    )
+
+
+def resolve_buffered_breakeven_pct(pos: dict, buffer_pct: float = None, reason: str = 'BREAKEVEN') -> float:
+    live_buffer_pct = compute_breakeven_buffer_pct(
+        spread_pct=_coerce_float(pos.get('spreadPct', 0.05), 0.05),
+        expected_slippage_pct=max(0.02, _resolve_observed_slippage_pct(pos)),
+        spread_level=str(pos.get('spreadLevel', pos.get('spread_level', 'LOW')) or 'LOW'),
+        is_live=bool(pos.get('isLive', False)),
+        reason=reason,
+    )
+    if buffer_pct is None:
+        return live_buffer_pct
+    return max(_coerce_float(buffer_pct, live_buffer_pct), live_buffer_pct)
+
+
 def compute_carry_cost_roi_pct(pos: dict) -> float:
     initial_margin = _coerce_float(pos.get('initialMargin', pos.get('marginUsd', 0.0)), 0.0)
     leverage = max(1.0, _coerce_float(pos.get('leverage', 1), 1.0))
@@ -9831,15 +9856,7 @@ def compute_buffered_breakeven_price(pos: dict, buffer_pct: float = None, reason
             'buffer_pct': 0.0,
             'buffer_delta': 0.0,
         }
-    resolved_buffer_pct = _coerce_float(
-        buffer_pct,
-        compute_breakeven_buffer_pct(
-            spread_pct=_coerce_float(pos.get('spreadPct', 0.05), 0.05),
-            spread_level=str(pos.get('spreadLevel', pos.get('spread_level', 'LOW')) or 'LOW'),
-            is_live=bool(pos.get('isLive', False)),
-            reason=reason,
-        ),
-    )
+    resolved_buffer_pct = resolve_buffered_breakeven_pct(pos, buffer_pct=buffer_pct, reason=reason)
     tick_size = get_tick_size(symbol)
     safe_delta = ensure_tick_safe_buffer(anchor_price, resolved_buffer_pct, tick_size, side)
     if side == 'SHORT':
@@ -10680,6 +10697,44 @@ def get_reject_attribution_summary() -> dict:
         return {"falseNegativeCount": 0, "totalRejected": 0, "fnRate": 0, "topRejectBlockers": []}
 
 
+def get_reject_attribution_optimizer_hints() -> dict:
+    """Conservative optimizer-facing hints derived from false-negative attribution."""
+    summary = get_reject_attribution_summary()
+    hints = []
+    for blocker in summary.get("topRejectBlockers", []):
+        sample_size = int(blocker.get("total", 0) or 0)
+        fn_pct = float(blocker.get("fn_pct", 0.0) or 0.0)
+        reason = str(blocker.get("reason", "") or "")
+        if sample_size < 3 or fn_pct < 25.0:
+            continue
+
+        parameter_bias = []
+        if any(tag in reason for tag in ("TRADEABILITY", "THIN_BOOK", "LIQ", "MICRO")):
+            parameter_bias.append({"parameter": "entry_tightness", "bias": "loosen_small"})
+            parameter_bias.append({"parameter": "min_confidence", "bias": "decrease_small"})
+        elif "MTF" in reason:
+            parameter_bias.append({"parameter": "min_confidence", "bias": "decrease_small"})
+        elif any(tag in reason for tag in ("EDGE", "COST")):
+            parameter_bias.append({"parameter": "tp_atr", "bias": "increase_small"})
+            parameter_bias.append({"parameter": "entry_tightness", "bias": "tighten_small"})
+        else:
+            parameter_bias.append({"parameter": "min_confidence", "bias": "review"})
+
+        hints.append({
+            "reason": reason,
+            "sample_size": sample_size,
+            "fn_pct": round(fn_pct, 1),
+            "priority": "high" if fn_pct >= 40.0 else "medium",
+            "parameter_bias": parameter_bias,
+        })
+
+    return {
+        "enabled": bool(REJECT_ATTRIBUTION_ENABLED),
+        "fn_rate": summary.get("fnRate", 0.0),
+        "candidate_hints": hints,
+    }
+
+
 
 
 def get_dynamic_depth_threshold(
@@ -10829,6 +10884,7 @@ try:
         compute_breakeven_buffer_pct as rfx_compute_breakeven_buffer_pct,
         should_set_breakeven as rfx_should_set_breakeven,
         compute_order_impact as rfx_compute_order_impact,
+        estimate_slippage_bps as rfx_estimate_slippage_bps,
         DepthImpact as RFX_DepthImpact,
         build_distance_truth as rfx_build_distance_truth,
         aggregate_distance_truth_stats as rfx_aggregate_distance_truth_stats,
@@ -11480,6 +11536,883 @@ def compute_position_size_usd(
     }
 
 
+def compute_execution_cost_size_adjustment(
+    planned_notional_usd: float,
+    leverage: float,
+    spread_pct: float,
+    depth_usd: float,
+    tradeability_score: float = 0.0,
+    entry_exec_score: float = 0.0,
+) -> dict:
+    """Conservatively shrink notional when expected execution cost is elevated."""
+    safe_notional = max(0.0, float(planned_notional_usd or 0.0))
+    safe_depth = max(0.0, float(depth_usd or 0.0))
+    safe_spread = max(0.0, float(spread_pct or 0.0))
+    safe_tradeability = float(tradeability_score or 0.0)
+    safe_exec = float(entry_exec_score or 0.0)
+
+    result = {
+        'applied': False,
+        'size_mult': 1.0,
+        'adjusted_notional_usd': round(safe_notional, 2),
+        'estimated_slippage_bps': 0.0,
+        'depth_cover': 0.0,
+        'reason': 'none',
+    }
+    if safe_notional <= 0 or safe_depth <= 0 or not _RFX_MODULES_AVAILABLE:
+        return result
+
+    est_slippage_bps = float(rfx_estimate_slippage_bps(safe_notional, safe_depth, safe_spread) or 0.0)
+    depth_cover = safe_depth / max(safe_notional, 1.0)
+    size_mult = 1.0
+    reasons = []
+
+    if est_slippage_bps >= 18.0:
+        size_mult = min(size_mult, 0.65)
+        reasons.append('SLIP_CRITICAL')
+    elif est_slippage_bps >= 12.0:
+        size_mult = min(size_mult, 0.78)
+        reasons.append('SLIP_HIGH')
+    elif est_slippage_bps >= 7.5:
+        size_mult = min(size_mult, 0.88)
+        reasons.append('SLIP_ELEVATED')
+
+    if depth_cover < 1.2:
+        size_mult = min(size_mult, 0.70)
+        reasons.append('DEPTH_THIN')
+    elif depth_cover < 1.8:
+        size_mult = min(size_mult, 0.84)
+        reasons.append('DEPTH_TIGHT')
+    elif depth_cover < 2.5:
+        size_mult = min(size_mult, 0.92)
+        reasons.append('DEPTH_OK')
+
+    if safe_tradeability > 0 and safe_tradeability < 50:
+        size_mult = min(size_mult, 0.90)
+        reasons.append('TRADEABILITY_SOFT')
+    if safe_exec > 0 and safe_exec < 65:
+        size_mult = min(size_mult, 0.92)
+        reasons.append('EXEC_SOFT')
+
+    size_mult = _clamp(size_mult, 0.65, 1.0)
+    adjusted_notional = safe_notional * size_mult
+    result.update({
+        'applied': size_mult < 0.999,
+        'size_mult': round(size_mult, 4),
+        'adjusted_notional_usd': round(adjusted_notional, 2),
+        'estimated_slippage_bps': round(est_slippage_bps, 2),
+        'depth_cover': round(depth_cover, 3),
+        'reason': '+'.join(reasons) if reasons else 'none',
+    })
+    return result
+
+
+def _percentile_linear(values: list[float], pct: float) -> float:
+    """Return a simple linear percentile without requiring NumPy."""
+    cleaned = []
+    for value in values or []:
+        try:
+            parsed = float(value)
+        except Exception:
+            continue
+        if math.isfinite(parsed):
+            cleaned.append(parsed)
+    if not cleaned:
+        return 0.0
+    cleaned.sort()
+    if len(cleaned) == 1:
+        return cleaned[0]
+    clipped_pct = max(0.0, min(100.0, float(pct or 0.0)))
+    rank = (clipped_pct / 100.0) * (len(cleaned) - 1)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return cleaned[lower]
+    weight = rank - lower
+    return cleaned[lower] * (1.0 - weight) + cleaned[upper] * weight
+
+
+def summarize_symbol_trade_execution(
+    symbol: str,
+    trades: list,
+    lookback: int = 12,
+) -> dict:
+    """Summarize recent closed-trade execution quality for one symbol."""
+    safe_symbol = str(symbol or "").upper()
+    if not safe_symbol:
+        return {
+            'trade_count': 0,
+            'win_rate': 50.0,
+            'avg_pnl': 0.0,
+            'avg_entry_slippage': 0.0,
+            'entry_slippage_p90': 0.0,
+            'avg_entry_spread': 0.0,
+        }
+
+    symbol_trades = []
+    for trade in reversed(trades or []):
+        if str(trade.get('symbol', '') or '').upper() != safe_symbol:
+            continue
+        symbol_trades.append(trade)
+        if len(symbol_trades) >= max(1, int(lookback or 1)):
+            break
+    symbol_trades.reverse()
+
+    entry_slippages = []
+    entry_spreads = []
+    pnl_values = []
+    wins = 0
+    for trade in symbol_trades:
+        pnl = _coerce_float(trade.get('pnl', 0.0), 0.0)
+        pnl_values.append(pnl)
+        if pnl > 0:
+            wins += 1
+        entry_slippages.append(abs(_coerce_float(trade.get('entry_slippage', trade.get('entrySlippage', 0.0)), 0.0)))
+        entry_spreads.append(abs(_coerce_float(trade.get('entry_spread', trade.get('entrySpread', 0.0)), 0.0)))
+
+    trade_count = len(symbol_trades)
+    avg_pnl = (sum(pnl_values) / trade_count) if trade_count > 0 else 0.0
+    win_rate = (wins / trade_count * 100.0) if trade_count > 0 else 50.0
+
+    return {
+        'trade_count': trade_count,
+        'win_rate': round(win_rate, 2),
+        'avg_pnl': round(avg_pnl, 4),
+        'avg_entry_slippage': round((sum(entry_slippages) / trade_count) if trade_count > 0 else 0.0, 4),
+        'entry_slippage_p90': round(_percentile_linear(entry_slippages, 90.0), 4),
+        'avg_entry_spread': round((sum(entry_spreads) / trade_count) if trade_count > 0 else 0.0, 4),
+    }
+
+
+def compute_symbol_execution_memory_adjustment(
+    symbol: str,
+    trades: list,
+    trade_pattern_penalty: int = 0,
+    tracker_penalty: int = 0,
+    lookback: int = 12,
+) -> dict:
+    """Convert symbol-specific live history into conservative size/leverage caps."""
+    stats = summarize_symbol_trade_execution(symbol, trades, lookback=lookback)
+    trade_count = int(stats.get('trade_count', 0) or 0)
+    entry_slip_p90 = _coerce_float(stats.get('entry_slippage_p90', 0.0), 0.0)
+    avg_entry_slip = _coerce_float(stats.get('avg_entry_slippage', 0.0), 0.0)
+    avg_entry_spread = _coerce_float(stats.get('avg_entry_spread', 0.0), 0.0)
+    win_rate = _coerce_float(stats.get('win_rate', 50.0), 50.0)
+    avg_pnl = _coerce_float(stats.get('avg_pnl', 0.0), 0.0)
+
+    result = {
+        'applied': False,
+        'size_mult': 1.0,
+        'leverage_cap': 0,
+        'reason': 'none',
+        'trade_count': trade_count,
+        'win_rate': win_rate,
+        'avg_pnl': avg_pnl,
+        'avg_entry_slippage': avg_entry_slip,
+        'entry_slippage_p90': entry_slip_p90,
+        'avg_entry_spread': avg_entry_spread,
+        'trade_pattern_penalty': int(trade_pattern_penalty or 0),
+        'tracker_penalty': int(tracker_penalty or 0),
+    }
+    if trade_count <= 0 and int(tracker_penalty or 0) <= 0 and int(trade_pattern_penalty or 0) >= 0:
+        return result
+
+    size_mult = 1.0
+    leverage_cap = 0
+    reasons = []
+
+    def _tighten_cap(current: int, candidate: int) -> int:
+        safe_candidate = int(candidate or 0)
+        if safe_candidate <= 0:
+            return int(current or 0)
+        safe_current = int(current or 0)
+        if safe_current <= 0:
+            return safe_candidate
+        return min(safe_current, safe_candidate)
+
+    if trade_count >= 4:
+        if entry_slip_p90 >= 0.70 or avg_entry_spread >= 0.22:
+            size_mult = min(size_mult, 0.68)
+            leverage_cap = _tighten_cap(leverage_cap, 5)
+            reasons.append('SYMBOL_SLIP_CRITICAL')
+        elif entry_slip_p90 >= 0.45 or avg_entry_slip >= 0.25:
+            size_mult = min(size_mult, 0.80)
+            leverage_cap = _tighten_cap(leverage_cap, 8)
+            reasons.append('SYMBOL_SLIP_HIGH')
+
+        if win_rate < 35.0 and avg_pnl < 0:
+            size_mult = min(size_mult, 0.84)
+            leverage_cap = _tighten_cap(leverage_cap, 8)
+            reasons.append('SYMBOL_WR_WEAK')
+        elif win_rate < 45.0 and avg_pnl < 0:
+            size_mult = min(size_mult, 0.92)
+            leverage_cap = _tighten_cap(leverage_cap, 10)
+            reasons.append('SYMBOL_WR_SOFT')
+
+    if int(tracker_penalty or 0) >= 25:
+        size_mult = min(size_mult, 0.72)
+        leverage_cap = _tighten_cap(leverage_cap, 6)
+        reasons.append('TRACKER_PENALTY_HARD')
+    elif int(tracker_penalty or 0) >= 15:
+        size_mult = min(size_mult, 0.82)
+        leverage_cap = _tighten_cap(leverage_cap, 8)
+        reasons.append('TRACKER_PENALTY')
+
+    if int(trade_pattern_penalty or 0) <= -10:
+        size_mult = min(size_mult, 0.80)
+        leverage_cap = _tighten_cap(leverage_cap, 8)
+        reasons.append('PATTERN_PENALTY')
+    elif int(trade_pattern_penalty or 0) < 0:
+        size_mult = min(size_mult, 0.90)
+        leverage_cap = _tighten_cap(leverage_cap, 10)
+        reasons.append('PATTERN_SOFT')
+
+    size_mult = round(_clamp(size_mult, 0.65, 1.0), 3)
+    result.update({
+        'applied': size_mult < 0.999 or leverage_cap > 0,
+        'size_mult': size_mult,
+        'leverage_cap': int(leverage_cap),
+        'reason': '+'.join(reasons) if reasons else 'none',
+    })
+    return result
+
+
+def normalize_regime_bucket(regime: str, trend_mode: bool = False) -> str:
+    """Collapse detailed regime labels into stable buckets for policy decisions."""
+    upper = str(regime or '').upper()
+    if upper in ('TRENDING', 'TRENDING_UP', 'TRENDING_DOWN'):
+        return 'TREND'
+    if upper == 'RANGING':
+        return 'RANGE'
+    if upper == 'VOLATILE':
+        return 'VOLATILE'
+    if upper == 'QUIET':
+        return 'QUIET'
+    return 'TREND' if bool(trend_mode) else 'UNKNOWN'
+
+
+def normalize_strategy_bucket(strategy_mode: str, trend_mode: bool = False) -> str:
+    safe_mode = normalize_strategy_mode(strategy_mode or STRATEGY_MODE_LEGACY)
+    if safe_mode == STRATEGY_MODE_SMART_V3_RUNNER:
+        return 'RUNNER'
+    if safe_mode == STRATEGY_MODE_SMART_V2:
+        return 'SMART'
+    return 'TREND' if bool(trend_mode) else 'LEGACY'
+
+
+def build_ev_context_descriptor(
+    payload: Optional[dict] = None,
+    *,
+    strategy_mode: Optional[str] = None,
+    market_regime: Optional[str] = None,
+    trend_mode: Optional[bool] = None,
+) -> dict:
+    """Build a compact strategy/regime context for EV stats and gating."""
+    safe_payload = payload if isinstance(payload, dict) else {}
+    signal_snapshot = safe_payload.get('signal_snapshot', {})
+    signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    truth_snapshot = safe_payload.get('truth_snapshot', {})
+    truth_snapshot = truth_snapshot if isinstance(truth_snapshot, dict) else {}
+    if not truth_snapshot and isinstance(signal_snapshot.get('truth_snapshot'), dict):
+        truth_snapshot = signal_snapshot.get('truth_snapshot', {})
+    settings_snapshot = safe_payload.get('settingsSnapshot', {})
+    settings_snapshot = settings_snapshot if isinstance(settings_snapshot, dict) else {}
+
+    resolved_trend_mode = bool(
+        trend_mode
+        if trend_mode is not None
+        else safe_payload.get('trend_mode', signal_snapshot.get('trend_mode', False))
+    )
+    resolved_strategy_mode = (
+        strategy_mode
+        or safe_payload.get('strategyMode')
+        or signal_snapshot.get('strategyMode')
+        or STRATEGY_MODE_LEGACY
+    )
+    resolved_market_regime = (
+        market_regime
+        or truth_snapshot.get('struct_regime')
+        or truth_snapshot.get('fast_regime')
+        or safe_payload.get('market_regime')
+        or signal_snapshot.get('market_regime')
+        or settings_snapshot.get('market_regime')
+        or 'UNKNOWN'
+    )
+    regime_bucket = normalize_regime_bucket(resolved_market_regime, trend_mode=resolved_trend_mode)
+    strategy_bucket = normalize_strategy_bucket(resolved_strategy_mode, trend_mode=resolved_trend_mode)
+
+    if truth_snapshot.get('struct_regime'):
+        source = 'truth_snapshot'
+    elif settings_snapshot.get('market_regime'):
+        source = 'settings_snapshot'
+    elif safe_payload.get('market_regime') or signal_snapshot.get('market_regime'):
+        source = 'payload'
+    else:
+        source = 'fallback'
+
+    return {
+        'strategy_mode': normalize_strategy_mode(resolved_strategy_mode),
+        'strategy_bucket': strategy_bucket,
+        'market_regime': str(resolved_market_regime or 'UNKNOWN').upper(),
+        'regime_bucket': regime_bucket,
+        'trend_mode': resolved_trend_mode,
+        'context_key': f"{strategy_bucket}:{regime_bucket}",
+        'source': source,
+    }
+
+
+def _ev_band_total(hist: dict) -> int:
+    safe_hist = hist if isinstance(hist, dict) else {}
+    return int(safe_hist.get('wins', 0) or 0) + int(safe_hist.get('losses', 0) or 0)
+
+
+def _ev_band_components(hist: dict) -> tuple[float, float, float]:
+    safe_hist = hist if isinstance(hist, dict) else {}
+    total = _ev_band_total(safe_hist)
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+    wins = int(safe_hist.get('wins', 0) or 0)
+    p_win = wins / total
+    avg_win = float(safe_hist.get('avg_win', 0.0) or 0.0)
+    avg_loss = abs(float(safe_hist.get('avg_loss', 0.0) or 0.0))
+    return p_win, avg_win, avg_loss
+
+
+def resolve_ev_gate_profile(signal: dict) -> dict:
+    """Adjust EV thresholds by stable strategy/regime context."""
+    ctx = build_ev_context_descriptor(signal)
+    soft_threshold = float(EV_SOFT_THRESHOLD)
+    hard_threshold = float(EV_HARD_THRESHOLD)
+    penalty_factor = float(EV_SOFT_PENALTY_FACTOR)
+    reasons = []
+
+    regime_bucket = ctx.get('regime_bucket', 'UNKNOWN')
+    if regime_bucket == 'TREND':
+        soft_threshold -= 0.0012
+        hard_threshold -= 0.0020
+        penalty_factor = max(penalty_factor, 0.76)
+        reasons.append('TREND')
+    elif regime_bucket == 'RANGE':
+        soft_threshold += 0.0006
+        hard_threshold += 0.0014
+        penalty_factor = min(penalty_factor, 0.68)
+        reasons.append('RANGE')
+    elif regime_bucket == 'VOLATILE':
+        soft_threshold += 0.0012
+        hard_threshold += 0.0025
+        penalty_factor = min(penalty_factor, 0.62)
+        reasons.append('VOLATILE')
+    elif regime_bucket == 'QUIET':
+        soft_threshold += 0.0008
+        hard_threshold += 0.0018
+        penalty_factor = min(penalty_factor, 0.66)
+        reasons.append('QUIET')
+
+    strategy_bucket = ctx.get('strategy_bucket', 'LEGACY')
+    if strategy_bucket == 'RUNNER':
+        soft_threshold -= 0.0005
+        hard_threshold -= 0.0010
+        penalty_factor = max(penalty_factor, 0.79)
+        reasons.append('RUNNER')
+    elif strategy_bucket == 'SMART':
+        soft_threshold -= 0.0002
+        hard_threshold -= 0.0005
+        penalty_factor = max(penalty_factor, 0.73)
+        reasons.append('SMART')
+
+    hard_threshold = min(hard_threshold, soft_threshold - 0.0025)
+    return {
+        'context': ctx,
+        'soft_threshold': round(soft_threshold, 6),
+        'hard_threshold': round(hard_threshold, 6),
+        'penalty_factor': round(_clamp(penalty_factor, 0.55, 0.85), 3),
+        'reason': '+'.join(reasons) if reasons else 'BASE',
+    }
+
+
+def compute_signal_opportunity_priority(signal: dict) -> float:
+    """Shared priority score for allocator and recycler comparisons."""
+    safe_signal = signal if isinstance(signal, dict) else {}
+    confidence = _coerce_float(safe_signal.get('confidenceScore', safe_signal.get('signalScore', 0.0)), 0.0)
+    volume_ratio = _coerce_float(safe_signal.get('volumeRatio', 1.0), 1.0)
+    spread_pct = _coerce_float(safe_signal.get('spreadPct', 0.05), 0.05)
+    ev = _coerce_float(safe_signal.get('ev', 0.0), 0.0)
+    exec_score = _coerce_float(safe_signal.get('entryExecScore', 0.0), 0.0)
+    allocator_priority = _coerce_float(
+        safe_signal.get('allocatorPriorityScore', safe_signal.get('_allocator_priority_score', 0.0)),
+        0.0,
+    )
+
+    priority = confidence
+    priority += max(-6.0, min(8.0, (volume_ratio - 1.0) * 6.0))
+    priority -= min(10.0, max(0.0, spread_pct * 18.0))
+    if exec_score > 0:
+        priority += max(-3.0, min(4.0, (exec_score - 0.72) * 22.0))
+    if bool(safe_signal.get('entryQualityPass', False)):
+        priority += 4.0
+    if bool(safe_signal.get('trend_mode', False)):
+        priority += 2.5
+    if ev != 0:
+        priority += max(-4.0, min(6.0, ev * 240.0))
+    if allocator_priority != 0:
+        priority = (priority * 0.75) + (allocator_priority * 0.25)
+    return round(priority, 2)
+
+
+def compute_pending_order_recycler_priority(order: dict, now_ms: Optional[int] = None) -> dict:
+    safe_order = order if isinstance(order, dict) else {}
+    signal_snapshot = safe_order.get('signal_snapshot', {})
+    signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    now_ms = int(now_ms if now_ms is not None else datetime.now().timestamp() * 1000)
+    created_at = int(safe_order.get('createdAt', now_ms) or now_ms)
+    age_sec = max(0.0, (now_ms - created_at) / 1000.0)
+    signal_score = _coerce_float(
+        safe_order.get('recheckScore', safe_order.get('signalScore', 0.0)),
+        _coerce_float(safe_order.get('signalScore', 0.0), 0.0),
+    )
+    signal_score_raw = _coerce_float(safe_order.get('signalScoreRaw', signal_score), signal_score)
+    wait_reason = str(
+        safe_order.get('feedbackReason', safe_order.get('lastWaitReason', '')) or ''
+    ).strip()
+    recheck_decision = str(safe_order.get('recheckDecision', '') or '').upper()
+    ev = _coerce_float(safe_order.get('ev', signal_snapshot.get('ev', 0.0)), 0.0)
+    exec_score = _coerce_float(
+        safe_order.get('entryExecScore', signal_snapshot.get('entryExecScore', 0.0)),
+        0.0,
+    )
+    allocator_priority = _coerce_float(
+        safe_order.get(
+            'allocatorPriorityScore',
+            signal_snapshot.get('allocatorPriorityScore', signal_snapshot.get('_allocator_priority_score', 0.0)),
+        ),
+        0.0,
+    )
+    confirmed = bool(safe_order.get('confirmed', False))
+    wait_state = bool(wait_reason) or recheck_decision.startswith('WARN') or recheck_decision.startswith('FAIL')
+    priority = max(signal_score, signal_score_raw * 0.92)
+    priority += min(2.0, float(safe_order.get('reinforcedCount', 0) or 0) * 0.75)
+    priority += 4.0 if confirmed else 0.0
+    priority += max(-4.0, min(4.0, ev * 180.0))
+    if exec_score > 0:
+        priority += max(-3.0, min(3.0, (exec_score - 0.74) * 24.0))
+    if bool(safe_order.get('trend_mode', signal_snapshot.get('trend_mode', False))):
+        priority += 1.5
+    priority -= min(10.0, age_sec / 90.0)
+    if wait_reason:
+        priority -= 4.0
+    if recheck_decision.startswith('WARN'):
+        priority -= 3.0
+    elif recheck_decision.startswith('FAIL'):
+        priority -= 5.0
+    if allocator_priority != 0:
+        priority = (priority * 0.70) + (allocator_priority * 0.30)
+    return {
+        'priority': round(priority, 2),
+        'age_sec': round(age_sec, 1),
+        'signal_score': round(signal_score, 2),
+        'signal_score_raw': round(signal_score_raw, 2),
+        'confirmed': confirmed,
+        'wait_state': wait_state,
+        'wait_reason': wait_reason or recheck_decision or 'none',
+    }
+
+
+def compute_pending_capital_recycler_plan(
+    new_signal: dict,
+    pending_orders: list,
+    *,
+    reason_code: str = 'MAX_EXPOSURE',
+    now_ms: Optional[int] = None,
+) -> dict:
+    """Select a weak pending order that can be replaced by a clearly better signal."""
+    safe_signal = new_signal if isinstance(new_signal, dict) else {}
+    orders = list(pending_orders or [])
+    if not safe_signal or not orders:
+        return {'applied': False, 'reason': 'none'}
+
+    now_ms = int(now_ms if now_ms is not None else datetime.now().timestamp() * 1000)
+    cluster_map = globals().get('COIN_CLUSTER_MAP', {}) or {}
+    new_symbol = str(safe_signal.get('symbol', '') or '')
+    new_side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    new_cluster = cluster_map.get(new_symbol, 'alt')
+    new_priority = compute_signal_opportunity_priority(safe_signal)
+    candidates = []
+
+    for order in orders:
+        safe_order = order if isinstance(order, dict) else {}
+        order_symbol = str(safe_order.get('symbol', '') or '')
+        order_side = str(safe_order.get('side', safe_order.get('action', '')) or '').upper()
+        if not order_symbol or not order_side or order_symbol == new_symbol:
+            continue
+        order_cluster = cluster_map.get(order_symbol, 'alt')
+        same_side = order_side == new_side
+        same_cluster = order_cluster == new_cluster
+
+        if reason_code in ('DIRECTION_LIMIT_LONG', 'DIRECTION_LIMIT_SHORT', 'DIRECTION_EXPOSURE') and not same_side:
+            continue
+        if reason_code == 'CLUSTER_CAP' and (not same_side or not same_cluster):
+            continue
+
+        order_meta = compute_pending_order_recycler_priority(safe_order, now_ms=now_ms)
+        priority_gap = new_priority - float(order_meta.get('priority', 0.0) or 0.0)
+        required_gap = 11.0
+        if same_side:
+            required_gap -= 1.5
+        if same_cluster:
+            required_gap -= 1.5
+        if not order_meta.get('confirmed', False):
+            required_gap -= 1.0
+        if order_meta.get('wait_state', False):
+            required_gap -= 1.0
+        if float(order_meta.get('age_sec', 0.0) or 0.0) >= 600:
+            required_gap -= 2.0
+        if order_meta.get('confirmed', False) and float(order_meta.get('age_sec', 0.0) or 0.0) < 240:
+            required_gap += 4.0
+        min_conf_snapshot = _coerce_float(safe_order.get('minConfidenceScoreSnapshot', 74.0), 74.0)
+        if float(order_meta.get('signal_score', 0.0) or 0.0) <= (min_conf_snapshot + 2.0):
+            required_gap -= 1.0
+        if priority_gap < required_gap:
+            continue
+
+        replace_score = priority_gap
+        replace_score += min(4.0, float(order_meta.get('age_sec', 0.0) or 0.0) / 240.0)
+        replace_score += 2.0 if same_side else 0.0
+        replace_score += 1.5 if same_cluster else 0.0
+        replace_score += 1.5 if order_meta.get('wait_state', False) else 0.0
+        if order_meta.get('confirmed', False) and float(order_meta.get('age_sec', 0.0) or 0.0) < 240:
+            replace_score -= 3.5
+
+        candidates.append({
+            'order': safe_order,
+            'meta': order_meta,
+            'same_side': same_side,
+            'same_cluster': same_cluster,
+            'priority_gap': round(priority_gap, 2),
+            'required_gap': round(required_gap, 2),
+            'replace_score': round(replace_score, 2),
+        })
+
+    if not candidates:
+        return {
+            'applied': False,
+            'reason': 'none',
+            'new_signal_priority': round(new_priority, 2),
+        }
+
+    best = max(
+        candidates,
+        key=lambda item: (
+            float(item.get('replace_score', 0.0) or 0.0),
+            float(item.get('priority_gap', 0.0) or 0.0),
+            float(item.get('meta', {}).get('age_sec', 0.0) or 0.0),
+        ),
+    )
+    order = best['order']
+    meta = best['meta']
+    return {
+        'applied': True,
+        'reason': reason_code,
+        'new_signal_priority': round(new_priority, 2),
+        'candidate_order_id': str(order.get('id', '') or ''),
+        'candidate_symbol': str(order.get('symbol', '') or ''),
+        'candidate_side': str(order.get('side', '') or ''),
+        'candidate_priority': meta.get('priority', 0.0),
+        'candidate_age_sec': meta.get('age_sec', 0.0),
+        'candidate_wait_reason': meta.get('wait_reason', 'none'),
+        'priority_gap': best.get('priority_gap', 0.0),
+        'required_gap': best.get('required_gap', 0.0),
+        'replace_score': best.get('replace_score', 0.0),
+        'same_side': best.get('same_side', False),
+        'same_cluster': best.get('same_cluster', False),
+    }
+
+
+def compute_symbol_microstructure_cooldown_plan(
+    exec_memory: dict,
+    *,
+    signal_score: float = 0.0,
+    entry_exec_score: float = 0.0,
+) -> dict:
+    """Convert repeated bad fill quality into a temporary symbol pause."""
+    safe_mem = exec_memory if isinstance(exec_memory, dict) else {}
+    trade_count = int(safe_mem.get('trade_count', 0) or 0)
+    entry_slip_p90 = abs(_coerce_float(safe_mem.get('entry_slippage_p90', 0.0), 0.0))
+    avg_entry_spread = abs(_coerce_float(safe_mem.get('avg_entry_spread', 0.0), 0.0))
+    win_rate = _coerce_float(safe_mem.get('win_rate', 50.0), 50.0)
+    avg_pnl = _coerce_float(safe_mem.get('avg_pnl', 0.0), 0.0)
+    tracker_penalty = int(safe_mem.get('tracker_penalty', 0) or 0)
+    trade_pattern_penalty = int(safe_mem.get('trade_pattern_penalty', 0) or 0)
+    severity = 0
+    reasons = []
+
+    if trade_count >= 4:
+        if entry_slip_p90 >= 0.85 or avg_entry_spread >= 0.30:
+            severity = max(severity, 3)
+            reasons.append('SLIP_EXTREME')
+        elif entry_slip_p90 >= 0.65 or avg_entry_spread >= 0.26:
+            severity = max(severity, 2)
+            reasons.append('SLIP_HIGH')
+        elif entry_slip_p90 >= 0.50 or avg_entry_spread >= 0.22:
+            severity = max(severity, 1)
+            reasons.append('SLIP_ELEVATED')
+
+        if win_rate < 35.0 and avg_pnl < 0:
+            severity += 1
+            reasons.append('WR_NEG')
+        if tracker_penalty >= 25:
+            severity += 1
+            reasons.append('TRACKER_HARD')
+        elif tracker_penalty >= 15 or trade_pattern_penalty <= -10:
+            severity += 1
+            reasons.append('TRACKER_SOFT')
+
+    severity = max(0, min(3, severity))
+    high_quality_override = (
+        severity < 3
+        and float(signal_score or 0.0) >= 92.0
+        and float(entry_exec_score or 0.0) >= 0.88
+    )
+    cooldown_sec = {1: 900, 2: 1800, 3: 3600}.get(severity, 0)
+    triggered = severity > 0 and not high_quality_override
+    return {
+        'triggered': triggered,
+        'severity': severity,
+        'cooldown_sec': cooldown_sec if triggered else 0,
+        'reason': '+'.join(reasons) if reasons else 'none',
+        'override_high_quality': high_quality_override,
+        'trade_count': trade_count,
+        'entry_slippage_p90': round(entry_slip_p90, 4),
+        'avg_entry_spread': round(avg_entry_spread, 4),
+        'win_rate': round(win_rate, 2),
+        'avg_pnl': round(avg_pnl, 4),
+    }
+
+
+def resolve_position_time_budget_profile(
+    pos: dict,
+    *,
+    current_struct_regime: Optional[str] = None,
+    current_fast_regime: Optional[str] = None,
+) -> dict:
+    """Resolve regime-aware holding-time multipliers for profitable stale positions."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    signal_snapshot = safe_pos.get('signal_snapshot', {})
+    signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    truth_snapshot = safe_pos.get('truth_snapshot', {})
+    truth_snapshot = truth_snapshot if isinstance(truth_snapshot, dict) else {}
+    if not truth_snapshot and isinstance(signal_snapshot.get('truth_snapshot'), dict):
+        truth_snapshot = signal_snapshot.get('truth_snapshot', {})
+    settings_snapshot = safe_pos.get('settingsSnapshot', {})
+    settings_snapshot = settings_snapshot if isinstance(settings_snapshot, dict) else {}
+
+    trend_mode = bool(safe_pos.get('trend_mode', signal_snapshot.get('trend_mode', False)))
+    strategy_mode = safe_pos.get('strategyMode', signal_snapshot.get('strategyMode', STRATEGY_MODE_LEGACY))
+    strategy_bucket = normalize_strategy_bucket(strategy_mode, trend_mode=trend_mode)
+    regime = (
+        truth_snapshot.get('struct_regime')
+        or truth_snapshot.get('fast_regime')
+        or settings_snapshot.get('market_regime')
+        or current_struct_regime
+        or current_fast_regime
+        or 'RANGING'
+    )
+    regime_bucket = normalize_regime_bucket(regime, trend_mode=trend_mode)
+
+    age_mult = 1.0
+    hard_limit_mult = 1.0
+    bounce_mult = 1.0
+    reasons = []
+
+    if regime_bucket == 'TREND':
+        age_mult *= 1.20
+        hard_limit_mult *= 1.25
+        bounce_mult *= 1.18
+        reasons.append('TREND')
+    elif regime_bucket == 'RANGE':
+        age_mult *= 0.82
+        hard_limit_mult *= 0.88
+        bounce_mult *= 0.82
+        reasons.append('RANGE')
+    elif regime_bucket == 'VOLATILE':
+        age_mult *= 0.72
+        hard_limit_mult *= 0.80
+        bounce_mult *= 0.78
+        reasons.append('VOLATILE')
+    elif regime_bucket == 'QUIET':
+        age_mult *= 0.76
+        hard_limit_mult *= 0.84
+        bounce_mult *= 0.76
+        reasons.append('QUIET')
+
+    if trend_mode:
+        age_mult *= 1.15
+        hard_limit_mult *= 1.10
+        bounce_mult *= 1.12
+        reasons.append('TREND_MODE')
+    if strategy_bucket == 'RUNNER':
+        age_mult *= 1.06
+        hard_limit_mult *= 1.08
+        bounce_mult *= 1.05
+        reasons.append('RUNNER')
+
+    entry_cost_bps = _coerce_float(
+        safe_pos.get(
+            'entryCostEstSlippageBps',
+            signal_snapshot.get('entryCostEstSlippageBps', 0.0),
+        ),
+        0.0,
+    )
+    entry_depth_cover = _coerce_float(
+        safe_pos.get('entryDepthCover', signal_snapshot.get('entryDepthCover', 0.0)),
+        0.0,
+    )
+    if entry_cost_bps >= 18.0 or bool(safe_pos.get('symbolExecMemoryApplied', False)):
+        age_mult *= 0.94
+        hard_limit_mult *= 0.95
+        reasons.append('EXEC_RISK')
+    if entry_depth_cover > 0 and entry_depth_cover < 1.10:
+        age_mult *= 0.93
+        bounce_mult *= 0.95
+        reasons.append('THIN_DEPTH')
+
+    if truth_snapshot.get('struct_regime'):
+        source = 'truth_snapshot'
+    elif settings_snapshot.get('market_regime'):
+        source = 'settings_snapshot'
+    elif current_struct_regime or current_fast_regime:
+        source = 'live_regime'
+    else:
+        source = 'fallback'
+
+    return {
+        'market_regime': str(regime or 'RANGING').upper(),
+        'regime_bucket': regime_bucket,
+        'strategy_bucket': strategy_bucket,
+        'age_mult': round(_clamp(age_mult, 0.60, 1.50), 3),
+        'hard_limit_mult': round(_clamp(hard_limit_mult, 0.65, 1.60), 3),
+        'bounce_mult': round(_clamp(bounce_mult, 0.65, 1.50), 3),
+        'source': source,
+        'reason': '+'.join(reasons) if reasons else 'BASE',
+    }
+
+
+def build_soft_signal_allocator_plan(
+    signals: list,
+    positions: list = None,
+    pending_orders: list = None,
+    max_positions: int = 5,
+    pending_weight: float = 0.35,
+) -> list:
+    """Soft-rank simultaneous signals and shrink lower-priority setups.
+
+    This is intentionally non-destructive: it only reorders and adjusts size.
+    Hard risk decisions remain with the existing exposure/risk gates.
+    """
+    raw_signals = list(signals or [])
+    if not raw_signals:
+        return []
+
+    cluster_map = globals().get('COIN_CLUSTER_MAP', {}) or {}
+    live_positions = list(positions or [])
+    live_pending = list(pending_orders or [])
+    safe_max_positions = max(1, int(max_positions or 1))
+
+    side_loads = {}
+    cluster_loads = {}
+    for pos in live_positions:
+        side = str(pos.get('side', pos.get('action', '')) or '').upper()
+        symbol = str(pos.get('symbol', '') or '')
+        if not side or not symbol:
+            continue
+        side_loads[side] = side_loads.get(side, 0.0) + 1.0
+        cluster_key = (side, cluster_map.get(symbol, 'alt'))
+        cluster_loads[cluster_key] = cluster_loads.get(cluster_key, 0.0) + 1.0
+    for order in live_pending:
+        side = str(order.get('side', order.get('action', '')) or '').upper()
+        symbol = str(order.get('symbol', '') or '')
+        if not side or not symbol:
+            continue
+        side_loads[side] = side_loads.get(side, 0.0) + pending_weight
+        cluster_key = (side, cluster_map.get(symbol, 'alt'))
+        cluster_loads[cluster_key] = cluster_loads.get(cluster_key, 0.0) + pending_weight
+
+    effective_used = len(live_positions) + int(len(live_pending) * pending_weight)
+    free_slots = max(1, safe_max_positions - effective_used)
+
+    scored = []
+    for signal in raw_signals:
+        sig = dict(signal or {})
+        symbol = str(sig.get('symbol', '') or '')
+        side = str(sig.get('action', sig.get('side', '')) or '').upper()
+        cluster = cluster_map.get(symbol, 'alt')
+        confidence = _coerce_float(sig.get('confidenceScore', sig.get('signalScore', 0.0)), 0.0)
+        volume_ratio = _coerce_float(sig.get('volumeRatio', 1.0), 1.0)
+        spread_pct = _coerce_float(sig.get('spreadPct', 0.05), 0.05)
+        ev = _coerce_float(sig.get('ev', 0.0), 0.0)
+        priority = confidence
+        priority += max(-6.0, min(8.0, (volume_ratio - 1.0) * 6.0))
+        priority -= min(10.0, max(0.0, spread_pct * 18.0))
+        if bool(sig.get('entryQualityPass', False)):
+            priority += 4.0
+        if bool(sig.get('trend_mode', False)):
+            priority += 2.5
+        if ev != 0:
+            priority += max(-4.0, min(6.0, ev * 250.0))
+        priority -= side_loads.get(side, 0.0) * 1.5
+        priority -= cluster_loads.get((side, cluster), 0.0) * 2.5
+        sig['_allocator_priority_score'] = round(priority, 2)
+        scored.append(sig)
+
+    scored.sort(
+        key=lambda sig: (
+            _coerce_float(sig.get('_allocator_priority_score', 0.0), 0.0),
+            _coerce_float(sig.get('confidenceScore', sig.get('signalScore', 0.0)), 0.0),
+            _coerce_float(sig.get('volumeRatio', 1.0), 1.0),
+        ),
+        reverse=True,
+    )
+
+    allocated_side = {}
+    allocated_cluster = {}
+    rank_mults = (1.00, 0.96, 0.91, 0.86, 0.80)
+    planned = []
+    for idx, sig in enumerate(scored):
+        symbol = str(sig.get('symbol', '') or '')
+        side = str(sig.get('action', sig.get('side', '')) or '').upper()
+        cluster = cluster_map.get(symbol, 'alt')
+        size_mult = rank_mults[min(idx, len(rank_mults) - 1)] if len(scored) > 1 else 1.0
+        reasons = []
+
+        if len(scored) > free_slots and idx >= free_slots:
+            size_mult = min(size_mult, 0.82)
+            reasons.append('RANK_OUTSIDE_FREE')
+        if cluster_loads.get((side, cluster), 0.0) >= 0.75:
+            size_mult = min(size_mult, 0.90)
+            reasons.append('LIVE_CLUSTER_PRESS')
+        if side_loads.get(side, 0.0) >= max(1.0, free_slots):
+            size_mult = min(size_mult, 0.94)
+            reasons.append('LIVE_SIDE_PRESS')
+        if allocated_cluster.get((side, cluster), 0) >= 1:
+            size_mult = min(size_mult, 0.88)
+            reasons.append('QUEUE_CLUSTER_STACK')
+        if allocated_side.get(side, 0) >= max(1, free_slots // 2):
+            size_mult = min(size_mult, 0.92)
+            reasons.append('QUEUE_SIDE_STACK')
+
+        size_mult = round(_clamp(size_mult, 0.72, 1.0), 3)
+        sig['allocatorPriorityScore'] = round(_coerce_float(sig.get('_allocator_priority_score', 0.0), 0.0), 2)
+        sig['allocatorRank'] = idx + 1
+        sig['allocatorSizeMult'] = size_mult
+        sig['allocatorReason'] = '+'.join(reasons) if reasons else 'TOP_RANK'
+        sig['sizeMultiplier'] = round(_coerce_float(sig.get('sizeMultiplier', 1.0), 1.0) * size_mult, 6)
+        sig.pop('_allocator_priority_score', None)
+        planned.append(sig)
+        allocated_side[side] = allocated_side.get(side, 0) + 1
+        allocated_cluster[(side, cluster)] = allocated_cluster.get((side, cluster), 0) + 1
+
+    return planned
+
+
 def get_btc_penalty_risk_caps(btc_penalty: float) -> tuple:
     """
     Map BTC counter-trend penalty to risk caps.
@@ -12089,6 +13022,8 @@ def build_v3_runner_fallback_tp_ladder(
     spread_level: str,
     tp_tighten: float,
     close_split: tuple[float, float, float, float],
+    structural_target_price: float = 0.0,
+    structural_target_source: str = '',
 ) -> dict:
     """Fallback 4-tier ladder for V3 when the RFX ladder is unavailable."""
     base = compute_adaptive_tp_ladder(
@@ -12132,6 +13067,15 @@ def build_v3_runner_fallback_tp_ladder(
         'close_pct': 0.0,
     })
     levels = apply_runner_tp_close_split(levels, close_split)
+    anchored_ladder = anchor_tp_ladder_levels_to_structural_target(
+        levels=levels,
+        entry_price=safe_entry,
+        side=side,
+        leverage=leverage,
+        structural_target_price=structural_target_price,
+        structural_target_source=structural_target_source,
+    )
+    levels = anchored_ladder['levels']
     for level in levels:
         pct = float(level.get('pct', 0))
         if side == 'LONG':
@@ -12146,6 +13090,10 @@ def build_v3_runner_fallback_tp_ladder(
             **base.get('telemetry', {}),
             "tp_tighten_mult": round(float(tp_tighten), 3),
             "close_split": format_runner_close_split(close_split),
+            "structural_anchor_applied": anchored_ladder['applied'],
+            "structural_target_source": anchored_ladder['source'],
+            "structural_target_pct": round(anchored_ladder['target_pct'], 4),
+            "structural_scale": round(anchored_ladder['scale'], 4),
         },
         "prices": prices,
     }
@@ -12205,6 +13153,8 @@ def ensure_v3_runner_tp_ladder(pos: dict, default_mode: str = STRATEGY_MODE_SMAR
         spread_level=pos.get('spreadLevel', 'Normal'),
         tp_tighten=float(pos.get('runner_tp_tighten', runner_controls.get('tp_tighten', 1.0)) or 1.0),
         close_split=runner_split,
+        structural_target_price=pos.get('takeProfit', 0.0) if pos.get('structuralTpAdjusted', False) else 0.0,
+        structural_target_source=pos.get('structuralTpSource', ''),
     )
     if not ladder.get('levels'):
         return False
@@ -12234,6 +13184,65 @@ def is_v3_trail_arm_pending(payload: dict = None, default_mode: str = STRATEGY_M
         and bool(data.get('trailArmed', False))
         and not bool(data.get('isTrailingActive', False))
     )
+
+
+def anchor_tp_ladder_levels_to_structural_target(
+    levels: list,
+    entry_price: float,
+    side: str,
+    leverage: int,
+    structural_target_price: float = 0.0,
+    structural_target_source: str = '',
+) -> dict:
+    safe_entry = max(0.0001, float(entry_price or 0.0))
+    safe_target = float(structural_target_price or 0.0)
+    safe_levels = [dict(level) for level in (levels or [])]
+    if not safe_levels or safe_target <= 0:
+        return {'levels': safe_levels, 'applied': False, 'target_pct': 0.0, 'scale': 1.0, 'source': ''}
+
+    target_in_profit = (
+        (side == 'LONG' and safe_target > safe_entry) or
+        (side == 'SHORT' and safe_target < safe_entry)
+    )
+    if not target_in_profit:
+        return {'levels': safe_levels, 'applied': False, 'target_pct': 0.0, 'scale': 1.0, 'source': ''}
+
+    final_level = next((level for level in safe_levels if str(level.get('key', '')) == 'tp_final'), safe_levels[-1])
+    final_pct = _coerce_float(final_level.get('pct', final_level.get('price_pct', 0.0)), 0.0)
+    penultimate_pct = 0.0
+    if len(safe_levels) >= 2:
+        penultimate_pct = _coerce_float(safe_levels[-2].get('pct', safe_levels[-2].get('price_pct', 0.0)), 0.0)
+    baseline_final_pct = max(final_pct, penultimate_pct * 1.10)
+    if baseline_final_pct <= 0:
+        return {'levels': safe_levels, 'applied': False, 'target_pct': 0.0, 'scale': 1.0, 'source': ''}
+
+    target_pct = abs(safe_target - safe_entry) / safe_entry * 100.0
+    if target_pct <= 0:
+        return {'levels': safe_levels, 'applied': False, 'target_pct': 0.0, 'scale': 1.0, 'source': ''}
+
+    scale = target_pct / baseline_final_pct
+    if target_pct <= (penultimate_pct * 1.02) or scale < 0.65 or scale > 1.35:
+        return {'levels': safe_levels, 'applied': False, 'target_pct': target_pct, 'scale': 1.0, 'source': ''}
+
+    for level in safe_levels:
+        key = str(level.get('key', '') or '')
+        base_pct = _coerce_float(level.get('pct', level.get('price_pct', 0.0)), 0.0)
+        scaled_pct = target_pct if key == 'tp_final' else (base_pct * scale)
+        level['pct'] = round(scaled_pct, 4)
+        level['price_pct'] = round(scaled_pct, 4)
+        level['roi_pct'] = round(price_move_pct_to_roi_pct(scaled_pct, leverage), 4)
+        if side == 'LONG':
+            level['price'] = round(safe_entry * (1 + scaled_pct / 100.0), 8)
+        else:
+            level['price'] = round(safe_entry * (1 - scaled_pct / 100.0), 8)
+
+    return {
+        'levels': safe_levels,
+        'applied': True,
+        'target_pct': target_pct,
+        'scale': scale,
+        'source': structural_target_source,
+    }
 
 
 def get_trail_exit_confirmation_requirements(payload: dict = None, profitable: bool = True, default_mode: str = STRATEGY_MODE_LEGACY) -> tuple[int, int]:
@@ -12536,6 +13545,35 @@ def detect_candle_sr_levels(
     return result
 
 
+def snapshot_structural_sr_levels(sr_levels: dict, max_levels: int = 3) -> dict:
+    """Keep a compact, serializable 4H S/R snapshot for runtime management."""
+    if not isinstance(sr_levels, dict):
+        return {}
+
+    def _pack(levels: list) -> list:
+        packed = []
+        for level in levels or []:
+            price = _coerce_float(level.get('price', 0.0), 0.0)
+            if price <= 0:
+                continue
+            packed.append({
+                'price': round(price, 8),
+                'touches': int(level.get('touches', 0) or 0),
+                'strength': round(_coerce_float(level.get('strength', 0.0), 0.0), 2),
+            })
+            if len(packed) >= max(1, int(max_levels or 1)):
+                break
+        return packed
+
+    return {
+        'timeframe': '4H',
+        'supports': _pack(sr_levels.get('supports', [])),
+        'resistances': _pack(sr_levels.get('resistances', [])),
+        'nearest_support': _coerce_float(sr_levels.get('nearest_support', 0.0), 0.0),
+        'nearest_resistance': _coerce_float(sr_levels.get('nearest_resistance', 0.0), 0.0),
+    }
+
+
 def compute_structural_entry_price(
     atr_entry: float,
     signal_side: str,
@@ -12808,6 +13846,113 @@ def compute_structural_tp(
     return result
 
 
+def compute_structural_trail_candidate(
+    side: str,
+    current_stop: float,
+    current_price: float,
+    entry_price: float,
+    sr_levels: dict,
+    atr: float,
+    spread_pct: float = 0.05,
+    volume_ratio: float = 1.0,
+    trailing_active: bool = False,
+    breakeven_activated: bool = False,
+) -> dict:
+    """Ratchet a live stop toward a broken 4H structural shelf.
+
+    Uses the entry-time 4H S/R snapshot only as a profit-locking tighten rule.
+    It never widens risk and only activates after trail/BE is already active.
+    """
+    result = {
+        'applied': False,
+        'candidate_stop': current_stop,
+        'structural_level': None,
+        'source': 'none',
+    }
+    if not (trailing_active or breakeven_activated):
+        return result
+    if current_stop <= 0 or current_price <= 0 or entry_price <= 0 or atr <= 0:
+        return result
+    if not isinstance(sr_levels, dict):
+        return result
+
+    atr_pct = (atr / entry_price * 100.0) if entry_price > 0 else 0.0
+    comp_vol = compute_composite_volatility(atr_pct, spread_pct, volume_ratio)
+    if comp_vol.get('category') == 'WILD':
+        return result
+
+    min_profit_dist = max(atr * 0.45, entry_price * 0.0020)
+    if side == 'LONG' and (current_price - entry_price) < min_profit_dist:
+        return result
+    if side == 'SHORT' and (entry_price - current_price) < min_profit_dist:
+        return result
+
+    level_buffer = atr * 0.10
+    min_improve = max(atr * 0.08, entry_price * 0.0008)
+    structural_levels = []
+    for level in sr_levels.get('supports', []) or []:
+        structural_levels.append(('support', level))
+    for level in sr_levels.get('resistances', []) or []:
+        structural_levels.append(('resistance', level))
+
+    if side == 'LONG':
+        best_level = None
+        best_source = ''
+        best_price = 0.0
+        for source, level in structural_levels:
+            level_price = _coerce_float(level.get('price', 0.0), 0.0)
+            touches = int(level.get('touches', 0) or 0)
+            if touches < 2 or level_price <= 0:
+                continue
+            if level_price <= entry_price + level_buffer:
+                continue
+            if level_price >= current_price - level_buffer:
+                continue
+            candidate = level_price - level_buffer
+            if candidate <= current_stop + min_improve:
+                continue
+            if candidate <= entry_price:
+                continue
+            if level_price > best_price:
+                best_price = level_price
+                best_level = level_price
+                best_source = source
+        if best_level is not None:
+            result['applied'] = True
+            result['candidate_stop'] = round(best_level - level_buffer, 8)
+            result['structural_level'] = round(best_level, 8)
+            result['source'] = f"{best_source}_reclaim"
+        return result
+
+    best_level = None
+    best_source = ''
+    best_price = float('inf')
+    for source, level in structural_levels:
+        level_price = _coerce_float(level.get('price', 0.0), 0.0)
+        touches = int(level.get('touches', 0) or 0)
+        if touches < 2 or level_price <= 0:
+            continue
+        if level_price >= entry_price - level_buffer:
+            continue
+        if level_price <= current_price + level_buffer:
+            continue
+        candidate = level_price + level_buffer
+        if candidate >= current_stop - min_improve:
+            continue
+        if candidate >= entry_price:
+            continue
+        if level_price < best_price:
+            best_price = level_price
+            best_level = level_price
+            best_source = source
+    if best_level is not None:
+        result['applied'] = True
+        result['candidate_stop'] = round(best_level + level_buffer, 8)
+        result['structural_level'] = round(best_level, 8)
+        result['source'] = f"{best_source}_reclaim"
+    return result
+
+
 # ============================================================================
 # Phase 250: ADAPTIVE TP LADDER
 # ============================================================================
@@ -12824,6 +13969,8 @@ def compute_adaptive_tp_ladder(
     coin_daily_trend: str = 'NEUTRAL',
     exec_score: float = 70.0,
     spread_level: str = 'Normal',
+    structural_target_price: float = 0.0,
+    structural_target_source: str = '',
 ) -> dict:
     """Phase 250: Compute adaptive runner-friendly 4-tier TP ladder.
     
@@ -12924,6 +14071,18 @@ def compute_adaptive_tp_ladder(
             'price': price,
             'close_pct': round(close_pct, 2),
         })
+
+    anchored_ladder = anchor_tp_ladder_levels_to_structural_target(
+        levels=levels,
+        entry_price=safe_entry,
+        side=side,
+        leverage=safe_lev,
+        structural_target_price=structural_target_price,
+        structural_target_source=structural_target_source,
+    )
+    levels = anchored_ladder['levels']
+    if anchored_ladder['applied']:
+        tp_final_pct = anchored_ladder['target_pct']
     
     telemetry = {
         'atr_pct': round(atr_pct, 3),
@@ -12934,6 +14093,10 @@ def compute_adaptive_tp_ladder(
         'trend_aligned': trend_aligned,
         'exec_score': safe_exec,
         'tp_final_target_roi': round(price_move_pct_to_roi_pct(tp_final_pct, safe_lev), 3),
+        'structural_anchor_applied': anchored_ladder['applied'],
+        'structural_target_source': anchored_ladder['source'],
+        'structural_target_pct': round(anchored_ladder['target_pct'], 4),
+        'structural_scale': round(anchored_ladder['scale'], 4),
     }
     
     logger.info(
@@ -13103,11 +14266,17 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     order_score_floor = float(order.get('minConfidenceScoreSnapshot', 74) or 74)
     created_at = int(order.get('createdAt', now_ms) or now_ms)
     age_min = (now_ms - created_at) / 60000.0
+    order_entry_price = float(order.get('entryPrice', order.get('signalPrice', 0.0)) or 0.0)
+    order_atr = float(order.get('atr', 0.0) or 0.0)
+    order_pullback_pct = float(order.get('pullbackPct', 0.0) or 0.0)
 
     live_side = opportunity.get('signalAction', 'NONE')
     live_spread = float(opportunity.get('spreadPct', 0) or 0)
     live_vol_ratio = float(opportunity.get('volumeRatio', 1.0) or 1.0)
     live_ob_trend = float(opportunity.get('obImbalanceTrend', 0) or 0)
+    live_price = float(
+        opportunity.get('price', opportunity.get('currentPrice', opportunity.get('markPrice', 0.0))) or 0.0
+    )
     direction_flip = False
     spread_reject = False
     ob_veto = False
@@ -13199,6 +14368,29 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     else:
         score += 2
         reasons.append(f"AGE_STALE({age_min:.0f}m)")
+
+    # ── 6. Entry drift control (10 pt) ────────────────────────
+    if order_entry_price > 0 and live_price > 0:
+        drift_pct = abs(live_price - order_entry_price) / order_entry_price * 100.0
+        atr_drift_band = (order_atr / order_entry_price * 100.0) if order_atr > 0 else 0.0
+        expected_band = max(0.35, order_pullback_pct, atr_drift_band * 0.8)
+        reject_band = max(expected_band * 2.2, atr_drift_band * 2.5, 1.8)
+        if drift_pct <= expected_band * 0.60:
+            score += 10
+            reasons.append(f"DRIFT_OK({drift_pct:.2f}%)")
+        elif drift_pct <= expected_band:
+            score += 6
+            reasons.append(f"DRIFT_MILD({drift_pct:.2f}%)")
+        elif drift_pct <= expected_band * 1.5:
+            score += 2
+            reasons.append(f"DRIFT_WAIT({drift_pct:.2f}%)")
+        else:
+            reasons.append(f"DRIFT_HIGH({drift_pct:.2f}%)")
+            if drift_pct >= reject_band and age_min >= 15:
+                hard_reject = True
+                reasons.append(f"DRIFT_REJECT({drift_pct:.2f}%>{reject_band:.2f}%)")
+    else:
+        reasons.append("DRIFT_UNKNOWN")
 
     softened_hard_reject = False
     if should_soften_pending_recheck_hard_reject(
@@ -18175,6 +19367,23 @@ async def background_scanner_loop():
                             f"📊 MTF_BUDGET: requested={len(mtf_update_symbols)} updated={mtf_updated} "
                             f"timeouts={mtf_timeout_count} budget={SCANNER_MTF_UPDATE_BUDGET_SEC:.1f}s"
                         )
+
+                    if multi_coin_scanner.active_signals:
+                        _planned_signals = build_soft_signal_allocator_plan(
+                            multi_coin_scanner.active_signals,
+                            positions=global_paper_trader.positions,
+                            pending_orders=global_paper_trader.pending_orders,
+                            max_positions=global_paper_trader.max_positions,
+                        )
+                        multi_coin_scanner.active_signals = _planned_signals
+                        if len(_planned_signals) > 1:
+                            _alloc_preview = ', '.join(
+                                f"{sig.get('symbol', '?')}#{sig.get('allocatorRank', 0)}"
+                                f"@{sig.get('allocatorPriorityScore', 0):.1f}"
+                                f"x{sig.get('allocatorSizeMult', 1.0):.2f}"
+                                for sig in _planned_signals[:5]
+                            )
+                            logger.info(f"🧭 CAPITAL_ALLOCATOR: {_alloc_preview}")
                     
                     for signal in multi_coin_scanner.active_signals:
                         try:
@@ -18414,6 +19623,33 @@ async def background_scanner_loop():
                                                 f"ROI={current_profit_roi:.1f}% peak={profit_ladder.get('profit_peak_roi_pct', 0.0):.1f}% "
                                                 f"SL ${old_sl:.6f} → ${profit_lock_price:.6f}"
                                             )
+
+                            _struct_trail = compute_structural_trail_candidate(
+                                side=pos.get('side', 'LONG'),
+                                current_stop=pos.get('trailingStop', trailing_stop),
+                                current_price=candle_close_price,
+                                entry_price=entry_price,
+                                sr_levels=(
+                                    pos.get('structural_sr_levels')
+                                    or (pos.get('signal_snapshot', {}) if isinstance(pos.get('signal_snapshot'), dict) else {}).get('structural_sr_levels', {})
+                                ),
+                                atr=max(_coerce_float(pos.get('atr', 0.0), 0.0), entry_price * 0.003 if entry_price > 0 else 0.0),
+                                spread_pct=_coerce_float(pos.get('spreadPct', 0.05), 0.05),
+                                volume_ratio=_coerce_float(pos.get('volumeRatio', 1.0), 1.0),
+                                trailing_active=bool(pos.get('isTrailingActive', False)),
+                                breakeven_activated=bool(pos.get('breakeven_activated', False)),
+                            )
+                            if _struct_trail.get('applied'):
+                                if apply_sl_floor(pos, _struct_trail['candidate_stop'], f"STRUCT_TRAIL_{str(_struct_trail['source']).upper()}"):
+                                    trailing_stop = pos.get('trailingStop', trailing_stop)
+                                    pos['structuralTrailLevel'] = _struct_trail.get('structural_level', 0.0)
+                                    pos['structuralTrailSource'] = _struct_trail.get('source', '')
+                                    pos['structuralTrailAppliedCount'] = int(pos.get('structuralTrailAppliedCount', 0) or 0) + 1
+                                    logger.info(
+                                        f"🧱 STRUCT_TRAIL: {pos.get('symbol','?')} {pos.get('side','LONG')} "
+                                        f"stop→${trailing_stop:.6f} level={_struct_trail.get('structural_level', 0.0):.6f} "
+                                        f"src={_struct_trail.get('source', '')}"
+                                    )
                             
                             # =========================================================
                             # SPIKE BYPASS v2: 5-Tick + 30-Second Confirmation for SL
@@ -21367,6 +22603,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # Phase 237B: Entry Tradeability Score — BEFORE marking accepted
     if ENTRY_TRADEABILITY_ENABLED:
         try:
+            signal['tradeabilityDepthUsd'] = round(float(total_depth or 0.0), 4)
             _td = compute_entry_tradeability(signal, {
                 'spread_pct': signal.get('spreadPct', 0.05),
                 'depth_ratio': total_depth / max(1, dynamic_depth_threshold) if total_depth > 0 else 1.0,
@@ -21572,11 +22809,17 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     
     # Patch D: EV Gate — soft penalty / hard block
     if EV_GATE_ENABLED:
+        _ev_profile = resolve_ev_gate_profile(signal)
+        signal['evContextKey'] = _ev_profile['context'].get('context_key', '')
+        signal['evSoftThresholdApplied'] = _ev_profile['soft_threshold']
+        signal['evHardThresholdApplied'] = _ev_profile['hard_threshold']
+        signal['evPenaltyFactorApplied'] = _ev_profile['penalty_factor']
         _ev_val = signal.get('ev', 0)
-        if _ev_val < EV_HARD_THRESHOLD and EV_HARD_BLOCK_ENABLED:
+        if _ev_val < _ev_profile['hard_threshold'] and EV_HARD_BLOCK_ENABLED:
             logger.warning(
                 f"🚫 EV_GATE_HARD_BLOCK: {action} {symbol} | EV={_ev_val:.4f} "
-                f"< hard={EV_HARD_THRESHOLD} → REJECTED"
+                f"< hard={_ev_profile['hard_threshold']:.4f} "
+                f"ctx={_ev_profile['context'].get('context_key')} → REJECTED"
             )
             global_paper_trader.pipeline_metrics.setdefault('ev_hard_block', 0)
             global_paper_trader.pipeline_metrics['ev_hard_block'] += 1
@@ -21587,18 +22830,24 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 'EXEC__EV_HARD_BLOCK',
                 f'EV_HARD_BLOCK:{_ev_val:.4f}',
                 feedback_reason=f"EV_HARD_BLOCK:{_ev_val:.4f}",
-                trace={'ev': round(float(_ev_val), 6), 'hard_threshold': EV_HARD_THRESHOLD},
+                trace={
+                    'ev': round(float(_ev_val), 6),
+                    'hard_threshold': _ev_profile['hard_threshold'],
+                    'ev_context': _ev_profile['context'].get('context_key'),
+                },
                 metric_key='ev_hard_block',
             )
-        elif _ev_val < EV_SOFT_THRESHOLD:
+        elif _ev_val < _ev_profile['soft_threshold']:
             _old_score = signal.get('confidenceScore', 0)
-            _new_score = _old_score * EV_SOFT_PENALTY_FACTOR
+            _new_score = _old_score * _ev_profile['penalty_factor']
             signal['confidenceScore'] = _new_score
             signal['_ev_soft_applied'] = True
             logger.info(
                 f"⚠️ EV_GATE_SOFT: {action} {symbol} | EV={_ev_val:.4f} "
-                f"< soft={EV_SOFT_THRESHOLD} → score {_old_score:.0f}→{_new_score:.0f} "
-                f"(×{EV_SOFT_PENALTY_FACTOR})"
+                f"< soft={_ev_profile['soft_threshold']:.4f} "
+                f"ctx={_ev_profile['context'].get('context_key')} "
+                f"→ score {_old_score:.0f}→{_new_score:.0f} "
+                f"(×{_ev_profile['penalty_factor']:.2f})"
             )
             global_paper_trader.pipeline_metrics.setdefault('ev_soft_penalty', 0)
             global_paper_trader.pipeline_metrics['ev_soft_penalty'] += 1
@@ -24346,7 +25595,9 @@ class PositionBasedKillSwitch:
             'PRE-REDUCE' if reason == 'PRE_STOP_REDUCE' else 'RECOVERY'
         )
         pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
-        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
+        _resync_after_partial = getattr(self, '_resync_live_protection_after_partial', None)
+        if callable(_resync_after_partial):
+            await _resync_after_partial(pos, f"{reason}_SYNC")
 
         # Record partial close in trade history
         partial_trade = {
@@ -24515,7 +25766,9 @@ class TimeBasedPositionManager:
             pos['initialMargin'] = max(0.0, float(pos.get('initialMargin', 0) or 0) * (1 - float(reduction_pct)))
         pos['lastExitDecision'] = reason
         pos['runtimeProtectionPhase'] = 'TIME-RECOVERY'
-        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
+        _resync_after_partial = getattr(self, '_resync_live_protection_after_partial', None)
+        if callable(_resync_after_partial):
+            await _resync_after_partial(pos, f"{reason}_SYNC")
 
         partial_trade = {
             "id": f"{pos.get('id', '')}_{trade_suffix}",
@@ -24823,7 +26076,9 @@ class TimeBasedPositionManager:
             pos['initialMargin'] = current_initial_margin * ratio
         paper_trader.balance += released_margin + pnl
         pos['lastExitDecision'] = reason
-        await self._resync_live_protection_after_partial(pos, f"{reason}_SYNC")
+        _resync_after_partial = getattr(self, '_resync_live_protection_after_partial', None)
+        if callable(_resync_after_partial):
+            await _resync_after_partial(pos, f"{reason}_SYNC")
 
         partial_trade = {
             "id": f"{pos.get('id', '')}_{label}",
@@ -25031,7 +26286,9 @@ class TimeBasedPositionManager:
                 f"(anchor={be_ctx.get('anchor_source', 'entry')} ${be_ctx.get('anchor_price', 0.0):.6f})"
             )
 
-        await self._resync_live_protection_after_partial(pos, f"{level_reason}_SYNC")
+        _resync_after_partial = getattr(self, '_resync_live_protection_after_partial', None)
+        if callable(_resync_after_partial):
+            await _resync_after_partial(pos, f"{level_reason}_SYNC")
         logger.info(
             f"💰 PARTIAL_TP: {symbol} closed {close_pct*100:.0f}% at ROI "
             f"{compute_position_roi_pct(pos, current_price):.2f}% (level: {level_key}, base: {base_tp_pct:.2f}%)"
@@ -25679,6 +26936,8 @@ class TimeBasedPositionManager:
                             coin_daily_trend=pos.get('coinDailyTrend', 'NEUTRAL'),
                             exec_score=pos.get('entryExecScore', pos.get('signalScore', 70.0)),
                             spread_level=spread_level,
+                            structural_target_price=pos.get('takeProfit', 0.0) if pos.get('structuralTpAdjusted', False) else 0.0,
+                            structural_target_source=pos.get('structuralTpSource', ''),
                         )
                         tp_levels = normalize_tp_ladder_levels(pos, fallback_ladder.get('levels', []))
                         base_tp_pct = fallback_ladder.get('telemetry', {}).get('base_tp_pct', 0)
@@ -31408,6 +32667,7 @@ class SignalGenerator:
         except Exception:
             pass
         sr_levels = detect_candle_sr_levels(_sr_ohlcv_4h, price, atr)
+        _structural_sr_snapshot = snapshot_structural_sr_levels(sr_levels)
         
         # 3. Compute structural entry (pullback + fib + S/R hybrid)
         ideal_entry = atr_entry  # Fallback
@@ -31687,6 +32947,7 @@ class SignalGenerator:
             # RFX-3A: Execution style telemetry
             'execution_style': _exec_style,
             'structural_zone': _structural_zone_dict,
+            'structural_sr_levels': _structural_sr_snapshot,
             'structural_fallback_stage': _fallback_stage,
             'struct_partial_tp_pct': _exec_profile.struct_partial_tp_pct if _exec_profile.exec_style_enabled else 0,
             'pullbackPct': round(pullback_pct * 100, 2),  # Phase 160: ATR+Spread based
@@ -32212,12 +33473,15 @@ class PaperTradingEngine:
             'risk_gate_soft_pass': 0,
             'late_score_rejected': 0,
             'low_score_pending_dropped': 0,
+            'pending_recycled': 0,
+            'microstructure_cooldown_block': 0,
         }
         # Settings log spam guard
         self._last_settings_log_ts = 0
         self._last_settings_log_signature = ""
         # Symbol-level execution feedback for UI (latest rejection reason).
         self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
+        self.microstructure_cooldowns = {}  # {symbol: {until_ts, reason, cooldown_sec, ts}}
         
         # =========================================================================
         # COIN BLACKLIST SYSTEM
@@ -32235,6 +33499,7 @@ class PaperTradingEngine:
         
         # Phase 224A: MAE/MFE Diagnostics + Signal EV
         self.score_band_stats = {}  # {"60-70": {wins, losses, total_win, total_loss, avg_win, avg_loss}}
+        self.score_band_stats_by_context = {}  # {"RUNNER:TREND": {"70-80": {...}}}
         self.last_signal_per_coin = {}  # {symbol: {side, time}} for flip detection
         self.signal_memory = {}  # {symbol: {side, streak, last_seen, score, ...}}
         
@@ -32440,25 +33705,46 @@ class PaperTradingEngine:
         Returns: Net EV value after costs (positive = profitable, negative = avoid)
         """
         score = signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0))  # Use raw pre-penalty score
+        ctx = build_ev_context_descriptor(signal)
         
         # Skor bandı: 50-60, 60-70, 70-80, 80-90, 90-100
         band = min(90, max(50, (score // 10) * 10))
         band_key = f"{band}-{band + 10}"
         
         hist = self.score_band_stats.get(band_key, {})
-        total = hist.get('wins', 0) + hist.get('losses', 0)
-        
-        # Require 30+ trades per band for reliable historical data (was 5, caused poisoned data)
-        if total < 30:
+        total = _ev_band_total(hist)
+        ctx_store = self.score_band_stats_by_context.get(ctx.get('context_key', ''), {})
+        ctx_hist = ctx_store.get(band_key, {}) if isinstance(ctx_store, dict) else {}
+        ctx_total = _ev_band_total(ctx_hist)
+
+        # Require 30+ trades per band for reliable global data.
+        if total < 30 and ctx_total < 10:
             # Yetersiz veri → EV tahmini: score'u PnL ölçeğine dönüştür
             ev_raw = (score - 60) * 0.005  # 60 skor = 0 EV, 80 skor = 0.1 EV
-            ev_source = f"FALLBACK(n={total})"
+            ev_source = f"FALLBACK(n={max(total, ctx_total)})"
         else:
-            p_win = hist['wins'] / total
-            avg_win = hist.get('avg_win', 0)
-            avg_loss = abs(hist.get('avg_loss', 0))
+            if ctx_total >= 10:
+                base_p_win, base_avg_win, base_avg_loss = _ev_band_components(hist)
+                ctx_p_win, ctx_avg_win, ctx_avg_loss = _ev_band_components(ctx_hist)
+                if total >= 20:
+                    ctx_weight = min(0.65, max(0.25, ctx_total / 40.0))
+                    p_win = (base_p_win * (1.0 - ctx_weight)) + (ctx_p_win * ctx_weight)
+                    avg_win = (base_avg_win * (1.0 - ctx_weight)) + (ctx_avg_win * ctx_weight)
+                    avg_loss = (base_avg_loss * (1.0 - ctx_weight)) + (ctx_avg_loss * ctx_weight)
+                    ev_source = (
+                        f"BLEND(ctx={ctx.get('context_key')} n={ctx_total} "
+                        f"base={total} w={ctx_weight:.2f})"
+                    )
+                else:
+                    p_win, avg_win, avg_loss = ctx_p_win, ctx_avg_win, ctx_avg_loss
+                    ev_source = f"CTX({ctx.get('context_key')} n={ctx_total})"
+            else:
+                p_win = hist['wins'] / total
+                avg_win = hist.get('avg_win', 0)
+                avg_loss = abs(hist.get('avg_loss', 0))
+                ev_source = f"HIST(W={hist['wins']},L={hist['losses']},pW={p_win:.2f})"
+
             ev_raw = p_win * avg_win - (1 - p_win) * avg_loss
-            ev_source = f"HIST(W={hist['wins']},L={hist['losses']},pW={p_win:.2f})"
             
             # Sanity check: if win rate > 50% but EV negative → exit quality issue, use fallback
             if p_win > 0.50 and ev_raw < 0:
@@ -32476,33 +33762,39 @@ class PaperTradingEngine:
         logger.info(
             f"📊 EV_CALC: {symbol} | score={score} band={band_key} {ev_source} | "
             f"ev_raw={ev_raw:.4f} cost={est_cost:.4f} ev_net={ev_net:.4f} | "
+            f"ctx={ctx.get('context_key')} "
             f"_raw={signal.get('_rawConfidenceScore', 'MISSING')} conf={signal.get('confidenceScore', 'MISSING')}"
         )
         
         return ev_net
     
-    def update_score_band_stats(self, signal_score: int, pnl: float):
+    def update_score_band_stats(
+        self,
+        signal_score: int,
+        pnl: float,
+        *,
+        strategy_mode: str = STRATEGY_MODE_LEGACY,
+        market_regime: str = 'UNKNOWN',
+        trend_mode: bool = False,
+    ):
         """Phase 224B: Trade kapanınca skor bandı istatistiğini güncelle."""
         band = min(90, max(50, (signal_score // 10) * 10))
         band_key = f"{band}-{band + 10}"
-        
-        if band_key not in self.score_band_stats:
-            self.score_band_stats[band_key] = {
-                'wins': 0, 'losses': 0,
-                'total_win': 0.0, 'total_loss': 0.0,
-                'avg_win': 0.0, 'avg_loss': 0.0
-            }
-        
-        stats = self.score_band_stats[band_key]
-        if pnl > 0:
-            stats['wins'] += 1
-            stats['total_win'] += pnl
-        else:
-            stats['losses'] += 1
-            stats['total_loss'] += pnl
-        
-        stats['avg_win'] = stats['total_win'] / max(1, stats['wins'])
-        stats['avg_loss'] = stats['total_loss'] / max(1, stats['losses'])
+        self._update_score_band_bucket(self.score_band_stats, band_key, pnl)
+        ctx = build_ev_context_descriptor(
+            {
+                'strategyMode': strategy_mode,
+                'market_regime': market_regime,
+                'trend_mode': trend_mode,
+            },
+            strategy_mode=strategy_mode,
+            market_regime=market_regime,
+            trend_mode=trend_mode,
+        )
+        context_key = ctx.get('context_key', 'LEGACY:UNKNOWN')
+        if context_key not in self.score_band_stats_by_context:
+            self.score_band_stats_by_context[context_key] = {}
+        self._update_score_band_bucket(self.score_band_stats_by_context[context_key], band_key, pnl)
     
     def get_dynamic_risk_per_trade(self) -> float:
         """
@@ -32605,6 +33897,144 @@ class PaperTradingEngine:
             self.execution_feedback.pop(symbol, None)
             return None
         return item
+
+    @staticmethod
+    def _new_score_band_bucket() -> dict:
+        return {
+            'wins': 0,
+            'losses': 0,
+            'total_win': 0.0,
+            'total_loss': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0,
+        }
+
+    @classmethod
+    def _update_score_band_bucket(cls, bucket_store: dict, band_key: str, pnl: float) -> None:
+        if band_key not in bucket_store:
+            bucket_store[band_key] = cls._new_score_band_bucket()
+        stats = bucket_store[band_key]
+        if pnl > 0:
+            stats['wins'] += 1
+            stats['total_win'] += pnl
+        else:
+            stats['losses'] += 1
+            stats['total_loss'] += pnl
+        stats['avg_win'] = stats['total_win'] / max(1, stats['wins'])
+        stats['avg_loss'] = stats['total_loss'] / max(1, stats['losses'])
+
+    def get_microstructure_cooldown(self, symbol: str) -> Optional[dict]:
+        """Return active symbol-level microstructure cooldown, auto-expiring stale ones."""
+        if not symbol:
+            return None
+        item = self.microstructure_cooldowns.get(symbol)
+        if not isinstance(item, dict):
+            return None
+        until_ts = float(item.get('until_ts', 0.0) or 0.0)
+        if until_ts <= 0:
+            self.microstructure_cooldowns.pop(symbol, None)
+            return None
+        now_ts = time.time()
+        if now_ts >= until_ts:
+            self.microstructure_cooldowns.pop(symbol, None)
+            return None
+        remaining_sec = max(0, int(math.ceil(until_ts - now_ts)))
+        item['remaining_sec'] = remaining_sec
+        return item
+
+    def set_microstructure_cooldown(
+        self,
+        symbol: str,
+        cooldown_sec: int,
+        reason: str,
+        *,
+        severity: int = 0,
+        detail: Optional[dict] = None,
+    ) -> Optional[dict]:
+        if not symbol or cooldown_sec <= 0:
+            return None
+        now_ts = time.time()
+        until_ts = now_ts + max(0, int(cooldown_sec))
+        existing = self.microstructure_cooldowns.get(symbol)
+        if isinstance(existing, dict):
+            existing_until = float(existing.get('until_ts', 0.0) or 0.0)
+            if existing_until > until_ts:
+                until_ts = existing_until
+        payload = {
+            'symbol': symbol,
+            'reason': str(reason or 'MICROSTRUCTURE'),
+            'severity': int(severity or 0),
+            'cooldown_sec': max(0, int(math.ceil(until_ts - now_ts))),
+            'ts': int(now_ts * 1000),
+            'until_ts': until_ts,
+            'detail': detail if isinstance(detail, dict) else {},
+        }
+        self.microstructure_cooldowns[symbol] = payload
+        return payload
+
+    def record_pending_recycle_event(
+        self,
+        order: Optional[dict],
+        decision_code: str,
+        *,
+        detail: str = '',
+        trace: Optional[dict] = None,
+    ) -> None:
+        if not isinstance(order, dict):
+            return
+        symbol = str(order.get('symbol', '') or '')
+        signal_id = str(order.get('signalId', '') or '')
+        pending_id = str(order.get('id', '') or '')
+        if not symbol or not signal_id:
+            return
+        now_ms = int(datetime.now().timestamp() * 1000)
+        event_payload = build_signal_event_payload(
+            {
+                'signal_id': signal_id,
+                'signalId': signal_id,
+                'symbol': symbol,
+                'action': order.get('side', 'NONE'),
+                'timestamp': now_ms,
+                'signal_score': order.get('signalScore', 0),
+                'signal_score_raw': order.get('signalScoreRaw', order.get('signalScore', 0)),
+            },
+            stage=SIGNAL_STAGE_PENDING_CANCELLED,
+            decision='SOFT_REJECT',
+            decision_code=str(decision_code or 'PENDING__RECYCLED'),
+            decision_detail=str(detail or 'pending_recycled'),
+            accepted=True,
+            pending_entry_id=pending_id,
+            executable=True,
+            is_pending=False,
+            is_opened=False,
+            score_before=order.get('signalScoreRaw', order.get('signalScore', 0)),
+            score_after=order.get('recheckScore', order.get('signalScore', 0)),
+            leverage_before=order.get('signalLeverageRaw', order.get('leverage', 0)),
+            leverage_after=order.get('leverage', 0),
+            size_mult=order.get('sizeMultiplier', 1.0),
+            trace=trace or {},
+        )
+        record_signal_event_memory(event_payload)
+        drop_signal_memory(
+            symbol,
+            signal_id=signal_id,
+            allowed_states=SIGNAL_PENDING_STATES.union({SIGNAL_STAGE_OPEN_ATTEMPT}),
+        )
+        safe_create_task(sqlite_manager.update_signal_decision(
+            signal_id,
+            stage=SIGNAL_STAGE_PENDING_CANCELLED,
+            decision='SOFT_REJECT',
+            decision_code=str(decision_code or 'PENDING__RECYCLED'),
+            decision_detail=str(detail or 'pending_recycled'),
+            accepted=True,
+            reject_reason=str(detail or 'pending_recycled'),
+            pending_entry_id=pending_id,
+            executable=True,
+            is_pending=False,
+            is_opened=False,
+            decision_trace=trace or {},
+        ))
+        safe_create_task(sqlite_manager.save_signal_event(event_payload))
     
     # =========================================================================
     # COIN BLACKLIST SYSTEM METHODS
@@ -32908,8 +34338,20 @@ class PaperTradingEngine:
         existing_pending['truth_snapshot'] = signal.get('truth_snapshot', existing_pending.get('truth_snapshot', {})) if signal else existing_pending.get('truth_snapshot', {})
         existing_pending['regime_adjustment'] = signal.get('regime_adjustment', existing_pending.get('regime_adjustment', '')) if signal else existing_pending.get('regime_adjustment', '')
         existing_pending['structural_zone'] = signal.get('structural_zone', existing_pending.get('structural_zone', {})) if signal else existing_pending.get('structural_zone', {})
+        existing_pending['structural_sr_levels'] = signal.get('structural_sr_levels', existing_pending.get('structural_sr_levels', {})) if signal else existing_pending.get('structural_sr_levels', {})
         existing_pending['structural_fallback_stage'] = signal.get('structural_fallback_stage', existing_pending.get('structural_fallback_stage', '')) if signal else existing_pending.get('structural_fallback_stage', '')
         existing_pending['execution_style'] = signal.get('execution_style', existing_pending.get('execution_style', EXEC_STYLE_MARKET)) if signal else existing_pending.get('execution_style', EXEC_STYLE_MARKET)
+        existing_pending['symbolExecMemoryApplied'] = bool(signal.get('symbolExecMemoryApplied', existing_pending.get('symbolExecMemoryApplied', False))) if signal else existing_pending.get('symbolExecMemoryApplied', False)
+        existing_pending['symbolExecMemorySizeMult'] = _coerce_float(signal.get('symbolExecMemorySizeMult', existing_pending.get('symbolExecMemorySizeMult', 1.0)) if signal else existing_pending.get('symbolExecMemorySizeMult', 1.0), 1.0)
+        existing_pending['symbolExecMemoryLevCap'] = int(signal.get('symbolExecMemoryLevCap', existing_pending.get('symbolExecMemoryLevCap', 0)) if signal else existing_pending.get('symbolExecMemoryLevCap', 0))
+        existing_pending['symbolExecMemoryReason'] = signal.get('symbolExecMemoryReason', existing_pending.get('symbolExecMemoryReason', 'none')) if signal else existing_pending.get('symbolExecMemoryReason', 'none')
+        existing_pending['allocatorPriorityScore'] = _coerce_float(signal.get('allocatorPriorityScore', existing_pending.get('allocatorPriorityScore', 0.0)) if signal else existing_pending.get('allocatorPriorityScore', 0.0), 0.0)
+        existing_pending['allocatorRank'] = int(signal.get('allocatorRank', existing_pending.get('allocatorRank', 0)) if signal else existing_pending.get('allocatorRank', 0) or 0)
+        existing_pending['allocatorSizeMult'] = _coerce_float(signal.get('allocatorSizeMult', existing_pending.get('allocatorSizeMult', 1.0)) if signal else existing_pending.get('allocatorSizeMult', 1.0), 1.0)
+        existing_pending['allocatorReason'] = signal.get('allocatorReason', existing_pending.get('allocatorReason', '')) if signal else existing_pending.get('allocatorReason', '')
+        existing_pending['evContextKey'] = signal.get('evContextKey', existing_pending.get('evContextKey', '')) if signal else existing_pending.get('evContextKey', '')
+        existing_pending['evSoftThresholdApplied'] = _coerce_float(signal.get('evSoftThresholdApplied', existing_pending.get('evSoftThresholdApplied', 0.0)) if signal else existing_pending.get('evSoftThresholdApplied', 0.0), 0.0)
+        existing_pending['evHardThresholdApplied'] = _coerce_float(signal.get('evHardThresholdApplied', existing_pending.get('evHardThresholdApplied', 0.0)) if signal else existing_pending.get('evHardThresholdApplied', 0.0), 0.0)
         existing_pending['minConfidenceScoreSnapshot'] = max(
             float(existing_pending.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score),
             float(self.min_confidence_score),
@@ -33122,12 +34564,83 @@ class PaperTradingEngine:
             self.set_execution_feedback(trade_symbol, "BLACKLISTED")
             logger.debug(f"Skipping {trade_symbol} - blacklisted")
             return None
+
+        active_micro_cd = self.get_microstructure_cooldown(trade_symbol)
+        if active_micro_cd:
+            self.set_execution_feedback(trade_symbol, "MICROSTRUCTURE_COOLDOWN")
+            self.pipeline_metrics.setdefault('open_rejected', 0)
+            self.pipeline_metrics.setdefault('open_reject_reasons', {})
+            self.pipeline_metrics.setdefault('microstructure_cooldown_block', 0)
+            self.pipeline_metrics['open_rejected'] += 1
+            self.pipeline_metrics['microstructure_cooldown_block'] += 1
+            self.pipeline_metrics['open_reject_reasons']['MICROSTRUCTURE_COOLDOWN'] = (
+                self.pipeline_metrics['open_reject_reasons'].get('MICROSTRUCTURE_COOLDOWN', 0) + 1
+            )
+            logger.info(
+                f"⏸️ MICROSTRUCTURE_COOLDOWN: {trade_symbol} "
+                f"remaining={active_micro_cd.get('remaining_sec', 0)}s "
+                f"reason={active_micro_cd.get('reason', 'unknown')}"
+            )
+            return None
+
+        def _apply_pending_recycler(block_reason: str) -> bool:
+            if not isinstance(signal, dict) or not self.pending_orders:
+                return False
+            recycle_plan = compute_pending_capital_recycler_plan(
+                signal,
+                self.pending_orders,
+                reason_code=block_reason,
+                now_ms=int(datetime.now().timestamp() * 1000),
+            )
+            if not recycle_plan.get('applied', False):
+                return False
+            recycle_order = next(
+                (
+                    order for order in self.pending_orders
+                    if str(order.get('id', '') or '') == recycle_plan.get('candidate_order_id', '')
+                ),
+                None,
+            )
+            if not recycle_order:
+                return False
+            try:
+                self.pending_orders.remove(recycle_order)
+            except ValueError:
+                return False
+            self.pipeline_metrics.setdefault('pending_recycled', 0)
+            self.pipeline_metrics['pending_recycled'] += 1
+            recycle_symbol = str(recycle_order.get('symbol', '') or '')
+            if recycle_symbol:
+                self.set_execution_feedback(recycle_symbol, f"RECYCLED_{block_reason}")
+            self.record_pending_recycle_event(
+                recycle_order,
+                f"PENDING__RECYCLED_{block_reason}",
+                detail=f"recycled_for_{trade_symbol}",
+                trace={
+                    'new_symbol': trade_symbol,
+                    'new_side': side,
+                    'priority_gap': recycle_plan.get('priority_gap', 0.0),
+                    'replace_score': recycle_plan.get('replace_score', 0.0),
+                    'same_side': recycle_plan.get('same_side', False),
+                    'same_cluster': recycle_plan.get('same_cluster', False),
+                },
+            )
+            logger.info(
+                f"♻️ PENDING_RECYCLE: {trade_symbol} {side} "
+                f"replaced {recycle_plan.get('candidate_symbol', '?')} {recycle_plan.get('candidate_side', '?')} "
+                f"reason={block_reason} gap={recycle_plan.get('priority_gap', 0.0):.1f} "
+                f"age={recycle_plan.get('candidate_age_sec', 0.0):.0f}s"
+            )
+            return True
         
         # Check position + pending order limits (pending down-weighted to avoid deadlock).
         pending_weight = 0.35
         pos_count = len(self.positions)
         pending_count = len(self.pending_orders)
         effective_exposure = pos_count + int(pending_count * pending_weight)
+        if effective_exposure >= self.max_positions and _apply_pending_recycler('MAX_EXPOSURE'):
+            pending_count = len(self.pending_orders)
+            effective_exposure = pos_count + int(pending_count * pending_weight)
         if effective_exposure >= self.max_positions:
             self.set_execution_feedback(trade_symbol, "MAX_EXPOSURE")
             logger.info(
@@ -33145,6 +34658,9 @@ class PaperTradingEngine:
         long_count = long_pos_count + int(long_pending_count * pending_weight)
         short_count = short_pos_count + int(short_pending_count * pending_weight)
         max_same_direction = max(3, self.max_positions * 70 // 100)
+        if side == 'LONG' and long_count >= max_same_direction and _apply_pending_recycler('DIRECTION_LIMIT_LONG'):
+            long_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
+            long_count = long_pos_count + int(long_pending_count * pending_weight)
         if side == 'LONG' and long_count >= max_same_direction:
             self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_LONG")
             logger.info(
@@ -33152,6 +34668,9 @@ class PaperTradingEngine:
                 f"| positions={long_pos_count}, pending={long_pending_count}, pending_w={pending_weight:.2f}"
             )
             return None
+        if side == 'SHORT' and short_count >= max_same_direction and _apply_pending_recycler('DIRECTION_LIMIT_SHORT'):
+            short_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
+            short_count = short_pos_count + int(short_pending_count * pending_weight)
         if side == 'SHORT' and short_count >= max_same_direction:
             self.set_execution_feedback(trade_symbol, "DIRECTION_LIMIT_SHORT")
             logger.info(
@@ -33172,6 +34691,15 @@ class PaperTradingEngine:
             for p in self.pending_orders if p.get('side') == side
         )
         max_dir_exposure = self.balance * _DIRECTION_EXPOSURE_PCT
+        if same_dir_margin >= max_dir_exposure and _apply_pending_recycler('DIRECTION_EXPOSURE'):
+            same_dir_margin = sum(
+                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+                for p in self.positions if p.get('side') == side
+            )
+            same_dir_margin += pending_weight * sum(
+                p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
+                for p in self.pending_orders if p.get('side') == side
+            )
         if same_dir_margin >= max_dir_exposure:
             self.set_execution_feedback(trade_symbol, "DIRECTION_EXPOSURE")
             logger.info(f"🚫 DIRECTION EXPOSURE: {side} margin ${same_dir_margin:.2f} >= ${max_dir_exposure:.2f} ({_DIRECTION_EXPOSURE_PCT*100:.0f}% of ${self.balance:.2f})")
@@ -33354,6 +34882,96 @@ class PaperTradingEngine:
             logger.info(f"LEV_PIPE_V2_SHADOW: {trade_symbol} old={adjusted_leverage} v2={_v2_lev['leverage']} factors={_v2_lev['factors']} cap={_v2_lev['cap_reason']}")
         except Exception as _lev_shadow_err:
             logger.debug(f"LEV_SHADOW error: {_lev_shadow_err}")
+
+        if signal is not None:
+            try:
+                _sym_pattern_pen = 0
+                _sym_tracker_pen = 0
+                if 'trade_pattern_analyzer' in globals() and trade_pattern_analyzer:
+                    _sym_pattern_pen = int(trade_pattern_analyzer.get_coin_penalty(trade_symbol) or 0)
+                if 'coin_performance_tracker' in globals() and coin_performance_tracker:
+                    _sym_tracker_pen = int(coin_performance_tracker.get_coin_penalty(trade_symbol) or 0)
+                _sym_exec_mem = compute_symbol_execution_memory_adjustment(
+                    symbol=trade_symbol,
+                    trades=self.trades,
+                    trade_pattern_penalty=_sym_pattern_pen,
+                    tracker_penalty=_sym_tracker_pen,
+                )
+                signal['symbolExecMemoryApplied'] = _sym_exec_mem['applied']
+                signal['symbolExecMemoryTrades'] = _sym_exec_mem['trade_count']
+                signal['symbolExecMemoryWinRate'] = _sym_exec_mem['win_rate']
+                signal['symbolExecMemoryAvgPnl'] = _sym_exec_mem['avg_pnl']
+                signal['symbolExecMemoryEntrySlipP90'] = _sym_exec_mem['entry_slippage_p90']
+                signal['symbolExecMemoryAvgSpread'] = _sym_exec_mem['avg_entry_spread']
+                signal['symbolExecMemorySizeMult'] = _sym_exec_mem['size_mult']
+                signal['symbolExecMemoryLevCap'] = _sym_exec_mem['leverage_cap']
+                signal['symbolExecMemoryReason'] = _sym_exec_mem['reason']
+                _sym_micro_cd = compute_symbol_microstructure_cooldown_plan(
+                    _sym_exec_mem,
+                    signal_score=signal.get('confidenceScore', 0.0),
+                    entry_exec_score=signal.get('entryExecScore', 0.0),
+                )
+                signal['symbolMicroCooldownTriggered'] = _sym_micro_cd['triggered']
+                signal['symbolMicroCooldownSec'] = _sym_micro_cd['cooldown_sec']
+                signal['symbolMicroCooldownReason'] = _sym_micro_cd['reason']
+                signal['symbolMicroCooldownSeverity'] = _sym_micro_cd['severity']
+                if _sym_micro_cd.get('override_high_quality', False):
+                    logger.info(
+                        f"🫧 MICROSTRUCTURE_OVERRIDE: {trade_symbol} "
+                        f"severity={_sym_micro_cd['severity']} score={signal.get('confidenceScore', 0):.0f} "
+                        f"exec={signal.get('entryExecScore', 0.0):.3f}"
+                    )
+                elif _sym_micro_cd['triggered']:
+                    cooldown = self.set_microstructure_cooldown(
+                        trade_symbol,
+                        _sym_micro_cd['cooldown_sec'],
+                        _sym_micro_cd['reason'],
+                        severity=_sym_micro_cd['severity'],
+                        detail={
+                            'trade_count': _sym_micro_cd['trade_count'],
+                            'entry_slippage_p90': _sym_micro_cd['entry_slippage_p90'],
+                            'avg_entry_spread': _sym_micro_cd['avg_entry_spread'],
+                            'win_rate': _sym_micro_cd['win_rate'],
+                            'avg_pnl': _sym_micro_cd['avg_pnl'],
+                        },
+                    )
+                    self.set_execution_feedback(trade_symbol, "MICROSTRUCTURE_COOLDOWN")
+                    self.pipeline_metrics.setdefault('open_rejected', 0)
+                    self.pipeline_metrics.setdefault('open_reject_reasons', {})
+                    self.pipeline_metrics.setdefault('microstructure_cooldown_block', 0)
+                    self.pipeline_metrics['open_rejected'] += 1
+                    self.pipeline_metrics['microstructure_cooldown_block'] += 1
+                    self.pipeline_metrics['open_reject_reasons']['MICROSTRUCTURE_COOLDOWN'] = (
+                        self.pipeline_metrics['open_reject_reasons'].get('MICROSTRUCTURE_COOLDOWN', 0) + 1
+                    )
+                    logger.info(
+                        f"⏸️ MICROSTRUCTURE_PAUSE: {trade_symbol} "
+                        f"cooldown={cooldown.get('cooldown_sec', 0) if cooldown else 0}s "
+                        f"severity={_sym_micro_cd['severity']} "
+                        f"slip_p90={_sym_micro_cd['entry_slippage_p90']:.2f}% "
+                        f"spread={_sym_micro_cd['avg_entry_spread']:.2f}% "
+                        f"reason={_sym_micro_cd['reason']}"
+                    )
+                    return None
+                if _sym_exec_mem['applied']:
+                    _old_signal_mult = _coerce_float(signal.get('sizeMultiplier', 1.0), 1.0)
+                    signal['sizeMultiplier'] = round(_old_signal_mult * _sym_exec_mem['size_mult'], 6)
+                    _sym_old_lev = adjusted_leverage
+                    if _sym_exec_mem['leverage_cap'] > 0:
+                        adjusted_leverage = min(adjusted_leverage, int(_sym_exec_mem['leverage_cap']))
+                    if adjusted_leverage < _sym_old_lev:
+                        signal['leverageCapApplied'] = True
+                        signal['leverageCapValue'] = adjusted_leverage
+                        signal['leverageCapReason'] = 'SYMBOL_EXEC_MEMORY'
+                    logger.info(
+                        f"🧠 SYMBOL_EXEC_MEMORY: {trade_symbol} size×{_sym_exec_mem['size_mult']:.2f} "
+                        f"lev={_sym_old_lev}x→{adjusted_leverage}x trades={_sym_exec_mem['trade_count']} "
+                        f"wr={_sym_exec_mem['win_rate']:.1f}% slip_p90={_sym_exec_mem['entry_slippage_p90']:.2f}% "
+                        f"reason={_sym_exec_mem['reason']}"
+                    )
+                signal['signalLeverageEffective'] = adjusted_leverage
+            except Exception as _sym_exec_err:
+                logger.debug(f"Symbol execution memory error: {_sym_exec_err}")
         
         # ================================================================
         # ASL-1: Adaptive Leverage + Adaptive Size (Quality-Driven)
@@ -33684,7 +35302,32 @@ class PaperTradingEngine:
             logger.info(f"SIZE_PIPE_V2_SHADOW: {trade_symbol} old=${position_size_usd:.2f} v2=${_v2_size['size_usd']:.2f} risk_score={_v2_size['risk_score']} target_pct={_v2_size['target_pct']} caps={_v2_size['cap_reasons']}")
         except Exception as _size_shadow_err:
             logger.debug(f"SIZE_SHADOW error: {_size_shadow_err}")
-        
+
+        _exec_cost_size = compute_execution_cost_size_adjustment(
+            planned_notional_usd=position_size_usd,
+            leverage=adjusted_leverage,
+            spread_pct=spread_pct,
+            depth_usd=_coerce_float(signal.get('tradeabilityDepthUsd', 0.0) if signal else 0.0, 0.0),
+            tradeability_score=_coerce_float(signal.get('tradeabilityScore', 0.0) if signal else 0.0, 0.0),
+            entry_exec_score=_coerce_float(signal.get('entryExecScore', 0.0) if signal else 0.0, 0.0),
+        )
+        if _exec_cost_size['applied']:
+            _pre_exec_cost_size = position_size_usd
+            position_size_usd = _exec_cost_size['adjusted_notional_usd']
+            _margin_usd = max(_margin_info['floor'], min(_margin_info['cap'], position_size_usd / max(adjusted_leverage, 1)))
+            position_size_usd = _margin_usd * adjusted_leverage
+            reasons.append(f"EXEC_COST_SIZE({_pre_exec_cost_size:.0f}→{position_size_usd:.0f})")
+            logger.info(
+                f"EXEC_COST_SIZE_APPLIED: {trade_symbol} ${_pre_exec_cost_size:.2f}->${position_size_usd:.2f} "
+                f"mult={_exec_cost_size['size_mult']:.3f} slip={_exec_cost_size['estimated_slippage_bps']:.2f}bps "
+                f"depth_cover={_exec_cost_size['depth_cover']:.2f} reason={_exec_cost_size['reason']}"
+            )
+        if signal is not None:
+            signal['entryCostSizeMult'] = _exec_cost_size['size_mult']
+            signal['entryCostEstSlippageBps'] = _exec_cost_size['estimated_slippage_bps']
+            signal['entryDepthCover'] = _exec_cost_size['depth_cover']
+            signal['entryCostReason'] = _exec_cost_size['reason']
+
         # OVP-1: Hoist _pending_id for canary decision (before min-notional)
         _pending_id = f"PO_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}_{side}_{trade_symbol}"
         _is_canary = canary_mode.should_use_canary(_pending_id, symbol=trade_symbol)
@@ -34044,6 +35687,10 @@ class PaperTradingEngine:
             "marginUsd": _margin_usd,  # P0-2: explicit margin field
             "stopLoss": sl,
             "takeProfit": tp,
+            "structuralTpAdjusted": signal.get('structuralTpAdjusted', False) if signal else False,
+            "structuralTpSource": signal.get('structuralTpSource', '') if signal else '',
+            "structuralTpLevel": signal.get('structuralTpLevel', 0.0) if signal else 0.0,
+            "structural_sr_levels": signal.get('structural_sr_levels', {}) if signal else {},
             "trailActivation": trail_activation,
             "trailDistance": trail_distance,
             "leverage": adjusted_leverage,
@@ -34095,6 +35742,22 @@ class PaperTradingEngine:
                 signal.get('tradeabilityDepthUsd', signal.get('depth_usd', signal.get('depthUsd', 0.0))) if signal else 0.0,
                 0.0,
             ),
+            "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
+            "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
+            "entryDepthCover": _coerce_float(signal.get('entryDepthCover', 0.0) if signal else 0.0, 0.0),
+            "entryCostReason": signal.get('entryCostReason', 'none') if signal else 'none',
+            "symbolExecMemoryApplied": bool(signal.get('symbolExecMemoryApplied', False)) if signal else False,
+            "symbolExecMemorySizeMult": _coerce_float(signal.get('symbolExecMemorySizeMult', 1.0) if signal else 1.0, 1.0),
+            "symbolExecMemoryLevCap": int(signal.get('symbolExecMemoryLevCap', 0) if signal else 0),
+            "symbolExecMemoryReason": signal.get('symbolExecMemoryReason', 'none') if signal else 'none',
+            "symbolExecMemoryEntrySlipP90": _coerce_float(signal.get('symbolExecMemoryEntrySlipP90', 0.0) if signal else 0.0, 0.0),
+            "allocatorPriorityScore": _coerce_float(signal.get('allocatorPriorityScore', 0.0) if signal else 0.0, 0.0),
+            "allocatorRank": int(signal.get('allocatorRank', 0) if signal else 0),
+            "allocatorSizeMult": _coerce_float(signal.get('allocatorSizeMult', 1.0) if signal else 1.0, 1.0),
+            "allocatorReason": signal.get('allocatorReason', '') if signal else '',
+            "evContextKey": signal.get('evContextKey', '') if signal else '',
+            "evSoftThresholdApplied": _coerce_float(signal.get('evSoftThresholdApplied', 0.0) if signal else 0.0, 0.0),
+            "evHardThresholdApplied": _coerce_float(signal.get('evHardThresholdApplied', 0.0) if signal else 0.0, 0.0),
             "entryImbalance": _coerce_float(signal.get('imbalance', 0.0) if signal else 0.0, 0.0),
             "configuredSlAtr": round(configured_sl_atr, 4),
             "configuredTpAtr": round(configured_tp_atr, 4),
@@ -34115,6 +35778,14 @@ class PaperTradingEngine:
                 "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
                 "entryExecScoreMin": float(getattr(live_binance_trader, 'exec_entry_score_min', 0.0) or 0.0),
                 "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+                "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
+                "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
+                "entryDepthCover": _coerce_float(signal.get('entryDepthCover', 0.0) if signal else 0.0, 0.0),
+                "symbolExecMemoryApplied": bool(signal.get('symbolExecMemoryApplied', False)) if signal else False,
+                "symbolExecMemorySizeMult": _coerce_float(signal.get('symbolExecMemorySizeMult', 1.0) if signal else 1.0, 1.0),
+                "symbolExecMemoryLevCap": int(signal.get('symbolExecMemoryLevCap', 0) if signal else 0),
+                "symbolExecMemoryReason": signal.get('symbolExecMemoryReason', 'none') if signal else 'none',
+                "symbolExecMemoryEntrySlipP90": _coerce_float(signal.get('symbolExecMemoryEntrySlipP90', 0.0) if signal else 0.0, 0.0),
             },
             "risk_snapshot": {
                 "stopLoss": sl,
@@ -34123,6 +35794,8 @@ class PaperTradingEngine:
                 "trailDistance": trail_distance,
                 "leverage": adjusted_leverage,
                 "sizeUsd": position_size_usd,
+                "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
+                "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
                 "entryStopRoiPct": round(compute_target_roi_pct(entry_price, sl, side, adjusted_leverage), 2),
                 "entryStopGateMode": "normal",
             },
@@ -35596,6 +37269,10 @@ class PaperTradingEngine:
             "contracts": order['size'],  # Phase 223b: needed for partial TP
             "stopLoss": sl,
             "takeProfit": tp,
+            "structuralTpAdjusted": order.get('structuralTpAdjusted', False),
+            "structuralTpSource": order.get('structuralTpSource', ''),
+            "structuralTpLevel": order.get('structuralTpLevel', 0.0),
+            "structural_sr_levels": order.get('structural_sr_levels', {}),
             "trailingStop": sl,
             "trailActivation": trail_activation,
             "trailDistance": trail_distance,
@@ -35637,6 +37314,22 @@ class PaperTradingEngine:
             "entrySpreadLevel": order.get('entrySpreadLevel', order.get('spreadLevel', 'Normal')),
             "entryAtrPct": order.get('entryAtrPct', 0.0),
             "entryDepthUsd": order.get('entryDepthUsd', 0.0),
+            "entryCostSizeMult": order.get('entryCostSizeMult', 1.0),
+            "entryCostEstSlippageBps": order.get('entryCostEstSlippageBps', 0.0),
+            "entryDepthCover": order.get('entryDepthCover', 0.0),
+            "entryCostReason": order.get('entryCostReason', 'none'),
+            "symbolExecMemoryApplied": bool(order.get('symbolExecMemoryApplied', False)),
+            "symbolExecMemorySizeMult": order.get('symbolExecMemorySizeMult', 1.0),
+            "symbolExecMemoryLevCap": order.get('symbolExecMemoryLevCap', 0),
+            "symbolExecMemoryReason": order.get('symbolExecMemoryReason', 'none'),
+            "symbolExecMemoryEntrySlipP90": order.get('symbolExecMemoryEntrySlipP90', 0.0),
+            "allocatorPriorityScore": order.get('allocatorPriorityScore', 0.0),
+            "allocatorRank": order.get('allocatorRank', 0),
+            "allocatorSizeMult": order.get('allocatorSizeMult', 1.0),
+            "allocatorReason": order.get('allocatorReason', ''),
+            "evContextKey": order.get('evContextKey', ''),
+            "evSoftThresholdApplied": order.get('evSoftThresholdApplied', 0.0),
+            "evHardThresholdApplied": order.get('evHardThresholdApplied', 0.0),
             "entryImbalance": order.get('entryImbalance', 0.0),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
@@ -35814,6 +37507,8 @@ class PaperTradingEngine:
                         exec_score=order.get('entryExecScore', 70.0),
                         spread_level=order.get('spreadLevel', 'Normal'),
                         tp_tighten_mult=_runner_tp_tighten,
+                        structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
+                        structural_target_source=order.get('structuralTpSource', ''),
                     )
                     if _force_v3_four_tier:
                         _tp_ladder['levels'] = apply_runner_tp_close_split(_tp_ladder.get('levels', []), _runner_split)
@@ -35852,6 +37547,8 @@ class PaperTradingEngine:
                             spread_level=order.get('spreadLevel', 'Normal'),
                             tp_tighten=_runner_tp_tighten,
                             close_split=_runner_split,
+                            structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
+                            structural_target_source=order.get('structuralTpSource', ''),
                         )
                     else:
                         _tp_ladder = compute_adaptive_tp_ladder(
@@ -35866,6 +37563,8 @@ class PaperTradingEngine:
                             coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
                             exec_score=order.get('entryExecScore', 70.0),
                             spread_level=order.get('spreadLevel', 'Normal'),
+                            structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
+                            structural_target_source=order.get('structuralTpSource', ''),
                         )
                     new_position['tp_ladder_levels'] = _tp_ladder['levels']
                     new_position['tp_ladder_version'] = _tp_ladder['version']
@@ -36500,9 +38199,22 @@ class PaperTradingEngine:
         
         # exit_tightness ile ölçeklendir: yüksek = daha uzun tutma süresi
         et = self.get_effective_exit_tightness(pos)
-        adjusted_max_age = self.max_position_age_hours * et
-        adjusted_hard_limit = 48 * et
-        bounce_mult = 0.3 * et  # Bounce threshold: yüksek = daha geniş
+        _live_struct_regime = None
+        _live_fast_regime = None
+        try:
+            _live_struct_regime = market_regime_detector.struct_regime
+            _live_fast_regime = market_regime_detector.fast_regime
+        except Exception:
+            pass
+        time_budget = resolve_position_time_budget_profile(
+            pos,
+            current_struct_regime=_live_struct_regime,
+            current_fast_regime=_live_fast_regime,
+        )
+        pos['timeBudgetProfile'] = time_budget
+        adjusted_max_age = self.max_position_age_hours * et * float(time_budget.get('age_mult', 1.0) or 1.0)
+        adjusted_hard_limit = 48 * et * float(time_budget.get('hard_limit_mult', 1.0) or 1.0)
+        bounce_mult = 0.3 * et * float(time_budget.get('bounce_mult', 1.0) or 1.0)
         
         # After adjusted max age, start gradual liquidation
         if age_hours > adjusted_max_age:
@@ -36510,7 +38222,11 @@ class PaperTradingEngine:
             if not pos.get('gradual_exit_mode', False):
                 pos['gradual_exit_mode'] = True
                 pos['gradual_exit_start'] = current_price
-                self.add_log(f"⏰ ZAMAN AŞIMI: {age_hours:.1f}h > {adjusted_max_age:.1f}h (x{et:.1f}) - Aşamalı tasfiye")
+                self.add_log(
+                    f"⏰ ZAMAN AŞIMI: {age_hours:.1f}h > {adjusted_max_age:.1f}h "
+                    f"(x{et:.1f}, {time_budget.get('regime_bucket','BASE')} {time_budget.get('reason','BASE')}) "
+                    f"- Aşamalı tasfiye"
+                )
             
             # For LONG: Close on bounces (price goes up then comes back)
             if pos['side'] == 'LONG':
@@ -36819,11 +38535,15 @@ class PaperTradingEngine:
                     # Phase 224B: Load EV signal filter state
                     if EV_STATS_RESET_ON_BOOT:
                         self.score_band_stats = {}
+                        self.score_band_stats_by_context = {}
                     else:
                         loaded_stats = data.get('score_band_stats', {})
                         self.score_band_stats = loaded_stats if isinstance(loaded_stats, dict) else {}
+                        loaded_ctx_stats = data.get('score_band_stats_by_context', {})
+                        self.score_band_stats_by_context = loaded_ctx_stats if isinstance(loaded_ctx_stats, dict) else {}
                     self.last_signal_per_coin = data.get('last_signal_per_coin', {})
                     self.signal_memory = data.get('signal_memory', {})
+                    self.microstructure_cooldowns = data.get('microstructure_cooldowns', {})
                     # Pipeline metrics persistence
                     saved_metrics = data.get('pipeline_metrics', {})
                     if saved_metrics:
@@ -36883,8 +38603,10 @@ class PaperTradingEngine:
                 "logs": self.logs[-100:],
                 # Phase 224B: EV signal filter state
                 "score_band_stats": self.score_band_stats,
+                "score_band_stats_by_context": self.score_band_stats_by_context,
                 "last_signal_per_coin": self.last_signal_per_coin,
                 "signal_memory": self.signal_memory,
+                "microstructure_cooldowns": self.microstructure_cooldowns,
                 "pipeline_metrics": self.pipeline_metrics,
             }
             with open(self.state_file, 'w') as f:
@@ -36917,6 +38639,8 @@ class PaperTradingEngine:
         # Clear pending orders
         self.pending_orders = []
         self.signal_memory = {}
+        self.microstructure_cooldowns = {}
+        self.score_band_stats_by_context = {}
         # Reset pipeline metrics
         for key in self.pipeline_metrics:
             self.pipeline_metrics[key] = 0
@@ -37235,7 +38959,33 @@ class PaperTradingEngine:
             logger.info(f"SIZE_PIPE_V2_SHADOW: {signal.get('symbol','')} old=${position_size_usd:.2f} v2=${_mv2_size['size_usd']:.2f} risk_score={_mv2_size['risk_score']} path=manual")
         except Exception:
             pass
-        
+
+        _manual_exec_cost_size = compute_execution_cost_size_adjustment(
+            planned_notional_usd=position_size_usd,
+            leverage=adjusted_leverage,
+            spread_pct=float(signal.get('spreadPct', 0.05) or 0.05),
+            depth_usd=_coerce_float(signal.get('tradeabilityDepthUsd', 0.0), 0.0),
+            tradeability_score=_coerce_float(signal.get('tradeabilityScore', 0.0), 0.0),
+            entry_exec_score=_coerce_float(signal.get('entryExecScore', 0.0), 0.0),
+        )
+        if _manual_exec_cost_size['applied']:
+            _manual_old_size = position_size_usd
+            position_size_usd = _manual_exec_cost_size['adjusted_notional_usd']
+            _manual_margin_usd = max(_manual_margin_info['floor'], min(_manual_margin_info['cap'], position_size_usd / max(adjusted_leverage, 1)))
+            position_size_usd = _manual_margin_usd * adjusted_leverage
+            position_size = position_size_usd / current_price if current_price > 0 else position_size
+            logger.info(
+                f"EXEC_COST_SIZE_APPLIED: {signal.get('symbol','')} ${_manual_old_size:.2f}->${position_size_usd:.2f} "
+                f"mult={_manual_exec_cost_size['size_mult']:.3f} "
+                f"slip={_manual_exec_cost_size['estimated_slippage_bps']:.2f}bps "
+                f"depth_cover={_manual_exec_cost_size['depth_cover']:.2f} path=manual "
+                f"reason={_manual_exec_cost_size['reason']}"
+            )
+        signal['entryCostSizeMult'] = _manual_exec_cost_size['size_mult']
+        signal['entryCostEstSlippageBps'] = _manual_exec_cost_size['estimated_slippage_bps']
+        signal['entryDepthCover'] = _manual_exec_cost_size['depth_cover']
+        signal['entryCostReason'] = _manual_exec_cost_size['reason']
+
         # P1: Min-notional conflict parity (same as WS path)
         _fee_rate_rt_m = 0.0008  # 0.08% round-trip
         _expected_edge_pct_m = max(0.005, (_m_vol_pct2 * 0.3) if _m_vol_pct2 > 0 else 0.01)
@@ -37300,6 +39050,9 @@ class PaperTradingEngine:
             "contracts": position_size,  # Phase 223b: needed for partial TP
             "stopLoss": signal['sl'],
             "takeProfit": signal['tp'],
+            "structuralTpAdjusted": signal.get('structuralTpAdjusted', False),
+            "structuralTpSource": signal.get('structuralTpSource', ''),
+            "structuralTpLevel": signal.get('structuralTpLevel', 0.0),
             "trailingStop": signal['sl'],
             "trailActivation": signal['trailActivation'],
             "trailDistance": signal['trailDistance'],
@@ -37339,6 +39092,10 @@ class PaperTradingEngine:
             "signalLeverageEffective": adjusted_leverage,
             "leverageCapApplied": signal.get('leverageCapApplied', False),
             "leverageCapReason": signal.get('leverageCapReason', ''),
+            "entryCostSizeMult": signal.get('entryCostSizeMult', 1.0),
+            "entryCostEstSlippageBps": signal.get('entryCostEstSlippageBps', 0.0),
+            "entryDepthCover": signal.get('entryDepthCover', 0.0),
+            "entryCostReason": signal.get('entryCostReason', 'none'),
             # RFX-1D: Truth snapshot + regime adjustment propagation
             "truth_snapshot": signal.get('truth_snapshot', {}),
             "regime_adjustment": signal.get('regime_adjustment', ''),
@@ -38270,7 +40027,22 @@ class PaperTradingEngine:
         # Phase 224B: Update score band statistics for EV calculation
         signal_score = pos.get('signalScore', 0)
         if signal_score > 0:
-            self.update_score_band_stats(signal_score, pnl)
+            pos_truth_snapshot = pos.get('truth_snapshot', {})
+            pos_truth_snapshot = pos_truth_snapshot if isinstance(pos_truth_snapshot, dict) else {}
+            pos_settings_snapshot = pos.get('settingsSnapshot', {})
+            pos_settings_snapshot = pos_settings_snapshot if isinstance(pos_settings_snapshot, dict) else {}
+            self.update_score_band_stats(
+                signal_score,
+                pnl,
+                strategy_mode=pos.get('strategyMode', STRATEGY_MODE_LEGACY),
+                market_regime=(
+                    pos_truth_snapshot.get('struct_regime')
+                    or pos_truth_snapshot.get('fast_regime')
+                    or pos_settings_snapshot.get('market_regime')
+                    or 'UNKNOWN'
+                ),
+                trend_mode=bool(pos.get('trend_mode', False)),
+            )
         
         # Phase 224C: Record exit in ExitArbitrator
         try:
