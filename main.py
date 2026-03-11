@@ -160,6 +160,8 @@ def _canonical_reason_core(reason: str, original_reason: str = "") -> str:
         return "TRAIL_TIGHT_EXIT"
     if "PROFIT_GIVEBACK_EXIT" in upper:
         return "PROFIT_GIVEBACK_EXIT"
+    if "SIDEWAYS_RECLAIM_CLOSE" in upper:
+        return "SIDEWAYS_RECLAIM_CLOSE"
     if "RECLAIM_BE_CLOSE" in upper:
         return "RECLAIM_BE_CLOSE"
     if "PRE_STOP_REDUCE" in upper:
@@ -9100,6 +9102,7 @@ EXIT_FORECAST_BLOCK_REASONS = {
     'TRAIL_NORMAL_EXIT',
     'TRAIL_TIGHT_EXIT',
     'PROFIT_GIVEBACK_EXIT',
+    'SIDEWAYS_RECLAIM_CLOSE',
     'RECLAIM_BE_CLOSE',
 }
 EXIT_FORECAST_MIN_HOLD_PROB = 0.62
@@ -9935,6 +9938,14 @@ def build_position_profit_ladder(pos: dict, current_price: float = None) -> Dict
     profit_peak_roi_pct = max(previous_peak, current_roi_pct if current_roi_pct > 0 else 0.0)
     profit_giveback_roi_pct = max(0.0, profit_peak_roi_pct - max(current_roi_pct, 0.0))
     profit_giveback_pct = (profit_giveback_roi_pct / profit_peak_roi_pct) if profit_peak_roi_pct > 0 else 0.0
+    continuation_flow = evaluate_v3_continuation_flow_state(
+        pos,
+        current_price if current_price is not None else _coerce_float(pos.get('currentPrice', entry_price), entry_price),
+        current_roi_pct=current_roi_pct,
+        profit_peak_roi_pct=profit_peak_roi_pct,
+        breakeven_floor_roi_pct=breakeven_floor_roi_pct,
+    )
+    continuation_flow_state = continuation_flow.get('state', V3_CONTINUATION_NEUTRAL)
 
     phase = 'WAIT'
     if current_roi_pct > 0:
@@ -9962,8 +9973,12 @@ def build_position_profit_ladder(pos: dict, current_price: float = None) -> Dict
 
     profit_lock_roi_pct = None
     profit_lock_price = 0.0
+    chop_tighten_active = False
     if lock_ratio > 0 and profit_peak_roi_pct > 0 and entry_price > 0:
         raw_lock_roi = max(breakeven_floor_roi_pct, profit_peak_roi_pct * lock_ratio)
+        if continuation_flow_state == V3_CONTINUATION_CHOP:
+            raw_lock_roi = max(raw_lock_roi, profit_peak_roi_pct * 0.35)
+            chop_tighten_active = True
         max_lock_roi = current_roi_pct - max(2.0, trail_distance_roi_pct * 0.40)
         effective_lock_roi = min(raw_lock_roi, max_lock_roi) if current_roi_pct > 0 else raw_lock_roi
         floor_lock_roi = max(breakeven_floor_roi_pct, effective_lock_roi)
@@ -10012,6 +10027,9 @@ def build_position_profit_ladder(pos: dict, current_price: float = None) -> Dict
         'profit_phase': phase,
         'profit_owner': profit_owner,
         'giveback_trail_ready': giveback_trail_ready,
+        'continuation_flow_state': continuation_flow_state,
+        'continuation_flow': continuation_flow,
+        'chop_tighten_active': chop_tighten_active,
         'tp_levels': tp_levels,
     }
 
@@ -10230,8 +10248,50 @@ def update_runtime_protection_telemetry(
     pos['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
     pos['runtimeTpLevels'] = profit_ladder['tp_levels']
     pos['runtimeGivebackTrailReady'] = profit_ladder['giveback_trail_ready']
+    flow_state = str(profit_ladder.get('continuation_flow_state', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
+    flow_ctx = profit_ladder.get('continuation_flow', {}) if isinstance(profit_ladder.get('continuation_flow'), dict) else {}
+    pos['continuationFlowState'] = flow_state
+    pos['runtimeContinuationFlowState'] = flow_state
+    pos['runtimeCurrentVolumeRatio'] = _coerce_float(flow_ctx.get('current_volume_ratio', pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))), _coerce_float(pos.get('volumeRatio', 1.0), 1.0))
+    pos['runtimeCurrentObImbalanceTrend'] = _coerce_float(flow_ctx.get('current_ob_imbalance_trend', pos.get('currentObImbalanceTrend', pos.get('obImbalanceTrend', 0.0))), _coerce_float(pos.get('obImbalanceTrend', 0.0), 0.0))
+    pos['runtimeCurrentImbalance'] = _coerce_float(flow_ctx.get('current_imbalance', pos.get('currentImbalance', pos.get('entryImbalance', 0.0))), _coerce_float(pos.get('entryImbalance', 0.0), 0.0))
+    pos['runtimeCurrentExecScore'] = _coerce_float(flow_ctx.get('current_exec_score', pos.get('currentExecScore', pos.get('entryExecScoreSnapshot', 0.0))), _coerce_float(pos.get('entryExecScoreSnapshot', 0.0), 0.0))
+    pos['chopTightenActive'] = bool(profit_ladder.get('chop_tighten_active', False))
+    now_ts = time.time()
+    if flow_state == V3_CONTINUATION_SUPPORTING:
+        pos['lastSupportiveFlowTs'] = now_ts
+        pos['chopSinceTs'] = 0
+    elif flow_state == V3_CONTINUATION_CHOP:
+        pos['chopSinceTs'] = pos.get('chopSinceTs') or now_ts
+    else:
+        if flow_state != V3_CONTINUATION_CHOP:
+            pos['chopSinceTs'] = 0
+    underwater_ctx = evaluate_v3_underwater_tape_state(
+        pos,
+        current_price,
+        current_roi_pct=ladder['current_roi_pct'],
+        signal_invalidation_state=ladder.get('signal_invalidation_state', {}),
+    )
+    apply_v3_underwater_tape_telemetry(pos, underwater_ctx)
+    pos['sidewaysReclaimArmed'] = bool(
+        evaluate_v3_sideways_reclaim_signal(
+            pos,
+            current_price,
+            current_roi_pct=ladder['current_roi_pct'],
+            underwater_ctx=underwater_ctx,
+        ).get('armed', False)
+    )
     merged = dict(ladder)
     merged.update(profit_ladder)
+    merged.update({
+        'underwater_tape_state': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
+        'underwater_price_loss_pct': pos.get('underwaterPriceLossPct', 0.0),
+        'underwater_atr_dist': pos.get('underwaterAtrDist', 0.0),
+        'small_loss_band_pct': pos.get('smallLossBandPct', 1.0),
+        'sideways_reclaim_armed': bool(pos.get('sidewaysReclaimArmed', False)),
+        'loss_gate_suppressed_reason': pos.get('lossGateSuppressedReason', ''),
+        'adverse_strong_since_ts': _coerce_float(pos.get('adverseStrongSinceTs', 0.0), 0.0),
+    })
     return merged
 
 
@@ -14018,6 +14078,18 @@ LEGACY_EXIT_OWNER = "LEGACY"
 V3_RUNNER_CONTEXT_TREND = "trend_aligned"
 V3_RUNNER_CONTEXT_COUNTER = "countertrend"
 V3_RUNNER_CONTEXT_RECOVERY = "recovery"
+V3_RUNNER_CONTEXT_INTRADAY = "intraday_continuation"
+V3_CONTINUATION_SUPPORTING = "SUPPORTING"
+V3_CONTINUATION_FADING = "FADING"
+V3_CONTINUATION_CHOP = "CHOP"
+V3_CONTINUATION_NEUTRAL = "NEUTRAL"
+V3_UNDERWATER_ADVERSE_STRONG = "ADVERSE_STRONG"
+V3_UNDERWATER_ADVERSE_WEAK = "ADVERSE_WEAK"
+V3_UNDERWATER_SIDEWAYS = "SIDEWAYS"
+V3_UNDERWATER_RECOVERING = "RECOVERING"
+V3_UNDERWATER_NEUTRAL = "NEUTRAL"
+ENTRY_ARCHETYPE_CONTINUATION = "continuation"
+ENTRY_ARCHETYPE_RECLAIM = "reclaim"
 V3_RUNNER_CONTEXT_CONFIGS = {
     V3_RUNNER_CONTEXT_TREND: {
         "trail_act_mult": 1.55,
@@ -14049,6 +14121,16 @@ V3_RUNNER_CONTEXT_CONFIGS = {
         "trail_arm_atr_req": 0.25,
         "be_after_trail_atr_req": 0.15,
     },
+    V3_RUNNER_CONTEXT_INTRADAY: {
+        "trail_act_mult": 1.65,
+        "trail_dist_mult": 1.95,
+        "tp_tighten": 1.00,
+        "be_buffer_mult": 0.85,
+        "tp_close_split": (0.10, 0.15, 0.25, 0.50),
+        "trail_arm_delay_sec": 75,
+        "trail_arm_atr_req": 0.45,
+        "be_after_trail_atr_req": 0.00,
+    },
 }
 
 
@@ -14058,6 +14140,76 @@ def _is_bullish_daily_trend(trend: str) -> bool:
 
 def _is_bearish_daily_trend(trend: str) -> bool:
     return str(trend or '').upper() in ('BEARISH', 'STRONG_BEARISH')
+
+
+def _is_side_ob_trend_aligned(side: str, ob_trend: float, threshold: float = 2.0) -> bool:
+    safe_side = str(side or '').upper()
+    safe_ob_trend = float(ob_trend or 0.0)
+    if safe_side == 'LONG':
+        return safe_ob_trend >= float(threshold or 0.0)
+    if safe_side == 'SHORT':
+        return safe_ob_trend <= -float(threshold or 0.0)
+    return False
+
+
+def _is_side_imbalance_hostile(side: str, imbalance: float, threshold: float = 8.0) -> bool:
+    safe_side = str(side or '').upper()
+    safe_imbalance = float(imbalance or 0.0)
+    if safe_side == 'LONG':
+        return safe_imbalance <= -abs(float(threshold or 0.0))
+    if safe_side == 'SHORT':
+        return safe_imbalance >= abs(float(threshold or 0.0))
+    return False
+
+
+def _is_side_ob_trend_adverse(side: str, ob_trend: float, threshold: float = 2.0) -> bool:
+    safe_side = str(side or '').upper()
+    safe_ob_trend = float(ob_trend or 0.0)
+    limit = abs(float(threshold or 0.0))
+    if safe_side == 'LONG':
+        return safe_ob_trend <= -limit
+    if safe_side == 'SHORT':
+        return safe_ob_trend >= limit
+    return False
+
+
+def _compute_unleveraged_price_loss_pct(entry_price: float, current_price: float, side: str) -> float:
+    safe_entry = float(entry_price or 0.0)
+    safe_current = float(current_price or 0.0)
+    if safe_entry <= 0 or safe_current <= 0:
+        return 0.0
+    safe_side = str(side or '').upper()
+    if safe_side == 'LONG':
+        return max(0.0, ((safe_entry - safe_current) / safe_entry) * 100.0)
+    if safe_side == 'SHORT':
+        return max(0.0, ((safe_current - safe_entry) / safe_entry) * 100.0)
+    return 0.0
+
+
+def _breakout_matches_side(breakout: str, side: str) -> bool:
+    safe_breakout = str(breakout or '').upper()
+    safe_side = str(side or '').upper()
+    return (
+        (safe_breakout == 'BREAKOUT_LONG' and safe_side == 'LONG')
+        or (safe_breakout == 'BREAKOUT_SHORT' and safe_side == 'SHORT')
+    )
+
+
+def classify_signal_entry_archetype(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
+    """Split entries into continuation vs reclaim without changing non-runner logic."""
+    data = payload or {}
+    mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    side = str(data.get('side', data.get('action', '')) or '').upper()
+    breakout = str(data.get('breakout', data.get('breakoutSignal', '')) or '').upper()
+    if not side:
+        return ENTRY_ARCHETYPE_RECLAIM
+
+    runner_context = classify_v3_runner_context(data, default_mode=mode) if mode == STRATEGY_MODE_SMART_V3_RUNNER else ''
+    if _breakout_matches_side(breakout, side):
+        return ENTRY_ARCHETYPE_CONTINUATION
+    if runner_context in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY):
+        return ENTRY_ARCHETYPE_CONTINUATION
+    return ENTRY_ARCHETYPE_RECLAIM
 
 
 def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
@@ -14082,6 +14234,17 @@ def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEG
     side = str(data.get('side', data.get('action', '')) or '').upper()
     daily_trend = str(data.get('coinDailyTrend', data.get('coin_daily_trend', 'NEUTRAL')) or 'NEUTRAL').upper()
     is_counter = bool(data.get('counterTrend', data.get('counter_trend', False)))
+    adx = _coerce_float(data.get('adx', 0.0), 0.0)
+    hurst = _coerce_float(data.get('hurst', 0.5), 0.5)
+    volume_ratio = _coerce_float(
+        data.get('currentVolumeRatio', data.get('volumeRatio', data.get('volume_ratio', 1.0))),
+        1.0,
+    )
+    is_volume_spike = bool(data.get('currentIsVolumeSpike', data.get('isVolumeSpike', data.get('is_volume_spike', False))))
+    ob_trend = _coerce_float(
+        data.get('currentObImbalanceTrend', data.get('obImbalanceTrend', data.get('ob_imbalance_trend', 0.0))),
+        0.0,
+    )
     if side == 'LONG':
         aligned = _is_bullish_daily_trend(daily_trend)
         opposed = _is_bearish_daily_trend(daily_trend)
@@ -14094,6 +14257,13 @@ def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEG
 
     if is_counter or opposed:
         return V3_RUNNER_CONTEXT_COUNTER
+    if (
+        adx >= 25.0
+        and hurst >= 0.52
+        and (volume_ratio >= 1.20 or is_volume_spike)
+        and _is_side_ob_trend_aligned(side, ob_trend, threshold=2.0)
+    ):
+        return V3_RUNNER_CONTEXT_INTRADAY
     if aligned:
         return V3_RUNNER_CONTEXT_TREND
     return V3_RUNNER_CONTEXT_COUNTER
@@ -14103,6 +14273,399 @@ def resolve_v3_runner_context_config(payload: dict = None, default_mode: str = S
     """Resolve the context-specific runner config for SMART_V3_RUNNER."""
     context = classify_v3_runner_context(payload, default_mode=default_mode)
     return dict(V3_RUNNER_CONTEXT_CONFIGS.get(context, V3_RUNNER_CONTEXT_CONFIGS[V3_RUNNER_CONTEXT_COUNTER]))
+
+
+def apply_live_flow_context_to_position(pos: dict, opportunity: dict) -> None:
+    """Persist the freshest scanner/WS flow context on an open position."""
+    if not isinstance(pos, dict) or not isinstance(opportunity, dict):
+        return
+
+    pos['currentVolumeRatio'] = _coerce_float(opportunity.get('volumeRatio', pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))), _coerce_float(pos.get('volumeRatio', 1.0), 1.0))
+    pos['currentIsVolumeSpike'] = bool(opportunity.get('isVolumeSpike', pos.get('currentIsVolumeSpike', pos.get('isVolumeSpike', False))))
+    pos['currentImbalance'] = _coerce_float(opportunity.get('imbalance', pos.get('currentImbalance', pos.get('entryImbalance', 0.0))), _coerce_float(pos.get('entryImbalance', 0.0), 0.0))
+    pos['currentObImbalanceTrend'] = _coerce_float(opportunity.get('obImbalanceTrend', pos.get('currentObImbalanceTrend', 0.0)), _coerce_float(pos.get('currentObImbalanceTrend', 0.0), 0.0))
+    pos['currentSpreadPct'] = _coerce_float(opportunity.get('spreadPct', pos.get('currentSpreadPct', pos.get('spreadPct', 0.05))), _coerce_float(pos.get('spreadPct', 0.05), 0.05))
+    pos['currentAtrPct'] = _coerce_float(opportunity.get('atrPct', opportunity.get('volatility_pct', pos.get('currentAtrPct', pos.get('volatility_pct', 0.0)))), _coerce_float(pos.get('volatility_pct', 0.0), 0.0))
+    pos['currentMicrostructureScore'] = _coerce_float(opportunity.get('microstructureScore', pos.get('currentMicrostructureScore', 0.0)), _coerce_float(pos.get('currentMicrostructureScore', 0.0), 0.0))
+    pos['currentFlowToxicityScore'] = _coerce_float(opportunity.get('flowToxicityScore', pos.get('currentFlowToxicityScore', 50.0)), _coerce_float(pos.get('currentFlowToxicityScore', 50.0), 50.0))
+    pos['currentExecScore'] = _coerce_float(
+        opportunity.get('entryExecScore', opportunity.get('execScore', pos.get('currentExecScore', pos.get('entryExecScoreSnapshot', pos.get('entryExecScore', 0.0))))),
+        _coerce_float(pos.get('entryExecScoreSnapshot', pos.get('entryExecScore', 0.0)), 0.0),
+    )
+
+
+def evaluate_v3_continuation_flow_state(
+    pos: dict,
+    current_price: float,
+    *,
+    current_roi_pct: Optional[float] = None,
+    profit_peak_roi_pct: Optional[float] = None,
+    breakeven_floor_roi_pct: Optional[float] = None,
+) -> dict:
+    """Classify the live V3 runner tape into continuation/chop states."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return {
+            'state': V3_CONTINUATION_NEUTRAL,
+            'supportive': False,
+            'fading': False,
+            'chop': False,
+            'current_volume_ratio': _coerce_float(safe_pos.get('volumeRatio', 1.0), 1.0),
+            'current_ob_imbalance_trend': _coerce_float(safe_pos.get('obImbalanceTrend', 0.0), 0.0),
+            'current_imbalance': _coerce_float(safe_pos.get('entryImbalance', 0.0), 0.0),
+            'current_exec_score': _coerce_float(safe_pos.get('entryExecScoreSnapshot', 0.0), 0.0),
+            'giveback_roi_pct': 0.0,
+        }
+
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    current_roi_pct = _coerce_float(
+        current_roi_pct if current_roi_pct is not None else compute_position_roi_pct(safe_pos, current_price=current_price),
+        0.0,
+    )
+    breakeven_floor_roi_pct = _coerce_float(
+        breakeven_floor_roi_pct if breakeven_floor_roi_pct is not None else safe_pos.get('runtimeBreakevenFloorRoiPct', 0.0),
+        0.0,
+    )
+    peak_roi_pct = max(
+        _coerce_float(profit_peak_roi_pct if profit_peak_roi_pct is not None else safe_pos.get('runtimeProfitPeakRoiPct', safe_pos.get('profitPeakRoiPct', 0.0)), 0.0),
+        max(current_roi_pct, 0.0),
+    )
+    giveback_roi_pct = max(0.0, peak_roi_pct - max(current_roi_pct, 0.0))
+    current_volume_ratio = _coerce_float(safe_pos.get('currentVolumeRatio', safe_pos.get('volumeRatio', 1.0)), 1.0)
+    current_is_volume_spike = bool(safe_pos.get('currentIsVolumeSpike', safe_pos.get('isVolumeSpike', False)))
+    current_imbalance = _coerce_float(safe_pos.get('currentImbalance', safe_pos.get('entryImbalance', 0.0)), 0.0)
+    current_ob_trend = _coerce_float(safe_pos.get('currentObImbalanceTrend', safe_pos.get('obImbalanceTrend', 0.0)), 0.0)
+    current_exec_score = _coerce_float(safe_pos.get('currentExecScore', safe_pos.get('entryExecScoreSnapshot', safe_pos.get('entryExecScore', 0.0))), 0.0)
+    age_sec = max(0.0, (time.time() * 1000 - int(safe_pos.get('openTime', 0) or 0)) / 1000.0)
+
+    around_breakeven = current_roi_pct >= min(0.0, breakeven_floor_roi_pct - 2.0)
+    side_obi_aligned = _is_side_ob_trend_aligned(side, current_ob_trend, threshold=2.0)
+    imbalance_hostile = _is_side_imbalance_hostile(side, current_imbalance, threshold=8.0)
+    supportive = bool(
+        around_breakeven
+        and (current_volume_ratio >= 1.15 or current_is_volume_spike)
+        and side_obi_aligned
+        and not imbalance_hostile
+    )
+
+    fading = bool(
+        (current_roi_pct > 0 or peak_roi_pct > 0)
+        and current_volume_ratio < 0.95
+        and not side_obi_aligned
+        and giveback_roi_pct >= max(2.0, peak_roi_pct * 0.18 if peak_roi_pct > 0 else 2.0)
+    )
+
+    chop = bool(
+        age_sec >= 900.0
+        and current_volume_ratio < 1.0
+        and abs(current_ob_trend) < 2.0
+        and (
+            abs(current_roi_pct) <= max(3.0, abs(breakeven_floor_roi_pct) + 1.0)
+            or giveback_roi_pct >= max(2.5, peak_roi_pct * 0.30 if peak_roi_pct > 0 else 2.5)
+        )
+    )
+
+    if supportive:
+        state = V3_CONTINUATION_SUPPORTING
+    elif chop:
+        state = V3_CONTINUATION_CHOP
+    elif fading:
+        state = V3_CONTINUATION_FADING
+    else:
+        state = V3_CONTINUATION_NEUTRAL
+
+    return {
+        'state': state,
+        'supportive': supportive,
+        'fading': fading,
+        'chop': chop,
+        'current_volume_ratio': round(current_volume_ratio, 4),
+        'current_ob_imbalance_trend': round(current_ob_trend, 4),
+        'current_imbalance': round(current_imbalance, 4),
+        'current_exec_score': round(current_exec_score, 4),
+        'giveback_roi_pct': round(giveback_roi_pct, 4),
+        'age_sec': round(age_sec, 2),
+        'around_breakeven': around_breakeven,
+    }
+
+
+def evaluate_v3_underwater_tape_state(
+    pos: dict,
+    current_price: float,
+    *,
+    current_roi_pct: Optional[float] = None,
+    signal_invalidation_state: Optional[dict] = None,
+) -> dict:
+    """Classify losing V3 positions into adverse/sideways/recovery tape states."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return {
+            'state': V3_UNDERWATER_NEUTRAL,
+            'price_loss_pct': 0.0,
+            'underwater_atr_dist': 0.0,
+            'small_loss_band_pct': 1.0,
+            'adverse_flow': False,
+            'hostile_imbalance': False,
+            'opposite_signal_persistent': False,
+            'score_collapse': False,
+            'dynamic_be_price': 0.0,
+            'dynamic_be_buffer_ratio': 0.0,
+            'recovered_from_worst': False,
+        }
+
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    entry_price = _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)
+    current_roi_pct = _coerce_float(
+        current_roi_pct if current_roi_pct is not None else compute_position_roi_pct(safe_pos, current_price=current_price),
+        0.0,
+    )
+    current_atr_pct = _coerce_float(
+        safe_pos.get(
+            'currentAtrPct',
+            safe_pos.get(
+                'volatility_pct',
+                ((float(safe_pos.get('atr', 0.0) or 0.0) / entry_price) * 100.0) if entry_price > 0 else 0.0,
+            ),
+        ),
+        0.0,
+    )
+    small_loss_band_pct = _clamp(max(1.0, current_atr_pct * 0.8), 1.0, 2.0)
+    price_loss_pct = _compute_unleveraged_price_loss_pct(entry_price, current_price, side)
+    atr_value = max(
+        _coerce_float(safe_pos.get('atr', 0.0), 0.0),
+        (entry_price * current_atr_pct / 100.0) if entry_price > 0 and current_atr_pct > 0 else 0.0,
+        max(float(current_price or 0.0), 1e-8) * 0.002,
+    )
+    underwater_atr_dist = abs(float(current_price or entry_price) - entry_price) / max(atr_value, 1e-8) if entry_price > 0 else 0.0
+    current_volume_ratio = _coerce_float(safe_pos.get('currentVolumeRatio', safe_pos.get('volumeRatio', 1.0)), 1.0)
+    current_is_volume_spike = bool(safe_pos.get('currentIsVolumeSpike', safe_pos.get('isVolumeSpike', False)))
+    current_imbalance = _coerce_float(safe_pos.get('currentImbalance', safe_pos.get('entryImbalance', 0.0)), 0.0)
+    current_ob_trend = _coerce_float(safe_pos.get('currentObImbalanceTrend', safe_pos.get('obImbalanceTrend', 0.0)), 0.0)
+    hostile_imbalance = _is_side_imbalance_hostile(side, current_imbalance, threshold=8.0)
+    adverse_ob = _is_side_ob_trend_adverse(side, current_ob_trend, threshold=2.0)
+    invalidation_state = signal_invalidation_state if isinstance(signal_invalidation_state, dict) else (
+        safe_pos.get('runtimeSignalInvalidationState', {}) if isinstance(safe_pos.get('runtimeSignalInvalidationState'), dict) else {}
+    )
+    invalidation_mode = str(invalidation_state.get('mode', '') or '').lower()
+    opposite_signal_persistent = bool(
+        invalidation_mode == 'opposite_signal'
+        and (
+            bool(invalidation_state.get('triggerReady', False))
+            or int(invalidation_state.get('oppositeCount', 0) or 0) >= SIGNAL_INVALIDATION_CONFIRM_COUNT
+        )
+    )
+    score_collapse = bool(invalidation_mode == 'score_collapse' and invalidation_state.get('triggerReady', False))
+    adverse_flow = bool(
+        (current_volume_ratio >= 1.15 or current_is_volume_spike or opposite_signal_persistent)
+        and (adverse_ob or opposite_signal_persistent)
+    )
+
+    worst_price = _coerce_float(safe_pos.get('worstUnderwaterPrice', 0.0), 0.0)
+    if current_roi_pct < 0 and entry_price > 0:
+        if worst_price <= 0:
+            worst_price = float(current_price or entry_price)
+        elif side == 'LONG':
+            worst_price = min(worst_price, float(current_price or worst_price))
+        else:
+            worst_price = max(worst_price, float(current_price or worst_price))
+
+    recovered_from_worst = False
+    if current_roi_pct < 0 and worst_price > 0:
+        if side == 'LONG':
+            recovery_dist = float(current_price or worst_price) - worst_price
+        else:
+            recovery_dist = worst_price - float(current_price or worst_price)
+        recovered_from_worst = recovery_dist >= (atr_value * 0.60)
+
+    spread_pct = _coerce_float(
+        safe_pos.get('currentSpreadPct', safe_pos.get('spreadPct', 0.05)),
+        _coerce_float(safe_pos.get('spreadPct', 0.05), 0.05),
+    )
+    spread_level = safe_pos.get('currentSpreadLevel', safe_pos.get('spreadLevel', 'LOW'))
+    dynamic_be_buffer_ratio = apply_runner_be_buffer(
+        compute_breakeven_buffer_pct(spread_pct=spread_pct, spread_level=spread_level, reason='SIDEWAYS_RECLAIM'),
+        {
+            'enabled': True,
+            'be_buffer_mult': _coerce_float(safe_pos.get('runner_be_buffer_mult', 1.0), 1.0),
+        },
+    )
+    if side == 'LONG':
+        dynamic_be_price = entry_price * (1.0 + dynamic_be_buffer_ratio)
+    else:
+        dynamic_be_price = entry_price * (1.0 - dynamic_be_buffer_ratio)
+
+    if current_roi_pct >= 0:
+        state = V3_UNDERWATER_NEUTRAL
+    elif (
+        price_loss_pct > small_loss_band_pct
+        and adverse_flow
+        and (hostile_imbalance or opposite_signal_persistent)
+    ):
+        state = V3_UNDERWATER_ADVERSE_STRONG
+    elif (
+        recovered_from_worst
+        and not adverse_flow
+        and not hostile_imbalance
+        and price_loss_pct <= (small_loss_band_pct * 1.25)
+    ):
+        state = V3_UNDERWATER_RECOVERING
+    elif (
+        price_loss_pct <= small_loss_band_pct
+        and current_volume_ratio < 1.0
+        and abs(current_ob_trend) < 2.0
+        and not hostile_imbalance
+        and not opposite_signal_persistent
+    ):
+        state = V3_UNDERWATER_SIDEWAYS
+    elif current_roi_pct < 0 and (
+        adverse_flow
+        or hostile_imbalance
+        or score_collapse
+        or opposite_signal_persistent
+        or (adverse_ob and current_volume_ratio >= 1.0)
+    ):
+        state = V3_UNDERWATER_ADVERSE_WEAK
+    else:
+        state = V3_UNDERWATER_NEUTRAL
+
+    return {
+        'state': state,
+        'price_loss_pct': round(price_loss_pct, 4),
+        'underwater_atr_dist': round(underwater_atr_dist, 4),
+        'small_loss_band_pct': round(small_loss_band_pct, 4),
+        'current_volume_ratio': round(current_volume_ratio, 4),
+        'current_ob_imbalance_trend': round(current_ob_trend, 4),
+        'current_imbalance': round(current_imbalance, 4),
+        'adverse_flow': adverse_flow,
+        'adverse_ob': adverse_ob,
+        'hostile_imbalance': hostile_imbalance,
+        'opposite_signal_persistent': opposite_signal_persistent,
+        'score_collapse': score_collapse,
+        'recovered_from_worst': recovered_from_worst,
+        'dynamic_be_price': round(dynamic_be_price, 8) if dynamic_be_price > 0 else 0.0,
+        'dynamic_be_buffer_ratio': round(dynamic_be_buffer_ratio, 6),
+        'worst_underwater_price': round(worst_price, 8) if worst_price > 0 else 0.0,
+    }
+
+
+def apply_v3_underwater_tape_telemetry(pos: dict, state_ctx: dict) -> dict:
+    """Persist loss-side V3 tape state on the position for runtime decisions and UI."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    ctx = state_ctx if isinstance(state_ctx, dict) else {}
+    state = str(ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+    prev_state = str(safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+    safe_pos['underwaterTapeState'] = state
+    safe_pos['underwaterPriceLossPct'] = _coerce_float(ctx.get('price_loss_pct', 0.0), 0.0)
+    safe_pos['underwaterAtrDist'] = _coerce_float(ctx.get('underwater_atr_dist', 0.0), 0.0)
+    safe_pos['smallLossBandPct'] = _coerce_float(ctx.get('small_loss_band_pct', 1.0), 1.0)
+    safe_pos['underwaterDynamicBePrice'] = _coerce_float(ctx.get('dynamic_be_price', 0.0), 0.0)
+    safe_pos['underwaterDynamicBeBufferRatio'] = _coerce_float(ctx.get('dynamic_be_buffer_ratio', 0.0), 0.0)
+
+    current_roi = _coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0)
+    now_ts = time.time()
+    if current_roi < 0:
+        worst_price = _coerce_float(ctx.get('worst_underwater_price', safe_pos.get('worstUnderwaterPrice', 0.0)), 0.0)
+        if worst_price > 0:
+            if worst_price != _coerce_float(safe_pos.get('worstUnderwaterPrice', 0.0), 0.0):
+                safe_pos['worstUnderwaterTs'] = now_ts
+            safe_pos['worstUnderwaterPrice'] = worst_price
+        elif safe_pos.get('worstUnderwaterTs', 0) <= 0:
+            safe_pos['worstUnderwaterTs'] = now_ts
+    elif current_roi >= 0:
+        safe_pos['sidewaysReclaimArmed'] = False
+        safe_pos['lossGateSuppressedReason'] = ''
+
+    if state == V3_UNDERWATER_SIDEWAYS:
+        safe_pos['sidewaysSinceTs'] = safe_pos.get('sidewaysSinceTs') or now_ts
+    elif state not in (V3_UNDERWATER_SIDEWAYS, V3_UNDERWATER_RECOVERING):
+        safe_pos['sidewaysSinceTs'] = 0
+
+    if state == V3_UNDERWATER_ADVERSE_STRONG:
+        safe_pos['adverseStrongSinceTs'] = safe_pos.get('adverseStrongSinceTs') or now_ts
+        safe_pos['adverseStrongSeen'] = True
+        safe_pos['lossGateSuppressedReason'] = ''
+    else:
+        safe_pos['adverseStrongSinceTs'] = 0
+
+    if state != V3_UNDERWATER_ADVERSE_STRONG and prev_state == V3_UNDERWATER_ADVERSE_STRONG:
+        safe_pos['lossGateSuppressedReason'] = safe_pos.get('lossGateSuppressedReason', '')
+
+    return ctx
+
+
+def evaluate_v3_sideways_reclaim_signal(
+    pos: dict,
+    current_price: float,
+    *,
+    current_roi_pct: Optional[float] = None,
+    underwater_ctx: Optional[dict] = None,
+) -> dict:
+    """Determine whether a losing V3 runner should reclaim-close around breakeven."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return {'armed': False, 'fire': False, 'reason': 'NON_V3'}
+
+    current_roi_pct = _coerce_float(
+        current_roi_pct if current_roi_pct is not None else compute_position_roi_pct(safe_pos, current_price=current_price),
+        0.0,
+    )
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else evaluate_v3_underwater_tape_state(
+        safe_pos,
+        current_price,
+        current_roi_pct=current_roi_pct,
+    )
+    state = str(state_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+    if state not in (V3_UNDERWATER_SIDEWAYS, V3_UNDERWATER_RECOVERING):
+        return {'armed': False, 'fire': False, 'reason': state}
+
+    now_ts = time.time()
+    age_sec = max(0.0, (now_ts * 1000 - int(safe_pos.get('openTime', 0) or 0)) / 1000.0)
+    if age_sec < 600.0:
+        return {'armed': False, 'fire': False, 'reason': 'AGE'}
+
+    last_supportive_ts = _coerce_float(safe_pos.get('lastSupportiveFlowTs', 0.0), 0.0)
+    if last_supportive_ts > 0 and (now_ts - last_supportive_ts) <= 300.0:
+        return {'armed': False, 'fire': False, 'reason': 'RECENT_SUPPORT'}
+
+    had_underwater_memory = bool(
+        _coerce_float(safe_pos.get('sidewaysSinceTs', 0.0), 0.0) > 0
+        or _coerce_float(safe_pos.get('worstUnderwaterTs', 0.0), 0.0) > 0
+    )
+    if not had_underwater_memory:
+        return {'armed': False, 'fire': False, 'reason': 'NO_MEMORY'}
+
+    be_floor_roi = _coerce_float(safe_pos.get('runtimeBreakevenFloorRoiPct', 0.0), 0.0)
+    dynamic_be_price = _coerce_float(state_ctx.get('dynamic_be_price', safe_pos.get('underwaterDynamicBePrice', 0.0)), 0.0)
+    be_zone_tolerance = abs(_coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)) * _coerce_float(
+        state_ctx.get('dynamic_be_buffer_ratio', safe_pos.get('underwaterDynamicBeBufferRatio', 0.0)),
+        0.0,
+    )
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    if side == 'LONG':
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) >= dynamic_be_price
+    else:
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) <= dynamic_be_price
+    in_be_buffer = (
+        _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0) > 0
+        and abs(float(current_price or 0.0) - _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)) <= max(be_zone_tolerance, _coerce_float(safe_pos.get('atr', 0.0), 0.0) * 0.15)
+    )
+
+    hostile_flow = bool(
+        state_ctx.get('hostile_imbalance', False)
+        or state_ctx.get('adverse_flow', False)
+        or state_ctx.get('opposite_signal_persistent', False)
+    )
+    fire = bool((current_roi_pct >= be_floor_roi or be_price_reached or in_be_buffer) and not hostile_flow)
+    return {
+        'armed': True,
+        'fire': fire,
+        'reason': 'READY' if fire else 'WAIT_BE',
+        'be_floor_roi_pct': round(be_floor_roi, 4),
+        'dynamic_be_price': dynamic_be_price,
+        'in_be_buffer': in_be_buffer,
+        'hostile_flow': hostile_flow,
+        'state': state,
+    }
 
 
 def format_runner_close_split(split: tuple[float, float, float, float]) -> str:
@@ -15593,10 +16156,12 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
         # should wait/retry and let live BBO/drift gates remain final authority.
         decision = 'WARN_WAIT'
 
+    limited_market_override = compute_limited_market_override_plan(order, pending_passed=(score >= 65 and not hard_reject))
     allow_market = (
         not hard_reject and (
             (score >= 70 and order_signal_score >= 85) or
-            (force_market and score >= 50 and order_signal_score >= max(75, order_score_floor + 4))
+            (force_market and score >= 50 and order_signal_score >= max(75, order_score_floor + 4)) or
+            bool(limited_market_override.get('eligible', False))
         )
     )
 
@@ -16239,6 +16804,97 @@ def update_runtime_trail_telemetry(
         pos['runtimeTrailLastUpdateTs'] = int(datetime.now().timestamp() * 1000)
     except Exception:
         pass
+
+
+def apply_v3_continuation_trail_overlay(
+    pos: dict,
+    *,
+    current_price: float,
+    dynamic_trail_distance: float,
+    min_price_move_pct: float,
+    min_roi_pct: float,
+    threshold_mult: float,
+    current_roi_pct: Optional[float] = None,
+) -> dict:
+    """Continuation-aware trail widening/tightening for SMART_V3_RUNNER only."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return {
+            'trail_distance': dynamic_trail_distance,
+            'min_price_move_pct': min_price_move_pct,
+            'min_roi_pct': min_roi_pct,
+            'threshold_mult': threshold_mult,
+            'state': V3_CONTINUATION_NEUTRAL,
+            'chop_tighten_active': False,
+        }
+
+    state_ctx = evaluate_v3_continuation_flow_state(
+        safe_pos,
+        current_price,
+        current_roi_pct=current_roi_pct,
+        profit_peak_roi_pct=_coerce_float(safe_pos.get('runtimeProfitPeakRoiPct', safe_pos.get('profitPeakRoiPct', 0.0)), 0.0),
+        breakeven_floor_roi_pct=_coerce_float(safe_pos.get('runtimeBreakevenFloorRoiPct', 0.0), 0.0),
+    )
+    state = state_ctx.get('state', V3_CONTINUATION_NEUTRAL)
+    trail_mult = 1.0
+    activation_mult = 1.0
+    chop_tighten_active = False
+    tp1_roi = _coerce_float(safe_pos.get('runtimeTp1RoiPct', 0.0), 0.0)
+    peak_roi = _coerce_float(safe_pos.get('runtimeProfitPeakRoiPct', safe_pos.get('profitPeakRoiPct', 0.0)), 0.0)
+    tp1_taken = bool((safe_pos.get('partial_tp_state') or {}).get('tp1', False))
+
+    if state == V3_CONTINUATION_SUPPORTING:
+        trail_mult = 1.20
+        activation_mult = 1.08
+    elif state == V3_CONTINUATION_FADING:
+        trail_mult = 0.90
+        activation_mult = 0.95
+    elif state == V3_CONTINUATION_CHOP:
+        trail_mult = 0.75
+        activation_mult = 0.85
+        chop_tighten_active = bool(tp1_taken or (tp1_roi > 0 and peak_roi >= tp1_roi))
+
+    safe_trail = max(0.0, float(dynamic_trail_distance or 0.0) * trail_mult)
+    safe_move = max(0.05, float(min_price_move_pct or 0.0) * activation_mult)
+    safe_roi = max(0.5, float(min_roi_pct or 0.0) * activation_mult)
+    safe_threshold = max(0.10, float(threshold_mult or 1.0) * activation_mult)
+
+    safe_pos['continuationFlowState'] = state
+    safe_pos['chopTightenActive'] = chop_tighten_active
+    if state == V3_CONTINUATION_SUPPORTING:
+        safe_pos['lastSupportiveFlowTs'] = time.time()
+    elif state == V3_CONTINUATION_CHOP:
+        safe_pos['chopSinceTs'] = safe_pos.get('chopSinceTs') or time.time()
+
+    return {
+        'trail_distance': safe_trail,
+        'min_price_move_pct': safe_move,
+        'min_roi_pct': safe_roi,
+        'threshold_mult': safe_threshold,
+        'state': state,
+        'chop_tighten_active': chop_tighten_active,
+    }
+
+
+def compute_limited_market_override_plan(payload: dict, *, pending_passed: bool = False) -> dict:
+    """Allow a single guarded market fallback for strong continuation entries."""
+    safe_payload = payload if isinstance(payload, dict) else {}
+    forecast_band = str(safe_payload.get('forecastBand', 'NEUTRAL') or 'NEUTRAL').upper()
+    eligible = bool(
+        str(safe_payload.get('entryArchetype', '') or '').lower() == ENTRY_ARCHETYPE_CONTINUATION
+        and _coerce_float(safe_payload.get('volumeRatio', 0.0), 0.0) >= 2.20
+        and bool(safe_payload.get('isVolumeSpike', False))
+        and _coerce_float(safe_payload.get('spreadPct', 1.0), 1.0) <= 0.12
+        and bool(safe_payload.get('entryExecStrictPassed', False))
+        and _coerce_float(safe_payload.get('microstructureScore', 0.0), 0.0) >= 70.0
+        and forecast_band in ('MEDIUM', 'STRONG')
+        and (pending_passed or not safe_payload.get('pendingPassRequired', False))
+    )
+    return {
+        'eligible': eligible,
+        'forecast_band': forecast_band,
+        'reason': 'LIMITED_MARKET_CONTINUATION' if eligible else 'none',
+    }
 
 
 def check_emergency_sl_static(pos: dict, current_price: float, trailing_stop: float) -> bool:
@@ -21095,12 +21751,16 @@ async def background_scanner_loop():
                         
                         # Find current price for this position from scanner data
                         current_price = None
+                        pos_opp = None
                         for opp in opportunities:
                             if opp.get('symbol') == pos_symbol:
                                 current_price = opp.get('price', 0)
+                                pos_opp = opp
                                 break
                         
                         if current_price and current_price > 0:
+                            if pos_opp:
+                                apply_live_flow_context_to_position(pos, pos_opp)
                             # Calculate unrealized PnL
                             entry_price = pos.get('entryPrice', current_price)
                             size = pos.get('size', 0)
@@ -21569,12 +22229,12 @@ async def background_scanner_loop():
                             # Hybrid dynamic trail distance (includes exit_tightness multiplier).
                             pos_atr = pos.get('atr', entry_price * 0.02)
                             pnl_pct = pos.get('unrealizedPnlPercent', 0)
-                            pos_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+                            pos_atr_pct = pos.get('currentAtrPct', pos.get('volatility_pct', 0)) or pos.get('volatilityPct', 0)
                             if not pos_atr_pct and entry_price > 0:
                                 pos_atr_pct = (pos_atr / entry_price) * 100
                             pos_atr_pct = pos_atr_pct or 2.0
-                            pos_spread = pos.get('spreadPct', 0.05)
-                            pos_vol_ratio = pos.get('volumeRatio', 1.0)
+                            pos_spread = pos.get('currentSpreadPct', pos.get('spreadPct', 0.05))
+                            pos_vol_ratio = pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))
                             effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
                             dynamic_trail_distance = get_hybrid_runtime_trail_distance(
                                 base_trail_distance=trail_distance,
@@ -21619,6 +22279,19 @@ async def background_scanner_loop():
                             min_price_move_for_trail, min_roi_for_trail = get_dynamic_trail_activation_threshold(
                                 pos_atr_pct, pos_spread, pos_vol_ratio, leverage, threshold_mult=threshold_mult
                             )
+                            _flow_overlay = apply_v3_continuation_trail_overlay(
+                                pos,
+                                current_price=candle_close_price,
+                                dynamic_trail_distance=dynamic_trail_distance,
+                                min_price_move_pct=min_price_move_for_trail,
+                                min_roi_pct=min_roi_for_trail,
+                                threshold_mult=threshold_mult,
+                                current_roi_pct=roi_pct,
+                            )
+                            dynamic_trail_distance = _flow_overlay['trail_distance']
+                            min_price_move_for_trail = _flow_overlay['min_price_move_pct']
+                            min_roi_for_trail = _flow_overlay['min_roi_pct']
+                            threshold_mult = _flow_overlay['threshold_mult']
                             update_runtime_trail_telemetry(
                                 pos=pos,
                                 dynamic_trail_distance=dynamic_trail_distance,
@@ -22105,12 +22778,12 @@ async def on_position_price_update(symbol: str, ticker: dict):
             ws_price_move_pct = ((entry_price - candle_close_price) / entry_price) * 100 if entry_price > 0 else 0
         ws_roi_pct = ws_price_move_pct * ws_leverage
         
-        ws_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+        ws_atr_pct = pos.get('currentAtrPct', pos.get('volatility_pct', 0)) or pos.get('volatilityPct', 0)
         if not ws_atr_pct and entry_price > 0:
             ws_atr_pct = (pos_atr / entry_price) * 100
         ws_atr_pct = ws_atr_pct or 2.0
-        ws_spread = pos.get('spreadPct', 0.05)
-        ws_vol_ratio = pos.get('volumeRatio', 1.0)
+        ws_spread = pos.get('currentSpreadPct', pos.get('spreadPct', 0.05))
+        ws_vol_ratio = pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))
         effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
         dynamic_trail_distance = get_hybrid_runtime_trail_distance(
             base_trail_distance=trail_distance,
@@ -22146,6 +22819,19 @@ async def on_position_price_update(symbol: str, ticker: dict):
         ws_min_price_move, ws_min_roi = get_dynamic_trail_activation_threshold(
             ws_atr_pct, ws_spread, ws_vol_ratio, ws_leverage, threshold_mult=threshold_mult
         )
+        _ws_flow_overlay = apply_v3_continuation_trail_overlay(
+            pos,
+            current_price=candle_close_price,
+            dynamic_trail_distance=dynamic_trail_distance,
+            min_price_move_pct=ws_min_price_move,
+            min_roi_pct=ws_min_roi,
+            threshold_mult=threshold_mult,
+            current_roi_pct=ws_roi_pct,
+        )
+        dynamic_trail_distance = _ws_flow_overlay['trail_distance']
+        ws_min_price_move = _ws_flow_overlay['min_price_move_pct']
+        ws_min_roi = _ws_flow_overlay['min_roi_pct']
+        threshold_mult = _ws_flow_overlay['threshold_mult']
         update_runtime_trail_telemetry(
             pos=pos,
             dynamic_trail_distance=dynamic_trail_distance,
@@ -22370,12 +23056,12 @@ async def position_price_update_loop():
                             fast_price_move = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
                         fast_roi = fast_price_move * fast_leverage
                         
-                        fast_atr_pct = pos.get('volatility_pct', 0) or pos.get('volatilityPct', 0)
+                        fast_atr_pct = pos.get('currentAtrPct', pos.get('volatility_pct', 0)) or pos.get('volatilityPct', 0)
                         if not fast_atr_pct and entry_price > 0:
                             fast_atr_pct = (pos_atr / entry_price) * 100
                         fast_atr_pct = fast_atr_pct or 2.0
-                        fast_spread = pos.get('spreadPct', 0.05)
-                        fast_vol_ratio = pos.get('volumeRatio', 1.0)
+                        fast_spread = pos.get('currentSpreadPct', pos.get('spreadPct', 0.05))
+                        fast_vol_ratio = pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))
                         effective_et = global_paper_trader.get_effective_exit_tightness(pos) if global_paper_trader else 1.0
                         dynamic_trail_distance = get_hybrid_runtime_trail_distance(
                             base_trail_distance=trail_distance,
@@ -22411,6 +23097,19 @@ async def position_price_update_loop():
                         fast_min_price_move, fast_min_roi = get_dynamic_trail_activation_threshold(
                             fast_atr_pct, fast_spread, fast_vol_ratio, fast_leverage, threshold_mult=threshold_mult
                         )
+                        _fast_flow_overlay = apply_v3_continuation_trail_overlay(
+                            pos,
+                            current_price=current_price,
+                            dynamic_trail_distance=dynamic_trail_distance,
+                            min_price_move_pct=fast_min_price_move,
+                            min_roi_pct=fast_min_roi,
+                            threshold_mult=threshold_mult,
+                            current_roi_pct=fast_roi,
+                        )
+                        dynamic_trail_distance = _fast_flow_overlay['trail_distance']
+                        fast_min_price_move = _fast_flow_overlay['min_price_move_pct']
+                        fast_min_roi = _fast_flow_overlay['min_roi_pct']
+                        threshold_mult = _fast_flow_overlay['threshold_mult']
                         update_runtime_trail_telemetry(
                             pos=pos,
                             dynamic_trail_distance=dynamic_trail_distance,
@@ -27000,6 +27699,48 @@ class PositionBasedKillSwitch:
             pos['runtimeSignalInvalidationState'] = {}
         pos['runtimeLossGateState'] = build_runtime_loss_gate_state(pos)
 
+    @staticmethod
+    def _is_v3_loss_owner_position(pos: dict) -> bool:
+        return normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER
+
+    def _evaluate_v3_underwater_state(self, pos: dict, current_price: float, current_roi: float) -> dict:
+        ctx = evaluate_v3_underwater_tape_state(
+            pos,
+            current_price,
+            current_roi_pct=current_roi,
+            signal_invalidation_state=pos.get('runtimeSignalInvalidationState', {}),
+        )
+        prev_state = str(pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+        apply_v3_underwater_tape_telemetry(pos, ctx)
+        if ctx.get('state') == V3_UNDERWATER_ADVERSE_STRONG and prev_state != V3_UNDERWATER_ADVERSE_STRONG:
+            logger.warning(
+                f"🔻 UNDERWATER_ADVERSE_STRONG: {pos.get('symbol','?')} {pos.get('side','?')} "
+                f"loss={ctx.get('price_loss_pct', 0.0):.2f}% band={ctx.get('small_loss_band_pct', 1.0):.2f}% "
+                f"vol={ctx.get('current_volume_ratio', 1.0):.2f} ob={ctx.get('current_ob_imbalance_trend', 0.0):.1f}"
+            )
+        return ctx
+
+    def _record_v3_loss_gate_suppressed(self, paper_trader, pos: dict, gate_reason: str, state_ctx: dict) -> None:
+        state = str(state_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+        summary = f"{gate_reason}:{state}"
+        if pos.get('lossGateSuppressedReason') == summary:
+            return
+        pos['lossGateSuppressedReason'] = summary
+        pos.setdefault('decision_trace', []).append({
+            't': int(time.time()),
+            'mgr': 'LOSS_GATE_SUPPRESSED',
+            'roi': round(compute_position_roi_pct(pos), 1),
+            'detail': summary[:160],
+        })
+        pos['decision_trace'] = pos.get('decision_trace', [])[-20:]
+        if hasattr(paper_trader, 'pipeline_metrics'):
+            paper_trader.pipeline_metrics.setdefault('v3_loss_gate_suppressed_count', 0)
+            paper_trader.pipeline_metrics['v3_loss_gate_suppressed_count'] += 1
+        logger.info(
+            f"🧊 LOSS_GATE_SUPPRESSED: {pos.get('symbol','?')} {pos.get('side','?')} "
+            f"gate={gate_reason} state={state}"
+        )
+
     def _evaluate_signal_invalidation_gate(self, pos: dict, current_roi: float) -> Optional[Dict[str, Any]]:
         symbol = pos.get('symbol', '')
         side = str(pos.get('side', 'LONG')).upper()
@@ -27236,6 +27977,12 @@ class PositionBasedKillSwitch:
                 current_roi = float(ladder.get('current_roi_pct', 0.0) or 0.0)
                 age_sec = self._position_age_sec(pos)
                 self._refresh_runtime_loss_gate_telemetry(pos, current_price, current_roi)
+                is_v3_loss_owner = self._is_v3_loss_owner_position(pos)
+                underwater_ctx = self._evaluate_v3_underwater_state(pos, current_price, current_roi) if is_v3_loss_owner else {}
+                allow_v3_loss_reduce = (not is_v3_loss_owner) or str(
+                    underwater_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL
+                ) == V3_UNDERWATER_ADVERSE_STRONG
+                allow_v3_recovery_ladder = (not is_v3_loss_owner) or bool(pos.get('adverseStrongSeen', False)) or allow_v3_loss_reduce
 
                 # Skip profitable positions for loss-side ladder actions, but keep telemetry fresh.
                 if unrealized_pnl >= 0 or current_roi >= 0:
@@ -27251,12 +27998,48 @@ class PositionBasedKillSwitch:
                         soft_gate = None
                         if not pos.get('signalInvalidationReduced', False):
                             soft_gate = self._evaluate_signal_invalidation_gate(pos, current_roi)
-                        if soft_gate is None and not pos.get('regimeDeteriorationReduced', False):
-                            soft_gate = self._evaluate_regime_deterioration_gate(pos, current_price)
-                        if soft_gate is None and not pos.get('executionRiskReduced', False):
-                            soft_gate = self._evaluate_execution_risk_gate(pos, current_price)
-                        if soft_gate is None and not pos.get('fundingDecayReduced', False):
-                            soft_gate = self._evaluate_funding_decay_gate(pos, current_roi, age_sec)
+                        if is_v3_loss_owner:
+                            underwater_ctx = self._evaluate_v3_underwater_state(pos, current_price, current_roi)
+                            allow_v3_loss_reduce = str(
+                                underwater_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL
+                            ) == V3_UNDERWATER_ADVERSE_STRONG
+                            allow_v3_recovery_ladder = bool(pos.get('adverseStrongSeen', False)) or allow_v3_loss_reduce
+                            allow_signal_gate = allow_v3_loss_reduce or bool(underwater_ctx.get('opposite_signal_persistent', False))
+                            if soft_gate is not None and not allow_signal_gate:
+                                self._record_v3_loss_gate_suppressed(
+                                    paper_trader,
+                                    pos,
+                                    str(soft_gate.get('reason', 'SIGNAL_INVALIDATION_REDUCE') or 'SIGNAL_INVALIDATION_REDUCE'),
+                                    underwater_ctx,
+                                )
+                                soft_gate = None
+                            if allow_v3_loss_reduce:
+                                if soft_gate is None and not pos.get('regimeDeteriorationReduced', False):
+                                    soft_gate = self._evaluate_regime_deterioration_gate(pos, current_price)
+                                if soft_gate is None and not pos.get('executionRiskReduced', False):
+                                    soft_gate = self._evaluate_execution_risk_gate(pos, current_price)
+                                if soft_gate is None and not pos.get('fundingDecayReduced', False):
+                                    soft_gate = self._evaluate_funding_decay_gate(pos, current_roi, age_sec)
+                            else:
+                                if not pos.get('regimeDeteriorationReduced', False):
+                                    gate_probe = self._evaluate_regime_deterioration_gate(pos, current_price)
+                                    if gate_probe is not None:
+                                        self._record_v3_loss_gate_suppressed(paper_trader, pos, 'REGIME_DETERIORATION_REDUCE', underwater_ctx)
+                                if not pos.get('executionRiskReduced', False):
+                                    gate_probe = self._evaluate_execution_risk_gate(pos, current_price)
+                                    if gate_probe is not None:
+                                        self._record_v3_loss_gate_suppressed(paper_trader, pos, 'EXECUTION_RISK_REDUCE', underwater_ctx)
+                                if not pos.get('fundingDecayReduced', False):
+                                    gate_probe = self._evaluate_funding_decay_gate(pos, current_roi, age_sec)
+                                    if gate_probe is not None:
+                                        self._record_v3_loss_gate_suppressed(paper_trader, pos, 'FUNDING_DECAY_REDUCE', underwater_ctx)
+                        else:
+                            if soft_gate is None and not pos.get('regimeDeteriorationReduced', False):
+                                soft_gate = self._evaluate_regime_deterioration_gate(pos, current_price)
+                            if soft_gate is None and not pos.get('executionRiskReduced', False):
+                                soft_gate = self._evaluate_execution_risk_gate(pos, current_price)
+                            if soft_gate is None and not pos.get('fundingDecayReduced', False):
+                                soft_gate = self._evaluate_funding_decay_gate(pos, current_roi, age_sec)
                         if soft_gate is not None:
                             reduced = await self._apply_soft_gate_reduce(
                                 paper_trader,
@@ -27272,30 +28055,113 @@ class PositionBasedKillSwitch:
                                     f"🪜 LOSS_GATE [{leverage}x]: {side} {symbol} {soft_gate['reason']} "
                                     f"reduced {float(soft_gate['reduction_pct']) * 100:.0f}% | {soft_gate.get('detail', '')}"
                                 )
+                                if is_v3_loss_owner and str(pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL) == V3_UNDERWATER_ADVERSE_STRONG:
+                                    if hasattr(paper_trader, 'pipeline_metrics'):
+                                        paper_trader.pipeline_metrics.setdefault('v3_adverse_strong_reduce_count', 0)
+                                        paper_trader.pipeline_metrics['v3_adverse_strong_reduce_count'] += 1
                                 continue
+                if is_v3_loss_owner:
+                    underwater_ctx = self._evaluate_v3_underwater_state(pos, current_price, current_roi)
+                    allow_v3_loss_reduce = str(
+                        underwater_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL
+                    ) == V3_UNDERWATER_ADVERSE_STRONG
+                    allow_v3_recovery_ladder = bool(pos.get('adverseStrongSeen', False)) or allow_v3_loss_reduce
 
                 # Pre-stop reduction: always active before the technical stop.
                 pre_stop_reduce_roi = ladder.get('pre_stop_reduce_roi_pct')
+                if bool(pos.get('preStopHoldArmed', False)):
+                    _hold_ctx = evaluate_v3_continuation_flow_state(pos, current_price, current_roi_pct=current_roi)
+                    _hold_until = float(pos.get('preStopHoldUntilTs', 0) or 0)
+                    _hold_breach_roi = _coerce_float(pos.get('preStopHoldBreachRoiPct', current_roi), current_roi)
+                    _hold_release = ''
+                    if time.time() >= _hold_until:
+                        _hold_release = 'TIME'
+                    elif _hold_ctx.get('state') != V3_CONTINUATION_SUPPORTING:
+                        _hold_release = 'FLOW_FADE'
+                    elif current_roi <= (_hold_breach_roi - 4.0):
+                        _hold_release = 'ROI_WORSE'
+
+                    if _hold_release:
+                        pos['preStopHoldArmed'] = False
+                        pos['preStopHoldUntilTs'] = 0
+                        pos['preStopHoldReleasedReason'] = _hold_release
+                        logger.info(
+                            f"🟡 PRE_STOP_HOLD_RELEASED: {side} {symbol} "
+                            f"reason={_hold_release} roi={current_roi:.1f}%"
+                        )
+                    else:
+                        continue
+
                 if pre_stop_reduce_roi is not None and current_roi <= pre_stop_reduce_roi and not pos.get('preStopReduced', False):
-                    pos['preStopReduced'] = True
-                    await self._reduce_position(
-                        paper_trader,
-                        pos,
-                        current_price,
-                        self.pre_stop_reduction_size,
-                        reason='PRE_STOP_REDUCE',
-                        trade_suffix='PRE_STOP',
+                    _runner_context = str(
+                        pos.get(
+                            'runnerContext',
+                            classify_v3_runner_context(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER),
+                        ) or ''
                     )
-                    actions["reduced"].append(f"{symbol} pre-stop ({current_roi:.1f}%)")
-                    logger.warning(
-                        f"🛡️ PRE_STOP_REDUCE [{leverage}x]: {side} {symbol} reduced {self.pre_stop_reduction_size*100:.0f}% "
-                        f"at ROI {current_roi:.1f}% (threshold: {pre_stop_reduce_roi:.0f}%)"
+                    _pre_hold_ctx = evaluate_v3_continuation_flow_state(pos, current_price, current_roi_pct=current_roi)
+                    _current_vol = _coerce_float(pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0)), 1.0)
+                    _current_spike = bool(pos.get('currentIsVolumeSpike', pos.get('isVolumeSpike', False)))
+                    _current_ob = _coerce_float(pos.get('currentObImbalanceTrend', pos.get('obImbalanceTrend', 0.0)), 0.0)
+                    _pos_atr = max(_coerce_float(pos.get('atr', 0.0), 0.0), max(current_price, 1e-8) * 0.002)
+                    _entry_atr_dist = abs(current_price - float(pos.get('entryPrice', current_price) or current_price)) / max(_pos_atr, 1e-8)
+                    _can_hold_pre_stop = (
+                        normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER
+                        and _runner_context in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY)
+                        and not bool(pos.get('preStopHoldUsed', False))
+                        and _pre_hold_ctx.get('state') == V3_CONTINUATION_SUPPORTING
+                        and (_current_vol >= 1.35 or _current_spike)
+                        and _is_side_ob_trend_aligned(side, _current_ob, threshold=2.0)
+                        and _entry_atr_dist <= 0.45
                     )
-                    continue
+                    if _can_hold_pre_stop:
+                        pos['preStopHoldArmed'] = True
+                        pos['preStopHoldUsed'] = True
+                        pos['preStopHoldUntilTs'] = time.time() + 180.0
+                        pos['preStopHoldBreachRoiPct'] = current_roi
+                        pos['preStopHoldReleasedReason'] = ''
+                        if hasattr(paper_trader, 'pipeline_metrics'):
+                            paper_trader.pipeline_metrics.setdefault('v3_pre_stop_hold_count', 0)
+                            paper_trader.pipeline_metrics['v3_pre_stop_hold_count'] += 1
+                        logger.info(
+                            f"🟡 PRE_STOP_HOLD_ARMED: {side} {symbol} "
+                            f"roi={current_roi:.1f}% vol={_current_vol:.2f} ob={_current_ob:.1f} "
+                            f"ctx={_runner_context} entry_atr={_entry_atr_dist:.2f}"
+                        )
+                        continue
+
+                    if is_v3_loss_owner and not allow_v3_loss_reduce:
+                        self._record_v3_loss_gate_suppressed(paper_trader, pos, 'PRE_STOP_REDUCE', underwater_ctx)
+                    else:
+                        pos['preStopReduced'] = True
+                        if hasattr(paper_trader, 'pipeline_metrics') and normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER:
+                            paper_trader.pipeline_metrics.setdefault('v3_pre_stop_reduce_count', 0)
+                            paper_trader.pipeline_metrics['v3_pre_stop_reduce_count'] += 1
+                            if str(pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL) == V3_UNDERWATER_ADVERSE_STRONG:
+                                paper_trader.pipeline_metrics.setdefault('v3_adverse_strong_reduce_count', 0)
+                                paper_trader.pipeline_metrics['v3_adverse_strong_reduce_count'] += 1
+                        await self._reduce_position(
+                            paper_trader,
+                            pos,
+                            current_price,
+                            self.pre_stop_reduction_size,
+                            reason='PRE_STOP_REDUCE',
+                            trade_suffix='PRE_STOP',
+                        )
+                        actions["reduced"].append(f"{symbol} pre-stop ({current_roi:.1f}%)")
+                        logger.warning(
+                            f"🛡️ PRE_STOP_REDUCE [{leverage}x]: {side} {symbol} reduced {self.pre_stop_reduction_size*100:.0f}% "
+                            f"at ROI {current_roi:.1f}% (threshold: {pre_stop_reduce_roi:.0f}%)"
+                        )
+                        continue
 
                 # Recovery arm and staged reductions.
                 recovery_arm_roi = ladder.get('recovery_arm_roi_pct')
-                if recovery_arm_roi is not None and age_sec >= MIN_POSITION_MATURITY_SEC and current_roi <= recovery_arm_roi:
+                if is_v3_loss_owner and not allow_v3_recovery_ladder:
+                    pos['recoveryArmed'] = False
+                    pos['recoveryTrailActive'] = False
+                    pos['recoveryStage'] = 0
+                elif recovery_arm_roi is not None and age_sec >= MIN_POSITION_MATURITY_SEC and current_roi <= recovery_arm_roi:
                     if not pos.get('recoveryArmed', False):
                         pos['recoveryArmed'] = True
                         pos['recoveryWorstRoiPct'] = current_roi
@@ -27303,7 +28169,7 @@ class PositionBasedKillSwitch:
                     else:
                         pos['recoveryWorstRoiPct'] = min(float(pos.get('recoveryWorstRoiPct', current_roi) or current_roi), current_roi)
 
-                if pos.get('recoveryArmed', False):
+                if pos.get('recoveryArmed', False) and (not is_v3_loss_owner or allow_v3_recovery_ladder):
                     pos['recoveryWorstRoiPct'] = min(float(pos.get('recoveryWorstRoiPct', current_roi) or current_roi), current_roi)
                     pos['recoveryPeakRoiPct'] = max(float(pos.get('recoveryPeakRoiPct', current_roi) or current_roi), current_roi)
                     ladder = update_runtime_protection_telemetry(
@@ -27484,6 +28350,13 @@ class PositionBasedKillSwitch:
             "strategyMode": pos.get('strategyMode', STRATEGY_MODE_LEGACY),
             "execution_profile_source": pos.get('execution_profile_source', 'neutral'),
             "exitOwner": pos.get('exitOwner', ''),
+            "underwaterTapeState": pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
+            "underwaterPriceLossPct": _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
+            "underwaterAtrDist": _coerce_float(pos.get('underwaterAtrDist', 0.0), 0.0),
+            "smallLossBandPct": _coerce_float(pos.get('smallLossBandPct', 1.0), 1.0),
+            "sidewaysReclaimArmed": bool(pos.get('sidewaysReclaimArmed', False)),
+            "lossGateSuppressedReason": pos.get('lossGateSuppressedReason', ''),
+            "adverseStrongSinceTs": _coerce_float(pos.get('adverseStrongSinceTs', 0.0), 0.0),
             "signalSnapshot": pos.get('signal_snapshot', {}),
             "execSnapshot": pos.get('exec_snapshot', {}),
             "riskSnapshot": pos.get('risk_snapshot', {}),
@@ -28326,6 +29199,46 @@ class TimeBasedPositionManager:
 
         entry_price = float(pos.get('entryPrice', current_price) or current_price)
         current_roi = compute_position_roi_pct(pos, current_price=current_price)
+        profit_ladder = build_position_profit_ladder(pos, current_price=current_price)
+        underwater_ctx = evaluate_v3_underwater_tape_state(
+            pos,
+            current_price,
+            current_roi_pct=current_roi,
+            signal_invalidation_state=pos.get('runtimeSignalInvalidationState', {}),
+        )
+        apply_v3_underwater_tape_telemetry(pos, underwater_ctx)
+        sideways_reclaim = evaluate_v3_sideways_reclaim_signal(
+            pos,
+            current_price,
+            current_roi_pct=current_roi,
+            underwater_ctx=underwater_ctx,
+        )
+        pos['sidewaysReclaimArmed'] = bool(sideways_reclaim.get('armed', False))
+        if sideways_reclaim.get('fire', False):
+            pos['lastExitDecision'] = 'SIDEWAYS_RECLAIM_CLOSE'
+            if hasattr(paper_trader, 'pipeline_metrics'):
+                paper_trader.pipeline_metrics.setdefault('v3_sideways_reclaim_count', 0)
+                paper_trader.pipeline_metrics['v3_sideways_reclaim_count'] += 1
+            paper_trader.close_via_engine(pos, current_price, 'SIDEWAYS_RECLAIM_CLOSE', 'V3_RUNNER')
+            actions["time_closed"].append(f"{pos.get('symbol')} sideways_reclaim")
+            return True
+        continuation_state = str(profit_ladder.get('continuation_flow_state', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
+        if continuation_state == V3_CONTINUATION_CHOP and not pos.get('chopSinceTs'):
+            pos['chopSinceTs'] = now_ts
+        chop_since_ts = float(pos.get('chopSinceTs', 0) or 0)
+        chop_age_sec = max(0.0, now_ts - chop_since_ts) if continuation_state == V3_CONTINUATION_CHOP and chop_since_ts > 0 else 0.0
+        if (
+            continuation_state == V3_CONTINUATION_CHOP
+            and chop_age_sec >= 600.0
+            and current_roi >= _coerce_float(profit_ladder.get('breakeven_floor_roi_pct', 0.0), 0.0)
+        ):
+            pos['lastExitDecision'] = 'RECLAIM_BE_CLOSE'
+            if hasattr(paper_trader, 'pipeline_metrics'):
+                paper_trader.pipeline_metrics.setdefault('v3_chop_tighten_count', 0)
+                paper_trader.pipeline_metrics['v3_chop_tighten_count'] += 1
+            paper_trader.close_via_engine(pos, current_price, 'RECLAIM_BE_CLOSE', 'V3_RUNNER')
+            actions["time_closed"].append(f"{pos.get('symbol')} reclaim_be")
+            return True
 
         partial_state = pos.get('partial_tp_state', {})
         triggered_slice = self._select_triggered_tp_slice_trail(pos, current_price)
@@ -28462,6 +29375,12 @@ class TimeBasedPositionManager:
                     logger.info(f"📊 POS_DEBUG: {symbol} age={age_hours:.1f}h pnl={unrealized_pnl:.2f} entry={entry_price:.4f} curr={current_price:.4f}")
 
                 if contracts > 0 and self._is_v3_runner_position(pos):
+                    if current_roi < 0 and age_hours >= 4.0 and not bool(pos.get('adverseStrongSeen', False)):
+                        if not bool(pos.get('_timeRecoveryBlockedNoted', False)):
+                            pos['_timeRecoveryBlockedNoted'] = True
+                            if hasattr(paper_trader, 'pipeline_metrics'):
+                                paper_trader.pipeline_metrics.setdefault('v3_time_recovery_blocked_count', 0)
+                                paper_trader.pipeline_metrics['v3_time_recovery_blocked_count'] += 1
                     _v3_handled = await self._handle_v3_runner_position(paper_trader, pos, current_price, actions)
                     if _v3_handled:
                         continue
@@ -34706,7 +35625,57 @@ class SignalGenerator:
             if struct_tp['adjusted']:
                 tp = struct_tp['tp']
                 reasons.append(f"TP_SR({struct_tp['source']})")
-        
+
+        _ct_preview = 'is_counter_trend' in dir() and bool(is_counter_trend)
+        _ct_strength_preview = float(blended_conf if ('blended_conf' in dir() and _ct_preview) else 0.0)
+        runner_context_preview = classify_v3_runner_context(
+            {
+                'strategyMode': strategy_mode,
+                'side': signal_side,
+                'coinDailyTrend': coin_daily_trend,
+                'counterTrend': _ct_preview,
+                'counterTrendStrength': _ct_strength_preview,
+                'adx': adx,
+                'hurst': hurst,
+                'volumeRatio': volume_ratio,
+                'isVolumeSpike': is_volume_spike,
+                'obImbalanceTrend': ob_imbalance_trend,
+            },
+            default_mode=strategy_mode,
+        )
+        entry_archetype = classify_signal_entry_archetype(
+            {
+                'strategyMode': strategy_mode,
+                'side': signal_side,
+                'breakout': breakout,
+                'runnerContext': runner_context_preview,
+                'coinDailyTrend': coin_daily_trend,
+                'counterTrend': _ct_preview,
+                'adx': adx,
+                'hurst': hurst,
+                'volumeRatio': volume_ratio,
+                'isVolumeSpike': is_volume_spike,
+                'obImbalanceTrend': ob_imbalance_trend,
+            },
+            default_mode=strategy_mode,
+        )
+        if entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
+            if not (volume_ratio >= 1.35 or is_volume_spike):
+                logger.info(
+                    f"🚫 CONTINUATION_LOW_VOLUME: {symbol} {signal_side} "
+                    f"vol={volume_ratio:.2f}x spike={is_volume_spike} ctx={runner_context_preview}"
+                )
+                return None
+            if not _is_side_ob_trend_aligned(signal_side, ob_imbalance_trend, threshold=2.0):
+                logger.info(
+                    f"🚫 CONTINUATION_OB_MISMATCH: {symbol} {signal_side} "
+                    f"ob_trend={ob_imbalance_trend:.2f} ctx={runner_context_preview}"
+                )
+                return None
+            reasons.append("ENTRY_ARCH(continuation)")
+        else:
+            reasons.append("ENTRY_ARCH(reclaim)")
+
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
         # =====================================================================
@@ -34861,6 +35830,8 @@ class SignalGenerator:
             'fibBlendAlpha': FIB_BLEND_ALPHA if fib_blend_applied else 0,
             'effectiveEntryTightness': effective_entry_tightness,
             'effectiveExitTightness': effective_exit_tightness,
+            'entryArchetype': entry_archetype,
+            'runnerContextResolved': runner_context_preview,
             'volumeRatio': round(volume_ratio, 2),
             'isVolumeSpike': is_volume_spike,
             'entryQualityCount': eq_pass_count,
@@ -34875,6 +35846,7 @@ class SignalGenerator:
             'entryTightnessMult': hybrid_entry.get('entry_tightness_mult', 1.0),
             'entryExecScore': exec_quality_score,
             'entryExecPassed': exec_quality_passed,
+            'entryExecStrictPassed': bool(exec_quality.get("strict_passed")),
             'entryExecNotes': exec_quality_notes,
             'compositeVolScore': comp_vol.get('score', 0),
             'compositeVolCategory': comp_vol.get('category', 'NORMAL'),
@@ -34885,11 +35857,18 @@ class SignalGenerator:
             'structuralTpLevel': struct_tp.get('structural_level'),
             'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
             'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
+            'limitedMarketOverrideEligible': False,
+            'limitedMarketOverrideUsed': False,
+            'continuationFlowState': V3_CONTINUATION_NEUTRAL,
+            'currentVolumeRatio': round(volume_ratio, 4),
+            'currentIsVolumeSpike': bool(is_volume_spike),
+            'currentImbalance': round(float(imbalance or 0.0), 4),
+            'currentObImbalanceTrend': round(float(ob_imbalance_trend or 0.0), 4),
         }
 
         def _build_full_signal_payload() -> dict:
-            _is_ct_for_profile = 'is_counter_trend' in dir() and bool(is_counter_trend)
-            _ct_str_for_profile = float(blended_conf if ('is_counter_trend' in dir() and is_counter_trend and 'blended_conf' in dir()) else 0.0)
+            _is_ct_for_profile = _ct_preview
+            _ct_str_for_profile = _ct_strength_preview
             _exec_profile = resolve_strategy_execution_profile(
                 mode=strategy_mode,
                 counter_trend=_is_ct_for_profile,
@@ -34902,6 +35881,11 @@ class SignalGenerator:
                     'coinDailyTrend': coin_daily_trend,
                     'counterTrend': _is_ct_for_profile,
                     'counterTrendStrength': _ct_str_for_profile,
+                    'adx': adx,
+                    'hurst': hurst,
+                    'volumeRatio': volume_ratio,
+                    'isVolumeSpike': is_volume_spike,
+                    'obImbalanceTrend': ob_imbalance_trend,
                 },
                 default_mode=strategy_mode,
             )
@@ -34972,11 +35956,13 @@ class SignalGenerator:
                 'runner_wide_profit_pct': _exec_profile.wide_to_normal_profit_pct,
                 'runner_wide_age_sec': _exec_profile.wide_to_normal_age_sec,
                 'runnerContext': _runner_controls_sig.get('runner_context', ''),
+                'runnerContextResolved': _runner_controls_sig.get('runner_context', runner_context_preview),
                 'exitOwner': _runner_controls_sig.get('exit_owner', LEGACY_EXIT_OWNER),
                 'tpCloseSplit': format_runner_close_split(_runner_controls_sig.get('tp_close_split', (0.30, 0.25, 0.25, 0.20))),
                 'tp1ArmDelaySec': _runner_controls_sig.get('trail_arm_delay_sec', 0),
                 'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
                 'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
+                'entryArchetype': entry_archetype,
                 'execution_style': _exec_style,
                 'structural_zone': _structural_zone_dict,
                 'structural_sr_levels': _structural_sr_snapshot,
@@ -37658,6 +38644,8 @@ class PaperTradingEngine:
             )
             return None
 
+        _limited_market_override = compute_limited_market_override_plan(signal or {}, pending_passed=False)
+
         # OVP-1: _pending_id already generated above (before sizing)
         pending_order = {
             "id": _pending_id,
@@ -37687,10 +38675,14 @@ class PaperTradingEngine:
             "liqEchoScore": _coerce_float(signal.get('liqEchoScore', 0.0) if signal else 0.0, 0.0),
             "liqEchoState": signal.get('liqEchoState', 'NONE') if signal else 'NONE',
             "liqEchoImpulseUsd": _coerce_float(signal.get('liqEchoImpulseUsd', 0.0) if signal else 0.0, 0.0),
+            "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
+            "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
             "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
             "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
             "refillFailureScore": _coerce_float(signal.get('refillFailureScore', 0.0) if signal else 0.0, 0.0),
             "quoteSurvivalMs": int(signal.get('quoteSurvivalMs', 0) if signal else 0),
+            "limitedMarketOverrideEligible": bool(_limited_market_override.get('eligible', False)),
+            "limitedMarketOverrideUsed": False,
             "size": position_size,
             "sizeUsd": position_size_usd,
             "marginUsd": _margin_usd,  # P0-2: explicit margin field
@@ -37720,10 +38712,21 @@ class PaperTradingEngine:
             "volatility_pct": (atr / price * 100) if price > 0 else 2.0,
             "spreadPct": signal.get('spreadPct', 0.05) if signal else 0.05,
             "volumeRatio": signal.get('volumeRatio', 1.0) if signal else 1.0,
+            "currentVolumeRatio": _coerce_float(signal.get('currentVolumeRatio', signal.get('volumeRatio', 1.0)) if signal else 1.0, 1.0),
+            "currentIsVolumeSpike": bool(signal.get('currentIsVolumeSpike', signal.get('isVolumeSpike', False)) if signal else False),
+            "currentImbalance": _coerce_float(signal.get('currentImbalance', signal.get('imbalance', 0.0)) if signal else 0.0, 0.0),
+            "currentObImbalanceTrend": _coerce_float(signal.get('currentObImbalanceTrend', signal.get('obImbalanceTrend', 0.0)) if signal else 0.0, 0.0),
+            "currentSpreadPct": _coerce_float(signal.get('spreadPct', 0.05) if signal else 0.05, 0.05),
+            "currentAtrPct": _coerce_float(signal.get('atrPct', signal.get('volatility_pct', 0.0)) if signal else 0.0, 0.0),
+            "currentMicrostructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
+            "currentFlowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 50.0) if signal else 50.0, 50.0),
+            "currentExecScore": _coerce_float(signal.get('entryExecScore', 0.0) if signal else 0.0, 0.0),
+            "continuationFlowState": V3_CONTINUATION_NEUTRAL,
             "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
             "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
             "entryThresholdMult": signal.get('entryThresholdMult', 1.0) if signal else 1.0,
             "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
+            "entryExecStrictPassed": bool(signal.get('entryExecStrictPassed', False)) if signal else False,
             "entryExecScoreMinSnapshot": float(getattr(live_binance_trader, 'exec_entry_score_min', 0.0) or 0.0),
             "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
             "entrySignalScoreSnapshot": signal.get('confidenceScore', 0) if signal else 0,
@@ -37787,10 +38790,12 @@ class PaperTradingEngine:
                 "entryExecScore": signal.get('entryExecScore', 0.0) if signal else 0.0,
                 "entryExecScoreMin": float(getattr(live_binance_trader, 'exec_entry_score_min', 0.0) or 0.0),
                 "entryExecPassed": signal.get('entryExecPassed', True) if signal else True,
+                "entryExecStrictPassed": bool(signal.get('entryExecStrictPassed', False)) if signal else False,
                 "forecastEdgeProb": _coerce_float(signal.get('forecastEdgeProb', 0.5) if signal else 0.5, 0.5),
                 "forecastBand": signal.get('forecastBand', 'NEUTRAL') if signal else 'NEUTRAL',
                 "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
                 "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
+                "limitedMarketOverrideEligible": bool(_limited_market_override.get('eligible', False)),
                 "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
                 "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
                 "entryDepthCover": _coerce_float(signal.get('entryDepthCover', 0.0) if signal else 0.0, 0.0),
@@ -37807,6 +38812,8 @@ class PaperTradingEngine:
                 "trailDistance": trail_distance,
                 "leverage": adjusted_leverage,
                 "sizeUsd": position_size_usd,
+                "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
+                "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
                 "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
                 "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
                 "entryStopRoiPct": round(compute_target_roi_pct(entry_price, sl, side, adjusted_leverage), 2),
@@ -38013,24 +39020,32 @@ class PaperTradingEngine:
                 fb_min_score -= 3
             elif forecast_band == 'WEAK':
                 fb_min_score += 4
+            limited_override_ready = bool(
+                order.get('limitedMarketOverrideEligible', False)
+                and not order.get('limitedMarketOverrideUsed', False)
+            )
                     
             # Check expiration first (with high-score market fallback for confirmed signals)
             if current_time > expires_at:
-                if is_confirmed and signal_score >= fb_min_score and current_price and current_price > 0:
-                    self.pipeline_metrics['market_fallback'] += 1
-                    self.pipeline_metrics['fallback_on_expire'] += 1
-                    self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
-                    logger.info(f"🔥 MARKET FALLBACK(EXPIRE): {side} {symbol} score={signal_score} age_expired → market fill")
-                    _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
-                    if not _executed:
-                        if order in self.pending_orders:
-                            self.pending_orders.remove(order)
-                        self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
-                        self.pipeline_metrics['fallback_gate_blocked'] += 1
-                        self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
-                        logger.info(f"🚫 MARKET FALLBACK BLOCKED(EXPIRE): {side} {symbol} | removing stale pending")
-                        self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
-                    continue
+                if is_confirmed and current_price and current_price > 0:
+                    if signal_score >= fb_min_score:
+                        self.pipeline_metrics['market_fallback'] += 1
+                        self.pipeline_metrics['fallback_on_expire'] += 1
+                        self.add_log(f"🔥 MARKET FALLBACK: {side} {symbol} score={signal_score} → pending expired, filling at market")
+                        logger.info(f"🔥 MARKET FALLBACK(EXPIRE): {side} {symbol} score={signal_score} age_expired → market fill")
+                        _executed = await self._gate_and_execute(order, current_price, opportunities, current_time, force_market=True)
+                        if not _executed:
+                            if order in self.pending_orders:
+                                self.pending_orders.remove(order)
+                            self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+                            self.pipeline_metrics['fallback_gate_blocked'] += 1
+                            self.set_pending_execution_feedback(order, "MARKET_FALLBACK_BLOCKED")
+                            logger.info(f"🚫 MARKET FALLBACK BLOCKED(EXPIRE): {side} {symbol} | removing stale pending")
+                            self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
+                        continue
+                    if limited_override_ready:
+                        await self._attempt_limited_market_override(order, current_price, opportunities, current_time, 'EXPIRE')
+                        continue
                 if order in self.pending_orders:
                     self.pending_orders.remove(order)
                 self.pipeline_metrics['pending_expired'] += 1
@@ -38505,6 +39520,9 @@ class PaperTradingEngine:
                                 logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
                                 self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
+                        if limited_override_ready:
+                            await self._attempt_limited_market_override(order, current_price, opportunities, current_time, 'TRAIL_FAIL')
+                            continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
@@ -38554,6 +39572,9 @@ class PaperTradingEngine:
                                 logger.info(f"🚫 MARKET FALLBACK BLOCKED(FAIL): {side} {symbol} | removing pending")
                                 self._finalize_forecast_event(order['id'], 'CANCELLED', 0, 'market_fallback_gate_block', current_time)
                             continue
+                        if limited_override_ready:
+                            await self._attempt_limited_market_override(order, current_price, opportunities, current_time, 'TRAIL_FAIL')
+                            continue
                         if order in self.pending_orders:
                             self.pending_orders.remove(order)
                         self.pipeline_metrics['trail_entry_fail'] += 1
@@ -38581,6 +39602,9 @@ class PaperTradingEngine:
                             logger.info(f"🚫 MARKET FALLBACK BLOCKED(TIMEOUT): {side} {symbol} | removing pending")
                             self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'market_fallback_gate_block', current_time)
                         continue
+                    if limited_override_ready:
+                        await self._attempt_limited_market_override(order, current_price, opportunities, current_time, 'TRAIL_TIMEOUT')
+                        continue
                     # Normal timeout
                     if order in self.pending_orders:
                         self.pending_orders.remove(order)
@@ -38596,6 +39620,37 @@ class PaperTradingEngine:
                 if elapsed_secs > 0 and int(elapsed_secs) % 30 < 4:
                     logger.debug(f"📍 TRAIL ENTRY WAIT: {side} {symbol} {elapsed_secs:.0f}s | price=${current_price:.6f} extreme=${extreme_price:.6f} dist={trail_pct:.2f}%")
     
+    async def _attempt_limited_market_override(
+        self,
+        order: dict,
+        fill_price: float,
+        opportunities: list,
+        current_time: int,
+        context_code: str,
+    ) -> bool:
+        """One-shot continuation-only market fallback without repricing/chasing."""
+        order['limitedMarketOverrideUsed'] = True
+        order['entry_method'] = 'LIMITED_MARKET_CONTINUATION'
+        self.pipeline_metrics.setdefault('continuation_market_override_count', 0)
+        self.pipeline_metrics['continuation_market_override_count'] += 1
+        self.add_log(
+            f"⚡ LIMITED_MARKET_CONTINUATION: {order.get('side','')} {order.get('symbol','')} "
+            f"context={context_code}"
+        )
+        executed = await self._gate_and_execute(order, fill_price, opportunities, current_time, force_market=True)
+        if not executed:
+            if order in self.pending_orders:
+                self.pending_orders.remove(order)
+            self.pipeline_metrics.setdefault('fallback_gate_blocked', 0)
+            self.pipeline_metrics['fallback_gate_blocked'] += 1
+            self.set_pending_execution_feedback(order, "LIMITED_MARKET_CONTINUATION_BLOCKED")
+            logger.info(
+                f"🚫 LIMITED_MARKET_CONTINUATION_BLOCKED: {order.get('side','')} {order.get('symbol','')} "
+                f"context={context_code}"
+            )
+            self._finalize_forecast_event(order.get('id', ''), 'CANCELLED', 0, 'limited_market_override_blocked', current_time)
+        return executed
+
     async def _gate_and_execute(self, order: dict, fill_price: float,
                                  opportunities: list, current_time: int,
                                  force_market: bool = False) -> bool:
@@ -39281,6 +40336,7 @@ class PaperTradingEngine:
             "signalId": order.get('signalId', ''),
             "symbol": order['symbol'],
             "side": order['side'],
+            "entry_method": order.get('entry_method', 'MARKET'),
             "entryPrice": fill_price,
             "size": order['size'],
             "sizeUsd": order['sizeUsd'],
@@ -39349,6 +40405,8 @@ class PaperTradingEngine:
             "evSoftThresholdApplied": order.get('evSoftThresholdApplied', 0.0),
             "evHardThresholdApplied": order.get('evHardThresholdApplied', 0.0),
             "entryImbalance": order.get('entryImbalance', 0.0),
+            "entryArchetype": order.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+            "runnerContextResolved": order.get('runnerContextResolved', order.get('runnerContext', '')),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
@@ -39379,6 +40437,35 @@ class PaperTradingEngine:
             "oppositePressureCount": 0,
             "oppositeBestScore": 0.0,
             "oppositeLastSeenTs": 0,
+            "currentVolumeRatio": order.get('currentVolumeRatio', order.get('volumeRatio', 1.0)),
+            "currentIsVolumeSpike": bool(order.get('currentIsVolumeSpike', False)),
+            "currentImbalance": order.get('currentImbalance', order.get('entryImbalance', 0.0)),
+            "currentObImbalanceTrend": order.get('currentObImbalanceTrend', 0.0),
+            "currentSpreadPct": order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
+            "currentAtrPct": order.get('currentAtrPct', order.get('volatility_pct', 0.0)),
+            "currentMicrostructureScore": order.get('currentMicrostructureScore', order.get('microstructureScore', 0.0)),
+            "currentFlowToxicityScore": order.get('currentFlowToxicityScore', order.get('flowToxicityScore', 50.0)),
+            "currentExecScore": order.get('currentExecScore', order.get('entryExecScore', 0.0)),
+            "continuationFlowState": order.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
+            "underwaterTapeState": V3_UNDERWATER_NEUTRAL,
+            "underwaterPriceLossPct": 0.0,
+            "underwaterAtrDist": 0.0,
+            "smallLossBandPct": 1.0,
+            "worstUnderwaterPrice": 0.0,
+            "worstUnderwaterTs": 0.0,
+            "sidewaysSinceTs": 0.0,
+            "sidewaysReclaimArmed": False,
+            "lossGateSuppressedReason": "",
+            "adverseStrongSinceTs": 0.0,
+            "adverseStrongSeen": False,
+            "preStopHoldUntilTs": 0,
+            "preStopHoldArmed": False,
+            "preStopHoldUsed": False,
+            "preStopHoldReleasedReason": "",
+            "preStopHoldBreachRoiPct": 0.0,
+            "chopSinceTs": 0,
+            "lastSupportiveFlowTs": 0,
+            "chopTightenActive": False,
             "recoveryStage": 0,
             "recoveryReason": "",
             "signalInvalidationReduced": False,
@@ -39401,6 +40488,8 @@ class PaperTradingEngine:
             "structural_zone": order.get('structural_zone', {}),
             "structural_fallback_stage": order.get('structural_fallback_stage', ''),
             "struct_partial_tp_pct": order.get('struct_partial_tp_pct', 0),
+            "limitedMarketOverrideEligible": bool(order.get('limitedMarketOverrideEligible', False)),
+            "limitedMarketOverrideUsed": bool(order.get('limitedMarketOverrideUsed', False)),
             # Phase 214: Failed Continuation Detector
             "fc_was_in_profit": False,
             "fc_failed_count": 0,
@@ -40134,7 +41223,11 @@ class PaperTradingEngine:
     def check_loss_recovery(self, pos: dict, current_price: float, atr: float) -> bool:
         """If in loss and recovering, trail to minimize loss."""
         entry = pos['entryPrice']
-        
+        if normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER:
+            underwater_state = str(pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+            if underwater_state != V3_UNDERWATER_ADVERSE_STRONG and not bool(pos.get('adverseStrongSeen', False)):
+                return False
+
         # RFX-2D: Counter-trend gets wider thresholds
         _is_ct_lr = COUNTER_EXIT_RELAX_ENABLED and pos.get('counterTrend', False)
         _lr_loss_threshold = 5 if _is_ct_lr else 3    # 5% vs 3%
@@ -41467,6 +42560,8 @@ class PaperTradingEngine:
             return 'TRAIL_TIGHT_EXIT'
         if 'PROFIT_GIVEBACK_EXIT' in r:
             return 'PROFIT_GIVEBACK_EXIT'
+        if 'SIDEWAYS_RECLAIM_CLOSE' in r:
+            return 'SIDEWAYS_RECLAIM_CLOSE'
         if 'RECLAIM_BE_CLOSE' in r:
             return 'RECLAIM_BE_CLOSE'
         if 'PRE_STOP_REDUCE' in r:
@@ -41555,6 +42650,7 @@ class PaperTradingEngine:
             'TRAIL_NORMAL_EXIT': f"📈 TRAIL NORMAL: Ana kâr koruma çıkışı ({pnl_percent:+.1f}%)",
             'TRAIL_TIGHT_EXIT': f"📈 TRAIL TIGHT: Sıkı kâr koruma çıkışı ({pnl_percent:+.1f}%)",
             'PROFIT_GIVEBACK_EXIT': f"📈 GIVEBACK: Zirveden kontrollü geri verme çıkışı ({pnl_percent:+.1f}%)",
+            'SIDEWAYS_RECLAIM_CLOSE': f"🔒 SIDEWAYS RECLAIM: Yatay zararda BE tabanından çıkış ({pnl_percent:+.1f}%)",
 
             # Kill Switch
             'KILL_SWITCH_FULL': f"⚠️ KILL: Kill Switch Tam Kapatma ({pnl_percent:+.1f}%)",
@@ -41696,6 +42792,7 @@ class PaperTradingEngine:
             'TRAIL_TIGHT_EXIT',
             'PROFIT_GIVEBACK_EXIT',
             'BREAKEVEN_CLOSE',
+            'SIDEWAYS_RECLAIM_CLOSE',
             'RECLAIM_BE_CLOSE',
             'EMERGENCY_SL',
         ] and sl_price > 0:
@@ -41703,6 +42800,13 @@ class PaperTradingEngine:
                 reason = f"SLIPPAGE_EXIT({original_reason})"
             elif side == 'SHORT' and exit_price < sl_price:
                 reason = f"SLIPPAGE_EXIT({original_reason})"
+
+        if (
+            normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER
+            and str(pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL) == V3_CONTINUATION_SUPPORTING
+        ):
+            self.pipeline_metrics.setdefault('v3_supporting_flow_exit_count', 0)
+            self.pipeline_metrics['v3_supporting_flow_exit_count'] += 1
         
         # Record trade
         trade = {
@@ -41758,6 +42862,8 @@ class PaperTradingEngine:
             "runner_tp_tighten": pos.get('runner_tp_tighten', 1.0),
             "runner_be_buffer_mult": pos.get('runner_be_buffer_mult', 1.0),
             "runnerContext": pos.get('runnerContext', ''),
+            "runnerContextResolved": pos.get('runnerContextResolved', pos.get('runnerContext', '')),
+            "entryArchetype": pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
             "tpCloseSplit": pos.get('tpCloseSplit', ''),
             "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
@@ -41769,6 +42875,21 @@ class PaperTradingEngine:
             "recoveryStage": int(pos.get('recoveryStage', 0) or 0),
             "internalProtectionOnly": bool(pos.get('internalProtectionOnly', False)),
             "lastExitDecision": pos.get('lastExitDecision', ''),
+            "continuationFlowState": pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
+            "underwaterTapeState": pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
+            "underwaterPriceLossPct": _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
+            "underwaterAtrDist": _coerce_float(pos.get('underwaterAtrDist', 0.0), 0.0),
+            "smallLossBandPct": _coerce_float(pos.get('smallLossBandPct', 1.0), 1.0),
+            "currentVolumeRatio": _coerce_float(pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0)), 1.0),
+            "currentObImbalanceTrend": _coerce_float(pos.get('currentObImbalanceTrend', 0.0), 0.0),
+            "currentImbalance": _coerce_float(pos.get('currentImbalance', pos.get('entryImbalance', 0.0)), 0.0),
+            "preStopHoldArmed": bool(pos.get('preStopHoldArmed', False)),
+            "preStopHoldReleasedReason": pos.get('preStopHoldReleasedReason', ''),
+            "chopTightenActive": bool(pos.get('chopTightenActive', False)),
+            "sidewaysReclaimArmed": bool(pos.get('sidewaysReclaimArmed', False)),
+            "lossGateSuppressedReason": pos.get('lossGateSuppressedReason', ''),
+            "adverseStrongSinceTs": _coerce_float(pos.get('adverseStrongSinceTs', 0.0), 0.0),
+            "limitedMarketOverrideUsed": bool(pos.get('limitedMarketOverrideUsed', False)),
             # RFX-3A: Execution style close telemetry
             "execution_style": pos.get('execution_style', 'MARKET'),
             "structural_fallback_stage": pos.get('structural_fallback_stage', ''),
@@ -41821,6 +42942,23 @@ class PaperTradingEngine:
                 'recoveryStage': int(pos.get('recoveryStage', 0) or 0),
                 'internalProtectionOnly': bool(pos.get('internalProtectionOnly', False)),
                 'lastExitDecision': pos.get('lastExitDecision', ''),
+                'entryArchetype': pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+                'runnerContextResolved': pos.get('runnerContextResolved', pos.get('runnerContext', '')),
+                'continuationFlowState': pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
+                'underwaterTapeState': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
+                'underwaterPriceLossPct': _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
+                'underwaterAtrDist': _coerce_float(pos.get('underwaterAtrDist', 0.0), 0.0),
+                'smallLossBandPct': _coerce_float(pos.get('smallLossBandPct', 1.0), 1.0),
+                'currentVolumeRatio': _coerce_float(pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0)), 1.0),
+                'currentObImbalanceTrend': _coerce_float(pos.get('currentObImbalanceTrend', 0.0), 0.0),
+                'currentImbalance': _coerce_float(pos.get('currentImbalance', pos.get('entryImbalance', 0.0)), 0.0),
+                'preStopHoldArmed': bool(pos.get('preStopHoldArmed', False)),
+                'preStopHoldReleasedReason': pos.get('preStopHoldReleasedReason', ''),
+                'chopTightenActive': bool(pos.get('chopTightenActive', False)),
+                'sidewaysReclaimArmed': bool(pos.get('sidewaysReclaimArmed', False)),
+                'lossGateSuppressedReason': pos.get('lossGateSuppressedReason', ''),
+                'adverseStrongSinceTs': _coerce_float(pos.get('adverseStrongSinceTs', 0.0), 0.0),
+                'limitedMarketOverrideUsed': bool(pos.get('limitedMarketOverrideUsed', False)),
                 'runtimeProfitPhase': pos.get('runtimeProfitPhase', 'WAIT'),
                 'runtimeProfitOwner': pos.get('runtimeProfitOwner', 'NONE'),
                 'runtimeProfitPeakRoiPct': float(pos.get('runtimeProfitPeakRoiPct', pos.get('profitPeakRoiPct', 0.0)) or 0.0),
@@ -43049,6 +44187,7 @@ class ExitDecisionEngine:
         'SL_HIT': 88,            # FIX #4 (Joint Audit): SL must outrank PROTECTION_LOCK and below
         'PROTECTION_LOCK': 85,
         'BREAKEVEN_CLOSE': 73,
+        'SIDEWAYS_RECLAIM_CLOSE': 72,
         'RECLAIM_BE_CLOSE': 72,
         'FAILED_CONTINUATION': 70,
         'PROFIT_GIVEBACK_EXIT': 66,
@@ -43082,6 +44221,7 @@ class ExitDecisionEngine:
             return reason_upper.split('(')[0].strip(), 'PROFIT'
         if 'SL_HIT' in reason_upper: return 'SL_HIT', 'LOSS'
         if 'EMERGENCY_SL' in reason_upper: return 'EMERGENCY_SL', 'LOSS'
+        if 'SIDEWAYS_RECLAIM_CLOSE' in reason_upper: return 'SIDEWAYS_RECLAIM_CLOSE', 'PROFIT'
         if 'RECLAIM_BE_CLOSE' in reason_upper: return 'RECLAIM_BE_CLOSE', 'PROFIT'
         if 'PROFIT_GIVEBACK_EXIT' in reason_upper: return 'PROFIT_GIVEBACK_EXIT', 'PROFIT'
         if 'RECOVERY_TRAIL_CLOSE' in reason_upper: return 'RECOVERY_TRAIL_CLOSE', 'LOSS'
