@@ -637,12 +637,14 @@ export default function App() {
   const [lastUpdateTime, setLastUpdateTime] = useState<Date | null>(null);
   const [lastFastTickMs, setLastFastTickMs] = useState<number>(0);
   const [isConnected, setIsConnected] = useState(false);
+  const [headerOffsetPx, setHeaderOffsetPx] = useState<number>(104);
   const [signalPriceFlash, setSignalPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
   const [positionPriceFlash, setPositionPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
   const signalPriceRef = useRef<Record<string, number>>({});
   const positionPriceRef = useRef<Record<string, number>>({});
   const signalFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const positionFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
 
   // Settings Modal
   const [showSettings, setShowSettings] = useState(false);
@@ -1709,6 +1711,30 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isRunning]);
 
+  useEffect(() => {
+    const headerEl = headerRef.current;
+    if (!headerEl) return;
+
+    const updateHeaderOffset = () => {
+      const nextHeight = Math.ceil(headerEl.getBoundingClientRect().height) + 12;
+      setHeaderOffsetPx(prev => (Math.abs(prev - nextHeight) > 1 ? nextHeight : prev));
+    };
+
+    updateHeaderOffset();
+
+    const resizeObserver = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => updateHeaderOffset())
+      : null;
+
+    resizeObserver?.observe(headerEl);
+    window.addEventListener('resize', updateHeaderOffset);
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', updateHeaderOffset);
+    };
+  }, [showPostExitWatchSummary, settings.strategyMode, autoTradeEnabled, isRunning, isConnected, fastTickFresh, lastUpdateTime]);
+
   const fastTickFresh = lastFastTickMs > 0 && (Date.now() - lastFastTickMs) <= 1200;
   const settingsAtrPreviewPct = (() => {
     const atrPcts = portfolio.positions
@@ -1752,7 +1778,7 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="fixed top-0 left-0 right-0 bg-[#0B0E14]/84 backdrop-blur-xl border-b border-slate-800 z-50 px-3 md:px-6">
+      <header ref={headerRef} className="fixed top-0 left-0 right-0 bg-[#0B0E14]/84 backdrop-blur-xl border-b border-slate-800 z-50 px-3 md:px-6">
         <div className="flex h-14 md:h-16 items-center justify-between gap-3 lg:h-auto lg:flex-col lg:items-stretch lg:gap-3 lg:py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2 md:gap-3">
@@ -1903,7 +1929,10 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="pt-16 md:pt-24 lg:pt-40 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+      <main
+        className="px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]"
+        style={{ paddingTop: `${headerOffsetPx}px` }}
+      >
 
         {/* Tab Navigation */}
         <TabNavigation
