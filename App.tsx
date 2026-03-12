@@ -280,6 +280,21 @@ const formatReentryOriginLabel = (item: any): string => {
   return '';
 };
 
+const HeaderStat: React.FC<{
+  label: string;
+  value: React.ReactNode;
+  accentClass?: string;
+  suffix?: React.ReactNode;
+}> = ({ label, value, accentClass = 'text-white', suffix }) => (
+  <div className="min-w-0">
+    <div className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{label}</div>
+    <div className={`mt-1 flex items-baseline gap-1 text-sm font-semibold ${accentClass}`}>
+      <span className="truncate">{value}</span>
+      {suffix ? <span className="text-[10px] font-normal text-slate-500">{suffix}</span> : null}
+    </div>
+  </div>
+);
+
 const getPositionDecisionSummary = (pos: any) => ({
   ...buildDecisionSummary(pos),
   positionThesisState: resolveSnapshotString(pos, 'positionThesisState'),
@@ -1709,6 +1724,10 @@ export default function App() {
     || postExitWatchersActive > 0
     || postExitWatchersCandidates > 0
     || postExitWatchersTriggered > 0;
+  const desktopHeaderGridClass = showPostExitWatchSummary
+    ? 'hidden lg:grid lg:grid-cols-[minmax(0,1.55fr)_minmax(240px,0.8fr)_minmax(280px,0.95fr)] gap-3'
+    : 'hidden lg:grid lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)] gap-3';
+  const executionSourceLabel = resolveExecutionSourceForUI(portfolio.positions, executableSignals, marketRegime);
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-slate-300 font-sans selection:bg-indigo-500/30">
@@ -1733,129 +1752,158 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="fixed top-0 left-0 right-0 h-14 md:h-16 bg-[#0B0E14]/80 backdrop-blur-md border-b border-slate-800 z-50 px-3 md:px-6 flex items-center justify-between">
-        <div className="flex items-center gap-2 md:gap-4">
-          <div className="flex items-center gap-2 md:gap-3">
-            <div className="w-8 h-8 md:w-10 md:h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <Waves className="w-5 h-5 md:w-6 md:h-6 text-white" />
+      <header className="fixed top-0 left-0 right-0 bg-[#0B0E14]/84 backdrop-blur-xl border-b border-slate-800 z-50 px-3 md:px-6">
+        <div className="flex h-14 md:h-16 items-center justify-between gap-3 lg:h-auto lg:flex-col lg:items-stretch lg:gap-3 lg:py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2 md:gap-3">
+              <div className="w-8 h-8 md:w-10 md:h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                <Waves className="w-5 h-5 md:w-6 md:h-6 text-white" />
+              </div>
+              <div className="min-w-0">
+                <h1 className="truncate text-sm md:text-lg font-bold text-white leading-tight">
+                  QuantMonitor <span className="hidden sm:inline text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span>
+                </h1>
+                <div className="flex items-center gap-1 md:gap-2 text-[10px] md:text-xs text-slate-500">
+                  <span className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
+                  {isRunning ? 'Aktif' : 'Duraklatıldı'}
+                  <span className="hidden xl:inline text-slate-600">•</span>
+                  <span className="hidden xl:inline-flex items-center gap-1 text-slate-500">
+                    <Network className={`w-3.5 h-3.5 ${isConnected ? 'text-cyan-400' : 'text-slate-600'}`} />
+                    {isConnected ? 'Bağlı' : 'Bağlantı yok'}
+                  </span>
+                </div>
+              </div>
             </div>
-            <div>
-              <h1 className="text-sm md:text-lg font-bold text-white leading-tight">QuantMonitor <span className="hidden sm:inline text-xs uppercase px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">Pro</span></h1>
-              <div className="flex items-center gap-1 md:gap-2 text-[10px] md:text-xs text-slate-500">
-                <span className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
-                {isRunning ? 'Aktif' : 'Duraklatıldı'}
+
+            <div className="flex items-center gap-2 md:gap-3">
+              <button
+                onClick={handleToggleAutoTrade}
+                className={`flex items-center gap-1 md:gap-2 px-2 md:px-3 py-1.5 rounded-lg font-bold text-[10px] md:text-xs transition-all border ${autoTradeEnabled
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+                  }`}
+              >
+                <div className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
+                <span className="hidden sm:inline">{autoTradeEnabled ? 'OTOMATİK AÇIK' : 'OTOMATİK KAPALI'}</span>
+              </button>
+
+              <button
+                onClick={handleReset}
+                className="hidden sm:flex items-center gap-1.5 px-2 md:px-3 py-1.5 rounded-lg font-medium text-xs bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
+                title="Sistemi Sıfırla"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Sıfırla</span>
+              </button>
+
+              <button
+                onClick={handleToggleScanner}
+                className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-bold transition-all shadow-lg text-xs md:text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
+              >
+                {isRunning ? <Square className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" /> : <Play className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" />}
+                {isRunning ? 'Durdur' : 'Başlat'}
+              </button>
+
+              <button
+                onClick={() => setShowSettings(true)}
+                className="w-8 h-8 md:w-9 md:h-9 rounded-lg flex items-center justify-center bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700 transition-all"
+              >
+                <Settings className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className={desktopHeaderGridClass}>
+            <div className="rounded-2xl border border-slate-800/80 bg-slate-950/60 px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                  <Radar className={`w-4 h-4 ${isConnected ? 'text-indigo-400' : 'text-slate-600'}`} />
+                  Canlı Özet
+                </div>
+                <div className="flex items-center gap-2">
+                  {lastUpdateTime && (
+                    <span className="text-xs text-slate-500">
+                      Son: <span className="text-slate-300">{lastUpdateTime.toLocaleTimeString('tr-TR')}</span>
+                    </span>
+                  )}
+                  {lastFastTickMs > 0 && (
+                    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-semibold ${fastTickFresh
+                      ? 'border-cyan-500/25 bg-cyan-500/10 text-cyan-300'
+                      : 'border-slate-700 bg-slate-900/70 text-slate-500'
+                      }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${fastTickFresh ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`}></span>
+                      Hızlı
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-5 gap-4">
+                <HeaderStat
+                  label="Varlık"
+                  value={scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}
+                  suffix={`/${scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}`}
+                />
+                <HeaderStat label="Uzun" value={displayLongSignals} accentClass="text-emerald-300" />
+                <HeaderStat label="Kısa" value={displayShortSignals} accentClass="text-rose-300" />
+                <HeaderStat label="Bağlantı" value={isConnected ? 'Canlı' : 'Kesik'} accentClass={isConnected ? 'text-cyan-300' : 'text-slate-400'} />
+                <HeaderStat label="Durum" value={isRunning ? 'Tarama açık' : 'Beklemede'} accentClass={isRunning ? 'text-emerald-300' : 'text-slate-400'} />
+              </div>
+            </div>
+
+            {showPostExitWatchSummary && (
+              <div className="rounded-2xl border border-violet-500/15 bg-gradient-to-br from-violet-500/8 via-slate-950/60 to-slate-950/70 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-violet-300">Post-Exit Watch</div>
+                  <span className="inline-flex items-center rounded-full border border-violet-500/20 bg-violet-500/10 px-2 py-1 text-[10px] font-semibold text-violet-200">
+                    Re-entry izleme
+                  </span>
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-3">
+                  <HeaderStat label="Watch" value={postExitWatchersActive} accentClass="text-violet-200" />
+                  <HeaderStat label="Aday" value={postExitWatchersCandidates} accentClass="text-cyan-300" />
+                  <HeaderStat label="2. Şans" value={postExitWatchersTriggered} accentClass="text-amber-300" />
+                </div>
+              </div>
+            )}
+
+            <div className={`rounded-2xl border px-4 py-3 ${settings.strategyMode === 'SMART_V3_RUNNER'
+              ? 'border-amber-500/20 bg-gradient-to-br from-amber-500/10 via-slate-950/65 to-slate-950/70'
+              : settings.strategyMode === 'SMART_V2'
+                ? 'border-cyan-500/20 bg-gradient-to-br from-cyan-500/10 via-slate-950/65 to-slate-950/70'
+                : 'border-slate-800/80 bg-slate-950/60'
+              }`}>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500">Motor</div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-bold uppercase ${settings.strategyMode === 'SMART_V3_RUNNER'
+                      ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                      : settings.strategyMode === 'SMART_V2'
+                        ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
+                        : 'border-slate-700 bg-slate-900/70 text-slate-300'
+                      }`}>
+                      <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
+                      {settings.strategyMode}
+                    </span>
+                  </div>
+                </div>
+                {phase193Status?.stoploss_guard?.global_locked && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/25 bg-rose-500/10 px-2 py-1 text-[10px] font-semibold uppercase text-rose-300">
+                    <Lock className="w-3 h-3" />
+                    SL Kalkanı
+                  </span>
+                )}
+              </div>
+              <div className="mt-3 text-xs text-slate-400">
+                Profil: <span className="text-slate-200">{executionSourceLabel}</span>
               </div>
             </div>
           </div>
-
-          {/* Scanner Stats - Hidden on mobile */}
-          <div className="hidden lg:flex items-center gap-3 px-4 py-2 bg-slate-800/50 rounded-lg border border-slate-700 ml-4">
-            <div className="relative">
-              <Radar className={`w-5 h-5 ${isConnected ? 'text-indigo-400 animate-pulse' : 'text-slate-500'}`} />
-              <span className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
-            </div>
-            <div className="flex items-center gap-4 text-xs">
-              <span className="text-slate-400">
-                <span className="font-bold text-white">{scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}</span>
-                <span className="text-slate-600">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span> Varlık
-              </span>
-              <span className="text-emerald-400">
-                🟢 <span className="font-bold">{displayLongSignals}</span>
-              </span>
-              <span className="text-rose-400">
-                🔴 <span className="font-bold">{displayShortSignals}</span>
-              </span>
-              {showPostExitWatchSummary && (
-                <>
-                  <span className="text-violet-300 border-l border-slate-700 pl-3">
-                    Watch <span className="font-bold">{postExitWatchersActive}</span>
-                  </span>
-                  <span className="text-cyan-300">
-                    Aday <span className="font-bold">{postExitWatchersCandidates}</span>
-                  </span>
-                  <span className="text-amber-300">
-                    2. Şans <span className="font-bold">{postExitWatchersTriggered}</span>
-                  </span>
-                </>
-              )}
-              {lastUpdateTime && (
-                <span className="text-slate-500 border-l border-slate-700 pl-3">
-                  Son: {lastUpdateTime.toLocaleTimeString('tr-TR')}
-                </span>
-              )}
-              {lastFastTickMs > 0 && (
-                <span className={`border-l border-slate-700 pl-3 flex items-center gap-1.5 font-semibold ${fastTickFresh ? 'text-cyan-400' : 'text-slate-600'}`}>
-                  <span className={`w-1.5 h-1.5 rounded-full ${fastTickFresh ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`}></span>
-                  HIZLI
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Phase 193: SL Guard Lock Badge */}
-          {phase193Status?.stoploss_guard?.global_locked && (
-            <div className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-rose-500/10 border border-rose-500/30 rounded-lg animate-pulse">
-              <Lock className="w-3.5 h-3.5 text-rose-400" />
-              <span className="text-[10px] font-bold text-rose-400 uppercase">SL Kalkanı</span>
-            </div>
-          )}
-
-          {/* SMART_V3_RUNNER: Strategy chip + execution profile source */}
-          <div className={`hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[10px] font-bold uppercase ${settings.strategyMode === 'SMART_V3_RUNNER'
-            ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
-            : settings.strategyMode === 'SMART_V2'
-              ? 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400'
-              : 'bg-slate-800/50 border-slate-700/30 text-slate-400'
-            }`}>
-            <span>{settings.strategyMode === 'SMART_V3_RUNNER' ? '🔥' : settings.strategyMode === 'SMART_V2' ? '⚡' : '🛡️'}</span>
-            <span>{settings.strategyMode}</span>
-            <span className="text-[8px] font-normal normal-case opacity-70">
-              profil: {resolveExecutionSourceForUI(portfolio.positions, executableSignals, marketRegime)}
-            </span>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2 md:gap-4">
-
-          <button
-            onClick={handleToggleAutoTrade}
-            className={`flex items-center gap-1 md:gap-2 px-2 md:px-3 py-1.5 rounded-lg font-bold text-[10px] md:text-xs transition-all border ${autoTradeEnabled
-              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-              : 'bg-slate-800 text-slate-400 border-slate-700'
-              }`}
-          >
-            <div className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${autoTradeEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
-            <span className="hidden sm:inline">{autoTradeEnabled ? 'OTOMATİK AÇIK' : 'OTOMATİK KAPALI'}</span>
-          </button>
-
-          <button
-            onClick={handleReset}
-            className="hidden sm:flex items-center gap-1.5 px-2 md:px-3 py-1.5 rounded-lg font-medium text-xs bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 border border-slate-700 transition-all"
-            title="Sistemi Sıfırla"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Sıfırla</span>
-          </button>
-
-          <button
-            onClick={handleToggleScanner}
-            className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-bold transition-all shadow-lg text-xs md:text-sm ${isRunning ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-500/20' : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-emerald-500/20'}`}
-          >
-            {isRunning ? <Square className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" /> : <Play className="w-3 h-3 md:w-3.5 md:h-3.5 fill-current" />}
-            {isRunning ? 'Durdur' : 'Başlat'}
-          </button>
-
-          <button
-            onClick={() => setShowSettings(true)}
-            className="w-8 h-8 md:w-9 md:h-9 rounded-lg flex items-center justify-center bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700 transition-all"
-          >
-            <Settings className="w-4 h-4" />
-          </button>
         </div>
       </header>
 
       {/* Main Content */}
-      <main className="pt-16 md:pt-24 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
+      <main className="pt-16 md:pt-24 lg:pt-40 px-3 md:px-6 pb-6 max-w-[1920px] mx-auto min-h-[calc(100vh-80px)]">
 
         {/* Tab Navigation */}
         <TabNavigation
