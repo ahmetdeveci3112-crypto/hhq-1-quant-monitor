@@ -82,6 +82,16 @@ def _json_loads_safe(value: Any, fallback: Any = None) -> Any:
         return fallback
 
 
+SYNC_ENTRY_ACTIVATION_GRACE_SEC = float(os.environ.get("SYNC_ENTRY_ACTIVATION_GRACE_SEC", "20"))
+SYNC_PROFIT_LOCK_MIN_AGE_SEC = float(os.environ.get("SYNC_PROFIT_LOCK_MIN_AGE_SEC", "45"))
+SYNC_PROFIT_LOCK_MIN_ROI_PCT = float(os.environ.get("SYNC_PROFIT_LOCK_MIN_ROI_PCT", "2.0"))
+SYNC_PROFIT_LOCK_MIN_ATR_DISTANCE = float(os.environ.get("SYNC_PROFIT_LOCK_MIN_ATR_DISTANCE", "0.25"))
+SYNC_DB_META_TIME_DRIFT_MS = int(float(os.environ.get("SYNC_DB_META_TIME_DRIFT_MS", "300000")))
+SLIPPAGE_EXIT_TICK_TOLERANCE = max(1, int(os.environ.get("SLIPPAGE_EXIT_TICK_TOLERANCE", "2")))
+SLIPPAGE_EXIT_FALLBACK_BPS = max(0.1, float(os.environ.get("SLIPPAGE_EXIT_FALLBACK_BPS", "2.0")))
+SLIPPAGE_EXIT_MAX_VALID_TICK_BPS = max(0.5, float(os.environ.get("SLIPPAGE_EXIT_MAX_VALID_TICK_BPS", "10.0")))
+
+
 def _reason_group_from_reason(reason: str) -> str:
     """Cross-strategy analytics bucket for close reasons."""
     upper = str(reason or "").upper()
@@ -2129,6 +2139,7 @@ class SQLiteManager:
                     'takeProfit': pos.get('takeProfit', 0),
                     'trailActivation': pos.get('trailActivation', 0),
                     'trailingStop': pos.get('trailingStop', 0),
+                    'exchangeSlPrice': pos.get('exchange_sl_price', 0),
                     'leverage': pos.get('leverage', 10),
                     'marginUsd': pos.get('marginUsd', 0),
                 })),
@@ -7758,6 +7769,16 @@ async def binance_position_sync_loop():
                 
                 for bp in binance_positions:
                     symbol = bp.get('symbol', '')
+                    _entry_hint = getattr(global_paper_trader, 'entry_activation_hints', {}).get(symbol)
+                    if _entry_hint:
+                        _hint_age = time.time() - float(_entry_hint.get('ts', 0.0) or 0.0)
+                        if _hint_age <= SYNC_ENTRY_ACTIVATION_GRACE_SEC:
+                            logger.info(
+                                f"⏳ SYNC_OPENING_GRACE_SKIP: {symbol} "
+                                f"source={_entry_hint.get('source', 'unknown')} age={_hint_age:.1f}s"
+                            )
+                            continue
+                        getattr(global_paper_trader, 'entry_activation_hints', {}).pop(symbol, None)
                     _sync_runner_controls = resolve_runner_exit_controls(
                         payload=bp,
                         default_mode=getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -7788,6 +7809,9 @@ async def binance_position_sync_loop():
                         # New position (manual or from previous session) - add with default params
                         entry_price = bp.get('entryPrice', 0)
                         mark_price = bp.get('markPrice', entry_price)
+                        sync_open_time_ms = int(bp.get('openTime', 0) or 0)
+                        sync_age_sec = max(0.0, time.time() - (sync_open_time_ms / 1000.0)) if sync_open_time_ms > 0 else (SYNC_PROFIT_LOCK_MIN_AGE_SEC + 1.0)
+                        exchange_be_price = float(bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', 0.0)) or 0.0)
                         
                         # ================================================================
                         # Phase 151: Dynamic volatility calculation for synced positions
@@ -7853,30 +7877,46 @@ async def binance_position_sync_loop():
                         _eff_sl_dist = max(_sl_dist_from_atr, _sl_dist_from_lev)
                         _eff_tp_dist = max(_tp_dist_from_atr, _tp_dist_from_lev) * _sync_runner_controls['tp_tighten']
 
+                        _allow_sync_profit_lock, _sync_profit_ctx = should_sync_lock_profit(
+                            entry_price=entry_price,
+                            mark_price=mark_price,
+                            side=bp.get('side', 'LONG'),
+                            leverage=_sync_leverage,
+                            atr=atr,
+                            age_sec=sync_age_sec,
+                            spread_pct=sync_spread_pct,
+                            exchange_break_even_price=exchange_be_price,
+                        )
+
                         if bp['side'] == 'LONG':
-                            # For LONG: if mark > entry, position is profitable
-                            if mark_price > entry_price:
-                                # Phase 243: Protect 50% of unrealized profit instead of breakeven
+                            if mark_price > entry_price and _allow_sync_profit_lock:
                                 profit_distance = mark_price - entry_price
-                                stop_loss = entry_price + (profit_distance * 0.5)  # Lock 50% profit
+                                stop_loss = entry_price + (profit_distance * 0.5)
                                 take_profit = mark_price + _eff_tp_dist
-                                trail_activation = entry_price + min_trail_distance  # Phase 210: Min 0.5 ATR from entry
+                                trail_activation = entry_price + min_trail_distance
                             else:
                                 stop_loss = entry_price - _eff_sl_dist
                                 take_profit = entry_price + _eff_tp_dist
-                                trail_activation = entry_price + (atr * trail_activation_atr)  # Phase 151: Dynamic
+                                trail_activation = entry_price + (atr * trail_activation_atr)
                         else:
-                            # For SHORT: if mark < entry, position is profitable
-                            if mark_price < entry_price:
-                                # Phase 243: Protect 50% of unrealized profit instead of breakeven
+                            if mark_price < entry_price and _allow_sync_profit_lock:
                                 profit_distance = entry_price - mark_price
-                                stop_loss = entry_price - (profit_distance * 0.5)  # Lock 50% profit
+                                stop_loss = entry_price - (profit_distance * 0.5)
                                 take_profit = mark_price - _eff_tp_dist
-                                trail_activation = entry_price - min_trail_distance  # Phase 210: Min 0.5 ATR from entry
+                                trail_activation = entry_price - min_trail_distance
                             else:
                                 stop_loss = entry_price + _eff_sl_dist
                                 take_profit = entry_price - _eff_tp_dist
-                                trail_activation = entry_price - (atr * trail_activation_atr)  # Phase 151: Dynamic
+                                trail_activation = entry_price - (atr * trail_activation_atr)
+
+                        if not _allow_sync_profit_lock and mark_price != entry_price:
+                            logger.info(
+                                f"🧯 SYNC_PROFIT_LOCK_BYPASS: {symbol} {bp.get('side','LONG')} "
+                                f"reason={_sync_profit_ctx.get('reason','?')} "
+                                f"age={_sync_profit_ctx.get('age_sec', 0.0):.1f}s "
+                                f"roi={_sync_profit_ctx.get('roi_pct', 0.0):.2f}% "
+                                f"atr={_sync_profit_ctx.get('atr_distance', 0.0):.2f}"
+                            )
                         
                         new_pos = {
                             'id': bp.get('id', f"BIN_{symbol}_{int(datetime.now().timestamp())}"),
@@ -7886,7 +7926,7 @@ async def binance_position_sync_loop():
                             'sizeUsd': bp.get('sizeUsd', 0),
                             'entryPrice': entry_price,
                             'markPrice': bp.get('markPrice', entry_price),
-                            'exchangeBreakEvenPrice': float(bp.get('exchangeBreakEvenPrice', bp.get('breakEvenPrice', 0.0)) or 0.0),
+                            'exchangeBreakEvenPrice': exchange_be_price,
                             'leverage': bp.get('leverage', 10),
                             'margin': bp.get('margin', 0),
                             'initialMargin': bp.get('margin', 0),
@@ -7956,10 +7996,17 @@ async def binance_position_sync_loop():
                         try:
                             _pos_meta = await sqlite_manager.get_position_metadata(symbol, side=bp.get('side'))
                             if _pos_meta:
-                                new_pos['signalScore'] = _pos_meta.get('signal_score', 0)
-                                new_pos['signalScoreRaw'] = _pos_meta.get('signal_score_raw', 0)
-                                if _pos_meta.get('open_time', 0) > 0:
-                                    new_pos['openTime'] = _pos_meta['open_time']
+                                db_open_time = int(_pos_meta.get('open_time', 0) or 0)
+                                if is_sync_metadata_compatible(new_pos.get('openTime', 0), db_open_time):
+                                    new_pos['signalScore'] = _pos_meta.get('signal_score', 0)
+                                    new_pos['signalScoreRaw'] = _pos_meta.get('signal_score_raw', 0)
+                                    if db_open_time > 0:
+                                        new_pos['openTime'] = db_open_time
+                                else:
+                                    logger.info(
+                                        f"🕒 SYNC_DB_META_BYPASS: {symbol} "
+                                        f"sync_open={new_pos.get('openTime', 0)} db_open={db_open_time}"
+                                    )
                         except Exception:
                             pass
 
@@ -9519,6 +9566,145 @@ def ensure_tick_safe_buffer(entry_price: float, buffer_pct: float, tick_size: fl
     # Snap to tick grid
     effective = snap_to_tick(effective, tick_size, direction='up')
     return effective
+
+
+def is_sync_metadata_compatible(sync_open_time_ms: int, db_open_time_ms: int, tolerance_ms: int = SYNC_DB_META_TIME_DRIFT_MS) -> bool:
+    """Guard against stale OPEN rows leaking old metadata into a fresh synced position."""
+    sync_open = int(sync_open_time_ms or 0)
+    db_open = int(db_open_time_ms or 0)
+    if db_open <= 0:
+        return False
+    if sync_open <= 0:
+        return True
+    return abs(sync_open - db_open) <= max(1, int(tolerance_ms or 0))
+
+
+def resolve_slippage_reference_price(pos: dict, reason: str) -> float:
+    """Pick the most credible trigger reference for post-fill reason validation."""
+    core = _canonical_reason_core(reason)
+    if core == 'TP_HIT':
+        return _coerce_float(pos.get('takeProfit', 0.0), 0.0)
+
+    local_stop = _coerce_float(pos.get('trailingStop', pos.get('stopLoss', 0.0)), 0.0)
+    exchange_stop = _coerce_float(pos.get('exchange_sl_price', 0.0), 0.0)
+
+    # Live SL/EMERGENCY exits should validate against the exchange stop if we have one.
+    if core in ('SL_HIT', 'EMERGENCY_SL') and exchange_stop > 0:
+        return exchange_stop
+    if local_stop > 0:
+        return local_stop
+    return exchange_stop
+
+
+def resolve_slippage_exit_tolerance(symbol: str, reference_price: float) -> float:
+    """Return a practical comparison tolerance for trigger-vs-fill validation."""
+    ref = abs(_coerce_float(reference_price, 0.0))
+    if ref <= 0:
+        return 0.0
+    tick = abs(_coerce_float(get_tick_size(symbol), 0.0))
+    if tick > 0:
+        tick_ratio_bps = (tick / ref) * 10000.0
+        if tick_ratio_bps <= SLIPPAGE_EXIT_MAX_VALID_TICK_BPS:
+            return tick * SLIPPAGE_EXIT_TICK_TOLERANCE
+    return ref * (SLIPPAGE_EXIT_FALLBACK_BPS / 10000.0)
+
+
+def should_mark_slippage_exit(reason: str, side: str, exit_price: float, trigger_price: float, symbol: str = '') -> bool:
+    """Mark only materially adverse trigger misses as SLIPPAGE_EXIT."""
+    core = _canonical_reason_core(reason)
+    if core not in {
+        'TP_HIT',
+        'SL_HIT',
+        'TRAIL_EXIT',
+        'TRAIL_WIDE_EXIT',
+        'TRAIL_NORMAL_EXIT',
+        'TRAIL_TIGHT_EXIT',
+        'PROFIT_GIVEBACK_EXIT',
+        'BREAKEVEN_CLOSE',
+        'SIDEWAYS_RECLAIM_CLOSE',
+        'RECLAIM_BE_CLOSE',
+        'EMERGENCY_SL',
+    }:
+        return False
+
+    ref = _coerce_float(trigger_price, 0.0)
+    fill = _coerce_float(exit_price, 0.0)
+    if ref <= 0 or fill <= 0:
+        return False
+
+    tol = resolve_slippage_exit_tolerance(symbol, ref)
+    safe_side = str(side or 'LONG').upper()
+
+    if core == 'TP_HIT':
+        if safe_side == 'LONG':
+            return fill < (ref - tol)
+        return fill > (ref + tol)
+
+    if safe_side == 'LONG':
+        return fill < (ref - tol)
+    return fill > (ref + tol)
+
+
+def should_sync_lock_profit(
+    *,
+    entry_price: float,
+    mark_price: float,
+    side: str,
+    leverage: int,
+    atr: float,
+    age_sec: float,
+    spread_pct: float = 0.05,
+    exchange_break_even_price: float = 0.0,
+) -> tuple[bool, dict]:
+    """Allow sync profit-lock only after the trade has real age and real cushion."""
+    entry = _coerce_float(entry_price, 0.0)
+    mark = _coerce_float(mark_price, 0.0)
+    safe_atr = max(_coerce_float(atr, 0.0), entry * 1e-6)
+    safe_lev = max(1, int(leverage or 1))
+    safe_side = str(side or 'LONG').upper()
+    if entry <= 0 or mark <= 0:
+        return False, {'reason': 'INVALID_PRICE', 'roi_pct': 0.0, 'atr_distance': 0.0}
+
+    favorable_move = (mark - entry) if safe_side == 'LONG' else (entry - mark)
+    if favorable_move <= 0:
+        return False, {'reason': 'NOT_PROFITABLE', 'roi_pct': 0.0, 'atr_distance': 0.0}
+
+    roi_pct = (favorable_move / entry) * 100.0 * safe_lev
+    atr_distance = favorable_move / max(safe_atr, 1e-12)
+    cost_roi_pct = _coerce_float(
+        estimate_trade_cost(
+            spread_pct=spread_pct,
+            leverage=safe_lev,
+            expected_hold_hours=0.5,
+            is_live=True,
+        ).get('roi_pct', 0.0),
+        0.0,
+    )
+    min_roi_pct = max(SYNC_PROFIT_LOCK_MIN_ROI_PCT, cost_roi_pct + 0.35)
+    exchange_be = _coerce_float(exchange_break_even_price, 0.0)
+    if exchange_be > 0:
+        min_roi_pct = max(min_roi_pct, compute_target_roi_pct(entry, exchange_be, safe_side, safe_lev) + 0.25)
+
+    metrics = {
+        'roi_pct': round(roi_pct, 4),
+        'atr_distance': round(atr_distance, 4),
+        'age_sec': round(max(0.0, float(age_sec or 0.0)), 2),
+        'min_roi_pct': round(min_roi_pct, 4),
+    }
+
+    if float(age_sec or 0.0) < SYNC_PROFIT_LOCK_MIN_AGE_SEC:
+        metrics['reason'] = 'AGE_TOO_YOUNG'
+        return False, metrics
+    if atr_distance < SYNC_PROFIT_LOCK_MIN_ATR_DISTANCE:
+        metrics['reason'] = 'MOVE_TOO_SMALL'
+        return False, metrics
+    if roi_pct < min_roi_pct:
+        metrics['reason'] = 'ROI_TOO_SMALL'
+        return False, metrics
+
+    metrics['reason'] = 'ELIGIBLE'
+    return True, metrics
+
 
 def compute_sl_tp_levels(
     entry_price: float,
@@ -38618,6 +38804,7 @@ class PaperTradingEngine:
         # Symbol-level execution feedback for UI (latest rejection reason).
         self.execution_feedback = {}  # {symbol: {"reason": str, "ts": int}}
         self.microstructure_cooldowns = {}  # {symbol: {until_ts, reason, cooldown_sec, ts}}
+        self.entry_activation_hints = {}  # {symbol: {ts: float, source: str}} protects sync/live fill race windows
         
         # =========================================================================
         # COIN BLACKLIST SYSTEM
@@ -43196,6 +43383,10 @@ class PaperTradingEngine:
         #   3. self.positions.append moved AFTER SL success → no race window
         # =====================================================================
         if is_live_mode and new_position.get('isLive', False):
+            self.entry_activation_hints[symbol] = {
+                "ts": time.time(),
+                "source": "live_fill_pending_sl",
+            }
             _sl_price = new_position.get('stopLoss', 0)
             _sl_amount = new_position.get('contracts', new_position.get('size', 0))
             _sl_side = new_position.get('side', 'LONG')
@@ -43244,6 +43435,7 @@ class PaperTradingEngine:
                     f"pozisyon açılmadı"
                 )
                 self.set_execution_feedback(symbol, "SL_ABORT_INVALID_PARAMS")
+                self.entry_activation_hints.pop(symbol, None)
                 return  # Position never enters self.positions
             
             # Place STOP_MARKET on exchange
@@ -43314,6 +43506,7 @@ class PaperTradingEngine:
                     f"pozisyon güvenlik için kapatıldı"
                 )
                 self.set_execution_feedback(symbol, "SL_ENFORCEMENT_CLOSE")
+                self.entry_activation_hints.pop(symbol, None)
                 return  # Position never enters self.positions
             
             # SL confirmed — NOW safe to add position to active list
@@ -43332,6 +43525,7 @@ class PaperTradingEngine:
             logger.info(f"📂 Position saved to SQLite: {symbol} openTime={new_position.get('openTime')}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to save position to SQLite: {e}")
+        self.entry_activation_hints.pop(symbol, None)
         
         # ── RFX-1A: Attach ExitStateMachine skeleton ──
         if RFX_EXIT_SM_ENABLED and _RFX_MODULES_AVAILABLE:
@@ -45014,32 +45208,20 @@ class PaperTradingEngine:
         # =====================================================================
         original_reason = reason
         side = pos.get('side', 'LONG')
-        tp_price = pos.get('takeProfit', 0)
-        sl_price = pos.get('trailingStop', pos.get('stopLoss', 0))
-        
-        if reason == 'TP_HIT' and tp_price > 0:
-            if side == 'LONG' and exit_price < tp_price:
-                reason = f"SLIPPAGE_EXIT({original_reason})"
-                logger.warning(f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} but exit ${exit_price:.6f} < TP ${tp_price:.6f} → {reason}")
-            elif side == 'SHORT' and exit_price > tp_price:
-                reason = f"SLIPPAGE_EXIT({original_reason})"
-                logger.warning(f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} but exit ${exit_price:.6f} > TP ${tp_price:.6f} → {reason}")
-        elif reason in [
-            'SL_HIT',
-            'TRAIL_EXIT',
-            'TRAIL_WIDE_EXIT',
-            'TRAIL_NORMAL_EXIT',
-            'TRAIL_TIGHT_EXIT',
-            'PROFIT_GIVEBACK_EXIT',
-            'BREAKEVEN_CLOSE',
-            'SIDEWAYS_RECLAIM_CLOSE',
-            'RECLAIM_BE_CLOSE',
-            'EMERGENCY_SL',
-        ] and sl_price > 0:
-            if side == 'LONG' and exit_price > sl_price:
-                reason = f"SLIPPAGE_EXIT({original_reason})"
-            elif side == 'SHORT' and exit_price < sl_price:
-                reason = f"SLIPPAGE_EXIT({original_reason})"
+        trigger_price = resolve_slippage_reference_price(pos, reason)
+        if should_mark_slippage_exit(
+            reason=reason,
+            side=side,
+            exit_price=exit_price,
+            trigger_price=trigger_price,
+            symbol=pos.get('symbol', ''),
+        ):
+            reason = f"SLIPPAGE_EXIT({original_reason})"
+            logger.warning(
+                f"🔄 REASON NORM: {pos.get('symbol')} {side} {original_reason} "
+                f"exit=${exit_price:.6f} trigger=${trigger_price:.6f} tol={resolve_slippage_exit_tolerance(pos.get('symbol', ''), trigger_price):.8f} "
+                f"→ {reason}"
+            )
 
         if (
             normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER
@@ -45165,6 +45347,8 @@ class PaperTradingEngine:
                 'stopLoss': pos.get('stopLoss', 0),
                 'takeProfit': pos.get('takeProfit', 0),
                 'trailingStop': pos.get('trailingStop', 0),
+                'exchangeSlPrice': pos.get('exchange_sl_price', 0),
+                'slippageTriggerPrice': trigger_price,
                 'atr': pos.get('atr', 0),
                 'leverage': pos.get('leverage', 10),
                 'price_move_pct': round(abs(exit_price - pos.get('entryPrice', 0)) / pos.get('entryPrice', 1) * 100, 4) if pos.get('entryPrice', 0) > 0 else 0,
