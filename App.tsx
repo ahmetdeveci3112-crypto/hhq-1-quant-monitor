@@ -1733,7 +1733,17 @@ export default function App() {
       resizeObserver?.disconnect();
       window.removeEventListener('resize', updateHeaderOffset);
     };
-  }, [showPostExitWatchSummary, settings.strategyMode, autoTradeEnabled, isRunning, isConnected, fastTickFresh, lastUpdateTime]);
+  }, [
+    settings.strategyMode,
+    autoTradeEnabled,
+    isRunning,
+    isConnected,
+    lastFastTickMs,
+    lastUpdateTime,
+    scannerStats.postExitReentryWatchersActive,
+    scannerStats.postExitReentryCandidates,
+    scannerStats.postExitReentryTriggered,
+  ]);
 
   const fastTickFresh = lastFastTickMs > 0 && (Date.now() - lastFastTickMs) <= 1200;
   const settingsAtrPreviewPct = (() => {
