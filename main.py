@@ -11814,6 +11814,8 @@ def evaluate_event_alpha_trigger(
         'score_bonus': 0,
         'reason': 'neutral',
         'priority': 0.0,
+        'liq_echo_score': 0.0,
+        'liq_echo_state': 'NONE',
     }
     if not EVENT_ALPHA_STANDALONE_ENABLED or not isinstance(opportunity, dict):
         return result
@@ -11881,6 +11883,8 @@ def evaluate_event_alpha_trigger(
         'score_bonus': int(score_bonus),
         'reason': reason,
         'priority': round(combined + max(0.0, 2.0 - spread_pct * 8.0), 4),
+        'liq_echo_score': round(liq_score, 4),
+        'liq_echo_state': liq_state,
     })
     return result
 
@@ -14122,6 +14126,13 @@ from risk.strategy_profile import (
     VALID_STRATEGY_MODES, normalize_strategy_mode, is_adaptive_mode, is_smart_mode,
     StrategyExecutionProfile, resolve_strategy_execution_profile,
 )
+from risk.signal_intent import (
+    SIGNAL_INTENT_POLICY_APPLY,
+    SIGNAL_INTENT_POLICY_OFF,
+    SIGNAL_INTENT_V3_MODE,
+    SIGNAL_INTENT_VERSION,
+    resolve_signal_intent,
+)
 
 # RFX-3A: Regime-based execution styles
 from risk.execution_style import (
@@ -14495,6 +14506,71 @@ def _breakout_matches_side(breakout: str, side: str) -> bool:
     )
 
 
+def _compact_signal_intent(intent: dict = None) -> dict:
+    safe_intent = intent if isinstance(intent, dict) else {}
+    if not safe_intent or not safe_intent.get('accepted', False):
+        return {}
+    alternate = safe_intent.get('alternateIntent', {})
+    return {
+        'side': str(safe_intent.get('side', '') or '').upper(),
+        'entryArchetype': str(safe_intent.get('entryArchetype', '') or '').lower(),
+        'directionOwner': str(safe_intent.get('directionOwner', '') or ''),
+        'directionConfidence': round(_coerce_float(safe_intent.get('directionConfidence', 0.0), 0.0), 4),
+        'directionReason': str(safe_intent.get('directionReason', '') or ''),
+        'intentScore': round(_coerce_float(safe_intent.get('intentScore', 0.0), 0.0), 4),
+        'runnerContextHint': str(safe_intent.get('runnerContextHint', '') or ''),
+        'policyMode': str(safe_intent.get('policyMode', '') or ''),
+        'signalIntentVersion': str(safe_intent.get('signalIntentVersion', SIGNAL_INTENT_VERSION) or SIGNAL_INTENT_VERSION),
+        'alternateIntent': alternate if isinstance(alternate, dict) else {},
+    }
+
+
+def _resolve_signal_intent_candidate(payload: dict = None, *, policy_mode: str = SIGNAL_INTENT_V3_MODE) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    mode = normalize_strategy_mode(
+        safe_payload.get('strategyMode', safe_payload.get('strategy_mode', STRATEGY_MODE_LEGACY))
+    )
+    if mode != STRATEGY_MODE_SMART_V3_RUNNER or str(policy_mode or SIGNAL_INTENT_V3_MODE).lower() == SIGNAL_INTENT_POLICY_OFF:
+        return {}
+    intent_inputs = _compact_decision_inputs(safe_payload)
+    intent_inputs.update({
+        'breakout': str(safe_payload.get('breakout', safe_payload.get('breakoutSignal', '')) or '').upper(),
+        'fibActive': bool(safe_payload.get('fibActive', False)),
+        'srNearestSupport': safe_payload.get('srNearestSupport'),
+        'srNearestResistance': safe_payload.get('srNearestResistance'),
+        'recoveryArmed': bool(safe_payload.get('recoveryArmed', False)),
+    })
+    resolved = resolve_signal_intent(intent_inputs, mode=mode, policy_mode=policy_mode)
+    return _compact_signal_intent(resolved)
+
+
+def _build_baseline_direction_metadata(
+    *,
+    signal_side: str,
+    zscore: float,
+    effective_threshold: float,
+    event_alpha_triggered: bool = False,
+    event_alpha_reason: str = '',
+) -> dict:
+    safe_side = str(signal_side or '').upper()
+    safe_zscore = _coerce_float(zscore, 0.0)
+    safe_threshold = max(0.01, _coerce_float(effective_threshold, 0.0))
+    confidence = 0.55 + min(0.20, abs(safe_zscore) / max(safe_threshold, 1.0) * 0.08)
+    if event_alpha_triggered:
+        return {
+            'side': safe_side,
+            'directionOwner': 'event_alpha',
+            'directionConfidence': round(_clamp(confidence + 0.05, 0.0, 0.95), 4),
+            'directionReason': str(event_alpha_reason or 'EVENT_ALPHA'),
+        }
+    return {
+        'side': safe_side,
+        'directionOwner': 'zscore_mean_reversion',
+        'directionConfidence': round(_clamp(confidence, 0.0, 0.95), 4),
+        'directionReason': f"Z({safe_zscore:.2f}>{safe_threshold:.2f})",
+    }
+
+
 def _compact_decision_inputs(payload: dict = None) -> dict:
     data = payload if isinstance(payload, dict) else {}
     return {
@@ -14521,6 +14597,9 @@ def _compact_decision_inputs(payload: dict = None) -> dict:
         'strategyMode': normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', STRATEGY_MODE_LEGACY))),
         'continuationFlowState': str(data.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
         'underwaterTapeState': str(data.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
+        'fibActive': bool(data.get('fibActive', False)),
+        'srNearestSupport': data.get('srNearestSupport'),
+        'srNearestResistance': data.get('srNearestResistance'),
     }
 
 
@@ -14586,6 +14665,7 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     forecast_prob = _coerce_float(inputs.get('forecastEdgeProb', 0.5), 0.5)
     forecast_band = str(inputs.get('forecastBand', 'NEUTRAL') or 'NEUTRAL').upper()
     breakout = str(inputs.get('breakout', '') or '').upper()
+    incoming_context = data.get('decisionContext', {}) if isinstance(data.get('decisionContext'), dict) else {}
     explicit_archetype = str(
         data.get('entryArchetype', data.get('entry_archetype', '')) or ''
     ).strip().lower()
@@ -14596,6 +14676,25 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         DECISION_ARCHETYPE_RECOVERY,
     ):
         explicit_archetype = ''
+    explicit_direction_owner = str(
+        data.get(
+            'directionOwner',
+            data.get('direction_owner', incoming_context.get('directionOwner', ''))
+        ) or ''
+    ).strip()
+    explicit_direction_confidence = _coerce_float(
+        data.get(
+            'directionConfidence',
+            data.get('direction_confidence', incoming_context.get('directionConfidence', 0.0))
+        ),
+        0.0,
+    )
+    explicit_direction_reason = str(
+        data.get(
+            'directionReason',
+            data.get('direction_reason', incoming_context.get('directionReason', ''))
+        ) or ''
+    ).strip()
     is_volume_spike = bool(inputs.get('isVolumeSpike', False))
     ob_trend = _coerce_float(inputs.get('obImbalanceTrend', 0.0), 0.0)
     daily_trend = str(inputs.get('coinDailyTrend', 'NEUTRAL') or 'NEUTRAL').upper()
@@ -14631,8 +14730,16 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
             or bool(data.get('recoveryArmed', False))
         )
     )
+    explicit_intent = bool(
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and explicit_archetype
+        and explicit_direction_owner
+    )
 
-    if safety_blocked:
+    if explicit_intent:
+        archetype = explicit_archetype
+        reason = explicit_direction_reason or 'SIGNAL_INTENT'
+    elif safety_blocked:
         archetype = DECISION_ARCHETYPE_NEUTRAL
         reason = 'SAFETY'
     elif recovery_ready:
@@ -14672,6 +14779,8 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     else:
         context_confidence += 0.05 if forecast_band in ('MEDIUM', 'STRONG') else 0.0
 
+    if explicit_intent:
+        context_confidence = max(context_confidence, explicit_direction_confidence)
     context_confidence += min(0.06, max(0.0, leader_lag) / 30.0)
     context_confidence += min(0.05, max(0.0, forecast_prob - 0.5) * 0.8)
     context_confidence = round(_clamp(context_confidence, 0.30, 0.95), 4)
@@ -14708,6 +14817,10 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         'mode': mode,
         'alignedDailyTrend': aligned_daily,
         'opposedDailyTrend': opposed_daily,
+        'directionOwner': explicit_direction_owner,
+        'directionConfidence': round(_clamp(explicit_direction_confidence, 0.0, 0.99), 4),
+        'directionReason': explicit_direction_reason,
+        'selectedViaIntent': explicit_intent,
     }
 
 
@@ -15123,6 +15236,7 @@ def queue_decision_snapshot_from_event_payload(
         context=decision_context,
         inputs=_compact_decision_inputs(merged_inputs),
         decision={
+            'side': str(merged_inputs.get('side', source_payload.get('action', '')) or ''),
             'entryArchetype': str(
                 decision_context.get(
                     'entryArchetype',
@@ -15131,6 +15245,16 @@ def queue_decision_snapshot_from_event_payload(
             ),
             'executionArchetype': str(decision_context.get('executionArchetype', '') or ''),
             'exitOwnerProfile': str(decision_context.get('exitOwnerProfile', source_payload.get('exitOwner', '')) or ''),
+            'directionOwner': str(decision_context.get('directionOwner', source_payload.get('directionOwner', '')) or ''),
+            'directionConfidence': _coerce_float(
+                decision_context.get('directionConfidence', source_payload.get('directionConfidence', 0.0)),
+                0.0,
+            ),
+            'directionReason': str(decision_context.get('directionReason', source_payload.get('directionReason', '')) or ''),
+            'signalIntentVersion': str(source_payload.get('signalIntentVersion', SIGNAL_INTENT_VERSION) or SIGNAL_INTENT_VERSION),
+            'signalIntentApplied': bool(source_payload.get('signalIntentApplied', False)),
+            'signalIntentCandidate': source_payload.get('signalIntentCandidate', {}) if isinstance(source_payload.get('signalIntentCandidate'), dict) else {},
+            'alternateIntent': source_payload.get('alternateIntent', {}) if isinstance(source_payload.get('alternateIntent'), dict) else {},
             'indicatorPolicy': decision_context.get('indicatorPolicy', source_payload.get('indicatorPolicy', {})),
             'gatePolicy': decision_context.get('gatePolicy', source_payload.get('gatePolicy', {})),
             'forecastPolicy': decision_context.get('forecastPolicy', source_payload.get('forecastPolicy', {})),
@@ -15191,6 +15315,8 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'expectancyBand': str(expectancy.get('expectancyBand', safe_pos.get('expectancyBand', 'NEUTRAL')) or 'NEUTRAL'),
             'expectancyRankingScore': _coerce_float(expectancy.get('rankingScore', safe_pos.get('expectancyRankingScore', 0.0)), 0.0),
             'entryArchetype': str(decision_context.get('entryArchetype', safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM),
+            'side': str(safe_pos.get('side', '') or ''),
+            'directionOwner': str(decision_context.get('directionOwner', safe_pos.get('directionOwner', '')) or ''),
             'exitOwner': str(safe_pos.get('exitOwner', '') or ''),
             'runnerContextResolved': str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
         },
@@ -15209,25 +15335,84 @@ def recompute_decision_snapshot_view(snapshot: dict, *, policy_version: str = 'c
     inputs = safe_snapshot.get('inputs') if isinstance(safe_snapshot.get('inputs'), dict) else _json_loads_safe(safe_snapshot.get('inputs_json', '{}'), {})
     context = safe_snapshot.get('context') if isinstance(safe_snapshot.get('context'), dict) else _json_loads_safe(safe_snapshot.get('context_json', '{}'), {})
     decision = safe_snapshot.get('decision') if isinstance(safe_snapshot.get('decision'), dict) else _json_loads_safe(safe_snapshot.get('decision_json', '{}'), {})
+    baseline_side = str(decision.get('side', inputs.get('side', '')) or '')
+    baseline_direction_owner = str(decision.get('directionOwner', context.get('directionOwner', '')) or '')
     if str(policy_version or 'candidate') == 'baseline':
         return {
             'decisionContext': context,
             'decision': decision,
             'expectancy': decision.get('expectancy', {}),
+            'side': baseline_side,
+            'directionOwner': baseline_direction_owner,
         }
-    candidate_context = build_decision_context({**inputs, 'decisionContext': context}, default_mode=inputs.get('strategyMode', STRATEGY_MODE_LEGACY))
+    mode = normalize_strategy_mode(inputs.get('strategyMode', STRATEGY_MODE_LEGACY))
+    candidate_intent = _resolve_signal_intent_candidate(inputs, policy_mode=SIGNAL_INTENT_POLICY_APPLY)
+    if mode == STRATEGY_MODE_SMART_V3_RUNNER and not candidate_intent:
+        candidate_context = {
+            'entryArchetype': DECISION_ARCHETYPE_NEUTRAL,
+            'executionArchetype': 'balanced',
+            'exitOwnerProfile': 'balanced',
+            'indicatorPolicy': {},
+            'gatePolicy': {},
+            'forecastPolicy': {},
+            'contextConfidence': 0.3,
+            'reason': 'NO_INTENT',
+            'mode': mode,
+            'directionOwner': '',
+            'directionConfidence': 0.0,
+            'directionReason': 'NO_INTENT',
+            'selectedViaIntent': False,
+        }
+        candidate_decision = dict(decision)
+        candidate_decision.update({
+            'side': '',
+            'entryArchetype': DECISION_ARCHETYPE_NEUTRAL,
+            'directionOwner': '',
+            'directionConfidence': 0.0,
+            'directionReason': 'NO_INTENT',
+            'rankingScore': 0.0,
+            'expectancy': {},
+        })
+        return {
+            'decisionContext': candidate_context,
+            'decision': candidate_decision,
+            'expectancy': {},
+            'side': '',
+            'directionOwner': '',
+        }
+    candidate_payload = dict(inputs)
+    if candidate_intent:
+        candidate_payload.update({
+            'side': candidate_intent.get('side', inputs.get('side', '')),
+            'entryArchetype': candidate_intent.get('entryArchetype', ''),
+            'directionOwner': candidate_intent.get('directionOwner', ''),
+            'directionConfidence': candidate_intent.get('directionConfidence', 0.0),
+            'directionReason': candidate_intent.get('directionReason', ''),
+            'signalIntentVersion': candidate_intent.get('signalIntentVersion', SIGNAL_INTENT_VERSION),
+            'alternateIntent': candidate_intent.get('alternateIntent', {}),
+        })
+    candidate_context = build_decision_context({**candidate_payload, 'decisionContext': context}, default_mode=mode)
     expectancy = compute_opportunity_expectancy(
-        {**inputs, 'decisionContext': candidate_context, 'forecastBand': inputs.get('forecastBand', 'NEUTRAL'), 'forecastEdgeProb': inputs.get('forecastEdgeProb', 0.5)},
+        {**candidate_payload, 'decisionContext': candidate_context, 'forecastBand': inputs.get('forecastBand', 'NEUTRAL'), 'forecastEdgeProb': inputs.get('forecastEdgeProb', 0.5)},
         decision_context=candidate_context,
     )
     candidate_decision = dict(decision)
     candidate_decision['expectancy'] = expectancy
     candidate_decision['entryArchetype'] = candidate_context.get('entryArchetype', decision.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM))
+    candidate_decision['side'] = str(candidate_payload.get('side', baseline_side) or '')
+    candidate_decision['directionOwner'] = str(candidate_context.get('directionOwner', candidate_payload.get('directionOwner', '')) or '')
+    candidate_decision['directionConfidence'] = _coerce_float(
+        candidate_context.get('directionConfidence', candidate_payload.get('directionConfidence', 0.0)),
+        0.0,
+    )
+    candidate_decision['directionReason'] = str(candidate_context.get('directionReason', candidate_payload.get('directionReason', '')) or '')
     candidate_decision['rankingScore'] = expectancy.get('rankingScore', 0.0)
     return {
         'decisionContext': candidate_context,
         'decision': candidate_decision,
         'expectancy': expectancy,
+        'side': candidate_decision.get('side', ''),
+        'directionOwner': candidate_decision.get('directionOwner', ''),
     }
 
 
@@ -15240,6 +15425,8 @@ def build_replay_report_from_snapshots(snapshots: list, *, policy_version: str =
             'baseline_vs_candidate': {},
             'decision_chain': [],
             'entry_changed': False,
+            'side_changed': False,
+            'direction_owner_changed': False,
             'reduce_count': 0,
             'partial_count': 0,
             'close_reason': '',
@@ -15256,6 +15443,10 @@ def build_replay_report_from_snapshots(snapshots: list, *, policy_version: str =
     realized_roi = 0.0
     baseline_entry = ''
     candidate_entry = ''
+    baseline_side = ''
+    candidate_side = ''
+    baseline_direction_owner = ''
+    candidate_direction_owner = ''
     for snap in safe_snaps:
         stage = str(snap.get('stage', '') or '')
         baseline_view = recompute_decision_snapshot_view(snap, policy_version='baseline')
@@ -15264,15 +15455,27 @@ def build_replay_report_from_snapshots(snapshots: list, *, policy_version: str =
         candidate_ctx = candidate_view.get('decisionContext', {})
         baseline_arch = str(baseline_ctx.get('entryArchetype', '') or '')
         candidate_arch = str(candidate_ctx.get('entryArchetype', baseline_arch) or '')
+        baseline_side_view = str(baseline_view.get('side', '') or '')
+        candidate_side_view = str(candidate_view.get('side', baseline_side_view) or '')
+        baseline_owner_view = str(baseline_view.get('directionOwner', '') or '')
+        candidate_owner_view = str(candidate_view.get('directionOwner', baseline_owner_view) or '')
         if stage == 'signal_generated' and not baseline_entry:
             baseline_entry = baseline_arch
+            baseline_side = baseline_side_view
+            baseline_direction_owner = baseline_owner_view
         if stage == 'signal_generated' and not candidate_entry:
             candidate_entry = candidate_arch
+            candidate_side = candidate_side_view
+            candidate_direction_owner = candidate_owner_view
         outcome = snap.get('outcome') if isinstance(snap.get('outcome'), dict) else _json_loads_safe(snap.get('outcome_json', '{}'), {})
         decision_chain.append({
             'stage': stage,
             'baselineArchetype': baseline_arch,
             'candidateArchetype': candidate_arch,
+            'baselineSide': baseline_side_view,
+            'candidateSide': candidate_side_view,
+            'baselineDirectionOwner': baseline_owner_view,
+            'candidateDirectionOwner': candidate_owner_view,
             'baselineRankingScore': _coerce_float((baseline_view.get('expectancy') or {}).get('rankingScore', 0.0), 0.0),
             'candidateRankingScore': _coerce_float((candidate_view.get('expectancy') or {}).get('rankingScore', 0.0), 0.0),
             'decisionCode': str((snap.get('decision') or {}).get('decisionCode', '') if isinstance(snap.get('decision'), dict) else ''),
@@ -15299,9 +15502,15 @@ def build_replay_report_from_snapshots(snapshots: list, *, policy_version: str =
         'baseline_vs_candidate': {
             'baseline_entry_archetype': baseline_entry,
             'candidate_entry_archetype': candidate_entry,
+            'baseline_side': baseline_side,
+            'candidate_side': candidate_side,
+            'baseline_direction_owner': baseline_direction_owner,
+            'candidate_direction_owner': candidate_direction_owner,
         },
         'decision_chain': decision_chain,
         'entry_changed': baseline_entry != candidate_entry,
+        'side_changed': baseline_side != candidate_side,
+        'direction_owner_changed': baseline_direction_owner != candidate_direction_owner,
         'reduce_count': reduce_count,
         'partial_count': partial_count,
         'close_reason': close_reason,
@@ -15417,7 +15626,9 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
             'context': decision_context,
             'inputs': _compact_decision_inputs(entry_inputs),
             'decision': {
+                'side': signal_snapshot.get('action', signal_snapshot.get('side', safe_trade.get('side', ''))),
                 'entryArchetype': signal_snapshot.get('entryArchetype', decision_context.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                'directionOwner': signal_snapshot.get('directionOwner', decision_context.get('directionOwner', '')),
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
             },
@@ -15440,7 +15651,9 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
             'context': decision_context,
             'inputs': _compact_decision_inputs(entry_inputs),
             'decision': {
+                'side': signal_snapshot.get('action', signal_snapshot.get('side', safe_trade.get('side', ''))),
                 'entryArchetype': signal_snapshot.get('entryArchetype', decision_context.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                'directionOwner': signal_snapshot.get('directionOwner', decision_context.get('directionOwner', '')),
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
             },
@@ -15479,6 +15692,19 @@ def classify_signal_entry_archetype(payload: dict = None, default_mode: str = ST
     """Split entries into continuation vs reclaim without changing non-runner logic."""
     data = payload or {}
     mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    explicit_archetype = str(data.get('entryArchetype', data.get('entry_archetype', '')) or '').strip().lower()
+    explicit_direction_owner = str(data.get('directionOwner', data.get('direction_owner', '')) or '').strip()
+    if (
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and explicit_direction_owner
+        and explicit_archetype in (
+            DECISION_ARCHETYPE_CONTINUATION,
+            DECISION_ARCHETYPE_RECLAIM,
+            DECISION_ARCHETYPE_EXHAUSTION,
+            DECISION_ARCHETYPE_RECOVERY,
+        )
+    ):
+        return explicit_archetype
     side = str(data.get('side', data.get('action', '')) or '').upper()
     breakout = str(data.get('breakout', data.get('breakoutSignal', '')) or '').upper()
     if not side:
@@ -23237,7 +23463,11 @@ async def background_scanner_loop():
                                 signal['atr'] = current_atr
                             
                             # Execute trade (includes MTF confirmation check)
-                            await process_signal_for_paper_trading(signal, price)
+                            await dispatch_signal_to_paper_trading(
+                                signal,
+                                price,
+                                spread_pct=signal.get('spreadPct', 0.05),
+                            )
                             
                             # Restore symbol
                             global_paper_trader.symbol = old_symbol
@@ -24722,6 +24952,18 @@ def classify_counter_trend(action: str, mtf_result: dict, dca_alignment: str,
     return is_ct, strength
 
 
+async def dispatch_signal_to_paper_trading(signal: dict, price: float, *, spread_pct: Optional[float] = None):
+    """Shared scanner/WS signal handoff into the paper-trading decision engine."""
+    if not isinstance(signal, dict):
+        return None
+    if 'global_paper_trader' in globals() and global_paper_trader and spread_pct is not None:
+        try:
+            global_paper_trader.current_spread_pct = float(spread_pct)
+        except Exception:
+            pass
+    return await process_signal_for_paper_trading(signal, price)
+
+
 async def process_signal_for_paper_trading(signal: dict, price: float):
     """Process a signal for paper trading execution."""
     if not global_paper_trader.enabled:
@@ -25718,6 +25960,13 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         signal.setdefault('liqEchoScore', 0.0)
         signal.setdefault('liqEchoState', 'NONE')
         signal.setdefault('liqEchoImpulseUsd', 0.0)
+        signal.setdefault('directionOwner', '')
+        signal.setdefault('directionConfidence', 0.0)
+        signal.setdefault('directionReason', '')
+        signal.setdefault('signalIntentVersion', SIGNAL_INTENT_VERSION)
+        signal.setdefault('signalIntentApplied', False)
+        signal.setdefault('signalIntentCandidate', {})
+        signal.setdefault('alternateIntent', {})
         early_forecast = compute_opportunity_forecast(signal, side=action, include_ev=False)
         signal['_forecast_pre_ev'] = early_forecast
     except Exception as forecast_err:
@@ -35859,7 +36108,33 @@ class SignalGenerator:
         # 2. CONFIDENCE SCORING SYSTEM (0-100)
         score = 0
         reasons = []
-        
+        signal_intent_candidate = {}
+        if strategy_mode == STRATEGY_MODE_SMART_V3_RUNNER:
+            signal_intent_candidate = _resolve_signal_intent_candidate(
+                {
+                    'strategyMode': strategy_mode,
+                    'symbol': symbol,
+                    'breakout': breakout,
+                    'zscore': zscore,
+                    'hurst': hurst,
+                    'adx': adx,
+                    'volumeRatio': volume_ratio,
+                    'isVolumeSpike': is_volume_spike,
+                    'obImbalanceTrend': ob_imbalance_trend,
+                    'imbalance': imbalance,
+                    'coinDailyTrend': coin_daily_trend,
+                    'marketRegime': market_regime,
+                    'liqEchoScore': event_alpha_cfg.get('liq_echo_score', event_alpha_cfg.get('liqEchoScore', 0.0)),
+                    'liqEchoState': event_alpha_cfg.get('liq_echo_state', event_alpha_cfg.get('liqEchoState', 'NONE')),
+                    'fibActive': fib_context.get('fib_active', False) if fib_context else False,
+                    'srNearestSupport': sr_levels.get('nearest_support') if 'sr_levels' in dir() and sr_levels else None,
+                    'srNearestResistance': sr_levels.get('nearest_resistance') if 'sr_levels' in dir() and sr_levels else None,
+                    'continuationFlowState': V3_CONTINUATION_NEUTRAL,
+                    'underwaterTapeState': V3_UNDERWATER_NEUTRAL,
+                },
+                policy_mode=SIGNAL_INTENT_V3_MODE,
+            )
+
         # =====================================================================
         # PHASE 247: HYBRID TREND DIRECTION FILTER + Z-SCORE TRIGGER
         # Katman 1: Trend yönü filtresi (EMA, MACD, ADX, D1 trend oylama)
@@ -35877,12 +36152,64 @@ class SignalGenerator:
             adx_trend=adx_trend,
             coin_daily_trend=coin_daily_trend,
         )
-        
+
         signal_side = None
-        
+        direction_metadata = {}
+        signal_intent_applied = False
+
         # Katman 2: Z-Score mean reversion trigger (contrarian)
         event_alpha_triggered = False
-        if abs(zscore) > effective_threshold:
+        if strategy_mode == STRATEGY_MODE_SMART_V3_RUNNER and SIGNAL_INTENT_V3_MODE == SIGNAL_INTENT_POLICY_APPLY:
+            if not signal_intent_candidate:
+                logger.info(f"🚫 SIGNAL_INTENT_V3: {symbol} no intent resolved in apply mode")
+                return None
+            signal_side = str(signal_intent_candidate.get('side', '') or '').upper()
+            if signal_side not in ('LONG', 'SHORT'):
+                logger.info(f"🚫 SIGNAL_INTENT_V3: {symbol} invalid side in apply mode")
+                return None
+            signal_intent_applied = True
+            reasons.append(
+                f"INTENT({signal_intent_candidate.get('entryArchetype', '?')}:{signal_intent_candidate.get('directionOwner', '?')})"
+            )
+            score += int(_coerce_float(signal_intent_candidate.get('intentScore', 0.0), 0.0))
+            direction_metadata = {
+                'side': signal_side,
+                'directionOwner': signal_intent_candidate.get('directionOwner', ''),
+                'directionConfidence': _coerce_float(signal_intent_candidate.get('directionConfidence', 0.0), 0.0),
+                'directionReason': signal_intent_candidate.get('directionReason', ''),
+            }
+            safe_adx_local = float(adx) if adx is not None else 20.0
+            if signal_side == "LONG" and not trend_dir['allow_long']:
+                if TREND_PENALTY_MODE:
+                    score -= 15
+                    reasons.append("TREND_AGAINST(-15)")
+                else:
+                    logger.info(
+                        f"🚫 TREND_GATE: {symbol} LONG blocked | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} intent={signal_intent_candidate.get('directionOwner', '?')}"
+                    )
+                    return None
+            elif signal_side == "SHORT" and not trend_dir['allow_short']:
+                if TREND_PENALTY_MODE:
+                    score -= 15
+                    reasons.append("TREND_AGAINST(-15)")
+                else:
+                    logger.info(
+                        f"🚫 TREND_GATE: {symbol} SHORT blocked | trend={trend_dir['direction']} "
+                        f"ADX={safe_adx_local:.0f} intent={signal_intent_candidate.get('directionOwner', '?')}"
+                    )
+                    return None
+            if trend_dir['direction'] == 'BULLISH' and signal_side == 'LONG':
+                pro_bonus = min(15, trend_dir['strength'] * 3)
+                score += pro_bonus
+                reasons.append(f"PRO_TREND+{pro_bonus}")
+            elif trend_dir['direction'] == 'BEARISH' and signal_side == 'SHORT':
+                pro_bonus = min(15, trend_dir['strength'] * 3)
+                score += pro_bonus
+                reasons.append(f"PRO_TREND+{pro_bonus}")
+            if abs(zscore) >= effective_threshold:
+                reasons.append(f"Z_CTX({zscore:.1f})")
+        elif abs(zscore) > effective_threshold:
             # Phase 207: Strategy Router VETO check for Mean Reversion
             if router_profile.get('veto_mr', False):
                 logger.debug(f"🛑 VETO: Router engelledi ({symbol}, MR_VETO) - {router_profile.get('reason')}")
@@ -35951,6 +36278,11 @@ class SignalGenerator:
             # Phase 152: Hurst etkisi artık SADECE threshold'da (calculate_adaptive_threshold)
             if hurst < 0.45:
                 reasons.append(f"H_MR({hurst:.2f})")  # Log only, no score change
+            direction_metadata = _build_baseline_direction_metadata(
+                signal_side=signal_side,
+                zscore=zscore,
+                effective_threshold=effective_threshold,
+            )
         elif event_alpha_enabled and event_alpha_side in ('LONG', 'SHORT'):
             if router_profile.get('veto_mr', False):
                 logger.debug(f"🛑 EVENT_ALPHA_VETO: Router engelledi ({symbol}) - {router_profile.get('reason')}")
@@ -35968,11 +36300,35 @@ class SignalGenerator:
                 reasons.append(f"Z_EVT({zscore:.1f}>{event_alpha_threshold:.2f})")
                 if hurst < 0.50:
                     reasons.append(f"H_EVT({hurst:.2f})")
+                direction_metadata = _build_baseline_direction_metadata(
+                    signal_side=signal_side,
+                    zscore=zscore,
+                    effective_threshold=event_alpha_threshold,
+                    event_alpha_triggered=True,
+                    event_alpha_reason=event_alpha_reason,
+                )
         else:
             return None  # Z-Score not extreme enough
-        
+
         if signal_side is None:
             return None
+
+        if (
+            strategy_mode == STRATEGY_MODE_SMART_V3_RUNNER
+            and SIGNAL_INTENT_V3_MODE == 'shadow'
+            and signal_intent_candidate
+        ):
+            if (
+                signal_intent_candidate.get('side', '') != signal_side
+                or signal_intent_candidate.get('entryArchetype', '') != classify_signal_entry_archetype(
+                    {'strategyMode': strategy_mode, 'side': signal_side, 'breakout': breakout},
+                    default_mode=strategy_mode,
+                )
+            ):
+                logger.info(
+                    f"🧪 SIGNAL_INTENT_SHADOW: {symbol} baseline={signal_side}/{direction_metadata.get('directionOwner','')} "
+                    f"candidate={signal_intent_candidate.get('side','')}/{signal_intent_candidate.get('entryArchetype','')}"
+                )
 
         # Strategy score tuning (post-side, pre-confluence).
         if is_smart_mode(strategy_mode):
@@ -35996,8 +36352,14 @@ class SignalGenerator:
                 # Volume spike without clear trend - could be reversal or manipulation
                 logger.info(f"📊 VOLUME_SPIKE: {symbol} vol_ratio={volume_ratio:.1f}x without strong trend")
         
-        # Phase 128: TRACE LOG - every signal that passes Z-Score threshold
-        logger.info(f"🎯 Z_PASS: {symbol} {signal_side} Z={zscore:.2f} H={hurst:.2f} score={score}")
+        # Phase 128: TRACE LOG - every signal that passes the raw trigger stage
+        if signal_intent_applied:
+            logger.info(
+                f"🎯 INTENT_PASS: {symbol} {signal_side} owner={direction_metadata.get('directionOwner', '')} "
+                f"score={score} z={zscore:.2f} h={hurst:.2f}"
+            )
+        else:
+            logger.info(f"🎯 Z_PASS: {symbol} {signal_side} Z={zscore:.2f} H={hurst:.2f} score={score}")
         
         # =====================================================================
         # Phase 212: SPIKE PROTECTION (Pump-Dump Guard)
@@ -36014,7 +36376,7 @@ class SignalGenerator:
                 return None
         
         # Bonus based on Z-Score strength (0-10 pts extra)
-        zscore_excess = abs(zscore) - effective_threshold
+        zscore_excess = max(0.0, abs(zscore) - effective_threshold)
         zscore_bonus = min(10, int(zscore_excess * 5))  # Each 0.2 above threshold = +1 pt
         score += zscore_bonus
         
@@ -37241,12 +37603,16 @@ class SignalGenerator:
             },
             default_mode=strategy_mode,
         )
+        if signal_intent_applied and signal_intent_candidate.get('runnerContextHint'):
+            runner_context_preview = str(signal_intent_candidate.get('runnerContextHint', runner_context_preview) or runner_context_preview)
         entry_archetype = classify_signal_entry_archetype(
             {
                 'strategyMode': strategy_mode,
                 'side': signal_side,
                 'breakout': breakout,
                 'runnerContext': runner_context_preview,
+                'entryArchetype': signal_intent_candidate.get('entryArchetype', '') if signal_intent_applied else '',
+                'directionOwner': direction_metadata.get('directionOwner', ''),
                 'coinDailyTrend': coin_daily_trend,
                 'counterTrend': _ct_preview,
                 'adx': adx,
@@ -37263,6 +37629,10 @@ class SignalGenerator:
             'side': signal_side,
             'breakout': breakout,
             'runnerContext': runner_context_preview,
+            'entryArchetype': signal_intent_candidate.get('entryArchetype', '') if signal_intent_applied else '',
+            'directionOwner': direction_metadata.get('directionOwner', ''),
+            'directionConfidence': direction_metadata.get('directionConfidence', 0.0),
+            'directionReason': direction_metadata.get('directionReason', ''),
             'coinDailyTrend': coin_daily_trend,
             'counterTrend': _ct_preview,
             'counterTrendStrength': _ct_strength_preview,
@@ -37287,18 +37657,36 @@ class SignalGenerator:
         if is_smart_mode(strategy_mode):
             preview_archetype = str(decision_context_preview.get('entryArchetype', entry_archetype) or entry_archetype).lower()
             if (
-                preview_archetype not in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM)
-                and entry_archetype in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM)
+                preview_archetype not in (
+                    ENTRY_ARCHETYPE_CONTINUATION,
+                    ENTRY_ARCHETYPE_RECLAIM,
+                    DECISION_ARCHETYPE_EXHAUSTION,
+                    DECISION_ARCHETYPE_RECOVERY,
+                )
+                and entry_archetype in (
+                    ENTRY_ARCHETYPE_CONTINUATION,
+                    ENTRY_ARCHETYPE_RECLAIM,
+                    DECISION_ARCHETYPE_EXHAUSTION,
+                    DECISION_ARCHETYPE_RECOVERY,
+                )
             ):
                 decision_context_preview = build_decision_context(
                     {
                         **decision_context_seed_payload,
                         'entryArchetype': entry_archetype,
+                        'directionOwner': direction_metadata.get('directionOwner', ''),
+                        'directionConfidence': direction_metadata.get('directionConfidence', 0.0),
+                        'directionReason': direction_metadata.get('directionReason', ''),
                     },
                     default_mode=strategy_mode,
                 )
                 preview_archetype = str(decision_context_preview.get('entryArchetype', entry_archetype) or entry_archetype).lower()
-            if preview_archetype in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM):
+            if preview_archetype in (
+                ENTRY_ARCHETYPE_CONTINUATION,
+                ENTRY_ARCHETYPE_RECLAIM,
+                DECISION_ARCHETYPE_EXHAUSTION,
+                DECISION_ARCHETYPE_RECOVERY,
+            ):
                 entry_archetype = preview_archetype
         if entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
             if not (volume_ratio >= 1.35 or is_volume_spike):
@@ -37314,6 +37702,10 @@ class SignalGenerator:
                 )
                 return None
             reasons.append("ENTRY_ARCH(continuation)")
+        elif entry_archetype == DECISION_ARCHETYPE_EXHAUSTION:
+            reasons.append("ENTRY_ARCH(exhaustion)")
+        elif entry_archetype == DECISION_ARCHETYPE_RECOVERY:
+            reasons.append("ENTRY_ARCH(recovery)")
         else:
             reasons.append("ENTRY_ARCH(reclaim)")
 
@@ -37473,6 +37865,17 @@ class SignalGenerator:
             'effectiveExitTightness': effective_exit_tightness,
             'entryArchetype': entry_archetype,
             'runnerContextResolved': runner_context_preview,
+            'directionOwner': direction_metadata.get('directionOwner', ''),
+            'directionConfidence': direction_metadata.get('directionConfidence', 0.0),
+            'directionReason': direction_metadata.get('directionReason', ''),
+            'signalIntentVersion': SIGNAL_INTENT_VERSION,
+            'signalIntentApplied': bool(signal_intent_applied),
+            'signalIntentCandidate': signal_intent_candidate if signal_intent_candidate else {},
+            'alternateIntent': (
+                signal_intent_candidate.get('alternateIntent', {})
+                if signal_intent_candidate
+                else {}
+            ),
             'volumeRatio': round(volume_ratio, 2),
             'isVolumeSpike': is_volume_spike,
             'entryQualityCount': eq_pass_count,
@@ -37514,6 +37917,9 @@ class SignalGenerator:
         }
         _signal_core_payload['entryArchetype'] = entry_archetype
         _signal_core_payload['decisionContext']['entryArchetype'] = entry_archetype
+        _signal_core_payload['decisionContext']['directionOwner'] = direction_metadata.get('directionOwner', '')
+        _signal_core_payload['decisionContext']['directionConfidence'] = direction_metadata.get('directionConfidence', 0.0)
+        _signal_core_payload['decisionContext']['directionReason'] = direction_metadata.get('directionReason', '')
         _preliminary_expectancy = compute_opportunity_expectancy(
             _signal_core_payload,
             decision_context=decision_context_preview,
@@ -37624,6 +38030,17 @@ class SignalGenerator:
                 'tp1ArmAtrReq': _runner_controls_sig.get('trail_arm_atr_req', 0.0),
                 'beAfterTrailAtrReq': _runner_controls_sig.get('be_after_trail_atr_req', 0.0),
                 'entryArchetype': entry_archetype,
+                'directionOwner': direction_metadata.get('directionOwner', ''),
+                'directionConfidence': direction_metadata.get('directionConfidence', 0.0),
+                'directionReason': direction_metadata.get('directionReason', ''),
+                'signalIntentVersion': SIGNAL_INTENT_VERSION,
+                'signalIntentApplied': bool(signal_intent_applied),
+                'signalIntentCandidate': signal_intent_candidate if signal_intent_candidate else {},
+                'alternateIntent': (
+                    signal_intent_candidate.get('alternateIntent', {})
+                    if signal_intent_candidate
+                    else {}
+                ),
                 'execution_style': _exec_style,
                 'structural_zone': _structural_zone_dict,
                 'structural_sr_levels': _structural_sr_snapshot,
@@ -40352,6 +40769,13 @@ class PaperTradingEngine:
             "liqEchoImpulseUsd": _coerce_float(signal.get('liqEchoImpulseUsd', 0.0) if signal else 0.0, 0.0),
             "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
             "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
+            "directionOwner": signal.get('directionOwner', '') if signal else '',
+            "directionConfidence": _coerce_float(signal.get('directionConfidence', 0.0) if signal else 0.0, 0.0),
+            "directionReason": signal.get('directionReason', '') if signal else '',
+            "signalIntentVersion": signal.get('signalIntentVersion', SIGNAL_INTENT_VERSION) if signal else SIGNAL_INTENT_VERSION,
+            "signalIntentApplied": bool(signal.get('signalIntentApplied', False)) if signal else False,
+            "signalIntentCandidate": signal.get('signalIntentCandidate', {}) if signal and isinstance(signal.get('signalIntentCandidate'), dict) else {},
+            "alternateIntent": signal.get('alternateIntent', {}) if signal and isinstance(signal.get('alternateIntent'), dict) else {},
             "decisionContext": signal.get('decisionContext', {}) if signal else {},
             "indicatorPolicy": signal.get('indicatorPolicy', {}) if signal else {},
             "gatePolicy": signal.get('gatePolicy', {}) if signal else {},
@@ -40482,6 +40906,9 @@ class PaperTradingEngine:
                 "forecastEdgeProb": _coerce_float(signal.get('forecastEdgeProb', 0.5) if signal else 0.5, 0.5),
                 "forecastBand": signal.get('forecastBand', 'NEUTRAL') if signal else 'NEUTRAL',
                 "decisionContext": signal.get('decisionContext', {}) if signal else {},
+                "directionOwner": signal.get('directionOwner', '') if signal else '',
+                "directionConfidence": _coerce_float(signal.get('directionConfidence', 0.0) if signal else 0.0, 0.0),
+                "directionReason": signal.get('directionReason', '') if signal else '',
                 "expectancy": signal.get('expectancy', {}) if signal else {},
                 "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
                 "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
@@ -40503,6 +40930,7 @@ class PaperTradingEngine:
                 "leverage": adjusted_leverage,
                 "sizeUsd": position_size_usd,
                 "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
+                "directionOwner": signal.get('directionOwner', '') if signal else '',
                 "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
                 "expectancyBand": signal.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL) if signal else DECISION_EXPECTANCY_BAND_NEUTRAL,
                 "expectancyRankingScore": _coerce_float(signal.get('expectancyRankingScore', 0.0) if signal else 0.0, 0.0),
@@ -42111,6 +42539,13 @@ class PaperTradingEngine:
             "entryImbalance": order.get('entryImbalance', 0.0),
             "entryArchetype": order.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
             "runnerContextResolved": order.get('runnerContextResolved', order.get('runnerContext', '')),
+            "directionOwner": order.get('directionOwner', ''),
+            "directionConfidence": _coerce_float(order.get('directionConfidence', 0.0), 0.0),
+            "directionReason": order.get('directionReason', ''),
+            "signalIntentVersion": order.get('signalIntentVersion', SIGNAL_INTENT_VERSION),
+            "signalIntentApplied": bool(order.get('signalIntentApplied', False)),
+            "signalIntentCandidate": order.get('signalIntentCandidate', {}) if isinstance(order.get('signalIntentCandidate'), dict) else {},
+            "alternateIntent": order.get('alternateIntent', {}) if isinstance(order.get('alternateIntent'), dict) else {},
             "decisionContext": order.get('decisionContext', {}),
             "indicatorPolicy": order.get('indicatorPolicy', {}),
             "gatePolicy": order.get('gatePolicy', {}),
@@ -43491,6 +43926,17 @@ class PaperTradingEngine:
         # Phase 16: Check if auto-trade is enabled
         if not self.enabled:
             self.add_log(f"⏸️ Auto-trade kapalı, işlem yapılmadı")
+            return
+
+        # Shared decision engine is authoritative for the global paper trader.
+        if 'global_paper_trader' in globals() and self is global_paper_trader:
+            safe_create_task(
+                dispatch_signal_to_paper_trading(
+                    signal,
+                    current_price,
+                    spread_pct=signal.get('spreadPct', 0.05),
+                )
+            )
             return
         
         # Phase 22: Multi-position and hedging logic
@@ -49951,20 +50397,13 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                                     logger.info(f"🤖 WS-Trade: {action} {active_symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}")
                                     
                                     try:
-                                        if hasattr(streamer, 'paper_trader') and streamer.paper_trader:
-                                            streamer.paper_trader.current_spread_pct = spread_pct
-                                            streamer.paper_trader.on_signal(signal, price)
+                                        await dispatch_signal_to_paper_trading(
+                                            signal,
+                                            price,
+                                            spread_pct=spread_pct,
+                                        )
                                     except Exception as pt_err:
                                         logger.error(f"Paper Trading Error: {pt_err}")
-                                    
-                                    try:
-                                        if 'global_paper_trader' in globals() and global_paper_trader:
-                                            global_paper_trader.last_signal_per_coin[active_symbol] = {
-                                                'side': signal.get('action', 'NONE'),
-                                                'time': datetime.now().timestamp()
-                                            }
-                                    except Exception as _sig_cache_err:
-                                        logger.debug(f"Signal cache update error: {_sig_cache_err}")
                                     logger.info(f"SIGNAL GENERATED: {signal['action']} @ {price}")
 
                     except Exception as e:

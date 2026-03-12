@@ -189,31 +189,42 @@ def test_build_replay_report_detects_candidate_archetype_change():
     snapshot = {
         "stage": "signal_generated",
         "source_version": "approx_ohlcv_v1",
-        "context": {"entryArchetype": main.DECISION_ARCHETYPE_RECLAIM},
+        "context": {
+            "entryArchetype": main.DECISION_ARCHETYPE_RECLAIM,
+            "directionOwner": "reclaim",
+        },
         "inputs": main._compact_decision_inputs(
             {
                 "symbol": "TESTUSDT",
                 "side": "LONG",
-                "strategyMode": main.STRATEGY_MODE_SMART_V2,
-                "breakout": "BULLISH_BREAKOUT",
+                "strategyMode": main.STRATEGY_MODE_SMART_V3_RUNNER,
+                "breakout": "BEARISH_BREAKOUT",
                 "volumeRatio": 1.45,
                 "isVolumeSpike": True,
-                "obImbalanceTrend": 2.7,
-                "coinDailyTrend": "NEUTRAL",
+                "obImbalanceTrend": -2.7,
+                "coinDailyTrend": "STRONG_BEARISH",
                 "market_regime": "TRENDING",
                 "forecastBand": "STRONG",
                 "forecastEdgeProb": 0.71,
             }
         ),
-        "decision": {"expectancy": {"rankingScore": 88.0}},
+        "decision": {
+            "side": "LONG",
+            "directionOwner": "reclaim",
+            "expectancy": {"rankingScore": 88.0},
+        },
         "outcome": {},
     }
 
     report = main.build_replay_report_from_snapshots([snapshot], policy_version="candidate")
 
     assert report["entry_changed"] is True
+    assert report["side_changed"] is True
+    assert report["direction_owner_changed"] is True
     assert report["baseline_vs_candidate"]["baseline_entry_archetype"] == main.DECISION_ARCHETYPE_RECLAIM
     assert report["baseline_vs_candidate"]["candidate_entry_archetype"] == main.DECISION_ARCHETYPE_CONTINUATION
+    assert report["baseline_vs_candidate"]["baseline_side"] == "LONG"
+    assert report["baseline_vs_candidate"]["candidate_side"] == "SHORT"
 
 
 def test_compute_signal_priority_prefers_expectancy_ranking_signal():
