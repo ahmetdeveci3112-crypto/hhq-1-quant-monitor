@@ -11822,7 +11822,10 @@ def evaluate_event_alpha_trigger(
     zscore = _coerce_float(opp.get('zscore', opp.get('zScore', 0.0)), 0.0)
     spread_pct = _coerce_float(opp.get('spreadPct', 0.0), 0.0)
     vol_ratio = _coerce_float(opp.get('volumeRatio', 0.0), 0.0)
-    entry_exec = _coerce_float(opp.get('entryExecScore', opp.get('signalScore', 0.0)), 0.0)
+    side_hint = _infer_side_from_zscore(zscore)
+    entry_exec = _coerce_float(opp.get('entryExecScore', opp.get('currentExecScore', 0.0)), 0.0)
+    if entry_exec <= 0 and side_hint:
+        entry_exec = compute_live_execution_quality_score(opp, side=side_hint)
     leader = leader_lag if isinstance(leader_lag, dict) else {}
     liq = liq_echo if isinstance(liq_echo, dict) else {}
     micro = micro_snapshot if isinstance(micro_snapshot, dict) else {}
@@ -15557,18 +15560,15 @@ def apply_live_flow_context_to_position(pos: dict, opportunity: dict) -> None:
     if not isinstance(pos, dict) or not isinstance(opportunity, dict):
         return
 
-    pos['currentVolumeRatio'] = _coerce_float(opportunity.get('volumeRatio', pos.get('currentVolumeRatio', pos.get('volumeRatio', 1.0))), _coerce_float(pos.get('volumeRatio', 1.0), 1.0))
-    pos['currentIsVolumeSpike'] = bool(opportunity.get('isVolumeSpike', pos.get('currentIsVolumeSpike', pos.get('isVolumeSpike', False))))
-    pos['currentImbalance'] = _coerce_float(opportunity.get('imbalance', pos.get('currentImbalance', pos.get('entryImbalance', 0.0))), _coerce_float(pos.get('entryImbalance', 0.0), 0.0))
-    pos['currentObImbalanceTrend'] = _coerce_float(opportunity.get('obImbalanceTrend', pos.get('currentObImbalanceTrend', 0.0)), _coerce_float(pos.get('currentObImbalanceTrend', 0.0), 0.0))
-    pos['currentSpreadPct'] = _coerce_float(opportunity.get('spreadPct', pos.get('currentSpreadPct', pos.get('spreadPct', 0.05))), _coerce_float(pos.get('spreadPct', 0.05), 0.05))
-    pos['currentAtrPct'] = _coerce_float(opportunity.get('atrPct', opportunity.get('volatility_pct', pos.get('currentAtrPct', pos.get('volatility_pct', 0.0)))), _coerce_float(pos.get('volatility_pct', 0.0), 0.0))
-    pos['currentMicrostructureScore'] = _coerce_float(opportunity.get('microstructureScore', pos.get('currentMicrostructureScore', 0.0)), _coerce_float(pos.get('currentMicrostructureScore', 0.0), 0.0))
-    pos['currentFlowToxicityScore'] = _coerce_float(opportunity.get('flowToxicityScore', pos.get('currentFlowToxicityScore', 50.0)), _coerce_float(pos.get('currentFlowToxicityScore', 50.0), 50.0))
-    pos['currentExecScore'] = _coerce_float(
-        opportunity.get('entryExecScore', opportunity.get('execScore', pos.get('currentExecScore', pos.get('entryExecScoreSnapshot', pos.get('entryExecScore', 0.0))))),
-        _coerce_float(pos.get('entryExecScoreSnapshot', pos.get('entryExecScore', 0.0)), 0.0),
-    )
+    pos.update(_build_live_flow_context_from_opportunity(pos, opportunity, side=str(pos.get('side', 'LONG') or 'LONG')))
+
+
+def apply_live_flow_context_to_pending_order(order: dict, opportunity: dict) -> None:
+    """Persist the freshest scanner/WS flow context on a pending order."""
+    if not isinstance(order, dict) or not isinstance(opportunity, dict):
+        return
+
+    order.update(_build_live_flow_context_from_opportunity(order, opportunity, side=str(order.get('side', 'LONG') or 'LONG')))
 
 
 def evaluate_v3_continuation_flow_state(
@@ -16360,6 +16360,162 @@ def compute_execution_quality_score(
         "passed": score >= EXEC_QUALITY_MIN_SCORE,
         "strict_passed": score >= EXEC_QUALITY_STRICT_MIN_SCORE,
         "notes": notes[:6],
+    }
+
+
+def _infer_side_from_zscore(zscore: float) -> str:
+    safe_zscore = _coerce_float(zscore, 0.0)
+    if safe_zscore < 0:
+        return "LONG"
+    if safe_zscore > 0:
+        return "SHORT"
+    return ""
+
+
+def compute_live_execution_quality_score(
+    payload: dict,
+    *,
+    side: str = "",
+    base_confidence_score: float = 70.0,
+) -> float:
+    """Estimate a fresh execution-quality score from the current live flow snapshot."""
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_side = str(side or safe_payload.get('side', safe_payload.get('action', '')) or '').upper()
+    if safe_side not in ('LONG', 'SHORT'):
+        safe_side = _infer_side_from_zscore(safe_payload.get('zscore', safe_payload.get('zScore', 0.0)))
+    if safe_side not in ('LONG', 'SHORT'):
+        return 0.0
+
+    score_seed = _coerce_float(
+        safe_payload.get(
+            'signalScore',
+            safe_payload.get(
+                'confidenceScore',
+                safe_payload.get('_rawConfidenceScore', base_confidence_score),
+            ),
+        ),
+        base_confidence_score,
+    )
+    if score_seed <= 0:
+        score_seed = base_confidence_score
+
+    exec_quality = compute_execution_quality_score(
+        signal_side=safe_side,
+        confidence_score=score_seed,
+        volume_ratio=_coerce_float(
+            safe_payload.get('currentVolumeRatio', safe_payload.get('volumeRatio', safe_payload.get('volume_ratio', 1.0))),
+            1.0,
+        ),
+        spread_pct=_coerce_float(
+            safe_payload.get('currentSpreadPct', safe_payload.get('spreadPct', 0.05)),
+            0.05,
+        ),
+        atr_pct=_coerce_float(
+            safe_payload.get(
+                'currentAtrPct',
+                safe_payload.get('atrPct', safe_payload.get('volatility_pct', safe_payload.get('volatilityPct', 0.0))),
+            ),
+            0.0,
+        ),
+        imbalance=_coerce_float(
+            safe_payload.get('currentImbalance', safe_payload.get('imbalance', 0.0)),
+            0.0,
+        ),
+        ob_imbalance_trend=_coerce_float(
+            safe_payload.get(
+                'currentObImbalanceTrend',
+                safe_payload.get('obImbalanceTrend', safe_payload.get('ob_imbalance_trend', 0.0)),
+            ),
+            0.0,
+        ),
+        eq_count=int(safe_payload.get('entryQualityCount', 0) or 0),
+        fib_active=bool(safe_payload.get('fibActive', safe_payload.get('fib_active', False))),
+        fib_bonus=_coerce_float(safe_payload.get('fibBonus', safe_payload.get('fib_bonus', 0.0)), 0.0),
+        is_volume_spike=bool(
+            safe_payload.get(
+                'currentIsVolumeSpike',
+                safe_payload.get('isVolumeSpike', safe_payload.get('is_volume_spike', False)),
+            )
+        ),
+        zscore=_coerce_float(safe_payload.get('zscore', safe_payload.get('zScore', 0.0)), 0.0),
+        adx=_coerce_float(safe_payload.get('adx', 0.0), 0.0),
+        hurst=_coerce_float(safe_payload.get('hurst', 0.5), 0.5),
+    )
+    return _coerce_float(exec_quality.get('score', score_seed), score_seed)
+
+
+def _build_live_flow_context_from_opportunity(
+    target: dict,
+    opportunity: dict,
+    *,
+    side: str = "",
+) -> dict:
+    safe_target = target if isinstance(target, dict) else {}
+    safe_opp = opportunity if isinstance(opportunity, dict) else {}
+    safe_side = str(side or safe_target.get('side', safe_target.get('action', '')) or '').upper()
+    opp_signal_side = str(safe_opp.get('signalAction', safe_opp.get('side', safe_opp.get('action', ''))) or '').upper()
+
+    current_exec_score = _coerce_float(
+        safe_opp.get('currentExecScore', safe_opp.get('entryExecScore', safe_opp.get('execScore', 0.0))),
+        0.0,
+    )
+    if (
+        safe_side in ('LONG', 'SHORT')
+        and (
+            current_exec_score <= 0
+            or (opp_signal_side in ('LONG', 'SHORT') and opp_signal_side != safe_side)
+        )
+    ):
+        current_exec_score = compute_live_execution_quality_score(safe_opp, side=safe_side)
+
+    return {
+        'currentVolumeRatio': _coerce_float(
+            safe_opp.get('volumeRatio', safe_target.get('currentVolumeRatio', safe_target.get('volumeRatio', 1.0))),
+            _coerce_float(safe_target.get('volumeRatio', 1.0), 1.0),
+        ),
+        'currentIsVolumeSpike': bool(
+            safe_opp.get('isVolumeSpike', safe_target.get('currentIsVolumeSpike', safe_target.get('isVolumeSpike', False)))
+        ),
+        'currentImbalance': _coerce_float(
+            safe_opp.get('imbalance', safe_target.get('currentImbalance', safe_target.get('entryImbalance', 0.0))),
+            _coerce_float(safe_target.get('entryImbalance', 0.0), 0.0),
+        ),
+        'currentObImbalanceTrend': _coerce_float(
+            safe_opp.get('obImbalanceTrend', safe_target.get('currentObImbalanceTrend', safe_target.get('obImbalanceTrend', 0.0))),
+            _coerce_float(safe_target.get('currentObImbalanceTrend', safe_target.get('obImbalanceTrend', 0.0)), 0.0),
+        ),
+        'currentSpreadPct': _coerce_float(
+            safe_opp.get('spreadPct', safe_target.get('currentSpreadPct', safe_target.get('spreadPct', 0.05))),
+            _coerce_float(safe_target.get('spreadPct', 0.05), 0.05),
+        ),
+        'currentAtrPct': _coerce_float(
+            safe_opp.get(
+                'atrPct',
+                safe_opp.get(
+                    'volatility_pct',
+                    safe_opp.get(
+                        'volatilityPct',
+                        safe_target.get(
+                            'currentAtrPct',
+                            safe_target.get('atrPct', safe_target.get('volatility_pct', safe_target.get('volatilityPct', 0.0))),
+                        ),
+                    ),
+                ),
+            ),
+            _coerce_float(safe_target.get('currentAtrPct', safe_target.get('volatility_pct', safe_target.get('volatilityPct', 0.0))), 0.0),
+        ),
+        'currentMicrostructureScore': _coerce_float(
+            safe_opp.get('microstructureScore', safe_target.get('currentMicrostructureScore', safe_target.get('microstructureScore', 0.0))),
+            _coerce_float(safe_target.get('currentMicrostructureScore', safe_target.get('microstructureScore', 0.0)), 0.0),
+        ),
+        'currentFlowToxicityScore': _coerce_float(
+            safe_opp.get('flowToxicityScore', safe_target.get('currentFlowToxicityScore', safe_target.get('flowToxicityScore', 50.0))),
+            _coerce_float(safe_target.get('currentFlowToxicityScore', safe_target.get('flowToxicityScore', 50.0)), 50.0),
+        ),
+        'currentExecScore': _coerce_float(
+            current_exec_score,
+            _coerce_float(safe_target.get('currentExecScore', safe_target.get('entryExecScoreSnapshot', safe_target.get('entryExecScore', 0.0))), 0.0),
+        ),
     }
 
 
@@ -19305,6 +19461,53 @@ class CoinOpportunity:
         self.recheck_score: float = 0.0
         self.recheck_decision: str = ''
         self.recheck_reasons: list = []
+
+    def reset_scan_signal_state(self) -> None:
+        """Clear per-scan signal snapshot fields so stale signal state does not persist."""
+        self.signal_score = 0
+        self.signal_action = "NONE"
+        self.leverage = 10
+        self.pullback_pct = 0.0
+        self.dynamic_trail_activation = 1.5
+        self.dynamic_trail_distance = 1.0
+        self.entry_quality_pass = False
+        self.entry_quality_reasons = []
+        self.fib_active = False
+        self.fib_level = None
+        self.fib_bonus = 0
+        self.fib_entry = 0.0
+        self.fib_blend_alpha = 0.0
+        self.entry_price = 0.0
+        self.trail_entry_min_move_pct = 0.0
+        self.trail_entry_min_roi_pct = 0.0
+        self.entry_threshold_mult = 1.0
+        self.strategy_mode = STRATEGY_MODE_LEGACY
+        self.active_strategy = "legacy"
+        self.strategy_label = "Legacy"
+        self.execution_reject_reason = None
+        self.execution_reject_ts = 0
+        self.pullback_dyn_base = 0.0
+        self.pullback_dyn_final = 0.0
+        self.pullback_dyn_floor = 0.0
+        self.pullback_dyn_regime_band = 'neutral'
+        self.pullback_model_version = 'v2'
+        self.recheck_score = 0.0
+        self.recheck_decision = ''
+        self.recheck_reasons = []
+
+    def update_live_flow_snapshot(
+        self,
+        *,
+        volume_ratio: float,
+        is_volume_spike: bool,
+        ob_imbalance_trend: float,
+        live_exec_score: float,
+    ) -> None:
+        self.volume_ratio = float(volume_ratio or 0.0)
+        self.is_volume_spike = bool(is_volume_spike)
+        self.ob_imbalance_trend = float(ob_imbalance_trend or 0.0)
+        self.entry_exec_score = float(live_exec_score or 0.0)
+        self.entry_exec_passed = bool(self.entry_exec_score >= EXEC_QUALITY_MIN_SCORE) if self.entry_exec_score > 0 else False
     
     def to_dict(self) -> dict:
         return {
@@ -19761,6 +19964,8 @@ class LightweightCoinAnalyzer:
         self._analyze_count += 1
         if self._analyze_count % 500 == 1:
             logger.info(f"🔍 ANALYZE #{self._analyze_count}: {self.symbol} prices={len(self.prices)}")
+
+        self.opportunity.reset_scan_signal_state()
         
         if len(self.prices) < 20:  # Reduced from 50 to 20 for faster startup
             return None
@@ -19912,6 +20117,28 @@ class LightweightCoinAnalyzer:
         # Phase 262: Stable short-term OB flow
         ob_trend_raw = self._get_imbalance_trend()
         ob_trend_stable = self._apply_ema('ema_ob_trend', ob_trend_raw)
+        live_exec_score = compute_live_execution_quality_score(
+            {
+                'zscore': zscore,
+                'volumeRatio': volume_ratio_stable,
+                'isVolumeSpike': is_volume_spike,
+                'spreadPct': effective_spread_stable,
+                'atrPct': volatility_pct if self.opportunity.price > 0 else 0.0,
+                'imbalance': imbalance,
+                'obImbalanceTrend': ob_trend_stable,
+                'adx': adx,
+                'hurst': hurst,
+                'fibActive': cs_fib_context.get('fib_active', False) if cs_fib_context else False,
+                'fibBonus': cs_fib_context.get('fib_score_bonus', 0.0) if cs_fib_context else 0.0,
+            },
+            side=_infer_side_from_zscore(zscore),
+        )
+        self.opportunity.update_live_flow_snapshot(
+            volume_ratio=volume_ratio_stable,
+            is_volume_spike=is_volume_spike,
+            ob_imbalance_trend=ob_trend_stable,
+            live_exec_score=live_exec_score,
+        )
         
         # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
         self.last_analysis_context = {
@@ -40465,10 +40692,14 @@ class PaperTradingEngine:
             
             # Find current price for this symbol (also used by expiry fallback)
             current_price = None
+            current_opp = None
             for opp in opportunities:
                 if opp.get('symbol') == symbol:
                     current_price = opp.get('price', 0)
+                    current_opp = opp
                     break
+            if current_opp:
+                apply_live_flow_context_to_pending_order(order, current_opp)
             
             signal_score = float(order.get('recheckScore', order.get('signalScore', 0)) or order.get('signalScore', 0))
             is_confirmed = order.get('confirmed', False)
@@ -40823,7 +41054,7 @@ class PaperTradingEngine:
                 order.get('atr', 0.0),
                 entry_price,
                 volatility_pct=order.get('volatility_pct', order.get('volatilityPct')),
-                spread_pct=order.get('spreadPct', 0.05),
+                spread_pct=order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
                 truth_snapshot=order.get('truth_snapshot'),
             )
             atr = float(atr_ctx['atr'] or 0.0)
@@ -40875,8 +41106,8 @@ class PaperTradingEngine:
 
                     order_hurst = order.get('hurst', 0.5)
                     order_adx = order.get('adx', 20.0)
-                    order_spread = order.get('spreadPct', 0.05)
-                    order_vol_ratio = order.get('volumeRatio', 1.0)
+                    order_spread = order.get('currentSpreadPct', order.get('spreadPct', 0.05))
+                    order_vol_ratio = order.get('currentVolumeRatio', order.get('volumeRatio', 1.0))
                     order_atr_pct = order.get('volatility_pct', 0) or order.get('volatilityPct', 0)
                     if not order_atr_pct and entry_price > 0:
                         order_atr_pct = (atr / entry_price) * 100
@@ -40933,8 +41164,8 @@ class PaperTradingEngine:
                 # Cancel distance: how far from entry before giving up
                 order_adx = order.get('adx', 0)
                 order_hurst = order.get('hurst', 0.5)
-                order_spread = order.get('spreadPct', 0.05)
-                order_vol_ratio = order.get('volumeRatio', 1.0)
+                order_spread = order.get('currentSpreadPct', order.get('spreadPct', 0.05))
+                order_vol_ratio = order.get('currentVolumeRatio', order.get('volumeRatio', 1.0))
                 adx_strength = min(1.0, max(0.0, (order_adx - 15) / 45))
                 hurst_strength = min(1.0, max(0.0, (order_hurst - 0.35) / 0.4))
                 trend_strength = adx_strength * 0.6 + hurst_strength * 0.4
@@ -41150,7 +41381,7 @@ class PaperTradingEngine:
         if force_market and FALLBACK_EDGE_GATE_MODE != 'off':
             try:
                 _signal_score = float(order.get('signalScore', 0) or 0)
-                _spread_pct = float(order.get('spreadPct', 0.05) or 0.05)
+                _spread_pct = float(order.get('currentSpreadPct', order.get('spreadPct', 0.05)) or 0.05)
                 _spread_bps = _spread_pct * 100  # convert to bps
                 _depth_est = float(order.get('depthUsd', 0) or order.get('volume24h', 0) or 0) * 0.01
                 _margin_usd = float(order.get('marginUsd', 0) or order.get('sizeUsd', 0) or 0) / max(1, int(order.get('leverage', 10) or 10))
@@ -41511,7 +41742,7 @@ class PaperTradingEngine:
             order.get('atr', 0.0),
             fill_price,
             volatility_pct=order.get('volatility_pct', order.get('volatilityPct')),
-            spread_pct=order.get('spreadPct', 0.05),
+            spread_pct=order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
             truth_snapshot=order.get('truth_snapshot'),
         )
         atr = float(atr_ctx['atr'] or 0.0)
@@ -41622,7 +41853,7 @@ class PaperTradingEngine:
             )
         
         # Phase 275+: Unified SL/TP via compute_sl_tp_levels helper
-        _ord_spread = float(order.get('spreadPct', 0.05))
+        _ord_spread = float(order.get('currentSpreadPct', order.get('spreadPct', 0.05)))
         _canary_sl_m = 1.0
         _canary_tp_m = 1.0
         _canary_trail_m = 1.0
@@ -42085,22 +42316,22 @@ class PaperTradingEngine:
                         _risk_params_tp = rfx_resolve_risk_params(_rp_enum_tp, order['leverage'])
                     except Exception:
                         pass
-                    _tp_ladder = rfx_compute_tp_ladder_v2(
-                        entry_price=fill_price,
-                        atr=atr,
-                        side=side,
-                        leverage=order['leverage'],
-                        tick_size=_tick,
-                        spread_pct=order.get('spreadPct', 0.05),
-                        risk_params=_risk_params_tp,
-                        adx=order.get('adx', 25.0),
-                        hurst=order.get('hurst', 0.50),
-                        volume_ratio=order.get('volumeRatio', 1.0),
-                        coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
-                        exec_score=order.get('entryExecScore', 70.0),
-                        spread_level=order.get('spreadLevel', 'Normal'),
-                        tp_tighten_mult=_runner_tp_tighten,
-                        structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
+                        _tp_ladder = rfx_compute_tp_ladder_v2(
+                            entry_price=fill_price,
+                            atr=atr,
+                            side=side,
+                            leverage=order['leverage'],
+                            tick_size=_tick,
+                            spread_pct=order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
+                            risk_params=_risk_params_tp,
+                            adx=order.get('adx', 25.0),
+                            hurst=order.get('hurst', 0.50),
+                            volume_ratio=order.get('currentVolumeRatio', order.get('volumeRatio', 1.0)),
+                            coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
+                            exec_score=order.get('currentExecScore', order.get('entryExecScore', 70.0)),
+                            spread_level=order.get('spreadLevel', 'Normal'),
+                            tp_tighten_mult=_runner_tp_tighten,
+                            structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
                         structural_target_source=order.get('structuralTpSource', ''),
                     )
                     if _force_v3_four_tier:
@@ -42131,12 +42362,12 @@ class PaperTradingEngine:
                             atr=atr,
                             side=side,
                             leverage=order['leverage'],
-                            spread_pct=order.get('spreadPct', 0.05),
-                            volume_ratio=order.get('volumeRatio', 1.0),
+                            spread_pct=order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
+                            volume_ratio=order.get('currentVolumeRatio', order.get('volumeRatio', 1.0)),
                             adx=order.get('adx', 25.0),
                             hurst=order.get('hurst', 0.50),
                             coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
-                            exec_score=order.get('entryExecScore', 70.0),
+                            exec_score=order.get('currentExecScore', order.get('entryExecScore', 70.0)),
                             spread_level=order.get('spreadLevel', 'Normal'),
                             tp_tighten=_runner_tp_tighten,
                             close_split=_runner_split,
@@ -42149,12 +42380,12 @@ class PaperTradingEngine:
                             entry_price=fill_price,
                             atr=atr,
                             leverage=order['leverage'],
-                            spread_pct=order.get('spreadPct', 0.05),
-                            volume_ratio=order.get('volumeRatio', 1.0),
+                            spread_pct=order.get('currentSpreadPct', order.get('spreadPct', 0.05)),
+                            volume_ratio=order.get('currentVolumeRatio', order.get('volumeRatio', 1.0)),
                             adx=order.get('adx', 25.0),
                             hurst=order.get('hurst', 0.50),
                             coin_daily_trend=order.get('coinDailyTrend', 'NEUTRAL'),
-                            exec_score=order.get('entryExecScore', 70.0),
+                            exec_score=order.get('currentExecScore', order.get('entryExecScore', 70.0)),
                             spread_level=order.get('spreadLevel', 'Normal'),
                             structural_target_price=order.get('takeProfit', 0.0) if order.get('structuralTpAdjusted', False) else 0.0,
                             structural_target_source=order.get('structuralTpSource', ''),
@@ -42289,7 +42520,7 @@ class PaperTradingEngine:
                             adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
                             adjusted_trail_act_atr=adjusted_trail_activation_atr,
                             adjusted_trail_dist_atr=adjusted_trail_distance_atr,
-                            spread_pct=float(order.get('spreadPct', 0.05)),
+                            spread_pct=float(order.get('currentSpreadPct', order.get('spreadPct', 0.05))),
                         )
                         new_position['stopLoss'] = _recalc['sl']
                         new_position['takeProfit'] = _recalc['tp']
@@ -42409,7 +42640,7 @@ class PaperTradingEngine:
                             adjusted_sl_atr=adjusted_sl_atr, adjusted_tp_atr=adjusted_tp_atr,
                             adjusted_trail_act_atr=adjusted_trail_activation_atr,
                             adjusted_trail_dist_atr=adjusted_trail_distance_atr,
-                            spread_pct=float(order.get('spreadPct', 0.05)),
+                            spread_pct=float(order.get('currentSpreadPct', order.get('spreadPct', 0.05))),
                         )
                         new_position['stopLoss'] = _fm_recalc['sl']
                         new_position['takeProfit'] = _fm_recalc['tp']

@@ -112,6 +112,103 @@ def test_apply_live_flow_context_to_position_updates_current_runtime_fields():
     assert pos["currentExecScore"] == 81.0
 
 
+def test_apply_live_flow_context_to_pending_order_updates_current_runtime_fields():
+    order = {
+        "id": "PEND_TEST",
+        "symbol": "TESTUSDT",
+        "side": "LONG",
+        "volumeRatio": 1.0,
+        "currentVolumeRatio": 1.0,
+        "currentIsVolumeSpike": False,
+        "currentImbalance": 0.0,
+        "currentObImbalanceTrend": 0.0,
+        "currentSpreadPct": 0.05,
+        "currentAtrPct": 0.9,
+        "currentExecScore": 70.0,
+        "entryExecScore": 70.0,
+    }
+    opp = {
+        "volumeRatio": 1.36,
+        "isVolumeSpike": True,
+        "imbalance": 6.0,
+        "obImbalanceTrend": 2.4,
+        "spreadPct": 0.08,
+        "volatilityPct": 1.7,
+        "microstructureScore": 76.0,
+        "flowToxicityScore": 34.0,
+    }
+
+    main.apply_live_flow_context_to_pending_order(order, opp)
+
+    assert order["currentVolumeRatio"] == 1.36
+    assert order["currentIsVolumeSpike"] is True
+    assert order["currentImbalance"] == 6.0
+    assert order["currentObImbalanceTrend"] == 2.4
+    assert order["currentAtrPct"] == 1.7
+    assert order["currentExecScore"] >= main.EXEC_QUALITY_MIN_SCORE
+
+
+def test_coin_opportunity_reset_scan_signal_state_clears_stale_signal_fields():
+    opp = main.CoinOpportunity("TESTUSDT")
+    opp.signal_score = 88
+    opp.signal_action = "LONG"
+    opp.pullback_pct = 1.3
+    opp.entry_quality_pass = True
+    opp.entry_quality_reasons = ["A:Vol"]
+    opp.fib_active = True
+    opp.entry_price = 101.2
+    opp.strategy_mode = main.STRATEGY_MODE_SMART_V3_RUNNER
+    opp.execution_reject_reason = "OLD"
+    opp.recheck_score = 77.0
+    opp.recheck_reasons = ["OLD"]
+
+    opp.reset_scan_signal_state()
+    opp.update_live_flow_snapshot(
+        volume_ratio=0.91,
+        is_volume_spike=False,
+        ob_imbalance_trend=-0.4,
+        live_exec_score=71.0,
+    )
+
+    assert opp.signal_score == 0
+    assert opp.signal_action == "NONE"
+    assert opp.pullback_pct == 0.0
+    assert opp.entry_quality_pass is False
+    assert opp.entry_quality_reasons == []
+    assert opp.fib_active is False
+    assert opp.entry_price == 0.0
+    assert opp.execution_reject_reason is None
+    assert opp.recheck_score == 0.0
+    assert opp.volume_ratio == 0.91
+    assert opp.entry_exec_score == 71.0
+
+
+def test_event_alpha_trigger_uses_live_exec_fallback_without_signal_snapshot():
+    opp = {
+        "symbol": "TESTUSDT",
+        "signalAction": "NONE",
+        "signalScore": 0.0,
+        "zscore": -1.35,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.32,
+        "isVolumeSpike": False,
+        "imbalance": 9.0,
+        "obImbalanceTrend": 3.4,
+        "adx": 28.0,
+        "hurst": 0.58,
+        "microstructureScore": 74.0,
+        "flowToxicityScore": 32.0,
+        "liqEchoScore": 7.0,
+        "liqEchoState": "SELL_SWEEP",
+    }
+
+    result = main.evaluate_event_alpha_trigger(opp)
+
+    assert result["triggered"] is True
+    assert result["side"] == "LONG"
+    assert result["reason"].startswith("LIQ_ECHO")
+
+
 def test_evaluate_v3_continuation_flow_state_detects_supporting_long_flow():
     pos = _build_v3_position(
         currentVolumeRatio=1.28,
