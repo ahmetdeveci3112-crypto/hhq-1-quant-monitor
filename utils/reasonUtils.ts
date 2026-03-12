@@ -95,6 +95,8 @@ const REASON_MAP: Record<string, string> = {
     'MICRO__THIN_BOOK_REJECT': '📚 Mikro: Emir defteri çok ince',
     'MICRO__OBI_VETO': '📚 Mikro: Emir defteri dengesi ters',
     'MICRO__OBI_NEUTRAL_LOW_VOL': '📚 Mikro: Nötr OBI + düşük hacim',
+    'OBI_VETO': '📚 Mikro: Emir defteri dengesi ters',
+    'OBI_NEUTRAL_LOW_VOL': '📚 Mikro: Nötr OBI + düşük hacim',
     'MICRO__TRADEABILITY_REJECT': '📚 Mikro: İşlenebilirlik yetersiz',
     'MICRO__GATES_PASS': '✅ Mikro filtreler geçildi',
     'EXEC__EXISTING_POSITION_SIGNAL_REFRESH': '🔁 Execution: Mevcut pozisyon sinyali yenilendi',
@@ -202,6 +204,8 @@ const REASON_TOOLTIP_MAP: Record<string, string> = {
     'MICRO__THIN_BOOK_REJECT': 'Emir defteri derinliği bu coin için yeterli değil; likidite riski yüksek.',
     'MICRO__OBI_VETO': 'Emir defterindeki alım/satım dengesi sinyal yönüne ters.',
     'MICRO__OBI_NEUTRAL_LOW_VOL': 'Emir defteri nötr ve hacim düşük; güvenilir giriş yapılamaz.',
+    'OBI_VETO': 'Emir defterindeki alım/satım dengesi sinyal yönüne ters.',
+    'OBI_NEUTRAL_LOW_VOL': 'Emir defteri nötr ve hacim düşük; güvenilir giriş yapılamaz.',
     'MICRO__TRADEABILITY_REJECT': 'Genel işlenebilirlik skoru yetersiz (spread + derinlik + hacim).',
     'MICRO__GATES_PASS': 'Mikro seviyedeki tüm filtreler başarıyla geçildi.',
 };
@@ -249,6 +253,8 @@ const REASON_INFO_MAP: Record<string, ReasonInfo> = {
     'BLOCK_OPEN_INVALID_BBO': { label: 'Geçersiz veri', description: 'Emir defteri verisi geçersiz.', category: 'warning', icon: '📡' },
     'ENTRY_RECHECK_FAIL': { label: 'Kontrol başarısız', description: 'Tekrar kontrolde giriş koşulları karşılanmadı.', category: 'danger', icon: '🚫' },
     'PENDING_REINFORCED': { label: 'Güçlendirildi', description: 'Bekleyen emrin sinyali yeniden teyit edildi.', category: 'success', icon: '🔁' },
+    'OBI_VETO': { label: 'Denge ters', description: 'Emir defteri alım/satım dengesi ters.', category: 'danger', icon: '📚' },
+    'OBI_NEUTRAL_LOW_VOL': { label: 'Düşük hacim', description: 'Nötr emir defteri ve düşük hacim.', category: 'danger', icon: '📚' },
 
     // ===== BACKEND WAIT STATES (main.py L31668-31686) =====
     'recheck_wait': { label: 'Tekrar kontrol', description: 'Giriş koşulları tekrar kontrol edilmek üzere bekleniyor.', category: 'warning', icon: '🔄' },
@@ -380,7 +386,7 @@ const normalizeCode = (reason: string | undefined): string => {
     const raw = String(reason).trim();
     if (!raw) return '';
     const codePart = raw.split(/[:|]/)[0] || raw;
-    return codePart.trim().toUpperCase();
+    return codePart.trim().replace(/\(\d+\)$/g, '').toUpperCase();
 };
 
 export const getReasonTooltip = (reason: string | undefined): string => {

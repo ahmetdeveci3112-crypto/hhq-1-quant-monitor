@@ -23,19 +23,13 @@ import {
 } from '../types';
 import { formatCurrency } from '../utils';
 import { translateReason } from '../utils/reasonUtils';
+import { humanizeDecisionToken } from '../utils/decisionUi';
 
 interface Props {
     apiUrl: string;
 }
 
-const humanizeToken = (value: string | null | undefined, fallback = '—'): string => {
-    const safe = String(value || '').trim();
-    if (!safe) return fallback;
-    return safe
-        .replace(/[_-]+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, (char) => char.toUpperCase());
-};
+const humanizeToken = humanizeDecisionToken;
 
 const formatTs = (value: number | undefined): string => {
     if (!value) return '—';
@@ -205,6 +199,8 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Partial', value: String(report.partial_count || 0) },
             { label: 'Giveback', value: formatPct(report.giveback) },
             { label: 'Entry Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
+            { label: 'Yön Değişti', value: report.side_changed ? 'Evet' : 'Hayır', tone: report.side_changed ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
+            { label: 'Owner Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
         ];
     }, [report, replayTrade]);
 
@@ -478,10 +474,18 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
                                                 <div className="text-[11px] uppercase tracking-wide text-slate-500">Baseline Entry</div>
                                                 <div className="mt-1 text-sm font-semibold text-white">{humanizeToken(report?.baseline_vs_candidate?.baseline_entry_archetype)}</div>
+                                                <div className="mt-2 space-y-1 text-xs text-slate-400">
+                                                    <div>Side: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_side)}</span></div>
+                                                    <div>Owner: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_direction_owner)}</span></div>
+                                                </div>
                                             </div>
                                             <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
                                                 <div className="text-[11px] uppercase tracking-wide text-slate-500">Candidate Entry</div>
                                                 <div className="mt-1 text-sm font-semibold text-white">{humanizeToken(report?.baseline_vs_candidate?.candidate_entry_archetype)}</div>
+                                                <div className="mt-2 space-y-1 text-xs text-slate-400">
+                                                    <div>Side: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_side)}</span></div>
+                                                    <div>Owner: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_direction_owner)}</span></div>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
@@ -519,8 +523,8 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         ) : (
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
-                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'entryArchetype', 'exitOwner', 'expectancyBand', 'runnerContextResolved']),
+                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason']),
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved']),
                                                     ...compactJson(snapshot.outcome, ['decision', 'reason', 'continuationFlowState', 'underwaterTapeState']),
                                                 ].slice(0, 8);
                                                 return (
@@ -577,11 +581,15 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                             <div className="text-[11px] uppercase tracking-wide text-slate-500">Baseline</div>
                                                             <div className="font-medium text-white">{humanizeToken(item.baselineArchetype)}</div>
                                                             <div className="text-xs text-slate-500 mt-1">Rank {Number(item.baselineRankingScore || 0).toFixed(1)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Side {humanizeToken(item.baselineSide)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Owner {humanizeToken(item.baselineDirectionOwner)}</div>
                                                         </div>
                                                         <div>
                                                             <div className="text-[11px] uppercase tracking-wide text-slate-500">Candidate</div>
                                                             <div className="font-medium text-white">{humanizeToken(item.candidateArchetype)}</div>
                                                             <div className="text-xs text-slate-500 mt-1">Rank {Number(item.candidateRankingScore || 0).toFixed(1)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Side {humanizeToken(item.candidateSide)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Owner {humanizeToken(item.candidateDirectionOwner)}</div>
                                                         </div>
                                                     </div>
                                                 </div>

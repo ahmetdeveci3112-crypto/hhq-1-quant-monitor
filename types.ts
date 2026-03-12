@@ -196,6 +196,12 @@ export interface Position {
   expectedMfeBucket?: string;
   expectedMaeBucket?: string;
   holdProfile?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
+  signalIntentApplied?: boolean;
   decisionContext?: DecisionContext;
   indicatorPolicy?: IndicatorPolicy;
   gatePolicy?: GatePolicy;
@@ -296,6 +302,12 @@ export interface Trade {
   expectedMfeBucket?: string;
   expectedMaeBucket?: string;
   holdProfile?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
+  signalIntentApplied?: boolean;
   decisionContext?: DecisionContext;
   indicatorPolicy?: IndicatorPolicy;
   gatePolicy?: GatePolicy;
@@ -335,6 +347,16 @@ export interface ForecastPolicy {
   preferSizeDefense?: boolean;
 }
 
+export interface AlternateIntent {
+  side?: 'LONG' | 'SHORT' | string;
+  entryArchetype?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  intentScore?: number;
+  signalIntentVersion?: string;
+}
+
 export interface DecisionContext {
   regimeBucket?: string;
   strategyBucket?: string;
@@ -349,6 +371,12 @@ export interface DecisionContext {
   mode?: string;
   alignedDailyTrend?: boolean;
   opposedDailyTrend?: boolean;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  selectedViaIntent?: boolean;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
 }
 
 export interface ExpectancyForecast {
@@ -412,6 +440,10 @@ export interface ReplayDecisionChainItem {
   stage: string;
   baselineArchetype?: string;
   candidateArchetype?: string;
+  baselineSide?: string;
+  candidateSide?: string;
+  baselineDirectionOwner?: string;
+  candidateDirectionOwner?: string;
   baselineRankingScore?: number;
   candidateRankingScore?: number;
   decisionCode?: string;
@@ -424,9 +456,15 @@ export interface ReplayReport {
   baseline_vs_candidate?: {
     baseline_entry_archetype?: string;
     candidate_entry_archetype?: string;
+    baseline_side?: string;
+    candidate_side?: string;
+    baseline_direction_owner?: string;
+    candidate_direction_owner?: string;
   };
   decision_chain?: ReplayDecisionChainItem[];
   entry_changed?: boolean;
+  side_changed?: boolean;
+  direction_owner_changed?: boolean;
   reduce_count?: number;
   partial_count?: number;
   close_reason?: string;
@@ -557,6 +595,14 @@ export interface BackendSignal {
   sizeMultiplier?: number;        // 0.5x - 1.5x position sizing
   timestamp: number;
   price: number;                  // Signal Price
+  entryArchetype?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
+  signalIntentApplied?: boolean;
+  decisionContext?: DecisionContext;
 }
 
 export interface PendingOrder {
@@ -720,6 +766,13 @@ export interface CoinOpportunity {
   expectedMaeBucket?: string;
   holdProfile?: string;
   replayFidelity?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
+  signalIntentApplied?: boolean;
+  selectedViaIntent?: boolean;
   leaderLagScore?: number;
   liqEchoScore?: number;
   microstructureScore?: number;
@@ -762,13 +815,22 @@ export interface PendingEntry {
   expectancy?: ExpectancyForecast;
   expectancyBand?: string;
   expectancyRankingScore?: number;
+  expectancySizeBias?: number;
   pendingPatienceBias?: number;
   expectedMfeBucket?: string;
   expectedMaeBucket?: string;
   holdProfile?: string;
   replayFidelity?: string;
+  directionOwner?: string;
+  directionConfidence?: number;
+  directionReason?: string;
+  signalIntentVersion?: string;
+  alternateIntent?: AlternateIntent;
+  signalIntentApplied?: boolean;
+  selectedViaIntent?: boolean;
   currentPrice?: number;
   waitReason?: string;
+  feedbackReason?: string;
   continuationFlowState?: string;
 }
 

@@ -3,6 +3,14 @@ import { Zap, TrendingUp, TrendingDown, Clock, ShoppingCart, Loader2, ChevronUp,
 import { CoinOpportunity, PendingEntry, SignalCounts } from '../types';
 import { buildDisplayActiveSignals } from '../utils/activeSignalsUtils';
 import { getReasonTooltip, translateReason, getReasonInfo, getReasonCategoryStyle } from '../utils/reasonUtils';
+import {
+    buildDecisionSummary,
+    formatAlternateIntentLabel,
+    formatSignalIntentVersion,
+    humanizeDecisionToken,
+    resolvePendingDisplayReasonCode,
+} from '../utils/decisionUi';
+import type { DecisionSummaryView } from '../utils/decisionUi';
 
 interface ActiveSignalsPanelProps {
     signals: any[]; // Executable signals only
@@ -130,59 +138,7 @@ const fmtNum = (value: number | null | undefined, digits: number = 2, fallback: 
     return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 };
 
-type DecisionSummary = {
-    entryArchetype: string;
-    regimeBucket: string;
-    executionArchetype: string;
-    exitOwnerProfile: string;
-    primaryOwner: string;
-    expectancyBand: string;
-    rankingScore: number | null;
-    holdProfile: string;
-    replayFidelity: string;
-    contextConfidence: number | null;
-    reason: string;
-    runnerContextResolved: string;
-    pendingPatienceBias: number | null;
-};
-
-const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
-    const safe = String(value || '').trim();
-    if (!safe) return fallback;
-    const dictionary: Record<string, string> = {
-        continuation: 'Devam',
-        reclaim: 'Geri Alım',
-        exhaustion: 'Tükeniş',
-        recovery: 'Toparlanma',
-        neutral_fallback: 'Dengeli',
-        runner_continuation: 'Runner',
-        reclaim_structural: 'Yapısal',
-        exhaustion_fade: 'Fade',
-        recovery_owner: 'Koruma',
-        balanced: 'Denge',
-        momentum_guarded: 'Momentum',
-        structural_limit: 'Yapısal Limit',
-        fade_confirmed: 'Onaylı Fade',
-        protective: 'Koruma',
-        strong: 'Güçlü',
-        good: 'İyi',
-        neutral: 'Nötr',
-        weak: 'Zayıf',
-        runner: 'Runner',
-        chop: 'Yatay',
-        fast_fail: 'Hızlı Red',
-        mean_revert: 'Geri Dönüş',
-        snapshot: 'Snapshot',
-        approx: 'Yaklaşık',
-        approx_ohlcv: 'Yaklaşık OHLCV',
-    };
-    const normalized = safe.toLowerCase();
-    if (dictionary[normalized]) return dictionary[normalized];
-    return safe
-        .replace(/[_-]+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, (char) => char.toUpperCase());
-};
+type DecisionSummary = DecisionSummaryView;
 
 const getArchetypeTone = (value: string): string => {
     switch (String(value || '').toLowerCase()) {
@@ -218,32 +174,7 @@ const getReplayTone = (value: string): string => (
         : 'bg-slate-800/80 text-slate-300 border border-slate-700/60'
 );
 
-const extractDecisionSummary = (item: Record<string, any>): DecisionSummary => {
-    const decisionContext = item.decisionContext && typeof item.decisionContext === 'object' ? item.decisionContext : {};
-    const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object' ? decisionContext.indicatorPolicy : {};
-    const expectancy = item.expectancy && typeof item.expectancy === 'object' ? item.expectancy : {};
-    const primaryOwner = Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
-        ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
-        : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', '');
-    const rankingScoreRaw = Number(expectancy.rankingScore ?? item.expectancyRankingScore ?? 0);
-    const pendingPatienceRaw = Number(expectancy.pendingPatienceBias ?? item.pendingPatienceBias ?? 0);
-
-    return {
-        entryArchetype: String(item.entryArchetype || decisionContext.entryArchetype || ''),
-        regimeBucket: String(decisionContext.regimeBucket || ''),
-        executionArchetype: String(decisionContext.executionArchetype || ''),
-        exitOwnerProfile: String(decisionContext.exitOwnerProfile || ''),
-        primaryOwner,
-        expectancyBand: String(item.expectancyBand || expectancy.expectancyBand || ''),
-        rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
-        holdProfile: String(item.holdProfile || expectancy.holdProfile || ''),
-        replayFidelity: String(item.replayFidelity || ''),
-        contextConfidence: Number.isFinite(Number(decisionContext.contextConfidence)) ? Number(decisionContext.contextConfidence) : null,
-        reason: String(decisionContext.reason || ''),
-        runnerContextResolved: String(item.runnerContextResolved || ''),
-        pendingPatienceBias: Number.isFinite(pendingPatienceRaw) && pendingPatienceRaw > 0 ? pendingPatienceRaw : null,
-    };
-};
+const extractDecisionSummary = (item: Record<string, any>): DecisionSummary => buildDecisionSummary(item);
 
 const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> = ({ summary, compact = false }) => {
     const hasData = Boolean(
@@ -254,14 +185,17 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> =
         || summary.runnerContextResolved
     );
     if (!hasData) return null;
+    const distinctDirectionReason = summary.directionReason && summary.directionReason !== summary.reason
+        ? summary.directionReason
+        : '';
 
     return (
         <div className={`rounded-md border border-slate-800/80 bg-slate-950/60 ${compact ? 'px-2 py-2' : 'px-2.5 py-2'}`}>
             <div className="flex items-center justify-between gap-2">
                 <div className="text-[9px] uppercase tracking-wider text-slate-500">Karar Özeti</div>
-                {summary.contextConfidence !== null && (
+                {summary.confidenceValue !== null && (
                     <span className="text-[10px] font-mono text-slate-400">
-                        Güven {(summary.contextConfidence * 100).toFixed(0)}%
+                        {summary.confidenceLabel || 'Güven'} {(summary.confidenceValue * 100).toFixed(0)}%
                     </span>
                 )}
             </div>
@@ -290,6 +224,11 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> =
                 {summary.replayFidelity && (
                     <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReplayTone(summary.replayFidelity)}`}>
                         {humanizeDecisionToken(summary.replayFidelity)}
+                    </span>
+                )}
+                {summary.selectedViaIntent && (
+                    <span className="rounded-full border border-fuchsia-500/25 bg-fuchsia-500/15 px-2 py-0.5 text-[10px] font-semibold text-fuchsia-300">
+                        Intent {formatSignalIntentVersion(summary.signalIntentVersion, 'V1')}
                     </span>
                 )}
             </div>
@@ -333,11 +272,13 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> =
                 )}
             </div>
 
-            {(summary.reason || summary.runnerContextResolved) && !compact && (
+            {(summary.reason || distinctDirectionReason || summary.alternateIntent) && !compact && (
                 <div className="mt-2 text-[10px] text-slate-500">
                     {summary.reason ? `Seçim: ${humanizeDecisionToken(summary.reason)}` : ''}
-                    {summary.reason && summary.runnerContextResolved ? ' • ' : ''}
-                    {summary.runnerContextResolved ? `Bağlam: ${humanizeDecisionToken(summary.runnerContextResolved)}` : ''}
+                    {summary.reason && distinctDirectionReason ? ' • ' : ''}
+                    {distinctDirectionReason ? `Yön: ${humanizeDecisionToken(distinctDirectionReason)}` : ''}
+                    {(summary.reason || distinctDirectionReason) && summary.alternateIntent ? ' • ' : ''}
+                    {summary.alternateIntent ? `Alt: ${formatAlternateIntentLabel(summary.alternateIntent)}` : ''}
                 </div>
             )}
         </div>
@@ -922,7 +863,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`}
                                 className="rounded-lg border border-cyan-500/30 bg-slate-900/60 px-3 py-2 border-l-4 border-l-cyan-400">
                                 {(() => {
-                                    const rawDecisionCode = String(entry.decisionCode || entry.waitReason || 'PENDING__WAIT');
+                                    const rawDecisionCode = resolvePendingDisplayReasonCode(entry as Record<string, any>);
                                     const reasonInfo = getReasonInfo(rawDecisionCode);
                                     const style = getReasonCategoryStyle(reasonInfo.category);
                                     const decisionTooltip = [
@@ -997,7 +938,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                             <div key={entry.pendingEntryId || entry.id || `${entry.symbol}-${entry.createdAt}`}
                                 className="rounded-lg border border-amber-500/20 bg-slate-900/60 px-3 py-2 border-l-4 border-l-amber-400">
                                 {(() => {
-                                    const rawDecisionCode = String(entry.decisionCode || entry.waitReason || 'PENDING__WAIT');
+                                    const rawDecisionCode = resolvePendingDisplayReasonCode(entry as Record<string, any>);
                                     const reasonInfo = getReasonInfo(rawDecisionCode);
                                     const style = getReasonCategoryStyle(reasonInfo.category);
                                     const decisionTooltip = [

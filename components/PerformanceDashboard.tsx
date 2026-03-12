@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, BarChart3, Trophy, AlertTriangle, Bot, RefreshCw, Layers } from 'lucide-react';
 import { Trade } from '../types';
 import { translateReason } from '../utils/reasonUtils';
+import { humanizeDecisionToken } from '../utils/decisionUi';
 
 interface DailyPnL {
     date: string;
@@ -57,34 +58,6 @@ const normalizeAttributionPayload = (raw: any) => {
         trade_count: tradeCount,
         has_data: tradeCount > 0 || hasAnyTotals || topPositive.length > 0 || topNegative.length > 0,
     };
-};
-
-const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
-    const safe = String(value || '').trim();
-    if (!safe) return fallback;
-    const dictionary: Record<string, string> = {
-        continuation: 'Devam',
-        reclaim: 'Geri Alım',
-        exhaustion: 'Tükeniş',
-        recovery: 'Toparlanma',
-        neutral_fallback: 'Dengeli',
-        strong: 'Güçlü',
-        good: 'İyi',
-        neutral: 'Nötr',
-        weak: 'Zayıf',
-        runner: 'Runner',
-        chop: 'Yatay',
-        fast_fail: 'Hızlı Red',
-        mean_revert: 'Geri Dönüş',
-        snapshot: 'Snapshot',
-        approx_ohlcv: 'Yaklaşık OHLCV',
-    };
-    const normalized = safe.toLowerCase();
-    if (dictionary[normalized]) return dictionary[normalized];
-    return safe
-        .replace(/[_-]+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, (char) => char.toUpperCase());
 };
 
 const getExpectancyTone = (value: string): string => {

@@ -14,6 +14,7 @@ import {
 import { formatPrice, formatCurrency, getPositionMargin } from './utils';
 import { translateReason, getCanonicalReason } from './utils/reasonUtils';
 import { buildDisplayActiveSignals } from './utils/activeSignalsUtils';
+import { buildDecisionSummary, formatSignalIntentVersion, humanizeDecisionToken } from './utils/decisionUi';
 import { SettingsModal } from './components/SettingsModal';
 import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
@@ -202,39 +203,6 @@ const getProfitPhaseTone = (phase: string): string => {
   }
 };
 
-const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
-  const safe = String(value || '').trim();
-  if (!safe) return fallback;
-  const dictionary: Record<string, string> = {
-    continuation: 'Devam',
-    reclaim: 'Geri Alım',
-    exhaustion: 'Tükeniş',
-    recovery: 'Toparlanma',
-    neutral_fallback: 'Dengeli',
-    strong: 'Güçlü',
-    good: 'İyi',
-    neutral: 'Nötr',
-    weak: 'Zayıf',
-    supporting: 'Destekliyor',
-    fading: 'Sönüyor',
-    chop: 'Yatay',
-    adverse_strong: 'Ters Güçlü',
-    adverse_weak: 'Ters Zayıf',
-    recovering: 'Toparlanıyor',
-    trend_aligned: 'Trend Uyumlu',
-    intraday_continuation: 'İçgün Devam',
-    countertrend: 'Karşı Trend',
-    snapshot: 'Snapshot',
-    approx_ohlcv: 'Yaklaşık OHLCV',
-  };
-  const normalized = safe.toLowerCase();
-  if (dictionary[normalized]) return dictionary[normalized];
-  return safe
-    .replace(/[_-]+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, (char) => char.toUpperCase());
-};
-
 const getArchetypeChipTone = (value: string): string => {
   switch (String(value || '').toLowerCase()) {
     case 'continuation':
@@ -278,31 +246,11 @@ const getStateChipTone = (value: string, family: 'continuation' | 'underwater'):
   return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
 };
 
-const getPositionDecisionSummary = (pos: any) => {
-  const decisionContext = pos?.decisionContext && typeof pos.decisionContext === 'object' ? pos.decisionContext : {};
-  const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object'
-    ? decisionContext.indicatorPolicy
-    : {};
-  const expectancy = pos?.expectancy && typeof pos.expectancy === 'object' ? pos.expectancy : {};
-  const rankingScoreRaw = Number(expectancy.rankingScore ?? pos?.expectancyRankingScore ?? 0);
-
-  return {
-    entryArchetype: String(pos?.entryArchetype || decisionContext.entryArchetype || ''),
-    expectancyBand: String(pos?.expectancyBand || expectancy.expectancyBand || ''),
-    holdProfile: String(pos?.holdProfile || expectancy.holdProfile || ''),
-    runnerContextResolved: String(pos?.runnerContextResolved || ''),
-    continuationFlowState: String(pos?.continuationFlowState || ''),
-    underwaterTapeState: String(pos?.underwaterTapeState || ''),
-    primaryOwner: Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
-      ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
-      : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', ''),
-    exitOwnerProfile: String(decisionContext.exitOwnerProfile || ''),
-    rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
-    lossGateSuppressedReason: String(pos?.lossGateSuppressedReason || ''),
-    sidewaysReclaimArmed: Boolean(pos?.sidewaysReclaimArmed),
-    regimeBucket: String(decisionContext.regimeBucket || ''),
-  };
-};
+const getPositionDecisionSummary = (pos: any) => ({
+  ...buildDecisionSummary(pos),
+  lossGateSuppressedReason: String(pos?.lossGateSuppressedReason || ''),
+  sidewaysReclaimArmed: Boolean(pos?.sidewaysReclaimArmed),
+});
 
 const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, compact = false }) => {
   const summary = getPositionDecisionSummary(pos);
@@ -2312,6 +2260,7 @@ export default function App() {
                                 {(() => {
                                   const summary = getPositionDecisionSummary(pos);
                                   const line = [
+                                    summary.selectedViaIntent ? `Intent ${formatSignalIntentVersion(summary.signalIntentVersion, 'V1')}` : '',
                                     summary.primaryOwner ? `Owner ${summary.primaryOwner}` : '',
                                     summary.exitOwnerProfile ? `Çıkış ${humanizeDecisionToken(summary.exitOwnerProfile)}` : '',
                                     summary.holdProfile ? `Tutuş ${humanizeDecisionToken(summary.holdProfile)}` : '',

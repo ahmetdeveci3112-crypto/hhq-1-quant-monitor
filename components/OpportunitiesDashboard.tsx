@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { TrendingUp, TrendingDown, Activity, Search, Layers3, Radar, ShieldAlert, Globe } from 'lucide-react';
 import { CoinOpportunity, PendingEntry } from '../types';
-import { getReasonTooltip, translateReason, getReasonInfo, getReasonCategoryStyle, getNextStep } from '../utils/reasonUtils';
+import { getReasonTooltip, getReasonInfo, getReasonCategoryStyle, getNextStep } from '../utils/reasonUtils';
+import { buildDecisionSummary, formatAlternateIntentLabel, formatSignalIntentVersion, humanizeDecisionToken } from '../utils/decisionUi';
 
 interface OpportunitiesDashboardProps {
     opportunities: CoinOpportunity[];
@@ -29,35 +30,6 @@ const formatVolume = (volume: number): string => {
 const getCoinIcon = (symbol: string): string => {
     const base = symbol.replace('USDT', '').toLowerCase();
     return `https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${base}.png`;
-};
-
-const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
-    const safe = String(value || '').trim();
-    if (!safe) return fallback;
-    const dictionary: Record<string, string> = {
-        continuation: 'Devam',
-        reclaim: 'Geri Alım',
-        exhaustion: 'Tükeniş',
-        recovery: 'Toparlanma',
-        neutral_fallback: 'Dengeli',
-        strong: 'Güçlü',
-        good: 'İyi',
-        neutral: 'Nötr',
-        weak: 'Zayıf',
-        runner: 'Runner',
-        chop: 'Yatay',
-        fast_fail: 'Hızlı Red',
-        mean_revert: 'Geri Dönüş',
-        snapshot: 'Snapshot',
-        approx: 'Yaklaşık',
-        approx_ohlcv: 'Yaklaşık OHLCV',
-    };
-    const normalized = safe.toLowerCase();
-    if (dictionary[normalized]) return dictionary[normalized];
-    return safe
-        .replace(/[_-]+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, (char) => char.toUpperCase());
 };
 
 const getArchetypeTone = (value: string): string => {
@@ -88,27 +60,7 @@ const getExpectancyTone = (value: string): string => {
     }
 };
 
-const getOpportunityDecisionSummary = (coin: CoinOpportunity) => {
-    const decisionContext = coin.decisionContext && typeof coin.decisionContext === 'object' ? coin.decisionContext : {};
-    const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object'
-        ? decisionContext.indicatorPolicy
-        : {};
-    const expectancy = coin.expectancy && typeof coin.expectancy === 'object' ? coin.expectancy : {};
-    const rankingScoreRaw = Number(expectancy.rankingScore ?? coin.expectancyRankingScore ?? 0);
-
-    return {
-        entryArchetype: String(coin.entryArchetype || decisionContext.entryArchetype || ''),
-        expectancyBand: String(coin.expectancyBand || expectancy.expectancyBand || ''),
-        regimeBucket: String(decisionContext.regimeBucket || ''),
-        holdProfile: String(coin.holdProfile || expectancy.holdProfile || ''),
-        runnerContextResolved: String(coin.runnerContextResolved || ''),
-        replayFidelity: String(coin.replayFidelity || ''),
-        primaryOwner: Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
-            ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
-            : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', ''),
-        rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
-    };
-};
+const getOpportunityDecisionSummary = (coin: CoinOpportunity) => buildDecisionSummary(coin as Record<string, any>);
 
 // Phase UI-Redesign: Enhanced CoinCard with "neden burada?" badge and "sonraki adım" text
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
@@ -236,6 +188,11 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                                 {humanizeDecisionToken(decisionSummary.regimeBucket)}
                             </span>
                         )}
+                        {decisionSummary.selectedViaIntent && (
+                            <span className="rounded-full border border-fuchsia-500/25 bg-fuchsia-500/15 px-2 py-1 text-[10px] font-semibold text-fuchsia-300">
+                                Intent {formatSignalIntentVersion(decisionSummary.signalIntentVersion, 'V1')}
+                            </span>
+                        )}
                     </div>
                     <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
                         {decisionSummary.primaryOwner && (
@@ -266,6 +223,13 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                     {decisionSummary.replayFidelity && (
                         <div className="mt-2 text-[10px] text-slate-500">
                             Replay: {humanizeDecisionToken(decisionSummary.replayFidelity)}
+                        </div>
+                    )}
+                    {(decisionSummary.directionReason || decisionSummary.alternateIntent) && (
+                        <div className="mt-1 text-[10px] text-slate-500">
+                            {decisionSummary.directionReason ? `Yön: ${humanizeDecisionToken(decisionSummary.directionReason)}` : ''}
+                            {decisionSummary.directionReason && decisionSummary.alternateIntent ? ' • ' : ''}
+                            {decisionSummary.alternateIntent ? `Alt: ${formatAlternateIntentLabel(decisionSummary.alternateIntent)}` : ''}
                         </div>
                     )}
                 </div>
@@ -355,11 +319,23 @@ const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                                 {humanizeDecisionToken(decisionSummary.expectancyBand)}
                             </span>
                         )}
+                        {decisionSummary.selectedViaIntent && (
+                            <span className="rounded-full border border-fuchsia-500/25 bg-fuchsia-500/15 px-2 py-1 text-[10px] font-semibold text-fuchsia-300">
+                                Intent {formatSignalIntentVersion(decisionSummary.signalIntentVersion, 'V1')}
+                            </span>
+                        )}
                     </div>
                     <div className="mt-2 text-[10px] text-slate-400">
                         {decisionSummary.primaryOwner ? `Owner: ${decisionSummary.primaryOwner}` : 'Owner bekleniyor'}
                         {decisionSummary.regimeBucket ? ` • ${humanizeDecisionToken(decisionSummary.regimeBucket)}` : ''}
                     </div>
+                    {(decisionSummary.directionReason || decisionSummary.alternateIntent) && (
+                        <div className="mt-1 text-[10px] text-slate-500">
+                            {decisionSummary.directionReason ? `Yön: ${humanizeDecisionToken(decisionSummary.directionReason)}` : ''}
+                            {decisionSummary.directionReason && decisionSummary.alternateIntent ? ' • ' : ''}
+                            {decisionSummary.alternateIntent ? `Alt: ${formatAlternateIntentLabel(decisionSummary.alternateIntent)}` : ''}
+                        </div>
+                    )}
                 </div>
             )}
         </div>
