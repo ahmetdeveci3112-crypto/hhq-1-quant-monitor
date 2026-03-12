@@ -14626,6 +14626,23 @@ V3_POST_EXIT_REENTRY_ATR_BREAKOUT_MULT = 0.35
 V3_POST_EXIT_REENTRY_SIZE_CAP_MULT = 0.35
 V3_POST_EXIT_REENTRY_STOP_MULT = 0.80
 V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE = 70.0
+V3_POST_EXIT_REENTRY_REASON_ALLOWLIST = (
+    "SIDEWAYS_RECLAIM_CLOSE",
+    "RECLAIM_BE_CLOSE",
+    "PROFIT_GIVEBACK_EXIT",
+)
+V3_POST_EXIT_REENTRY_RUNNER_CONTEXT_ALLOWLIST = (
+    V3_RUNNER_CONTEXT_COUNTER,
+    V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+    V3_RUNNER_CONTEXT_RECOVERY,
+    "",
+)
+V3_POST_EXIT_REENTRY_CONTINUATION_CONTEXT_ALLOWLIST = (
+    V3_RUNNER_CONTEXT_TREND,
+    V3_RUNNER_CONTEXT_INTRADAY,
+    V3_RUNNER_CONTEXT_RECOVERY,
+    V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+)
 V3_RUNNER_CONTEXT_CONFIGS = {
     V3_RUNNER_CONTEXT_TREND: {
         "trail_act_mult": 1.55,
@@ -15779,13 +15796,13 @@ def register_post_exit_reentry_watch(
     if _has_symbol_exposure(symbol):
         return None
     reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
-    if reason_core not in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE'):
+    if reason_core not in V3_POST_EXIT_REENTRY_REASON_ALLOWLIST:
         return None
     entry_archetype = str(safe_pos.get('entryArchetype', safe_trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM).lower()
     if entry_archetype != ENTRY_ARCHETYPE_RECLAIM:
         return None
     runner_context_resolved = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
-    if runner_context_resolved not in (V3_RUNNER_CONTEXT_COUNTER, V3_RUNNER_CONTEXT_CONTINUATION_RESCUE, ''):
+    if runner_context_resolved not in V3_POST_EXIT_REENTRY_RUNNER_CONTEXT_ALLOWLIST:
         return None
     existing_watch = post_exit_reentry_watchers.get(symbol)
     if isinstance(existing_watch, dict):
@@ -25945,6 +25962,107 @@ def _post_exit_reentry_breakout_distance(
     return safe_price <= (safe_exit - threshold), threshold
 
 
+def _build_post_exit_reentry_fallback_opportunity(watch: dict, signal: dict) -> Optional[dict]:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    safe_signal = signal if isinstance(signal, dict) else {}
+    decision_ctx = safe_signal.get('decisionContext') if isinstance(safe_signal.get('decisionContext'), dict) else {}
+    if not safe_signal:
+        return None
+    symbol = str(safe_watch.get('symbol', safe_signal.get('symbol', '')) or '').upper()
+    if not symbol:
+        return None
+    current_price = _coerce_float(
+        safe_signal.get('price', safe_signal.get('signalPrice', safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)))),
+        _coerce_float(safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)), 0.0),
+    )
+    if current_price <= 0:
+        return None
+    return {
+        'symbol': symbol,
+        'price': current_price,
+        'signalAction': str(safe_signal.get('action', safe_signal.get('side', safe_watch.get('side', ''))) or '').upper(),
+        'signalScore': _coerce_float(
+            safe_signal.get('signalScore', safe_signal.get('confidenceScore', safe_watch.get('originalSignalScore', 0.0))),
+            _coerce_float(safe_watch.get('originalSignalScore', 0.0), 0.0),
+        ),
+        'continuationFlowState': str(
+            safe_signal.get(
+                'continuationFlowState',
+                decision_ctx.get('continuationFlowState', safe_watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)),
+            )
+            or safe_watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)
+        ),
+        'volumeRatio': _coerce_float(
+            safe_signal.get('currentVolumeRatio', safe_signal.get('volumeRatio', safe_watch.get('currentVolumeRatio', 0.0))),
+            _coerce_float(safe_watch.get('currentVolumeRatio', 0.0), 0.0),
+        ),
+        'isVolumeSpike': bool(
+            safe_signal.get('currentIsVolumeSpike', safe_signal.get('isVolumeSpike', safe_watch.get('currentIsVolumeSpike', False)))
+        ),
+        'obImbalanceTrend': _coerce_float(
+            safe_signal.get('currentObImbalanceTrend', safe_signal.get('obImbalanceTrend', safe_watch.get('currentObImbalanceTrend', 0.0))),
+            _coerce_float(safe_watch.get('currentObImbalanceTrend', 0.0), 0.0),
+        ),
+        'imbalance': _coerce_float(
+            safe_signal.get('currentImbalance', safe_signal.get('imbalance', safe_watch.get('currentImbalance', 0.0))),
+            _coerce_float(safe_watch.get('currentImbalance', 0.0), 0.0),
+        ),
+        'currentExecScore': _coerce_float(
+            safe_signal.get('currentExecScore', safe_signal.get('entryExecScore', safe_watch.get('currentExecScore', 0.0))),
+            _coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0),
+        ),
+        'entryExecScore': _coerce_float(
+            safe_signal.get('entryExecScore', safe_signal.get('currentExecScore', safe_watch.get('currentExecScore', 0.0))),
+            _coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0),
+        ),
+        'spreadPct': _coerce_float(
+            safe_signal.get('currentSpreadPct', safe_signal.get('spreadPct', 0.05)),
+            0.05,
+        ),
+        'atr': _coerce_float(
+            safe_signal.get('atr', safe_watch.get('atr', 0.0)),
+            _coerce_float(safe_watch.get('atr', 0.0), 0.0),
+        ),
+        'atrPct': _coerce_float(
+            safe_signal.get('currentAtrPct', safe_signal.get('atrPct', safe_signal.get('volatility_pct', 0.0))),
+            0.0,
+        ),
+        'runnerContextResolved': str(
+            safe_signal.get('runnerContextResolved', safe_signal.get('runnerContext', safe_watch.get('runnerContextResolved', '')))
+            or safe_watch.get('runnerContextResolved', '')
+        ),
+    }
+
+
+def _is_post_exit_reentry_signal_eligible(watch: dict, signal: dict) -> bool:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    safe_signal = signal if isinstance(signal, dict) else {}
+    decision_ctx = safe_signal.get('decisionContext') if isinstance(safe_signal.get('decisionContext'), dict) else {}
+    if not safe_signal:
+        return False
+    watch_side = str(safe_watch.get('side', '') or '').upper()
+    signal_side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    if watch_side in ('LONG', 'SHORT') and signal_side != watch_side:
+        return False
+    signal_entry_arch = str(
+        safe_signal.get('entryArchetype', decision_ctx.get('entryArchetype', ''))
+        or ''
+    ).lower()
+    direction_owner = str(
+        safe_signal.get('directionOwner', decision_ctx.get('directionOwner', ''))
+        or ''
+    ).lower()
+    runner_context = str(
+        safe_signal.get('runnerContextResolved', safe_signal.get('runnerContext', ''))
+        or ''
+    )
+    return bool(
+        signal_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+        or direction_owner in ('continuation', 'recovery')
+        or runner_context in V3_POST_EXIT_REENTRY_CONTINUATION_CONTEXT_ALLOWLIST
+    )
+
+
 def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict) -> dict:
     import copy as _reentry_copy
 
@@ -26116,6 +26234,8 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         opp = opp_by_symbol.get(symbol)
         sig = signal_by_symbol.get(symbol)
         if not isinstance(opp, dict):
+            opp = _build_post_exit_reentry_fallback_opportunity(watch, sig)
+        if not isinstance(opp, dict):
             continue
         current_price = _coerce_float(opp.get('price', watch.get('lastPrice', watch.get('exitPrice', 0.0))), 0.0)
         live_ctx = _build_live_flow_context_from_opportunity(watch, opp, side=watch.get('side', ''))
@@ -26148,10 +26268,7 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         if now_ts < _coerce_float(watch.get('cooldownUntilTs', 0.0), 0.0):
             continue
 
-        signal_entry_arch = str(
-            (sig.get('entryArchetype', ((sig.get('decisionContext') or {}).get('entryArchetype', ''))) if isinstance(sig, dict) else '')
-            or ''
-        ).lower()
+        signal_reentry_eligible = _is_post_exit_reentry_signal_eligible(watch, sig)
         atr_distance = max(
             _coerce_float(opp.get('atr', watch.get('atr', 0.0)), 0.0),
             _coerce_float(current_price * (_coerce_float(opp.get('atrPct', opp.get('volatility_pct', 0.0)), 0.0) / 100.0), 0.0),
@@ -26170,7 +26287,7 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         continuation_ok = bool(
             continuation_state == V3_CONTINUATION_SUPPORTING
             or (
-                signal_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+                signal_reentry_eligible
                 and volume_ok
                 and obi_ok
                 and exec_ok
@@ -26179,7 +26296,7 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         signal_ok = bool(
             isinstance(sig, dict)
             and str(sig.get('action', '') or '').upper() == str(watch.get('side', '') or '').upper()
-            and signal_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+            and signal_reentry_eligible
             and opp_action == str(watch.get('side', '') or '').upper()
             and opp_score > 0
         )

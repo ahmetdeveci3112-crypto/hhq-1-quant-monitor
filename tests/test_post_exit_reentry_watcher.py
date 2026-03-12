@@ -145,6 +145,25 @@ def test_register_post_exit_reentry_watch_arms_for_eligible_reclaim_close(monkey
     assert main.post_exit_reentry_watchers["AAVEUSDT"]["originalTradeId"] == "TRD_RECLAIM_AAVE"
 
 
+def test_register_post_exit_reentry_watch_arms_for_profit_giveback_exit(monkeypatch):
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
+    monkeypatch.setattr(main.global_paper_trader, "positions", [])
+    monkeypatch.setattr(main.global_paper_trader, "pending_orders", [])
+
+    watch = main.register_post_exit_reentry_watch(
+        _build_reclaim_pos(),
+        _build_closed_trade(reason="SMART_V3_RUNNER__PROFIT_GIVEBACK_EXIT"),
+        original_reason="SMART_V3_RUNNER__PROFIT_GIVEBACK_EXIT",
+        normalized_reason="SMART_V3_RUNNER__PROFIT_GIVEBACK_EXIT",
+        exit_price=100.55,
+    )
+
+    assert watch is not None
+    assert watch["exitReason"] == "PROFIT_GIVEBACK_EXIT"
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
+
+
 def test_register_post_exit_reentry_watch_skips_hard_stop_close(monkeypatch):
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
@@ -201,6 +220,48 @@ def test_evaluate_post_exit_reentry_watchers_confirms_after_persistence(monkeypa
     asyncio.run(main.evaluate_post_exit_reentry_watchers([_build_candidate_opp()], [_build_candidate_signal()]))
 
     assert events == [("PEW_AAVE", "AAVEUSDT", "AAVEUSDT")]
+    assert watch["reentryTriggered"] is True
+
+
+def test_evaluate_post_exit_reentry_watchers_uses_signal_fallback_without_opportunity(monkeypatch):
+    events = []
+    watch = _build_watch(cooldownUntilTs=1000.0)
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol: False)
+
+    async def _fake_dispatch(safe_watch, signal, opportunity):
+        safe_watch["watchState"] = main.POST_EXIT_REENTRY_STATE_CONFIRMED
+        safe_watch["reentryUsed"] = True
+        safe_watch["reentryTriggered"] = True
+        safe_watch["reentryTriggerReason"] = "CONTINUATION_REENTRY_DISPATCHED"
+        events.append((safe_watch["watcherId"], signal["symbol"], opportunity["symbol"], round(opportunity["price"], 4)))
+        return True
+
+    signal = _build_candidate_signal(
+        price=100.65,
+        currentVolumeRatio=1.28,
+        currentObImbalanceTrend=2.7,
+        currentImbalance=2.5,
+        currentExecScore=74.0,
+        currentSpreadPct=0.05,
+        currentAtrPct=0.9,
+        continuationFlowState=main.V3_CONTINUATION_SUPPORTING,
+        runnerContextResolved=main.V3_RUNNER_CONTEXT_INTRADAY,
+        entryArchetype=main.ENTRY_ARCHETYPE_RECLAIM,
+        directionOwner="continuation",
+    )
+
+    monkeypatch.setattr(main, "dispatch_post_exit_reentry_watch", _fake_dispatch)
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+    asyncio.run(main.evaluate_post_exit_reentry_watchers([], [signal]))
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_CANDIDATE
+    assert watch["confirmCount"] == 1
+
+    monkeypatch.setattr(main.time, "time", lambda: 1061.0)
+    asyncio.run(main.evaluate_post_exit_reentry_watchers([], [signal]))
+
+    assert events == [("PEW_AAVE", "AAVEUSDT", "AAVEUSDT", 100.65)]
     assert watch["reentryTriggered"] is True
 
 
