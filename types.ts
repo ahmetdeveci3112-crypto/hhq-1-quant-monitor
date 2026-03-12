@@ -177,6 +177,30 @@ export interface Position {
   | string;
   runtimeTrailThresholdMult?: number;
   runtimeTrailLastUpdateTs?: number;
+  entryArchetype?: string;
+  runnerContextResolved?: string;
+  continuationFlowState?: string;
+  underwaterTapeState?: string;
+  sidewaysReclaimArmed?: boolean;
+  lossGateSuppressedReason?: string;
+  currentVolumeRatio?: number;
+  currentObImbalanceTrend?: number;
+  currentImbalance?: number;
+  underwaterPriceLossPct?: number;
+  underwaterAtrDist?: number;
+  smallLossBandPct?: number;
+  adverseStrongSinceTs?: number;
+  replayFidelity?: string;
+  expectancyBand?: string;
+  expectancyRankingScore?: number;
+  expectedMfeBucket?: string;
+  expectedMaeBucket?: string;
+  holdProfile?: string;
+  decisionContext?: DecisionContext;
+  indicatorPolicy?: IndicatorPolicy;
+  gatePolicy?: GatePolicy;
+  forecastPolicy?: ForecastPolicy;
+  expectancy?: ExpectancyForecast;
 }
 
 // Phase 139+232: Comprehensive close reason type matching all backend reasons
@@ -188,7 +212,7 @@ export type CloseReason =
   // Trailing Stop
   | 'TRAILING' | 'TRAILING_STOP' | 'TRAIL_EXIT'
   | 'TRAIL_WIDE_EXIT' | 'TRAIL_NORMAL_EXIT' | 'TRAIL_TIGHT_EXIT'
-  | 'PROFIT_GIVEBACK_EXIT' | 'RECLAIM_BE_CLOSE'
+  | 'PROFIT_GIVEBACK_EXIT' | 'RECLAIM_BE_CLOSE' | 'SIDEWAYS_RECLAIM_CLOSE'
   // Kill Switch
   | 'KILL_SWITCH_FULL' | 'KILL_SWITCH_PARTIAL'
   // Time-based position management
@@ -199,12 +223,16 @@ export type CloseReason =
   // Phase 142: Portfolio Recovery Close
   | 'RECOVERY_CLOSE_ALL'
   | 'PRE_STOP_REDUCE'
+  | 'PRE_STOP_HOLD_ARMED'
+  | 'PRE_STOP_HOLD_RELEASED'
   | 'SIGNAL_INVALIDATION_REDUCE'
   | 'REGIME_DETERIORATION_REDUCE'
   | 'EXECUTION_RISK_REDUCE'
   | 'FUNDING_DECAY_REDUCE'
   | 'RECOVERY_REDUCE_STAGE1'
   | 'RECOVERY_REDUCE_STAGE2'
+  | 'CHOP_TIGHTEN'
+  | 'LIMITED_MARKET_CONTINUATION'
   // Phase 232 / Phase 206: New reasons
   | 'FAILED_CONTINUATION' | 'PORTFOLIO_DRAWDOWN'
   | 'BREAKEVEN_CLOSE' | 'RECOVERY_TRAIL_CLOSE' | 'TRAILING_DD_LOCK'
@@ -256,6 +284,204 @@ export interface Trade {
   runner_trail_dist_mult?: number;
   runner_tp_tighten?: number;
   runner_be_buffer_mult?: number;
+  entryArchetype?: string;
+  runnerContextResolved?: string;
+  continuationFlowState?: string;
+  underwaterTapeState?: string;
+  sidewaysReclaimArmed?: boolean;
+  lossGateSuppressedReason?: string;
+  replayFidelity?: string;
+  expectancyBand?: string;
+  expectancyRankingScore?: number;
+  expectedMfeBucket?: string;
+  expectedMaeBucket?: string;
+  holdProfile?: string;
+  decisionContext?: DecisionContext;
+  indicatorPolicy?: IndicatorPolicy;
+  gatePolicy?: GatePolicy;
+  forecastPolicy?: ForecastPolicy;
+  expectancy?: ExpectancyForecast;
+  signalSnapshot?: Record<string, any>;
+  closeSnapshot?: Record<string, any>;
+}
+
+export interface IndicatorPolicy {
+  primary?: string[];
+  secondary?: string[];
+  suppressed?: string[];
+}
+
+export interface GatePolicy {
+  primary_owner?: string;
+  primaryOwner?: string;
+  allow_soft_rescue?: boolean;
+  allowSoftRescue?: boolean;
+  allow_continuation_market_override?: boolean;
+  allowContinuationMarketOverride?: boolean;
+  allow_structural_only_reclaim?: boolean;
+  allowStructuralOnlyReclaim?: boolean;
+  prefer_soft_over_hard?: boolean;
+  preferSoftOverHard?: boolean;
+}
+
+export interface ForecastPolicy {
+  weight_bias?: string;
+  weightBias?: string;
+  prefer_ranking_owner?: boolean;
+  preferRankingOwner?: boolean;
+  prefer_pending_patience?: boolean;
+  preferPendingPatience?: boolean;
+  prefer_size_defense?: boolean;
+  preferSizeDefense?: boolean;
+}
+
+export interface DecisionContext {
+  regimeBucket?: string;
+  strategyBucket?: string;
+  entryArchetype?: string;
+  executionArchetype?: string;
+  exitOwnerProfile?: string;
+  indicatorPolicy?: IndicatorPolicy;
+  gatePolicy?: GatePolicy;
+  forecastPolicy?: ForecastPolicy;
+  contextConfidence?: number;
+  reason?: string;
+  mode?: string;
+  alignedDailyTrend?: boolean;
+  opposedDailyTrend?: boolean;
+}
+
+export interface ExpectancyForecast {
+  edgeProb?: number;
+  uncertainty?: number;
+  expectancyBand?: string;
+  expectedMfeBucket?: string;
+  expectedMaeBucket?: string;
+  holdProfile?: string;
+  rankingScore?: number;
+  sizeBias?: number;
+  pendingPatienceBias?: number;
+  contextKey?: string;
+  historySamples?: number;
+  historyWinRate?: number;
+  historyAvgRoi?: number;
+  historyAvgPeakRoi?: number;
+}
+
+export interface ReplayDecisionSnapshot {
+  snapshotId: string;
+  createdTs: number;
+  created_ts?: number;
+  symbol: string;
+  stage: string;
+  signalId?: string;
+  tradeId?: string;
+  positionId?: string;
+  context: DecisionContext;
+  inputs: Record<string, any>;
+  decision: Record<string, any>;
+  outcome: Record<string, any>;
+  sourceVersion?: string;
+}
+
+export interface ReplaySearchResult {
+  tradeId: string;
+  id?: string;
+  symbol: string;
+  displaySymbol?: string;
+  side: 'LONG' | 'SHORT' | string;
+  openTime: number;
+  closeTime: number;
+  pnl: number;
+  roi: number;
+  reason: string;
+  reasonOwner?: string;
+  entryArchetype?: string;
+  expectancyBand?: string;
+  expectancyRankingScore?: number;
+  holdProfile?: string;
+  replayFidelity?: string;
+  strategyMode?: string;
+  runnerContextResolved?: string;
+  peakRoi?: number;
+  realizedPeakCaptureRatio?: number;
+  giveback?: number;
+}
+
+export interface ReplayDecisionChainItem {
+  stage: string;
+  baselineArchetype?: string;
+  candidateArchetype?: string;
+  baselineRankingScore?: number;
+  candidateRankingScore?: number;
+  decisionCode?: string;
+}
+
+export interface ReplayReport {
+  approximate: boolean;
+  snapshot_count?: number;
+  snapshotCount?: number;
+  baseline_vs_candidate?: {
+    baseline_entry_archetype?: string;
+    candidate_entry_archetype?: string;
+  };
+  decision_chain?: ReplayDecisionChainItem[];
+  entry_changed?: boolean;
+  reduce_count?: number;
+  partial_count?: number;
+  close_reason?: string;
+  peak_roi?: number;
+  realized_peak_capture_ratio?: number;
+  giveback?: number;
+}
+
+export interface ReplayTradeResponse {
+  success: boolean;
+  trade: ReplaySearchResult;
+  policyVersion: 'baseline' | 'candidate' | string;
+  replayFidelity: string;
+  approximate: boolean;
+  report: ReplayReport;
+}
+
+export interface ReplaySnapshotsResponse {
+  success: boolean;
+  tradeId: string;
+  replayFidelity: string;
+  count: number;
+  snapshots: ReplayDecisionSnapshot[];
+}
+
+export interface ReplaySearchResponse {
+  success: boolean;
+  symbol: string;
+  days: number;
+  limit: number;
+  count: number;
+  items: ReplaySearchResult[];
+}
+
+export interface ReplayHealthResponse {
+  success: boolean;
+  days: number;
+  tradeCount: number;
+  snapshotCoverage: number;
+  snapshotReadyCount: number;
+  approximateCount: number;
+  avgRealizedPeakCaptureRatio: number;
+  preStopReduceCount: number;
+  sidewaysReclaimCount: number;
+  archetypeCounts: Record<string, number>;
+  expectancyBandCounts: Record<string, { count: number; wins: number }>;
+}
+
+export interface BacktestApiResponse {
+  trades: Array<Record<string, any>>;
+  equityCurve: Array<Record<string, any>>;
+  priceData: Array<Record<string, any>>;
+  stats: Record<string, any>;
+  fidelity?: string;
+  error?: string;
 }
 
 export interface EquityPoint {
@@ -479,6 +705,26 @@ export interface CoinOpportunity {
   // Phase 205: pandas-ta observability
   squeezeFiring?: boolean;
   chopIndex?: number;
+  entryArchetype?: string;
+  runnerContextResolved?: string;
+  decisionContext?: DecisionContext;
+  indicatorPolicy?: IndicatorPolicy;
+  gatePolicy?: GatePolicy;
+  forecastPolicy?: ForecastPolicy;
+  expectancy?: ExpectancyForecast;
+  expectancyBand?: string;
+  expectancyRankingScore?: number;
+  expectancySizeBias?: number;
+  pendingPatienceBias?: number;
+  expectedMfeBucket?: string;
+  expectedMaeBucket?: string;
+  holdProfile?: string;
+  replayFidelity?: string;
+  leaderLagScore?: number;
+  liqEchoScore?: number;
+  microstructureScore?: number;
+  flowToxicityScore?: number;
+  refillFailureScore?: number;
 }
 
 export interface PendingEntry {
@@ -507,6 +753,23 @@ export interface PendingEntry {
   executionStyle?: string;
   structuralFallbackStage?: string;
   recheckInSec?: number;
+  entryArchetype?: string;
+  runnerContextResolved?: string;
+  decisionContext?: DecisionContext;
+  indicatorPolicy?: IndicatorPolicy;
+  gatePolicy?: GatePolicy;
+  forecastPolicy?: ForecastPolicy;
+  expectancy?: ExpectancyForecast;
+  expectancyBand?: string;
+  expectancyRankingScore?: number;
+  pendingPatienceBias?: number;
+  expectedMfeBucket?: string;
+  expectedMaeBucket?: string;
+  holdProfile?: string;
+  replayFidelity?: string;
+  currentPrice?: number;
+  waitReason?: string;
+  continuationFlowState?: string;
 }
 
 export interface SignalCounterBreakdown {

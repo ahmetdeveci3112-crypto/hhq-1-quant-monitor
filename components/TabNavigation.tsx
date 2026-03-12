@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Wallet, Zap, BarChart3, Terminal, TrendingUp, TrendingDown, Bot } from 'lucide-react';
+import React from 'react';
+import { Wallet, Zap, BarChart3, Terminal, TrendingUp, Bot, Radar } from 'lucide-react';
 
 interface TabsProps {
     activeTab: string;
@@ -25,6 +25,7 @@ export const TabNavigation: React.FC<TabsProps> = ({
         { id: 'signals', label: 'Sinyaller', icon: Zap, badge: signalCount > 0 ? signalCount : null },
         { id: 'opportunities', label: 'Adaylar', icon: TrendingUp, badge: opportunitiesCount > 0 ? opportunitiesCount : null },
         { id: 'ai', label: 'Yapay Zeka', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
+        { id: 'workbench', label: 'Workbench', icon: Radar, badge: null },
         { id: 'performance', label: 'Performans', icon: BarChart3, badge: null },
         { id: 'logs', label: 'Loglar', icon: Terminal, badge: null },
     ];

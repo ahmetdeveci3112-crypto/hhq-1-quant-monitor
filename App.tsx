@@ -23,6 +23,7 @@ import { WalletPanel, PositionCardBinance } from './components/WalletPanel';
 import { TabNavigation } from './components/TabNavigation';
 import { AITrackingPanel } from './components/AITrackingPanel';
 import { PerformanceDashboard } from './components/PerformanceDashboard';
+import { ReplayWorkbench } from './components/ReplayWorkbench';
 import { useUIWebSocket } from './hooks/useUIWebSocket';
 
 // Backend WebSocket URLs
@@ -199,6 +200,195 @@ const getProfitPhaseTone = (phase: string): string => {
     default:
       return 'bg-slate-800/50 text-slate-500';
   }
+};
+
+const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
+  const safe = String(value || '').trim();
+  if (!safe) return fallback;
+  const dictionary: Record<string, string> = {
+    continuation: 'Devam',
+    reclaim: 'Geri Alım',
+    exhaustion: 'Tükeniş',
+    recovery: 'Toparlanma',
+    neutral_fallback: 'Dengeli',
+    strong: 'Güçlü',
+    good: 'İyi',
+    neutral: 'Nötr',
+    weak: 'Zayıf',
+    supporting: 'Destekliyor',
+    fading: 'Sönüyor',
+    chop: 'Yatay',
+    adverse_strong: 'Ters Güçlü',
+    adverse_weak: 'Ters Zayıf',
+    recovering: 'Toparlanıyor',
+    trend_aligned: 'Trend Uyumlu',
+    intraday_continuation: 'İçgün Devam',
+    countertrend: 'Karşı Trend',
+    snapshot: 'Snapshot',
+    approx_ohlcv: 'Yaklaşık OHLCV',
+  };
+  const normalized = safe.toLowerCase();
+  if (dictionary[normalized]) return dictionary[normalized];
+  return safe
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
+const getArchetypeChipTone = (value: string): string => {
+  switch (String(value || '').toLowerCase()) {
+    case 'continuation':
+      return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+    case 'reclaim':
+      return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
+    case 'exhaustion':
+      return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+    case 'recovery':
+      return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+    default:
+      return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+  }
+};
+
+const getExpectancyChipTone = (value: string): string => {
+  switch (String(value || '').toUpperCase()) {
+    case 'STRONG':
+      return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+    case 'GOOD':
+      return 'bg-lime-500/15 text-lime-300 border border-lime-500/25';
+    case 'WEAK':
+      return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+    default:
+      return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+  }
+};
+
+const getStateChipTone = (value: string, family: 'continuation' | 'underwater'): string => {
+  const safe = String(value || '').toLowerCase();
+  if (family === 'continuation') {
+    if (safe === 'supporting') return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+    if (safe === 'fading') return 'bg-amber-500/15 text-amber-300 border border-amber-500/25';
+    if (safe === 'chop') return 'bg-slate-700/80 text-slate-300 border border-slate-600/60';
+    return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+  }
+  if (safe === 'adverse_strong') return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+  if (safe === 'adverse_weak') return 'bg-orange-500/15 text-orange-300 border border-orange-500/25';
+  if (safe === 'recovering') return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+  if (safe === 'sideways') return 'bg-slate-700/80 text-slate-300 border border-slate-600/60';
+  return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+};
+
+const getPositionDecisionSummary = (pos: any) => {
+  const decisionContext = pos?.decisionContext && typeof pos.decisionContext === 'object' ? pos.decisionContext : {};
+  const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object'
+    ? decisionContext.indicatorPolicy
+    : {};
+  const expectancy = pos?.expectancy && typeof pos.expectancy === 'object' ? pos.expectancy : {};
+  const rankingScoreRaw = Number(expectancy.rankingScore ?? pos?.expectancyRankingScore ?? 0);
+
+  return {
+    entryArchetype: String(pos?.entryArchetype || decisionContext.entryArchetype || ''),
+    expectancyBand: String(pos?.expectancyBand || expectancy.expectancyBand || ''),
+    holdProfile: String(pos?.holdProfile || expectancy.holdProfile || ''),
+    runnerContextResolved: String(pos?.runnerContextResolved || ''),
+    continuationFlowState: String(pos?.continuationFlowState || ''),
+    underwaterTapeState: String(pos?.underwaterTapeState || ''),
+    primaryOwner: Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
+      ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
+      : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', ''),
+    exitOwnerProfile: String(decisionContext.exitOwnerProfile || ''),
+    rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
+    lossGateSuppressedReason: String(pos?.lossGateSuppressedReason || ''),
+    sidewaysReclaimArmed: Boolean(pos?.sidewaysReclaimArmed),
+    regimeBucket: String(decisionContext.regimeBucket || ''),
+  };
+};
+
+const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, compact = false }) => {
+  const summary = getPositionDecisionSummary(pos);
+  const hasData = Boolean(
+    summary.entryArchetype
+    || summary.expectancyBand
+    || summary.runnerContextResolved
+    || summary.continuationFlowState
+    || summary.underwaterTapeState
+    || summary.primaryOwner
+  );
+  if (!hasData) return null;
+
+  return (
+    <div className={`rounded-lg border border-slate-800/80 bg-slate-950/50 ${compact ? 'px-2 py-2' : 'px-2.5 py-2'}`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[9px] uppercase tracking-wider text-slate-500">Decision HUD</div>
+        {summary.regimeBucket && (
+          <span className="text-[10px] text-slate-400">{humanizeDecisionToken(summary.regimeBucket)}</span>
+        )}
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {summary.entryArchetype && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getArchetypeChipTone(summary.entryArchetype)}`}>
+            {humanizeDecisionToken(summary.entryArchetype)}
+          </span>
+        )}
+        {summary.expectancyBand && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getExpectancyChipTone(summary.expectancyBand)}`}>
+            {humanizeDecisionToken(summary.expectancyBand)}
+          </span>
+        )}
+        {summary.runnerContextResolved && (
+          <span className="rounded-full border border-slate-700/60 bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+            {humanizeDecisionToken(summary.runnerContextResolved)}
+          </span>
+        )}
+        {summary.continuationFlowState && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getStateChipTone(summary.continuationFlowState, 'continuation')}`}>
+            {humanizeDecisionToken(summary.continuationFlowState)}
+          </span>
+        )}
+        {summary.underwaterTapeState && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getStateChipTone(summary.underwaterTapeState, 'underwater')}`}>
+            {humanizeDecisionToken(summary.underwaterTapeState)}
+          </span>
+        )}
+      </div>
+
+      <div className={`mt-2 grid gap-2 text-[10px] text-slate-400 ${compact ? 'grid-cols-2' : 'grid-cols-2 xl:grid-cols-4'}`}>
+        {summary.primaryOwner && (
+          <div>
+            <div className="text-slate-500">Owner</div>
+            <div className="font-medium text-slate-200">{summary.primaryOwner}</div>
+          </div>
+        )}
+        {summary.exitOwnerProfile && (
+          <div>
+            <div className="text-slate-500">Çıkış</div>
+            <div className="font-medium text-slate-200">{humanizeDecisionToken(summary.exitOwnerProfile)}</div>
+          </div>
+        )}
+        {summary.holdProfile && (
+          <div>
+            <div className="text-slate-500">Tutuş</div>
+            <div className="font-medium text-slate-200">{humanizeDecisionToken(summary.holdProfile)}</div>
+          </div>
+        )}
+        {summary.rankingScore !== null && (
+          <div>
+            <div className="text-slate-500">Rank</div>
+            <div className="font-mono text-slate-200">{summary.rankingScore.toFixed(1)}</div>
+          </div>
+        )}
+      </div>
+
+      {(summary.lossGateSuppressedReason || summary.sidewaysReclaimArmed) && (
+        <div className="mt-2 text-[10px] text-slate-500">
+          {summary.lossGateSuppressedReason ? `Loss gate: ${translateReason(summary.lossGateSuppressedReason)}` : 'Loss gate nötr'}
+          {summary.lossGateSuppressedReason && summary.sidewaysReclaimArmed ? ' • ' : ''}
+          {summary.sidewaysReclaimArmed ? 'BE reclaim hazır' : ''}
+        </div>
+      )}
+    </div>
+  );
 };
 
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
@@ -1932,6 +2122,9 @@ export default function App() {
                             {regimeFlags.length > 0 ? ` • ${regimeFlags.join(', ')}` : ''}
                           </div>
                         )}
+                        <div className="mt-2">
+                          <PositionDecisionHUD pos={pos} compact />
+                        </div>
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
@@ -2044,12 +2237,28 @@ export default function App() {
                                   src={`https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${pos.symbol.replace('USDT', '').toLowerCase()}.png`}
                                   alt=""
                                   className="w-5 h-5"
-                                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                                 />
                                 <span className="font-medium text-white">{pos.symbol.replace('USDT', '')}</span>
                                 <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
                                 <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
                                 <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
+                              </div>
+                              <div className="mt-1 flex flex-wrap gap-1">
+                                {(() => {
+                                  const summary = getPositionDecisionSummary(pos);
+                                  const chips = [
+                                    summary.entryArchetype ? { label: humanizeDecisionToken(summary.entryArchetype), className: getArchetypeChipTone(summary.entryArchetype) } : null,
+                                    summary.expectancyBand ? { label: humanizeDecisionToken(summary.expectancyBand), className: getExpectancyChipTone(summary.expectancyBand) } : null,
+                                    summary.continuationFlowState ? { label: humanizeDecisionToken(summary.continuationFlowState), className: getStateChipTone(summary.continuationFlowState, 'continuation') } : null,
+                                    summary.underwaterTapeState ? { label: humanizeDecisionToken(summary.underwaterTapeState), className: getStateChipTone(summary.underwaterTapeState, 'underwater') } : null,
+                                  ].filter(Boolean) as Array<{ label: string; className: string }>;
+                                  return chips.map((chip) => (
+                                    <span key={`${pos.id}-${chip.label}`} className={`text-[9px] px-1 py-0.5 rounded font-semibold ${chip.className}`}>
+                                      {chip.label}
+                                    </span>
+                                  ));
+                                })()}
                               </div>
                             </td>
                             <td className="py-3 px-2">
@@ -2100,6 +2309,22 @@ export default function App() {
                                 {runtimeExchangeBreakEvenPrice > 0 && (
                                   <div className="font-mono text-slate-500">BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
                                 )}
+                                {(() => {
+                                  const summary = getPositionDecisionSummary(pos);
+                                  const line = [
+                                    summary.primaryOwner ? `Owner ${summary.primaryOwner}` : '',
+                                    summary.exitOwnerProfile ? `Çıkış ${humanizeDecisionToken(summary.exitOwnerProfile)}` : '',
+                                    summary.holdProfile ? `Tutuş ${humanizeDecisionToken(summary.holdProfile)}` : '',
+                                  ].filter(Boolean).join(' • ');
+                                  if (!line && !summary.lossGateSuppressedReason) return null;
+                                  return (
+                                    <div className="font-mono text-slate-500">
+                                      {line}
+                                      {line && summary.lossGateSuppressedReason ? ' • ' : ''}
+                                      {summary.lossGateSuppressedReason ? `Loss ${translateReason(summary.lossGateSuppressedReason)}` : ''}
+                                    </div>
+                                  );
+                                })()}
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
@@ -2460,9 +2685,20 @@ export default function App() {
 
         {/* PERFORMANCE TAB */}
         {
+          activeTab === 'workbench' && (
+            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
+              <ReplayWorkbench apiUrl={BACKEND_API_URL} />
+            </div>
+          )
+        }
+
+        {
           activeTab === 'performance' && (
             <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-              <PerformanceDashboard apiUrl={isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000'} />
+              <PerformanceDashboard
+                apiUrl={isProduction ? 'https://hhq-1-quant-monitor.fly.dev' : 'http://localhost:8000'}
+                trades={portfolio.trades}
+              />
             </div>
           )
         }

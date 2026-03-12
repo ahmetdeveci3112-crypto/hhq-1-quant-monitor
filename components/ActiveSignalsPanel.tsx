@@ -130,6 +130,220 @@ const fmtNum = (value: number | null | undefined, digits: number = 2, fallback: 
     return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 };
 
+type DecisionSummary = {
+    entryArchetype: string;
+    regimeBucket: string;
+    executionArchetype: string;
+    exitOwnerProfile: string;
+    primaryOwner: string;
+    expectancyBand: string;
+    rankingScore: number | null;
+    holdProfile: string;
+    replayFidelity: string;
+    contextConfidence: number | null;
+    reason: string;
+    runnerContextResolved: string;
+    pendingPatienceBias: number | null;
+};
+
+const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
+    const safe = String(value || '').trim();
+    if (!safe) return fallback;
+    const dictionary: Record<string, string> = {
+        continuation: 'Devam',
+        reclaim: 'Geri Alım',
+        exhaustion: 'Tükeniş',
+        recovery: 'Toparlanma',
+        neutral_fallback: 'Dengeli',
+        runner_continuation: 'Runner',
+        reclaim_structural: 'Yapısal',
+        exhaustion_fade: 'Fade',
+        recovery_owner: 'Koruma',
+        balanced: 'Denge',
+        momentum_guarded: 'Momentum',
+        structural_limit: 'Yapısal Limit',
+        fade_confirmed: 'Onaylı Fade',
+        protective: 'Koruma',
+        strong: 'Güçlü',
+        good: 'İyi',
+        neutral: 'Nötr',
+        weak: 'Zayıf',
+        runner: 'Runner',
+        chop: 'Yatay',
+        fast_fail: 'Hızlı Red',
+        mean_revert: 'Geri Dönüş',
+        snapshot: 'Snapshot',
+        approx: 'Yaklaşık',
+        approx_ohlcv: 'Yaklaşık OHLCV',
+    };
+    const normalized = safe.toLowerCase();
+    if (dictionary[normalized]) return dictionary[normalized];
+    return safe
+        .replace(/[_-]+/g, ' ')
+        .trim()
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
+const getArchetypeTone = (value: string): string => {
+    switch (String(value || '').toLowerCase()) {
+        case 'continuation':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'reclaim':
+            return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
+        case 'exhaustion':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        case 'recovery':
+            return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+const getExpectancyTone = (value: string): string => {
+    switch (String(value || '').toUpperCase()) {
+        case 'STRONG':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'GOOD':
+            return 'bg-lime-500/15 text-lime-300 border border-lime-500/25';
+        case 'WEAK':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+const getReplayTone = (value: string): string => (
+    String(value || '').toLowerCase().includes('snapshot')
+        ? 'bg-violet-500/15 text-violet-300 border border-violet-500/25'
+        : 'bg-slate-800/80 text-slate-300 border border-slate-700/60'
+);
+
+const extractDecisionSummary = (item: Record<string, any>): DecisionSummary => {
+    const decisionContext = item.decisionContext && typeof item.decisionContext === 'object' ? item.decisionContext : {};
+    const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object' ? decisionContext.indicatorPolicy : {};
+    const expectancy = item.expectancy && typeof item.expectancy === 'object' ? item.expectancy : {};
+    const primaryOwner = Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
+        ? humanizeDecisionToken(indicatorPolicy.primary[0])
+        : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '');
+    const rankingScoreRaw = Number(expectancy.rankingScore ?? item.expectancyRankingScore ?? 0);
+    const pendingPatienceRaw = Number(expectancy.pendingPatienceBias ?? item.pendingPatienceBias ?? 0);
+
+    return {
+        entryArchetype: String(item.entryArchetype || decisionContext.entryArchetype || ''),
+        regimeBucket: String(decisionContext.regimeBucket || ''),
+        executionArchetype: String(decisionContext.executionArchetype || ''),
+        exitOwnerProfile: String(decisionContext.exitOwnerProfile || ''),
+        primaryOwner,
+        expectancyBand: String(item.expectancyBand || expectancy.expectancyBand || ''),
+        rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
+        holdProfile: String(item.holdProfile || expectancy.holdProfile || ''),
+        replayFidelity: String(item.replayFidelity || ''),
+        contextConfidence: Number.isFinite(Number(decisionContext.contextConfidence)) ? Number(decisionContext.contextConfidence) : null,
+        reason: String(decisionContext.reason || ''),
+        runnerContextResolved: String(item.runnerContextResolved || ''),
+        pendingPatienceBias: Number.isFinite(pendingPatienceRaw) && pendingPatienceRaw > 0 ? pendingPatienceRaw : null,
+    };
+};
+
+const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> = ({ summary, compact = false }) => {
+    const hasData = Boolean(
+        summary.entryArchetype
+        || summary.expectancyBand
+        || summary.primaryOwner
+        || summary.regimeBucket
+        || summary.runnerContextResolved
+    );
+    if (!hasData) return null;
+
+    return (
+        <div className={`rounded-md border border-slate-800/80 bg-slate-950/60 ${compact ? 'px-2 py-2' : 'px-2.5 py-2'}`}>
+            <div className="flex items-center justify-between gap-2">
+                <div className="text-[9px] uppercase tracking-wider text-slate-500">Karar Özeti</div>
+                {summary.contextConfidence !== null && (
+                    <span className="text-[10px] font-mono text-slate-400">
+                        Güven {(summary.contextConfidence * 100).toFixed(0)}%
+                    </span>
+                )}
+            </div>
+
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {summary.entryArchetype && (
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getArchetypeTone(summary.entryArchetype)}`}>
+                        {humanizeDecisionToken(summary.entryArchetype)}
+                    </span>
+                )}
+                {summary.expectancyBand && (
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getExpectancyTone(summary.expectancyBand)}`}>
+                        {humanizeDecisionToken(summary.expectancyBand)}
+                    </span>
+                )}
+                {summary.regimeBucket && (
+                    <span className="rounded-full border border-slate-700/60 bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                        {humanizeDecisionToken(summary.regimeBucket)}
+                    </span>
+                )}
+                {summary.holdProfile && (
+                    <span className="rounded-full border border-slate-700/60 bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                        Tutuş {humanizeDecisionToken(summary.holdProfile)}
+                    </span>
+                )}
+                {summary.replayFidelity && (
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReplayTone(summary.replayFidelity)}`}>
+                        {humanizeDecisionToken(summary.replayFidelity)}
+                    </span>
+                )}
+            </div>
+
+            <div className={`mt-2 grid gap-2 text-[10px] text-slate-400 ${compact ? 'grid-cols-2' : 'grid-cols-2 sm:grid-cols-4'}`}>
+                {summary.primaryOwner && (
+                    <div>
+                        <div className="text-slate-500">Owner</div>
+                        <div className="font-medium text-slate-200">{summary.primaryOwner}</div>
+                    </div>
+                )}
+                {summary.executionArchetype && (
+                    <div>
+                        <div className="text-slate-500">Yürütme</div>
+                        <div className="font-medium text-slate-200">{humanizeDecisionToken(summary.executionArchetype)}</div>
+                    </div>
+                )}
+                {summary.exitOwnerProfile && (
+                    <div>
+                        <div className="text-slate-500">Çıkış</div>
+                        <div className="font-medium text-slate-200">{humanizeDecisionToken(summary.exitOwnerProfile)}</div>
+                    </div>
+                )}
+                {summary.rankingScore !== null && (
+                    <div>
+                        <div className="text-slate-500">Rank</div>
+                        <div className="font-mono text-slate-200">{summary.rankingScore.toFixed(1)}</div>
+                    </div>
+                )}
+                {summary.pendingPatienceBias !== null && (
+                    <div>
+                        <div className="text-slate-500">Sabır</div>
+                        <div className="font-mono text-slate-200">x{summary.pendingPatienceBias.toFixed(2)}</div>
+                    </div>
+                )}
+                {summary.runnerContextResolved && (
+                    <div>
+                        <div className="text-slate-500">Runner</div>
+                        <div className="font-medium text-slate-200">{humanizeDecisionToken(summary.runnerContextResolved)}</div>
+                    </div>
+                )}
+            </div>
+
+            {(summary.reason || summary.runnerContextResolved) && !compact && (
+                <div className="mt-2 text-[10px] text-slate-500">
+                    {summary.reason ? `Seçim: ${humanizeDecisionToken(summary.reason)}` : ''}
+                    {summary.reason && summary.runnerContextResolved ? ' • ' : ''}
+                    {summary.runnerContextResolved ? `Bağlam: ${humanizeDecisionToken(summary.runnerContextResolved)}` : ''}
+                </div>
+            )}
+        </div>
+    );
+};
+
 // Phase 239V2: Shared helper for consistent pullback value extraction
 const getPullbackValues = (signal: CoinOpportunity, entryPrice: number): { finalPb: number; floorPb: number | null } => {
     // P0: zero-division guard
@@ -484,6 +698,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
             getReasonTooltip(rawDecisionCode),
             rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
         ].filter(Boolean).join('\n');
+        const decisionSummary = extractDecisionSummary(signal as Record<string, any>);
 
         return (
             <div className={`p-3 rounded-lg border transition-colors ${isLong ? 'bg-emerald-500/5 border-emerald-500/30' : 'bg-rose-500/5 border-rose-500/30'
@@ -517,6 +732,10 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 <div className="mb-2 rounded-md border border-slate-800 bg-slate-900/70 px-2 py-1.5">
                     <div className="text-[9px] text-slate-500 uppercase">Durum</div>
                     <div className="mt-1 text-[11px] text-slate-200" title={decisionTooltip}>{decisionLabel}</div>
+                </div>
+
+                <div className="mb-2">
+                    <DecisionBrief summary={decisionSummary} compact />
                 </div>
 
                 {/* Middle: Price Info */}
@@ -746,6 +965,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     Ne bekleniyor: {reasonInfo.description}
                                                 </div>
                                             )}
+                                            <div className="mt-2">
+                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact />
+                                            </div>
                                         </>
                                     );
                                 })()}
@@ -818,6 +1040,9 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                     Ne bekleniyor: {reasonInfo.description}
                                                 </div>
                                             )}
+                                            <div className="mt-2">
+                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact />
+                                            </div>
                                         </>
                                     );
                                 })()}
@@ -917,6 +1142,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                     getReasonTooltip(rawDecisionCode),
                                     rawDecisionCode ? `Kod: ${rawDecisionCode}` : '',
                                 ].filter(Boolean).join('\n');
+                                const decisionSummary = extractDecisionSummary(signal as Record<string, any>);
                                 const trailTitle = getTrailEntryTooltip({
                                     signal,
                                     isLong,
@@ -970,7 +1196,14 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                             <QualityBadges signal={signal} qualityTooltip={qualityTooltip} />
                                         </td>
                                         <td className="py-2.5 px-3 text-[11px] text-slate-300" title={decisionTooltip}>
-                                            {decisionLabel}
+                                            <div>{decisionLabel}</div>
+                                            <div className="mt-0.5 text-[10px] text-slate-500">
+                                                {[
+                                                    decisionSummary.entryArchetype ? humanizeDecisionToken(decisionSummary.entryArchetype) : '',
+                                                    decisionSummary.expectancyBand ? humanizeDecisionToken(decisionSummary.expectancyBand) : '',
+                                                    decisionSummary.primaryOwner || '',
+                                                ].filter(Boolean).join(' • ') || 'Karar özeti bekleniyor'}
+                                            </div>
                                         </td>
                                         <td className={`py-2.5 px-3 text-right font-mono text-xs ${Math.abs(signal.zscore || 0) >= 2 ? 'text-amber-400' : 'text-slate-400'}`}>
                                             {(signal.zscore || 0).toFixed(2)}

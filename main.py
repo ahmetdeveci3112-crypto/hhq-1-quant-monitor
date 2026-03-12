@@ -601,6 +601,27 @@ class SQLiteManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS decision_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    created_ts INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    signal_id TEXT DEFAULT '',
+                    trade_id TEXT DEFAULT '',
+                    position_id TEXT DEFAULT '',
+                    context_json TEXT DEFAULT '{}',
+                    inputs_json TEXT DEFAULT '{}',
+                    decision_json TEXT DEFAULT '{}',
+                    outcome_json TEXT DEFAULT '{}',
+                    source_version TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_decision_snapshots_symbol_ts ON decision_snapshots(symbol, created_ts DESC)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_decision_snapshots_trade_stage ON decision_snapshots(trade_id, stage)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_decision_snapshots_position_ts ON decision_snapshots(position_id, created_ts DESC)')
             
             # Open positions table - tracks positions while open
             await db.execute('''
@@ -1417,6 +1438,61 @@ class SQLiteManager:
                 ''',
                 [payload[col] for col in columns],
             )
+            signal_snapshot = trade.get('signalSnapshot', trade.get('signal_snapshot', {}))
+            if not isinstance(signal_snapshot, dict):
+                signal_snapshot = {}
+            snapshot_context = signal_snapshot.get('decisionContext', {})
+            if not isinstance(snapshot_context, dict):
+                snapshot_context = {}
+            snapshot_inputs = _compact_decision_inputs({
+                **signal_snapshot,
+                'symbol': trade.get('symbol', payload['symbol']),
+                'side': trade.get('side', payload['side']),
+                'strategyMode': strategy_mode,
+            })
+            snapshot_decision = {
+                'entryArchetype': signal_snapshot.get('entryArchetype', trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                'exitOwner': trade.get('exitOwner', trade.get('exit_owner', '')),
+                'reasonCode': reason_fields['reason_code'],
+                'expectancy': signal_snapshot.get('expectancy', trade.get('expectancy', {})),
+            }
+            snapshot_outcome = {
+                'reason': reason_fields['reason_detail'],
+                'roi': _coerce_float(trade.get('roi', trade.get('pnlPercent', 0.0)), 0.0),
+                'pnl': _coerce_float(trade.get('pnl', 0.0), 0.0),
+                'peak_roi': max(
+                    _coerce_float(close_snapshot.get('runtimeProfitPeakRoiPct', close_snapshot.get('profitPeakRoiPct', trade.get('mfe_pct', 0.0))), 0.0),
+                    max(_coerce_float(trade.get('roi', trade.get('pnlPercent', 0.0)), 0.0), 0.0),
+                ),
+                'closeReason': trade.get('closeReason', trade.get('reason', reason_fields['reason_detail'])),
+            }
+            snapshot_stage = 'partial_close'
+            if reason_fields['reason_group'] not in ('KILL', 'TP', 'RECOVERY') or 'PARTIAL' not in str(reason_fields['reason_code']).upper():
+                if not any(token in str(reason_fields['reason_code']).upper() for token in ('PARTIAL', 'REDUCE')):
+                    snapshot_stage = 'position_closed'
+            await db.execute(
+                '''
+                INSERT OR REPLACE INTO decision_snapshots (
+                    snapshot_id, created_ts, symbol, stage, signal_id, trade_id,
+                    position_id, context_json, inputs_json, decision_json,
+                    outcome_json, source_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    f"DS_{payload['symbol']}_{snapshot_stage}_{payload['trade_id']}",
+                    int(payload.get('close_time', int(datetime.now().timestamp() * 1000)) or int(datetime.now().timestamp() * 1000)),
+                    payload['symbol'],
+                    snapshot_stage,
+                    payload.get('signal_id', ''),
+                    payload.get('trade_id', ''),
+                    payload.get('position_id', ''),
+                    _json_dumps_safe(snapshot_context),
+                    _json_dumps_safe(snapshot_inputs),
+                    _json_dumps_safe(snapshot_decision),
+                    _json_dumps_safe(snapshot_outcome),
+                    DECISION_SNAPSHOT_SOURCE_VERSION,
+                )
+            )
             await db.commit()
     
     async def get_recent_trades(self, limit: int = 50) -> list:
@@ -1788,6 +1864,118 @@ class SQLiteManager:
             )
             await db.commit()
 
+    async def save_decision_snapshot(self, snapshot_data: dict):
+        """Persist compact decision snapshots for replay and post-mortem analysis."""
+        safe_snapshot = snapshot_data if isinstance(snapshot_data, dict) else {}
+        snapshot_id = str(safe_snapshot.get('snapshot_id', '') or safe_snapshot.get('snapshotId', '') or f"DS_{uuid.uuid4().hex}")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                '''
+                INSERT OR REPLACE INTO decision_snapshots (
+                    snapshot_id, created_ts, symbol, stage, signal_id, trade_id,
+                    position_id, context_json, inputs_json, decision_json,
+                    outcome_json, source_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    snapshot_id,
+                    int(safe_snapshot.get('created_ts', int(datetime.now().timestamp() * 1000)) or int(datetime.now().timestamp() * 1000)),
+                    str(safe_snapshot.get('symbol', '') or ''),
+                    str(safe_snapshot.get('stage', 'candidate') or 'candidate'),
+                    str(safe_snapshot.get('signal_id', safe_snapshot.get('signalId', '')) or ''),
+                    str(safe_snapshot.get('trade_id', safe_snapshot.get('tradeId', '')) or ''),
+                    str(safe_snapshot.get('position_id', safe_snapshot.get('positionId', '')) or ''),
+                    _json_dumps_safe(safe_snapshot.get('context', {})),
+                    _json_dumps_safe(safe_snapshot.get('inputs', {})),
+                    _json_dumps_safe(safe_snapshot.get('decision', {})),
+                    _json_dumps_safe(safe_snapshot.get('outcome', {})),
+                    str(safe_snapshot.get('source_version', DECISION_SNAPSHOT_SOURCE_VERSION) or DECISION_SNAPSHOT_SOURCE_VERSION),
+                )
+            )
+            await db.commit()
+
+    async def get_trade_decision_snapshots(self, trade_id: str) -> list:
+        """Fetch decision snapshots for a specific trade."""
+        safe_trade_id = str(trade_id or '').strip()
+        if not safe_trade_id:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                '''
+                SELECT * FROM decision_snapshots
+                WHERE trade_id = ?
+                ORDER BY created_ts ASC
+                ''',
+                (safe_trade_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        **dict(row),
+                        'context': _json_loads_safe(row['context_json'], {}),
+                        'inputs': _json_loads_safe(row['inputs_json'], {}),
+                        'decision': _json_loads_safe(row['decision_json'], {}),
+                        'outcome': _json_loads_safe(row['outcome_json'], {}),
+                    }
+                    for row in rows
+                ]
+
+    async def get_symbol_decision_snapshots(
+        self,
+        symbol: str,
+        *,
+        start_ts: int = 0,
+        end_ts: int = 0,
+        limit: int = 500,
+    ) -> list:
+        """Fetch decision snapshots for a symbol and optional time window."""
+        safe_symbol = str(symbol or '').strip().upper()
+        if not safe_symbol:
+            return []
+        clauses = ['symbol = ?']
+        params: list[Any] = [safe_symbol]
+        if int(start_ts or 0) > 0:
+            clauses.append('created_ts >= ?')
+            params.append(int(start_ts))
+        if int(end_ts or 0) > 0:
+            clauses.append('created_ts <= ?')
+            params.append(int(end_ts))
+        safe_limit = max(1, int(limit or 500))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = f'''
+                SELECT * FROM decision_snapshots
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_ts ASC
+                LIMIT ?
+            '''
+            params.append(safe_limit)
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        **dict(row),
+                        'context': _json_loads_safe(row['context_json'], {}),
+                        'inputs': _json_loads_safe(row['inputs_json'], {}),
+                        'decision': _json_loads_safe(row['decision_json'], {}),
+                        'outcome': _json_loads_safe(row['outcome_json'], {}),
+                    }
+                    for row in rows
+                ]
+
+    async def prune_decision_snapshots(self, retention_days: int = 30) -> int:
+        """Drop old decision snapshots; returns deleted row count."""
+        safe_days = max(1, int(retention_days or 30))
+        cutoff_ms = int((datetime.now().timestamp() - (safe_days * 86400)) * 1000)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'DELETE FROM decision_snapshots WHERE created_ts < ?',
+                (cutoff_ms,),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0)
+
     async def update_signal_decision(
         self,
         signal_id: str,
@@ -1945,6 +2133,40 @@ class SQLiteManager:
                     'marginUsd': pos.get('marginUsd', 0),
                 })),
             ))
+            signal_snapshot = pos.get('signal_snapshot', pos)
+            if not isinstance(signal_snapshot, dict):
+                signal_snapshot = {}
+            await db.execute(
+                '''
+                INSERT OR REPLACE INTO decision_snapshots (
+                    snapshot_id, created_ts, symbol, stage, signal_id, trade_id,
+                    position_id, context_json, inputs_json, decision_json,
+                    outcome_json, source_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    f"DS_{pos.get('symbol','')}_position_opened_{pos.get('id','')}",
+                    int(pos.get('openTime', int(datetime.now().timestamp() * 1000)) or int(datetime.now().timestamp() * 1000)),
+                    str(pos.get('symbol', '') or ''),
+                    'position_opened',
+                    str(pos.get('signalId', pos.get('signal_id', '')) or ''),
+                    str(pos.get('tradeId', pos.get('trade_id', '')) or ''),
+                    str(pos.get('id', '') or ''),
+                    _json_dumps_safe(signal_snapshot.get('decisionContext', {})),
+                    _json_dumps_safe(_compact_decision_inputs(pos)),
+                    _json_dumps_safe({
+                        'entryArchetype': signal_snapshot.get('entryArchetype', pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                        'exitOwner': pos.get('exitOwner', ''),
+                        'expectancy': signal_snapshot.get('expectancy', pos.get('expectancy', {})),
+                    }),
+                    _json_dumps_safe({
+                        'entryPrice': _coerce_float(pos.get('entryPrice', 0.0), 0.0),
+                        'sizeUsd': _coerce_float(pos.get('sizeUsd', 0.0), 0.0),
+                        'leverage': int(pos.get('leverage', 0) or 0),
+                    }),
+                    DECISION_SNAPSHOT_SOURCE_VERSION,
+                )
+            )
             await db.commit()
     
     async def close_position_in_db(self, position_id: str, symbol: str = None):
@@ -10273,6 +10495,7 @@ def update_runtime_protection_telemetry(
         signal_invalidation_state=ladder.get('signal_invalidation_state', {}),
     )
     apply_v3_underwater_tape_telemetry(pos, underwater_ctx)
+    maybe_queue_position_state_snapshot(pos, reason='profit_ladder_runtime')
     pos['sidewaysReclaimArmed'] = bool(
         evaluate_v3_sideways_reclaim_signal(
             pos,
@@ -13043,6 +13266,34 @@ def compute_signal_opportunity_priority(signal: dict) -> float:
         safe_signal.get('allocatorPriorityScore', safe_signal.get('_allocator_priority_score', 0.0)),
         0.0,
     )
+    expectancy = safe_signal.get('expectancy', {})
+    expectancy = expectancy if isinstance(expectancy, dict) else {}
+    expectancy_rank = _coerce_float(
+        expectancy.get('rankingScore', safe_signal.get('expectancyRankingScore', 0.0)),
+        0.0,
+    )
+    expectancy_size_bias = _coerce_float(
+        expectancy.get('sizeBias', safe_signal.get('expectancySizeBias', 1.0)),
+        1.0,
+    )
+    expectancy_edge_prob = _coerce_float(
+        expectancy.get('edgeProb', safe_signal.get('forecastEdgeProb', 0.5)),
+        0.5,
+    )
+    expectancy_uncertainty = _coerce_float(
+        expectancy.get('uncertainty', safe_signal.get('forecastUncertainty', 1.0)),
+        1.0,
+    )
+    expectancy_band = str(
+        expectancy.get('expectancyBand', safe_signal.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL))
+        or DECISION_EXPECTANCY_BAND_NEUTRAL
+    ).upper()
+    decision_context = safe_signal.get('decisionContext', {})
+    decision_context = decision_context if isinstance(decision_context, dict) else {}
+    context_confidence = _coerce_float(
+        decision_context.get('contextConfidence', safe_signal.get('contextConfidence', 0.5)),
+        0.5,
+    )
 
     priority = confidence
     priority += max(-6.0, min(8.0, (volume_ratio - 1.0) * 6.0))
@@ -13055,6 +13306,18 @@ def compute_signal_opportunity_priority(signal: dict) -> float:
         priority += 2.5
     if ev != 0:
         priority += max(-4.0, min(6.0, ev * 240.0))
+    if expectancy_rank != 0:
+        priority = (priority * 0.58) + (expectancy_rank * 0.42)
+    priority += max(-5.0, min(5.5, (expectancy_edge_prob - 0.5) * 16.0))
+    priority -= max(0.0, min(4.5, expectancy_uncertainty * 4.0))
+    priority += max(-2.0, min(2.0, (expectancy_size_bias - 1.0) * 12.0))
+    priority += max(-1.5, min(2.5, (context_confidence - 0.5) * 10.0))
+    if expectancy_band == DECISION_EXPECTANCY_BAND_STRONG:
+        priority += 3.0
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_GOOD:
+        priority += 1.5
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_WEAK:
+        priority -= 3.0
     if allocator_priority != 0:
         priority = (priority * 0.75) + (allocator_priority * 0.25)
     return round(priority, 2)
@@ -13064,6 +13327,8 @@ def compute_pending_order_recycler_priority(order: dict, now_ms: Optional[int] =
     safe_order = order if isinstance(order, dict) else {}
     signal_snapshot = safe_order.get('signal_snapshot', {})
     signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    expectancy = safe_order.get('expectancy', signal_snapshot.get('expectancy', {}))
+    expectancy = expectancy if isinstance(expectancy, dict) else {}
     now_ms = int(now_ms if now_ms is not None else datetime.now().timestamp() * 1000)
     created_at = int(safe_order.get('createdAt', now_ms) or now_ms)
     age_sec = max(0.0, (now_ms - created_at) / 1000.0)
@@ -13088,6 +13353,18 @@ def compute_pending_order_recycler_priority(order: dict, now_ms: Optional[int] =
         ),
         0.0,
     )
+    expectancy_rank = _coerce_float(
+        expectancy.get('rankingScore', safe_order.get('expectancyRankingScore', signal_snapshot.get('expectancyRankingScore', 0.0))),
+        0.0,
+    )
+    pending_patience_bias = _coerce_float(
+        expectancy.get('pendingPatienceBias', safe_order.get('pendingPatienceBias', signal_snapshot.get('pendingPatienceBias', 1.0))),
+        1.0,
+    )
+    expectancy_band = str(
+        expectancy.get('expectancyBand', safe_order.get('expectancyBand', signal_snapshot.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)))
+        or DECISION_EXPECTANCY_BAND_NEUTRAL
+    ).upper()
     confirmed = bool(safe_order.get('confirmed', False))
     wait_state = bool(wait_reason) or recheck_decision.startswith('WARN') or recheck_decision.startswith('FAIL')
     priority = max(signal_score, signal_score_raw * 0.92)
@@ -13098,7 +13375,16 @@ def compute_pending_order_recycler_priority(order: dict, now_ms: Optional[int] =
         priority += max(-3.0, min(3.0, (exec_score - 0.74) * 24.0))
     if bool(safe_order.get('trend_mode', signal_snapshot.get('trend_mode', False))):
         priority += 1.5
+    if expectancy_rank != 0:
+        priority = (priority * 0.62) + (expectancy_rank * 0.38)
+    priority += max(-2.5, min(2.5, (pending_patience_bias - 1.0) * 10.0))
+    if expectancy_band == DECISION_EXPECTANCY_BAND_STRONG:
+        priority += 1.5
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_WEAK:
+        priority -= 2.0
     priority -= min(10.0, age_sec / 90.0)
+    if pending_patience_bias > 1.0:
+        priority += min(2.5, age_sec / 240.0)
     if wait_reason:
         priority -= 4.0
     if recheck_decision.startswith('WARN'):
@@ -13446,19 +13732,7 @@ def build_soft_signal_allocator_plan(
         symbol = str(sig.get('symbol', '') or '')
         side = str(sig.get('action', sig.get('side', '')) or '').upper()
         cluster = cluster_map.get(symbol, 'alt')
-        confidence = _coerce_float(sig.get('confidenceScore', sig.get('signalScore', 0.0)), 0.0)
-        volume_ratio = _coerce_float(sig.get('volumeRatio', 1.0), 1.0)
-        spread_pct = _coerce_float(sig.get('spreadPct', 0.05), 0.05)
-        ev = _coerce_float(sig.get('ev', 0.0), 0.0)
-        priority = confidence
-        priority += max(-6.0, min(8.0, (volume_ratio - 1.0) * 6.0))
-        priority -= min(10.0, max(0.0, spread_pct * 18.0))
-        if bool(sig.get('entryQualityPass', False)):
-            priority += 4.0
-        if bool(sig.get('trend_mode', False)):
-            priority += 2.5
-        if ev != 0:
-            priority += max(-4.0, min(6.0, ev * 250.0))
+        priority = compute_signal_opportunity_priority(sig)
         priority -= side_loads.get(side, 0.0) * 1.5
         priority -= cluster_loads.get((side, cluster), 0.0) * 2.5
         sig['_allocator_priority_score'] = round(priority, 2)
@@ -13483,6 +13757,12 @@ def build_soft_signal_allocator_plan(
         cluster = cluster_map.get(symbol, 'alt')
         size_mult = rank_mults[min(idx, len(rank_mults) - 1)] if len(scored) > 1 else 1.0
         reasons = []
+        expectancy = sig.get('expectancy', {})
+        expectancy = expectancy if isinstance(expectancy, dict) else {}
+        expectancy_size_bias = _coerce_float(
+            expectancy.get('sizeBias', sig.get('expectancySizeBias', 1.0)),
+            1.0,
+        )
 
         if len(scored) > free_slots and idx >= free_slots:
             size_mult = min(size_mult, 0.82)
@@ -13499,6 +13779,11 @@ def build_soft_signal_allocator_plan(
         if allocated_side.get(side, 0) >= max(1, free_slots // 2):
             size_mult = min(size_mult, 0.92)
             reasons.append('QUEUE_SIDE_STACK')
+        size_mult *= expectancy_size_bias
+        if expectancy_size_bias > 1.03:
+            reasons.append('EXPECTANCY_UPSIZE')
+        elif expectancy_size_bias < 0.98:
+            reasons.append('EXPECTANCY_DOWNSIZE')
 
         size_mult = round(_clamp(size_mult, 0.72, 1.0), 3)
         sig['allocatorPriorityScore'] = round(_coerce_float(sig.get('_allocator_priority_score', 0.0), 0.0), 2)
@@ -14090,6 +14375,18 @@ V3_UNDERWATER_RECOVERING = "RECOVERING"
 V3_UNDERWATER_NEUTRAL = "NEUTRAL"
 ENTRY_ARCHETYPE_CONTINUATION = "continuation"
 ENTRY_ARCHETYPE_RECLAIM = "reclaim"
+DECISION_ARCHETYPE_CONTINUATION = ENTRY_ARCHETYPE_CONTINUATION
+DECISION_ARCHETYPE_RECLAIM = ENTRY_ARCHETYPE_RECLAIM
+DECISION_ARCHETYPE_EXHAUSTION = "exhaustion"
+DECISION_ARCHETYPE_RECOVERY = "recovery"
+DECISION_ARCHETYPE_NEUTRAL = "neutral_fallback"
+DECISION_REPLAY_FIDELITY_SNAPSHOT = "snapshot"
+DECISION_REPLAY_FIDELITY_APPROX = "approx_ohlcv"
+DECISION_EXPECTANCY_BAND_STRONG = "STRONG"
+DECISION_EXPECTANCY_BAND_GOOD = "GOOD"
+DECISION_EXPECTANCY_BAND_NEUTRAL = "NEUTRAL"
+DECISION_EXPECTANCY_BAND_WEAK = "WEAK"
+DECISION_SNAPSHOT_SOURCE_VERSION = "decision_controller_v1"
 V3_RUNNER_CONTEXT_CONFIGS = {
     V3_RUNNER_CONTEXT_TREND: {
         "trail_act_mult": 1.55,
@@ -14190,9 +14487,989 @@ def _breakout_matches_side(breakout: str, side: str) -> bool:
     safe_breakout = str(breakout or '').upper()
     safe_side = str(side or '').upper()
     return (
-        (safe_breakout == 'BREAKOUT_LONG' and safe_side == 'LONG')
-        or (safe_breakout == 'BREAKOUT_SHORT' and safe_side == 'SHORT')
+        (safe_breakout in ('BREAKOUT_LONG', 'BULLISH_BREAKOUT', 'LONG_BREAKOUT') and safe_side == 'LONG')
+        or (safe_breakout in ('BREAKOUT_SHORT', 'BEARISH_BREAKOUT', 'SHORT_BREAKOUT') and safe_side == 'SHORT')
     )
+
+
+def _compact_decision_inputs(payload: dict = None) -> dict:
+    data = payload if isinstance(payload, dict) else {}
+    return {
+        'symbol': str(data.get('symbol', '') or ''),
+        'side': str(data.get('side', data.get('action', '')) or '').upper(),
+        'zscore': round(_coerce_float(data.get('zscore', data.get('zScore', 0.0)), 0.0), 4),
+        'hurst': round(_coerce_float(data.get('hurst', 0.5), 0.5), 4),
+        'adx': round(_coerce_float(data.get('adx', 0.0), 0.0), 4),
+        'breakout': str(data.get('breakout', data.get('breakoutSignal', '')) or '').upper(),
+        'volumeRatio': round(_coerce_float(data.get('currentVolumeRatio', data.get('volumeRatio', 1.0)), 1.0), 4),
+        'isVolumeSpike': bool(data.get('currentIsVolumeSpike', data.get('isVolumeSpike', False))),
+        'imbalance': round(_coerce_float(data.get('currentImbalance', data.get('imbalance', 0.0)), 0.0), 4),
+        'obImbalanceTrend': round(_coerce_float(data.get('currentObImbalanceTrend', data.get('obImbalanceTrend', 0.0)), 0.0), 4),
+        'spreadPct': round(_coerce_float(data.get('currentSpreadPct', data.get('spreadPct', 0.05)), 0.05), 4),
+        'volatilityPct': round(_coerce_float(data.get('currentAtrPct', data.get('volatility_pct', data.get('atrPct', 0.0))), 0.0), 4),
+        'coinDailyTrend': str(data.get('coinDailyTrend', data.get('coin_daily_trend', 'NEUTRAL')) or 'NEUTRAL').upper(),
+        'marketRegime': str(data.get('market_regime', data.get('marketRegime', 'RANGING')) or 'RANGING').upper(),
+        'leaderLagScore': round(_coerce_float(data.get('leaderLagScore', 0.0), 0.0), 4),
+        'liqEchoScore': round(_coerce_float(data.get('liqEchoScore', 0.0), 0.0), 4),
+        'liqEchoState': str(data.get('liqEchoState', 'NONE') or 'NONE').upper(),
+        'microstructureScore': round(_coerce_float(data.get('currentMicrostructureScore', data.get('microstructureScore', 0.0)), 0.0), 4),
+        'forecastBand': str(data.get('forecastBand', 'NEUTRAL') or 'NEUTRAL').upper(),
+        'forecastEdgeProb': round(_coerce_float(data.get('forecastEdgeProb', data.get('forecastEdgeProb', 0.5)), 0.5), 4),
+        'strategyMode': normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', STRATEGY_MODE_LEGACY))),
+        'continuationFlowState': str(data.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
+        'underwaterTapeState': str(data.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
+    }
+
+
+def _decision_primary_secondary_suppressed(archetype: str) -> tuple[list[str], list[str], list[str], str, str]:
+    safe_arch = str(archetype or DECISION_ARCHETYPE_NEUTRAL).lower()
+    if safe_arch == DECISION_ARCHETYPE_CONTINUATION:
+        return (
+            ['breakout', 'volume', 'obi', 'microstructure'],
+            ['leader_lag', 'liquidation_echo', 'forecast'],
+            ['fib_only_veto', 'reclaim_only_exit'],
+            'momentum_guarded',
+            'runner_continuation',
+        )
+    if safe_arch == DECISION_ARCHETYPE_RECLAIM:
+        return (
+            ['zscore', 'structural_sr', 'fib', 'entry_forecast'],
+            ['vwap', 'sweep', 'forecast'],
+            ['limited_market_override', 'pure_breakout_bonus'],
+            'structural_limit',
+            'reclaim_structural',
+        )
+    if safe_arch == DECISION_ARCHETYPE_EXHAUSTION:
+        return (
+            ['liquidation_echo', 'spread_depth_fade', 'zscore_extreme'],
+            ['microstructure', 'forecast'],
+            ['breakout_continuation_bonus'],
+            'fade_confirmed',
+            'exhaustion_fade',
+        )
+    if safe_arch == DECISION_ARCHETYPE_RECOVERY:
+        return (
+            ['underwater_tape', 'failed_continuation', 'reclaim_be'],
+            ['soft_forecast', 'execution_risk'],
+            ['aggressive_continuation_hold'],
+            'protective',
+            'recovery_owner',
+        )
+    return (
+        ['balanced_score', 'forecast'],
+        ['vwap', 'volume', 'microstructure'],
+        [],
+        'balanced',
+        'balanced',
+    )
+
+
+def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> dict:
+    """Select a single primary trade archetype and policy family for a payload."""
+    data = payload if isinstance(payload, dict) else {}
+    inputs = _compact_decision_inputs(data)
+    mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
+    side = inputs['side']
+    trend_mode = bool(data.get('trend_mode', False))
+    regime_bucket = normalize_regime_bucket(inputs['marketRegime'], trend_mode=trend_mode)
+    strategy_bucket = normalize_strategy_bucket(mode, trend_mode=trend_mode)
+    zscore = abs(_coerce_float(inputs.get('zscore', 0.0), 0.0))
+    volume_ratio = _coerce_float(inputs.get('volumeRatio', 1.0), 1.0)
+    adx = _coerce_float(inputs.get('adx', 0.0), 0.0)
+    hurst = _coerce_float(inputs.get('hurst', 0.5), 0.5)
+    leader_lag = _coerce_float(inputs.get('leaderLagScore', 0.0), 0.0)
+    liq_echo = _coerce_float(inputs.get('liqEchoScore', 0.0), 0.0)
+    micro_score = _coerce_float(inputs.get('microstructureScore', 0.0), 0.0)
+    forecast_prob = _coerce_float(inputs.get('forecastEdgeProb', 0.5), 0.5)
+    forecast_band = str(inputs.get('forecastBand', 'NEUTRAL') or 'NEUTRAL').upper()
+    breakout = str(inputs.get('breakout', '') or '').upper()
+    explicit_archetype = str(
+        data.get('entryArchetype', data.get('entry_archetype', '')) or ''
+    ).strip().lower()
+    if explicit_archetype not in (
+        DECISION_ARCHETYPE_CONTINUATION,
+        DECISION_ARCHETYPE_RECLAIM,
+        DECISION_ARCHETYPE_EXHAUSTION,
+        DECISION_ARCHETYPE_RECOVERY,
+    ):
+        explicit_archetype = ''
+    is_volume_spike = bool(inputs.get('isVolumeSpike', False))
+    ob_trend = _coerce_float(inputs.get('obImbalanceTrend', 0.0), 0.0)
+    daily_trend = str(inputs.get('coinDailyTrend', 'NEUTRAL') or 'NEUTRAL').upper()
+    continuation_flow = str(inputs.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
+    underwater_state = str(inputs.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+    safety_blocked = bool(data.get('emergencyBlock', False) or data.get('safetyBlocked', False))
+
+    aligned_daily = (side == 'LONG' and _is_bullish_daily_trend(daily_trend)) or (side == 'SHORT' and _is_bearish_daily_trend(daily_trend))
+    opposed_daily = (side == 'LONG' and _is_bearish_daily_trend(daily_trend)) or (side == 'SHORT' and _is_bullish_daily_trend(daily_trend))
+    continuation_ready = bool(
+        _breakout_matches_side(breakout, side)
+        and (volume_ratio >= 1.20 or is_volume_spike)
+        and _is_side_ob_trend_aligned(side, ob_trend, threshold=2.0)
+    )
+    reclaim_ready = bool(
+        zscore >= max(1.0, float(getattr(global_paper_trader, 'z_score_threshold', 1.6) or 1.6) * 0.80 if 'global_paper_trader' in globals() and global_paper_trader else 1.0)
+        or bool(data.get('fibActive', False))
+        or bool(data.get('srNearestSupport') or data.get('srNearestResistance'))
+    )
+    exhaustion_ready = bool(
+        liq_echo >= 6.0
+        and (
+            str(inputs.get('liqEchoState', 'NONE') or 'NONE').upper().startswith('SELL_')
+            or str(inputs.get('liqEchoState', 'NONE') or 'NONE').upper().startswith('BUY_')
+        )
+        and zscore >= 1.0
+    )
+    recovery_ready = bool(
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and (
+            underwater_state in (V3_UNDERWATER_ADVERSE_STRONG, V3_UNDERWATER_RECOVERING)
+            or continuation_flow == V3_CONTINUATION_CHOP
+            or bool(data.get('recoveryArmed', False))
+        )
+    )
+
+    if safety_blocked:
+        archetype = DECISION_ARCHETYPE_NEUTRAL
+        reason = 'SAFETY'
+    elif recovery_ready:
+        archetype = DECISION_ARCHETYPE_RECOVERY
+        reason = underwater_state or continuation_flow or 'RECOVERY'
+    elif exhaustion_ready:
+        archetype = DECISION_ARCHETYPE_EXHAUSTION
+        reason = 'LIQUIDATION_ECHO'
+    elif continuation_ready and not opposed_daily:
+        archetype = DECISION_ARCHETYPE_CONTINUATION
+        reason = 'BREAKOUT_VOLUME_OBI'
+    elif reclaim_ready:
+        archetype = DECISION_ARCHETYPE_RECLAIM
+        reason = 'MEAN_REVERSION_STRUCT'
+    elif explicit_archetype:
+        archetype = explicit_archetype
+        reason = 'EXPLICIT_ENTRY_ARCHETYPE'
+    else:
+        archetype = DECISION_ARCHETYPE_NEUTRAL
+        reason = 'FALLBACK'
+
+    primary, secondary, suppressed, execution_archetype, exit_owner_profile = _decision_primary_secondary_suppressed(archetype)
+    context_confidence = 0.40
+    if archetype == DECISION_ARCHETYPE_CONTINUATION:
+        context_confidence += min(0.20, max(0.0, volume_ratio - 1.0) * 0.18)
+        context_confidence += 0.10 if _is_side_ob_trend_aligned(side, ob_trend, threshold=2.0) else 0.0
+        context_confidence += 0.08 if aligned_daily else 0.0
+    elif archetype == DECISION_ARCHETYPE_RECLAIM:
+        context_confidence += min(0.18, zscore * 0.06)
+        context_confidence += 0.06 if bool(data.get('fibActive', False)) else 0.0
+    elif archetype == DECISION_ARCHETYPE_EXHAUSTION:
+        context_confidence += min(0.20, liq_echo / 25.0)
+        context_confidence += min(0.08, max(0.0, micro_score) / 20.0)
+    elif archetype == DECISION_ARCHETYPE_RECOVERY:
+        context_confidence += 0.12 if underwater_state in (V3_UNDERWATER_ADVERSE_STRONG, V3_UNDERWATER_RECOVERING) else 0.0
+        context_confidence += 0.08 if continuation_flow == V3_CONTINUATION_CHOP else 0.0
+    else:
+        context_confidence += 0.05 if forecast_band in ('MEDIUM', 'STRONG') else 0.0
+
+    context_confidence += min(0.06, max(0.0, leader_lag) / 30.0)
+    context_confidence += min(0.05, max(0.0, forecast_prob - 0.5) * 0.8)
+    context_confidence = round(_clamp(context_confidence, 0.30, 0.95), 4)
+
+    indicator_policy = {
+        'primary': primary,
+        'secondary': secondary,
+        'suppressed': suppressed,
+    }
+    gate_policy = {
+        'primary_owner': archetype,
+        'allow_soft_rescue': archetype != DECISION_ARCHETYPE_EXHAUSTION,
+        'allow_continuation_market_override': archetype == DECISION_ARCHETYPE_CONTINUATION,
+        'allow_structural_only_reclaim': archetype == DECISION_ARCHETYPE_RECLAIM,
+        'prefer_soft_over_hard': archetype in (DECISION_ARCHETYPE_CONTINUATION, DECISION_ARCHETYPE_RECLAIM, DECISION_ARCHETYPE_NEUTRAL),
+    }
+    forecast_policy = {
+        'weight_bias': archetype,
+        'prefer_ranking_owner': True,
+        'prefer_pending_patience': archetype in (DECISION_ARCHETYPE_CONTINUATION, DECISION_ARCHETYPE_RECOVERY),
+        'prefer_size_defense': archetype in (DECISION_ARCHETYPE_EXHAUSTION, DECISION_ARCHETYPE_RECOVERY),
+    }
+    return {
+        'regimeBucket': regime_bucket,
+        'strategyBucket': strategy_bucket,
+        'entryArchetype': archetype,
+        'executionArchetype': execution_archetype,
+        'exitOwnerProfile': exit_owner_profile,
+        'indicatorPolicy': indicator_policy,
+        'gatePolicy': gate_policy,
+        'forecastPolicy': forecast_policy,
+        'contextConfidence': context_confidence,
+        'reason': reason,
+        'mode': mode,
+        'alignedDailyTrend': aligned_daily,
+        'opposedDailyTrend': opposed_daily,
+    }
+
+
+def _expectancy_context_key_for_payload(payload: dict = None) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    decision_context = data.get('decisionContext', {}) if isinstance(data.get('decisionContext'), dict) else {}
+    archetype = str(
+        decision_context.get(
+            'entryArchetype',
+            data.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+        ) or ENTRY_ARCHETYPE_RECLAIM
+    ).lower()
+    regime_bucket = str(
+        decision_context.get(
+            'regimeBucket',
+            normalize_regime_bucket(
+                data.get('market_regime', data.get('marketRegime', 'RANGING')),
+                trend_mode=bool(data.get('trend_mode', False)),
+            ),
+        ) or 'UNKNOWN'
+    ).upper()
+    strategy_bucket = str(
+        decision_context.get(
+            'strategyBucket',
+            normalize_strategy_bucket(
+                data.get('strategyMode', data.get('strategy_mode', STRATEGY_MODE_LEGACY)),
+                trend_mode=bool(data.get('trend_mode', False)),
+            ),
+        ) or 'LEGACY'
+    ).upper()
+    return f"{archetype}|{regime_bucket}|{strategy_bucket}"
+
+
+def _extract_trade_expectancy_context_key(trade: dict = None) -> str:
+    safe_trade = trade if isinstance(trade, dict) else {}
+    signal_snapshot = safe_trade.get('signalSnapshot', safe_trade.get('signal_snapshot', {}))
+    if not isinstance(signal_snapshot, dict):
+        signal_snapshot = {}
+    merged = dict(signal_snapshot)
+    merged.setdefault('entryArchetype', safe_trade.get('entryArchetype', signal_snapshot.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)))
+    merged.setdefault('strategyMode', safe_trade.get('strategyMode', safe_trade.get('strategy_mode', signal_snapshot.get('strategyMode', STRATEGY_MODE_LEGACY))))
+    merged.setdefault('market_regime', signal_snapshot.get('market_regime', signal_snapshot.get('marketRegime', 'RANGING')))
+    return _expectancy_context_key_for_payload(merged)
+
+
+def _bucket_from_value(value: float, low_cutoff: float, high_cutoff: float) -> str:
+    safe_value = _coerce_float(value, 0.0)
+    if safe_value >= high_cutoff:
+        return 'HIGH'
+    if safe_value >= low_cutoff:
+        return 'MEDIUM'
+    return 'LOW'
+
+
+def summarize_expectancy_context_history(trades: list, context_key: str, lookback: int = 100) -> dict:
+    """Summarize recent realized/peak behavior for a context bucket."""
+    safe_trades = [t for t in (trades or []) if isinstance(t, dict)]
+    safe_key = str(context_key or '').strip()
+    if not safe_key:
+        return {
+            'samples': 0,
+            'win_rate': 50.0,
+            'avg_roi': 0.0,
+            'avg_peak_roi': 0.0,
+            'avg_mae': 0.0,
+            'avg_hold_sec': 0.0,
+            'hold_profile': 'CHOP',
+            'expected_mfe_bucket': 'MEDIUM',
+            'expected_mae_bucket': 'MEDIUM',
+        }
+
+    matched = []
+    for trade in safe_trades:
+        if _extract_trade_expectancy_context_key(trade) == safe_key:
+            matched.append(trade)
+    if not matched:
+        matched = safe_trades[-min(len(safe_trades), max(lookback // 2, 30)):]
+    else:
+        matched = matched[-min(len(matched), lookback):]
+
+    if not matched:
+        return {
+            'samples': 0,
+            'win_rate': 50.0,
+            'avg_roi': 0.0,
+            'avg_peak_roi': 0.0,
+            'avg_mae': 0.0,
+            'avg_hold_sec': 0.0,
+            'hold_profile': 'CHOP',
+            'expected_mfe_bucket': 'MEDIUM',
+            'expected_mae_bucket': 'MEDIUM',
+        }
+
+    rois = []
+    peaks = []
+    maes = []
+    hold_secs = []
+    fast_fail = 0
+    mean_revert = 0
+    runner = 0
+    chop = 0
+    for trade in matched:
+        close_snapshot = trade.get('closeSnapshot', trade.get('close_snapshot', {}))
+        if not isinstance(close_snapshot, dict):
+            close_snapshot = {}
+        roi = _coerce_float(trade.get('roi', trade.get('pnlPercent', 0.0)), 0.0)
+        peak_roi = max(
+            _coerce_float(close_snapshot.get('runtimeProfitPeakRoiPct', close_snapshot.get('profitPeakRoiPct', trade.get('mfe_pct', 0.0))), 0.0),
+            max(roi, 0.0),
+        )
+        mae = abs(_coerce_float(trade.get('mae_pct', close_snapshot.get('mae_pct', 0.0)), 0.0))
+        open_time = int(trade.get('openTime', trade.get('open_time', 0)) or 0)
+        close_time = int(trade.get('closeTime', trade.get('close_time', 0)) or 0)
+        hold = max(0.0, (close_time - open_time) / 1000.0) if close_time and open_time else 0.0
+        rois.append(roi)
+        peaks.append(peak_roi)
+        maes.append(mae)
+        hold_secs.append(hold)
+        if roi < 0 and hold <= 1800:
+            fast_fail += 1
+        elif peak_roi >= 8.0 and hold >= 3600:
+            runner += 1
+        elif peak_roi > 0 and roi >= 0 and hold < 5400:
+            mean_revert += 1
+        else:
+            chop += 1
+
+    sample_count = len(matched)
+    win_rate = (sum(1 for roi in rois if roi > 0) / sample_count) * 100.0 if sample_count else 50.0
+    avg_roi = sum(rois) / sample_count if sample_count else 0.0
+    avg_peak_roi = sum(peaks) / sample_count if sample_count else 0.0
+    avg_mae = sum(maes) / sample_count if sample_count else 0.0
+    avg_hold = sum(hold_secs) / sample_count if sample_count else 0.0
+    hold_profile = 'CHOP'
+    counts = {
+        'FAST_FAIL': fast_fail,
+        'RUNNER': runner,
+        'MEAN_REVERT': mean_revert,
+        'CHOP': chop,
+    }
+    hold_profile = max(counts.items(), key=lambda item: item[1])[0]
+    return {
+        'samples': sample_count,
+        'win_rate': round(win_rate, 4),
+        'avg_roi': round(avg_roi, 4),
+        'avg_peak_roi': round(avg_peak_roi, 4),
+        'avg_mae': round(avg_mae, 4),
+        'avg_hold_sec': round(avg_hold, 2),
+        'hold_profile': hold_profile,
+        'expected_mfe_bucket': _bucket_from_value(avg_peak_roi, 4.0, 9.0),
+        'expected_mae_bucket': _bucket_from_value(avg_mae, 2.5, 5.0),
+    }
+
+
+def _get_expectancy_reference_trades(limit: int = 250) -> list:
+    if 'global_paper_trader' in globals() and getattr(global_paper_trader, 'trades', None):
+        return list(global_paper_trader.trades[-limit:])
+    return []
+
+
+def _resolve_expectancy_band(edge_prob: float, uncertainty: float) -> str:
+    safe_prob = _coerce_float(edge_prob, 0.5)
+    safe_unc = _coerce_float(uncertainty, 1.0)
+    if safe_prob >= 0.66 and safe_unc <= 0.32:
+        return DECISION_EXPECTANCY_BAND_STRONG
+    if safe_prob >= 0.58 and safe_unc <= 0.44:
+        return DECISION_EXPECTANCY_BAND_GOOD
+    if safe_prob < 0.45 or safe_unc >= 0.72:
+        return DECISION_EXPECTANCY_BAND_WEAK
+    return DECISION_EXPECTANCY_BAND_NEUTRAL
+
+
+def compute_opportunity_expectancy(
+    signal: dict,
+    *,
+    forecast: dict = None,
+    decision_context: dict = None,
+    trades: list = None,
+) -> dict:
+    """Convert forecast + historical context into ranking/size/patience guidance."""
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_forecast = forecast if isinstance(forecast, dict) else compute_opportunity_forecast(safe_signal, side=str(safe_signal.get('action', safe_signal.get('side', '')) or ''), include_ev=True)
+    ctx = decision_context if isinstance(decision_context, dict) else build_decision_context(safe_signal, default_mode=safe_signal.get('strategyMode', safe_signal.get('strategy_mode', STRATEGY_MODE_LEGACY)))
+    history = trades if isinstance(trades, list) else _get_expectancy_reference_trades()
+    context_key = _expectancy_context_key_for_payload({**safe_signal, 'decisionContext': ctx})
+    history_summary = summarize_expectancy_context_history(history, context_key, lookback=120)
+
+    forecast_edge = _coerce_float(safe_forecast.get('edge_prob', safe_signal.get('forecastEdgeProb', 0.5)), 0.5)
+    forecast_unc = _coerce_float(safe_forecast.get('uncertainty', safe_signal.get('forecastUncertainty', 1.0)), 1.0)
+    win_rate_prob = _clamp(history_summary.get('win_rate', 50.0) / 100.0, 0.0, 1.0)
+    avg_roi = _coerce_float(history_summary.get('avg_roi', 0.0), 0.0)
+    avg_peak = max(
+        _coerce_float(history_summary.get('avg_peak_roi', 0.0), 0.0),
+        max(avg_roi, 0.0),
+    )
+    avg_mae = _coerce_float(history_summary.get('avg_mae', 0.0), 0.0)
+    context_conf = _coerce_float(ctx.get('contextConfidence', 0.5), 0.5)
+    micro_score = _coerce_float(safe_signal.get('microstructureScore', safe_signal.get('currentMicrostructureScore', 0.0)), 0.0)
+    liq_echo = _coerce_float(safe_signal.get('liqEchoScore', 0.0), 0.0)
+    leader_lag = _coerce_float(safe_signal.get('leaderLagScore', 0.0), 0.0)
+    toxicity = _coerce_float(safe_signal.get('flowToxicityScore', 50.0), 50.0)
+    signal_score = _coerce_float(safe_signal.get('confidenceScore', safe_signal.get('signalScore', 0.0)), 0.0)
+
+    historical_edge = _clamp((win_rate_prob * 0.65) + _clamp(avg_roi / 20.0, -0.20, 0.20) + 0.35, 0.0, 1.0)
+    overlay_bonus = _clamp((micro_score / 40.0) + (liq_echo / 40.0) + (leader_lag / 45.0), -0.15, 0.15)
+    toxicity_penalty = _clamp((toxicity - 50.0) / 200.0, -0.15, 0.20)
+    edge_prob = _clamp((forecast_edge * 0.62) + (historical_edge * 0.28) + (context_conf * 0.10) + overlay_bonus - toxicity_penalty, 0.0, 1.0)
+    history_samples = int(history_summary.get('samples', 0) or 0)
+    history_unc_penalty = 0.0
+    if history_samples < 4:
+        history_unc_penalty = 0.18
+    elif history_samples < 8:
+        history_unc_penalty = 0.12
+    uncertainty = _clamp(
+        (forecast_unc * 0.65)
+        + history_unc_penalty
+        + max(0.0, 0.12 - context_conf * 0.08),
+        0.0,
+        1.0,
+    )
+    expectancy_band = _resolve_expectancy_band(edge_prob, uncertainty)
+    expected_mfe_bucket = history_summary.get('expected_mfe_bucket', _bucket_from_value(avg_peak, 4.0, 9.0))
+    expected_mae_bucket = history_summary.get('expected_mae_bucket', _bucket_from_value(avg_mae, 2.5, 5.0))
+    hold_profile = history_summary.get('hold_profile', 'CHOP')
+
+    ranking_score = signal_score
+    ranking_score += (edge_prob - 0.5) * 22.0
+    ranking_score += (context_conf - 0.5) * 10.0
+    ranking_score += min(5.0, history_summary.get('samples', 0) / 12.0)
+    if expectancy_band == DECISION_EXPECTANCY_BAND_STRONG:
+        ranking_score += 4.0
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_GOOD:
+        ranking_score += 2.0
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_WEAK:
+        ranking_score -= 4.0
+
+    size_bias = 1.0
+    if expectancy_band == DECISION_EXPECTANCY_BAND_STRONG and uncertainty <= 0.34:
+        size_bias *= 1.10
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_GOOD:
+        size_bias *= 1.03
+    elif expectancy_band == DECISION_EXPECTANCY_BAND_WEAK or uncertainty >= 0.65:
+        size_bias *= 0.82
+    if toxicity >= 70.0:
+        size_bias *= 0.88
+    pending_patience_bias = 1.0
+    if hold_profile in ('RUNNER', 'MEAN_REVERT') and expectancy_band in (DECISION_EXPECTANCY_BAND_STRONG, DECISION_EXPECTANCY_BAND_GOOD):
+        pending_patience_bias *= 1.15
+    elif hold_profile == 'FAST_FAIL' or expectancy_band == DECISION_EXPECTANCY_BAND_WEAK:
+        pending_patience_bias *= 0.85
+
+    return {
+        'edgeProb': round(edge_prob, 4),
+        'uncertainty': round(uncertainty, 4),
+        'expectancyBand': expectancy_band,
+        'expectedMfeBucket': expected_mfe_bucket,
+        'expectedMaeBucket': expected_mae_bucket,
+        'holdProfile': hold_profile,
+        'rankingScore': round(ranking_score, 4),
+        'sizeBias': round(_clamp(size_bias, 0.70, 1.15), 4),
+        'pendingPatienceBias': round(_clamp(pending_patience_bias, 0.80, 1.25), 4),
+        'contextKey': context_key,
+        'historySamples': int(history_summary.get('samples', 0) or 0),
+        'historyWinRate': round(history_summary.get('win_rate', 50.0), 4),
+        'historyAvgRoi': round(history_summary.get('avg_roi', 0.0), 4),
+        'historyAvgPeakRoi': round(history_summary.get('avg_peak_roi', 0.0), 4),
+    }
+
+
+def build_decision_snapshot_payload(
+    *,
+    stage: str,
+    symbol: str,
+    signal_id: str = '',
+    trade_id: str = '',
+    position_id: str = '',
+    context: dict = None,
+    inputs: dict = None,
+    decision: dict = None,
+    outcome: dict = None,
+    source_version: str = DECISION_SNAPSHOT_SOURCE_VERSION,
+    created_ts: Optional[int] = None,
+) -> dict:
+    snap_ts = int(created_ts or int(datetime.now().timestamp() * 1000))
+    return {
+        'snapshot_id': f"DS_{symbol}_{stage}_{snap_ts}_{uuid.uuid4().hex[:8]}",
+        'created_ts': snap_ts,
+        'symbol': str(symbol or ''),
+        'stage': str(stage or 'candidate'),
+        'signal_id': str(signal_id or ''),
+        'trade_id': str(trade_id or ''),
+        'position_id': str(position_id or ''),
+        'context': context if isinstance(context, dict) else {},
+        'inputs': inputs if isinstance(inputs, dict) else {},
+        'decision': decision if isinstance(decision, dict) else {},
+        'outcome': outcome if isinstance(outcome, dict) else {},
+        'source_version': str(source_version or DECISION_SNAPSHOT_SOURCE_VERSION),
+    }
+
+
+def queue_decision_snapshot(
+    *,
+    stage: str,
+    symbol: str,
+    signal_id: str = '',
+    trade_id: str = '',
+    position_id: str = '',
+    context: dict = None,
+    inputs: dict = None,
+    decision: dict = None,
+    outcome: dict = None,
+    source_version: str = DECISION_SNAPSHOT_SOURCE_VERSION,
+    created_ts: Optional[int] = None,
+):
+    if 'sqlite_manager' not in globals() or sqlite_manager is None:
+        return None
+    last_prune_ts = float(getattr(sqlite_manager, '_decision_snapshot_last_prune_ts', 0.0) or 0.0)
+    now_ts = datetime.now().timestamp()
+    if (now_ts - last_prune_ts) >= 86400.0:
+        setattr(sqlite_manager, '_decision_snapshot_last_prune_ts', now_ts)
+        safe_create_task(sqlite_manager.prune_decision_snapshots(30))
+    payload = build_decision_snapshot_payload(
+        stage=stage,
+        symbol=symbol,
+        signal_id=signal_id,
+        trade_id=trade_id,
+        position_id=position_id,
+        context=context,
+        inputs=inputs,
+        decision=decision,
+        outcome=outcome,
+        source_version=source_version,
+        created_ts=created_ts,
+    )
+    safe_create_task(sqlite_manager.save_decision_snapshot(payload))
+    return payload
+
+
+def _decision_snapshot_source_payload(payload: dict = None) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    signal_snapshot = safe_payload.get('signal_snapshot', safe_payload.get('signalSnapshot', {}))
+    if isinstance(signal_snapshot, dict) and signal_snapshot:
+        return signal_snapshot
+    return safe_payload
+
+
+def queue_decision_snapshot_from_event_payload(
+    payload: dict,
+    event_payload: dict,
+    *,
+    trade_id: str = '',
+    position_id: str = '',
+) -> Optional[dict]:
+    safe_event = event_payload if isinstance(event_payload, dict) else {}
+    stage = str(safe_event.get('stage', '') or '')
+    snapshot_stage = ''
+    if stage == 'RAW_GENERATED':
+        snapshot_stage = 'candidate'
+    elif stage == 'EXECUTABLE':
+        snapshot_stage = 'signal_generated'
+    elif stage == 'PENDING_CREATED':
+        snapshot_stage = 'pending_created'
+    elif stage == 'PENDING_RECHECK':
+        snapshot_stage = 'pending_recheck'
+    elif stage in ('HARD_REJECT', 'EXPIRED', 'PENDING_CANCELLED', 'SUPERSEDED'):
+        snapshot_stage = 'signal_rejected'
+    if not snapshot_stage:
+        return None
+
+    source_payload = _decision_snapshot_source_payload(payload)
+    symbol = str(
+        safe_event.get('symbol')
+        or source_payload.get('symbol')
+        or ''
+    ).strip().upper()
+    if not symbol:
+        return None
+    signal_id = str(
+        safe_event.get('signal_id')
+        or safe_event.get('signalId')
+        or source_payload.get('signalId')
+        or source_payload.get('signal_id')
+        or ''
+    )
+    decision_context = source_payload.get('decisionContext', {})
+    if not isinstance(decision_context, dict) or not decision_context:
+        decision_context = build_decision_context(
+            source_payload,
+            default_mode=source_payload.get('strategyMode', source_payload.get('strategy_mode', STRATEGY_MODE_LEGACY)),
+        )
+    expectancy = source_payload.get('expectancy', {})
+    if not isinstance(expectancy, dict):
+        expectancy = {}
+    merged_inputs = dict(source_payload)
+    merged_inputs.update({
+        'symbol': symbol,
+        'side': source_payload.get('side', source_payload.get('action', safe_event.get('action', ''))),
+        'signalScore': safe_event.get('score_after', source_payload.get('confidenceScore', source_payload.get('signalScore', 0.0))),
+        'signalScoreRaw': safe_event.get('score_before', source_payload.get('_rawConfidenceScore', source_payload.get('signalScoreRaw', 0.0))),
+        'forecastBand': source_payload.get('forecastBand', safe_event.get('forecastBand', 'NEUTRAL')),
+        'forecastEdgeProb': source_payload.get('forecastEdgeProb', safe_event.get('forecastEdgeProb', 0.5)),
+    })
+    created_ts = int(
+        safe_event.get('timestamp', safe_event.get('created_ts', int(datetime.now().timestamp() * 1000)))
+        or int(datetime.now().timestamp() * 1000)
+    )
+    return queue_decision_snapshot(
+        stage=snapshot_stage,
+        symbol=symbol,
+        signal_id=signal_id,
+        trade_id=str(trade_id or source_payload.get('tradeId', source_payload.get('trade_id', '')) or ''),
+        position_id=str(position_id or source_payload.get('id', source_payload.get('positionId', source_payload.get('position_id', ''))) or ''),
+        context=decision_context,
+        inputs=_compact_decision_inputs(merged_inputs),
+        decision={
+            'entryArchetype': str(
+                decision_context.get(
+                    'entryArchetype',
+                    source_payload.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+                ) or ENTRY_ARCHETYPE_RECLAIM
+            ),
+            'executionArchetype': str(decision_context.get('executionArchetype', '') or ''),
+            'exitOwnerProfile': str(decision_context.get('exitOwnerProfile', source_payload.get('exitOwner', '')) or ''),
+            'indicatorPolicy': decision_context.get('indicatorPolicy', source_payload.get('indicatorPolicy', {})),
+            'gatePolicy': decision_context.get('gatePolicy', source_payload.get('gatePolicy', {})),
+            'forecastPolicy': decision_context.get('forecastPolicy', source_payload.get('forecastPolicy', {})),
+            'contextConfidence': _coerce_float(
+                decision_context.get('contextConfidence', source_payload.get('contextConfidence', 0.5)),
+                0.5,
+            ),
+            'decisionCode': str(safe_event.get('decision_code', '') or ''),
+            'decisionDetail': str(safe_event.get('decision_detail', '') or ''),
+            'expectancy': expectancy,
+        },
+        outcome={
+            'accepted': bool(safe_event.get('accepted', False)),
+            'decision': str(safe_event.get('decision', '') or ''),
+            'decisionCode': str(safe_event.get('decision_code', '') or ''),
+            'decisionDetail': str(safe_event.get('decision_detail', '') or ''),
+            'rejectReason': str(safe_event.get('reject_reason', '') or ''),
+            'pendingEntryId': str(safe_event.get('pending_entry_id', '') or ''),
+            'scoreAfter': _coerce_float(safe_event.get('score_after', merged_inputs.get('signalScore', 0.0)), 0.0),
+            'leverageAfter': _coerce_float(safe_event.get('leverage_after', source_payload.get('leverage', 0.0)), 0.0),
+            'sizeMult': _coerce_float(safe_event.get('size_mult', source_payload.get('sizeMultiplier', 1.0)), 1.0),
+        },
+        created_ts=created_ts,
+    )
+
+
+def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -> bool:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    symbol = str(safe_pos.get('symbol', '') or '')
+    if not symbol:
+        return False
+    now_ms = int(datetime.now().timestamp() * 1000)
+    state_key = "|".join([
+        str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
+        str(safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
+        str(safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
+        str(safe_pos.get('lastExitDecision', '') or ''),
+        str(safe_pos.get('lossGateSuppressedReason', '') or ''),
+    ])
+    last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
+    last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
+    if state_key == last_state_key and (now_ms - last_snapshot_ts) < 60000:
+        return False
+    safe_pos['_decisionSnapshotStateKey'] = state_key
+    safe_pos['_decisionSnapshotLastTs'] = now_ms
+    decision_context = safe_pos.get('decisionContext', {}) if isinstance(safe_pos.get('decisionContext'), dict) else build_decision_context(safe_pos, default_mode=safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY))
+    expectancy = safe_pos.get('expectancy', {}) if isinstance(safe_pos.get('expectancy'), dict) else {}
+    queue_decision_snapshot(
+        stage='position_state_change',
+        symbol=symbol,
+        signal_id=str(safe_pos.get('signalId', safe_pos.get('signal_id', '')) or ''),
+        trade_id=str(safe_pos.get('tradeId', safe_pos.get('trade_id', '')) or ''),
+        position_id=str(safe_pos.get('id', '') or ''),
+        context=decision_context,
+        inputs=_compact_decision_inputs(safe_pos),
+        decision={
+            'reason': reason,
+            'expectancyBand': str(expectancy.get('expectancyBand', safe_pos.get('expectancyBand', 'NEUTRAL')) or 'NEUTRAL'),
+            'expectancyRankingScore': _coerce_float(expectancy.get('rankingScore', safe_pos.get('expectancyRankingScore', 0.0)), 0.0),
+            'entryArchetype': str(decision_context.get('entryArchetype', safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM),
+            'exitOwner': str(safe_pos.get('exitOwner', '') or ''),
+            'runnerContextResolved': str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
+        },
+        outcome={
+            'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
+            'continuationFlowState': str(safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
+            'underwaterTapeState': str(safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
+        },
+        created_ts=now_ms,
+    )
+    return True
+
+
+def recompute_decision_snapshot_view(snapshot: dict, *, policy_version: str = 'candidate') -> dict:
+    safe_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    inputs = safe_snapshot.get('inputs') if isinstance(safe_snapshot.get('inputs'), dict) else _json_loads_safe(safe_snapshot.get('inputs_json', '{}'), {})
+    context = safe_snapshot.get('context') if isinstance(safe_snapshot.get('context'), dict) else _json_loads_safe(safe_snapshot.get('context_json', '{}'), {})
+    decision = safe_snapshot.get('decision') if isinstance(safe_snapshot.get('decision'), dict) else _json_loads_safe(safe_snapshot.get('decision_json', '{}'), {})
+    if str(policy_version or 'candidate') == 'baseline':
+        return {
+            'decisionContext': context,
+            'decision': decision,
+            'expectancy': decision.get('expectancy', {}),
+        }
+    candidate_context = build_decision_context({**inputs, 'decisionContext': context}, default_mode=inputs.get('strategyMode', STRATEGY_MODE_LEGACY))
+    expectancy = compute_opportunity_expectancy(
+        {**inputs, 'decisionContext': candidate_context, 'forecastBand': inputs.get('forecastBand', 'NEUTRAL'), 'forecastEdgeProb': inputs.get('forecastEdgeProb', 0.5)},
+        decision_context=candidate_context,
+    )
+    candidate_decision = dict(decision)
+    candidate_decision['expectancy'] = expectancy
+    candidate_decision['entryArchetype'] = candidate_context.get('entryArchetype', decision.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM))
+    candidate_decision['rankingScore'] = expectancy.get('rankingScore', 0.0)
+    return {
+        'decisionContext': candidate_context,
+        'decision': candidate_decision,
+        'expectancy': expectancy,
+    }
+
+
+def build_replay_report_from_snapshots(snapshots: list, *, policy_version: str = 'candidate') -> dict:
+    safe_snaps = [snap for snap in (snapshots or []) if isinstance(snap, dict)]
+    if not safe_snaps:
+        return {
+            'approximate': True,
+            'snapshot_count': 0,
+            'baseline_vs_candidate': {},
+            'decision_chain': [],
+            'entry_changed': False,
+            'reduce_count': 0,
+            'partial_count': 0,
+            'close_reason': '',
+            'peak_roi': 0.0,
+            'realized_peak_capture_ratio': 0.0,
+            'giveback': 0.0,
+        }
+
+    decision_chain = []
+    reduce_count = 0
+    partial_count = 0
+    close_reason = ''
+    peak_roi = 0.0
+    realized_roi = 0.0
+    baseline_entry = ''
+    candidate_entry = ''
+    for snap in safe_snaps:
+        stage = str(snap.get('stage', '') or '')
+        baseline_view = recompute_decision_snapshot_view(snap, policy_version='baseline')
+        candidate_view = recompute_decision_snapshot_view(snap, policy_version=policy_version)
+        baseline_ctx = baseline_view.get('decisionContext', {})
+        candidate_ctx = candidate_view.get('decisionContext', {})
+        baseline_arch = str(baseline_ctx.get('entryArchetype', '') or '')
+        candidate_arch = str(candidate_ctx.get('entryArchetype', baseline_arch) or '')
+        if stage == 'signal_generated' and not baseline_entry:
+            baseline_entry = baseline_arch
+        if stage == 'signal_generated' and not candidate_entry:
+            candidate_entry = candidate_arch
+        outcome = snap.get('outcome') if isinstance(snap.get('outcome'), dict) else _json_loads_safe(snap.get('outcome_json', '{}'), {})
+        decision_chain.append({
+            'stage': stage,
+            'baselineArchetype': baseline_arch,
+            'candidateArchetype': candidate_arch,
+            'baselineRankingScore': _coerce_float((baseline_view.get('expectancy') or {}).get('rankingScore', 0.0), 0.0),
+            'candidateRankingScore': _coerce_float((candidate_view.get('expectancy') or {}).get('rankingScore', 0.0), 0.0),
+            'decisionCode': str((snap.get('decision') or {}).get('decisionCode', '') if isinstance(snap.get('decision'), dict) else ''),
+        })
+        if stage == 'partial_close':
+            partial_count += 1
+        if stage in ('partial_close', 'position_closed'):
+            reason = str(outcome.get('reason', outcome.get('closeReason', '')) or '')
+            if 'REDUCE' in reason.upper():
+                reduce_count += 1
+            if stage == 'position_closed':
+                close_reason = reason
+                realized_roi = _coerce_float(outcome.get('roi', outcome.get('pnlPercent', 0.0)), 0.0)
+                peak_roi = max(
+                    _coerce_float(outcome.get('peak_roi', 0.0), 0.0),
+                    _coerce_float(outcome.get('peakRoi', 0.0), 0.0),
+                    realized_roi,
+                )
+    capture = (realized_roi / peak_roi) if peak_roi > 0 else 0.0
+    giveback = max(0.0, peak_roi - max(realized_roi, 0.0))
+    return {
+        'approximate': any(str(snap.get('source_version', '') or '').startswith('approx') for snap in safe_snaps),
+        'snapshot_count': len(safe_snaps),
+        'baseline_vs_candidate': {
+            'baseline_entry_archetype': baseline_entry,
+            'candidate_entry_archetype': candidate_entry,
+        },
+        'decision_chain': decision_chain,
+        'entry_changed': baseline_entry != candidate_entry,
+        'reduce_count': reduce_count,
+        'partial_count': partial_count,
+        'close_reason': close_reason,
+        'peak_roi': round(peak_roi, 4),
+        'realized_peak_capture_ratio': round(capture, 4),
+        'giveback': round(giveback, 4),
+    }
+
+
+def _normalize_replay_snapshot(snapshot: dict) -> dict:
+    safe_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    context = safe_snapshot.get('context') if isinstance(safe_snapshot.get('context'), dict) else _json_loads_safe(safe_snapshot.get('context_json', '{}'), {})
+    inputs = safe_snapshot.get('inputs') if isinstance(safe_snapshot.get('inputs'), dict) else _json_loads_safe(safe_snapshot.get('inputs_json', '{}'), {})
+    decision = safe_snapshot.get('decision') if isinstance(safe_snapshot.get('decision'), dict) else _json_loads_safe(safe_snapshot.get('decision_json', '{}'), {})
+    outcome = safe_snapshot.get('outcome') if isinstance(safe_snapshot.get('outcome'), dict) else _json_loads_safe(safe_snapshot.get('outcome_json', '{}'), {})
+    return {
+        'snapshotId': str(safe_snapshot.get('snapshot_id', safe_snapshot.get('snapshotId', '')) or ''),
+        'createdTs': int(safe_snapshot.get('created_ts', safe_snapshot.get('createdTs', 0)) or 0),
+        'created_ts': int(safe_snapshot.get('created_ts', safe_snapshot.get('createdTs', 0)) or 0),
+        'symbol': str(safe_snapshot.get('symbol', '') or ''),
+        'stage': str(safe_snapshot.get('stage', '') or ''),
+        'signalId': str(safe_snapshot.get('signal_id', safe_snapshot.get('signalId', '')) or ''),
+        'tradeId': str(safe_snapshot.get('trade_id', safe_snapshot.get('tradeId', '')) or ''),
+        'positionId': str(safe_snapshot.get('position_id', safe_snapshot.get('positionId', '')) or ''),
+        'context': context,
+        'inputs': inputs,
+        'decision': decision,
+        'outcome': outcome,
+        'source_version': str(safe_snapshot.get('source_version', safe_snapshot.get('sourceVersion', '')) or ''),
+        'sourceVersion': str(safe_snapshot.get('source_version', safe_snapshot.get('sourceVersion', '')) or ''),
+    }
+
+
+def _build_replay_trade_summary(trade: dict) -> dict:
+    safe_trade = trade if isinstance(trade, dict) else {}
+    signal_snapshot = safe_trade.get('signalSnapshot', {}) if isinstance(safe_trade.get('signalSnapshot'), dict) else {}
+    close_snapshot = safe_trade.get('closeSnapshot', {}) if isinstance(safe_trade.get('closeSnapshot'), dict) else {}
+    decision_context = safe_trade.get('decisionContext', {}) if isinstance(safe_trade.get('decisionContext'), dict) else signal_snapshot.get('decisionContext', {})
+    close_reason = str(safe_trade.get('reason', safe_trade.get('closeReason', '')) or '')
+    peak_roi = max(
+        _coerce_float(close_snapshot.get('runtimeProfitPeakRoiPct', close_snapshot.get('profitPeakRoiPct', 0.0)), 0.0),
+        max(_coerce_float(safe_trade.get('roi', 0.0), 0.0), 0.0),
+    )
+    realized_roi = _coerce_float(safe_trade.get('roi', 0.0), 0.0)
+    capture_ratio = (realized_roi / peak_roi) if peak_roi > 0 and realized_roi > 0 else 0.0
+    replay_fidelity = str(
+        safe_trade.get('replayFidelity')
+        or signal_snapshot.get('replayFidelity')
+        or ('snapshot' if safe_trade.get('decisionContext') else 'approx_ohlcv')
+    )
+    return {
+        'tradeId': str(safe_trade.get('tradeId', safe_trade.get('id', '')) or safe_trade.get('id', '')),
+        'id': str(safe_trade.get('tradeId', safe_trade.get('id', '')) or safe_trade.get('id', '')),
+        'symbol': str(safe_trade.get('symbolFull', safe_trade.get('symbol', '')) or safe_trade.get('symbol', '')),
+        'displaySymbol': str(safe_trade.get('symbol', '') or '').replace('USDT', ''),
+        'side': str(safe_trade.get('side', '') or ''),
+        'openTime': int(safe_trade.get('openTime', 0) or 0),
+        'closeTime': int(safe_trade.get('closeTime', 0) or 0),
+        'pnl': round(_coerce_float(safe_trade.get('pnl', 0.0), 0.0), 4),
+        'roi': round(realized_roi, 4),
+        'reason': close_reason,
+        'reasonOwner': str(safe_trade.get('reasonOwner', '') or ''),
+        'entryArchetype': str(safe_trade.get('entryArchetype', signal_snapshot.get('entryArchetype', decision_context.get('entryArchetype', ''))) or ''),
+        'expectancyBand': str(safe_trade.get('expectancyBand', signal_snapshot.get('expectancyBand', '')) or ''),
+        'expectancyRankingScore': round(_coerce_float(safe_trade.get('expectancyRankingScore', signal_snapshot.get('expectancyRankingScore', 0.0)), 0.0), 4),
+        'holdProfile': str(safe_trade.get('holdProfile', signal_snapshot.get('holdProfile', '')) or ''),
+        'replayFidelity': replay_fidelity,
+        'strategyMode': str(safe_trade.get('strategyMode', signal_snapshot.get('strategyMode', STRATEGY_MODE_LEGACY)) or STRATEGY_MODE_LEGACY),
+        'runnerContextResolved': str(safe_trade.get('runnerContextResolved', signal_snapshot.get('runnerContextResolved', '')) or ''),
+        'peakRoi': round(peak_roi, 4),
+        'realizedPeakCaptureRatio': round(capture_ratio, 4),
+        'giveback': round(max(0.0, peak_roi - max(realized_roi, 0.0)), 4),
+    }
+
+
+def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
+    safe_trade = trade if isinstance(trade, dict) else {}
+    signal_snapshot = safe_trade.get('signalSnapshot', {}) if isinstance(safe_trade.get('signalSnapshot'), dict) else {}
+    close_snapshot = safe_trade.get('closeSnapshot', {}) if isinstance(safe_trade.get('closeSnapshot'), dict) else {}
+    trade_id = str(safe_trade.get('tradeId', safe_trade.get('id', '')) or safe_trade.get('id', ''))
+    signal_id = str(safe_trade.get('signalId', '') or '')
+    position_id = str(safe_trade.get('positionId', '') or '')
+    symbol = str(safe_trade.get('symbolFull', safe_trade.get('symbol', '')) or safe_trade.get('symbol', ''))
+    if not symbol:
+        return []
+
+    open_ts = int(safe_trade.get('openTime', safe_trade.get('signalTs', 0)) or 0)
+    close_ts = int(safe_trade.get('closeTime', safe_trade.get('exitTs', open_ts)) or open_ts)
+    entry_inputs = dict(signal_snapshot)
+    entry_inputs.setdefault('symbol', symbol)
+    entry_inputs.setdefault('side', safe_trade.get('side', ''))
+    entry_inputs.setdefault('strategyMode', safe_trade.get('strategyMode', STRATEGY_MODE_LEGACY))
+    decision_context = signal_snapshot.get('decisionContext', {})
+    if not isinstance(decision_context, dict) or not decision_context:
+        decision_context = build_decision_context(
+            entry_inputs,
+            default_mode=safe_trade.get('strategyMode', STRATEGY_MODE_LEGACY),
+        )
+
+    expectancy = signal_snapshot.get('expectancy', {})
+    if not isinstance(expectancy, dict):
+        expectancy = {}
+
+    return [
+        {
+            'snapshotId': f"approx_{trade_id}_signal_generated",
+            'createdTs': open_ts,
+            'symbol': symbol,
+            'stage': 'signal_generated',
+            'signalId': signal_id,
+            'tradeId': trade_id,
+            'positionId': position_id,
+            'context': decision_context,
+            'inputs': _compact_decision_inputs(entry_inputs),
+            'decision': {
+                'entryArchetype': signal_snapshot.get('entryArchetype', decision_context.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                'exitOwner': safe_trade.get('exitOwner', ''),
+                'expectancy': expectancy,
+            },
+            'outcome': {
+                'accepted': True,
+                'decision': 'PASS',
+                'decisionCode': 'approx_signal_generated',
+            },
+            'sourceVersion': 'approx_ohlcv_v1',
+            'source_version': 'approx_ohlcv_v1',
+        },
+        {
+            'snapshotId': f"approx_{trade_id}_position_closed",
+            'createdTs': close_ts,
+            'symbol': symbol,
+            'stage': 'position_closed',
+            'signalId': signal_id,
+            'tradeId': trade_id,
+            'positionId': position_id,
+            'context': decision_context,
+            'inputs': _compact_decision_inputs(entry_inputs),
+            'decision': {
+                'entryArchetype': signal_snapshot.get('entryArchetype', decision_context.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)),
+                'exitOwner': safe_trade.get('exitOwner', ''),
+                'expectancy': expectancy,
+            },
+            'outcome': {
+                'reason': safe_trade.get('reason', safe_trade.get('closeReason', '')),
+                'roi': _coerce_float(safe_trade.get('roi', 0.0), 0.0),
+                'pnl': _coerce_float(safe_trade.get('pnl', 0.0), 0.0),
+                'peak_roi': max(
+                    _coerce_float(close_snapshot.get('runtimeProfitPeakRoiPct', close_snapshot.get('profitPeakRoiPct', 0.0)), 0.0),
+                    max(_coerce_float(safe_trade.get('roi', 0.0), 0.0), 0.0),
+                ),
+                'closeReason': safe_trade.get('closeReason', safe_trade.get('reason', '')),
+            },
+            'sourceVersion': 'approx_ohlcv_v1',
+            'source_version': 'approx_ohlcv_v1',
+        },
+    ]
+
+
+async def _get_trade_for_replay_by_id(trade_id: str) -> Optional[dict]:
+    safe_trade_id = str(trade_id or '').strip()
+    if not safe_trade_id:
+        return None
+    try:
+        trades = await sqlite_manager.get_full_trade_history(limit=0)
+    except Exception:
+        return None
+    for trade in trades:
+        current_id = str(trade.get('tradeId', trade.get('id', '')) or trade.get('id', ''))
+        if current_id == safe_trade_id or str(trade.get('id', '')) == safe_trade_id:
+            return trade
+    return None
 
 
 def classify_signal_entry_archetype(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
@@ -21761,6 +23038,7 @@ async def background_scanner_loop():
                         if current_price and current_price > 0:
                             if pos_opp:
                                 apply_live_flow_context_to_position(pos, pos_opp)
+                                maybe_queue_position_state_snapshot(pos, reason='live_flow_context')
                             # Calculate unrealized PnL
                             entry_price = pos.get('entryPrice', current_price)
                             size = pos.get('size', 0)
@@ -23397,6 +24675,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             drop_signal_memory(symbol, signal_id=signal_id)
         safe_create_task(sqlite_manager.save_signal(payload))
         safe_create_task(sqlite_manager.save_signal_event(payload))
+        queue_decision_snapshot_from_event_payload(signal, payload)
         return payload
 
     def hard_reject_signal(code: str, detail: str = '', trace: Optional[dict] = None):
@@ -25409,6 +26688,96 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             )
             global_paper_trader.pipeline_metrics.setdefault('ev_soft_penalty', 0)
             global_paper_trader.pipeline_metrics['ev_soft_penalty'] += 1
+
+    try:
+        decision_context = build_decision_context(
+            signal,
+            default_mode=signal.get('strategyMode', signal.get('strategy_mode', STRATEGY_MODE_LEGACY)),
+        )
+        strategy_mode_norm = normalize_strategy_mode(
+            signal.get('strategyMode', signal.get('strategy_mode', STRATEGY_MODE_LEGACY))
+        )
+        if strategy_mode_norm in (STRATEGY_MODE_SMART_V2, STRATEGY_MODE_SMART_V3_RUNNER):
+            signal['entryArchetype'] = decision_context.get(
+                'entryArchetype',
+                signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+            )
+        signal['decisionContext'] = decision_context
+        signal['indicatorPolicy'] = decision_context.get('indicatorPolicy', {})
+        signal['gatePolicy'] = decision_context.get('gatePolicy', {})
+        signal['forecastPolicy'] = decision_context.get('forecastPolicy', {})
+        signal['contextConfidence'] = _coerce_float(decision_context.get('contextConfidence', 0.5), 0.5)
+        signal['executionArchetype'] = decision_context.get('executionArchetype', '')
+        signal['exitOwnerProfile'] = decision_context.get('exitOwnerProfile', '')
+        signal['replayFidelity'] = DECISION_REPLAY_FIDELITY_SNAPSHOT
+
+        expectancy = compute_opportunity_expectancy(
+            signal,
+            forecast=final_forecast,
+            decision_context=decision_context,
+        )
+        signal['expectancy'] = expectancy
+        signal['expectancyBand'] = expectancy.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)
+        signal['expectancyRankingScore'] = expectancy.get('rankingScore', 0.0)
+        signal['expectancySizeBias'] = expectancy.get('sizeBias', 1.0)
+        signal['pendingPatienceBias'] = expectancy.get('pendingPatienceBias', 1.0)
+        signal['expectedMfeBucket'] = expectancy.get('expectedMfeBucket', 'MEDIUM')
+        signal['expectedMaeBucket'] = expectancy.get('expectedMaeBucket', 'MEDIUM')
+        signal['holdProfile'] = expectancy.get('holdProfile', 'CHOP')
+
+        size_bias = _coerce_float(expectancy.get('sizeBias', 1.0), 1.0)
+        if abs(size_bias - 1.0) >= 0.01:
+            signal['sizeMultiplier'] = round(
+                float(signal.get('sizeMultiplier', 1.0) or 1.0) * size_bias,
+                6,
+            )
+        if (
+            signal['expectancyBand'] == DECISION_EXPECTANCY_BAND_WEAK
+            or _coerce_float(expectancy.get('uncertainty', 1.0), 1.0) >= 0.68
+        ):
+            _cur_lev = max(3, int(signal.get('leverage', 10) or 10))
+            _expectancy_cap = max(3, int(round(_cur_lev * 0.85)))
+            if _expectancy_cap < _cur_lev:
+                signal['leverage'] = _expectancy_cap
+                signal['leverageCapApplied'] = True
+                signal['leverageCapValue'] = _expectancy_cap
+                signal['leverageCapReason'] = 'EXPECTANCY_DEFENSIVE_CAP'
+
+        telemetry = signal.get('telemetry', {})
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+        telemetry.update({
+            'decisionContext': {
+                'entryArchetype': signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+                'regimeBucket': decision_context.get('regimeBucket', 'UNKNOWN'),
+                'executionArchetype': decision_context.get('executionArchetype', ''),
+                'exitOwnerProfile': decision_context.get('exitOwnerProfile', ''),
+                'contextConfidence': signal.get('contextConfidence', 0.5),
+            },
+            'expectancyBand': signal['expectancyBand'],
+            'expectancyRankingScore': round(_coerce_float(signal['expectancyRankingScore'], 0.0), 4),
+            'expectancySizeBias': round(_coerce_float(signal['expectancySizeBias'], 1.0), 4),
+            'pendingPatienceBias': round(_coerce_float(signal['pendingPatienceBias'], 1.0), 4),
+            'expectedMfeBucket': signal['expectedMfeBucket'],
+            'expectedMaeBucket': signal['expectedMaeBucket'],
+            'holdProfile': signal['holdProfile'],
+        })
+        signal['telemetry'] = telemetry
+
+        truth_snapshot = signal.get('truth_snapshot', {})
+        if not isinstance(truth_snapshot, dict):
+            truth_snapshot = {}
+        truth_snapshot.update({
+            'entryArchetype': signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+            'regimeBucket': decision_context.get('regimeBucket', 'UNKNOWN'),
+            'expectancyBand': signal['expectancyBand'],
+            'expectedMfeBucket': signal['expectedMfeBucket'],
+            'expectedMaeBucket': signal['expectedMaeBucket'],
+            'holdProfile': signal['holdProfile'],
+        })
+        signal['truth_snapshot'] = truth_snapshot
+    except Exception as decision_ctx_err:
+        logger.debug(f"Decision context / expectancy finalize error: {decision_ctx_err}")
 
     final_signal_score = float(signal.get('confidenceScore', 0) or 0)
     min_signal_score = float(getattr(global_paper_trader, 'min_confidence_score', 74) or 74)
@@ -27712,6 +29081,7 @@ class PositionBasedKillSwitch:
         )
         prev_state = str(pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
         apply_v3_underwater_tape_telemetry(pos, ctx)
+        maybe_queue_position_state_snapshot(pos, reason='kill_switch_underwater_refresh')
         if ctx.get('state') == V3_UNDERWATER_ADVERSE_STRONG and prev_state != V3_UNDERWATER_ADVERSE_STRONG:
             logger.warning(
                 f"🔻 UNDERWATER_ADVERSE_STRONG: {pos.get('symbol','?')} {pos.get('side','?')} "
@@ -29207,6 +30577,7 @@ class TimeBasedPositionManager:
             signal_invalidation_state=pos.get('runtimeSignalInvalidationState', {}),
         )
         apply_v3_underwater_tape_telemetry(pos, underwater_ctx)
+        maybe_queue_position_state_snapshot(pos, reason='v3_runner_runtime')
         sideways_reclaim = evaluate_v3_sideways_reclaim_signal(
             pos,
             current_price,
@@ -35659,6 +37030,49 @@ class SignalGenerator:
             },
             default_mode=strategy_mode,
         )
+        decision_context_seed_payload = {
+            'strategyMode': strategy_mode,
+            'symbol': symbol,
+            'side': signal_side,
+            'breakout': breakout,
+            'runnerContext': runner_context_preview,
+            'coinDailyTrend': coin_daily_trend,
+            'counterTrend': _ct_preview,
+            'counterTrendStrength': _ct_strength_preview,
+            'adx': adx,
+            'hurst': hurst,
+            'volumeRatio': volume_ratio,
+            'isVolumeSpike': is_volume_spike,
+            'obImbalanceTrend': ob_imbalance_trend,
+            'imbalance': imbalance,
+            'spreadPct': spread_pct,
+            'volatility_pct': atr_pct * 100,
+            'market_regime': market_regime,
+            'zscore': zscore,
+            'fibActive': fib_context.get('fib_active', False) if fib_context else False,
+            'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
+            'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
+        }
+        decision_context_preview = build_decision_context(
+            decision_context_seed_payload,
+            default_mode=strategy_mode,
+        )
+        if is_smart_mode(strategy_mode):
+            preview_archetype = str(decision_context_preview.get('entryArchetype', entry_archetype) or entry_archetype).lower()
+            if (
+                preview_archetype not in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM)
+                and entry_archetype in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM)
+            ):
+                decision_context_preview = build_decision_context(
+                    {
+                        **decision_context_seed_payload,
+                        'entryArchetype': entry_archetype,
+                    },
+                    default_mode=strategy_mode,
+                )
+                preview_archetype = str(decision_context_preview.get('entryArchetype', entry_archetype) or entry_archetype).lower()
+            if preview_archetype in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM):
+                entry_archetype = preview_archetype
         if entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
             if not (volume_ratio >= 1.35 or is_volume_spike):
                 logger.info(
@@ -35864,7 +37278,27 @@ class SignalGenerator:
             'currentIsVolumeSpike': bool(is_volume_spike),
             'currentImbalance': round(float(imbalance or 0.0), 4),
             'currentObImbalanceTrend': round(float(ob_imbalance_trend or 0.0), 4),
+            'decisionContext': decision_context_preview,
+            'indicatorPolicy': decision_context_preview.get('indicatorPolicy', {}),
+            'gatePolicy': decision_context_preview.get('gatePolicy', {}),
+            'forecastPolicy': decision_context_preview.get('forecastPolicy', {}),
+            'contextConfidence': decision_context_preview.get('contextConfidence', 0.5),
+            'replayFidelity': DECISION_REPLAY_FIDELITY_APPROX,
         }
+        _signal_core_payload['entryArchetype'] = entry_archetype
+        _signal_core_payload['decisionContext']['entryArchetype'] = entry_archetype
+        _preliminary_expectancy = compute_opportunity_expectancy(
+            _signal_core_payload,
+            decision_context=decision_context_preview,
+        )
+        _signal_core_payload['expectancy'] = _preliminary_expectancy
+        _signal_core_payload['expectancyBand'] = _preliminary_expectancy.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)
+        _signal_core_payload['expectancyRankingScore'] = _preliminary_expectancy.get('rankingScore', 0.0)
+        _signal_core_payload['expectancySizeBias'] = _preliminary_expectancy.get('sizeBias', 1.0)
+        _signal_core_payload['pendingPatienceBias'] = _preliminary_expectancy.get('pendingPatienceBias', 1.0)
+        _signal_core_payload['expectedMfeBucket'] = _preliminary_expectancy.get('expectedMfeBucket', 'MEDIUM')
+        _signal_core_payload['expectedMaeBucket'] = _preliminary_expectancy.get('expectedMaeBucket', 'MEDIUM')
+        _signal_core_payload['holdProfile'] = _preliminary_expectancy.get('holdProfile', 'CHOP')
 
         def _build_full_signal_payload() -> dict:
             _is_ct_for_profile = _ct_preview
@@ -35972,6 +37406,20 @@ class SignalGenerator:
                 'macdHistogram': round(float(_ei.get('macd_histogram', 0.0)), 6),
                 'stochRsiK': round(float(_ei.get('stoch_rsi_k', 50.0)), 4),
                 'emaCross': str(_ei.get('ema_cross', 'NEUTRAL')),
+                'decisionContext': decision_context_preview,
+                'indicatorPolicy': decision_context_preview.get('indicatorPolicy', {}),
+                'gatePolicy': decision_context_preview.get('gatePolicy', {}),
+                'forecastPolicy': decision_context_preview.get('forecastPolicy', {}),
+                'contextConfidence': decision_context_preview.get('contextConfidence', 0.5),
+                'expectancy': _preliminary_expectancy,
+                'expectancyBand': _preliminary_expectancy.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL),
+                'expectancyRankingScore': _preliminary_expectancy.get('rankingScore', 0.0),
+                'expectancySizeBias': _preliminary_expectancy.get('sizeBias', 1.0),
+                'pendingPatienceBias': _preliminary_expectancy.get('pendingPatienceBias', 1.0),
+                'expectedMfeBucket': _preliminary_expectancy.get('expectedMfeBucket', 'MEDIUM'),
+                'expectedMaeBucket': _preliminary_expectancy.get('expectedMaeBucket', 'MEDIUM'),
+                'holdProfile': _preliminary_expectancy.get('holdProfile', 'CHOP'),
+                'replayFidelity': DECISION_REPLAY_FIDELITY_APPROX,
             }
 
         return build_signal_payload_with_fallback(
@@ -38677,6 +40125,19 @@ class PaperTradingEngine:
             "liqEchoImpulseUsd": _coerce_float(signal.get('liqEchoImpulseUsd', 0.0) if signal else 0.0, 0.0),
             "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
             "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
+            "decisionContext": signal.get('decisionContext', {}) if signal else {},
+            "indicatorPolicy": signal.get('indicatorPolicy', {}) if signal else {},
+            "gatePolicy": signal.get('gatePolicy', {}) if signal else {},
+            "forecastPolicy": signal.get('forecastPolicy', {}) if signal else {},
+            "expectancy": signal.get('expectancy', {}) if signal else {},
+            "expectancyBand": signal.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL) if signal else DECISION_EXPECTANCY_BAND_NEUTRAL,
+            "expectancyRankingScore": _coerce_float(signal.get('expectancyRankingScore', 0.0) if signal else 0.0, 0.0),
+            "expectancySizeBias": _coerce_float(signal.get('expectancySizeBias', 1.0) if signal else 1.0, 1.0),
+            "pendingPatienceBias": _coerce_float(signal.get('pendingPatienceBias', 1.0) if signal else 1.0, 1.0),
+            "expectedMfeBucket": signal.get('expectedMfeBucket', 'MEDIUM') if signal else 'MEDIUM',
+            "expectedMaeBucket": signal.get('expectedMaeBucket', 'MEDIUM') if signal else 'MEDIUM',
+            "holdProfile": signal.get('holdProfile', 'CHOP') if signal else 'CHOP',
+            "replayFidelity": signal.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX) if signal else DECISION_REPLAY_FIDELITY_APPROX,
             "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
             "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
             "refillFailureScore": _coerce_float(signal.get('refillFailureScore', 0.0) if signal else 0.0, 0.0),
@@ -38793,6 +40254,8 @@ class PaperTradingEngine:
                 "entryExecStrictPassed": bool(signal.get('entryExecStrictPassed', False)) if signal else False,
                 "forecastEdgeProb": _coerce_float(signal.get('forecastEdgeProb', 0.5) if signal else 0.5, 0.5),
                 "forecastBand": signal.get('forecastBand', 'NEUTRAL') if signal else 'NEUTRAL',
+                "decisionContext": signal.get('decisionContext', {}) if signal else {},
+                "expectancy": signal.get('expectancy', {}) if signal else {},
                 "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
                 "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
                 "limitedMarketOverrideEligible": bool(_limited_market_override.get('eligible', False)),
@@ -38814,6 +40277,8 @@ class PaperTradingEngine:
                 "sizeUsd": position_size_usd,
                 "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) if signal else ENTRY_ARCHETYPE_RECLAIM,
                 "runnerContextResolved": signal.get('runnerContextResolved', signal.get('runnerContext', '')) if signal else '',
+                "expectancyBand": signal.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL) if signal else DECISION_EXPECTANCY_BAND_NEUTRAL,
+                "expectancyRankingScore": _coerce_float(signal.get('expectancyRankingScore', 0.0) if signal else 0.0, 0.0),
                 "entryCostSizeMult": _coerce_float(signal.get('entryCostSizeMult', 1.0) if signal else 1.0, 1.0),
                 "entryCostEstSlippageBps": _coerce_float(signal.get('entryCostEstSlippageBps', 0.0) if signal else 0.0, 0.0),
                 "entryStopRoiPct": round(compute_target_roi_pct(entry_price, sl, side, adjusted_leverage), 2),
@@ -38989,6 +40454,7 @@ class PaperTradingEngine:
                 decision_trace=trace or {},
             ))
             safe_create_task(sqlite_manager.save_signal_event(event_payload))
+            queue_decision_snapshot_from_event_payload(order, event_payload)
         
         for order in list(self.pending_orders):
             symbol = order.get('symbol', '')
@@ -39008,6 +40474,7 @@ class PaperTradingEngine:
             is_confirmed = order.get('confirmed', False)
             forecast_prob = order.get('forecastProb', 0.5)
             forecast_band = str(order.get('forecastBand', 'NEUTRAL') or 'NEUTRAL').upper()
+            pending_patience_bias = _coerce_float(order.get('pendingPatienceBias', 1.0), 1.0)
             
             # Phase 262: Modulate fallback min score based on forecast (applied to ALL fallback paths)
             fb_min_score = max(MARKET_FALLBACK_MIN_SCORE, score_floor)
@@ -39020,6 +40487,10 @@ class PaperTradingEngine:
                 fb_min_score -= 3
             elif forecast_band == 'WEAK':
                 fb_min_score += 4
+            if pending_patience_bias > 1.0:
+                fb_min_score -= min(3.0, (pending_patience_bias - 1.0) * 10.0)
+            elif pending_patience_bias < 1.0:
+                fb_min_score += min(4.0, (1.0 - pending_patience_bias) * 12.0)
             limited_override_ready = bool(
                 order.get('limitedMarketOverrideEligible', False)
                 and not order.get('limitedMarketOverrideUsed', False)
@@ -39081,6 +40552,8 @@ class PaperTradingEngine:
             stale_threshold_min = STALE_THRESHOLD_CONFIRMED_MIN if is_confirmed else STALE_THRESHOLD_UNCONFIRMED_MIN
             stale_threshold_min += min(20, reinforced_count * 4)
             stale_grace_min = STALE_GRACE_MIN + min(10, reinforced_count * 2)
+            stale_threshold_min *= _clamp(pending_patience_bias, 0.80, 1.25)
+            stale_grace_min *= _clamp(pending_patience_bias, 0.85, 1.25)
             if pending_age_min > stale_threshold_min:
                 stale_penalty = min(20, int((pending_age_min - stale_threshold_min) * STALE_PENALTY_PER_MIN))
                 original_score = order.get('signalScore', 70)
@@ -40407,6 +41880,19 @@ class PaperTradingEngine:
             "entryImbalance": order.get('entryImbalance', 0.0),
             "entryArchetype": order.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
             "runnerContextResolved": order.get('runnerContextResolved', order.get('runnerContext', '')),
+            "decisionContext": order.get('decisionContext', {}),
+            "indicatorPolicy": order.get('indicatorPolicy', {}),
+            "gatePolicy": order.get('gatePolicy', {}),
+            "forecastPolicy": order.get('forecastPolicy', {}),
+            "expectancy": order.get('expectancy', {}),
+            "expectancyBand": order.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL),
+            "expectancyRankingScore": order.get('expectancyRankingScore', 0.0),
+            "expectancySizeBias": order.get('expectancySizeBias', 1.0),
+            "pendingPatienceBias": order.get('pendingPatienceBias', 1.0),
+            "expectedMfeBucket": order.get('expectedMfeBucket', 'MEDIUM'),
+            "expectedMaeBucket": order.get('expectedMaeBucket', 'MEDIUM'),
+            "holdProfile": order.get('holdProfile', 'CHOP'),
+            "replayFidelity": order.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
@@ -42210,6 +43696,20 @@ class PaperTradingEngine:
             # RFX-1D: Truth snapshot + regime adjustment propagation
             "truth_snapshot": signal.get('truth_snapshot', {}),
             "regime_adjustment": signal.get('regime_adjustment', ''),
+            "entryArchetype": signal.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+            "decisionContext": signal.get('decisionContext', {}),
+            "indicatorPolicy": signal.get('indicatorPolicy', {}),
+            "gatePolicy": signal.get('gatePolicy', {}),
+            "forecastPolicy": signal.get('forecastPolicy', {}),
+            "expectancy": signal.get('expectancy', {}),
+            "expectancyBand": signal.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL),
+            "expectancyRankingScore": signal.get('expectancyRankingScore', 0.0),
+            "expectancySizeBias": signal.get('expectancySizeBias', 1.0),
+            "pendingPatienceBias": signal.get('pendingPatienceBias', 1.0),
+            "expectedMfeBucket": signal.get('expectedMfeBucket', 'MEDIUM'),
+            "expectedMaeBucket": signal.get('expectedMaeBucket', 'MEDIUM'),
+            "holdProfile": signal.get('holdProfile', 'CHOP'),
+            "replayFidelity": signal.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX),
             # RFX-2B: Distance truth telemetry
             "distance_truth": signal.get('distance_truth', {}),
         }
@@ -45971,6 +47471,156 @@ async def get_performance_summary():
         "binanceTotalPnlIncome": round(binance_total_pnl_income, 2)
     })
 
+
+def _safe_int_query_param(raw_value: Any, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+@app.get("/api/replay/search")
+async def replay_search(request: Request):
+    symbol = str(request.query_params.get('symbol', '') or '').strip().upper()
+    days = _safe_int_query_param(request.query_params.get('days', 14), 14, min_value=1, max_value=365)
+    limit = _safe_int_query_param(request.query_params.get('limit', 50), 50, min_value=1, max_value=200)
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff_ms = now_ms - (days * 86400 * 1000)
+
+    trades = await sqlite_manager.get_full_trade_history(limit=max(limit * 20, 600))
+    items = []
+    for trade in trades:
+        trade_symbol = str(trade.get('symbolFull', trade.get('symbol', '')) or trade.get('symbol', ''))
+        if symbol and symbol not in (trade_symbol.upper(), str(trade.get('symbol', '') or '').upper()):
+            continue
+        close_time = int(trade.get('closeTime', 0) or 0)
+        if close_time and close_time < cutoff_ms:
+            continue
+        items.append(_build_replay_trade_summary(trade))
+        if len(items) >= limit:
+            break
+
+    return JSONResponse({
+        'success': True,
+        'symbol': symbol,
+        'days': days,
+        'limit': limit,
+        'count': len(items),
+        'items': items,
+    })
+
+
+@app.get("/api/replay/trade/{trade_id}")
+async def replay_trade_report(trade_id: str, request: Request):
+    safe_trade_id = str(trade_id or '').strip()
+    if not safe_trade_id:
+        return JSONResponse({'error': 'trade_id required'}, status_code=400)
+
+    policy_version = str(request.query_params.get('policy_version', 'candidate') or 'candidate').strip().lower()
+    if policy_version not in ('baseline', 'candidate'):
+        policy_version = 'candidate'
+
+    trade = await _get_trade_for_replay_by_id(safe_trade_id)
+    if not trade:
+        return JSONResponse({'error': 'trade not found'}, status_code=404)
+
+    snapshots = await sqlite_manager.get_trade_decision_snapshots(safe_trade_id)
+    normalized_snaps = [_normalize_replay_snapshot(snapshot) for snapshot in snapshots]
+    replay_fidelity = 'snapshot'
+    if not normalized_snaps:
+        normalized_snaps = _synthesize_replay_snapshots_from_trade(trade)
+        replay_fidelity = 'approx_ohlcv'
+
+    report = build_replay_report_from_snapshots(normalized_snaps, policy_version=policy_version)
+    trade_summary = _build_replay_trade_summary(trade)
+    trade_summary['replayFidelity'] = replay_fidelity
+
+    return JSONResponse({
+        'success': True,
+        'trade': trade_summary,
+        'policyVersion': policy_version,
+        'replayFidelity': replay_fidelity,
+        'approximate': bool(report.get('approximate', False)),
+        'report': report,
+    })
+
+
+@app.get("/api/replay/snapshots/{trade_id}")
+async def replay_trade_snapshots(trade_id: str):
+    safe_trade_id = str(trade_id or '').strip()
+    if not safe_trade_id:
+        return JSONResponse({'error': 'trade_id required'}, status_code=400)
+
+    snapshots = await sqlite_manager.get_trade_decision_snapshots(safe_trade_id)
+    normalized_snaps = [_normalize_replay_snapshot(snapshot) for snapshot in snapshots]
+    replay_fidelity = 'snapshot'
+    if not normalized_snaps:
+        trade = await _get_trade_for_replay_by_id(safe_trade_id)
+        if not trade:
+            return JSONResponse({'error': 'trade not found'}, status_code=404)
+        normalized_snaps = _synthesize_replay_snapshots_from_trade(trade)
+        replay_fidelity = 'approx_ohlcv'
+
+    return JSONResponse({
+        'success': True,
+        'tradeId': safe_trade_id,
+        'replayFidelity': replay_fidelity,
+        'count': len(normalized_snaps),
+        'snapshots': normalized_snaps,
+    })
+
+
+@app.get("/api/replay/health")
+async def replay_health(request: Request):
+    days = _safe_int_query_param(request.query_params.get('days', 30), 30, min_value=1, max_value=365)
+    now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff_ms = now_ms - (days * 86400 * 1000)
+    trades = await sqlite_manager.get_full_trade_history(limit=1200)
+    recent = [trade for trade in trades if int(trade.get('closeTime', 0) or 0) >= cutoff_ms]
+
+    views = []
+    for trade in recent:
+        summary = _build_replay_trade_summary(trade)
+        views.append(summary)
+
+    snapshot_ready = sum(1 for view in views if 'snapshot' in str(view.get('replayFidelity', '')).lower())
+    approx_count = sum(1 for view in views if str(view.get('replayFidelity', '')).lower() and 'snapshot' not in str(view.get('replayFidelity', '')).lower())
+    capture_values = [float(view.get('realizedPeakCaptureRatio', 0.0) or 0.0) for view in views if float(view.get('peakRoi', 0.0) or 0.0) > 0]
+    avg_capture = (sum(capture_values) / len(capture_values)) if capture_values else 0.0
+    pre_stop_reduce_count = sum(1 for view in views if 'PRE_STOP_REDUCE' in str(view.get('reason', '')).upper())
+    sideways_reclaim_count = sum(
+        1
+        for view in views
+        if any(token in str(view.get('reason', '')).upper() for token in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE'))
+    )
+
+    archetype_counts: Dict[str, int] = {}
+    expectancy_counts: Dict[str, Dict[str, int]] = {}
+    for view in views:
+        archetype = str(view.get('entryArchetype', 'neutral_fallback') or 'neutral_fallback')
+        archetype_counts[archetype] = archetype_counts.get(archetype, 0) + 1
+        band = str(view.get('expectancyBand', 'NEUTRAL') or 'NEUTRAL')
+        bucket = expectancy_counts.get(band, {'count': 0, 'wins': 0})
+        bucket['count'] += 1
+        if float(view.get('pnl', 0.0) or 0.0) > 0:
+            bucket['wins'] += 1
+        expectancy_counts[band] = bucket
+
+    return JSONResponse({
+        'success': True,
+        'days': days,
+        'tradeCount': len(views),
+        'snapshotCoverage': round((snapshot_ready / len(views)) * 100, 2) if views else 0.0,
+        'snapshotReadyCount': snapshot_ready,
+        'approximateCount': approx_count,
+        'avgRealizedPeakCaptureRatio': round(avg_capture, 4),
+        'preStopReduceCount': pre_stop_reduce_count,
+        'sidewaysReclaimCount': sideways_reclaim_count,
+        'archetypeCounts': archetype_counts,
+        'expectancyBandCounts': expectancy_counts,
+    })
+
 @app.post("/scanner/start")
 async def scanner_start():
     """Start the background scanner."""
@@ -48641,7 +50291,8 @@ async def run_backtest(request: BacktestRequest):
             "trades": trades,
             "equityCurve": equity_curve[::max(1, len(equity_curve)//500)],
             "priceData": price_data,
-            "stats": stats
+            "stats": stats,
+            "fidelity": "approx_ohlcv",
         }
         
     except Exception as e:

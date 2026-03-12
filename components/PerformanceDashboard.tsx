@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, BarChart3, Trophy, AlertTriangle, Bot, RefreshCw, Layers } from 'lucide-react';
+import { Trade } from '../types';
 import { translateReason } from '../utils/reasonUtils';
 
 interface DailyPnL {
@@ -22,6 +23,7 @@ interface CoinPerformer {
 
 interface Props {
     apiUrl: string;
+    trades?: Trade[];
 }
 
 // Phase 232: translateReason imported from utils/reasonUtils.ts (single source)
@@ -57,8 +59,63 @@ const normalizeAttributionPayload = (raw: any) => {
     };
 };
 
+const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
+    const safe = String(value || '').trim();
+    if (!safe) return fallback;
+    const dictionary: Record<string, string> = {
+        continuation: 'Devam',
+        reclaim: 'Geri Alım',
+        exhaustion: 'Tükeniş',
+        recovery: 'Toparlanma',
+        neutral_fallback: 'Dengeli',
+        strong: 'Güçlü',
+        good: 'İyi',
+        neutral: 'Nötr',
+        weak: 'Zayıf',
+        runner: 'Runner',
+        chop: 'Yatay',
+        fast_fail: 'Hızlı Red',
+        mean_revert: 'Geri Dönüş',
+        snapshot: 'Snapshot',
+        approx_ohlcv: 'Yaklaşık OHLCV',
+    };
+    const normalized = safe.toLowerCase();
+    if (dictionary[normalized]) return dictionary[normalized];
+    return safe
+        .replace(/[_-]+/g, ' ')
+        .trim()
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+};
 
-export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
+const getExpectancyTone = (value: string): string => {
+    switch (String(value || '').toUpperCase()) {
+        case 'STRONG':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'GOOD':
+            return 'bg-lime-500/15 text-lime-300 border border-lime-500/25';
+        case 'WEAK':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+const getArchetypeTone = (value: string): string => {
+    switch (String(value || '').toLowerCase()) {
+        case 'continuation':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'reclaim':
+            return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
+        case 'exhaustion':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        case 'recovery':
+            return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+export const PerformanceDashboard: React.FC<Props> = ({ apiUrl, trades = [] }) => {
     const [summary, setSummary] = useState<any>(null);
     const [dailyPnl, setDailyPnl] = useState<DailyPnL[]>([]);
     const [coinStats, setCoinStats] = useState<any>(null);
@@ -116,6 +173,70 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
     const avgWin = toNum(summary?.avgWin);
     const avgLoss = toNum(summary?.avgLoss);
     const expectancy = (winRate * avgWin) + ((1 - winRate) * avgLoss);
+    const recentTrades = Array.isArray(trades) ? trades.slice(0, 80) : [];
+    const decisionViews = recentTrades.map((trade) => {
+        const signalSnapshot = trade.signalSnapshot && typeof trade.signalSnapshot === 'object' ? trade.signalSnapshot : {};
+        const closeSnapshot = trade.closeSnapshot && typeof trade.closeSnapshot === 'object' ? trade.closeSnapshot : {};
+        const decisionContext = trade.decisionContext && typeof trade.decisionContext === 'object'
+            ? trade.decisionContext
+            : (signalSnapshot as any).decisionContext || {};
+        const reason = String(trade.reason || trade.closeReason || '');
+        const entryArchetype = String(trade.entryArchetype || (signalSnapshot as any).entryArchetype || decisionContext.entryArchetype || '');
+        const expectancyBand = String(trade.expectancyBand || (signalSnapshot as any).expectancyBand || '');
+        const holdProfile = String(trade.holdProfile || (signalSnapshot as any).holdProfile || '');
+        const replayFidelity = String(trade.replayFidelity || (signalSnapshot as any).replayFidelity || '');
+        const reasonOwner = String(trade.reasonOwner || decisionContext.exitOwnerProfile || '');
+        const peakRoi = Math.max(
+            toNum((closeSnapshot as any).runtimeProfitPeakRoiPct ?? (closeSnapshot as any).profitPeakRoiPct, 0),
+            Math.max(toNum(trade.pnlPercent, 0), 0),
+        );
+        const realizedRoi = toNum(trade.pnlPercent, 0);
+        const captureRatio = peakRoi > 0 && realizedRoi > 0 ? realizedRoi / peakRoi : null;
+        return {
+            reason,
+            entryArchetype,
+            expectancyBand,
+            holdProfile,
+            replayFidelity,
+            reasonOwner,
+            captureRatio,
+            win: realizedRoi > 0,
+        };
+    });
+    const captureValues = decisionViews
+        .map((trade) => trade.captureRatio)
+        .filter((value): value is number => value !== null && Number.isFinite(value));
+    const avgCaptureRatio = captureValues.length > 0
+        ? captureValues.reduce((sum, value) => sum + value, 0) / captureValues.length
+        : 0;
+    const preStopReduceCount = decisionViews.filter((trade) => trade.reason.toUpperCase().includes('PRE_STOP_REDUCE')).length;
+    const sidewaysReclaimCount = decisionViews.filter((trade) => {
+        const reason = trade.reason.toUpperCase();
+        return reason.includes('SIDEWAYS_RECLAIM_CLOSE') || reason.includes('RECLAIM_BE_CLOSE');
+    }).length;
+    const snapshotReadyCount = decisionViews.filter((trade) => trade.replayFidelity.toLowerCase().includes('snapshot')).length;
+    const approxCount = decisionViews.filter((trade) => trade.replayFidelity && !trade.replayFidelity.toLowerCase().includes('snapshot')).length;
+    const archetypeCounts = decisionViews.reduce<Record<string, number>>((acc, trade) => {
+        const key = trade.entryArchetype || 'neutral_fallback';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+    }, {});
+    const expectancyBandCounts = decisionViews.reduce<Record<string, { count: number; wins: number }>>((acc, trade) => {
+        const key = trade.expectancyBand || 'NEUTRAL';
+        const bucket = acc[key] || { count: 0, wins: 0 };
+        bucket.count += 1;
+        if (trade.win) bucket.wins += 1;
+        acc[key] = bucket;
+        return acc;
+    }, {});
+    const ownerCounts = decisionViews.reduce<Record<string, number>>((acc, trade) => {
+        const key = trade.reasonOwner || 'balanced';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+    }, {});
+    const topArchetypes = Object.entries(archetypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 4);
+    const topOwners = Object.entries(ownerCounts).sort((a, b) => b[1] - a[1]).slice(0, 4);
+    const expectancyBreakdown = Object.entries(expectancyBandCounts).sort((a, b) => b[1].count - a[1].count);
 
     return (
         <div className="space-y-6">
@@ -394,6 +515,87 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl }) => {
                         ))}
                 </div>
             </div>
+
+            {decisionViews.length > 0 && (
+                <div className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-slate-700/50 rounded-2xl p-4 sm:p-6 backdrop-blur-sm">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                        <div>
+                            <h3 className="text-lg font-bold text-white">Karar Kalitesi</h3>
+                            <p className="text-xs text-slate-500">Son {decisionViews.length} trade üzerinden replay ve owner görünümü</p>
+                        </div>
+                        <div className="text-xs text-slate-400">
+                            Snapshot {snapshotReadyCount} • Approx {approxCount}
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-3">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500">Peak Capture</div>
+                            <div className={`mt-1 text-lg font-bold ${avgCaptureRatio >= 0.65 ? 'text-emerald-400' : avgCaptureRatio >= 0.45 ? 'text-amber-300' : 'text-rose-400'}`}>
+                                {(avgCaptureRatio * 100).toFixed(0)}%
+                            </div>
+                            <div className="text-[10px] text-slate-400">Realized / peak oranı</div>
+                        </div>
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-3">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500">PRE_STOP</div>
+                            <div className="mt-1 text-lg font-bold text-amber-300">{preStopReduceCount}</div>
+                            <div className="text-[10px] text-slate-400">Erken reduce kapanışı</div>
+                        </div>
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-3">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500">BE / Reclaim</div>
+                            <div className="mt-1 text-lg font-bold text-cyan-300">{sidewaysReclaimCount}</div>
+                            <div className="text-[10px] text-slate-400">Korunan yatay çıkış</div>
+                        </div>
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/60 p-3">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500">Replay Hazır</div>
+                            <div className="mt-1 text-lg font-bold text-violet-300">{snapshotReadyCount}/{decisionViews.length}</div>
+                            <div className="text-[10px] text-slate-400">Snapshot fidelity</div>
+                        </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-4 xl:grid-cols-3">
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/50 p-4">
+                            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Archetype Dağılımı</div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                                {topArchetypes.map(([archetype, count]) => (
+                                    <div key={archetype} className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${getArchetypeTone(archetype)}`}>
+                                        {humanizeDecisionToken(archetype)} · {count}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/50 p-4">
+                            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Expectancy Band</div>
+                            <div className="mt-3 space-y-2">
+                                {expectancyBreakdown.map(([band, value]) => (
+                                    <div key={band} className="flex items-center justify-between gap-3">
+                                        <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${getExpectancyTone(band)}`}>
+                                            {humanizeDecisionToken(band)}
+                                        </span>
+                                        <div className="text-right text-[10px] text-slate-400">
+                                            <div>{value.count} trade</div>
+                                            <div className="text-slate-500">WR %{value.count > 0 ? ((value.wins / value.count) * 100).toFixed(0) : '0'}</div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="rounded-xl border border-slate-700/60 bg-slate-900/50 p-4">
+                            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Çıkış Owner Mix</div>
+                            <div className="mt-3 space-y-2">
+                                {topOwners.map(([owner, count]) => (
+                                    <div key={owner} className="flex items-center justify-between gap-3 text-[10px]">
+                                        <span className="text-slate-300">{humanizeDecisionToken(owner)}</span>
+                                        <span className="rounded-full bg-slate-800 px-2 py-1 font-semibold text-slate-300">{count}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Blocked Coins */}
             {coinStats?.blocked_coins?.length > 0 && (

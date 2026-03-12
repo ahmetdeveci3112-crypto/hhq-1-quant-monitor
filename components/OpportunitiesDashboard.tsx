@@ -31,6 +31,85 @@ const getCoinIcon = (symbol: string): string => {
     return `https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/${base}.png`;
 };
 
+const humanizeDecisionToken = (value: string | null | undefined, fallback: string = '—'): string => {
+    const safe = String(value || '').trim();
+    if (!safe) return fallback;
+    const dictionary: Record<string, string> = {
+        continuation: 'Devam',
+        reclaim: 'Geri Alım',
+        exhaustion: 'Tükeniş',
+        recovery: 'Toparlanma',
+        neutral_fallback: 'Dengeli',
+        strong: 'Güçlü',
+        good: 'İyi',
+        neutral: 'Nötr',
+        weak: 'Zayıf',
+        runner: 'Runner',
+        chop: 'Yatay',
+        fast_fail: 'Hızlı Red',
+        mean_revert: 'Geri Dönüş',
+        snapshot: 'Snapshot',
+        approx: 'Yaklaşık',
+        approx_ohlcv: 'Yaklaşık OHLCV',
+    };
+    const normalized = safe.toLowerCase();
+    if (dictionary[normalized]) return dictionary[normalized];
+    return safe
+        .replace(/[_-]+/g, ' ')
+        .trim()
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
+const getArchetypeTone = (value: string): string => {
+    switch (String(value || '').toLowerCase()) {
+        case 'continuation':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'reclaim':
+            return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
+        case 'exhaustion':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        case 'recovery':
+            return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+const getExpectancyTone = (value: string): string => {
+    switch (String(value || '').toUpperCase()) {
+        case 'STRONG':
+            return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+        case 'GOOD':
+            return 'bg-lime-500/15 text-lime-300 border border-lime-500/25';
+        case 'WEAK':
+            return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
+        default:
+            return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+    }
+};
+
+const getOpportunityDecisionSummary = (coin: CoinOpportunity) => {
+    const decisionContext = coin.decisionContext && typeof coin.decisionContext === 'object' ? coin.decisionContext : {};
+    const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object'
+        ? decisionContext.indicatorPolicy
+        : {};
+    const expectancy = coin.expectancy && typeof coin.expectancy === 'object' ? coin.expectancy : {};
+    const rankingScoreRaw = Number(expectancy.rankingScore ?? coin.expectancyRankingScore ?? 0);
+
+    return {
+        entryArchetype: String(coin.entryArchetype || decisionContext.entryArchetype || ''),
+        expectancyBand: String(coin.expectancyBand || expectancy.expectancyBand || ''),
+        regimeBucket: String(decisionContext.regimeBucket || ''),
+        holdProfile: String(coin.holdProfile || expectancy.holdProfile || ''),
+        runnerContextResolved: String(coin.runnerContextResolved || ''),
+        replayFidelity: String(coin.replayFidelity || ''),
+        primaryOwner: Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
+            ? humanizeDecisionToken(indicatorPolicy.primary[0])
+            : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', ''),
+        rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
+    };
+};
+
 // Phase UI-Redesign: Enhanced CoinCard with "neden burada?" badge and "sonraki adım" text
 const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const isLong = coin.signalAction === 'LONG';
@@ -45,6 +124,7 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
         ? [getReasonTooltip(rawReason), `Kod: ${rawReason}`].filter(Boolean).join('\n')
         : '';
     const nextStep = getNextStep(coin);
+    const decisionSummary = getOpportunityDecisionSummary(coin);
 
     const borderColor = isLong
         ? 'border-emerald-500/50'
@@ -137,6 +217,60 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
                 </div>
             )}
 
+            {(decisionSummary.entryArchetype || decisionSummary.expectancyBand || decisionSummary.primaryOwner) && (
+                <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Karar motoru</div>
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {decisionSummary.entryArchetype && (
+                            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${getArchetypeTone(decisionSummary.entryArchetype)}`}>
+                                {humanizeDecisionToken(decisionSummary.entryArchetype)}
+                            </span>
+                        )}
+                        {decisionSummary.expectancyBand && (
+                            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${getExpectancyTone(decisionSummary.expectancyBand)}`}>
+                                {humanizeDecisionToken(decisionSummary.expectancyBand)}
+                            </span>
+                        )}
+                        {decisionSummary.regimeBucket && (
+                            <span className="rounded-full border border-slate-700/60 bg-slate-800/80 px-2 py-1 text-[10px] font-semibold text-slate-300">
+                                {humanizeDecisionToken(decisionSummary.regimeBucket)}
+                            </span>
+                        )}
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
+                        {decisionSummary.primaryOwner && (
+                            <div>
+                                <div className="text-slate-500">Owner</div>
+                                <div className="font-medium text-slate-200">{decisionSummary.primaryOwner}</div>
+                            </div>
+                        )}
+                        {decisionSummary.rankingScore !== null && (
+                            <div>
+                                <div className="text-slate-500">Rank</div>
+                                <div className="font-mono text-slate-200">{decisionSummary.rankingScore.toFixed(1)}</div>
+                            </div>
+                        )}
+                        {decisionSummary.holdProfile && (
+                            <div>
+                                <div className="text-slate-500">Tutuş</div>
+                                <div className="font-medium text-slate-200">{humanizeDecisionToken(decisionSummary.holdProfile)}</div>
+                            </div>
+                        )}
+                        {decisionSummary.runnerContextResolved && (
+                            <div>
+                                <div className="text-slate-500">Runner</div>
+                                <div className="font-medium text-slate-200">{humanizeDecisionToken(decisionSummary.runnerContextResolved)}</div>
+                            </div>
+                        )}
+                    </div>
+                    {decisionSummary.replayFidelity && (
+                        <div className="mt-2 text-[10px] text-slate-500">
+                            Replay: {humanizeDecisionToken(decisionSummary.replayFidelity)}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Phase UI-Redesign: "Neden Burada?" reason badge */}
             {reasonInfo && reasonStyle && (
                 <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
@@ -162,6 +296,7 @@ const CoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
 
 const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     const nextStep = getNextStep(coin);
+    const decisionSummary = getOpportunityDecisionSummary(coin);
 
     return (
         <div className="rounded-xl border border-slate-800 bg-[#10151d] px-4 py-3 transition-colors hover:border-slate-700 hover:bg-slate-900/70">
@@ -205,6 +340,28 @@ const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
             <div className="mt-2 text-[10px] text-slate-500 italic">
                 ↳ {nextStep}
             </div>
+
+            {(decisionSummary.entryArchetype || decisionSummary.expectancyBand || decisionSummary.primaryOwner) && (
+                <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500">Hazırlık</div>
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {decisionSummary.entryArchetype && (
+                            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${getArchetypeTone(decisionSummary.entryArchetype)}`}>
+                                {humanizeDecisionToken(decisionSummary.entryArchetype)}
+                            </span>
+                        )}
+                        {decisionSummary.expectancyBand && (
+                            <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${getExpectancyTone(decisionSummary.expectancyBand)}`}>
+                                {humanizeDecisionToken(decisionSummary.expectancyBand)}
+                            </span>
+                        )}
+                    </div>
+                    <div className="mt-2 text-[10px] text-slate-400">
+                        {decisionSummary.primaryOwner ? `Owner: ${decisionSummary.primaryOwner}` : 'Owner bekleniyor'}
+                        {decisionSummary.regimeBucket ? ` • ${humanizeDecisionToken(decisionSummary.regimeBucket)}` : ''}
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
