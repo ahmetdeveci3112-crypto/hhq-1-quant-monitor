@@ -198,6 +198,13 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Reduce', value: String(report.reduce_count || 0) },
             { label: 'Partial', value: String(report.partial_count || 0) },
             { label: 'Giveback', value: formatPct(report.giveback) },
+            { label: 'Thesis', value: humanizeToken(trade.positionThesisState, '—') },
+            { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
+            {
+                label: 'Re-entry',
+                value: trade.postExitReentryTriggered ? 'Tetiklendi' : 'Yok',
+                tone: trade.postExitReentryTriggered ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60',
+            },
             { label: 'Entry Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Yön Değişti', value: report.side_changed ? 'Evet' : 'Hayır', tone: report.side_changed ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Owner Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
@@ -491,7 +498,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                     </div>
                                     <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
                                         <div className="text-xs uppercase tracking-wide text-slate-500">Trade Özeti</div>
-                                        <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                                        <div className="mt-3 grid grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
                                             <div>
                                                 <div className="text-slate-500 text-xs">Owner</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reasonOwner)}</div>
@@ -507,6 +514,34 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             <div>
                                                 <div className="text-slate-500 text-xs">Runner</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runnerContextResolved)}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Thesis</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionThesisState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Rescue</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reclaimRescueReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Profit Hold</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.profitContinuationHoldReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Post-Exit Watch</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Triggered</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.postExitReentryTriggered ? 'Evet' : 'Hayır'}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitReentryReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Outcome</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.postExitReentryOutcome || '—'}</div>
                                             </div>
                                         </div>
                                     </div>
@@ -524,9 +559,9 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
                                                     ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved']),
-                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'continuationFlowState', 'underwaterTapeState']),
-                                                ].slice(0, 8);
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
+                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'rescueReason', 'profitHoldReason']),
+                                                ].slice(0, 12);
                                                 return (
                                                     <details
                                                         key={snapshot.snapshotId}

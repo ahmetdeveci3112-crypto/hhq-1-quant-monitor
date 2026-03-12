@@ -90,6 +90,7 @@ SYNC_DB_META_TIME_DRIFT_MS = int(float(os.environ.get("SYNC_DB_META_TIME_DRIFT_M
 SLIPPAGE_EXIT_TICK_TOLERANCE = max(1, int(os.environ.get("SLIPPAGE_EXIT_TICK_TOLERANCE", "2")))
 SLIPPAGE_EXIT_FALLBACK_BPS = max(0.1, float(os.environ.get("SLIPPAGE_EXIT_FALLBACK_BPS", "2.0")))
 SLIPPAGE_EXIT_MAX_VALID_TICK_BPS = max(0.5, float(os.environ.get("SLIPPAGE_EXIT_MAX_VALID_TICK_BPS", "10.0")))
+V3_THESIS_REVALIDATION_MODE = str(os.environ.get("V3_THESIS_REVALIDATION_MODE", "apply") or "apply").strip().lower()
 
 
 def _reason_group_from_reason(reason: str) -> str:
@@ -4183,6 +4184,13 @@ class LiveBinanceTrader:
                         # Phase 212: Duplicate Emergency SL removed — pre-guard version handles this
                         # (See L1527-1557 above)
                         if should_close:
+                            if maybe_defer_v3_profit_exit(
+                                fallback_profit_pos,
+                                current_price=candle_close_price,
+                                profit_ladder=fallback_profit_ladder,
+                                note='live_trail_fallback',
+                            ):
+                                continue
                             logger.warning(f"🔴 LIVE TRAIL EXIT: {symbol} {side} | {close_reason}")
                             logger.warning(f"   📊 ROI: {pnl_percent:.1f}% | PnL: ${unrealized_pnl:.2f}")
                             
@@ -14564,6 +14572,7 @@ V3_RUNNER_CONTEXT_TREND = "trend_aligned"
 V3_RUNNER_CONTEXT_COUNTER = "countertrend"
 V3_RUNNER_CONTEXT_RECOVERY = "recovery"
 V3_RUNNER_CONTEXT_INTRADAY = "intraday_continuation"
+V3_RUNNER_CONTEXT_CONTINUATION_RESCUE = "continuation_rescue"
 V3_CONTINUATION_SUPPORTING = "SUPPORTING"
 V3_CONTINUATION_FADING = "FADING"
 V3_CONTINUATION_CHOP = "CHOP"
@@ -14587,6 +14596,36 @@ DECISION_EXPECTANCY_BAND_GOOD = "GOOD"
 DECISION_EXPECTANCY_BAND_NEUTRAL = "NEUTRAL"
 DECISION_EXPECTANCY_BAND_WEAK = "WEAK"
 DECISION_SNAPSHOT_SOURCE_VERSION = "decision_controller_v1"
+POSITION_THESIS_ENTRY = "ENTRY_THESIS"
+POSITION_THESIS_REVALIDATING = "REVALIDATING"
+POSITION_THESIS_CONTINUATION_RESCUE = "CONTINUATION_RESCUE"
+POSITION_THESIS_PROFIT_CONTINUATION_HOLD = "PROFIT_CONTINUATION_HOLD"
+POSITION_THESIS_EXIT_CONFIRMED = "EXIT_CONFIRMED"
+V3_RECLAIM_RESCUE_PERSISTENCE_SEC = 60.0
+V3_RECLAIM_RESCUE_HOLD_WINDOW_SEC = 180.0
+V3_PROFIT_HOLD_PERSISTENCE_SEC = 45.0
+V3_PROFIT_HOLD_WINDOW_SEC = 120.0
+V3_THESIS_EXEC_SCORE_FLOOR = 60.0
+V3_RESCUE_VOLUME_FLOOR = 1.15
+V3_PROFIT_HOLD_VOLUME_FLOOR = 1.10
+V3_THESIS_OBI_ALIGN_THRESHOLD = 2.0
+V3_POST_EXIT_REENTRY_MODE = str(os.environ.get('V3_POST_EXIT_REENTRY_MODE', 'full_apply') or 'full_apply').strip().lower()
+POST_EXIT_REENTRY_STATE_ARMED = "ARMED"
+POST_EXIT_REENTRY_STATE_CANDIDATE = "CANDIDATE"
+POST_EXIT_REENTRY_STATE_CONFIRMED = "CONFIRMED"
+POST_EXIT_REENTRY_STATE_EXPIRED = "EXPIRED"
+POST_EXIT_REENTRY_STATE_CANCELLED = "CANCELLED"
+V3_POST_EXIT_REENTRY_COOLDOWN_SEC = 90.0
+V3_POST_EXIT_REENTRY_WATCH_WINDOW_SEC = 600.0
+V3_POST_EXIT_REENTRY_PERSISTENCE_SEC = 60.0
+V3_POST_EXIT_REENTRY_CONFIRM_SCANS = 2
+V3_POST_EXIT_REENTRY_VOLUME_FLOOR = 1.20
+V3_POST_EXIT_REENTRY_EXEC_SCORE_FLOOR = 65.0
+V3_POST_EXIT_REENTRY_BREAKOUT_PCT = 0.002
+V3_POST_EXIT_REENTRY_ATR_BREAKOUT_MULT = 0.35
+V3_POST_EXIT_REENTRY_SIZE_CAP_MULT = 0.35
+V3_POST_EXIT_REENTRY_STOP_MULT = 0.80
+V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE = 70.0
 V3_RUNNER_CONTEXT_CONFIGS = {
     V3_RUNNER_CONTEXT_TREND: {
         "trail_act_mult": 1.55,
@@ -15473,12 +15512,29 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
     if not symbol:
         return False
     now_ms = int(datetime.now().timestamp() * 1000)
+    rescue_candidate = bool(
+        _coerce_float(safe_pos.get('_reclaimRescueCandidateSinceTs', 0.0), 0.0) > 0
+        or _coerce_float(safe_pos.get('reclaimRescueExpireTs', 0.0), 0.0) > (now_ms / 1000.0)
+    )
+    rescue_accepted = bool(_coerce_float(safe_pos.get('reclaimRescueArmedTs', 0.0), 0.0) > 0)
+    profit_hold_candidate = bool(
+        _coerce_float(safe_pos.get('_profitContinuationHoldCandidateSinceTs', 0.0), 0.0) > 0
+        or _coerce_float(safe_pos.get('profitContinuationHoldExpireTs', 0.0), 0.0) > (now_ms / 1000.0)
+    )
+    profit_hold_accepted = bool(_coerce_float(safe_pos.get('profitContinuationHoldArmedTs', 0.0), 0.0) > 0)
     state_key = "|".join([
         str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
+        str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY),
         str(safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
         str(safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
         str(safe_pos.get('lastExitDecision', '') or ''),
         str(safe_pos.get('lossGateSuppressedReason', '') or ''),
+        str(rescue_candidate),
+        str(rescue_accepted),
+        str(profit_hold_candidate),
+        str(profit_hold_accepted),
+        str(safe_pos.get('reclaimRescueReason', '') or ''),
+        str(safe_pos.get('profitContinuationHoldReason', '') or ''),
     ])
     last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
     last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
@@ -15505,15 +15561,295 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'directionOwner': str(decision_context.get('directionOwner', safe_pos.get('directionOwner', '')) or ''),
             'exitOwner': str(safe_pos.get('exitOwner', '') or ''),
             'runnerContextResolved': str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
+            'positionThesisState': str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY),
+            'rescueCandidate': rescue_candidate,
+            'rescueAccepted': rescue_accepted,
+            'profitHoldCandidate': profit_hold_candidate,
+            'profitHoldAccepted': profit_hold_accepted,
         },
         outcome={
             'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
             'continuationFlowState': str(safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
             'underwaterTapeState': str(safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL),
+            'thesisState': str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY),
+            'rescueReason': str(safe_pos.get('reclaimRescueReason', '') or ''),
+            'profitHoldReason': str(safe_pos.get('profitContinuationHoldReason', '') or ''),
+            'rescueConfidence': round(_coerce_float(safe_pos.get('reclaimRescueConfidence', 0.0), 0.0), 4),
+            'profitHoldConfidence': round(_coerce_float(safe_pos.get('profitContinuationHoldConfidence', 0.0), 0.0), 4),
         },
         created_ts=now_ms,
     )
     return True
+
+
+def _is_v3_post_exit_reentry_enabled() -> bool:
+    return str(V3_POST_EXIT_REENTRY_MODE or "full_apply").strip().lower() != "off"
+
+
+def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None, signal: dict = None) -> dict:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    safe_opp = opportunity if isinstance(opportunity, dict) else {}
+    safe_signal = signal if isinstance(signal, dict) else {}
+    merged = {
+        'symbol': safe_watch.get('symbol', ''),
+        'side': safe_watch.get('side', ''),
+        'strategyMode': STRATEGY_MODE_SMART_V3_RUNNER,
+        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'runnerContextResolved': safe_watch.get('runnerContextResolved', ''),
+        'reentryOriginTradeId': safe_watch.get('originalTradeId', ''),
+        'reentryOriginExitReason': safe_watch.get('exitReason', ''),
+        'reentryWatcherId': safe_watch.get('watcherId', ''),
+        'signalScore': safe_watch.get('originalSignalScore', 0.0),
+        'currentVolumeRatio': safe_watch.get('currentVolumeRatio', 0.0),
+        'currentIsVolumeSpike': safe_watch.get('currentIsVolumeSpike', False),
+        'currentObImbalanceTrend': safe_watch.get('currentObImbalanceTrend', 0.0),
+        'currentImbalance': safe_watch.get('currentImbalance', 0.0),
+        'currentExecScore': safe_watch.get('currentExecScore', 0.0),
+        'continuationFlowState': safe_watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
+        'signalAction': safe_watch.get('side', ''),
+        'signalPrice': safe_watch.get('exitPrice', 0.0),
+        'entryPrice': safe_watch.get('entryPrice', 0.0),
+        'price': safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)),
+        'signalScoreRaw': safe_watch.get('originalSignalScore', 0.0),
+        'expectancyBand': safe_watch.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL),
+        'expectancyRankingScore': safe_watch.get('expectancyRankingScore', 0.0),
+    }
+    if safe_opp:
+        merged.update({
+            'price': safe_opp.get('price', merged.get('price', 0.0)),
+            'signalAction': safe_opp.get('signalAction', merged.get('signalAction', '')),
+            'signalScore': safe_opp.get('signalScore', merged.get('signalScore', 0.0)),
+            'currentVolumeRatio': safe_opp.get('volumeRatio', merged.get('currentVolumeRatio', 0.0)),
+            'currentIsVolumeSpike': safe_opp.get('isVolumeSpike', merged.get('currentIsVolumeSpike', False)),
+            'currentObImbalanceTrend': safe_opp.get('obImbalanceTrend', merged.get('currentObImbalanceTrend', 0.0)),
+            'currentImbalance': safe_opp.get('imbalance', merged.get('currentImbalance', 0.0)),
+            'currentExecScore': safe_opp.get('currentExecScore', safe_opp.get('entryExecScore', merged.get('currentExecScore', 0.0))),
+            'continuationFlowState': safe_opp.get('continuationFlowState', merged.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)),
+            'atr': safe_opp.get('atr', safe_watch.get('atr', 0.0)),
+            'atrPct': safe_opp.get('atrPct', safe_opp.get('volatility_pct', 0.0)),
+            'breakout': safe_opp.get('breakout', ''),
+        })
+    if safe_signal:
+        merged.update({
+            'signalAction': safe_signal.get('action', merged.get('signalAction', '')),
+            'signalScore': safe_signal.get('confidenceScore', merged.get('signalScore', 0.0)),
+            'signalScoreRaw': safe_signal.get('_rawConfidenceScore', merged.get('signalScoreRaw', merged.get('signalScore', 0.0))),
+            'entryArchetype': safe_signal.get('entryArchetype', merged.get('entryArchetype', ENTRY_ARCHETYPE_CONTINUATION)),
+            'runnerContextResolved': safe_signal.get('runnerContextResolved', merged.get('runnerContextResolved', '')),
+            'directionOwner': safe_signal.get('directionOwner', ''),
+            'directionConfidence': safe_signal.get('directionConfidence', 0.0),
+            'directionReason': safe_signal.get('directionReason', ''),
+            'expectancyBand': safe_signal.get('expectancyBand', merged.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)),
+            'expectancyRankingScore': safe_signal.get('expectancyRankingScore', merged.get('expectancyRankingScore', 0.0)),
+        })
+    return _compact_decision_inputs(merged)
+
+
+def queue_post_exit_reentry_watch_snapshot(
+    watch: dict,
+    *,
+    reason: str,
+    opportunity: Optional[dict] = None,
+    signal: Optional[dict] = None,
+) -> bool:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    symbol = str(safe_watch.get('symbol', '') or '').upper()
+    if not symbol:
+        return False
+    created_ts = int(datetime.now().timestamp() * 1000)
+    context = safe_watch.get('decisionContext', {}) if isinstance(safe_watch.get('decisionContext'), dict) else {}
+    inputs = _build_post_exit_reentry_watch_inputs(safe_watch, opportunity, signal)
+    decision = {
+        'reason': str(reason or ''),
+        'side': str(safe_watch.get('side', '') or ''),
+        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'runnerContextResolved': str(safe_watch.get('runnerContextResolved', '') or ''),
+        'watchState': str(safe_watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
+        'reentryOriginTradeId': str(safe_watch.get('originalTradeId', '') or ''),
+        'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
+        'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
+        'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
+    }
+    outcome = {
+        'watchState': str(safe_watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
+        'cancelReason': str(safe_watch.get('cancelReason', '') or ''),
+        'candidateAccepted': bool(safe_watch.get('watchState') == POST_EXIT_REENTRY_STATE_CANDIDATE),
+        'confirmCount': int(safe_watch.get('confirmCount', 0) or 0),
+        'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
+        'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
+        'reentryPendingEntryId': str(safe_watch.get('reentryPendingEntryId', '') or ''),
+        'reentryPositionId': str(safe_watch.get('reentryPositionId', '') or ''),
+        'continuationFlowState': str(safe_watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL),
+        'currentVolumeRatio': round(_coerce_float(safe_watch.get('currentVolumeRatio', 0.0), 0.0), 4),
+        'currentObImbalanceTrend': round(_coerce_float(safe_watch.get('currentObImbalanceTrend', 0.0), 0.0), 4),
+        'currentExecScore': round(_coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0), 4),
+        'breakoutDistancePrice': round(_coerce_float(safe_watch.get('breakoutDistancePrice', 0.0), 0.0), 8),
+    }
+    queue_decision_snapshot(
+        stage='post_exit_reentry_watch',
+        symbol=symbol,
+        signal_id=str(safe_watch.get('signalId', '') or ''),
+        trade_id=str(safe_watch.get('originalTradeId', '') or ''),
+        position_id=str(safe_watch.get('positionId', '') or ''),
+        context=context,
+        inputs=inputs,
+        decision=decision,
+        outcome=outcome,
+        created_ts=created_ts,
+    )
+    return True
+
+
+def _has_symbol_exposure(symbol: str) -> bool:
+    safe_symbol = str(symbol or '').upper()
+    if not safe_symbol or 'global_paper_trader' not in globals() or not global_paper_trader:
+        return False
+    if any(str(pos.get('symbol', '') or '').upper() == safe_symbol for pos in getattr(global_paper_trader, 'positions', [])):
+        return True
+    return any(str(order.get('symbol', '') or '').upper() == safe_symbol for order in getattr(global_paper_trader, 'pending_orders', []))
+
+
+def _is_symbol_close_pending(symbol: str) -> bool:
+    safe_symbol = str(symbol or '').upper()
+    if not safe_symbol:
+        return False
+    pending = pending_close_reasons if isinstance(globals().get('pending_close_reasons'), dict) else {}
+    return safe_symbol in pending
+
+
+def build_post_exit_reentry_watchers_summary(now_ts: Optional[float] = None) -> dict:
+    now_ts = float(now_ts or time.time())
+    watchers = post_exit_reentry_watchers if isinstance(globals().get('post_exit_reentry_watchers'), dict) else {}
+    items = []
+    counts = {
+        'active': 0,
+        'candidate': 0,
+        'confirmed': 0,
+        'triggered': 0,
+    }
+    for symbol, watch in watchers.items():
+        if not isinstance(watch, dict):
+            continue
+        state = str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED)
+        expires_in = max(0.0, _coerce_float(watch.get('watchExpiresTs', 0.0), 0.0) - now_ts)
+        items.append({
+            'watcherId': str(watch.get('watcherId', '') or ''),
+            'symbol': symbol,
+            'side': str(watch.get('side', '') or ''),
+            'watchState': state,
+            'exitReason': str(watch.get('exitReason', '') or ''),
+            'candidateSinceTs': _coerce_float(watch.get('candidateSinceTs', 0.0), 0.0),
+            'confirmCount': int(watch.get('confirmCount', 0) or 0),
+            'reentryTriggered': bool(watch.get('reentryTriggered', False)),
+            'cancelReason': str(watch.get('cancelReason', '') or ''),
+            'expiresInSec': round(expires_in, 1),
+        })
+        if state in (POST_EXIT_REENTRY_STATE_ARMED, POST_EXIT_REENTRY_STATE_CANDIDATE):
+            counts['active'] += 1
+        if state == POST_EXIT_REENTRY_STATE_CANDIDATE:
+            counts['candidate'] += 1
+        if state == POST_EXIT_REENTRY_STATE_CONFIRMED:
+            counts['confirmed'] += 1
+        if bool(watch.get('reentryTriggered', False)):
+            counts['triggered'] += 1
+    items.sort(key=lambda item: item.get('expiresInSec', 0.0))
+    return {
+        **counts,
+        'items': items[:12],
+    }
+
+
+def register_post_exit_reentry_watch(
+    pos: dict,
+    trade: dict,
+    *,
+    original_reason: str = '',
+    normalized_reason: str = '',
+    exit_price: float = 0.0,
+) -> Optional[dict]:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    safe_trade = trade if isinstance(trade, dict) else {}
+    if not _is_v3_post_exit_reentry_enabled():
+        return None
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return None
+    symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
+    if not symbol:
+        return None
+    if _has_symbol_exposure(symbol):
+        return None
+    reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
+    if reason_core not in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE'):
+        return None
+    entry_archetype = str(safe_pos.get('entryArchetype', safe_trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM).lower()
+    if entry_archetype != ENTRY_ARCHETYPE_RECLAIM:
+        return None
+    runner_context_resolved = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
+    if runner_context_resolved not in (V3_RUNNER_CONTEXT_COUNTER, V3_RUNNER_CONTEXT_CONTINUATION_RESCUE, ''):
+        return None
+    existing_watch = post_exit_reentry_watchers.get(symbol)
+    if isinstance(existing_watch, dict):
+        existing_watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
+        existing_watch['cancelReason'] = 'REPLACED_BY_NEW_EXIT'
+        queue_post_exit_reentry_watch_snapshot(existing_watch, reason='replaced')
+    now_ts = time.time()
+    watcher_id = f"PEW_{symbol}_{int(now_ts * 1000)}"
+    signal_snapshot = safe_trade.get('signalSnapshot', safe_pos.get('signal_snapshot', {}))
+    if not isinstance(signal_snapshot, dict):
+        signal_snapshot = {}
+    expectancy = signal_snapshot.get('expectancy', safe_pos.get('expectancy', {}))
+    if not isinstance(expectancy, dict):
+        expectancy = {}
+    watch = {
+        'watcherId': watcher_id,
+        'symbol': symbol,
+        'signalId': str(safe_trade.get('signalId', safe_pos.get('signalId', safe_pos.get('signal_id', ''))) or ''),
+        'positionId': str(safe_trade.get('positionId', safe_pos.get('id', '')) or safe_pos.get('id', '')),
+        'originalTradeId': str(safe_trade.get('tradeId', safe_trade.get('id', safe_pos.get('id', ''))) or safe_pos.get('id', '')),
+        'side': str(safe_pos.get('side', safe_trade.get('side', 'LONG')) or 'LONG').upper(),
+        'exitTs': now_ts,
+        'exitPrice': _coerce_float(exit_price or safe_trade.get('exitPrice', 0.0), 0.0),
+        'entryPrice': _coerce_float(safe_pos.get('entryPrice', safe_trade.get('entryPrice', 0.0)), 0.0),
+        'atr': _coerce_float(safe_pos.get('atr', safe_trade.get('atr', 0.0)), 0.0),
+        'exitReason': reason_core,
+        'entryArchetype': entry_archetype,
+        'runnerContextResolved': runner_context_resolved,
+        'peakRoiPct': _coerce_float(
+            safe_pos.get('runtimeProfitPeakRoiPct', safe_trade.get('peakRoi', safe_trade.get('roi', 0.0))),
+            0.0,
+        ),
+        'watchState': POST_EXIT_REENTRY_STATE_ARMED,
+        'cooldownUntilTs': now_ts + V3_POST_EXIT_REENTRY_COOLDOWN_SEC,
+        'watchExpiresTs': now_ts + V3_POST_EXIT_REENTRY_WATCH_WINDOW_SEC,
+        'candidateSinceTs': 0.0,
+        'confirmCount': 0,
+        'reentryUsed': False,
+        'reentryTriggered': False,
+        'reentryTriggerReason': '',
+        'reentryPendingEntryId': '',
+        'reentryPositionId': '',
+        'cancelReason': '',
+        'decisionContext': signal_snapshot.get('decisionContext', safe_pos.get('decisionContext', {})),
+        'expectancyBand': str(expectancy.get('expectancyBand', safe_trade.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)) or DECISION_EXPECTANCY_BAND_NEUTRAL),
+        'expectancyRankingScore': _coerce_float(expectancy.get('rankingScore', safe_trade.get('expectancyRankingScore', 0.0)), 0.0),
+        'originalSignalScore': _coerce_float(safe_pos.get('signalScore', safe_trade.get('signalScore', 0.0)), 0.0),
+        'continuationFlowState': V3_CONTINUATION_NEUTRAL,
+        'currentVolumeRatio': 0.0,
+        'currentIsVolumeSpike': False,
+        'currentObImbalanceTrend': 0.0,
+        'currentImbalance': 0.0,
+        'currentExecScore': 0.0,
+        'lastPrice': _coerce_float(exit_price or safe_trade.get('exitPrice', 0.0), 0.0),
+        'breakoutDistancePrice': 0.0,
+    }
+    post_exit_reentry_watchers[symbol] = watch
+    queue_post_exit_reentry_watch_snapshot(watch, reason='armed')
+    logger.info(
+        f"🛰️ POST_EXIT_WATCH_ARMED: {symbol} {watch['side']} "
+        f"trade={watch['originalTradeId']} reason={reason_core} cooloff={V3_POST_EXIT_REENTRY_COOLDOWN_SEC:.0f}s "
+        f"ttl={V3_POST_EXIT_REENTRY_WATCH_WINDOW_SEC:.0f}s"
+    )
+    return watch
 
 
 def recompute_decision_snapshot_view(snapshot: dict, *, policy_version: str = 'candidate') -> dict:
@@ -15730,6 +16066,62 @@ def _normalize_replay_snapshot(snapshot: dict) -> dict:
     }
 
 
+def _extract_post_exit_reentry_watch_summary(snapshots: list) -> dict:
+    safe_snaps = [snap for snap in (snapshots or []) if isinstance(snap, dict)]
+    watch_snaps = [snap for snap in safe_snaps if str(snap.get('stage', '') or '') == 'post_exit_reentry_watch']
+    if not watch_snaps:
+        return {
+            'postExitWatchState': '',
+            'postExitReentryTriggered': False,
+            'postExitReentryReason': '',
+            'postExitReentryOutcome': '',
+            'postExitReentryTradeId': '',
+        }
+
+    latest = max(watch_snaps, key=lambda snap: int(snap.get('createdTs', snap.get('created_ts', 0)) or 0))
+    latest_decision = latest.get('decision') if isinstance(latest.get('decision'), dict) else {}
+    latest_outcome = latest.get('outcome') if isinstance(latest.get('outcome'), dict) else {}
+    watch_state = str(
+        latest_outcome.get('watchState', latest_decision.get('watchState', POST_EXIT_REENTRY_STATE_ARMED))
+        or POST_EXIT_REENTRY_STATE_ARMED
+    )
+    triggered = any(
+        bool((snap.get('outcome') if isinstance(snap.get('outcome'), dict) else {}).get('reentryTriggered', False))
+        for snap in watch_snaps
+    )
+    trigger_reason = str(latest_outcome.get('reentryTriggerReason', latest_decision.get('reentryTriggerReason', '')) or '')
+    cancel_reason = str(latest_outcome.get('cancelReason', '') or '')
+    reason = trigger_reason or cancel_reason or str(latest_decision.get('reason', '') or '')
+    outcome = 'TRIGGERED' if triggered else (cancel_reason or watch_state or '')
+    return {
+        'postExitWatchState': watch_state,
+        'postExitReentryTriggered': triggered,
+        'postExitReentryReason': reason,
+        'postExitReentryOutcome': outcome,
+        'postExitReentryTradeId': '',
+    }
+
+
+def _find_post_exit_reentry_trade(trades: list, origin_trade_id: str) -> Optional[dict]:
+    safe_origin = str(origin_trade_id or '').strip()
+    if not safe_origin:
+        return None
+    for trade in trades or []:
+        if not isinstance(trade, dict):
+            continue
+        signal_snapshot = trade.get('signalSnapshot')
+        if not isinstance(signal_snapshot, dict):
+            signal_snapshot = _json_loads_safe(trade.get('signal_snapshot_json', '{}'), {})
+        if bool(trade.get('isPostExitReentry', False) or signal_snapshot.get('isPostExitReentry', False)):
+            candidate_origin = str(
+                trade.get('reentryOriginTradeId', signal_snapshot.get('reentryOriginTradeId', ''))
+                or signal_snapshot.get('reentryOriginTradeId', '')
+            ).strip()
+            if candidate_origin == safe_origin:
+                return trade
+    return None
+
+
 def _build_replay_trade_summary(trade: dict) -> dict:
     safe_trade = trade if isinstance(trade, dict) else {}
     signal_snapshot = safe_trade.get('signalSnapshot', {}) if isinstance(safe_trade.get('signalSnapshot'), dict) else {}
@@ -15766,6 +16158,14 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'replayFidelity': replay_fidelity,
         'strategyMode': str(safe_trade.get('strategyMode', signal_snapshot.get('strategyMode', STRATEGY_MODE_LEGACY)) or STRATEGY_MODE_LEGACY),
         'runnerContextResolved': str(safe_trade.get('runnerContextResolved', signal_snapshot.get('runnerContextResolved', '')) or ''),
+        'positionThesisState': str(safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_ENTRY)) or POSITION_THESIS_ENTRY),
+        'reclaimRescueReason': str(safe_trade.get('reclaimRescueReason', close_snapshot.get('reclaimRescueReason', '')) or ''),
+        'profitContinuationHoldReason': str(safe_trade.get('profitContinuationHoldReason', close_snapshot.get('profitContinuationHoldReason', '')) or ''),
+        'postExitWatchState': str(safe_trade.get('postExitWatchState', '') or ''),
+        'postExitReentryTriggered': bool(safe_trade.get('postExitReentryTriggered', False)),
+        'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
+        'postExitReentryOutcome': str(safe_trade.get('postExitReentryOutcome', '') or ''),
+        'postExitReentryTradeId': str(safe_trade.get('postExitReentryTradeId', '') or ''),
         'peakRoi': round(peak_roi, 4),
         'realizedPeakCaptureRatio': round(capture_ratio, 4),
         'giveback': round(max(0.0, peak_roi - max(realized_roi, 0.0)), 4),
@@ -15817,6 +16217,7 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'directionOwner': signal_snapshot.get('directionOwner', decision_context.get('directionOwner', '')),
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
+                'positionThesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_ENTRY)),
             },
             'outcome': {
                 'accepted': True,
@@ -15842,6 +16243,7 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'directionOwner': signal_snapshot.get('directionOwner', decision_context.get('directionOwner', '')),
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
+                'positionThesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_EXIT_CONFIRMED)),
             },
             'outcome': {
                 'reason': safe_trade.get('reason', safe_trade.get('closeReason', '')),
@@ -15852,6 +16254,9 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                     max(_coerce_float(safe_trade.get('roi', 0.0), 0.0), 0.0),
                 ),
                 'closeReason': safe_trade.get('closeReason', safe_trade.get('reason', '')),
+                'thesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_EXIT_CONFIRMED)),
+                'rescueReason': safe_trade.get('reclaimRescueReason', close_snapshot.get('reclaimRescueReason', '')),
+                'profitHoldReason': safe_trade.get('profitContinuationHoldReason', close_snapshot.get('profitContinuationHoldReason', '')),
             },
             'sourceVersion': 'approx_ohlcv_v1',
             'source_version': 'approx_ohlcv_v1',
@@ -16280,6 +16685,342 @@ def apply_v3_underwater_tape_telemetry(pos: dict, state_ctx: dict) -> dict:
         safe_pos['lossGateSuppressedReason'] = safe_pos.get('lossGateSuppressedReason', '')
 
     return ctx
+
+
+def _is_v3_thesis_revalidation_enabled() -> bool:
+    return str(V3_THESIS_REVALIDATION_MODE or "apply").strip().lower() != "off"
+
+
+def _ensure_v3_thesis_state_fields(pos: dict) -> None:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    safe_pos.setdefault('positionThesisState', POSITION_THESIS_ENTRY)
+    safe_pos.setdefault('reclaimRescueArmedTs', 0.0)
+    safe_pos.setdefault('reclaimRescueExpireTs', 0.0)
+    safe_pos.setdefault('reclaimRescueReason', '')
+    safe_pos.setdefault('reclaimRescueConfidence', 0.0)
+    safe_pos.setdefault('reclaimRescueReleaseReason', '')
+    safe_pos.setdefault('profitContinuationHoldArmedTs', 0.0)
+    safe_pos.setdefault('profitContinuationHoldExpireTs', 0.0)
+    safe_pos.setdefault('profitContinuationHoldReason', '')
+    safe_pos.setdefault('profitContinuationHoldConfidence', 0.0)
+    safe_pos.setdefault('profitContinuationHoldReleaseReason', '')
+    safe_pos.setdefault('thesisRevalidationLastTs', 0.0)
+    safe_pos.setdefault('_reclaimRescueCandidateSinceTs', 0.0)
+    safe_pos.setdefault('_reclaimRescueUsed', False)
+    safe_pos.setdefault('_profitContinuationHoldCandidateSinceTs', 0.0)
+    safe_pos.setdefault('_profitContinuationHoldUsed', False)
+
+
+def evaluate_v3_position_thesis_revalidation(
+    pos: dict,
+    current_price: float,
+    current_roi_pct: float,
+    profit_ladder: dict,
+    underwater_ctx: dict,
+) -> dict:
+    """Evaluate and persist V3 thesis-revalidation state for open positions."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    _ensure_v3_thesis_state_fields(safe_pos)
+    result = {
+        'armed': False,
+        'fire_rescue': False,
+        'fire_profit_hold': False,
+        'thesis_state': str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY),
+        'reason': '',
+        'confidence': 0.0,
+        'hold_window_sec': 0.0,
+        'candidate_runner_context': str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or ''),
+        'candidate_entry_archetype': str(safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) or ENTRY_ARCHETYPE_RECLAIM),
+    }
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return result
+    if not _is_v3_thesis_revalidation_enabled():
+        return result
+
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else evaluate_v3_underwater_tape_state(
+        safe_pos,
+        current_price,
+        current_roi_pct=current_roi_pct,
+        signal_invalidation_state=safe_pos.get('runtimeSignalInvalidationState', {}),
+    )
+    now_ts = time.time()
+    safe_pos['thesisRevalidationLastTs'] = now_ts
+
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    entry_archetype = str(safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) or ENTRY_ARCHETYPE_RECLAIM)
+    runner_context_resolved = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
+    current_volume_ratio = _coerce_float(
+        ladder.get('continuation_flow', {}).get('current_volume_ratio', safe_pos.get('currentVolumeRatio', safe_pos.get('volumeRatio', 1.0)))
+        if isinstance(ladder.get('continuation_flow'), dict) else safe_pos.get('currentVolumeRatio', safe_pos.get('volumeRatio', 1.0)),
+        _coerce_float(safe_pos.get('currentVolumeRatio', safe_pos.get('volumeRatio', 1.0)), 1.0),
+    )
+    current_is_volume_spike = bool(safe_pos.get('currentIsVolumeSpike', safe_pos.get('isVolumeSpike', False)))
+    current_ob_trend = _coerce_float(
+        ladder.get('continuation_flow', {}).get('current_ob_imbalance_trend', safe_pos.get('currentObImbalanceTrend', safe_pos.get('obImbalanceTrend', 0.0)))
+        if isinstance(ladder.get('continuation_flow'), dict) else safe_pos.get('currentObImbalanceTrend', safe_pos.get('obImbalanceTrend', 0.0)),
+        _coerce_float(safe_pos.get('currentObImbalanceTrend', safe_pos.get('obImbalanceTrend', 0.0)), 0.0),
+    )
+    current_exec_score = _coerce_float(
+        ladder.get('continuation_flow', {}).get('current_exec_score', safe_pos.get('currentExecScore', safe_pos.get('entryExecScoreSnapshot', 0.0)))
+        if isinstance(ladder.get('continuation_flow'), dict) else safe_pos.get('currentExecScore', safe_pos.get('entryExecScoreSnapshot', 0.0)),
+        _coerce_float(safe_pos.get('currentExecScore', safe_pos.get('entryExecScoreSnapshot', 0.0)), 0.0),
+    )
+    continuation_state = str(ladder.get('continuation_flow_state', safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)) or V3_CONTINUATION_NEUTRAL)
+    underwater_state = str(state_ctx.get('state', safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL)) or V3_UNDERWATER_NEUTRAL)
+    hostile_imbalance = bool(state_ctx.get('hostile_imbalance', False))
+    opposite_signal_persistent = bool(state_ctx.get('opposite_signal_persistent', False))
+    adverse_state = underwater_state in (V3_UNDERWATER_ADVERSE_STRONG, V3_UNDERWATER_ADVERSE_WEAK)
+    side_obi_aligned = _is_side_ob_trend_aligned(side, current_ob_trend, threshold=V3_THESIS_OBI_ALIGN_THRESHOLD)
+    age_sec = max(0.0, (now_ts * 1000 - int(safe_pos.get('openTime', 0) or 0)) / 1000.0)
+    be_floor_roi_pct = _coerce_float(ladder.get('breakeven_floor_roi_pct', safe_pos.get('runtimeBreakevenFloorRoiPct', 0.0)), 0.0)
+    dynamic_be_price = _coerce_float(state_ctx.get('dynamic_be_price', safe_pos.get('underwaterDynamicBePrice', 0.0)), 0.0)
+    dynamic_be_buffer_ratio = _coerce_float(state_ctx.get('dynamic_be_buffer_ratio', safe_pos.get('underwaterDynamicBeBufferRatio', 0.0)), 0.0)
+    entry_price = _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)
+    if side == 'LONG':
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) >= dynamic_be_price
+    else:
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) <= dynamic_be_price
+    be_zone_tolerance = entry_price * dynamic_be_buffer_ratio if entry_price > 0 else 0.0
+    in_be_buffer = bool(
+        entry_price > 0
+        and abs(float(current_price or 0.0) - entry_price) <= max(be_zone_tolerance, _coerce_float(safe_pos.get('atr', 0.0), 0.0) * 0.15)
+    )
+    near_be_zone = bool(current_roi_pct >= min(0.0, be_floor_roi_pct - 2.0) or be_price_reached or in_be_buffer)
+    had_underwater_memory = bool(
+        _coerce_float(safe_pos.get('sidewaysSinceTs', 0.0), 0.0) > 0
+        or _coerce_float(safe_pos.get('worstUnderwaterTs', 0.0), 0.0) > 0
+        or _coerce_float(state_ctx.get('worst_underwater_price', 0.0), 0.0) > 0
+    )
+    giveback_roi_pct = _coerce_float(ladder.get('profit_giveback_roi_pct', safe_pos.get('runtimeProfitGivebackRoiPct', 0.0)), 0.0)
+    giveback_arm_roi_pct = _coerce_float(ladder.get('profit_giveback_arm_roi_pct', safe_pos.get('runtimeProfitGivebackArmRoiPct', 0.0)), 0.0)
+    giveback_started = bool(
+        current_roi_pct > 0
+        and (
+            bool(ladder.get('giveback_trail_ready', False))
+            or giveback_roi_pct >= max(1.0, min(giveback_arm_roi_pct, 1.5) if giveback_arm_roi_pct > 0 else 1.0)
+        )
+    )
+
+    rescue_confidence = _clamp(
+        0.45
+        + min(0.18, max(0.0, current_volume_ratio - 1.0) * 0.22)
+        + (0.10 if current_is_volume_spike else 0.0)
+        + (0.12 if side_obi_aligned else 0.0)
+        + min(0.12, max(0.0, current_exec_score - V3_THESIS_EXEC_SCORE_FLOOR) / 100.0),
+        0.0,
+        0.95,
+    )
+    profit_hold_confidence = _clamp(
+        0.42
+        + min(0.18, max(0.0, current_volume_ratio - 1.0) * 0.20)
+        + (0.08 if current_is_volume_spike else 0.0)
+        + (0.12 if side_obi_aligned else 0.0)
+        + min(0.14, max(0.0, current_exec_score - V3_THESIS_EXEC_SCORE_FLOOR) / 90.0),
+        0.0,
+        0.95,
+    )
+
+    rescue_support = bool(
+        entry_archetype == ENTRY_ARCHETYPE_RECLAIM or runner_context_resolved == V3_RUNNER_CONTEXT_COUNTER or str(safe_pos.get('runnerContext', '')) == V3_RUNNER_CONTEXT_COUNTER
+    )
+    rescue_support = bool(
+        rescue_support
+        and had_underwater_memory
+        and underwater_state in (V3_UNDERWATER_SIDEWAYS, V3_UNDERWATER_RECOVERING)
+        and age_sec >= 600.0
+        and near_be_zone
+        and continuation_state == V3_CONTINUATION_SUPPORTING
+        and (current_volume_ratio >= V3_RESCUE_VOLUME_FLOOR or current_is_volume_spike)
+        and side_obi_aligned
+        and current_exec_score >= V3_THESIS_EXEC_SCORE_FLOOR
+        and not hostile_imbalance
+        and not opposite_signal_persistent
+        and not adverse_state
+    )
+    profit_hold_support = bool(
+        current_roi_pct > 0
+        and giveback_started
+        and continuation_state == V3_CONTINUATION_SUPPORTING
+        and (current_volume_ratio >= V3_PROFIT_HOLD_VOLUME_FLOOR or current_is_volume_spike)
+        and side_obi_aligned
+        and current_exec_score >= V3_THESIS_EXEC_SCORE_FLOOR
+        and not hostile_imbalance
+        and not opposite_signal_persistent
+        and not adverse_state
+    )
+
+    rescue_expire_ts = _coerce_float(safe_pos.get('reclaimRescueExpireTs', 0.0), 0.0)
+    rescue_active = rescue_expire_ts > now_ts
+    if rescue_active:
+        if rescue_support:
+            safe_pos['positionThesisState'] = POSITION_THESIS_CONTINUATION_RESCUE
+            safe_pos['runnerContextResolved'] = V3_RUNNER_CONTEXT_CONTINUATION_RESCUE
+            safe_pos['reclaimRescueConfidence'] = rescue_confidence
+            result.update({
+                'armed': True,
+                'fire_rescue': True,
+                'thesis_state': POSITION_THESIS_CONTINUATION_RESCUE,
+                'reason': str(safe_pos.get('reclaimRescueReason', 'SUPPORTING_FLOW_RESCUE') or 'SUPPORTING_FLOW_RESCUE'),
+                'confidence': rescue_confidence,
+                'hold_window_sec': round(max(0.0, rescue_expire_ts - now_ts), 2),
+                'candidate_runner_context': V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+                'candidate_entry_archetype': ENTRY_ARCHETYPE_CONTINUATION,
+            })
+            return result
+        safe_pos['reclaimRescueExpireTs'] = 0.0
+        safe_pos['reclaimRescueReleaseReason'] = 'TIME' if now_ts >= rescue_expire_ts else 'FLOW_FADE'
+        safe_pos['runnerContextResolved'] = str(safe_pos.get('baseRunnerContext', safe_pos.get('runnerContext', runner_context_resolved)) or runner_context_resolved)
+
+    profit_hold_expire_ts = _coerce_float(safe_pos.get('profitContinuationHoldExpireTs', 0.0), 0.0)
+    profit_hold_active = profit_hold_expire_ts > now_ts
+    if profit_hold_active:
+        if profit_hold_support:
+            safe_pos['positionThesisState'] = POSITION_THESIS_PROFIT_CONTINUATION_HOLD
+            safe_pos['profitContinuationHoldConfidence'] = profit_hold_confidence
+            result.update({
+                'armed': True,
+                'fire_profit_hold': True,
+                'thesis_state': POSITION_THESIS_PROFIT_CONTINUATION_HOLD,
+                'reason': str(safe_pos.get('profitContinuationHoldReason', 'SUPPORTING_FLOW_PROFIT_HOLD') or 'SUPPORTING_FLOW_PROFIT_HOLD'),
+                'confidence': profit_hold_confidence,
+                'hold_window_sec': round(max(0.0, profit_hold_expire_ts - now_ts), 2),
+                'candidate_runner_context': str(safe_pos.get('runnerContextResolved', runner_context_resolved) or runner_context_resolved),
+                'candidate_entry_archetype': entry_archetype,
+            })
+            return result
+        safe_pos['profitContinuationHoldExpireTs'] = 0.0
+        safe_pos['profitContinuationHoldReleaseReason'] = 'TIME' if now_ts >= profit_hold_expire_ts else 'FLOW_FADE'
+
+    if rescue_support and not bool(safe_pos.get('_reclaimRescueUsed', False)):
+        rescue_candidate_since = _coerce_float(safe_pos.get('_reclaimRescueCandidateSinceTs', 0.0), 0.0)
+        if rescue_candidate_since <= 0:
+            rescue_candidate_since = now_ts
+            safe_pos['_reclaimRescueCandidateSinceTs'] = rescue_candidate_since
+        persistence_sec = now_ts - rescue_candidate_since
+        if persistence_sec >= V3_RECLAIM_RESCUE_PERSISTENCE_SEC:
+            safe_pos['_reclaimRescueUsed'] = True
+            safe_pos['positionThesisState'] = POSITION_THESIS_CONTINUATION_RESCUE
+            safe_pos['reclaimRescueArmedTs'] = rescue_candidate_since
+            safe_pos['reclaimRescueExpireTs'] = now_ts + V3_RECLAIM_RESCUE_HOLD_WINDOW_SEC
+            safe_pos['reclaimRescueReason'] = 'SUPPORTING_FLOW_RESCUE'
+            safe_pos['reclaimRescueConfidence'] = rescue_confidence
+            safe_pos['reclaimRescueReleaseReason'] = ''
+            safe_pos['_reclaimRescueCandidateSinceTs'] = 0.0
+            safe_pos['runnerContextResolved'] = V3_RUNNER_CONTEXT_CONTINUATION_RESCUE
+            result.update({
+                'armed': True,
+                'fire_rescue': True,
+                'thesis_state': POSITION_THESIS_CONTINUATION_RESCUE,
+                'reason': 'SUPPORTING_FLOW_RESCUE',
+                'confidence': rescue_confidence,
+                'hold_window_sec': V3_RECLAIM_RESCUE_HOLD_WINDOW_SEC,
+                'candidate_runner_context': V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+                'candidate_entry_archetype': ENTRY_ARCHETYPE_CONTINUATION,
+            })
+            return result
+        safe_pos['positionThesisState'] = POSITION_THESIS_REVALIDATING
+        result.update({
+            'armed': True,
+            'thesis_state': POSITION_THESIS_REVALIDATING,
+            'reason': 'RESCUE_REVALIDATING',
+            'confidence': rescue_confidence,
+            'hold_window_sec': round(max(0.0, V3_RECLAIM_RESCUE_PERSISTENCE_SEC - persistence_sec), 2),
+            'candidate_runner_context': V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+            'candidate_entry_archetype': ENTRY_ARCHETYPE_CONTINUATION,
+        })
+        return result
+    safe_pos['_reclaimRescueCandidateSinceTs'] = 0.0
+
+    if profit_hold_support and not bool(safe_pos.get('_profitContinuationHoldUsed', False)):
+        profit_hold_candidate_since = _coerce_float(safe_pos.get('_profitContinuationHoldCandidateSinceTs', 0.0), 0.0)
+        if profit_hold_candidate_since <= 0:
+            profit_hold_candidate_since = now_ts
+            safe_pos['_profitContinuationHoldCandidateSinceTs'] = profit_hold_candidate_since
+        persistence_sec = now_ts - profit_hold_candidate_since
+        if persistence_sec >= V3_PROFIT_HOLD_PERSISTENCE_SEC:
+            safe_pos['_profitContinuationHoldUsed'] = True
+            safe_pos['positionThesisState'] = POSITION_THESIS_PROFIT_CONTINUATION_HOLD
+            safe_pos['profitContinuationHoldArmedTs'] = profit_hold_candidate_since
+            safe_pos['profitContinuationHoldExpireTs'] = now_ts + V3_PROFIT_HOLD_WINDOW_SEC
+            safe_pos['profitContinuationHoldReason'] = 'SUPPORTING_FLOW_PROFIT_HOLD'
+            safe_pos['profitContinuationHoldConfidence'] = profit_hold_confidence
+            safe_pos['profitContinuationHoldReleaseReason'] = ''
+            safe_pos['_profitContinuationHoldCandidateSinceTs'] = 0.0
+            result.update({
+                'armed': True,
+                'fire_profit_hold': True,
+                'thesis_state': POSITION_THESIS_PROFIT_CONTINUATION_HOLD,
+                'reason': 'SUPPORTING_FLOW_PROFIT_HOLD',
+                'confidence': profit_hold_confidence,
+                'hold_window_sec': V3_PROFIT_HOLD_WINDOW_SEC,
+                'candidate_runner_context': str(safe_pos.get('runnerContextResolved', runner_context_resolved) or runner_context_resolved),
+                'candidate_entry_archetype': entry_archetype,
+            })
+            return result
+        safe_pos['positionThesisState'] = POSITION_THESIS_REVALIDATING
+        result.update({
+            'armed': True,
+            'thesis_state': POSITION_THESIS_REVALIDATING,
+            'reason': 'PROFIT_HOLD_REVALIDATING',
+            'confidence': profit_hold_confidence,
+            'hold_window_sec': round(max(0.0, V3_PROFIT_HOLD_PERSISTENCE_SEC - persistence_sec), 2),
+            'candidate_runner_context': str(safe_pos.get('runnerContextResolved', runner_context_resolved) or runner_context_resolved),
+            'candidate_entry_archetype': entry_archetype,
+        })
+        return result
+    safe_pos['_profitContinuationHoldCandidateSinceTs'] = 0.0
+
+    if not rescue_active and not profit_hold_active:
+        safe_pos['positionThesisState'] = POSITION_THESIS_ENTRY
+        if safe_pos.get('runnerContextResolved') == V3_RUNNER_CONTEXT_CONTINUATION_RESCUE:
+            safe_pos['runnerContextResolved'] = str(safe_pos.get('baseRunnerContext', safe_pos.get('runnerContext', runner_context_resolved)) or runner_context_resolved)
+    result['thesis_state'] = str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY)
+    return result
+
+
+def maybe_defer_v3_profit_exit(
+    pos: dict,
+    current_price: float,
+    *,
+    profit_ladder: Optional[dict] = None,
+    underwater_ctx: Optional[dict] = None,
+    note: str = '',
+) -> bool:
+    """Return True when a profitable V3 exit should be deferred for continuation hold."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return False
+    current_roi_pct = compute_position_roi_pct(safe_pos, current_price=current_price)
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else evaluate_v3_underwater_tape_state(
+        safe_pos,
+        current_price,
+        current_roi_pct=current_roi_pct,
+        signal_invalidation_state=safe_pos.get('runtimeSignalInvalidationState', {}),
+    )
+    thesis_ctx = evaluate_v3_position_thesis_revalidation(
+        safe_pos,
+        current_price=current_price,
+        current_roi_pct=current_roi_pct,
+        profit_ladder=ladder,
+        underwater_ctx=state_ctx,
+    )
+    if not thesis_ctx.get('fire_profit_hold', False):
+        return False
+    safe_pos['lastExitDecision'] = 'PROFIT_CONTINUATION_HOLD'
+    safe_pos['trailBreachCount'] = 0
+    safe_pos['trailBreachStartTime'] = 0
+    safe_pos['slConfirmCount'] = 0
+    safe_pos['slBreachStartTime'] = 0
+    clear_trail_breach_telemetry(safe_pos)
+    maybe_queue_position_state_snapshot(safe_pos, reason='v3_profit_exit_deferred')
+    logger.info(
+        f"🟢 V3_PROFIT_HOLD: {safe_pos.get('symbol', '?')} {safe_pos.get('side', 'LONG')} "
+        f"roi={current_roi_pct:.1f}% note={note or 'profit_exit'} "
+        f"reason={thesis_ctx.get('reason', 'SUPPORTING_FLOW_PROFIT_HOLD')} hold={thesis_ctx.get('hold_window_sec', 0)}s"
+    )
+    return True
 
 
 def evaluate_v3_sideways_reclaim_signal(
@@ -23661,6 +24402,14 @@ async def background_scanner_loop():
                         except Exception as sig_error:
                             logger.debug(f"Signal processing error for {symbol}: {sig_error}")
                             continue
+
+                    try:
+                        await evaluate_post_exit_reentry_watchers(
+                            opportunities,
+                            multi_coin_scanner.active_signals,
+                        )
+                    except Exception as watcher_err:
+                        logger.debug(f"Post-exit re-entry watcher error: {watcher_err}")
                 
                 # =====================================================================
                 # PHASE 32: UPDATE OPEN POSITIONS WITH REAL-TIME PRICES
@@ -23970,6 +24719,13 @@ async def background_scanner_loop():
                                         seconds=trail_breach_dur,
                                     )
                                     if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
+                                        if maybe_defer_v3_profit_exit(
+                                            pos,
+                                            current_price=current_price,
+                                            profit_ladder=profit_ladder,
+                                            note='trail_confirmed',
+                                        ):
+                                            continue
                                         reason = derive_profit_exit_reason(
                                             pos,
                                             current_price=current_price,
@@ -24029,6 +24785,13 @@ async def background_scanner_loop():
                                         logger.info(f"🔴 SL CONFIRMED: {pos.get('symbol', '?')} after {pos['slConfirmCount']} ticks / {breach_duration:.0f}s")
                                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
                                         pos_roi = pos.get('unrealizedPnlPercent', 0)
+                                        if pos.get('isTrailingActive', False) and pos_roi >= 0 and maybe_defer_v3_profit_exit(
+                                            pos,
+                                            current_price=current_price,
+                                            profit_ladder=profit_ladder,
+                                            note='sl_confirmed_profitable',
+                                        ):
+                                            continue
                                         reason = (
                                             derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder)
                                             if (pos.get('isTrailingActive', False) and pos_roi >= 0)
@@ -24613,6 +25376,13 @@ async def on_position_price_update(symbol: str, ticker: dict):
                 )
                 if pos['trailBreachCount'] >= trail_confirm_ticks and trail_breach_dur >= trail_confirm_seconds:
                     profit_ladder_ws = build_position_profit_ladder(pos, current_price=current_price)
+                    if maybe_defer_v3_profit_exit(
+                        pos,
+                        current_price=current_price,
+                        profit_ladder=profit_ladder_ws,
+                        note='ws_trail_confirmed',
+                    ):
+                        continue
                     reason = derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder_ws)
                     logger.info(
                         f"🔴 TRAIL EXIT (confirmed, WS): {symbol} {pos['side']} "
@@ -24637,6 +25407,13 @@ async def on_position_price_update(symbol: str, ticker: dict):
             elif breach_duration >= SL_MAX_WAIT_SECONDS:
                 # Phase 217: Sakin piyasada tick gelmese bile süre doldu
                 profit_ladder_ws = build_position_profit_ladder(pos, current_price=current_price)
+                if pos.get('isTrailingActive', False) and maybe_defer_v3_profit_exit(
+                    pos,
+                    current_price=current_price,
+                    profit_ladder=profit_ladder_ws,
+                    note='ws_sl_timeout_profitable',
+                ):
+                    continue
                 reason = (
                     derive_profit_exit_reason(pos, current_price=current_price, profit_ladder=profit_ladder_ws)
                     if pos.get('isTrailingActive', False)
@@ -25148,6 +25925,315 @@ async def dispatch_signal_to_paper_trading(signal: dict, price: float, *, spread
         except Exception:
             pass
     return await process_signal_for_paper_trading(signal, price)
+
+
+def _post_exit_reentry_breakout_distance(
+    side: str,
+    *,
+    exit_price: float,
+    current_price: float,
+    atr_distance: float,
+) -> tuple[bool, float]:
+    safe_exit = _coerce_float(exit_price, 0.0)
+    safe_price = _coerce_float(current_price, 0.0)
+    safe_atr_distance = max(_coerce_float(atr_distance, 0.0), safe_exit * V3_POST_EXIT_REENTRY_BREAKOUT_PCT)
+    if safe_exit <= 0 or safe_price <= 0:
+        return False, 0.0
+    threshold = max(safe_exit * V3_POST_EXIT_REENTRY_BREAKOUT_PCT, safe_atr_distance * V3_POST_EXIT_REENTRY_ATR_BREAKOUT_MULT)
+    if str(side or 'LONG').upper() == 'LONG':
+        return safe_price >= (safe_exit + threshold), threshold
+    return safe_price <= (safe_exit - threshold), threshold
+
+
+def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict) -> dict:
+    import copy as _reentry_copy
+
+    safe_watch = watch if isinstance(watch, dict) else {}
+    safe_signal = _reentry_copy.deepcopy(signal if isinstance(signal, dict) else {})
+    safe_opp = opportunity if isinstance(opportunity, dict) else {}
+    symbol = str(safe_watch.get('symbol', safe_signal.get('symbol', safe_opp.get('symbol', ''))) or '').upper()
+    side = str(safe_watch.get('side', safe_signal.get('action', safe_signal.get('side', 'LONG'))) or 'LONG').upper()
+    current_price = _coerce_float(safe_opp.get('price', safe_signal.get('price', safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)))), 0.0)
+    live_ctx = _build_live_flow_context_from_opportunity(safe_signal, safe_opp, side=side)
+    base_score = max(
+        _coerce_float(safe_signal.get('confidenceScore', 0.0), 0.0),
+        _coerce_float(safe_opp.get('signalScore', 0.0), 0.0),
+        _coerce_float(safe_watch.get('originalSignalScore', 0.0), 0.0),
+    )
+    base_size_mult = _coerce_float(safe_signal.get('sizeMultiplier', 1.0), 1.0)
+    safe_signal.pop('signalId', None)
+    safe_signal.pop('signal_id', None)
+    safe_signal.update({
+        'symbol': symbol,
+        'action': side,
+        'side': side,
+        'price': current_price,
+        'entryPrice': _coerce_float(safe_signal.get('entryPrice', current_price), current_price),
+        'confidenceScore': base_score,
+        'signalScore': base_score,
+        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'runnerContextResolved': str(
+            safe_signal.get('runnerContextResolved', safe_signal.get('runnerContext', safe_watch.get('runnerContextResolved', V3_RUNNER_CONTEXT_TREND)))
+            or safe_watch.get('runnerContextResolved', V3_RUNNER_CONTEXT_TREND)
+        ),
+        'strategyMode': STRATEGY_MODE_SMART_V3_RUNNER,
+        'activeStrategy': 'smart_v3_runner',
+        'strategyLabel': 'SMART_V3_RUNNER',
+        'sizeMultiplier': min(base_size_mult, V3_POST_EXIT_REENTRY_SIZE_CAP_MULT),
+        'postExitReentrySizeCapMult': V3_POST_EXIT_REENTRY_SIZE_CAP_MULT,
+        'postExitReentryStopMult': V3_POST_EXIT_REENTRY_STOP_MULT,
+        'isPostExitReentry': True,
+        'reentryOrigin': 'post_exit_continuation_watch',
+        'reentryOriginTradeId': str(safe_watch.get('originalTradeId', '') or ''),
+        'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
+        'reentryWatcherId': str(safe_watch.get('watcherId', '') or ''),
+        'reentryOriginSignalId': str(safe_watch.get('signalId', '') or ''),
+        'currentVolumeRatio': live_ctx.get('currentVolumeRatio', safe_signal.get('currentVolumeRatio', safe_signal.get('volumeRatio', 1.0))),
+        'currentIsVolumeSpike': live_ctx.get('currentIsVolumeSpike', safe_signal.get('currentIsVolumeSpike', safe_signal.get('isVolumeSpike', False))),
+        'currentImbalance': live_ctx.get('currentImbalance', safe_signal.get('currentImbalance', safe_signal.get('imbalance', 0.0))),
+        'currentObImbalanceTrend': live_ctx.get('currentObImbalanceTrend', safe_signal.get('currentObImbalanceTrend', safe_signal.get('obImbalanceTrend', 0.0))),
+        'currentSpreadPct': live_ctx.get('currentSpreadPct', safe_signal.get('currentSpreadPct', safe_signal.get('spreadPct', 0.05))),
+        'currentAtrPct': live_ctx.get('currentAtrPct', safe_signal.get('currentAtrPct', safe_signal.get('atrPct', safe_signal.get('volatility_pct', 0.0)))),
+        'currentExecScore': live_ctx.get('currentExecScore', safe_signal.get('currentExecScore', safe_signal.get('entryExecScore', 0.0))),
+        'continuationFlowState': str(safe_opp.get('continuationFlowState', safe_signal.get('continuationFlowState', V3_CONTINUATION_SUPPORTING)) or V3_CONTINUATION_SUPPORTING),
+    })
+    if safe_signal.get('entryExecScore', 0.0) <= 0:
+        safe_signal['entryExecScore'] = safe_signal.get('currentExecScore', 0.0)
+    if not safe_signal.get('directionOwner'):
+        safe_signal['directionOwner'] = 'continuation'
+    safe_signal['directionReason'] = str(safe_signal.get('directionReason', '') or 'POST_EXIT_CONTINUATION_REENTRY')
+    telemetry = safe_signal.get('telemetry', {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    telemetry.update({
+        'isPostExitReentry': True,
+        'reentryOriginTradeId': safe_signal['reentryOriginTradeId'],
+        'reentryOriginExitReason': safe_signal['reentryOriginExitReason'],
+        'reentryWatcherId': safe_signal['reentryWatcherId'],
+    })
+    safe_signal['telemetry'] = telemetry
+    return safe_signal
+
+
+async def dispatch_post_exit_reentry_watch(watch: dict, signal: dict, opportunity: dict) -> bool:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    if not safe_watch:
+        return False
+    symbol = str(safe_watch.get('symbol', '') or '').upper()
+    if not symbol:
+        return False
+    if _is_symbol_close_pending(symbol):
+        logger.info(f"⏳ POST_EXIT_REENTRY_DEFERRED: {symbol} close still pending on exchange sync")
+        return False
+    if _has_symbol_exposure(symbol):
+        safe_watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
+        safe_watch['cancelReason'] = 'CANCELLED_SUPERSEDED'
+        queue_post_exit_reentry_watch_snapshot(safe_watch, reason='superseded', opportunity=opportunity, signal=signal)
+        post_exit_reentry_watchers.pop(symbol, None)
+        return False
+    reentry_signal = _build_post_exit_reentry_signal(safe_watch, signal, opportunity)
+    current_price = _coerce_float(reentry_signal.get('price', opportunity.get('price', 0.0) if isinstance(opportunity, dict) else 0.0), 0.0)
+    await dispatch_signal_to_paper_trading(
+        reentry_signal,
+        current_price,
+        spread_pct=_coerce_float(reentry_signal.get('currentSpreadPct', reentry_signal.get('spreadPct', 0.05)), 0.05),
+    )
+    new_pending = next((order for order in global_paper_trader.pending_orders if str(order.get('symbol', '') or '').upper() == symbol), None)
+    new_position = next((pos for pos in global_paper_trader.positions if str(pos.get('symbol', '') or '').upper() == symbol), None)
+    if new_pending or new_position:
+        safe_watch['watchState'] = POST_EXIT_REENTRY_STATE_CONFIRMED
+        safe_watch['reentryUsed'] = True
+        safe_watch['reentryTriggered'] = True
+        safe_watch['reentryTriggerReason'] = 'CONTINUATION_REENTRY_DISPATCHED'
+        safe_watch['reentryPendingEntryId'] = str((new_pending or {}).get('id', '') or '')
+        safe_watch['reentryPositionId'] = str((new_position or {}).get('id', '') or '')
+        safe_watch['watchExpiresTs'] = max(_coerce_float(safe_watch.get('watchExpiresTs', 0.0), 0.0), time.time() + 120.0)
+        queue_post_exit_reentry_watch_snapshot(safe_watch, reason='confirmed', opportunity=opportunity, signal=reentry_signal)
+        logger.info(
+            f"🚀 POST_EXIT_REENTRY_TRIGGERED: {symbol} {safe_watch.get('side', 'LONG')} "
+            f"watcher={safe_watch.get('watcherId', '')} pending={safe_watch.get('reentryPendingEntryId', '')} "
+            f"position={safe_watch.get('reentryPositionId', '')}"
+        )
+        return True
+    feedback = global_paper_trader.get_execution_feedback(symbol) or {}
+    safe_watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
+    safe_watch['cancelReason'] = str(feedback.get('reason') or 'CANCELLED_REJECTED')
+    queue_post_exit_reentry_watch_snapshot(safe_watch, reason='dispatch_rejected', opportunity=opportunity, signal=reentry_signal)
+    post_exit_reentry_watchers.pop(symbol, None)
+    logger.info(
+        f"🚫 POST_EXIT_REENTRY_REJECTED: {symbol} {safe_watch.get('side', 'LONG')} "
+        f"reason={safe_watch.get('cancelReason', 'CANCELLED_REJECTED')}"
+    )
+    return False
+
+
+async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list) -> None:
+    if not _is_v3_post_exit_reentry_enabled():
+        return
+    if not isinstance(post_exit_reentry_watchers, dict) or not post_exit_reentry_watchers:
+        return
+    now_ts = time.time()
+    opp_by_symbol = {}
+    for opp in opportunities or []:
+        if not isinstance(opp, dict):
+            continue
+        symbol = str(opp.get('symbol', '') or '').upper()
+        if symbol and symbol not in opp_by_symbol:
+            opp_by_symbol[symbol] = opp
+    signal_by_symbol = {}
+    for sig in signals or []:
+        if not isinstance(sig, dict):
+            continue
+        symbol = str(sig.get('symbol', '') or '').upper()
+        if not symbol:
+            continue
+        score = _coerce_float(sig.get('confidenceScore', 0.0), 0.0)
+        current_best = signal_by_symbol.get(symbol)
+        if current_best is None or score > _coerce_float(current_best.get('confidenceScore', 0.0), 0.0):
+            signal_by_symbol[symbol] = sig
+
+    for symbol, watch in list(post_exit_reentry_watchers.items()):
+        if not isinstance(watch, dict):
+            post_exit_reentry_watchers.pop(symbol, None)
+            continue
+        if _coerce_float(watch.get('watchExpiresTs', 0.0), 0.0) <= now_ts:
+            watch['watchState'] = POST_EXIT_REENTRY_STATE_EXPIRED
+            watch['cancelReason'] = 'WATCH_EXPIRED'
+            queue_post_exit_reentry_watch_snapshot(watch, reason='expired')
+            post_exit_reentry_watchers.pop(symbol, None)
+            continue
+        if watch.get('reentryUsed', False):
+            continue
+        if _is_symbol_close_pending(symbol):
+            continue
+        if _has_symbol_exposure(symbol):
+            watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
+            watch['cancelReason'] = 'CANCELLED_SUPERSEDED'
+            queue_post_exit_reentry_watch_snapshot(watch, reason='superseded')
+            post_exit_reentry_watchers.pop(symbol, None)
+            continue
+
+        opp = opp_by_symbol.get(symbol)
+        sig = signal_by_symbol.get(symbol)
+        if not isinstance(opp, dict):
+            continue
+        current_price = _coerce_float(opp.get('price', watch.get('lastPrice', watch.get('exitPrice', 0.0))), 0.0)
+        live_ctx = _build_live_flow_context_from_opportunity(watch, opp, side=watch.get('side', ''))
+        watch['lastPrice'] = current_price
+        watch['currentVolumeRatio'] = _coerce_float(live_ctx.get('currentVolumeRatio', 0.0), 0.0)
+        watch['currentIsVolumeSpike'] = bool(live_ctx.get('currentIsVolumeSpike', False))
+        watch['currentObImbalanceTrend'] = _coerce_float(live_ctx.get('currentObImbalanceTrend', 0.0), 0.0)
+        watch['currentImbalance'] = _coerce_float(live_ctx.get('currentImbalance', 0.0), 0.0)
+        watch['currentExecScore'] = _coerce_float(live_ctx.get('currentExecScore', 0.0), 0.0)
+        watch['continuationFlowState'] = str(
+            opp.get('continuationFlowState', sig.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) if isinstance(sig, dict) else V3_CONTINUATION_NEUTRAL)
+            or V3_CONTINUATION_NEUTRAL
+        )
+
+        current_spread_pct = _coerce_float(live_ctx.get('currentSpreadPct', opp.get('spreadPct', 0.05)), 0.05)
+        hostile_imbalance = _is_side_imbalance_hostile(watch.get('side', ''), watch.get('currentImbalance', 0.0), threshold=8.0)
+        opp_action = str(opp.get('signalAction', sig.get('action', '')) if isinstance(sig, dict) else opp.get('signalAction', '') or '').upper()
+        opp_score = max(
+            _coerce_float(opp.get('signalScore', 0.0), 0.0),
+            _coerce_float(sig.get('confidenceScore', 0.0), 0.0) if isinstance(sig, dict) else 0.0,
+        )
+        spread_broken = current_spread_pct > 0.25
+        if hostile_imbalance or spread_broken or (opp_action in ('LONG', 'SHORT') and opp_action != watch.get('side', '') and opp_score >= V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE):
+            watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
+            watch['cancelReason'] = 'HOSTILE_IMBALANCE' if hostile_imbalance else ('SPREAD_DETERIORATION' if spread_broken else 'OPPOSITE_SIGNAL')
+            queue_post_exit_reentry_watch_snapshot(watch, reason='cancelled', opportunity=opp, signal=sig)
+            post_exit_reentry_watchers.pop(symbol, None)
+            continue
+
+        if now_ts < _coerce_float(watch.get('cooldownUntilTs', 0.0), 0.0):
+            continue
+
+        signal_entry_arch = str(
+            (sig.get('entryArchetype', ((sig.get('decisionContext') or {}).get('entryArchetype', ''))) if isinstance(sig, dict) else '')
+            or ''
+        ).lower()
+        atr_distance = max(
+            _coerce_float(opp.get('atr', watch.get('atr', 0.0)), 0.0),
+            _coerce_float(current_price * (_coerce_float(opp.get('atrPct', opp.get('volatility_pct', 0.0)), 0.0) / 100.0), 0.0),
+        )
+        breakout_passed, breakout_distance = _post_exit_reentry_breakout_distance(
+            str(watch.get('side', 'LONG') or 'LONG').upper(),
+            exit_price=_coerce_float(watch.get('exitPrice', 0.0), 0.0),
+            current_price=current_price,
+            atr_distance=atr_distance,
+        )
+        watch['breakoutDistancePrice'] = breakout_distance
+        volume_ok = watch['currentVolumeRatio'] >= V3_POST_EXIT_REENTRY_VOLUME_FLOOR or bool(watch.get('currentIsVolumeSpike', False))
+        obi_ok = _is_side_ob_trend_aligned(watch.get('side', ''), watch.get('currentObImbalanceTrend', 0.0), threshold=V3_THESIS_OBI_ALIGN_THRESHOLD)
+        exec_ok = watch['currentExecScore'] >= V3_POST_EXIT_REENTRY_EXEC_SCORE_FLOOR
+        continuation_state = str(watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
+        continuation_ok = bool(
+            continuation_state == V3_CONTINUATION_SUPPORTING
+            or (
+                signal_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+                and volume_ok
+                and obi_ok
+                and exec_ok
+            )
+        )
+        signal_ok = bool(
+            isinstance(sig, dict)
+            and str(sig.get('action', '') or '').upper() == str(watch.get('side', '') or '').upper()
+            and signal_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+            and opp_action == str(watch.get('side', '') or '').upper()
+            and opp_score > 0
+        )
+        candidate_ok = bool(signal_ok and continuation_ok and volume_ok and obi_ok and exec_ok and breakout_passed)
+        if not candidate_ok:
+            if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE:
+                watch['watchState'] = POST_EXIT_REENTRY_STATE_ARMED
+                watch['candidateSinceTs'] = 0.0
+                watch['confirmCount'] = 0
+                queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_lost', opportunity=opp, signal=sig)
+            continue
+
+        if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) != POST_EXIT_REENTRY_STATE_CANDIDATE:
+            watch['watchState'] = POST_EXIT_REENTRY_STATE_CANDIDATE
+            watch['candidateSinceTs'] = now_ts
+            watch['confirmCount'] = 1
+            queue_post_exit_reentry_watch_snapshot(watch, reason='candidate', opportunity=opp, signal=sig)
+            continue
+
+        watch['confirmCount'] = int(watch.get('confirmCount', 0) or 0) + 1
+        persistence_sec = max(0.0, now_ts - _coerce_float(watch.get('candidateSinceTs', now_ts), now_ts))
+        queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_progress', opportunity=opp, signal=sig)
+        if watch['confirmCount'] < V3_POST_EXIT_REENTRY_CONFIRM_SCANS or persistence_sec < V3_POST_EXIT_REENTRY_PERSISTENCE_SEC:
+            continue
+        await dispatch_post_exit_reentry_watch(watch, sig, opp)
+
+
+def resolve_reentry_cooldown_gate(signal: dict, existing_signal: dict, now_ts: float) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_existing = existing_signal if isinstance(existing_signal, dict) else {}
+    last_close_ts = _coerce_float(safe_existing.get('last_close_ts', 0.0), 0.0)
+    is_post_exit_reentry = bool(safe_signal.get('isPostExitReentry', False))
+    result = {
+        'blocked': False,
+        'override_applied': False,
+        'remaining_sec': 0.0,
+        'cooldown_sec': float(MIN_REENTRY_COOLDOWN_SEC),
+        'reason': '',
+    }
+    if last_close_ts <= 0:
+        return result
+    elapsed_sec = max(0.0, float(now_ts) - last_close_ts)
+    if elapsed_sec >= MIN_REENTRY_COOLDOWN_SEC:
+        return result
+    result['remaining_sec'] = max(0.0, MIN_REENTRY_COOLDOWN_SEC - elapsed_sec)
+    if is_post_exit_reentry and elapsed_sec >= V3_POST_EXIT_REENTRY_COOLDOWN_SEC:
+        result['override_applied'] = True
+        result['cooldown_sec'] = float(V3_POST_EXIT_REENTRY_COOLDOWN_SEC)
+        result['reason'] = 'POST_EXIT_REENTRY_OVERRIDE'
+        return result
+    result['blocked'] = True
+    result['cooldown_sec'] = float(V3_POST_EXIT_REENTRY_COOLDOWN_SEC if is_post_exit_reentry else MIN_REENTRY_COOLDOWN_SEC)
+    result['reason'] = 'POST_EXIT_REENTRY_COOLDOWN' if is_post_exit_reentry else 'REENTRY_COOLDOWN'
+    return result
 
 
 async def process_signal_for_paper_trading(signal: dict, price: float):
@@ -25877,17 +26963,32 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     hard_reject_signal('EXEC__REENTRY_LIMIT', 'REENTRY_LIMIT')
                     reject_feedback("REENTRY_LIMIT")
                     return
-                if sig['last_close_ts'] > 0 and (now_ts - sig['last_close_ts']) < MIN_REENTRY_COOLDOWN_SEC:
-                    remaining = MIN_REENTRY_COOLDOWN_SEC - (now_ts - sig['last_close_ts'])
-                    logger.info(f"🚫 REENTRY_COOLDOWN: {symbol} {action} cooldown {remaining:.0f}s remaining")
+                cooldown_gate = resolve_reentry_cooldown_gate(signal, sig, now_ts)
+                if cooldown_gate['blocked']:
+                    remaining = cooldown_gate['remaining_sec']
+                    logger.info(
+                        f"🚫 {cooldown_gate['reason']}: {symbol} {action} "
+                        f"cooldown {remaining:.0f}s remaining"
+                    )
                     rollback_signal_memory()
                     hard_reject_signal(
                         'EXEC__REENTRY_COOLDOWN',
-                        'REENTRY_COOLDOWN',
-                        trace={'cooldown_sec_remaining': round(remaining, 2)},
+                        cooldown_gate['reason'],
+                        trace={
+                            'cooldown_sec_remaining': round(remaining, 2),
+                            'cooldown_sec_required': round(_coerce_float(cooldown_gate['cooldown_sec'], MIN_REENTRY_COOLDOWN_SEC), 2),
+                            'is_post_exit_reentry': bool(signal.get('isPostExitReentry', False)),
+                        },
                     )
-                    reject_feedback("REENTRY_COOLDOWN")
+                    reject_feedback(cooldown_gate['reason'])
                     return
+                if cooldown_gate['override_applied']:
+                    logger.info(
+                        f"🛰️ POST_EXIT_REENTRY_OVERRIDE: {symbol} {action} "
+                        f"elapsed={now_ts - _coerce_float(sig.get('last_close_ts', 0.0), 0.0):.0f}s "
+                        f"generic={MIN_REENTRY_COOLDOWN_SEC:.0f}s watcher={V3_POST_EXIT_REENTRY_COOLDOWN_SEC:.0f}s"
+                    )
+                    signal['_post_exit_reentry_cooldown_override'] = True
                 # Mark as re-entry attempt (count incremented after fill in execute_pending_order)
                 signal['_is_reentry'] = True
                 signal['_reentry_count'] = sig['reentry_count']
@@ -31238,6 +32339,7 @@ class TimeBasedPositionManager:
 
     async def _handle_v3_runner_position(self, paper_trader, pos: dict, current_price: float, actions: dict) -> bool:
         now_ts = time.time()
+        _ensure_v3_thesis_state_fields(pos)
         pos.setdefault('exitOwner', V3_EXIT_OWNER)
         pos.setdefault('runnerContext', classify_v3_runner_context(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER))
         pos.setdefault('baseRunnerContext', pos.get('runnerContext', V3_RUNNER_CONTEXT_COUNTER))
@@ -31302,7 +32404,17 @@ class TimeBasedPositionManager:
             signal_invalidation_state=pos.get('runtimeSignalInvalidationState', {}),
         )
         apply_v3_underwater_tape_telemetry(pos, underwater_ctx)
+        prev_thesis_state = str(pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY)
+        thesis_ctx = evaluate_v3_position_thesis_revalidation(
+            pos,
+            current_price=current_price,
+            current_roi_pct=current_roi,
+            profit_ladder=profit_ladder,
+            underwater_ctx=underwater_ctx,
+        )
         maybe_queue_position_state_snapshot(pos, reason='v3_runner_runtime')
+        if thesis_ctx.get('thesis_state') != prev_thesis_state or thesis_ctx.get('armed', False):
+            maybe_queue_position_state_snapshot(pos, reason='v3_thesis_revalidation')
         sideways_reclaim = evaluate_v3_sideways_reclaim_signal(
             pos,
             current_price,
@@ -31311,10 +32423,21 @@ class TimeBasedPositionManager:
         )
         pos['sidewaysReclaimArmed'] = bool(sideways_reclaim.get('armed', False))
         if sideways_reclaim.get('fire', False):
+            if thesis_ctx.get('fire_rescue', False):
+                pos['lastExitDecision'] = 'CONTINUATION_RESCUE_HOLD'
+                if hasattr(paper_trader, 'pipeline_metrics'):
+                    paper_trader.pipeline_metrics.setdefault('v3_continuation_rescue_count', 0)
+                    if not bool(pos.get('_reclaimRescueMetricTagged', False)):
+                        paper_trader.pipeline_metrics['v3_continuation_rescue_count'] += 1
+                        pos['_reclaimRescueMetricTagged'] = True
+                maybe_queue_position_state_snapshot(pos, reason='v3_continuation_rescue_hold')
+                return True
+            pos['positionThesisState'] = POSITION_THESIS_EXIT_CONFIRMED
             pos['lastExitDecision'] = 'SIDEWAYS_RECLAIM_CLOSE'
             if hasattr(paper_trader, 'pipeline_metrics'):
                 paper_trader.pipeline_metrics.setdefault('v3_sideways_reclaim_count', 0)
                 paper_trader.pipeline_metrics['v3_sideways_reclaim_count'] += 1
+            maybe_queue_position_state_snapshot(pos, reason='v3_sideways_reclaim_close')
             paper_trader.close_via_engine(pos, current_price, 'SIDEWAYS_RECLAIM_CLOSE', 'V3_RUNNER')
             actions["time_closed"].append(f"{pos.get('symbol')} sideways_reclaim")
             return True
@@ -31328,10 +32451,21 @@ class TimeBasedPositionManager:
             and chop_age_sec >= 600.0
             and current_roi >= _coerce_float(profit_ladder.get('breakeven_floor_roi_pct', 0.0), 0.0)
         ):
+            if thesis_ctx.get('fire_profit_hold', False):
+                pos['lastExitDecision'] = 'PROFIT_CONTINUATION_HOLD'
+                if hasattr(paper_trader, 'pipeline_metrics'):
+                    paper_trader.pipeline_metrics.setdefault('v3_profit_continuation_hold_count', 0)
+                    if not bool(pos.get('_profitContinuationHoldMetricTagged', False)):
+                        paper_trader.pipeline_metrics['v3_profit_continuation_hold_count'] += 1
+                        pos['_profitContinuationHoldMetricTagged'] = True
+                maybe_queue_position_state_snapshot(pos, reason='v3_profit_continuation_hold')
+                return True
+            pos['positionThesisState'] = POSITION_THESIS_EXIT_CONFIRMED
             pos['lastExitDecision'] = 'RECLAIM_BE_CLOSE'
             if hasattr(paper_trader, 'pipeline_metrics'):
                 paper_trader.pipeline_metrics.setdefault('v3_chop_tighten_count', 0)
                 paper_trader.pipeline_metrics['v3_chop_tighten_count'] += 1
+            maybe_queue_position_state_snapshot(pos, reason='v3_reclaim_be_close')
             paper_trader.close_via_engine(pos, current_price, 'RECLAIM_BE_CLOSE', 'V3_RUNNER')
             actions["time_closed"].append(f"{pos.get('symbol')} reclaim_be")
             return True
@@ -40470,6 +41604,15 @@ class PaperTradingEngine:
         except Exception as rp_err:
             logger.debug(f"Regime profile params error: {rp_err}")
 
+        post_exit_reentry_stop_mult = _coerce_float(signal.get('postExitReentryStopMult', 1.0) if signal else 1.0, 1.0)
+        if post_exit_reentry_stop_mult > 0 and abs(post_exit_reentry_stop_mult - 1.0) > 1e-9:
+            adjusted_sl_atr *= post_exit_reentry_stop_mult
+            adjusted_trail_distance_atr *= post_exit_reentry_stop_mult
+            logger.info(
+                f"🛰️ POST_EXIT_REENTRY_RISK_APPLIED(open): {trade_symbol} {side} "
+                f"sl×{post_exit_reentry_stop_mult:.2f} trail_dist×{post_exit_reentry_stop_mult:.2f}"
+            )
+
         atr_floor_ctx = apply_user_configured_exit_atr_floors(
             configured_sl_atr=configured_sl_atr,
             configured_tp_atr=configured_tp_atr,
@@ -41026,6 +42169,13 @@ class PaperTradingEngine:
             "signalIntentApplied": bool(signal.get('signalIntentApplied', False)) if signal else False,
             "signalIntentCandidate": signal.get('signalIntentCandidate', {}) if signal and isinstance(signal.get('signalIntentCandidate'), dict) else {},
             "alternateIntent": signal.get('alternateIntent', {}) if signal and isinstance(signal.get('alternateIntent'), dict) else {},
+            "isPostExitReentry": bool(signal.get('isPostExitReentry', False)) if signal else False,
+            "reentryOrigin": signal.get('reentryOrigin', '') if signal else '',
+            "reentryOriginTradeId": str(signal.get('reentryOriginTradeId', '') or '') if signal else '',
+            "reentryOriginExitReason": str(signal.get('reentryOriginExitReason', '') or '') if signal else '',
+            "reentryWatcherId": str(signal.get('reentryWatcherId', '') or '') if signal else '',
+            "postExitReentryStopMult": post_exit_reentry_stop_mult,
+            "postExitReentrySizeCapMult": _coerce_float(signal.get('postExitReentrySizeCapMult', 1.0) if signal else 1.0, 1.0),
             "decisionContext": signal.get('decisionContext', {}) if signal else {},
             "indicatorPolicy": signal.get('indicatorPolicy', {}) if signal else {},
             "gatePolicy": signal.get('gatePolicy', {}) if signal else {},
@@ -42507,6 +43657,15 @@ class PaperTradingEngine:
                 f"trail_dist×{_runner_controls['trail_dist_mult']:.2f}"
             )
 
+        post_exit_reentry_stop_mult = _coerce_float(order.get('postExitReentryStopMult', 1.0), 1.0)
+        if post_exit_reentry_stop_mult > 0 and abs(post_exit_reentry_stop_mult - 1.0) > 1e-9:
+            adjusted_sl_atr *= post_exit_reentry_stop_mult
+            adjusted_trail_distance_atr *= post_exit_reentry_stop_mult
+            logger.info(
+                f"🛰️ POST_EXIT_REENTRY_RISK_APPLIED(exec): {symbol} {side} "
+                f"sl×{post_exit_reentry_stop_mult:.2f} trail_dist×{post_exit_reentry_stop_mult:.2f}"
+            )
+
         atr_floor_ctx = apply_user_configured_exit_atr_floors(
             configured_sl_atr=configured_sl_atr,
             configured_tp_atr=configured_tp_atr,
@@ -42809,6 +43968,13 @@ class PaperTradingEngine:
             "expectedMaeBucket": order.get('expectedMaeBucket', 'MEDIUM'),
             "holdProfile": order.get('holdProfile', 'CHOP'),
             "replayFidelity": order.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX),
+            "isPostExitReentry": bool(order.get('isPostExitReentry', False)),
+            "reentryOrigin": order.get('reentryOrigin', ''),
+            "reentryOriginTradeId": str(order.get('reentryOriginTradeId', '') or ''),
+            "reentryOriginExitReason": str(order.get('reentryOriginExitReason', '') or ''),
+            "reentryWatcherId": str(order.get('reentryWatcherId', '') or ''),
+            "postExitReentryStopMult": _coerce_float(order.get('postExitReentryStopMult', 1.0), 1.0),
+            "postExitReentrySizeCapMult": _coerce_float(order.get('postExitReentrySizeCapMult', 1.0), 1.0),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
@@ -44858,6 +46024,12 @@ class PaperTradingEngine:
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
+                        if pos.get('isTrailingActive') and roi_pct >= 0 and maybe_defer_v3_profit_exit(
+                            pos,
+                            current_price=current_price,
+                            note='paper_trail_long',
+                        ):
+                            continue
                         reason = (
                             derive_profit_exit_reason(pos, current_price=current_price)
                             if (pos.get('isTrailingActive') and roi_pct >= 0)
@@ -44920,6 +46092,12 @@ class PaperTradingEngine:
                     breach_duration = now_ts - pos['slBreachStartTime']
                     if pos['slConfirmCount'] >= 5 and breach_duration >= 15:
                         # ROI negatifse SL'den kapanmış — trailing aktif olsa bile etiket SL_HIT
+                        if pos.get('isTrailingActive') and roi_pct >= 0 and maybe_defer_v3_profit_exit(
+                            pos,
+                            current_price=current_price,
+                            note='paper_trail_short',
+                        ):
+                            continue
                         reason = (
                             derive_profit_exit_reason(pos, current_price=current_price)
                             if (pos.get('isTrailingActive') and roi_pct >= 0)
@@ -45151,6 +46329,11 @@ class PaperTradingEngine:
             logger.warning(f"⚠️ IDEMPOTENT_GUARD: {pos.get('symbol')} already closing/removed, skipping ({reason})")
             return None
         pos['_closing'] = True
+        thesis_state_value = ''
+        if normalize_strategy_mode(pos.get('strategyMode', STRATEGY_MODE_LEGACY)) == STRATEGY_MODE_SMART_V3_RUNNER:
+            _ensure_v3_thesis_state_fields(pos)
+            pos['positionThesisState'] = POSITION_THESIS_EXIT_CONFIRMED
+            thesis_state_value = POSITION_THESIS_EXIT_CONFIRMED
         
         # Phase 252: Update active_signals lifecycle on position close
         _close_symbol = pos.get('symbol', '')
@@ -45286,6 +46469,16 @@ class PaperTradingEngine:
             "runnerContext": pos.get('runnerContext', ''),
             "runnerContextResolved": pos.get('runnerContextResolved', pos.get('runnerContext', '')),
             "entryArchetype": pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+            "positionThesisState": pos.get('positionThesisState', thesis_state_value),
+            "reclaimRescueReason": pos.get('reclaimRescueReason', ''),
+            "reclaimRescueConfidence": _coerce_float(pos.get('reclaimRescueConfidence', 0.0), 0.0),
+            "profitContinuationHoldReason": pos.get('profitContinuationHoldReason', ''),
+            "profitContinuationHoldConfidence": _coerce_float(pos.get('profitContinuationHoldConfidence', 0.0), 0.0),
+            "isPostExitReentry": bool(pos.get('isPostExitReentry', False)),
+            "reentryOrigin": pos.get('reentryOrigin', ''),
+            "reentryOriginTradeId": str(pos.get('reentryOriginTradeId', '') or ''),
+            "reentryOriginExitReason": str(pos.get('reentryOriginExitReason', '') or ''),
+            "reentryWatcherId": str(pos.get('reentryWatcherId', '') or ''),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
             "tpCloseSplit": pos.get('tpCloseSplit', ''),
             "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
@@ -45367,7 +46560,17 @@ class PaperTradingEngine:
                 'internalProtectionOnly': bool(pos.get('internalProtectionOnly', False)),
                 'lastExitDecision': pos.get('lastExitDecision', ''),
                 'entryArchetype': pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM),
+                'positionThesisState': pos.get('positionThesisState', thesis_state_value),
                 'runnerContextResolved': pos.get('runnerContextResolved', pos.get('runnerContext', '')),
+                'reclaimRescueReason': pos.get('reclaimRescueReason', ''),
+                'reclaimRescueConfidence': _coerce_float(pos.get('reclaimRescueConfidence', 0.0), 0.0),
+                'profitContinuationHoldReason': pos.get('profitContinuationHoldReason', ''),
+                'profitContinuationHoldConfidence': _coerce_float(pos.get('profitContinuationHoldConfidence', 0.0), 0.0),
+                'isPostExitReentry': bool(pos.get('isPostExitReentry', False)),
+                'reentryOrigin': pos.get('reentryOrigin', ''),
+                'reentryOriginTradeId': str(pos.get('reentryOriginTradeId', '') or ''),
+                'reentryOriginExitReason': str(pos.get('reentryOriginExitReason', '') or ''),
+                'reentryWatcherId': str(pos.get('reentryWatcherId', '') or ''),
                 'continuationFlowState': pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
                 'underwaterTapeState': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
                 'underwaterPriceLossPct': _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
@@ -45400,6 +46603,17 @@ class PaperTradingEngine:
                 'distance_truth': pos.get('distance_truth', {}),
             }),
         }
+
+        try:
+            register_post_exit_reentry_watch(
+                pos,
+                trade,
+                original_reason=original_reason,
+                normalized_reason=reason,
+                exit_price=exit_price,
+            )
+        except Exception as reentry_watch_err:
+            logger.debug(f"Post-exit re-entry watch register error: {reentry_watch_err}")
         
         # Phase 267C: PnL Attribution decomposition
         if pnl_attribution_service and pnl_attribution_service.enabled:
@@ -47131,6 +48345,7 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 # Phase 252: Active signal lifecycle tracking
 # Signals persist until invalidated by confirmed counter-signal
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
+post_exit_reentry_watchers = {}  # {symbol: {watcherId, originalTradeId, watchState, ...}}
 signal_event_buffer = deque(maxlen=2000)
 
 SIGNAL_STAGE_RAW = 'RAW_GENERATED'
@@ -47431,6 +48646,11 @@ def get_pending_entries_snapshot(now_ms: Optional[int] = None) -> list:
             "signalIntentApplied": bool(order.get("signalIntentApplied", False)),
             "selectedViaIntent": bool(order.get("selectedViaIntent", (order.get("decisionContext") or {}).get("selectedViaIntent", False))),
             "alternateIntent": order.get("alternateIntent", {}) if isinstance(order.get("alternateIntent"), dict) else {},
+            "isPostExitReentry": bool(order.get("isPostExitReentry", False)),
+            "reentryOrigin": order.get("reentryOrigin", ""),
+            "reentryOriginTradeId": str(order.get("reentryOriginTradeId", "") or ""),
+            "reentryOriginExitReason": str(order.get("reentryOriginExitReason", "") or ""),
+            "reentryWatcherId": str(order.get("reentryWatcherId", "") or ""),
             "decisionContext": order.get("decisionContext", {}),
             "indicatorPolicy": order.get("indicatorPolicy", {}),
             "gatePolicy": order.get("gatePolicy", {}),
@@ -47640,6 +48860,7 @@ async def paper_trading_status():
     
     # P0-RCA #1: Source-aware trade dedup via single-authority helper
     _deduped_trades, _dedup_stats = dedupe_trades_for_ui(global_paper_trader.trades)
+    post_exit_reentry_summary = build_post_exit_reentry_watchers_summary()
     
     return JSONResponse({
         "balance": global_paper_trader.balance,
@@ -47662,6 +48883,10 @@ async def paper_trading_status():
         "executableSignalStats": signal_stats.get("executableSignalStats", {}),
         "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
         "signalEventsSummary": get_signal_events_summary(),
+        "postExitReentrySummary": post_exit_reentry_summary,
+        "postExitReentryWatchersActive": post_exit_reentry_summary.get("active", 0),
+        "postExitReentryCandidates": post_exit_reentry_summary.get("candidate", 0),
+        "postExitReentryTriggered": post_exit_reentry_summary.get("triggered", 0),
         "lastOrderError": live_binance_trader.last_order_error,
         "executionDiagnostics": build_execution_diagnostics_snapshot(live_binance_trader),
         # Phase 237D: Reject attribution summary
@@ -48557,6 +49782,31 @@ async def replay_trade_report(trade_id: str, request: Request):
     report = build_replay_report_from_snapshots(normalized_snaps, policy_version=policy_version)
     trade_summary = _build_replay_trade_summary(trade)
     trade_summary['replayFidelity'] = replay_fidelity
+    watch_summary = _extract_post_exit_reentry_watch_summary(normalized_snaps)
+    trade_summary.update(watch_summary)
+    if bool(trade_summary.get('postExitReentryTriggered', False)):
+        try:
+            related_trades = await sqlite_manager.get_full_trade_history(limit=1200)
+        except Exception:
+            related_trades = []
+        reentry_trade = _find_post_exit_reentry_trade(related_trades, safe_trade_id)
+        if isinstance(reentry_trade, dict):
+            reentry_trade_id = str(reentry_trade.get('tradeId', reentry_trade.get('id', '')) or reentry_trade.get('id', ''))
+            reentry_side = str(reentry_trade.get('side', '') or '')
+            reentry_pnl = round(_coerce_float(reentry_trade.get('pnl', 0.0), 0.0), 4)
+            reentry_roi = round(_coerce_float(reentry_trade.get('roi', 0.0), 0.0), 4)
+            trade_summary['postExitReentryTradeId'] = reentry_trade_id
+            trade_summary['postExitReentryOutcome'] = f"{reentry_side} {reentry_pnl:+.4f} ({reentry_roi:+.2f}%)"
+            if not trade_summary.get('postExitReentryReason'):
+                trade_summary['postExitReentryReason'] = str(
+                    reentry_trade.get('reentryOriginExitReason', '')
+                    or (
+                        reentry_trade.get('signalSnapshot', {})
+                        if isinstance(reentry_trade.get('signalSnapshot'), dict)
+                        else {}
+                    ).get('reentryOriginExitReason', '')
+                    or 'CONTINUATION_REENTRY'
+                )
 
     return JSONResponse({
         'success': True,
@@ -48724,6 +49974,7 @@ async def scanner_status():
     executable_signals = get_persistent_active_signals_snapshot()
     pending_entries = get_pending_entries_snapshot()
     signal_stats = _build_ui_signal_stats(opportunities, executable_signals, pending_entries)
+    post_exit_reentry_summary = build_post_exit_reentry_watchers_summary()
     return JSONResponse({
         "running": effective_running,
         "runningFlag": multi_coin_scanner.running,
@@ -48739,6 +49990,10 @@ async def scanner_status():
         "executableSignalStats": signal_stats.get("executableSignalStats", {}),
         "pendingEntryStats": signal_stats.get("pendingEntryStats", {}),
         "signalEventsSummary": get_signal_events_summary(),
+        "postExitReentrySummary": post_exit_reentry_summary,
+        "postExitReentryWatchersActive": post_exit_reentry_summary.get("active", 0),
+        "postExitReentryCandidates": post_exit_reentry_summary.get("candidate", 0),
+        "postExitReentryTriggered": post_exit_reentry_summary.get("triggered", 0),
     })
 
 # Phase 17: Settings endpoints

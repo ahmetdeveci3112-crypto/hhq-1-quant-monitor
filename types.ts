@@ -207,6 +207,14 @@ export interface Position {
   gatePolicy?: GatePolicy;
   forecastPolicy?: ForecastPolicy;
   expectancy?: ExpectancyForecast;
+  positionThesisState?: string;
+  reclaimRescueReason?: string;
+  profitContinuationHoldReason?: string;
+  isPostExitReentry?: boolean;
+  reentryOrigin?: string;
+  reentryOriginTradeId?: string;
+  reentryOriginExitReason?: string;
+  reentryWatcherId?: string;
 }
 
 // Phase 139+232: Comprehensive close reason type matching all backend reasons
@@ -315,6 +323,14 @@ export interface Trade {
   expectancy?: ExpectancyForecast;
   signalSnapshot?: Record<string, any>;
   closeSnapshot?: Record<string, any>;
+  positionThesisState?: string;
+  reclaimRescueReason?: string;
+  profitContinuationHoldReason?: string;
+  isPostExitReentry?: boolean;
+  reentryOrigin?: string;
+  reentryOriginTradeId?: string;
+  reentryOriginExitReason?: string;
+  reentryWatcherId?: string;
 }
 
 export interface IndicatorPolicy {
@@ -431,6 +447,14 @@ export interface ReplaySearchResult {
   replayFidelity?: string;
   strategyMode?: string;
   runnerContextResolved?: string;
+  positionThesisState?: string;
+  reclaimRescueReason?: string;
+  profitContinuationHoldReason?: string;
+  postExitWatchState?: string;
+  postExitReentryTriggered?: boolean;
+  postExitReentryReason?: string;
+  postExitReentryOutcome?: string;
+  postExitReentryTradeId?: string;
   peakRoi?: number;
   realizedPeakCaptureRatio?: number;
   giveback?: number;
@@ -778,6 +802,11 @@ export interface CoinOpportunity {
   microstructureScore?: number;
   flowToxicityScore?: number;
   refillFailureScore?: number;
+  isPostExitReentry?: boolean;
+  reentryOrigin?: string;
+  reentryOriginTradeId?: string;
+  reentryOriginExitReason?: string;
+  reentryWatcherId?: string;
 }
 
 export interface PendingEntry {
@@ -832,6 +861,11 @@ export interface PendingEntry {
   waitReason?: string;
   feedbackReason?: string;
   continuationFlowState?: string;
+  isPostExitReentry?: boolean;
+  reentryOrigin?: string;
+  reentryOriginTradeId?: string;
+  reentryOriginExitReason?: string;
+  reentryWatcherId?: string;
 }
 
 export interface SignalCounterBreakdown {
@@ -883,6 +917,9 @@ export interface ScannerStats {
   rawSignalStats?: SignalCounterBreakdown;
   executableSignalStats?: SignalCounterBreakdown;
   pendingEntryStats?: SignalCounterBreakdown;
+  postExitReentryWatchersActive?: number;
+  postExitReentryCandidates?: number;
+  postExitReentryTriggered?: number;
   lastUpdate: number;
 }
 

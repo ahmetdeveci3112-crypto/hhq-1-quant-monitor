@@ -174,20 +174,37 @@ const getReplayTone = (value: string): string => (
         : 'bg-slate-800/80 text-slate-300 border border-slate-700/60'
 );
 
+const getReentryTone = (): string => 'bg-violet-500/15 text-violet-300 border border-violet-500/25';
+
+const formatReentryOriginLabel = (item?: Record<string, any>): string => {
+    const exitReason = String(item?.reentryOriginExitReason || '');
+    if (exitReason) return translateReason(exitReason);
+    return item?.isPostExitReentry ? 'Çıkış sonrası continuation' : '';
+};
+
 const extractDecisionSummary = (item: Record<string, any>): DecisionSummary => buildDecisionSummary(item);
 
-const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> = ({ summary, compact = false }) => {
+const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean; item?: Record<string, any> }> = ({ summary, compact = false, item }) => {
+    const isPostExitReentry = Boolean(item?.isPostExitReentry);
+    const reentryOriginLabel = formatReentryOriginLabel(item);
     const hasData = Boolean(
         summary.entryArchetype
         || summary.expectancyBand
         || summary.primaryOwner
         || summary.regimeBucket
         || summary.runnerContextResolved
+        || isPostExitReentry
     );
     if (!hasData) return null;
     const distinctDirectionReason = summary.directionReason && summary.directionReason !== summary.reason
         ? summary.directionReason
         : '';
+    const footerNotes = [
+        !compact && summary.reason ? `Seçim: ${humanizeDecisionToken(summary.reason)}` : '',
+        !compact && distinctDirectionReason ? `Yön: ${humanizeDecisionToken(distinctDirectionReason)}` : '',
+        !compact && summary.alternateIntent ? `Alt: ${formatAlternateIntentLabel(summary.alternateIntent)}` : '',
+        isPostExitReentry ? `2. Şans: ${reentryOriginLabel}` : '',
+    ].filter(Boolean);
 
     return (
         <div className={`rounded-md border border-slate-800/80 bg-slate-950/60 ${compact ? 'px-2 py-2' : 'px-2.5 py-2'}`}>
@@ -231,6 +248,11 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> =
                         Intent {formatSignalIntentVersion(summary.signalIntentVersion, 'V1')}
                     </span>
                 )}
+                {isPostExitReentry && (
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReentryTone()}`}>
+                        2. Şans
+                    </span>
+                )}
             </div>
 
             <div className={`mt-2 grid gap-2 text-[10px] text-slate-400 ${compact ? 'grid-cols-2' : 'grid-cols-2 sm:grid-cols-4'}`}>
@@ -272,13 +294,9 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean }> =
                 )}
             </div>
 
-            {(summary.reason || distinctDirectionReason || summary.alternateIntent) && !compact && (
+            {footerNotes.length > 0 && (
                 <div className="mt-2 text-[10px] text-slate-500">
-                    {summary.reason ? `Seçim: ${humanizeDecisionToken(summary.reason)}` : ''}
-                    {summary.reason && distinctDirectionReason ? ' • ' : ''}
-                    {distinctDirectionReason ? `Yön: ${humanizeDecisionToken(distinctDirectionReason)}` : ''}
-                    {(summary.reason || distinctDirectionReason) && summary.alternateIntent ? ' • ' : ''}
-                    {summary.alternateIntent ? `Alt: ${formatAlternateIntentLabel(summary.alternateIntent)}` : ''}
+                    {footerNotes.join(' • ')}
                 </div>
             )}
         </div>
@@ -676,7 +694,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                 </div>
 
                 <div className="mb-2">
-                    <DecisionBrief summary={decisionSummary} compact />
+                    <DecisionBrief summary={decisionSummary} compact item={signal as Record<string, any>} />
                 </div>
 
                 {/* Middle: Price Info */}
@@ -907,7 +925,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                 </div>
                                             )}
                                             <div className="mt-2">
-                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact />
+                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact item={entry as Record<string, any>} />
                                             </div>
                                         </>
                                     );
@@ -982,7 +1000,7 @@ export const ActiveSignalsPanel: React.FC<ActiveSignalsPanelProps> = ({ signals,
                                                 </div>
                                             )}
                                             <div className="mt-2">
-                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact />
+                                                <DecisionBrief summary={extractDecisionSummary(entry as Record<string, any>)} compact item={entry as Record<string, any>} />
                                             </div>
                                         </>
                                     );

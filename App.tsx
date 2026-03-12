@@ -246,14 +246,61 @@ const getStateChipTone = (value: string, family: 'continuation' | 'underwater'):
   return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
 };
 
+const getThesisChipTone = (value: string): string => {
+  switch (String(value || '').toUpperCase()) {
+    case 'REVALIDATING':
+      return 'bg-sky-500/15 text-sky-300 border border-sky-500/25';
+    case 'CONTINUATION_RESCUE':
+      return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
+    case 'PROFIT_CONTINUATION_HOLD':
+      return 'bg-amber-500/15 text-amber-300 border border-amber-500/25';
+    case 'EXIT_CONFIRMED':
+      return 'bg-slate-700/80 text-slate-300 border border-slate-600/60';
+    default:
+      return 'bg-slate-800/80 text-slate-300 border border-slate-700/60';
+  }
+};
+
+const getReentryChipTone = (): string => 'bg-violet-500/15 text-violet-300 border border-violet-500/25';
+
+const resolveSnapshotString = (item: any, field: string): string => {
+  const value = item?.[field] ?? item?.closeSnapshot?.[field] ?? item?.signalSnapshot?.[field] ?? '';
+  return String(value || '');
+};
+
+const resolveSnapshotBoolean = (item: any, field: string): boolean => {
+  const value = item?.[field] ?? item?.closeSnapshot?.[field] ?? item?.signalSnapshot?.[field] ?? false;
+  return Boolean(value);
+};
+
+const formatReentryOriginLabel = (item: any): string => {
+  const exitReason = resolveSnapshotString(item, 'reentryOriginExitReason');
+  if (exitReason) return translateReason(exitReason);
+  if (resolveSnapshotBoolean(item, 'isPostExitReentry')) return 'Çıkış sonrası continuation';
+  return '';
+};
+
 const getPositionDecisionSummary = (pos: any) => ({
   ...buildDecisionSummary(pos),
+  positionThesisState: resolveSnapshotString(pos, 'positionThesisState'),
+  reclaimRescueReason: resolveSnapshotString(pos, 'reclaimRescueReason'),
+  profitContinuationHoldReason: resolveSnapshotString(pos, 'profitContinuationHoldReason'),
+  isPostExitReentry: resolveSnapshotBoolean(pos, 'isPostExitReentry'),
+  reentryOriginExitReason: resolveSnapshotString(pos, 'reentryOriginExitReason'),
   lossGateSuppressedReason: String(pos?.lossGateSuppressedReason || ''),
   sidewaysReclaimArmed: Boolean(pos?.sidewaysReclaimArmed),
 });
 
 const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, compact = false }) => {
   const summary = getPositionDecisionSummary(pos);
+  const showThesisChip = Boolean(summary.positionThesisState && summary.positionThesisState !== 'ENTRY_THESIS');
+  const thesisNotes = [
+    summary.reclaimRescueReason ? `Rescue: ${humanizeDecisionToken(summary.reclaimRescueReason)}` : '',
+    summary.profitContinuationHoldReason ? `Kâr Tutuş: ${humanizeDecisionToken(summary.profitContinuationHoldReason)}` : '',
+    summary.isPostExitReentry ? `2. Şans: ${formatReentryOriginLabel(pos)}` : '',
+    summary.lossGateSuppressedReason ? `Loss gate: ${translateReason(summary.lossGateSuppressedReason)}` : '',
+    summary.sidewaysReclaimArmed ? 'BE reclaim hazır' : '',
+  ].filter(Boolean);
   const hasData = Boolean(
     summary.entryArchetype
     || summary.expectancyBand
@@ -261,6 +308,8 @@ const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, c
     || summary.continuationFlowState
     || summary.underwaterTapeState
     || summary.primaryOwner
+    || showThesisChip
+    || summary.isPostExitReentry
   );
   if (!hasData) return null;
 
@@ -287,6 +336,16 @@ const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, c
         {summary.runnerContextResolved && (
           <span className="rounded-full border border-slate-700/60 bg-slate-800/80 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
             {humanizeDecisionToken(summary.runnerContextResolved)}
+          </span>
+        )}
+        {showThesisChip && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getThesisChipTone(summary.positionThesisState)}`}>
+            {humanizeDecisionToken(summary.positionThesisState)}
+          </span>
+        )}
+        {summary.isPostExitReentry && (
+          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReentryChipTone()}`}>
+            2. Şans
           </span>
         )}
         {summary.continuationFlowState && (
@@ -328,11 +387,9 @@ const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, c
         )}
       </div>
 
-      {(summary.lossGateSuppressedReason || summary.sidewaysReclaimArmed) && (
+      {thesisNotes.length > 0 && (
         <div className="mt-2 text-[10px] text-slate-500">
-          {summary.lossGateSuppressedReason ? `Loss gate: ${translateReason(summary.lossGateSuppressedReason)}` : 'Loss gate nötr'}
-          {summary.lossGateSuppressedReason && summary.sidewaysReclaimArmed ? ' • ' : ''}
-          {summary.sidewaysReclaimArmed ? 'BE reclaim hazır' : ''}
+          {thesisNotes.join(' • ')}
         </div>
       )}
     </div>
@@ -555,6 +612,9 @@ export default function App() {
     longSignals: 0,
     shortSignals: 0,
     activeSignals: 0,
+    postExitReentryWatchersActive: 0,
+    postExitReentryCandidates: 0,
+    postExitReentryTriggered: 0,
     lastUpdate: 0
   });
 
@@ -1642,6 +1702,13 @@ export default function App() {
     if (atrPcts.length === 0) return 2.0;
     return atrPcts.reduce((sum, value) => sum + value, 0) / atrPcts.length;
   })();
+  const postExitWatchersActive = scannerStats.postExitReentryWatchersActive ?? 0;
+  const postExitWatchersCandidates = scannerStats.postExitReentryCandidates ?? 0;
+  const postExitWatchersTriggered = scannerStats.postExitReentryTriggered ?? 0;
+  const showPostExitWatchSummary = settings.strategyMode === 'SMART_V3_RUNNER'
+    || postExitWatchersActive > 0
+    || postExitWatchersCandidates > 0
+    || postExitWatchersTriggered > 0;
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-slate-300 font-sans selection:bg-indigo-500/30">
@@ -1698,6 +1765,19 @@ export default function App() {
               <span className="text-rose-400">
                 🔴 <span className="font-bold">{displayShortSignals}</span>
               </span>
+              {showPostExitWatchSummary && (
+                <>
+                  <span className="text-violet-300 border-l border-slate-700 pl-3">
+                    Watch <span className="font-bold">{postExitWatchersActive}</span>
+                  </span>
+                  <span className="text-cyan-300">
+                    Aday <span className="font-bold">{postExitWatchersCandidates}</span>
+                  </span>
+                  <span className="text-amber-300">
+                    2. Şans <span className="font-bold">{postExitWatchersTriggered}</span>
+                  </span>
+                </>
+              )}
               {lastUpdateTime && (
                 <span className="text-slate-500 border-l border-slate-700 pl-3">
                   Son: {lastUpdateTime.toLocaleTimeString('tr-TR')}
@@ -1789,23 +1869,41 @@ export default function App() {
         />
 
         {/* Scanner Stats - Always visible compact bar */}
-        <div className="grid grid-cols-4 gap-2 mb-4">
-          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Varlık</span>
-            <span className="text-sm font-bold text-white">{scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}<span className="text-[10px] text-slate-600 font-normal">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span></span>
+        <div className="mb-4 space-y-2">
+          <div className="grid grid-cols-4 gap-2">
+            <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+              <span className="text-[10px] text-slate-500 uppercase">Varlık</span>
+              <span className="text-sm font-bold text-white">{scannerStats.scannedCoins ?? scannerStats.analyzedCoins ?? scannerStats.totalCoins}<span className="text-[10px] text-slate-600 font-normal">/{scannerStats.marketUniverseCoins ?? scannerStats.totalCoins}</span></span>
+            </div>
+            <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+              <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
+              <span className="text-sm font-bold text-emerald-400">{displayLongSignals}</span>
+            </div>
+            <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+              <span className="text-[10px] text-slate-500 uppercase">Kısa</span>
+              <span className="text-sm font-bold text-rose-400">{displayShortSignals}</span>
+            </div>
+            <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
+              <span className="text-[10px] text-slate-500 uppercase">Pozisyon</span>
+              <span className="text-sm font-bold text-amber-400">{portfolio.positions.length}</span>
+            </div>
           </div>
-          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Uzun</span>
-            <span className="text-sm font-bold text-emerald-400">{displayLongSignals}</span>
-          </div>
-          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Kısa</span>
-            <span className="text-sm font-bold text-rose-400">{displayShortSignals}</span>
-          </div>
-          <div className="bg-[#151921]/80 border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 uppercase">Pozisyon</span>
-            <span className="text-sm font-bold text-amber-400">{portfolio.positions.length}</span>
-          </div>
+          {showPostExitWatchSummary && (
+            <div className="grid grid-cols-3 gap-2">
+              <div className="bg-[#111827]/80 border border-violet-500/20 rounded-lg px-3 py-2 flex items-center justify-between">
+                <span className="text-[10px] text-slate-500 uppercase">Watch</span>
+                <span className="text-sm font-bold text-violet-300">{postExitWatchersActive}</span>
+              </div>
+              <div className="bg-[#111827]/80 border border-cyan-500/20 rounded-lg px-3 py-2 flex items-center justify-between">
+                <span className="text-[10px] text-slate-500 uppercase">Aday</span>
+                <span className="text-sm font-bold text-cyan-300">{postExitWatchersCandidates}</span>
+              </div>
+              <div className="bg-[#111827]/80 border border-amber-500/20 rounded-lg px-3 py-2 flex items-center justify-between">
+                <span className="text-[10px] text-slate-500 uppercase">2. Şans</span>
+                <span className="text-sm font-bold text-amber-300">{postExitWatchersTriggered}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* TAB CONTENT */}
@@ -2001,6 +2099,8 @@ export default function App() {
                     const tp2RoiPct = Number((pos as any).runtimeTp2RoiPct ?? 0);
                     const tp3RoiPct = Number((pos as any).runtimeTp3RoiPct ?? 0);
                     const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
+                    const positionSummary = getPositionDecisionSummary(pos);
+                    const showThesisChip = Boolean(positionSummary.positionThesisState && positionSummary.positionThesisState !== 'ENTRY_THESIS');
 
                     return (
                       <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
@@ -2012,6 +2112,14 @@ export default function App() {
                             {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TAKİP</span>}
                             <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
                             <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
+                            {showThesisChip && (
+                              <span className={`text-[9px] px-1 py-0.5 rounded ${getThesisChipTone(positionSummary.positionThesisState)}`}>
+                                {humanizeDecisionToken(positionSummary.positionThesisState)}
+                              </span>
+                            )}
+                            {positionSummary.isPostExitReentry && (
+                              <span className={`text-[9px] px-1 py-0.5 rounded ${getReentryChipTone()}`}>2. Şans</span>
+                            )}
                           </div>
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
                         </div>
@@ -2176,6 +2284,8 @@ export default function App() {
                         const tp2RoiPct = Number((pos as any).runtimeTp2RoiPct ?? 0);
                         const tp3RoiPct = Number((pos as any).runtimeTp3RoiPct ?? 0);
                         const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
+                        const positionSummary = getPositionDecisionSummary(pos);
+                        const showThesisChip = Boolean(positionSummary.positionThesisState && positionSummary.positionThesisState !== 'ENTRY_THESIS');
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
@@ -2194,12 +2304,13 @@ export default function App() {
                               </div>
                               <div className="mt-1 flex flex-wrap gap-1">
                                 {(() => {
-                                  const summary = getPositionDecisionSummary(pos);
                                   const chips = [
-                                    summary.entryArchetype ? { label: humanizeDecisionToken(summary.entryArchetype), className: getArchetypeChipTone(summary.entryArchetype) } : null,
-                                    summary.expectancyBand ? { label: humanizeDecisionToken(summary.expectancyBand), className: getExpectancyChipTone(summary.expectancyBand) } : null,
-                                    summary.continuationFlowState ? { label: humanizeDecisionToken(summary.continuationFlowState), className: getStateChipTone(summary.continuationFlowState, 'continuation') } : null,
-                                    summary.underwaterTapeState ? { label: humanizeDecisionToken(summary.underwaterTapeState), className: getStateChipTone(summary.underwaterTapeState, 'underwater') } : null,
+                                    positionSummary.entryArchetype ? { label: humanizeDecisionToken(positionSummary.entryArchetype), className: getArchetypeChipTone(positionSummary.entryArchetype) } : null,
+                                    positionSummary.expectancyBand ? { label: humanizeDecisionToken(positionSummary.expectancyBand), className: getExpectancyChipTone(positionSummary.expectancyBand) } : null,
+                                    showThesisChip ? { label: humanizeDecisionToken(positionSummary.positionThesisState), className: getThesisChipTone(positionSummary.positionThesisState) } : null,
+                                    positionSummary.isPostExitReentry ? { label: '2. Şans', className: getReentryChipTone() } : null,
+                                    positionSummary.continuationFlowState ? { label: humanizeDecisionToken(positionSummary.continuationFlowState), className: getStateChipTone(positionSummary.continuationFlowState, 'continuation') } : null,
+                                    positionSummary.underwaterTapeState ? { label: humanizeDecisionToken(positionSummary.underwaterTapeState), className: getStateChipTone(positionSummary.underwaterTapeState, 'underwater') } : null,
                                   ].filter(Boolean) as Array<{ label: string; className: string }>;
                                   return chips.map((chip) => (
                                     <span key={`${pos.id}-${chip.label}`} className={`text-[9px] px-1 py-0.5 rounded font-semibold ${chip.className}`}>
@@ -2258,19 +2369,26 @@ export default function App() {
                                   <div className="font-mono text-slate-500">BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
                                 )}
                                 {(() => {
-                                  const summary = getPositionDecisionSummary(pos);
                                   const line = [
-                                    summary.selectedViaIntent ? `Intent ${formatSignalIntentVersion(summary.signalIntentVersion, 'V1')}` : '',
-                                    summary.primaryOwner ? `Owner ${summary.primaryOwner}` : '',
-                                    summary.exitOwnerProfile ? `Çıkış ${humanizeDecisionToken(summary.exitOwnerProfile)}` : '',
-                                    summary.holdProfile ? `Tutuş ${humanizeDecisionToken(summary.holdProfile)}` : '',
+                                    positionSummary.selectedViaIntent ? `Intent ${formatSignalIntentVersion(positionSummary.signalIntentVersion, 'V1')}` : '',
+                                    positionSummary.primaryOwner ? `Owner ${positionSummary.primaryOwner}` : '',
+                                    positionSummary.exitOwnerProfile ? `Çıkış ${humanizeDecisionToken(positionSummary.exitOwnerProfile)}` : '',
+                                    positionSummary.holdProfile ? `Tutuş ${humanizeDecisionToken(positionSummary.holdProfile)}` : '',
+                                    positionSummary.isPostExitReentry ? '2. Şans Trade' : '',
                                   ].filter(Boolean).join(' • ');
-                                  if (!line && !summary.lossGateSuppressedReason) return null;
+                                  const thesisLine = [
+                                    positionSummary.reclaimRescueReason ? `Rescue ${humanizeDecisionToken(positionSummary.reclaimRescueReason)}` : '',
+                                    positionSummary.profitContinuationHoldReason ? `Kâr Tutuş ${humanizeDecisionToken(positionSummary.profitContinuationHoldReason)}` : '',
+                                    positionSummary.isPostExitReentry ? formatReentryOriginLabel(pos) : '',
+                                  ].filter(Boolean).join(' • ');
+                                  if (!line && !positionSummary.lossGateSuppressedReason && !thesisLine) return null;
                                   return (
                                     <div className="font-mono text-slate-500">
                                       {line}
-                                      {line && summary.lossGateSuppressedReason ? ' • ' : ''}
-                                      {summary.lossGateSuppressedReason ? `Loss ${translateReason(summary.lossGateSuppressedReason)}` : ''}
+                                      {line && positionSummary.lossGateSuppressedReason ? ' • ' : ''}
+                                      {positionSummary.lossGateSuppressedReason ? `Loss ${translateReason(positionSummary.lossGateSuppressedReason)}` : ''}
+                                      {(line || positionSummary.lossGateSuppressedReason) && thesisLine ? ' • ' : ''}
+                                      {thesisLine}
                                     </div>
                                   );
                                 })()}
@@ -2347,12 +2465,25 @@ export default function App() {
                       ((trade as any).margin && (trade as any).margin > 0 ? (trade.pnl / (trade as any).margin) * 100 : 0);
                     const isLong = trade.side === 'LONG';
                     const isWin = trade.pnl >= 0;
+                    const tradeThesisState = resolveSnapshotString(trade, 'positionThesisState');
+                    const tradeRescueReason = resolveSnapshotString(trade, 'reclaimRescueReason');
+                    const tradeProfitHoldReason = resolveSnapshotString(trade, 'profitContinuationHoldReason');
+                    const isPostExitReentry = resolveSnapshotBoolean(trade, 'isPostExitReentry');
+                    const reentryOriginLabel = formatReentryOriginLabel(trade);
+                    const tradeInsightNotes = [
+                      tradeRescueReason ? `Rescue: ${humanizeDecisionToken(tradeRescueReason)}` : '',
+                      tradeProfitHoldReason ? `Kâr Tutuş: ${humanizeDecisionToken(tradeProfitHoldReason)}` : '',
+                      isPostExitReentry ? `2. Şans: ${reentryOriginLabel}` : '',
+                    ].filter(Boolean);
                     return (
                       <div key={trade.id || `${trade.symbol}_${trade.closeTime}_${i}`} className={`p-3 rounded-lg border ${isWin ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex items-center gap-2">
                             <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'YOK'}</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{trade.side}</span>
+                            {isPostExitReentry && (
+                              <span className={`text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>2. Şans</span>
+                            )}
                           </div>
                           <span className="text-[10px] text-slate-500">
                             {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
@@ -2363,6 +2494,30 @@ export default function App() {
                           <div><span className="text-slate-500">Çıkış</span><div className="font-mono text-white">${formatPrice(trade.exitPrice)}</div></div>
                           <div><span className="text-slate-500">Neden</span><div className="text-slate-400 truncate">{translateReason((trade as any).reason || trade.closeReason)}</div></div>
                         </div>
+                        {(isPostExitReentry || tradeRescueReason || tradeProfitHoldReason || (tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState))) && (
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState) && (
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${getThesisChipTone(tradeThesisState)}`}>
+                                {humanizeDecisionToken(tradeThesisState)}
+                              </span>
+                            )}
+                            {tradeRescueReason && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                                Rescue
+                              </span>
+                            )}
+                            {tradeProfitHoldReason && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                                Kâr Tutuş
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {tradeInsightNotes.length > 0 && (
+                          <div className="mt-1 text-[10px] text-slate-500">
+                            {tradeInsightNotes.join(' • ')}
+                          </div>
+                        )}
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
                           <span className={`text-xs font-mono font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {isWin ? '+' : ''}{formatCurrency(trade.pnl)}
@@ -2402,6 +2557,11 @@ export default function App() {
                         // Use pre-calculated ROI from backend, or calculate if not available
                         const roi = (trade as any).roi !== undefined ? (trade as any).roi :
                           ((trade as any).margin && (trade as any).margin > 0 ? (trade.pnl / (trade as any).margin) * 100 : 0);
+                        const tradeThesisState = resolveSnapshotString(trade, 'positionThesisState');
+                        const tradeRescueReason = resolveSnapshotString(trade, 'reclaimRescueReason');
+                        const tradeProfitHoldReason = resolveSnapshotString(trade, 'profitContinuationHoldReason');
+                        const isPostExitReentry = resolveSnapshotBoolean(trade, 'isPostExitReentry');
+                        const reentryOriginLabel = formatReentryOriginLabel(trade);
                         return (
                           <tr key={trade.id || `${trade.symbol}_${trade.closeTime}_${i}`} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
                             <td className="py-3 px-4 text-slate-400 font-mono text-xs">
@@ -2425,9 +2585,42 @@ export default function App() {
                               className="py-3 px-4 text-xs text-slate-400 cursor-help relative group"
                               title={getReasonTooltip(trade)}
                             >
-                              <span className="hover:text-white transition-colors">
-                                {translateReason((trade as any).reason || trade.closeReason)}
-                              </span>
+                              <div className="space-y-1">
+                                <span className="hover:text-white transition-colors">
+                                  {translateReason((trade as any).reason || trade.closeReason)}
+                                </span>
+                                {(isPostExitReentry || tradeRescueReason || tradeProfitHoldReason || (tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState))) && (
+                                  <div className="flex flex-wrap gap-1">
+                                    {isPostExitReentry && (
+                                      <span className={`inline-flex text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>2. Şans</span>
+                                    )}
+                                    {tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState) && (
+                                      <span className={`inline-flex text-[9px] px-1 py-0.5 rounded font-semibold ${getThesisChipTone(tradeThesisState)}`}>
+                                        {humanizeDecisionToken(tradeThesisState)}
+                                      </span>
+                                    )}
+                                    {tradeRescueReason && (
+                                      <span className="inline-flex text-[9px] px-1 py-0.5 rounded font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                                        Rescue
+                                      </span>
+                                    )}
+                                    {tradeProfitHoldReason && (
+                                      <span className="inline-flex text-[9px] px-1 py-0.5 rounded font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                                        Kâr Tutuş
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                                {(tradeRescueReason || tradeProfitHoldReason || isPostExitReentry) && (
+                                  <div className="text-[10px] text-slate-500">
+                                    {[
+                                      tradeRescueReason ? `Rescue: ${humanizeDecisionToken(tradeRescueReason)}` : '',
+                                      tradeProfitHoldReason ? `Kâr Tutuş: ${humanizeDecisionToken(tradeProfitHoldReason)}` : '',
+                                      isPostExitReentry ? `2. Şans: ${reentryOriginLabel}` : '',
+                                    ].filter(Boolean).join(' • ')}
+                                  </div>
+                                )}
+                              </div>
                               {/* Tooltip on hover */}
                               <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-50 w-64 p-3 bg-slate-800 border border-slate-600 rounded-lg shadow-xl text-xs whitespace-pre-line">
                                 <div className="text-slate-300 font-mono">
