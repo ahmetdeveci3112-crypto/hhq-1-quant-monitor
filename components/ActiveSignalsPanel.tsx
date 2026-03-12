@@ -223,8 +223,8 @@ const extractDecisionSummary = (item: Record<string, any>): DecisionSummary => {
     const indicatorPolicy = decisionContext.indicatorPolicy && typeof decisionContext.indicatorPolicy === 'object' ? decisionContext.indicatorPolicy : {};
     const expectancy = item.expectancy && typeof item.expectancy === 'object' ? item.expectancy : {};
     const primaryOwner = Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
-        ? humanizeDecisionToken(indicatorPolicy.primary[0])
-        : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '');
+        ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
+        : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', '');
     const rankingScoreRaw = Number(expectancy.rankingScore ?? item.expectancyRankingScore ?? 0);
     const pendingPatienceRaw = Number(expectancy.pendingPatienceBias ?? item.pendingPatienceBias ?? 0);
 

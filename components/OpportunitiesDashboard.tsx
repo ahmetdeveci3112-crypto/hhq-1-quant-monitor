@@ -104,7 +104,7 @@ const getOpportunityDecisionSummary = (coin: CoinOpportunity) => {
         runnerContextResolved: String(coin.runnerContextResolved || ''),
         replayFidelity: String(coin.replayFidelity || ''),
         primaryOwner: Array.isArray(indicatorPolicy.primary) && indicatorPolicy.primary.length > 0
-            ? humanizeDecisionToken(indicatorPolicy.primary[0])
+            ? humanizeDecisionToken(indicatorPolicy.primary[0], '')
             : humanizeDecisionToken(decisionContext.gatePolicy?.primary_owner || decisionContext.gatePolicy?.primaryOwner || '', ''),
         rankingScore: Number.isFinite(rankingScoreRaw) && rankingScoreRaw > 0 ? rankingScoreRaw : null,
     };
