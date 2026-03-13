@@ -14609,6 +14609,14 @@ V3_THESIS_EXEC_SCORE_FLOOR = 60.0
 V3_RESCUE_VOLUME_FLOOR = 1.15
 V3_PROFIT_HOLD_VOLUME_FLOOR = 1.10
 V3_THESIS_OBI_ALIGN_THRESHOLD = 2.0
+V3_AGED_PROFIT_GUARD_MODE = str(os.environ.get('V3_AGED_PROFIT_GUARD_MODE', 'apply') or 'apply').strip().lower()
+AGED_PROFIT_GUARD_STATE_IDLE = "IDLE"
+AGED_PROFIT_GUARD_STATE_WATCHING = "WATCHING"
+AGED_PROFIT_GUARD_STATE_NON_SUPPORTING = "NON_SUPPORTING"
+AGED_PROFIT_GUARD_STATE_BE_FLOOR_ARMED = "BE_FLOOR_ARMED"
+V3_AGED_PROFIT_WATCH_START_SEC = 3600.0
+V3_AGED_PROFIT_BE_FLOOR_SEC = 4 * 3600.0
+V3_AGED_PROFIT_NON_SUPPORTING_PERSISTENCE_SEC = 900.0
 V3_POST_EXIT_REENTRY_MODE = str(os.environ.get('V3_POST_EXIT_REENTRY_MODE', 'full_apply') or 'full_apply').strip().lower()
 POST_EXIT_REENTRY_STATE_ARMED = "ARMED"
 POST_EXIT_REENTRY_STATE_CANDIDATE = "CANDIDATE"
@@ -15552,6 +15560,9 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
         str(profit_hold_accepted),
         str(safe_pos.get('reclaimRescueReason', '') or ''),
         str(safe_pos.get('profitContinuationHoldReason', '') or ''),
+        str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
+        str(safe_pos.get('agedProfitGuardReason', '') or ''),
+        str(_coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0) > 0),
     ])
     last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
     last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
@@ -15583,6 +15594,8 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'rescueAccepted': rescue_accepted,
             'profitHoldCandidate': profit_hold_candidate,
             'profitHoldAccepted': profit_hold_accepted,
+            'agedProfitGuardState': str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
+            'agedProfitGuardReason': str(safe_pos.get('agedProfitGuardReason', '') or ''),
         },
         outcome={
             'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
@@ -15593,6 +15606,11 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'profitHoldReason': str(safe_pos.get('profitContinuationHoldReason', '') or ''),
             'rescueConfidence': round(_coerce_float(safe_pos.get('reclaimRescueConfidence', 0.0), 0.0), 4),
             'profitHoldConfidence': round(_coerce_float(safe_pos.get('profitContinuationHoldConfidence', 0.0), 0.0), 4),
+            'agedProfitGuardState': str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
+            'agedProfitGuardReason': str(safe_pos.get('agedProfitGuardReason', '') or ''),
+            'agedProfitPositiveSinceTs': round(_coerce_float(safe_pos.get('agedProfitPositiveSinceTs', 0.0), 0.0), 3),
+            'agedProfitNonSupportingSinceTs': round(_coerce_float(safe_pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0), 3),
+            'agedProfitBeFloorArmedTs': round(_coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0), 3),
         },
         created_ts=now_ms,
     )
@@ -16178,6 +16196,11 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'positionThesisState': str(safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_ENTRY)) or POSITION_THESIS_ENTRY),
         'reclaimRescueReason': str(safe_trade.get('reclaimRescueReason', close_snapshot.get('reclaimRescueReason', '')) or ''),
         'profitContinuationHoldReason': str(safe_trade.get('profitContinuationHoldReason', close_snapshot.get('profitContinuationHoldReason', '')) or ''),
+        'agedProfitGuardState': str(safe_trade.get('agedProfitGuardState', close_snapshot.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)) or AGED_PROFIT_GUARD_STATE_IDLE),
+        'agedProfitGuardReason': str(safe_trade.get('agedProfitGuardReason', close_snapshot.get('agedProfitGuardReason', '')) or ''),
+        'agedProfitPositiveSinceTs': _coerce_float(safe_trade.get('agedProfitPositiveSinceTs', close_snapshot.get('agedProfitPositiveSinceTs', 0.0)), 0.0),
+        'agedProfitNonSupportingSinceTs': _coerce_float(safe_trade.get('agedProfitNonSupportingSinceTs', close_snapshot.get('agedProfitNonSupportingSinceTs', 0.0)), 0.0),
+        'agedProfitBeFloorArmedTs': _coerce_float(safe_trade.get('agedProfitBeFloorArmedTs', close_snapshot.get('agedProfitBeFloorArmedTs', 0.0)), 0.0),
         'postExitWatchState': str(safe_trade.get('postExitWatchState', '') or ''),
         'postExitReentryTriggered': bool(safe_trade.get('postExitReentryTriggered', False)),
         'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
@@ -16235,6 +16258,8 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
                 'positionThesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_ENTRY)),
+                'agedProfitGuardState': safe_trade.get('agedProfitGuardState', close_snapshot.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)),
+                'agedProfitGuardReason': safe_trade.get('agedProfitGuardReason', close_snapshot.get('agedProfitGuardReason', '')),
             },
             'outcome': {
                 'accepted': True,
@@ -16274,6 +16299,11 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'thesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_EXIT_CONFIRMED)),
                 'rescueReason': safe_trade.get('reclaimRescueReason', close_snapshot.get('reclaimRescueReason', '')),
                 'profitHoldReason': safe_trade.get('profitContinuationHoldReason', close_snapshot.get('profitContinuationHoldReason', '')),
+                'agedProfitGuardState': safe_trade.get('agedProfitGuardState', close_snapshot.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)),
+                'agedProfitGuardReason': safe_trade.get('agedProfitGuardReason', close_snapshot.get('agedProfitGuardReason', '')),
+                'agedProfitPositiveSinceTs': safe_trade.get('agedProfitPositiveSinceTs', close_snapshot.get('agedProfitPositiveSinceTs', 0.0)),
+                'agedProfitNonSupportingSinceTs': safe_trade.get('agedProfitNonSupportingSinceTs', close_snapshot.get('agedProfitNonSupportingSinceTs', 0.0)),
+                'agedProfitBeFloorArmedTs': safe_trade.get('agedProfitBeFloorArmedTs', close_snapshot.get('agedProfitBeFloorArmedTs', 0.0)),
             },
             'sourceVersion': 'approx_ohlcv_v1',
             'source_version': 'approx_ohlcv_v1',
@@ -16708,6 +16738,10 @@ def _is_v3_thesis_revalidation_enabled() -> bool:
     return str(V3_THESIS_REVALIDATION_MODE or "apply").strip().lower() != "off"
 
 
+def _is_v3_aged_profit_guard_enabled() -> bool:
+    return str(V3_AGED_PROFIT_GUARD_MODE or "apply").strip().lower() != "off"
+
+
 def _ensure_v3_thesis_state_fields(pos: dict) -> None:
     safe_pos = pos if isinstance(pos, dict) else {}
     safe_pos.setdefault('positionThesisState', POSITION_THESIS_ENTRY)
@@ -16726,6 +16760,173 @@ def _ensure_v3_thesis_state_fields(pos: dict) -> None:
     safe_pos.setdefault('_reclaimRescueUsed', False)
     safe_pos.setdefault('_profitContinuationHoldCandidateSinceTs', 0.0)
     safe_pos.setdefault('_profitContinuationHoldUsed', False)
+    safe_pos.setdefault('agedProfitPositiveSinceTs', 0.0)
+    safe_pos.setdefault('agedProfitNonSupportingSinceTs', 0.0)
+    safe_pos.setdefault('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)
+    safe_pos.setdefault('agedProfitBeFloorArmedTs', 0.0)
+    safe_pos.setdefault('agedProfitGuardReason', '')
+
+
+def evaluate_v3_aged_profit_guard(
+    pos: dict,
+    current_price: float,
+    profit_ladder: dict,
+    underwater_ctx: dict,
+    thesis_ctx: dict,
+) -> dict:
+    """Protect long-lived small profits without tightening V3 trail behavior."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    _ensure_v3_thesis_state_fields(safe_pos)
+    result = {
+        'watching': False,
+        'should_arm_be_floor': False,
+        'reason': str(safe_pos.get('agedProfitGuardReason', '') or ''),
+        'candidate_floor_price': 0.0,
+        'guard_state': str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
+        'positive_age_sec': 0.0,
+        'non_supporting_age_sec': 0.0,
+    }
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return result
+    if not _is_v3_aged_profit_guard_enabled():
+        return result
+
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else {}
+    thesis_state = str(
+        (thesis_ctx or {}).get('thesis_state', safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY))
+        or safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY)
+        or POSITION_THESIS_ENTRY
+    )
+    continuation_state = str(
+        ladder.get('continuation_flow_state', safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL))
+        or safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)
+        or V3_CONTINUATION_NEUTRAL
+    )
+    current_roi_pct = _coerce_float(
+        ladder.get('current_roi_pct', compute_position_roi_pct(safe_pos, current_price=current_price)),
+        compute_position_roi_pct(safe_pos, current_price=current_price),
+    )
+    now_ts = time.time()
+    partial_tp_state = safe_pos.get('partial_tp_state', {})
+    partial_tp_hit = any(bool(v) for v in partial_tp_state.values()) if isinstance(partial_tp_state, dict) else False
+    adverse_state = str(state_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL) in (
+        V3_UNDERWATER_ADVERSE_STRONG,
+        V3_UNDERWATER_ADVERSE_WEAK,
+    )
+
+    if current_roi_pct <= 0:
+        if _coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0) <= 0:
+            safe_pos['agedProfitPositiveSinceTs'] = 0.0
+            safe_pos['agedProfitNonSupportingSinceTs'] = 0.0
+            safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_IDLE
+            safe_pos['agedProfitGuardReason'] = 'ROI_NON_POSITIVE'
+        result.update({
+            'reason': str(safe_pos.get('agedProfitGuardReason', 'ROI_NON_POSITIVE') or 'ROI_NON_POSITIVE'),
+            'guard_state': str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
+        })
+        return result
+
+    if _coerce_float(safe_pos.get('agedProfitPositiveSinceTs', 0.0), 0.0) <= 0:
+        safe_pos['agedProfitPositiveSinceTs'] = now_ts
+    positive_age_sec = max(0.0, now_ts - _coerce_float(safe_pos.get('agedProfitPositiveSinceTs', 0.0), now_ts))
+    result['positive_age_sec'] = round(positive_age_sec, 2)
+
+    if positive_age_sec < V3_AGED_PROFIT_WATCH_START_SEC:
+        safe_pos['agedProfitNonSupportingSinceTs'] = 0.0
+        safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_IDLE
+        safe_pos['agedProfitGuardReason'] = 'PROFIT_TOO_YOUNG'
+        result.update({
+            'reason': 'PROFIT_TOO_YOUNG',
+            'guard_state': AGED_PROFIT_GUARD_STATE_IDLE,
+        })
+        return result
+
+    if bool(safe_pos.get('isTrailingActive', False)) or bool(safe_pos.get('trailArmed', False)) or partial_tp_hit:
+        safe_pos['agedProfitNonSupportingSinceTs'] = 0.0
+        safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_IDLE
+        safe_pos['agedProfitGuardReason'] = 'PROTECTED_ALREADY'
+        result.update({
+            'reason': 'PROTECTED_ALREADY',
+            'guard_state': AGED_PROFIT_GUARD_STATE_IDLE,
+        })
+        return result
+
+    if bool(safe_pos.get('breakeven_activated', False)) or _coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0) > 0:
+        safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_BE_FLOOR_ARMED
+        if not str(safe_pos.get('agedProfitGuardReason', '') or '').strip():
+            safe_pos['agedProfitGuardReason'] = 'BE_ALREADY_ACTIVE'
+        result.update({
+            'watching': True,
+            'reason': str(safe_pos.get('agedProfitGuardReason', 'BE_ALREADY_ACTIVE') or 'BE_ALREADY_ACTIVE'),
+            'guard_state': AGED_PROFIT_GUARD_STATE_BE_FLOOR_ARMED,
+        })
+        return result
+
+    if thesis_state in (POSITION_THESIS_PROFIT_CONTINUATION_HOLD, POSITION_THESIS_CONTINUATION_RESCUE) or adverse_state:
+        safe_pos['agedProfitNonSupportingSinceTs'] = 0.0
+        safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_WATCHING
+        safe_pos['agedProfitGuardReason'] = 'THESIS_SUPPORT' if thesis_state in (
+            POSITION_THESIS_PROFIT_CONTINUATION_HOLD,
+            POSITION_THESIS_CONTINUATION_RESCUE,
+        ) else 'HARD_RISK_ACTIVE'
+        result.update({
+            'watching': True,
+            'reason': str(safe_pos.get('agedProfitGuardReason', '') or 'WATCHING'),
+            'guard_state': AGED_PROFIT_GUARD_STATE_WATCHING,
+        })
+        return result
+
+    if continuation_state == V3_CONTINUATION_SUPPORTING:
+        safe_pos['agedProfitNonSupportingSinceTs'] = 0.0
+        safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_WATCHING
+        safe_pos['agedProfitGuardReason'] = 'SUPPORTING_FLOW'
+        result.update({
+            'watching': True,
+            'reason': 'SUPPORTING_FLOW',
+            'guard_state': AGED_PROFIT_GUARD_STATE_WATCHING,
+        })
+        return result
+
+    if _coerce_float(safe_pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0) <= 0:
+        safe_pos['agedProfitNonSupportingSinceTs'] = now_ts
+    non_supporting_age_sec = max(0.0, now_ts - _coerce_float(safe_pos.get('agedProfitNonSupportingSinceTs', 0.0), now_ts))
+    safe_pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_NON_SUPPORTING
+    safe_pos['agedProfitGuardReason'] = 'NON_SUPPORTING_FLOW'
+    result.update({
+        'watching': True,
+        'reason': 'NON_SUPPORTING_FLOW',
+        'guard_state': AGED_PROFIT_GUARD_STATE_NON_SUPPORTING,
+        'non_supporting_age_sec': round(non_supporting_age_sec, 2),
+    })
+
+    if positive_age_sec < V3_AGED_PROFIT_BE_FLOOR_SEC or non_supporting_age_sec < V3_AGED_PROFIT_NON_SUPPORTING_PERSISTENCE_SEC:
+        return result
+
+    be_ctx = compute_buffered_breakeven_price(safe_pos, reason='AGED_PROFIT_NO_SUPPORT')
+    candidate_floor_price = _coerce_float(be_ctx.get('price', 0.0), 0.0)
+    atr = _coerce_float(safe_pos.get('atr', 0.0), 0.0)
+    tick = get_tick_size(str(safe_pos.get('symbol', '') or ''))
+    safe_gap = max((atr * 0.15) if atr > 0 else 0.0, tick * 5)
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    price_has_room = bool(
+        candidate_floor_price > 0
+        and (
+            (side == 'LONG' and float(current_price or 0.0) >= candidate_floor_price + safe_gap)
+            or (side == 'SHORT' and float(current_price or 0.0) <= candidate_floor_price - safe_gap)
+        )
+    )
+    result['candidate_floor_price'] = round(candidate_floor_price, 8) if candidate_floor_price > 0 else 0.0
+    if not candidate_floor_price or not price_has_room:
+        safe_pos['agedProfitGuardReason'] = 'AGED_PROFIT_INSUFFICIENT_GAP'
+        result['reason'] = 'AGED_PROFIT_INSUFFICIENT_GAP'
+        return result
+
+    result.update({
+        'should_arm_be_floor': True,
+        'reason': 'AGED_PROFIT_NO_SUPPORT',
+    })
+    return result
 
 
 def evaluate_v3_position_thesis_revalidation(
@@ -32529,9 +32730,40 @@ class TimeBasedPositionManager:
             profit_ladder=profit_ladder,
             underwater_ctx=underwater_ctx,
         )
+        aged_profit_ctx = evaluate_v3_aged_profit_guard(
+            pos,
+            current_price=current_price,
+            profit_ladder=profit_ladder,
+            underwater_ctx=underwater_ctx,
+            thesis_ctx=thesis_ctx,
+        )
         maybe_queue_position_state_snapshot(pos, reason='v3_runner_runtime')
         if thesis_ctx.get('thesis_state') != prev_thesis_state or thesis_ctx.get('armed', False):
             maybe_queue_position_state_snapshot(pos, reason='v3_thesis_revalidation')
+        if aged_profit_ctx.get('should_arm_be_floor', False):
+            candidate_floor = _coerce_float(aged_profit_ctx.get('candidate_floor_price', 0.0), 0.0)
+            effective_stop = get_effective_stop_price(pos)
+            already_protected = bool(
+                candidate_floor > 0
+                and (
+                    (pos.get('side', 'LONG') == 'LONG' and effective_stop >= candidate_floor > 0)
+                    or (pos.get('side', 'LONG') == 'SHORT' and effective_stop > 0 and effective_stop <= candidate_floor)
+                )
+            )
+            if already_protected or apply_sl_floor(pos, candidate_floor, 'AGED_PROFIT_BE_GUARD'):
+                pos['agedProfitBeFloorArmedTs'] = now_ts
+                pos['agedProfitGuardState'] = AGED_PROFIT_GUARD_STATE_BE_FLOOR_ARMED
+                pos['agedProfitGuardReason'] = 'AGED_PROFIT_ALREADY_PROTECTED' if already_protected else 'AGED_PROFIT_NO_SUPPORT'
+                if not already_protected:
+                    pos['breakeven_activated'] = True
+                    if pos.get('isLive', False):
+                        await self._sync_v3_protective_order(pos, candidate_floor, 'AGED_PROFIT_BE_GUARD')
+                logger.info(
+                    f"🛡️ AGED_PROFIT_BE_GUARD: {pos.get('symbol', '?')} {pos.get('side', 'LONG')} "
+                    f"roi={current_roi:.1f}% flow={profit_ladder.get('continuation_flow_state', V3_CONTINUATION_NEUTRAL)} "
+                    f"floor=${candidate_floor:.6f} protected={int(already_protected)}"
+                )
+                maybe_queue_position_state_snapshot(pos, reason='v3_aged_profit_be_guard')
         sideways_reclaim = evaluate_v3_sideways_reclaim_signal(
             pos,
             current_price,
@@ -46591,6 +46823,11 @@ class PaperTradingEngine:
             "reclaimRescueConfidence": _coerce_float(pos.get('reclaimRescueConfidence', 0.0), 0.0),
             "profitContinuationHoldReason": pos.get('profitContinuationHoldReason', ''),
             "profitContinuationHoldConfidence": _coerce_float(pos.get('profitContinuationHoldConfidence', 0.0), 0.0),
+            "agedProfitGuardState": pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE),
+            "agedProfitGuardReason": pos.get('agedProfitGuardReason', ''),
+            "agedProfitPositiveSinceTs": _coerce_float(pos.get('agedProfitPositiveSinceTs', 0.0), 0.0),
+            "agedProfitNonSupportingSinceTs": _coerce_float(pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0),
+            "agedProfitBeFloorArmedTs": _coerce_float(pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0),
             "isPostExitReentry": bool(pos.get('isPostExitReentry', False)),
             "reentryOrigin": pos.get('reentryOrigin', ''),
             "reentryOriginTradeId": str(pos.get('reentryOriginTradeId', '') or ''),
@@ -46683,6 +46920,11 @@ class PaperTradingEngine:
                 'reclaimRescueConfidence': _coerce_float(pos.get('reclaimRescueConfidence', 0.0), 0.0),
                 'profitContinuationHoldReason': pos.get('profitContinuationHoldReason', ''),
                 'profitContinuationHoldConfidence': _coerce_float(pos.get('profitContinuationHoldConfidence', 0.0), 0.0),
+                'agedProfitGuardState': pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE),
+                'agedProfitGuardReason': pos.get('agedProfitGuardReason', ''),
+                'agedProfitPositiveSinceTs': _coerce_float(pos.get('agedProfitPositiveSinceTs', 0.0), 0.0),
+                'agedProfitNonSupportingSinceTs': _coerce_float(pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0),
+                'agedProfitBeFloorArmedTs': _coerce_float(pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0),
                 'isPostExitReentry': bool(pos.get('isPostExitReentry', False)),
                 'reentryOrigin': pos.get('reentryOrigin', ''),
                 'reentryOriginTradeId': str(pos.get('reentryOriginTradeId', '') or ''),

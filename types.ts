@@ -210,6 +210,11 @@ export interface Position {
   positionThesisState?: string;
   reclaimRescueReason?: string;
   profitContinuationHoldReason?: string;
+  agedProfitGuardState?: string;
+  agedProfitGuardReason?: string;
+  agedProfitPositiveSinceTs?: number;
+  agedProfitNonSupportingSinceTs?: number;
+  agedProfitBeFloorArmedTs?: number;
   isPostExitReentry?: boolean;
   reentryOrigin?: string;
   reentryOriginTradeId?: string;
@@ -326,6 +331,11 @@ export interface Trade {
   positionThesisState?: string;
   reclaimRescueReason?: string;
   profitContinuationHoldReason?: string;
+  agedProfitGuardState?: string;
+  agedProfitGuardReason?: string;
+  agedProfitPositiveSinceTs?: number;
+  agedProfitNonSupportingSinceTs?: number;
+  agedProfitBeFloorArmedTs?: number;
   isPostExitReentry?: boolean;
   reentryOrigin?: string;
   reentryOriginTradeId?: string;
@@ -450,6 +460,11 @@ export interface ReplaySearchResult {
   positionThesisState?: string;
   reclaimRescueReason?: string;
   profitContinuationHoldReason?: string;
+  agedProfitGuardState?: string;
+  agedProfitGuardReason?: string;
+  agedProfitPositiveSinceTs?: number;
+  agedProfitNonSupportingSinceTs?: number;
+  agedProfitBeFloorArmedTs?: number;
   postExitWatchState?: string;
   postExitReentryTriggered?: boolean;
   postExitReentryReason?: string;

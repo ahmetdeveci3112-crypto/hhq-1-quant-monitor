@@ -199,6 +199,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Partial', value: String(report.partial_count || 0) },
             { label: 'Giveback', value: formatPct(report.giveback) },
             { label: 'Thesis', value: humanizeToken(trade.positionThesisState, '—') },
+            { label: 'Aged Guard', value: humanizeToken(trade.agedProfitGuardState, '—') },
             { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
             {
                 label: 'Re-entry',
@@ -528,6 +529,26 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.profitContinuationHoldReason, '—')}</div>
                                             </div>
                                             <div>
+                                                <div className="text-slate-500 text-xs">Aged Guard</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.agedProfitGuardState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Guard Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.agedProfitGuardReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Kârda Since</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.agedProfitPositiveSinceTs ? formatTs(replayTrade.trade.agedProfitPositiveSinceTs * 1000) : '—'}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Support Lost</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.agedProfitNonSupportingSinceTs ? formatTs(replayTrade.trade.agedProfitNonSupportingSinceTs * 1000) : '—'}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">BE Guard Armed</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.agedProfitBeFloorArmedTs ? formatTs(replayTrade.trade.agedProfitBeFloorArmedTs * 1000) : 'Hayır'}</div>
+                                            </div>
+                                            <div>
                                                 <div className="text-slate-500 text-xs">Post-Exit Watch</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchState, '—')}</div>
                                             </div>
@@ -559,8 +580,8 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
                                                     ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
-                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'rescueReason', 'profitHoldReason']),
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'agedProfitGuardState', 'agedProfitGuardReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
+                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs']),
                                                 ].slice(0, 12);
                                                 return (
                                                     <details
