@@ -116,6 +116,52 @@ def test_fakeout_reclaim_guard_skips_hostile_flow(monkeypatch):
     assert pos["fakeoutReclaimHoldArmed"] is False
 
 
+def test_fakeout_reclaim_guard_skips_on_structure_failure(monkeypatch):
+    pos = _build_reclaim_pos(
+        structureTrend="DOWN",
+        breakoutRetestState="FAILED_BREAKDOWN",
+        patternBias="NEUTRAL",
+        patternConfidence=0.82,
+    )
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+
+    result = main.evaluate_v3_fakeout_reclaim_guard(
+        pos,
+        current_price=99.95,
+        current_roi_pct=-0.5,
+        underwater_ctx=_underwater_ctx(),
+        thesis_ctx=_thesis_ctx(),
+        close_reason="SIDEWAYS_RECLAIM_CLOSE",
+    )
+
+    assert result["fire_hold"] is False
+    assert result["block_close"] is False
+    assert result["reason"] == "STRUCTURE_FAILURE"
+
+
+def test_fakeout_reclaim_guard_keeps_hold_when_structure_supports_continuation(monkeypatch):
+    pos = _build_reclaim_pos(
+        structureTrend="UP",
+        breakoutRetestState="BULL_RETEST_HOLD",
+        patternBias="CONTINUATION",
+        patternConfidence=0.84,
+    )
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+
+    result = main.evaluate_v3_fakeout_reclaim_guard(
+        pos,
+        current_price=99.95,
+        current_roi_pct=-0.5,
+        underwater_ctx=_underwater_ctx(),
+        thesis_ctx=_thesis_ctx(),
+        close_reason="SIDEWAYS_RECLAIM_CLOSE",
+    )
+
+    assert result["fire_hold"] is True
+    assert result["block_close"] is True
+    assert pos["fakeoutReclaimHoldArmed"] is True
+
+
 def test_fakeout_reclaim_guard_recovers_after_persistence(monkeypatch):
     pos = _build_reclaim_pos()
     monkeypatch.setattr(main.time, "time", lambda: 1000.0)

@@ -262,6 +262,11 @@ const getThesisChipTone = (value: string): string => {
 };
 
 const getReentryChipTone = (): string => 'bg-violet-500/15 text-violet-300 border border-violet-500/25';
+const getReentryBadgeLabel = (item: any): string => (
+  String(resolveSnapshotString(item, 'postExitReentryEntryMode') || '').toUpperCase() === 'SHALLOW_PULLBACK'
+    ? '2. Şans • Sığ Giriş'
+    : '2. Şans'
+);
 
 const resolveSnapshotString = (item: any, field: string): string => {
   const value = item?.[field] ?? item?.closeSnapshot?.[field] ?? item?.signalSnapshot?.[field] ?? '';
@@ -360,7 +365,7 @@ const PositionDecisionHUD: React.FC<{ pos: any; compact?: boolean }> = ({ pos, c
         )}
         {summary.isPostExitReentry && (
           <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReentryChipTone()}`}>
-            2. Şans
+            {getReentryBadgeLabel(item)}
           </span>
         )}
         {summary.continuationFlowState && (
@@ -2205,7 +2210,7 @@ export default function App() {
                               </span>
                             )}
                             {positionSummary.isPostExitReentry && (
-                              <span className={`text-[9px] px-1 py-0.5 rounded ${getReentryChipTone()}`}>2. Şans</span>
+                              <span className={`text-[9px] px-1 py-0.5 rounded ${getReentryChipTone()}`}>{getReentryBadgeLabel(pos)}</span>
                             )}
                           </div>
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
@@ -2569,7 +2574,7 @@ export default function App() {
                             <span className="font-bold text-white text-sm">{trade.symbol?.replace('USDT', '') || 'YOK'}</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{trade.side}</span>
                             {isPostExitReentry && (
-                              <span className={`text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>2. Şans</span>
+                              <span className={`text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>{getReentryBadgeLabel(trade)}</span>
                             )}
                           </div>
                           <span className="text-[10px] text-slate-500">
@@ -2679,7 +2684,7 @@ export default function App() {
                                 {(isPostExitReentry || tradeRescueReason || tradeProfitHoldReason || (tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState))) && (
                                   <div className="flex flex-wrap gap-1">
                                     {isPostExitReentry && (
-                                      <span className={`inline-flex text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>2. Şans</span>
+                                      <span className={`inline-flex text-[9px] px-1 py-0.5 rounded font-semibold ${getReentryChipTone()}`}>{getReentryBadgeLabel(trade)}</span>
                                     )}
                                     {tradeThesisState && !['ENTRY_THESIS', 'EXIT_CONFIRMED'].includes(tradeThesisState) && (
                                       <span className={`inline-flex text-[9px] px-1 py-0.5 rounded font-semibold ${getThesisChipTone(tradeThesisState)}`}>

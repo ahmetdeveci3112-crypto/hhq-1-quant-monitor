@@ -175,6 +175,11 @@ const getReplayTone = (value: string): string => (
 );
 
 const getReentryTone = (): string => 'bg-violet-500/15 text-violet-300 border border-violet-500/25';
+const getReentryBadgeLabel = (item?: Record<string, any>): string => (
+    String(item?.postExitReentryEntryMode || '').toUpperCase() === 'SHALLOW_PULLBACK'
+        ? '2. Şans • Sığ Giriş'
+        : '2. Şans'
+);
 
 const formatReentryOriginLabel = (item?: Record<string, any>): string => {
     const exitReason = String(item?.reentryOriginExitReason || '');
@@ -250,7 +255,7 @@ const DecisionBrief: React.FC<{ summary: DecisionSummary; compact?: boolean; ite
                 )}
                 {isPostExitReentry && (
                     <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${getReentryTone()}`}>
-                        2. Şans
+                        {getReentryBadgeLabel(item)}
                     </span>
                 )}
             </div>

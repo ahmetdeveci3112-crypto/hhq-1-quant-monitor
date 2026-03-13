@@ -227,6 +227,21 @@ export interface Position {
   reentryOriginTradeId?: string;
   reentryOriginExitReason?: string;
   reentryWatcherId?: string;
+  postExitReentryEntryMode?: string;
+  postExitReentryPullbackPctOriginal?: number;
+  postExitReentryPullbackPctApplied?: number;
+  postExitReentryConfirmDelaySec?: number;
+  postExitReentryExpiresSec?: number;
+  postExitReentryExecutionPriority?: string;
+  structureTrend?: string;
+  swingState?: string;
+  compressionState?: string;
+  breakoutRetestState?: string;
+  srContext?: string;
+  patternBias?: string;
+  patternConfidence?: number;
+  patternSource?: string;
+  structureVersion?: string;
 }
 
 // Phase 139+232: Comprehensive close reason type matching all backend reasons
@@ -355,6 +370,21 @@ export interface Trade {
   reentryOriginTradeId?: string;
   reentryOriginExitReason?: string;
   reentryWatcherId?: string;
+  postExitReentryEntryMode?: string;
+  postExitReentryPullbackPctOriginal?: number;
+  postExitReentryPullbackPctApplied?: number;
+  postExitReentryConfirmDelaySec?: number;
+  postExitReentryExpiresSec?: number;
+  postExitReentryExecutionPriority?: string;
+  structureTrend?: string;
+  swingState?: string;
+  compressionState?: string;
+  breakoutRetestState?: string;
+  srContext?: string;
+  patternBias?: string;
+  patternConfidence?: number;
+  patternSource?: string;
+  structureVersion?: string;
 }
 
 export interface IndicatorPolicy {
@@ -417,6 +447,15 @@ export interface DecisionContext {
   selectedViaIntent?: boolean;
   signalIntentVersion?: string;
   alternateIntent?: AlternateIntent;
+  structureTrend?: string;
+  swingState?: string;
+  compressionState?: string;
+  breakoutRetestState?: string;
+  srContext?: string;
+  patternBias?: string;
+  patternConfidence?: number;
+  patternSource?: string;
+  structureVersion?: string;
 }
 
 export interface ExpectancyForecast {
@@ -491,6 +530,21 @@ export interface ReplaySearchResult {
   postExitReentryReason?: string;
   postExitReentryOutcome?: string;
   postExitReentryTradeId?: string;
+  postExitReentryEntryMode?: string;
+  postExitReentryPullbackPctOriginal?: number;
+  postExitReentryPullbackPctApplied?: number;
+  postExitReentryConfirmDelaySec?: number;
+  postExitReentryExpiresSec?: number;
+  postExitReentryExecutionPriority?: string;
+  structureTrend?: string;
+  swingState?: string;
+  compressionState?: string;
+  breakoutRetestState?: string;
+  srContext?: string;
+  patternBias?: string;
+  patternConfidence?: number;
+  patternSource?: string;
+  structureVersion?: string;
   peakRoi?: number;
   realizedPeakCaptureRatio?: number;
   giveback?: number;
@@ -902,6 +956,12 @@ export interface PendingEntry {
   reentryOriginTradeId?: string;
   reentryOriginExitReason?: string;
   reentryWatcherId?: string;
+  postExitReentryEntryMode?: string;
+  postExitReentryPullbackPctOriginal?: number;
+  postExitReentryPullbackPctApplied?: number;
+  postExitReentryConfirmDelaySec?: number;
+  postExitReentryExpiresSec?: number;
+  postExitReentryExecutionPriority?: string;
 }
 
 export interface SignalCounterBreakdown {

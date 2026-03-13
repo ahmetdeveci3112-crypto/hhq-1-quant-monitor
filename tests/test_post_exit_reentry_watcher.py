@@ -126,6 +126,58 @@ def _build_candidate_signal(**overrides):
     return signal
 
 
+def test_resolve_post_exit_reentry_entry_profile_clamps_deep_pullback_long():
+    profile = main.resolve_post_exit_reentry_entry_profile(
+        {
+            "action": "LONG",
+            "entryPrice": 99.02,
+            "pullbackPct": 0.98,
+            "currentAtrPct": 0.30,
+        },
+        {"price": 100.0},
+        {"side": "LONG", "exitPrice": 100.0},
+    )
+
+    assert profile["postExitReentryEntryMode"] == "SHALLOW_PULLBACK"
+    assert round(profile["postExitReentryPullbackPctApplied"], 4) == 0.225
+    assert round(profile["entryPrice"], 4) == 99.775
+
+
+def test_resolve_post_exit_reentry_entry_profile_clamps_deep_pullback_short():
+    profile = main.resolve_post_exit_reentry_entry_profile(
+        {
+            "action": "SHORT",
+            "entryPrice": 100.98,
+            "pullbackPct": 0.98,
+            "currentAtrPct": 0.30,
+        },
+        {"price": 100.0},
+        {"side": "SHORT", "exitPrice": 100.0},
+    )
+
+    assert profile["postExitReentryEntryMode"] == "SHALLOW_PULLBACK"
+    assert round(profile["postExitReentryPullbackPctApplied"], 4) == 0.225
+    assert round(profile["entryPrice"], 4) == 100.225
+
+
+def test_build_post_exit_reentry_signal_reanchors_shallow_profile():
+    signal = _build_candidate_signal(price=100.0, entryPrice=99.02, pullbackPct=0.98, currentAtrPct=0.30)
+    built = main._build_post_exit_reentry_signal(
+        _build_watch(exitPrice=100.0, lastPrice=100.0),
+        signal,
+        _build_candidate_opp(price=100.0, atr=0.30),
+    )
+
+    assert built["isPostExitReentry"] is True
+    assert built["entryArchetype"] == main.ENTRY_ARCHETYPE_CONTINUATION
+    assert built["postExitReentryEntryMode"] == "SHALLOW_PULLBACK"
+    assert round(built["postExitReentryPullbackPctApplied"], 4) == 0.225
+    assert round(built["signalPrice"], 4) == 100.0
+    assert round(built["entryPrice"], 4) == 99.775
+    assert built["postExitReentryConfirmDelaySec"] == 30
+    assert built["postExitReentryExpiresSec"] == 240
+
+
 def test_register_post_exit_reentry_watch_arms_for_eligible_reclaim_close(monkeypatch):
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
@@ -213,6 +265,70 @@ def test_resolve_reentry_cooldown_gate_allows_post_exit_override():
     assert gate["reason"] == "POST_EXIT_REENTRY_OVERRIDE"
 
 
+def test_should_suppress_generic_signal_for_post_exit_watch_same_side(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "post_exit_reentry_watchers",
+        {"AAVEUSDT": _build_watch(symbol="AAVEUSDT", watchState=main.POST_EXIT_REENTRY_STATE_ARMED)},
+    )
+
+    assert main._should_suppress_generic_signal_for_post_exit_watch(
+        {"symbol": "AAVEUSDT", "action": "LONG"}
+    ) is True
+    assert main._should_suppress_generic_signal_for_post_exit_watch(
+        {"symbol": "AAVEUSDT", "action": "SHORT"}
+    ) is False
+
+
+def test_open_position_applies_shallow_reentry_pending_profile(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(trader, "enabled", True)
+    monkeypatch.setattr(trader, "symbol", "AAVEUSDT")
+    monkeypatch.setattr(trader, "positions", [])
+    monkeypatch.setattr(trader, "pending_orders", [])
+    monkeypatch.setattr(trader, "balance", 100.0)
+    monkeypatch.setattr(trader, "max_positions", 10)
+    monkeypatch.setattr(trader, "allow_hedging", True)
+    monkeypatch.setattr(trader, "is_coin_blacklisted", lambda symbol: False)
+    monkeypatch.setattr(trader, "get_microstructure_cooldown", lambda symbol: None)
+    monkeypatch.setattr(trader, "add_log", lambda message: None)
+    monkeypatch.setattr(main.live_binance_trader, "enabled", True)
+    monkeypatch.setattr(main, "portfolio_risk_service", None)
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+
+    async def _noop_save_entry_forecast_event(**kwargs):
+        return None
+
+    monkeypatch.setattr(main.sqlite_manager, "save_entry_forecast_event", _noop_save_entry_forecast_event)
+
+    signal = main._build_post_exit_reentry_signal(
+        _build_watch(exitPrice=100.0, lastPrice=100.0),
+        _build_candidate_signal(
+            price=100.0,
+            entryPrice=99.02,
+            pullbackPct=0.98,
+            currentAtrPct=0.30,
+            leverage=8,
+            confidenceScore=88.0,
+            spreadPct=0.05,
+        ),
+        _build_candidate_opp(price=100.0, atr=0.30),
+    )
+
+    start_ms = int(time.time() * 1000)
+    pending = asyncio.run(trader.open_position("LONG", 100.0, 0.30, signal, symbol="AAVEUSDT"))
+
+    assert pending is not None
+    assert pending["isPostExitReentry"] is True
+    assert pending["postExitReentryEntryMode"] == "SHALLOW_PULLBACK"
+    assert round(float(pending["pullbackPct"]), 4) == 0.225
+    assert round(float(pending["entryPrice"]), 4) == 99.775
+    assert pending["postExitReentryConfirmDelaySec"] == 30
+    assert pending["postExitReentryExpiresSec"] == 240
+    assert 29000 <= pending["confirmAfter"] - start_ms <= 31000
+    assert 239000 <= pending["expiresAt"] - start_ms <= 241000
+
+
 def test_evaluate_post_exit_reentry_watchers_confirms_after_persistence(monkeypatch):
     events = []
     watch = _build_watch(cooldownUntilTs=1000.0)
@@ -239,6 +355,66 @@ def test_evaluate_post_exit_reentry_watchers_confirms_after_persistence(monkeypa
 
     assert events == [("PEW_AAVE", "AAVEUSDT", "AAVEUSDT")]
     assert watch["reentryTriggered"] is True
+
+
+def test_evaluate_post_exit_reentry_watchers_requires_supportive_structure(monkeypatch):
+    events = []
+    watch = _build_watch(
+        cooldownUntilTs=1000.0,
+        patternBias="CONTINUATION",
+        patternConfidence=0.72,
+        breakoutRetestState="BULL_RETEST_HOLD",
+    )
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
+
+    async def _fake_dispatch(safe_watch, signal, opportunity):
+        safe_watch["watchState"] = main.POST_EXIT_REENTRY_STATE_CONFIRMED
+        safe_watch["reentryUsed"] = True
+        safe_watch["reentryTriggered"] = True
+        events.append((safe_watch["watcherId"], signal["symbol"], opportunity["symbol"]))
+        return True
+
+    monkeypatch.setattr(main, "dispatch_post_exit_reentry_watch", _fake_dispatch)
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+    asyncio.run(
+        main.evaluate_post_exit_reentry_watchers(
+            [_build_candidate_opp(patternBias="CONTINUATION", patternConfidence=0.78, breakoutRetestState="BULL_RETEST_HOLD")],
+            [_build_candidate_signal(patternBias="CONTINUATION", patternConfidence=0.78, breakoutRetestState="BULL_RETEST_HOLD")],
+        )
+    )
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_CANDIDATE
+
+    monkeypatch.setattr(main.time, "time", lambda: 1061.0)
+    asyncio.run(
+        main.evaluate_post_exit_reentry_watchers(
+            [_build_candidate_opp(patternBias="CONTINUATION", patternConfidence=0.78, breakoutRetestState="BULL_RETEST_HOLD")],
+            [_build_candidate_signal(patternBias="CONTINUATION", patternConfidence=0.78, breakoutRetestState="BULL_RETEST_HOLD")],
+        )
+    )
+
+    assert events == [("PEW_AAVE", "AAVEUSDT", "AAVEUSDT")]
+    assert watch["reentryTriggered"] is True
+
+
+def test_evaluate_post_exit_reentry_watchers_blocks_on_structure_failure(monkeypatch):
+    watch = _build_watch(cooldownUntilTs=1000.0)
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+
+    asyncio.run(
+        main.evaluate_post_exit_reentry_watchers(
+            [_build_candidate_opp(patternBias="NEUTRAL", patternConfidence=0.25, breakoutRetestState="FAILED_BREAKOUT")],
+            [_build_candidate_signal(patternBias="NEUTRAL", patternConfidence=0.25, breakoutRetestState="FAILED_BREAKOUT")],
+        )
+    )
+
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
+    assert watch["confirmCount"] == 0
+    assert watch["candidateSinceTs"] == 0.0
 
 
 def test_evaluate_post_exit_reentry_watchers_uses_signal_fallback_without_opportunity(monkeypatch):

@@ -14296,6 +14296,7 @@ from risk.signal_intent import (
     SIGNAL_INTENT_VERSION,
     resolve_signal_intent,
 )
+from risk.market_structure import analyze_market_structure
 
 # RFX-3A: Regime-based execution styles
 from risk.execution_style import (
@@ -14603,9 +14604,15 @@ V3_POST_EXIT_REENTRY_VOLUME_FLOOR = 1.20
 V3_POST_EXIT_REENTRY_EXEC_SCORE_FLOOR = 65.0
 V3_POST_EXIT_REENTRY_BREAKOUT_PCT = 0.002
 V3_POST_EXIT_REENTRY_ATR_BREAKOUT_MULT = 0.35
+V3_POST_EXIT_REENTRY_PULLBACK_MIN_PCT = 0.20
+V3_POST_EXIT_REENTRY_PULLBACK_MAX_PCT = 0.35
+V3_POST_EXIT_REENTRY_PULLBACK_ATR_MULT = 0.75
+V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC = 30
+V3_POST_EXIT_REENTRY_EXPIRES_SEC = 240
 V3_POST_EXIT_REENTRY_SIZE_CAP_MULT = 0.35
 V3_POST_EXIT_REENTRY_STOP_MULT = 0.80
 V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE = 70.0
+V3_STRUCTURE_CONTEXT_MODE = str(os.environ.get('V3_STRUCTURE_CONTEXT_MODE', 'apply') or 'apply').strip().lower()
 V3_POST_EXIT_REENTRY_REASON_ALLOWLIST = (
     "SIDEWAYS_RECLAIM_CLOSE",
     "RECLAIM_BE_CLOSE",
@@ -14728,6 +14735,181 @@ def _breakout_matches_side(breakout: str, side: str) -> bool:
     )
 
 
+def _default_market_structure_context() -> dict:
+    return {
+        'structureTrend': 'MIXED',
+        'swingState': 'MIXED',
+        'compressionState': 'NONE',
+        'breakoutRetestState': 'NONE',
+        'srContext': 'UNKNOWN',
+        'patternBias': 'NEUTRAL',
+        'patternConfidence': 0.0,
+        'patternSource': 'TRADING_PATTERN_SCANNER_INSPIRED',
+        'structureVersion': 'v1',
+    }
+
+
+def _is_v3_structure_context_enabled() -> bool:
+    return str(V3_STRUCTURE_CONTEXT_MODE or 'apply').strip().lower() != 'off'
+
+
+def _structure_context_available(ctx: dict = None) -> bool:
+    safe_ctx = ctx if isinstance(ctx, dict) else {}
+    return bool(
+        _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0) > 0.0
+        or str(safe_ctx.get('breakoutRetestState', 'NONE') or 'NONE') != 'NONE'
+        or str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL') != 'NEUTRAL'
+    )
+
+
+def _symbol_to_ccxt_perp(symbol: str) -> str:
+    safe_symbol = str(symbol or '').upper().strip()
+    if safe_symbol.endswith('USDT') and len(safe_symbol) > 4:
+        return f"{safe_symbol[:-4]}/USDT:USDT"
+    return safe_symbol
+
+
+def _apply_market_structure_context_to_payload(payload: dict, structure_ctx: dict) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else _default_market_structure_context()
+    if _structure_context_available(safe_payload):
+        for key in (
+            'structureTrend',
+            'swingState',
+            'compressionState',
+            'breakoutRetestState',
+            'srContext',
+            'patternBias',
+            'patternConfidence',
+            'patternSource',
+            'structureVersion',
+        ):
+            safe_payload.setdefault(key, _default_market_structure_context().get(key))
+        return safe_payload
+    for key in (
+        'structureTrend',
+        'swingState',
+        'compressionState',
+        'breakoutRetestState',
+        'srContext',
+        'patternBias',
+        'patternConfidence',
+        'patternSource',
+        'structureVersion',
+    ):
+        safe_payload[key] = safe_ctx.get(key, _default_market_structure_context().get(key))
+    return safe_payload
+
+
+def _get_cached_ohlcv_for_structure(symbol: str) -> tuple[list, list]:
+    safe_symbol = str(symbol or '').upper().strip()
+    if not safe_symbol:
+        return [], []
+    ohlcv_15m = []
+    ohlcv_1h = []
+    trend_cache = {}
+    if 'mtf_confirmation' in globals() and getattr(mtf_confirmation, 'coin_trends', None):
+        trend_cache = mtf_confirmation.coin_trends.get(safe_symbol, {}) or {}
+        if isinstance(trend_cache, dict):
+            ohlcv_15m = list(trend_cache.get('ohlcv_15m', []) or [])
+            ohlcv_1h = list(trend_cache.get('ohlcv_1h', []) or [])
+    ccxt_symbol = _symbol_to_ccxt_perp(safe_symbol)
+    provider_cache = getattr(globals().get('data_provider'), '_cache', {}) if 'data_provider' in globals() else {}
+    if not ohlcv_15m:
+        cached_15m = provider_cache.get((ccxt_symbol, '15m'), {})
+        if isinstance(cached_15m, dict):
+            ohlcv_15m = list(cached_15m.get('data', []) or [])
+    if not ohlcv_1h:
+        cached_1h = provider_cache.get((ccxt_symbol, '1h'), {})
+        if isinstance(cached_1h, dict):
+            ohlcv_1h = list(cached_1h.get('data', []) or [])
+    return ohlcv_15m, ohlcv_1h
+
+
+def get_market_structure_context(symbol: str, *, side: str = '', force: bool = False) -> dict:
+    safe_symbol = str(symbol or '').upper().strip()
+    safe_side = str(side or '').upper().strip()
+    if not safe_symbol or not _is_v3_structure_context_enabled():
+        return _default_market_structure_context()
+    ohlcv_15m, ohlcv_1h = _get_cached_ohlcv_for_structure(safe_symbol)
+    if len(ohlcv_15m) < 12 or len(ohlcv_1h) < 8:
+        return _default_market_structure_context()
+
+    last_15m_ts = int((ohlcv_15m[-1][0] if ohlcv_15m else 0) or 0)
+    last_1h_ts = int((ohlcv_1h[-1][0] if ohlcv_1h else 0) or 0)
+    cache_key = (safe_symbol, safe_side, last_15m_ts, last_1h_ts)
+    now_ts = time.time()
+    cached = market_structure_cache.get(cache_key) if isinstance(globals().get('market_structure_cache'), dict) else None
+    if not force and isinstance(cached, dict) and (now_ts - _coerce_float(cached.get('ts', 0.0), 0.0)) <= 60.0:
+        return dict(cached.get('ctx', _default_market_structure_context()))
+
+    ctx = analyze_market_structure(safe_symbol, ohlcv_15m, ohlcv_1h, side=safe_side)
+    if not isinstance(ctx, dict):
+        ctx = _default_market_structure_context()
+    market_structure_cache[cache_key] = {
+        'ts': now_ts,
+        'ctx': dict(ctx),
+    }
+    return dict(ctx)
+
+
+def apply_market_structure_context(payload: dict, *, symbol: str = '', side: str = '', force: bool = False) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    resolved_symbol = str(symbol or safe_payload.get('symbol', '') or '').upper().strip()
+    resolved_side = str(side or safe_payload.get('side', safe_payload.get('action', '')) or '').upper().strip()
+    ctx = get_market_structure_context(resolved_symbol, side=resolved_side, force=force)
+    return _apply_market_structure_context_to_payload(safe_payload, ctx)
+
+
+def _structure_retest_matches_side(structure_ctx: dict = None, side: str = '') -> bool:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    safe_side = str(side or '').upper().strip()
+    retest_state = str(safe_ctx.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    if safe_side == 'LONG':
+        return retest_state == 'BULL_RETEST_HOLD'
+    if safe_side == 'SHORT':
+        return retest_state == 'BEAR_RETEST_HOLD'
+    return retest_state in ('BULL_RETEST_HOLD', 'BEAR_RETEST_HOLD')
+
+
+def _structure_context_supports_fakeout_hold(structure_ctx: dict = None, side: str = '') -> tuple[bool, str]:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    if not _structure_context_available(safe_ctx):
+        return True, 'STRUCTURE_UNAVAILABLE'
+    retest_state = str(safe_ctx.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    if retest_state in ('FAILED_BREAKOUT', 'FAILED_BREAKDOWN'):
+        return False, 'STRUCTURE_FAILURE'
+    bias = str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    confidence = _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0)
+    if confidence < 0.60:
+        return False, 'NO_STRUCTURE_SUPPORT'
+    if bias == 'CONTINUATION' and _structure_retest_matches_side(safe_ctx, side):
+        return True, 'STRUCTURE_CONTINUATION'
+    sr_context = str(safe_ctx.get('srContext', 'UNKNOWN') or 'UNKNOWN').upper()
+    safe_side = str(side or '').upper().strip()
+    sr_supportive = (
+        sr_context in ('AT_BREAKOUT_LEVEL', 'INSIDE_RANGE')
+        or (safe_side == 'LONG' and sr_context == 'ABOVE_SUPPORT')
+        or (safe_side == 'SHORT' and sr_context == 'BELOW_RESISTANCE')
+    )
+    if bias == 'RECLAIM' and sr_supportive:
+        return True, 'STRUCTURE_RECLAIM'
+    return False, 'NO_STRUCTURE_SUPPORT'
+
+
+def _structure_context_supports_reentry(structure_ctx: dict = None, side: str = '') -> bool:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    if not _structure_context_available(safe_ctx):
+        return True
+    confidence = _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0)
+    bias = str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    return bool(
+        confidence >= 0.60
+        and bias == 'CONTINUATION'
+        and _structure_retest_matches_side(safe_ctx, side)
+    )
+
+
 def _compact_signal_intent(intent: dict = None) -> dict:
     safe_intent = intent if isinstance(intent, dict) else {}
     if not safe_intent or not safe_intent.get('accepted', False):
@@ -14822,6 +15004,15 @@ def _compact_decision_inputs(payload: dict = None) -> dict:
         'fibActive': bool(data.get('fibActive', False)),
         'srNearestSupport': data.get('srNearestSupport'),
         'srNearestResistance': data.get('srNearestResistance'),
+        'structureTrend': str(data.get('structureTrend', 'MIXED') or 'MIXED').upper(),
+        'swingState': str(data.get('swingState', 'MIXED') or 'MIXED').upper(),
+        'compressionState': str(data.get('compressionState', 'NONE') or 'NONE').upper(),
+        'breakoutRetestState': str(data.get('breakoutRetestState', 'NONE') or 'NONE').upper(),
+        'srContext': str(data.get('srContext', 'UNKNOWN') or 'UNKNOWN').upper(),
+        'patternBias': str(data.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper(),
+        'patternConfidence': round(_coerce_float(data.get('patternConfidence', 0.0), 0.0), 4),
+        'patternSource': str(data.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+        'structureVersion': str(data.get('structureVersion', 'v1') or 'v1'),
     }
 
 
@@ -15043,6 +15234,15 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         'directionConfidence': round(_clamp(explicit_direction_confidence, 0.0, 0.99), 4),
         'directionReason': explicit_direction_reason,
         'selectedViaIntent': explicit_intent,
+        'structureTrend': str(inputs.get('structureTrend', 'MIXED') or 'MIXED'),
+        'swingState': str(inputs.get('swingState', 'MIXED') or 'MIXED'),
+        'compressionState': str(inputs.get('compressionState', 'NONE') or 'NONE'),
+        'breakoutRetestState': str(inputs.get('breakoutRetestState', 'NONE') or 'NONE'),
+        'srContext': str(inputs.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+        'patternBias': str(inputs.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(inputs.get('patternConfidence', 0.0), 0.0), 4),
+        'patternSource': str(inputs.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+        'structureVersion': str(inputs.get('structureVersion', 'v1') or 'v1'),
     }
 
 
@@ -15540,6 +15740,10 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
         str(safe_pos.get('fakeoutReclaimReason', '') or ''),
         str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
         str(_coerce_float(safe_pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0) > 0),
+        str(safe_pos.get('structureTrend', '') or ''),
+        str(safe_pos.get('breakoutRetestState', '') or ''),
+        str(safe_pos.get('patternBias', '') or ''),
+        f"{_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0):.2f}",
     ])
     last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
     last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
@@ -15577,6 +15781,13 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'fakeoutReclaimHoldUsed': bool(safe_pos.get('fakeoutReclaimHoldUsed', False)),
             'fakeoutReclaimReason': str(safe_pos.get('fakeoutReclaimReason', '') or ''),
             'fakeoutReclaimReleaseReason': str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
+            'structureTrend': str(safe_pos.get('structureTrend', 'MIXED') or 'MIXED'),
+            'swingState': str(safe_pos.get('swingState', 'MIXED') or 'MIXED'),
+            'compressionState': str(safe_pos.get('compressionState', 'NONE') or 'NONE'),
+            'breakoutRetestState': str(safe_pos.get('breakoutRetestState', 'NONE') or 'NONE'),
+            'srContext': str(safe_pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+            'patternBias': str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+            'patternConfidence': round(_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0), 4),
         },
         outcome={
             'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
@@ -15597,6 +15808,13 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'fakeoutReclaimHoldUntilTs': round(_coerce_float(safe_pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0), 3),
             'fakeoutReclaimReason': str(safe_pos.get('fakeoutReclaimReason', '') or ''),
             'fakeoutReclaimReleaseReason': str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
+            'structureTrend': str(safe_pos.get('structureTrend', 'MIXED') or 'MIXED'),
+            'swingState': str(safe_pos.get('swingState', 'MIXED') or 'MIXED'),
+            'compressionState': str(safe_pos.get('compressionState', 'NONE') or 'NONE'),
+            'breakoutRetestState': str(safe_pos.get('breakoutRetestState', 'NONE') or 'NONE'),
+            'srContext': str(safe_pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+            'patternBias': str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+            'patternConfidence': round(_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0), 4),
         },
         created_ts=now_ms,
     )
@@ -15634,6 +15852,15 @@ def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None,
         'signalScoreRaw': safe_watch.get('originalSignalScore', 0.0),
         'expectancyBand': safe_watch.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL),
         'expectancyRankingScore': safe_watch.get('expectancyRankingScore', 0.0),
+        'structureTrend': safe_watch.get('structureTrend', 'MIXED'),
+        'swingState': safe_watch.get('swingState', 'MIXED'),
+        'compressionState': safe_watch.get('compressionState', 'NONE'),
+        'breakoutRetestState': safe_watch.get('breakoutRetestState', 'NONE'),
+        'srContext': safe_watch.get('srContext', 'UNKNOWN'),
+        'patternBias': safe_watch.get('patternBias', 'NEUTRAL'),
+        'patternConfidence': safe_watch.get('patternConfidence', 0.0),
+        'patternSource': safe_watch.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED'),
+        'structureVersion': safe_watch.get('structureVersion', 'v1'),
     }
     if safe_opp:
         merged.update({
@@ -15649,6 +15876,15 @@ def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None,
             'atr': safe_opp.get('atr', safe_watch.get('atr', 0.0)),
             'atrPct': safe_opp.get('atrPct', safe_opp.get('volatility_pct', 0.0)),
             'breakout': safe_opp.get('breakout', ''),
+            'structureTrend': safe_opp.get('structureTrend', merged.get('structureTrend', 'MIXED')),
+            'swingState': safe_opp.get('swingState', merged.get('swingState', 'MIXED')),
+            'compressionState': safe_opp.get('compressionState', merged.get('compressionState', 'NONE')),
+            'breakoutRetestState': safe_opp.get('breakoutRetestState', merged.get('breakoutRetestState', 'NONE')),
+            'srContext': safe_opp.get('srContext', merged.get('srContext', 'UNKNOWN')),
+            'patternBias': safe_opp.get('patternBias', merged.get('patternBias', 'NEUTRAL')),
+            'patternConfidence': safe_opp.get('patternConfidence', merged.get('patternConfidence', 0.0)),
+            'patternSource': safe_opp.get('patternSource', merged.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED')),
+            'structureVersion': safe_opp.get('structureVersion', merged.get('structureVersion', 'v1')),
         })
     if safe_signal:
         merged.update({
@@ -15662,6 +15898,15 @@ def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None,
             'directionReason': safe_signal.get('directionReason', ''),
             'expectancyBand': safe_signal.get('expectancyBand', merged.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)),
             'expectancyRankingScore': safe_signal.get('expectancyRankingScore', merged.get('expectancyRankingScore', 0.0)),
+            'structureTrend': safe_signal.get('structureTrend', merged.get('structureTrend', 'MIXED')),
+            'swingState': safe_signal.get('swingState', merged.get('swingState', 'MIXED')),
+            'compressionState': safe_signal.get('compressionState', merged.get('compressionState', 'NONE')),
+            'breakoutRetestState': safe_signal.get('breakoutRetestState', merged.get('breakoutRetestState', 'NONE')),
+            'srContext': safe_signal.get('srContext', merged.get('srContext', 'UNKNOWN')),
+            'patternBias': safe_signal.get('patternBias', merged.get('patternBias', 'NEUTRAL')),
+            'patternConfidence': safe_signal.get('patternConfidence', merged.get('patternConfidence', 0.0)),
+            'patternSource': safe_signal.get('patternSource', merged.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED')),
+            'structureVersion': safe_signal.get('structureVersion', merged.get('structureVersion', 'v1')),
         })
     return _compact_decision_inputs(merged)
 
@@ -15690,6 +15935,13 @@ def queue_post_exit_reentry_watch_snapshot(
         'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
         'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
         'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
+        'structureTrend': str(safe_watch.get('structureTrend', 'MIXED') or 'MIXED'),
+        'swingState': str(safe_watch.get('swingState', 'MIXED') or 'MIXED'),
+        'compressionState': str(safe_watch.get('compressionState', 'NONE') or 'NONE'),
+        'breakoutRetestState': str(safe_watch.get('breakoutRetestState', 'NONE') or 'NONE'),
+        'srContext': str(safe_watch.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+        'patternBias': str(safe_watch.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(safe_watch.get('patternConfidence', 0.0), 0.0), 4),
     }
     outcome = {
         'watchState': str(safe_watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
@@ -15705,6 +15957,13 @@ def queue_post_exit_reentry_watch_snapshot(
         'currentObImbalanceTrend': round(_coerce_float(safe_watch.get('currentObImbalanceTrend', 0.0), 0.0), 4),
         'currentExecScore': round(_coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0), 4),
         'breakoutDistancePrice': round(_coerce_float(safe_watch.get('breakoutDistancePrice', 0.0), 0.0), 8),
+        'structureTrend': str(safe_watch.get('structureTrend', 'MIXED') or 'MIXED'),
+        'swingState': str(safe_watch.get('swingState', 'MIXED') or 'MIXED'),
+        'compressionState': str(safe_watch.get('compressionState', 'NONE') or 'NONE'),
+        'breakoutRetestState': str(safe_watch.get('breakoutRetestState', 'NONE') or 'NONE'),
+        'srContext': str(safe_watch.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+        'patternBias': str(safe_watch.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(safe_watch.get('patternConfidence', 0.0), 0.0), 4),
     }
     queue_decision_snapshot(
         stage='post_exit_reentry_watch',
@@ -16206,6 +16465,21 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
         'postExitReentryOutcome': str(safe_trade.get('postExitReentryOutcome', '') or ''),
         'postExitReentryTradeId': str(safe_trade.get('postExitReentryTradeId', '') or ''),
+        'postExitReentryEntryMode': str(safe_trade.get('postExitReentryEntryMode', close_snapshot.get('postExitReentryEntryMode', signal_snapshot.get('postExitReentryEntryMode', ''))) or ''),
+        'postExitReentryPullbackPctOriginal': _coerce_float(safe_trade.get('postExitReentryPullbackPctOriginal', close_snapshot.get('postExitReentryPullbackPctOriginal', signal_snapshot.get('postExitReentryPullbackPctOriginal', 0.0))), 0.0),
+        'postExitReentryPullbackPctApplied': _coerce_float(safe_trade.get('postExitReentryPullbackPctApplied', close_snapshot.get('postExitReentryPullbackPctApplied', signal_snapshot.get('postExitReentryPullbackPctApplied', 0.0))), 0.0),
+        'postExitReentryConfirmDelaySec': int(safe_trade.get('postExitReentryConfirmDelaySec', close_snapshot.get('postExitReentryConfirmDelaySec', signal_snapshot.get('postExitReentryConfirmDelaySec', 0))) or 0),
+        'postExitReentryExpiresSec': int(safe_trade.get('postExitReentryExpiresSec', close_snapshot.get('postExitReentryExpiresSec', signal_snapshot.get('postExitReentryExpiresSec', 0))) or 0),
+        'postExitReentryExecutionPriority': str(safe_trade.get('postExitReentryExecutionPriority', close_snapshot.get('postExitReentryExecutionPriority', signal_snapshot.get('postExitReentryExecutionPriority', ''))) or ''),
+        'structureTrend': str(safe_trade.get('structureTrend', close_snapshot.get('structureTrend', signal_snapshot.get('structureTrend', 'MIXED'))) or 'MIXED'),
+        'swingState': str(safe_trade.get('swingState', close_snapshot.get('swingState', signal_snapshot.get('swingState', 'MIXED'))) or 'MIXED'),
+        'compressionState': str(safe_trade.get('compressionState', close_snapshot.get('compressionState', signal_snapshot.get('compressionState', 'NONE'))) or 'NONE'),
+        'breakoutRetestState': str(safe_trade.get('breakoutRetestState', close_snapshot.get('breakoutRetestState', signal_snapshot.get('breakoutRetestState', 'NONE'))) or 'NONE'),
+        'srContext': str(safe_trade.get('srContext', close_snapshot.get('srContext', signal_snapshot.get('srContext', 'UNKNOWN'))) or 'UNKNOWN'),
+        'patternBias': str(safe_trade.get('patternBias', close_snapshot.get('patternBias', signal_snapshot.get('patternBias', 'NEUTRAL'))) or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(safe_trade.get('patternConfidence', close_snapshot.get('patternConfidence', signal_snapshot.get('patternConfidence', 0.0))), 0.0), 4),
+        'patternSource': str(safe_trade.get('patternSource', close_snapshot.get('patternSource', signal_snapshot.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED'))) or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+        'structureVersion': str(safe_trade.get('structureVersion', close_snapshot.get('structureVersion', signal_snapshot.get('structureVersion', 'v1'))) or 'v1'),
         'peakRoi': round(peak_roi, 4),
         'realizedPeakCaptureRatio': round(capture_ratio, 4),
         'giveback': round(max(0.0, peak_roi - max(realized_roi, 0.0)), 4),
@@ -17387,6 +17661,20 @@ def evaluate_v3_fakeout_reclaim_guard(
     state = str(state_ctx.get('state', safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL)) or V3_UNDERWATER_NEUTRAL)
     if state not in (V3_UNDERWATER_SIDEWAYS, V3_UNDERWATER_RECOVERING):
         result['reason'] = state
+        return result
+
+    structure_ctx = {
+        'structureTrend': safe_pos.get('structureTrend', 'MIXED'),
+        'swingState': safe_pos.get('swingState', 'MIXED'),
+        'compressionState': safe_pos.get('compressionState', 'NONE'),
+        'breakoutRetestState': safe_pos.get('breakoutRetestState', 'NONE'),
+        'srContext': safe_pos.get('srContext', 'UNKNOWN'),
+        'patternBias': safe_pos.get('patternBias', 'NEUTRAL'),
+        'patternConfidence': safe_pos.get('patternConfidence', 0.0),
+    }
+    structure_ok, structure_reason = _structure_context_supports_fakeout_hold(structure_ctx, safe_pos.get('side', ''))
+    if _structure_context_available(structure_ctx) and not structure_ok:
+        result['reason'] = structure_reason
         return result
 
     side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
@@ -24735,6 +25023,20 @@ async def background_scanner_loop():
                         if s and s not in mtf_seen:
                             mtf_seen.add(s)
                             mtf_update_symbols.append(s)
+                    for pos in getattr(global_paper_trader, 'positions', []) or []:
+                        s = pos.get('symbol', '')
+                        if s and s not in mtf_seen:
+                            mtf_seen.add(s)
+                            mtf_update_symbols.append(s)
+                    for order in getattr(global_paper_trader, 'pending_orders', []) or []:
+                        s = order.get('symbol', '')
+                        if s and s not in mtf_seen:
+                            mtf_seen.add(s)
+                            mtf_update_symbols.append(s)
+                    for s in list(post_exit_reentry_watchers.keys()) if isinstance(post_exit_reentry_watchers, dict) else []:
+                        if s and s not in mtf_seen:
+                            mtf_seen.add(s)
+                            mtf_update_symbols.append(s)
 
                     # FIB pre-warm only in SMART_V2 to keep LEGACY path lightweight.
                     strategy_mode_upper = str(getattr(global_paper_trader, 'strategy_mode', STRATEGY_MODE_LEGACY)).upper()
@@ -24790,11 +25092,25 @@ async def background_scanner_loop():
                                 for sig in _planned_signals[:5]
                             )
                             logger.info(f"🧭 CAPITAL_ALLOCATOR: {_alloc_preview}")
-                    
+
+                    try:
+                        await evaluate_post_exit_reentry_watchers(
+                            opportunities,
+                            multi_coin_scanner.active_signals,
+                        )
+                    except Exception as watcher_err:
+                        logger.debug(f"Post-exit re-entry watcher error: {watcher_err}")
+
                     for signal in multi_coin_scanner.active_signals:
                         try:
                             symbol = signal.get('symbol', 'UNKNOWN')
                             price = signal.get('price', 0)
+                            if _should_suppress_generic_signal_for_post_exit_watch(signal):
+                                logger.info(
+                                    f"🛰️ WATCHER_PRIORITY: generic dispatch skipped for {symbol} "
+                                    f"{signal.get('action', signal.get('side', 'NONE'))}"
+                                )
+                                continue
                             
                             # Update paper trader symbol temporarily for this signal
                             old_symbol = global_paper_trader.symbol
@@ -24819,14 +25135,6 @@ async def background_scanner_loop():
                         except Exception as sig_error:
                             logger.debug(f"Signal processing error for {symbol}: {sig_error}")
                             continue
-
-                    try:
-                        await evaluate_post_exit_reentry_watchers(
-                            opportunities,
-                            multi_coin_scanner.active_signals,
-                        )
-                    except Exception as watcher_err:
-                        logger.debug(f"Post-exit re-entry watcher error: {watcher_err}")
                 
                 # =====================================================================
                 # PHASE 32: UPDATE OPEN POSITIONS WITH REAL-TIME PRICES
@@ -26463,6 +26771,100 @@ def _is_post_exit_reentry_signal_eligible(watch: dict, signal: dict) -> bool:
     )
 
 
+def resolve_post_exit_reentry_entry_profile(signal: dict, opportunity: dict, watch: dict) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_opp = opportunity if isinstance(opportunity, dict) else {}
+    safe_watch = watch if isinstance(watch, dict) else {}
+    side = str(safe_watch.get('side', safe_signal.get('action', safe_signal.get('side', 'LONG'))) or 'LONG').upper()
+    current_price = _coerce_float(
+        safe_opp.get('price', safe_signal.get('price', safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)))),
+        0.0,
+    )
+    if current_price <= 0:
+        current_price = _coerce_float(safe_watch.get('exitPrice', safe_signal.get('entryPrice', 0.0)), 0.0)
+
+    raw_entry_price = _coerce_float(
+        safe_signal.get('entryPrice', safe_watch.get('entryPrice', current_price)),
+        current_price,
+    )
+    original_pullback_pct = _coerce_float(safe_signal.get('pullbackPct', 0.0), 0.0)
+    if original_pullback_pct <= 0 and current_price > 0 and raw_entry_price > 0:
+        original_pullback_pct = abs(current_price - raw_entry_price) / current_price * 100.0
+
+    atr_pct = _coerce_float(
+        safe_signal.get(
+            'currentAtrPct',
+            safe_signal.get(
+                'atrPct',
+                safe_opp.get(
+                    'currentAtrPct',
+                    safe_opp.get(
+                        'atrPct',
+                        safe_signal.get('volatility_pct', safe_opp.get('volatility_pct', 0.0)),
+                    ),
+                ),
+            ),
+        ),
+        0.0,
+    )
+    if atr_pct <= 0 and current_price > 0:
+        atr_distance = max(
+            _coerce_float(safe_signal.get('atr', safe_opp.get('atr', safe_watch.get('atr', 0.0))), 0.0),
+            0.0,
+        )
+        if atr_distance > 0:
+            atr_pct = atr_distance / current_price * 100.0
+
+    target_pullback_pct = max(
+        V3_POST_EXIT_REENTRY_PULLBACK_MIN_PCT,
+        min(V3_POST_EXIT_REENTRY_PULLBACK_MAX_PCT, atr_pct * V3_POST_EXIT_REENTRY_PULLBACK_ATR_MULT),
+    )
+    if original_pullback_pct <= 0:
+        original_pullback_pct = target_pullback_pct
+
+    effective_pullback_pct = min(original_pullback_pct, target_pullback_pct)
+    if current_price > 0:
+        if side == 'SHORT':
+            entry_price = current_price * (1.0 + (effective_pullback_pct / 100.0))
+        else:
+            entry_price = current_price * (1.0 - (effective_pullback_pct / 100.0))
+    else:
+        entry_price = raw_entry_price
+
+    return {
+        'postExitReentryEntryMode': 'SHALLOW_PULLBACK',
+        'postExitReentryPullbackPctOriginal': round(original_pullback_pct, 4),
+        'postExitReentryPullbackPctApplied': round(effective_pullback_pct, 4),
+        'postExitReentryConfirmDelaySec': V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC,
+        'postExitReentryExpiresSec': V3_POST_EXIT_REENTRY_EXPIRES_SEC,
+        'postExitReentryExecutionPriority': 'WATCHER',
+        'signalPrice': current_price,
+        'entryPrice': entry_price,
+    }
+
+
+def _should_suppress_generic_signal_for_post_exit_watch(signal: dict) -> bool:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    if not safe_signal or bool(safe_signal.get('isPostExitReentry', False)):
+        return False
+    symbol = str(safe_signal.get('symbol', '') or '').upper()
+    if not symbol:
+        return False
+    watch = post_exit_reentry_watchers.get(symbol) if isinstance(post_exit_reentry_watchers, dict) else None
+    if not isinstance(watch, dict):
+        return False
+    watch_state = str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED)
+    if watch_state not in (
+        POST_EXIT_REENTRY_STATE_ARMED,
+        POST_EXIT_REENTRY_STATE_CANDIDATE,
+        POST_EXIT_REENTRY_STATE_CONFIRMED,
+    ):
+        return False
+    signal_side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    watch_side = str(watch.get('side', '') or '').upper()
+    return bool(signal_side and watch_side and signal_side == watch_side)
+
+
 def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict) -> dict:
     import copy as _reentry_copy
 
@@ -26471,8 +26873,12 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
     safe_opp = opportunity if isinstance(opportunity, dict) else {}
     symbol = str(safe_watch.get('symbol', safe_signal.get('symbol', safe_opp.get('symbol', ''))) or '').upper()
     side = str(safe_watch.get('side', safe_signal.get('action', safe_signal.get('side', 'LONG'))) or 'LONG').upper()
+    safe_opp = apply_market_structure_context(dict(safe_opp), symbol=symbol, side=side) if isinstance(safe_opp, dict) and safe_opp else safe_opp
+    safe_signal = apply_market_structure_context(safe_signal, symbol=symbol, side=side) if isinstance(safe_signal, dict) else safe_signal
+    safe_watch = apply_market_structure_context(safe_watch, symbol=symbol, side=side) if isinstance(safe_watch, dict) else safe_watch
     current_price = _coerce_float(safe_opp.get('price', safe_signal.get('price', safe_watch.get('lastPrice', safe_watch.get('exitPrice', 0.0)))), 0.0)
     live_ctx = _build_live_flow_context_from_opportunity(safe_signal, safe_opp, side=side)
+    reentry_profile = resolve_post_exit_reentry_entry_profile(safe_signal, safe_opp, safe_watch)
     base_score = max(
         _coerce_float(safe_signal.get('confidenceScore', 0.0), 0.0),
         _coerce_float(safe_opp.get('signalScore', 0.0), 0.0),
@@ -26485,8 +26891,14 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'symbol': symbol,
         'action': side,
         'side': side,
-        'price': current_price,
-        'entryPrice': _coerce_float(safe_signal.get('entryPrice', current_price), current_price),
+        'price': _coerce_float(reentry_profile.get('signalPrice', current_price), current_price),
+        'signalPrice': _coerce_float(reentry_profile.get('signalPrice', current_price), current_price),
+        'entryPrice': _coerce_float(reentry_profile.get('entryPrice', current_price), current_price),
+        'pullbackPct': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', safe_signal.get('pullbackPct', 0.0)), 0.0),
+        'pullbackDynFinal': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', safe_signal.get('pullbackDynFinal', safe_signal.get('pullbackPct', 0.0))), 0.0),
+        'pullbackDynFloor': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', safe_signal.get('pullbackDynFloor', safe_signal.get('pullbackPct', 0.0))), 0.0),
+        'pullbackLocked': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', safe_signal.get('pullbackPct', 0.0)), 0.0) / 100.0,
+        'execution_profile_source': 'post_exit_reentry_shallow',
         'confidenceScore': base_score,
         'signalScore': base_score,
         'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
@@ -26506,6 +26918,12 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
         'reentryWatcherId': str(safe_watch.get('watcherId', '') or ''),
         'reentryOriginSignalId': str(safe_watch.get('signalId', '') or ''),
+        'postExitReentryEntryMode': str(reentry_profile.get('postExitReentryEntryMode', 'SHALLOW_PULLBACK') or 'SHALLOW_PULLBACK'),
+        'postExitReentryPullbackPctOriginal': _coerce_float(reentry_profile.get('postExitReentryPullbackPctOriginal', 0.0), 0.0),
+        'postExitReentryPullbackPctApplied': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', 0.0), 0.0),
+        'postExitReentryConfirmDelaySec': int(reentry_profile.get('postExitReentryConfirmDelaySec', V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC) or V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC),
+        'postExitReentryExpiresSec': int(reentry_profile.get('postExitReentryExpiresSec', V3_POST_EXIT_REENTRY_EXPIRES_SEC) or V3_POST_EXIT_REENTRY_EXPIRES_SEC),
+        'postExitReentryExecutionPriority': str(reentry_profile.get('postExitReentryExecutionPriority', 'WATCHER') or 'WATCHER'),
         'currentVolumeRatio': live_ctx.get('currentVolumeRatio', safe_signal.get('currentVolumeRatio', safe_signal.get('volumeRatio', 1.0))),
         'currentIsVolumeSpike': live_ctx.get('currentIsVolumeSpike', safe_signal.get('currentIsVolumeSpike', safe_signal.get('isVolumeSpike', False))),
         'currentImbalance': live_ctx.get('currentImbalance', safe_signal.get('currentImbalance', safe_signal.get('imbalance', 0.0))),
@@ -26528,6 +26946,14 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'reentryOriginTradeId': safe_signal['reentryOriginTradeId'],
         'reentryOriginExitReason': safe_signal['reentryOriginExitReason'],
         'reentryWatcherId': safe_signal['reentryWatcherId'],
+        'postExitReentryEntryMode': safe_signal.get('postExitReentryEntryMode', 'SHALLOW_PULLBACK'),
+        'postExitReentryPullbackPctApplied': safe_signal.get('postExitReentryPullbackPctApplied', 0.0),
+        'postExitReentryConfirmDelaySec': safe_signal.get('postExitReentryConfirmDelaySec', V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC),
+        'postExitReentryExpiresSec': safe_signal.get('postExitReentryExpiresSec', V3_POST_EXIT_REENTRY_EXPIRES_SEC),
+        'structureTrend': safe_signal.get('structureTrend', 'MIXED'),
+        'breakoutRetestState': safe_signal.get('breakoutRetestState', 'NONE'),
+        'patternBias': safe_signal.get('patternBias', 'NEUTRAL'),
+        'patternConfidence': safe_signal.get('patternConfidence', 0.0),
     })
     safe_signal['telemetry'] = telemetry
     return safe_signal
@@ -26637,6 +27063,11 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
             opp = _build_post_exit_reentry_fallback_opportunity(watch, sig)
         if not isinstance(opp, dict):
             continue
+        opp = apply_market_structure_context(opp, symbol=symbol, side=watch.get('side', ''))
+        watch = apply_market_structure_context(watch, symbol=symbol, side=watch.get('side', ''))
+        post_exit_reentry_watchers[symbol] = watch
+        if isinstance(sig, dict):
+            sig = apply_market_structure_context(sig, symbol=symbol, side=watch.get('side', ''))
         current_price = _coerce_float(opp.get('price', watch.get('lastPrice', watch.get('exitPrice', 0.0))), 0.0)
         live_ctx = _build_live_flow_context_from_opportunity(watch, opp, side=watch.get('side', ''))
         watch['lastPrice'] = current_price
@@ -26700,7 +27131,8 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
             and opp_action == str(watch.get('side', '') or '').upper()
             and opp_score > 0
         )
-        candidate_ok = bool(signal_ok and continuation_ok and volume_ok and obi_ok and exec_ok and breakout_passed)
+        structure_ok = _structure_context_supports_reentry(opp, watch.get('side', ''))
+        candidate_ok = bool(signal_ok and continuation_ok and volume_ok and obi_ok and exec_ok and breakout_passed and structure_ok)
         if not candidate_ok:
             if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE:
                 watch['watchState'] = POST_EXIT_REENTRY_STATE_ARMED
@@ -29167,7 +29599,15 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     queue_pass_stage(
         'OPEN__ATTEMPT',
         SIGNAL_STAGE_OPEN_ATTEMPT,
-        trace={'attempt_price': price, 'atr': atr},
+        trace={
+            'attempt_price': price,
+            'atr': atr,
+            'is_post_exit_reentry': bool(signal.get('isPostExitReentry', False)),
+            'post_exit_reentry_entry_mode': signal.get('postExitReentryEntryMode', ''),
+            'post_exit_reentry_pullback_pct_applied': signal.get('postExitReentryPullbackPctApplied', 0.0),
+            'post_exit_reentry_confirm_delay_sec': signal.get('postExitReentryConfirmDelaySec', 0),
+            'post_exit_reentry_expires_sec': signal.get('postExitReentryExpiresSec', 0),
+        },
     )
     pos = None  # FIX #6 Rev: prevent UnboundLocalError if try raises
     try:
@@ -29204,6 +29644,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         'signal_price': pos.get('signalPrice', 0),
                         'expires_at': pos.get('expiresAt', 0),
                         'confirm_after': pos.get('confirmAfter', 0),
+                        'is_post_exit_reentry': bool(pos.get('isPostExitReentry', False)),
+                        'post_exit_reentry_entry_mode': pos.get('postExitReentryEntryMode', ''),
+                        'post_exit_reentry_pullback_pct_applied': pos.get('postExitReentryPullbackPctApplied', 0.0),
+                        'post_exit_reentry_confirm_delay_sec': pos.get('postExitReentryConfirmDelaySec', 0),
+                        'post_exit_reentry_expires_sec': pos.get('postExitReentryExpiresSec', 0),
                     },
                 )
             else:
@@ -29626,6 +30071,8 @@ class MultiTimeframeConfirmation:
                 result['trend_1d'] = trend_1d['trend']
             
             # Phase FIB: Cache OHLCV snapshots for Fibonacci swing detection
+            if ohlcv_15m:
+                result['ohlcv_15m'] = ohlcv_15m[-30:]
             if ohlcv_1h:
                 result['ohlcv_1h'] = ohlcv_1h[-30:]
             if ohlcv_4h:
@@ -32936,6 +33383,7 @@ class TimeBasedPositionManager:
             underwater_ctx=underwater_ctx,
             thesis_ctx=thesis_ctx,
         )
+        apply_market_structure_context(pos, symbol=pos.get('symbol', ''), side=pos.get('side', ''))
         maybe_queue_position_state_snapshot(pos, reason='v3_runner_runtime')
         if thesis_ctx.get('thesis_state') != prev_thesis_state or thesis_ctx.get('armed', False):
             maybe_queue_position_state_snapshot(pos, reason='v3_thesis_revalidation')
@@ -41848,6 +42296,8 @@ class PaperTradingEngine:
             # No pullback, use current price
             entry_price = price
             pullback_pct = 0
+
+        is_post_exit_reentry = bool(signal.get('isPostExitReentry', False)) if isinstance(signal, dict) else False
         
         # Get spread-adjusted parameters from signal
         spread_level = signal.get('spreadLevel', 'normal') if signal else 'normal'
@@ -42582,6 +43032,18 @@ class PaperTradingEngine:
                 return default
 
         _sig = signal if isinstance(signal, dict) else {}
+        _reentry_entry_mode = str(_sig.get('postExitReentryEntryMode', '') or '')
+        _reentry_pullback_pct_original = _safe_float(_sig.get('postExitReentryPullbackPctOriginal', pullback_pct), pullback_pct)
+        _reentry_pullback_pct_applied = _safe_float(_sig.get('postExitReentryPullbackPctApplied', pullback_pct), pullback_pct)
+        _reentry_confirm_delay_sec = max(
+            1,
+            int(_safe_float(_sig.get('postExitReentryConfirmDelaySec', V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC), V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC)),
+        )
+        _reentry_expires_sec = max(
+            _reentry_confirm_delay_sec + 30,
+            int(_safe_float(_sig.get('postExitReentryExpiresSec', V3_POST_EXIT_REENTRY_EXPIRES_SEC), V3_POST_EXIT_REENTRY_EXPIRES_SEC)),
+        )
+        _reentry_exec_priority = str(_sig.get('postExitReentryExecutionPriority', '') or '')
         _dyn_floor = _safe_float(_sig.get('pullbackDynFloor', _sig.get('pullbackMinDyn', pullback_pct)), pullback_pct)
         _dyn_base = _safe_float(_sig.get('pullbackDynBase', 0), 0.0)
         _dyn_adj = _safe_float(_sig.get('pullbackDynAdj', 0), 0.0)
@@ -42601,8 +43063,29 @@ class PaperTradingEngine:
         _forecast_model_version = 'none'
         _forecast_features = {}
         _pullback_pct_requested = _dyn_final  # snapshot before policy
-        
-        if ENTRY_FORECAST_ENABLED:
+
+        if is_post_exit_reentry:
+            _pullback_pct_requested = _reentry_pullback_pct_original if _reentry_pullback_pct_original > 0 else _reentry_pullback_pct_applied
+            if _reentry_pullback_pct_applied > 0:
+                _dyn_floor = _reentry_pullback_pct_applied
+                _dyn_base = _reentry_pullback_pct_applied
+                _dyn_adj = _reentry_pullback_pct_applied - _pullback_pct_requested
+                _dyn_final = _reentry_pullback_pct_applied
+                _dyn_band = 'watcher_shallow'
+                pullback_pct = _reentry_pullback_pct_applied
+                if side == 'LONG':
+                    entry_price = price * (1.0 - (pullback_pct / 100.0))
+                else:
+                    entry_price = price * (1.0 + (pullback_pct / 100.0))
+            _forecast_prob = _coerce_float(_sig.get('forecastEdgeProb', 0.5), 0.5)
+            _forecast_uncertainty = _coerce_float(_sig.get('forecastUncertainty', 1.0), 1.0)
+            _forecast_source = 'post_exit_reentry'
+            _forecast_model_version = 'watcher_shallow_v1'
+            _forecast_features = {
+                'entry_mode': _reentry_entry_mode or 'SHALLOW_PULLBACK',
+                'execution_priority': _reentry_exec_priority or 'WATCHER',
+            }
+        elif ENTRY_FORECAST_ENABLED:
             try:
                 # Build features dict for the ML service
                 _raw_feats = {
@@ -42713,6 +43196,14 @@ class PaperTradingEngine:
             )
             return None
 
+        if is_post_exit_reentry:
+            signal_confirmation_delay_seconds = _reentry_confirm_delay_sec
+            pending_timeout_seconds = _reentry_expires_sec
+            _confirm_base_sec = signal_confirmation_delay_seconds
+            _confirm_after_regime_sec = signal_confirmation_delay_seconds
+            _confirm_clamp_min = min(_confirm_clamp_min, signal_confirmation_delay_seconds)
+            _confirm_clamp_max = max(_confirm_clamp_max, signal_confirmation_delay_seconds)
+
         _limited_market_override = compute_limited_market_override_plan(signal or {}, pending_passed=False)
 
         # OVP-1: _pending_id already generated above (before sizing)
@@ -42760,6 +43251,12 @@ class PaperTradingEngine:
             "reentryWatcherId": str(signal.get('reentryWatcherId', '') or '') if signal else '',
             "postExitReentryStopMult": post_exit_reentry_stop_mult,
             "postExitReentrySizeCapMult": _coerce_float(signal.get('postExitReentrySizeCapMult', 1.0) if signal else 1.0, 1.0),
+            "postExitReentryEntryMode": _reentry_entry_mode if is_post_exit_reentry else '',
+            "postExitReentryPullbackPctOriginal": _reentry_pullback_pct_original if is_post_exit_reentry else 0.0,
+            "postExitReentryPullbackPctApplied": _reentry_pullback_pct_applied if is_post_exit_reentry else 0.0,
+            "postExitReentryConfirmDelaySec": _reentry_confirm_delay_sec if is_post_exit_reentry else 0,
+            "postExitReentryExpiresSec": _reentry_expires_sec if is_post_exit_reentry else 0,
+            "postExitReentryExecutionPriority": _reentry_exec_priority if is_post_exit_reentry else '',
             "decisionContext": signal.get('decisionContext', {}) if signal else {},
             "indicatorPolicy": signal.get('indicatorPolicy', {}) if signal else {},
             "gatePolicy": signal.get('gatePolicy', {}) if signal else {},
@@ -42963,8 +43460,19 @@ class PaperTradingEngine:
         # CEDG-1: Preflight canary log
         if _is_canary:
             logger.info(f"🐤 CANARY PREFLIGHT: {side} {trade_symbol} id={_pending_id} is_canary=True")
-        self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
-        logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
+        if is_post_exit_reentry:
+            self.add_log(
+                f"🛰️ REENTRY PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} "
+                f"(shallow {pullback_pct:.2f}% pullback) | {signal_confirmation_delay_seconds}s confirm"
+            )
+            logger.info(
+                f"🛰️ REENTRY PENDING ORDER: {side} {trade_symbol} @ {entry_price} "
+                f"(shallow {pullback_pct:.2f}% pullback from {price}, confirm={signal_confirmation_delay_seconds}s "
+                f"expiry={pending_timeout_seconds}s priority={_reentry_exec_priority or 'WATCHER'})"
+            )
+        else:
+            self.add_log(f"📋 PENDING: {side} {trade_symbol} | ${price:.4f} → ${entry_price:.4f} ({pullback_pct}% pullback) | Spread: {spread_level}")
+            logger.info(f"📋 PENDING ORDER: {side} {trade_symbol} @ {entry_price} (pullback {pullback_pct}% from {price}, spread={spread_level})")
         # P3: Confirmation delay telemetry — 3-step breakdown for observability
         try:
             logger.info(f"⏱️ CONFIRM_DELAY: {trade_symbol} base={_confirm_base_sec}s regime={_confirm_after_regime_sec}s final={signal_confirmation_delay_seconds}s clamp=[{_confirm_clamp_min},{_confirm_clamp_max}]")
@@ -44559,6 +45067,12 @@ class PaperTradingEngine:
             "reentryWatcherId": str(order.get('reentryWatcherId', '') or ''),
             "postExitReentryStopMult": _coerce_float(order.get('postExitReentryStopMult', 1.0), 1.0),
             "postExitReentrySizeCapMult": _coerce_float(order.get('postExitReentrySizeCapMult', 1.0), 1.0),
+            "postExitReentryEntryMode": str(order.get('postExitReentryEntryMode', '') or ''),
+            "postExitReentryPullbackPctOriginal": _coerce_float(order.get('postExitReentryPullbackPctOriginal', 0.0), 0.0),
+            "postExitReentryPullbackPctApplied": _coerce_float(order.get('postExitReentryPullbackPctApplied', 0.0), 0.0),
+            "postExitReentryConfirmDelaySec": int(order.get('postExitReentryConfirmDelaySec', 0) or 0),
+            "postExitReentryExpiresSec": int(order.get('postExitReentryExpiresSec', 0) or 0),
+            "postExitReentryExecutionPriority": str(order.get('postExitReentryExecutionPriority', '') or ''),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
@@ -47082,6 +47596,21 @@ class PaperTradingEngine:
             "reentryOriginTradeId": str(pos.get('reentryOriginTradeId', '') or ''),
             "reentryOriginExitReason": str(pos.get('reentryOriginExitReason', '') or ''),
             "reentryWatcherId": str(pos.get('reentryWatcherId', '') or ''),
+            "postExitReentryEntryMode": str(pos.get('postExitReentryEntryMode', '') or ''),
+            "postExitReentryPullbackPctOriginal": _coerce_float(pos.get('postExitReentryPullbackPctOriginal', 0.0), 0.0),
+            "postExitReentryPullbackPctApplied": _coerce_float(pos.get('postExitReentryPullbackPctApplied', 0.0), 0.0),
+            "postExitReentryConfirmDelaySec": int(pos.get('postExitReentryConfirmDelaySec', 0) or 0),
+            "postExitReentryExpiresSec": int(pos.get('postExitReentryExpiresSec', 0) or 0),
+            "postExitReentryExecutionPriority": str(pos.get('postExitReentryExecutionPriority', '') or ''),
+            "structureTrend": str(pos.get('structureTrend', 'MIXED') or 'MIXED'),
+            "swingState": str(pos.get('swingState', 'MIXED') or 'MIXED'),
+            "compressionState": str(pos.get('compressionState', 'NONE') or 'NONE'),
+            "breakoutRetestState": str(pos.get('breakoutRetestState', 'NONE') or 'NONE'),
+            "srContext": str(pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+            "patternBias": str(pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+            "patternConfidence": _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
+            "patternSource": str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+            "structureVersion": str(pos.get('structureVersion', 'v1') or 'v1'),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
             "tpCloseSplit": pos.get('tpCloseSplit', ''),
             "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
@@ -47186,6 +47715,21 @@ class PaperTradingEngine:
                 'reentryOriginTradeId': str(pos.get('reentryOriginTradeId', '') or ''),
                 'reentryOriginExitReason': str(pos.get('reentryOriginExitReason', '') or ''),
                 'reentryWatcherId': str(pos.get('reentryWatcherId', '') or ''),
+                'postExitReentryEntryMode': str(pos.get('postExitReentryEntryMode', '') or ''),
+                'postExitReentryPullbackPctOriginal': _coerce_float(pos.get('postExitReentryPullbackPctOriginal', 0.0), 0.0),
+                'postExitReentryPullbackPctApplied': _coerce_float(pos.get('postExitReentryPullbackPctApplied', 0.0), 0.0),
+                'postExitReentryConfirmDelaySec': int(pos.get('postExitReentryConfirmDelaySec', 0) or 0),
+                'postExitReentryExpiresSec': int(pos.get('postExitReentryExpiresSec', 0) or 0),
+                'postExitReentryExecutionPriority': str(pos.get('postExitReentryExecutionPriority', '') or ''),
+                'structureTrend': str(pos.get('structureTrend', 'MIXED') or 'MIXED'),
+                'swingState': str(pos.get('swingState', 'MIXED') or 'MIXED'),
+                'compressionState': str(pos.get('compressionState', 'NONE') or 'NONE'),
+                'breakoutRetestState': str(pos.get('breakoutRetestState', 'NONE') or 'NONE'),
+                'srContext': str(pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+                'patternBias': str(pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+                'patternConfidence': _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
+                'patternSource': str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+                'structureVersion': str(pos.get('structureVersion', 'v1') or 'v1'),
                 'continuationFlowState': pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
                 'underwaterTapeState': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
                 'underwaterPriceLossPct': _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
@@ -48961,6 +49505,7 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 # Signals persist until invalidated by confirmed counter-signal
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
 post_exit_reentry_watchers = {}  # {symbol: {watcherId, originalTradeId, watchState, ...}}
+market_structure_cache = {}
 signal_event_buffer = deque(maxlen=2000)
 
 SIGNAL_STAGE_RAW = 'RAW_GENERATED'

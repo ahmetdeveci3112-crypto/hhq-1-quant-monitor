@@ -202,11 +202,19 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Aged Guard', value: humanizeToken(trade.agedProfitGuardState, '—') },
             { label: 'Fake-Out', value: trade.fakeoutReclaimHoldArmed || trade.fakeoutReclaimHoldUsed ? humanizeToken(trade.fakeoutReclaimReleaseReason || trade.fakeoutReclaimReason || 'ARMED') : '—' },
             { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
+            { label: 'Structure', value: humanizeToken(trade.structureTrend, '—') },
+            { label: 'Retest', value: humanizeToken(trade.breakoutRetestState, '—') },
+            {
+                label: 'Pattern',
+                value: `${humanizeToken(trade.patternBias, '—')} ${trade.patternConfidence ? `(${Number(trade.patternConfidence).toFixed(2)})` : ''}`.trim(),
+            },
             {
                 label: 'Re-entry',
                 value: trade.postExitReentryTriggered ? 'Tetiklendi' : 'Yok',
                 tone: trade.postExitReentryTriggered ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60',
             },
+            { label: 'Re-entry Exec', value: humanizeToken(trade.postExitReentryEntryMode, '—') },
+            { label: 'Re-entry Pullback', value: trade.postExitReentryPullbackPctApplied ? `%${Number(trade.postExitReentryPullbackPctApplied).toFixed(2)}` : '—' },
             { label: 'Entry Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Yön Değişti', value: report.side_changed ? 'Evet' : 'Hayır', tone: report.side_changed ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Owner Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
@@ -518,6 +526,38 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runnerContextResolved)}</div>
                                             </div>
                                             <div>
+                                                <div className="text-slate-500 text-xs">Structure</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.structureTrend, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Swing</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.swingState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Compression</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.compressionState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Retest</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.breakoutRetestState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">SR Context</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.srContext, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Pattern Bias</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.patternBias, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Pattern Confidence</div>
+                                                <div className="font-semibold text-white">
+                                                    {typeof replayTrade.trade.patternConfidence === 'number'
+                                                        ? Number(replayTrade.trade.patternConfidence).toFixed(2)
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
                                                 <div className="text-slate-500 text-xs">Thesis</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionThesisState, '—')}</div>
                                             </div>
@@ -579,6 +619,30 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 <div className="text-slate-500 text-xs">Re-entry Outcome</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.postExitReentryOutcome || '—'}</div>
                                             </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Exec Mode</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitReentryEntryMode, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Pullback</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.postExitReentryPullbackPctApplied
+                                                        ? `%${Number(replayTrade.trade.postExitReentryPullbackPctApplied).toFixed(2)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Confirm Delay</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.postExitReentryConfirmDelaySec ? `${replayTrade.trade.postExitReentryConfirmDelaySec}s` : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Re-entry Expiry</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.postExitReentryExpiresSec ? `${replayTrade.trade.postExitReentryExpiresSec}s` : '—'}
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -594,10 +658,10 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         ) : (
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
-                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
-                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason']),
-                                                ].slice(0, 12);
+                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence']),
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
+                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason']),
+                                                ].slice(0, 16);
                                                 return (
                                                     <details
                                                         key={snapshot.snapshotId}
