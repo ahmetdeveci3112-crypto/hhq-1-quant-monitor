@@ -36,6 +36,24 @@ const formatUnix = (ts?: number) => {
   return d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString('tr-TR', { day: '2-digit', month: '2-digit' });
 };
 
+const humanizeGovernanceReason = (reason?: string) => {
+  if (!reason) return '—';
+  if (reason === 'auto_promote_disabled') return 'Kapalı: auto promote açık değil';
+  if (reason === 'auto_rollback_disabled') return 'Kapalı: auto rollback açık değil';
+  if (reason === 'no_live_eval_support') return 'Bu model için canlı eval desteği yok';
+  if (reason === 'no_recent_metrics' || reason === 'no_live_eval_samples') return 'Henüz yeterli canlı eval örneği yok';
+  if (reason.startsWith('insufficient_samples')) return `Yetersiz challenger örneği • ${reason.match(/\((.*)\)/)?.[1] || ''}`;
+  if (reason.startsWith('insufficient_champion_samples')) return `Yetersiz champion örneği • ${reason.match(/\((.*)\)/)?.[1] || ''}`;
+  if (reason.startsWith('insufficient_champion_live_eval')) return 'Champion tarafında yeterli canlı eval yok';
+  if (reason.startsWith('insufficient_uplift')) return `Uplift eşiği geçilmedi • ${reason.match(/\((.*)\)/)?.[1] || ''}`;
+  if (reason.startsWith('brier_degradation')) return `Kalibrasyon kötüleşti • ${reason.match(/\((.*)\)/)?.[1] || ''}`;
+  if (reason.startsWith('brier_spike')) return `Canlı kalibrasyon bozuldu • ${reason.match(/\((.*)\)/)?.[1] || ''}`;
+  if (reason === 'champion_stable') return 'Champion stabil';
+  if (reason === 'missing_model') return 'Champion/challenger çifti eksik';
+  if (reason === 'no_challenger') return 'Aktif challenger yok';
+  return reason;
+};
+
 export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, optimizerStats, onToggleOptimizer, phase193Status, onSLGuardSettings, onFreqAIRetrain, onHyperoptRun, onHyperoptSettings, onForceApplyLast, settingsSnapshot, apiUrl }) => {
   const [localSettings, setLocalSettings] = React.useState(settings);
   const [isSaving, setIsSaving] = useState(false);
@@ -80,6 +98,8 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
   const previewLeverage = Number(settingsSnapshot?.leverage ?? localSettings.leverage ?? 10);
   const previewAtrPct = Number(settingsSnapshot?.atrPct ?? 2.0);
   const roiPreview = (atrMult: number) => (previewAtrPct * atrMult * Math.max(1, previewLeverage)).toFixed(1);
+  const entryForecastGovernance = phase193Status?.ml_governance?.models?.entry_forecast;
+  const freqAiGovernance = phase193Status?.ml_governance?.models?.freqai;
 
   const handleGovernanceToggle = useCallback(async (field: 'auto_promote' | 'auto_rollback', newValue: boolean) => {
     if (!apiUrl) return;
@@ -1129,6 +1149,11 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                         }`} />
                     </button>
                   </div>
+                  <div className="mb-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-3 py-2 text-[10px] text-slate-300 space-y-1">
+                    <div>Auto-apply yalnızca bu toggle açıkken arka planda çalışır.</div>
+                    <div>`Optimize+Apply` manuel tek-sefer apply ister; `Force Apply` min iyileşme eşiğini aşar ama runtime ownership lock&apos;ı aşmaz.</div>
+                    <div className="text-slate-400">SMART_V3 açık pozisyonlar generic TP/trail resync almaz; mevcut V3 runtime yönetimi korunur.</div>
+                  </div>
 
                   {/* Score & Telemetry */}
                   <div className="grid grid-cols-2 gap-2 mb-3">
@@ -1143,6 +1168,20 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                       <div className={`text-sm font-bold ${(phase193Status.hyperopt.improvement_pct || 0) > 0 ? 'text-emerald-400' : 'text-slate-300'}`}>
                         {phase193Status.hyperopt.improvement_pct !== undefined ? `${phase193Status.hyperopt.improvement_pct >= 0 ? '+' : ''}%${phase193Status.hyperopt.improvement_pct.toFixed(1)}` : '—'}
                       </div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 mb-3">
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Min İyileşme</div>
+                      <div className="text-sm font-bold text-cyan-300">%{phase193Status.hyperopt.min_apply_improvement_pct ?? 0}</div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Min Trade</div>
+                      <div className="text-sm font-bold text-slate-200">{phase193Status.hyperopt.min_trades_for_apply ?? 0}</div>
+                    </div>
+                    <div className="bg-slate-900/50 rounded p-2 text-center">
+                      <div className="text-[10px] text-slate-500">Cooldown</div>
+                      <div className="text-sm font-bold text-slate-200">{Math.round((phase193Status.hyperopt.apply_cooldown_sec ?? 0) / 60)}dk</div>
                     </div>
                   </div>
 
@@ -1253,7 +1292,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-500 mb-3">
-                    🏆 Yeni eğitilen modelleri &quot;challenger&quot; olarak test eder, performansı yeterli ise otomatik promosyon yapar.
+                    🏆 Otomatik promote/rollback yalnızca siz açtığınızda ve model için yeterli canlı eval biriktiğinde çalışır. Canlı eval desteği olmayan modeller manuel kalır.
                   </p>
 
                   {(() => {
@@ -1275,7 +1314,7 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                             <div className={`text-sm font-bold ${hasChallenger ? 'text-amber-400' : 'text-slate-400'}`}>
                               {hasChallenger ? '🧪 Test Ediliyor' : '⏳ Bekleniyor'}
                             </div>
-                            <div className="text-[8px] text-slate-600">Shadow modda test eder</div>
+                            <div className="text-[8px] text-slate-600">Canlı label/eval biriktirir</div>
                           </div>
                         </div>
                         <div className="bg-slate-900/50 rounded-lg p-2 space-y-1">
@@ -1322,6 +1361,48 @@ export const SettingsModal: React.FC<Props> = ({ onClose, settings, onSave, opti
                           <p className="text-[9px] text-slate-600 mt-2 text-center">
                             ML_GOVERNANCE_ENABLED env flag ile aktifleştirilir
                           </p>
+                        )}
+                        {gov?.enabled && (
+                          <div className="mt-3 rounded-lg border border-teal-500/20 bg-teal-500/5 px-3 py-2 text-[10px] text-slate-300 space-y-2">
+                            <div className="font-medium text-teal-300">Entry Forecast canlı değerlendirme</div>
+                            <div className="grid grid-cols-2 gap-2">
+                              <div className="rounded bg-slate-900/50 p-2">
+                                <div className="text-slate-500">Champion</div>
+                                <div className="font-semibold text-slate-200">
+                                  {entryForecastGovernance?.champion_live_metrics?.sample_count ?? 0} örnek
+                                </div>
+                                <div className="text-slate-400">
+                                  Acc {entryForecastGovernance?.champion_live_metrics?.accuracy ?? '—'} •
+                                  Brier {entryForecastGovernance?.champion_live_metrics?.brier ?? '—'}
+                                </div>
+                              </div>
+                              <div className="rounded bg-slate-900/50 p-2">
+                                <div className="text-slate-500">Challenger</div>
+                                <div className="font-semibold text-slate-200">
+                                  {entryForecastGovernance?.challenger_live_metrics?.sample_count ?? 0} örnek
+                                </div>
+                                <div className="text-slate-400">
+                                  Acc {entryForecastGovernance?.challenger_live_metrics?.accuracy ?? '—'} •
+                                  Brier {entryForecastGovernance?.challenger_live_metrics?.brier ?? '—'}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-slate-500">Auto Promote durumu</span>
+                              <span className="text-right text-slate-300">
+                                {humanizeGovernanceReason(entryForecastGovernance?.promotion_check?.reason)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-slate-500">Auto Rollback durumu</span>
+                              <span className="text-right text-slate-300">
+                                {humanizeGovernanceReason(entryForecastGovernance?.rollback_check?.reason)}
+                              </span>
+                            </div>
+                            <div className="text-slate-400">
+                              FreqAI: {freqAiGovernance?.live_eval_supported ? 'canlı eval destekli' : 'canlı challenger eval desteği yok; otomatik karar vermez'}.
+                            </div>
+                          </div>
                         )}
                       </>
                     );

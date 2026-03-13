@@ -94,12 +94,13 @@ def test_ml_governance():
     assert r2['registered'], "Second model should register"
     assert r2['role'] == 'challenger', "Second model should be challenger"
 
-    # Check promotion — v2 is better
+    # Unsupported model keys should never auto-promote without real live eval support
     promo = svc.check_promotion('test_model')
-    assert promo['should_promote'], f"Should promote: {promo['reason']}"
+    assert not promo['should_promote'], f"Auto promote should stay blocked: {promo['reason']}"
+    assert promo['reason'] == 'no_live_eval_support'
 
-    # Promote
-    promote_result = svc.promote('test_model')
+    # Manual promote still works
+    promote_result = svc.promote('test_model', notes='manual test promote')
     assert promote_result['success'], "Promote should succeed"
     assert promote_result['new_champion'] == 'v2'
 
@@ -124,8 +125,12 @@ def test_ml_governance():
     assert status['event_count'] > 0
 
     # Check rollback policy
-    rollback_check = svc.check_rollback('test_model', recent_metrics={'brier': 0.50, 'pnl': -10})
-    assert rollback_check['should_rollback'], "Should trigger rollback on degraded metrics"
+    rollback_check = svc.check_rollback('test_model')
+    assert not rollback_check['should_rollback'], "Unsupported model should not auto-rollback without live eval support"
+    assert rollback_check['reason'] == 'no_live_eval_support'
+
+    rollback_check_manual = svc.check_rollback('test_model', recent_metrics={'brier': 0.50, 'pnl': -10})
+    assert rollback_check_manual['should_rollback'], "Manual rollback input should still be honored"
     rollback_guard = svc.check_rollback(
         'test_model',
         recent_metrics={'sample_count': 20, 'brier': 0.50, 'pnl': -10}

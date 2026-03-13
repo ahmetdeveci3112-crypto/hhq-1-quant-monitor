@@ -7205,14 +7205,16 @@ async def lifespan(app: FastAPI):
                                 }
                             )
                             logger.info(f"🏆 ML Governance: FreqAI registered → {_reg}")
-                            # Auto-promote if challenger was registered
-                            if _reg.get('role') == 'challenger':
+                            # Auto-promote only when explicitly enabled; promotion itself requires live eval support.
+                            if _reg.get('role') == 'challenger' and ml_governance_service.auto_promote:
                                 _promo = ml_governance_service.check_promotion('freqai')
                                 if _promo.get('should_promote'):
                                     _result = ml_governance_service.promote('freqai', notes=_promo.get('reason', ''))
                                     logger.warning(f"🏆 ML_AUTO_PROMOTE: freqai → {_result}")
                                 else:
                                     logger.info(f"ML Governance: freqai promotion check → {_promo.get('reason')}")
+                            elif _reg.get('role') == 'challenger':
+                                logger.info("ML Governance: freqai challenger registered; auto-promote disabled")
                         except Exception as _gov_err:
                             logger.debug(f"ML Governance register error: {_gov_err}")
                 freqai_model.on_model_trained = _on_model_trained
@@ -7318,14 +7320,16 @@ async def lifespan(app: FastAPI):
                                 }
                             )
                             logger.info(f"🏆 ML Governance: entry_forecast registered → {_reg}")
-                            # Auto-promote if challenger was registered
-                            if _reg.get('role') == 'challenger':
+                            # Auto-promote only when explicitly enabled; promotion itself requires live eval support.
+                            if _reg.get('role') == 'challenger' and ml_governance_service.auto_promote:
                                 _promo = ml_governance_service.check_promotion('entry_forecast')
                                 if _promo.get('should_promote'):
                                     _result = ml_governance_service.promote('entry_forecast', notes=_promo.get('reason', ''))
                                     logger.warning(f"🏆 ML_AUTO_PROMOTE: entry_forecast → {_result}")
                                 else:
                                     logger.info(f"ML Governance: entry_forecast promotion check → {_promo.get('reason')}")
+                            elif _reg.get('role') == 'challenger':
+                                logger.info("ML Governance: entry_forecast challenger registered; auto-promote disabled")
                         except Exception as _gov_err:
                             logger.debug(f"ML Governance register error: {_gov_err}")
                     logger.info(f"✅ Entry forecast auto-retrain: {result}")
@@ -7360,44 +7364,9 @@ async def lifespan(app: FastAPI):
                 if not ml_governance_service or not ml_governance_service.enabled or not ml_governance_service.auto_rollback:
                     continue
                 
-                # Build recent metrics from last 200 trades (Phase 268 fix: was 50, needs >=min_samples)
-                recent_trades = global_paper_trader.trades[-200:] if hasattr(global_paper_trader, 'trades') else []
-                if len(recent_trades) < 10:
-                    continue
-                
-                wins = sum(1 for t in recent_trades if (t.get('pnl') or 0) > 0)
-                total = len(recent_trades)
-                win_rate = wins / total if total > 0 else 0
-                total_pnl_usdt = sum(t.get('pnl', 0) for t in recent_trades)
-                total_margin = sum(t.get('margin', t.get('sizeUsd', 100)) for t in recent_trades)
-                # P1 fix: drawdown as percentage of total margin (matches drawdown_guard_pct semantics)
-                pnl_pct = (total_pnl_usdt / max(total_margin, 1)) * 100
-                
-                # Check each model key with model-specific brier comparison
+                # Check each model with its own live evaluation support; unsupported models stay manual-only.
                 for model_key in list(ml_governance_service._registry.keys()):
-                    champion = ml_governance_service.get_champion(model_key)
-                    if not champion:
-                        continue
-                    
-                    # Phase 268: Skip brier comparison if no calibrated baseline
-                    train_brier = champion.get('metrics', {}).get('brier')
-                    if train_brier is not None and train_brier != 0:
-                        recent_brier = 1.0 - win_rate  # proxy
-                        model_metrics = {
-                            'brier': recent_brier,
-                            'pnl': pnl_pct,
-                            'win_rate': win_rate,
-                            'sample_count': total,
-                        }
-                    else:
-                        # No calibrated brier — skip brier comparison entirely
-                        model_metrics = {
-                            'pnl': pnl_pct,
-                            'win_rate': win_rate,
-                            'sample_count': total,
-                        }
-                    
-                    check = ml_governance_service.check_rollback(model_key, model_metrics)
+                    check = ml_governance_service.check_rollback(model_key)
                     if check.get('should_rollback'):
                         _result = ml_governance_service.rollback(model_key, notes=check.get('reason', ''))
                         logger.warning(f"🔄 ML_AUTO_ROLLBACK: {model_key} → {_result}")
@@ -50948,11 +50917,13 @@ async def phase193_entry_forecast_retrain():
                         'sample_count': result.get('sample_count', len(rows)),
                     }
                 )
-                # P3 fix: Auto-promote check for manual retrain
-                if _reg.get('role') == 'challenger':
+                # Auto-promote only when explicitly enabled; promotion itself requires live eval support.
+                if _reg.get('role') == 'challenger' and ml_governance_service.auto_promote:
                     _promo = ml_governance_service.check_promotion('entry_forecast')
                     if _promo.get('should_promote'):
                         ml_governance_service.promote('entry_forecast', notes=_promo.get('reason', ''))
+                elif _reg.get('role') == 'challenger':
+                    logger.info("ML Governance: manual retrain challenger registered; auto-promote disabled")
             except Exception as _gov_err:
                 logger.warning(f"ML Governance manual retrain register/promote error: {_gov_err}")
     

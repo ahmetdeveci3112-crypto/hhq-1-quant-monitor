@@ -14,6 +14,7 @@ import json
 import time
 import logging
 import tempfile
+import sqlite3
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,12 @@ DEFAULT_POLICY = {
     'max_brier_increase': 0.05,
     'drawdown_guard_pct': -5.0,
 }
+
+ENTRY_FORECAST_PROMOTION_LOOKBACK_SEC = int(os.getenv('ML_GOV_ENTRY_FORECAST_PROMOTION_LOOKBACK_SEC', str(30 * 24 * 3600)))
+ENTRY_FORECAST_ROLLBACK_LOOKBACK_SEC = int(os.getenv('ML_GOV_ENTRY_FORECAST_ROLLBACK_LOOKBACK_SEC', str(7 * 24 * 3600)))
+ENTRY_FORECAST_PROMOTION_SAMPLE_LIMIT = int(os.getenv('ML_GOV_ENTRY_FORECAST_PROMOTION_SAMPLE_LIMIT', '500'))
+ENTRY_FORECAST_ROLLBACK_SAMPLE_LIMIT = int(os.getenv('ML_GOV_ENTRY_FORECAST_ROLLBACK_SAMPLE_LIMIT', '250'))
+ENTRY_FORECAST_MIN_CHAMPION_EVAL_SAMPLES = int(os.getenv('ML_GOV_ENTRY_FORECAST_MIN_CHAMPION_EVAL_SAMPLES', '30'))
 
 
 class MLGovernanceService:
@@ -340,6 +347,123 @@ class MLGovernanceService:
         self._persist_eval_window(entry)
 
     # ------------------------------------------------------------------
+    # Live evaluation helpers
+    # ------------------------------------------------------------------
+    def _supports_live_eval(self, model_key: str) -> bool:
+        return model_key == 'entry_forecast'
+
+    def _get_sqlite_path(self) -> Optional[str]:
+        return getattr(self._sqlite, 'db_path', None) if self._sqlite else None
+
+    def _load_entry_forecast_live_eval_metrics(
+        self,
+        version: Optional[str],
+        *,
+        lookback_sec: int,
+        sample_limit: int,
+    ) -> Dict:
+        if not version:
+            return {'available': False, 'reason': 'missing_version'}
+        db_path = self._get_sqlite_path()
+        if not db_path:
+            return {'available': False, 'reason': 'sqlite_unavailable'}
+
+        cutoff_ts = max(0, int(time.time()) - max(0, int(lookback_sec)))
+        limit_n = max(10, int(sample_limit))
+        try:
+            with sqlite3.connect(db_path) as db:
+                row = db.execute(
+                    '''
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN outcome_label = 1 THEN 1 ELSE 0 END) AS hits,
+                        AVG(
+                            CASE
+                                WHEN ((COALESCE(forecast_prob, 0.5) >= 0.5 AND outcome_label = 1)
+                                   OR (COALESCE(forecast_prob, 0.5) < 0.5 AND outcome_label = 0))
+                                THEN 1.0 ELSE 0.0
+                            END
+                        ) AS accuracy,
+                        AVG(
+                            (COALESCE(forecast_prob, 0.5) - outcome_label) *
+                            (COALESCE(forecast_prob, 0.5) - outcome_label)
+                        ) AS brier,
+                        AVG(COALESCE(forecast_prob, 0.5)) AS avg_prob
+                    FROM (
+                        SELECT forecast_prob, outcome_label
+                        FROM entry_forecast_events
+                        WHERE model_version = ?
+                          AND outcome_label IS NOT NULL
+                          AND COALESCE(forecast_source, '') != 'MARKET_FALLBACK'
+                          AND COALESCE(outcome_ts, created_ts) >= ?
+                        ORDER BY COALESCE(outcome_ts, created_ts) DESC
+                        LIMIT ?
+                    ) recent_eval
+                    ''',
+                    (version, cutoff_ts, limit_n),
+                ).fetchone()
+        except Exception as e:
+            logger.debug(f"ML_GOV live eval query error ({version}): {e}")
+            return {'available': False, 'reason': 'live_eval_query_failed'}
+
+        total = int(row[0] or 0) if row else 0
+        if total <= 0:
+            return {
+                'available': False,
+                'reason': 'no_live_eval_samples',
+                'source': 'entry_forecast_events',
+                'sample_count': 0,
+                'version': version,
+            }
+
+        hits = int(row[1] or 0)
+        accuracy = float(row[2] or 0.0)
+        brier = float(row[3] or 0.0)
+        avg_prob = float(row[4] or 0.0)
+        return {
+            'available': True,
+            'source': 'entry_forecast_events',
+            'version': version,
+            'sample_count': total,
+            'hit_rate': round(hits / max(total, 1), 4),
+            'accuracy': round(accuracy, 4),
+            'brier': round(brier, 6),
+            'avg_prob': round(avg_prob, 4),
+            'lookback_sec': int(lookback_sec),
+        }
+
+    def get_live_eval_metrics(
+        self,
+        model_key: str,
+        version: Optional[str] = None,
+        *,
+        purpose: str = 'promotion',
+    ) -> Dict:
+        if not self.enabled:
+            return {'available': False, 'reason': 'governance_disabled'}
+        if not self._supports_live_eval(model_key):
+            return {'available': False, 'reason': 'no_live_eval_support'}
+
+        if model_key == 'entry_forecast':
+            lookback_sec = (
+                ENTRY_FORECAST_PROMOTION_LOOKBACK_SEC
+                if purpose == 'promotion'
+                else ENTRY_FORECAST_ROLLBACK_LOOKBACK_SEC
+            )
+            sample_limit = (
+                ENTRY_FORECAST_PROMOTION_SAMPLE_LIMIT
+                if purpose == 'promotion'
+                else ENTRY_FORECAST_ROLLBACK_SAMPLE_LIMIT
+            )
+            return self._load_entry_forecast_live_eval_metrics(
+                version,
+                lookback_sec=lookback_sec,
+                sample_limit=sample_limit,
+            )
+
+        return {'available': False, 'reason': 'no_live_eval_support'}
+
+    # ------------------------------------------------------------------
     # Promotion policy
     # ------------------------------------------------------------------
     def get_policy(self, model_key: str) -> Dict:
@@ -369,14 +493,38 @@ class MLGovernanceService:
             return {'should_promote': False, 'reason': 'missing_model'}
 
         policy = self.get_policy(model_key)
-        c_metrics = challenger.get('metrics', {})
-        ch_metrics = champion.get('metrics', {})
+        if not self._supports_live_eval(model_key):
+            return {'should_promote': False, 'reason': 'no_live_eval_support'}
+
+        c_metrics = self.get_live_eval_metrics(model_key, challenger.get('version'), purpose='promotion')
+        if not c_metrics.get('available'):
+            return {
+                'should_promote': False,
+                'reason': c_metrics.get('reason', 'no_live_eval_samples'),
+                'metrics': {'source': c_metrics.get('source', 'live_eval')},
+            }
+
+        ch_metrics = self.get_live_eval_metrics(model_key, champion.get('version'), purpose='promotion')
+        if not ch_metrics.get('available'):
+            return {
+                'should_promote': False,
+                'reason': f"insufficient_champion_live_eval ({ch_metrics.get('reason', 'no_live_eval_samples')})",
+                'metrics': {'source': ch_metrics.get('source', 'live_eval')},
+            }
 
         # Check minimum samples
         if c_metrics.get('sample_count', 0) < policy['min_samples']:
             return {
                 'should_promote': False,
                 'reason': f"insufficient_samples ({c_metrics.get('sample_count', 0)}/{policy['min_samples']})"
+            }
+        if ch_metrics.get('sample_count', 0) < ENTRY_FORECAST_MIN_CHAMPION_EVAL_SAMPLES:
+            return {
+                'should_promote': False,
+                'reason': (
+                    f"insufficient_champion_samples "
+                    f"({ch_metrics.get('sample_count', 0)}/{ENTRY_FORECAST_MIN_CHAMPION_EVAL_SAMPLES})"
+                ),
             }
 
         # Check uplift vs champion
@@ -404,7 +552,13 @@ class MLGovernanceService:
         return {
             'should_promote': True,
             'reason': f"challenger_better (uplift={uplift:.2f}%, brier_delta={brier_increase:+.4f})",
-            'metrics': {'uplift_pct': uplift, 'brier_delta': brier_increase},
+            'metrics': {
+                'uplift_pct': uplift,
+                'brier_delta': brier_increase,
+                'source': 'live_eval',
+                'challenger_samples': c_metrics.get('sample_count', 0),
+                'champion_samples': ch_metrics.get('sample_count', 0),
+            },
         }
 
     def promote(self, model_key: str, version: str = None, notes: str = '') -> Dict:
@@ -464,7 +618,15 @@ class MLGovernanceService:
             return {'should_rollback': False, 'reason': 'no_champion'}
 
         if not recent_metrics:
-            return {'should_rollback': False, 'reason': 'no_recent_metrics'}
+            if not self._supports_live_eval(model_key):
+                return {'should_rollback': False, 'reason': 'no_live_eval_support'}
+            recent_metrics = self.get_live_eval_metrics(
+                model_key,
+                champion.get('version'),
+                purpose='rollback',
+            )
+            if not recent_metrics.get('available'):
+                return {'should_rollback': False, 'reason': recent_metrics.get('reason', 'no_recent_metrics')}
 
         policy = self.get_policy(model_key)
         
@@ -485,6 +647,11 @@ class MLGovernanceService:
                 return {
                     'should_rollback': True,
                     'reason': f"brier_spike ({brier_delta:+.4f} > {policy['max_brier_increase'] * 2})",
+                    'metrics': {
+                        'source': recent_metrics.get('source', 'live_eval'),
+                        'sample_count': recent_metrics.get('sample_count'),
+                        'brier_delta': round(brier_delta, 6),
+                    },
                 }
 
         # Check PnL drawdown
@@ -579,6 +746,16 @@ class MLGovernanceService:
         reg = self._registry.get(model_key, {})
         champion = reg.get('champion')
         challenger = reg.get('challenger')
+        champion_live = (
+            self.get_live_eval_metrics(model_key, champion.get('version'), purpose='rollback')
+            if champion else {'available': False, 'reason': 'no_champion'}
+        )
+        challenger_live = (
+            self.get_live_eval_metrics(model_key, challenger.get('version'), purpose='promotion')
+            if challenger else {'available': False, 'reason': 'no_challenger'}
+        )
+        promotion_check = self.check_promotion(model_key) if challenger else {'should_promote': False, 'reason': 'no_challenger'}
+        rollback_check = self.check_rollback(model_key) if champion else {'should_rollback': False, 'reason': 'no_champion'}
 
         return {
             'champion': {
@@ -595,6 +772,11 @@ class MLGovernanceService:
             } if challenger else None,
             'policy': self.get_policy(model_key),
             'history_count': len(reg.get('history', [])),
+            'live_eval_supported': self._supports_live_eval(model_key),
+            'champion_live_metrics': champion_live,
+            'challenger_live_metrics': challenger_live,
+            'promotion_check': promotion_check,
+            'rollback_check': rollback_check,
         }
 
     # ------------------------------------------------------------------

@@ -226,29 +226,32 @@ class HHQHyperOptimizer:
             return 'MEAN_REVERSION'
         return 'DEFAULT'
     
-    def apply_to_trader(self, trader) -> bool:
+    def apply_to_trader(self, trader, *, force: bool = False, improvement_pct: Optional[float] = None) -> bool:
         """Phase 246C: Apply best_params to runtime trading parameters.
         
-        Only applies if improvement > 5% over defaults.
+        Manual apply respects configured improvement threshold unless forced.
         Uses snapshot/rollback for exception safety.
         Returns True if params were applied.
         """
         if not self.best_params or not self.is_optimized:
             return False
         
-        # Phase 249 fix: Enforce >5% improvement threshold
-        try:
-            default_params = {hp['name']: hp['default'] for hp in self.active_hyperparameters}
-            default_score = self._evaluate_with_params(default_params)
-            if default_score != 0:
-                improvement = (self.best_score - default_score) / abs(default_score) * 100
-            else:
-                improvement = 0
-            if improvement < 5.0:
-                logger.info(f"⏭️ Hyperopt skip apply: improvement={improvement:+.1f}% < 5% threshold")
-                return False
-        except Exception:
-            pass  # If check fails, proceed with apply
+        # Respect configurable threshold unless this is an explicit force-apply.
+        if not force:
+            try:
+                improvement = improvement_pct
+                if improvement is None:
+                    default_params = {hp['name']: hp['default'] for hp in self.active_hyperparameters}
+                    default_score = self._evaluate_with_params(default_params)
+                    improvement = ((self.best_score - default_score) / abs(default_score) * 100) if default_score != 0 else 0
+                if float(improvement or 0) < float(self.min_apply_improvement_pct):
+                    logger.info(
+                        f"⏭️ Hyperopt skip apply: improvement={float(improvement or 0):+.1f}% "
+                        f"< {self.min_apply_improvement_pct:.1f}% threshold"
+                    )
+                    return False
+            except Exception:
+                pass
         
         # P0-RCA #6: Map hyperopt param names to trader attributes
         # Hyperopt searches in DIRECT scale (e.g., sl_atr=2.0 = 2× ATR).
@@ -304,7 +307,13 @@ class HHQHyperOptimizer:
             return (False, 'cooldown')
         return (True, 'ok')
     
-    async def maybe_apply_to_runtime(self, force: bool = False, trader=None, improvement_pct: float = 0.0) -> dict:
+    async def maybe_apply_to_runtime(
+        self,
+        force: bool = False,
+        trader=None,
+        improvement_pct: float = 0.0,
+        manual_request: bool = False,
+    ) -> dict:
         """Phase 265: Conditionally apply best params to runtime trader."""
         if trader is None:
             from main import global_paper_trader
@@ -320,26 +329,45 @@ class HHQHyperOptimizer:
         except Exception:
             pass
         
-        if not force and not self.auto_apply_enabled:
+        if not force and not manual_request and not self.auto_apply_enabled:
             self.last_apply_result = 'skipped'
             self.last_apply_reason = 'auto_apply_disabled'
             return {'applied': False, 'reason': 'auto_apply_disabled'}
         
         if not force:
-            ok, reason = self._can_apply(improvement_pct)
-            if not ok:
-                self.last_apply_result = 'skipped'
-                self.last_apply_reason = reason
-                logger.info(f"⏭️ Hyperopt apply skipped: {reason}")
-                return {'applied': False, 'reason': reason}
+            if manual_request:
+                if improvement_pct < self.min_apply_improvement_pct:
+                    self.last_apply_result = 'skipped'
+                    self.last_apply_reason = 'low_improvement'
+                    logger.info("⏭️ Hyperopt manual apply skipped: low_improvement")
+                    return {'applied': False, 'reason': 'low_improvement'}
+            else:
+                ok, reason = self._can_apply(improvement_pct)
+                if not ok:
+                    self.last_apply_result = 'skipped'
+                    self.last_apply_reason = reason
+                    logger.info(f"⏭️ Hyperopt apply skipped: {reason}")
+                    return {'applied': False, 'reason': reason}
         
-        applied = self.apply_to_trader(trader)
+        applied = self.apply_to_trader(trader, force=force, improvement_pct=improvement_pct)
         if applied:
             # P2-06: Resync open positions with new params
             try:
                 resync_count = 0
-                from main import compute_sl_tp_levels, apply_sl_floor
+                skipped_v3 = 0
+                from main import (
+                    compute_sl_tp_levels,
+                    apply_sl_floor,
+                    normalize_strategy_mode,
+                    STRATEGY_MODE_SMART_V3_RUNNER,
+                )
                 for pos in list(getattr(trader, 'positions', [])):
+                    strategy_mode = normalize_strategy_mode(
+                        pos.get('strategyMode', pos.get('strategy_mode', 'LEGACY'))
+                    )
+                    if strategy_mode == STRATEGY_MODE_SMART_V3_RUNNER:
+                        skipped_v3 += 1
+                        continue
                     _atr = pos.get('atr', 0)
                     _entry = pos.get('entryPrice', 0)
                     if _atr <= 0 or _entry <= 0:
@@ -361,13 +389,14 @@ class HHQHyperOptimizer:
                     pos['trailActivation'] = levels['trail_activation']
                     pos['trailDistance'] = levels['trail_distance']
                     resync_count += 1
-                if resync_count:
-                    logger.info(f"🔄 HYPEROPT RESYNC: {resync_count} open positions updated")
+                if resync_count or skipped_v3:
+                    suffix = f", skipped_v3={skipped_v3}" if skipped_v3 else ""
+                    logger.info(f"🔄 HYPEROPT RESYNC: {resync_count} open positions updated{suffix}")
             except Exception as e:
                 logger.warning(f"⚠️ Hyperopt resync error: {e}")
             self.last_apply_time = int(time.time())
             self.last_apply_result = 'applied'
-            self.last_apply_reason = 'ok' if not force else 'forced'
+            self.last_apply_reason = 'forced' if force else ('manual_apply' if manual_request else 'ok')
             self.last_apply_params = dict(self.best_params)
         else:
             self.last_apply_result = 'skipped'
@@ -616,7 +645,11 @@ class HHQHyperOptimizer:
             # Phase 265 fix: Only auto-apply when explicitly requested.
             actually_applied = False
             if apply or force_apply:
-                apply_res = await self.maybe_apply_to_runtime(force=force_apply, improvement_pct=improvement)
+                apply_res = await self.maybe_apply_to_runtime(
+                    force=force_apply,
+                    improvement_pct=improvement,
+                    manual_request=bool(apply and not force_apply),
+                )
                 result['params_applied'] = apply_res['applied']
                 result['apply_reason'] = apply_res['reason']
                 result['run_apply_result'] = 'applied' if apply_res['applied'] else 'skipped'
