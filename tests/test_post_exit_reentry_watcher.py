@@ -164,6 +164,24 @@ def test_register_post_exit_reentry_watch_arms_for_profit_giveback_exit(monkeypa
     assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
 
 
+def test_register_post_exit_reentry_watch_ignores_current_closing_position_exposure(monkeypatch):
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
+    monkeypatch.setattr(main.global_paper_trader, "positions", [_build_reclaim_pos(_closing=True)])
+    monkeypatch.setattr(main.global_paper_trader, "pending_orders", [])
+
+    watch = main.register_post_exit_reentry_watch(
+        _build_reclaim_pos(_closing=True),
+        _build_closed_trade(),
+        original_reason="SMART_V3_RUNNER__SIDEWAYS_RECLAIM_CLOSE",
+        normalized_reason="SMART_V3_RUNNER__SIDEWAYS_RECLAIM_CLOSE",
+        exit_price=100.25,
+    )
+
+    assert watch is not None
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
+
+
 def test_register_post_exit_reentry_watch_skips_hard_stop_close(monkeypatch):
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
@@ -200,7 +218,7 @@ def test_evaluate_post_exit_reentry_watchers_confirms_after_persistence(monkeypa
     watch = _build_watch(cooldownUntilTs=1000.0)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
-    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol: False)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
 
     async def _fake_dispatch(safe_watch, signal, opportunity):
         safe_watch["watchState"] = main.POST_EXIT_REENTRY_STATE_CONFIRMED
@@ -228,7 +246,7 @@ def test_evaluate_post_exit_reentry_watchers_uses_signal_fallback_without_opport
     watch = _build_watch(cooldownUntilTs=1000.0)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
-    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol: False)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
 
     async def _fake_dispatch(safe_watch, signal, opportunity):
         safe_watch["watchState"] = main.POST_EXIT_REENTRY_STATE_CONFIRMED
@@ -269,7 +287,7 @@ def test_evaluate_post_exit_reentry_watchers_cancels_on_hostile_imbalance(monkey
     watch = _build_watch(cooldownUntilTs=1000.0)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AAVEUSDT": watch})
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
-    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol: False)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
     monkeypatch.setattr(main.time, "time", lambda: 1000.0)
 
     asyncio.run(

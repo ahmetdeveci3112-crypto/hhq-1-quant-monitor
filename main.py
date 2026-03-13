@@ -14578,6 +14578,9 @@ V3_THESIS_EXEC_SCORE_FLOOR = 60.0
 V3_RESCUE_VOLUME_FLOOR = 1.15
 V3_PROFIT_HOLD_VOLUME_FLOOR = 1.10
 V3_THESIS_OBI_ALIGN_THRESHOLD = 2.0
+V3_FAKEOUT_RECLAIM_HOLD_WINDOW_SEC = 120.0
+V3_FAKEOUT_RECLAIM_RECOVERY_PERSISTENCE_SEC = 30.0
+V3_FAKEOUT_RECLAIM_INVALIDATION_ROI_DELTA_PCT = 2.0
 V3_AGED_PROFIT_GUARD_MODE = str(os.environ.get('V3_AGED_PROFIT_GUARD_MODE', 'apply') or 'apply').strip().lower()
 AGED_PROFIT_GUARD_STATE_IDLE = "IDLE"
 AGED_PROFIT_GUARD_STATE_WATCHING = "WATCHING"
@@ -15532,6 +15535,11 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
         str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
         str(safe_pos.get('agedProfitGuardReason', '') or ''),
         str(_coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0) > 0),
+        str(bool(safe_pos.get('fakeoutReclaimHoldArmed', False))),
+        str(bool(safe_pos.get('fakeoutReclaimHoldUsed', False))),
+        str(safe_pos.get('fakeoutReclaimReason', '') or ''),
+        str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
+        str(_coerce_float(safe_pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0) > 0),
     ])
     last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
     last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
@@ -15565,6 +15573,10 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'profitHoldAccepted': profit_hold_accepted,
             'agedProfitGuardState': str(safe_pos.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE) or AGED_PROFIT_GUARD_STATE_IDLE),
             'agedProfitGuardReason': str(safe_pos.get('agedProfitGuardReason', '') or ''),
+            'fakeoutReclaimHoldArmed': bool(safe_pos.get('fakeoutReclaimHoldArmed', False)),
+            'fakeoutReclaimHoldUsed': bool(safe_pos.get('fakeoutReclaimHoldUsed', False)),
+            'fakeoutReclaimReason': str(safe_pos.get('fakeoutReclaimReason', '') or ''),
+            'fakeoutReclaimReleaseReason': str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
         },
         outcome={
             'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
@@ -15580,6 +15592,11 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'agedProfitPositiveSinceTs': round(_coerce_float(safe_pos.get('agedProfitPositiveSinceTs', 0.0), 0.0), 3),
             'agedProfitNonSupportingSinceTs': round(_coerce_float(safe_pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0), 3),
             'agedProfitBeFloorArmedTs': round(_coerce_float(safe_pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0), 3),
+            'fakeoutReclaimHoldArmed': bool(safe_pos.get('fakeoutReclaimHoldArmed', False)),
+            'fakeoutReclaimHoldUsed': bool(safe_pos.get('fakeoutReclaimHoldUsed', False)),
+            'fakeoutReclaimHoldUntilTs': round(_coerce_float(safe_pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0), 3),
+            'fakeoutReclaimReason': str(safe_pos.get('fakeoutReclaimReason', '') or ''),
+            'fakeoutReclaimReleaseReason': str(safe_pos.get('fakeoutReclaimReleaseReason', '') or ''),
         },
         created_ts=now_ms,
     )
@@ -15704,11 +15721,18 @@ def queue_post_exit_reentry_watch_snapshot(
     return True
 
 
-def _has_symbol_exposure(symbol: str) -> bool:
+def _has_symbol_exposure(symbol: str, exclude_position_id: str = '') -> bool:
     safe_symbol = str(symbol or '').upper()
     if not safe_symbol or 'global_paper_trader' not in globals() or not global_paper_trader:
         return False
-    if any(str(pos.get('symbol', '') or '').upper() == safe_symbol for pos in getattr(global_paper_trader, 'positions', [])):
+    safe_exclude = str(exclude_position_id or '')
+    for pos in getattr(global_paper_trader, 'positions', []):
+        if str(pos.get('symbol', '') or '').upper() != safe_symbol:
+            continue
+        if safe_exclude and str(pos.get('id', '') or '') == safe_exclude:
+            continue
+        if bool(pos.get('_closing', False)):
+            continue
         return True
     return any(str(order.get('symbol', '') or '').upper() == safe_symbol for order in getattr(global_paper_trader, 'pending_orders', []))
 
@@ -15780,7 +15804,7 @@ def register_post_exit_reentry_watch(
     symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
     if not symbol:
         return None
-    if _has_symbol_exposure(symbol):
+    if _has_symbol_exposure(symbol, exclude_position_id=str(safe_pos.get('id', '') or safe_trade.get('positionId', ''))):
         return None
     reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
     if reason_core not in V3_POST_EXIT_REENTRY_REASON_ALLOWLIST:
@@ -16170,6 +16194,13 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'agedProfitPositiveSinceTs': _coerce_float(safe_trade.get('agedProfitPositiveSinceTs', close_snapshot.get('agedProfitPositiveSinceTs', 0.0)), 0.0),
         'agedProfitNonSupportingSinceTs': _coerce_float(safe_trade.get('agedProfitNonSupportingSinceTs', close_snapshot.get('agedProfitNonSupportingSinceTs', 0.0)), 0.0),
         'agedProfitBeFloorArmedTs': _coerce_float(safe_trade.get('agedProfitBeFloorArmedTs', close_snapshot.get('agedProfitBeFloorArmedTs', 0.0)), 0.0),
+        'fakeoutReclaimHoldArmed': bool(safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False))),
+        'fakeoutReclaimHoldUsed': bool(safe_trade.get('fakeoutReclaimHoldUsed', close_snapshot.get('fakeoutReclaimHoldUsed', False))),
+        'fakeoutReclaimHoldUntilTs': _coerce_float(safe_trade.get('fakeoutReclaimHoldUntilTs', close_snapshot.get('fakeoutReclaimHoldUntilTs', 0.0)), 0.0),
+        'fakeoutReclaimCandidateTs': _coerce_float(safe_trade.get('fakeoutReclaimCandidateTs', close_snapshot.get('fakeoutReclaimCandidateTs', 0.0)), 0.0),
+        'fakeoutReclaimArmRoiPct': _coerce_float(safe_trade.get('fakeoutReclaimArmRoiPct', close_snapshot.get('fakeoutReclaimArmRoiPct', 0.0)), 0.0),
+        'fakeoutReclaimReason': str(safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')) or ''),
+        'fakeoutReclaimReleaseReason': str(safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')) or ''),
         'postExitWatchState': str(safe_trade.get('postExitWatchState', '') or ''),
         'postExitReentryTriggered': bool(safe_trade.get('postExitReentryTriggered', False)),
         'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
@@ -16229,6 +16260,9 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'positionThesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_ENTRY)),
                 'agedProfitGuardState': safe_trade.get('agedProfitGuardState', close_snapshot.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)),
                 'agedProfitGuardReason': safe_trade.get('agedProfitGuardReason', close_snapshot.get('agedProfitGuardReason', '')),
+                'fakeoutReclaimHoldArmed': safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False)),
+                'fakeoutReclaimReason': safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')),
+                'fakeoutReclaimReleaseReason': safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')),
             },
             'outcome': {
                 'accepted': True,
@@ -16255,6 +16289,11 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'exitOwner': safe_trade.get('exitOwner', ''),
                 'expectancy': expectancy,
                 'positionThesisState': safe_trade.get('positionThesisState', close_snapshot.get('positionThesisState', POSITION_THESIS_EXIT_CONFIRMED)),
+                'agedProfitGuardState': safe_trade.get('agedProfitGuardState', close_snapshot.get('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)),
+                'agedProfitGuardReason': safe_trade.get('agedProfitGuardReason', close_snapshot.get('agedProfitGuardReason', '')),
+                'fakeoutReclaimHoldArmed': safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False)),
+                'fakeoutReclaimReason': safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')),
+                'fakeoutReclaimReleaseReason': safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')),
             },
             'outcome': {
                 'reason': safe_trade.get('reason', safe_trade.get('closeReason', '')),
@@ -16273,6 +16312,9 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'agedProfitPositiveSinceTs': safe_trade.get('agedProfitPositiveSinceTs', close_snapshot.get('agedProfitPositiveSinceTs', 0.0)),
                 'agedProfitNonSupportingSinceTs': safe_trade.get('agedProfitNonSupportingSinceTs', close_snapshot.get('agedProfitNonSupportingSinceTs', 0.0)),
                 'agedProfitBeFloorArmedTs': safe_trade.get('agedProfitBeFloorArmedTs', close_snapshot.get('agedProfitBeFloorArmedTs', 0.0)),
+                'fakeoutReclaimHoldArmed': safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False)),
+                'fakeoutReclaimReason': safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')),
+                'fakeoutReclaimReleaseReason': safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')),
             },
             'sourceVersion': 'approx_ohlcv_v1',
             'source_version': 'approx_ohlcv_v1',
@@ -16734,6 +16776,13 @@ def _ensure_v3_thesis_state_fields(pos: dict) -> None:
     safe_pos.setdefault('agedProfitGuardState', AGED_PROFIT_GUARD_STATE_IDLE)
     safe_pos.setdefault('agedProfitBeFloorArmedTs', 0.0)
     safe_pos.setdefault('agedProfitGuardReason', '')
+    safe_pos.setdefault('fakeoutReclaimHoldArmed', False)
+    safe_pos.setdefault('fakeoutReclaimHoldUsed', False)
+    safe_pos.setdefault('fakeoutReclaimHoldUntilTs', 0.0)
+    safe_pos.setdefault('fakeoutReclaimCandidateTs', 0.0)
+    safe_pos.setdefault('fakeoutReclaimArmRoiPct', 0.0)
+    safe_pos.setdefault('fakeoutReclaimReason', '')
+    safe_pos.setdefault('fakeoutReclaimReleaseReason', '')
 
 
 def evaluate_v3_aged_profit_guard(
@@ -17283,6 +17332,187 @@ def evaluate_v3_sideways_reclaim_signal(
         'hostile_flow': hostile_flow,
         'state': state,
     }
+
+
+def evaluate_v3_fakeout_reclaim_guard(
+    pos: dict,
+    current_price: float,
+    current_roi_pct: float,
+    underwater_ctx: dict,
+    thesis_ctx: dict,
+    *,
+    close_reason: str = '',
+) -> dict:
+    """Delay reclaim exits briefly when the tape looks like a short-lived sweep/fake-out."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    _ensure_v3_thesis_state_fields(safe_pos)
+    result = {
+        'armed': bool(safe_pos.get('fakeoutReclaimHoldArmed', False)),
+        'fire_hold': False,
+        'block_close': False,
+        'recovered': False,
+        'release_reason': '',
+        'reason': str(safe_pos.get('fakeoutReclaimReason', '') or ''),
+        'hold_window_sec': 0.0,
+        'candidate_age_sec': 0.0,
+    }
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        result['reason'] = 'NON_V3'
+        return result
+    if str(safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM) or ENTRY_ARCHETYPE_RECLAIM).lower() != ENTRY_ARCHETYPE_RECLAIM:
+        result['reason'] = 'NON_RECLAIM'
+        return result
+    runner_context = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
+    if runner_context not in (
+        V3_RUNNER_CONTEXT_COUNTER,
+        V3_RUNNER_CONTEXT_RECOVERY,
+        V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+    ):
+        result['reason'] = 'RUNNER_CONTEXT'
+        return result
+    if str(close_reason or '').upper() not in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE'):
+        result['reason'] = 'OUT_OF_SCOPE'
+        return result
+
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else {}
+    thesis_state = str(
+        (thesis_ctx or {}).get('thesis_state', safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY))
+        or safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY)
+        or POSITION_THESIS_ENTRY
+    )
+    if thesis_state in (POSITION_THESIS_CONTINUATION_RESCUE, POSITION_THESIS_PROFIT_CONTINUATION_HOLD):
+        result['reason'] = 'THESIS_SUPPORT'
+        return result
+
+    state = str(state_ctx.get('state', safe_pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL)) or V3_UNDERWATER_NEUTRAL)
+    if state not in (V3_UNDERWATER_SIDEWAYS, V3_UNDERWATER_RECOVERING):
+        result['reason'] = state
+        return result
+
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    entry_price = _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)
+    dynamic_be_price = _coerce_float(state_ctx.get('dynamic_be_price', safe_pos.get('underwaterDynamicBePrice', 0.0)), 0.0)
+    dynamic_be_buffer_ratio = _coerce_float(
+        state_ctx.get('dynamic_be_buffer_ratio', safe_pos.get('underwaterDynamicBeBufferRatio', 0.0)),
+        0.0,
+    )
+    be_zone_tolerance = entry_price * dynamic_be_buffer_ratio if entry_price > 0 else 0.0
+    in_be_buffer = bool(
+        entry_price > 0
+        and abs(float(current_price or 0.0) - entry_price) <= max(be_zone_tolerance, _coerce_float(safe_pos.get('atr', 0.0), 0.0) * 0.15)
+    )
+    if side == 'LONG':
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) >= dynamic_be_price
+    else:
+        be_price_reached = dynamic_be_price > 0 and float(current_price or 0.0) <= dynamic_be_price
+
+    continuation_state = str(
+        safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL
+    )
+    hostile_flow = bool(
+        state_ctx.get('hostile_imbalance', False)
+        or state_ctx.get('opposite_signal_persistent', False)
+        or state_ctx.get('adverse_flow', False)
+        or state in (V3_UNDERWATER_ADVERSE_STRONG, V3_UNDERWATER_ADVERSE_WEAK)
+    )
+    reclaim_zone_recovered = bool(be_price_reached or in_be_buffer)
+    recovery_candidate = bool(
+        reclaim_zone_recovered
+        and not hostile_flow
+        and (
+            state == V3_UNDERWATER_RECOVERING
+            or continuation_state == V3_CONTINUATION_SUPPORTING
+        )
+    )
+    now_ts = time.time()
+    hold_until_ts = _coerce_float(safe_pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0)
+    candidate_ts = _coerce_float(safe_pos.get('fakeoutReclaimCandidateTs', 0.0), 0.0)
+    if candidate_ts > 0:
+        result['candidate_age_sec'] = round(max(0.0, now_ts - candidate_ts), 2)
+
+    if bool(safe_pos.get('fakeoutReclaimHoldArmed', False)):
+        result['armed'] = True
+        if hostile_flow or current_roi_pct <= (_coerce_float(safe_pos.get('fakeoutReclaimArmRoiPct', current_roi_pct), current_roi_pct) - V3_FAKEOUT_RECLAIM_INVALIDATION_ROI_DELTA_PCT):
+            safe_pos['fakeoutReclaimHoldArmed'] = False
+            safe_pos['fakeoutReclaimHoldUntilTs'] = 0.0
+            safe_pos['fakeoutReclaimCandidateTs'] = 0.0
+            safe_pos['fakeoutReclaimReleaseReason'] = 'INVALIDATED'
+            result.update({
+                'armed': False,
+                'release_reason': 'INVALIDATED',
+                'reason': str(safe_pos.get('fakeoutReclaimReason', '') or 'FAKEOUT_RECLAIM_RECHECK'),
+            })
+            return result
+        if recovery_candidate:
+            if candidate_ts <= 0:
+                candidate_ts = now_ts
+                safe_pos['fakeoutReclaimCandidateTs'] = candidate_ts
+            candidate_age_sec = max(0.0, now_ts - candidate_ts)
+            result['candidate_age_sec'] = round(candidate_age_sec, 2)
+            if candidate_age_sec >= V3_FAKEOUT_RECLAIM_RECOVERY_PERSISTENCE_SEC:
+                safe_pos['fakeoutReclaimHoldArmed'] = False
+                safe_pos['fakeoutReclaimHoldUntilTs'] = 0.0
+                safe_pos['fakeoutReclaimCandidateTs'] = 0.0
+                safe_pos['fakeoutReclaimReleaseReason'] = 'RECOVERED'
+                safe_pos['sidewaysReclaimArmed'] = False
+                result.update({
+                    'armed': False,
+                    'recovered': True,
+                    'block_close': True,
+                    'release_reason': 'RECOVERED',
+                    'reason': str(safe_pos.get('fakeoutReclaimReason', '') or 'FAKEOUT_RECLAIM_RECHECK'),
+                })
+                return result
+        else:
+            safe_pos['fakeoutReclaimCandidateTs'] = 0.0
+            result['candidate_age_sec'] = 0.0
+        if hold_until_ts > now_ts:
+            result.update({
+                'block_close': True,
+                'reason': str(safe_pos.get('fakeoutReclaimReason', '') or 'FAKEOUT_RECLAIM_RECHECK'),
+                'hold_window_sec': round(max(0.0, hold_until_ts - now_ts), 2),
+            })
+            return result
+        safe_pos['fakeoutReclaimHoldArmed'] = False
+        safe_pos['fakeoutReclaimHoldUntilTs'] = 0.0
+        safe_pos['fakeoutReclaimCandidateTs'] = 0.0
+        safe_pos['fakeoutReclaimReleaseReason'] = 'TIMEOUT'
+        result.update({
+            'armed': False,
+            'release_reason': 'TIMEOUT',
+            'reason': str(safe_pos.get('fakeoutReclaimReason', '') or 'FAKEOUT_RECLAIM_RECHECK'),
+        })
+        return result
+
+    if bool(safe_pos.get('fakeoutReclaimHoldUsed', False)):
+        result['reason'] = 'USED_ALREADY'
+        return result
+    if hostile_flow:
+        result['reason'] = 'HOSTILE_FLOW'
+        return result
+    if not bool(state_ctx.get('recovered_from_worst', False) or state == V3_UNDERWATER_RECOVERING):
+        result['reason'] = 'NO_FAKEOUT_SIGNAL'
+        return result
+    if not bool(reclaim_zone_recovered or current_roi_pct >= _coerce_float(safe_pos.get('runtimeBreakevenFloorRoiPct', 0.0), 0.0)):
+        result['reason'] = 'NOT_IN_RECLAIM_ZONE'
+        return result
+
+    safe_pos['fakeoutReclaimHoldArmed'] = True
+    safe_pos['fakeoutReclaimHoldUsed'] = True
+    safe_pos['fakeoutReclaimHoldUntilTs'] = now_ts + V3_FAKEOUT_RECLAIM_HOLD_WINDOW_SEC
+    safe_pos['fakeoutReclaimArmRoiPct'] = current_roi_pct
+    safe_pos['fakeoutReclaimReason'] = f"{str(close_reason or 'RECLAIM_CLOSE').upper()}_FAKEOUT_RECHECK"
+    safe_pos['fakeoutReclaimReleaseReason'] = ''
+    safe_pos['fakeoutReclaimCandidateTs'] = now_ts if recovery_candidate else 0.0
+    result.update({
+        'armed': True,
+        'fire_hold': True,
+        'block_close': True,
+        'reason': str(safe_pos.get('fakeoutReclaimReason', '') or 'FAKEOUT_RECLAIM_RECHECK'),
+        'hold_window_sec': V3_FAKEOUT_RECLAIM_HOLD_WINDOW_SEC,
+        'candidate_age_sec': 0.0,
+    })
+    return result
 
 
 def format_runner_close_split(split: tuple[float, float, float, float]) -> str:
@@ -32750,6 +32980,24 @@ class TimeBasedPositionManager:
                         pos['_reclaimRescueMetricTagged'] = True
                 maybe_queue_position_state_snapshot(pos, reason='v3_continuation_rescue_hold')
                 return True
+            fakeout_guard = evaluate_v3_fakeout_reclaim_guard(
+                pos,
+                current_price,
+                current_roi,
+                underwater_ctx,
+                thesis_ctx,
+                close_reason='SIDEWAYS_RECLAIM_CLOSE',
+            )
+            if fakeout_guard.get('block_close', False):
+                pos['lastExitDecision'] = 'FAKEOUT_RECLAIM_RECOVERED' if fakeout_guard.get('recovered', False) else 'FAKEOUT_RECLAIM_HOLD'
+                maybe_queue_position_state_snapshot(
+                    pos,
+                    reason='v3_fakeout_reclaim_recovered' if fakeout_guard.get('recovered', False) else 'v3_fakeout_reclaim_hold',
+                )
+                return True
+            if fakeout_guard.get('release_reason'):
+                pos['lastExitDecision'] = f"FAKEOUT_RECLAIM_{str(fakeout_guard.get('release_reason', '') or 'RELEASED').upper()}"
+                maybe_queue_position_state_snapshot(pos, reason='v3_fakeout_reclaim_release')
             pos['positionThesisState'] = POSITION_THESIS_EXIT_CONFIRMED
             pos['lastExitDecision'] = 'SIDEWAYS_RECLAIM_CLOSE'
             if hasattr(paper_trader, 'pipeline_metrics'):
@@ -32778,6 +33026,24 @@ class TimeBasedPositionManager:
                         pos['_profitContinuationHoldMetricTagged'] = True
                 maybe_queue_position_state_snapshot(pos, reason='v3_profit_continuation_hold')
                 return True
+            fakeout_guard = evaluate_v3_fakeout_reclaim_guard(
+                pos,
+                current_price,
+                current_roi,
+                underwater_ctx,
+                thesis_ctx,
+                close_reason='RECLAIM_BE_CLOSE',
+            )
+            if fakeout_guard.get('block_close', False):
+                pos['lastExitDecision'] = 'FAKEOUT_RECLAIM_RECOVERED' if fakeout_guard.get('recovered', False) else 'FAKEOUT_RECLAIM_HOLD'
+                maybe_queue_position_state_snapshot(
+                    pos,
+                    reason='v3_fakeout_reclaim_recovered' if fakeout_guard.get('recovered', False) else 'v3_fakeout_reclaim_hold',
+                )
+                return True
+            if fakeout_guard.get('release_reason'):
+                pos['lastExitDecision'] = f"FAKEOUT_RECLAIM_{str(fakeout_guard.get('release_reason', '') or 'RELEASED').upper()}"
+                maybe_queue_position_state_snapshot(pos, reason='v3_fakeout_reclaim_release')
             pos['positionThesisState'] = POSITION_THESIS_EXIT_CONFIRMED
             pos['lastExitDecision'] = 'RECLAIM_BE_CLOSE'
             if hasattr(paper_trader, 'pipeline_metrics'):
@@ -44341,6 +44607,13 @@ class PaperTradingEngine:
             "worstUnderwaterTs": 0.0,
             "sidewaysSinceTs": 0.0,
             "sidewaysReclaimArmed": False,
+            "fakeoutReclaimHoldArmed": False,
+            "fakeoutReclaimHoldUsed": False,
+            "fakeoutReclaimHoldUntilTs": 0.0,
+            "fakeoutReclaimCandidateTs": 0.0,
+            "fakeoutReclaimArmRoiPct": 0.0,
+            "fakeoutReclaimReason": "",
+            "fakeoutReclaimReleaseReason": "",
             "lossGateSuppressedReason": "",
             "adverseStrongSinceTs": 0.0,
             "adverseStrongSeen": False,
@@ -46797,6 +47070,13 @@ class PaperTradingEngine:
             "agedProfitPositiveSinceTs": _coerce_float(pos.get('agedProfitPositiveSinceTs', 0.0), 0.0),
             "agedProfitNonSupportingSinceTs": _coerce_float(pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0),
             "agedProfitBeFloorArmedTs": _coerce_float(pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0),
+            "fakeoutReclaimHoldArmed": bool(pos.get('fakeoutReclaimHoldArmed', False)),
+            "fakeoutReclaimHoldUsed": bool(pos.get('fakeoutReclaimHoldUsed', False)),
+            "fakeoutReclaimHoldUntilTs": _coerce_float(pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0),
+            "fakeoutReclaimCandidateTs": _coerce_float(pos.get('fakeoutReclaimCandidateTs', 0.0), 0.0),
+            "fakeoutReclaimArmRoiPct": _coerce_float(pos.get('fakeoutReclaimArmRoiPct', 0.0), 0.0),
+            "fakeoutReclaimReason": pos.get('fakeoutReclaimReason', ''),
+            "fakeoutReclaimReleaseReason": pos.get('fakeoutReclaimReleaseReason', ''),
             "isPostExitReentry": bool(pos.get('isPostExitReentry', False)),
             "reentryOrigin": pos.get('reentryOrigin', ''),
             "reentryOriginTradeId": str(pos.get('reentryOriginTradeId', '') or ''),
@@ -46894,6 +47174,13 @@ class PaperTradingEngine:
                 'agedProfitPositiveSinceTs': _coerce_float(pos.get('agedProfitPositiveSinceTs', 0.0), 0.0),
                 'agedProfitNonSupportingSinceTs': _coerce_float(pos.get('agedProfitNonSupportingSinceTs', 0.0), 0.0),
                 'agedProfitBeFloorArmedTs': _coerce_float(pos.get('agedProfitBeFloorArmedTs', 0.0), 0.0),
+                'fakeoutReclaimHoldArmed': bool(pos.get('fakeoutReclaimHoldArmed', False)),
+                'fakeoutReclaimHoldUsed': bool(pos.get('fakeoutReclaimHoldUsed', False)),
+                'fakeoutReclaimHoldUntilTs': _coerce_float(pos.get('fakeoutReclaimHoldUntilTs', 0.0), 0.0),
+                'fakeoutReclaimCandidateTs': _coerce_float(pos.get('fakeoutReclaimCandidateTs', 0.0), 0.0),
+                'fakeoutReclaimArmRoiPct': _coerce_float(pos.get('fakeoutReclaimArmRoiPct', 0.0), 0.0),
+                'fakeoutReclaimReason': pos.get('fakeoutReclaimReason', ''),
+                'fakeoutReclaimReleaseReason': pos.get('fakeoutReclaimReleaseReason', ''),
                 'isPostExitReentry': bool(pos.get('isPostExitReentry', False)),
                 'reentryOrigin': pos.get('reentryOrigin', ''),
                 'reentryOriginTradeId': str(pos.get('reentryOriginTradeId', '') or ''),
