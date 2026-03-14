@@ -47,6 +47,14 @@ const formatPct = (value: number | undefined, digits = 2): string => {
     return `${num >= 0 ? '+' : ''}${num.toFixed(digits)}%`;
 };
 
+const formatLevel = (value: number | undefined): string => {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) return '—';
+    if (num >= 1000) return `$${num.toFixed(2)}`;
+    if (num >= 1) return `$${num.toFixed(4)}`;
+    return `$${num.toFixed(6)}`;
+};
+
 const toneForBand = (value: string | undefined): string => {
     switch (String(value || '').toUpperCase()) {
         case 'STRONG':
@@ -202,12 +210,46 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Aged Guard', value: humanizeToken(trade.agedProfitGuardState, '—') },
             { label: 'Fake-Out', value: trade.fakeoutReclaimHoldArmed || trade.fakeoutReclaimHoldUsed ? humanizeToken(trade.fakeoutReclaimReleaseReason || trade.fakeoutReclaimReason || 'ARMED') : '—' },
             { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
+            { label: 'Resolution', value: humanizeToken(trade.postExitResolutionMode, '—') },
+            { label: 'Resolution Side', value: humanizeToken(trade.postExitResolutionTargetSide, '—') },
             { label: 'Structure', value: humanizeToken(trade.structureTrend, '—') },
+            { label: 'Kurulum', value: humanizeToken(trade.setupState15m, '—') },
+            { label: 'Arka Plan', value: humanizeToken(trade.backdropState1h, '—') },
+            { label: 'Geçiş', value: humanizeToken(trade.transitionState, '—') },
             { label: 'Retest', value: humanizeToken(trade.breakoutRetestState, '—') },
             { label: 'Barrier', value: humanizeToken(trade.barrierVerdict, '—') },
             {
                 label: 'Pattern',
                 value: `${humanizeToken(trade.patternBias, '—')} ${trade.patternConfidence ? `(${Number(trade.patternConfidence).toFixed(2)})` : ''}`.trim(),
+            },
+            { label: 'Baskın Yön', value: humanizeToken(trade.dominantSide, '—') },
+            { label: 'Çıkış Profili', value: humanizeToken(trade.preferredExitProfile || trade.runtimeExitProfile, '—') },
+            { label: 'Çıkış Sahibi', value: humanizeToken(trade.runtimeExitOwner, '—') },
+            { label: 'Çıkış Sahibi Nedeni', value: humanizeToken(trade.runtimeExitOwnerReason, '—') },
+            { label: 'State Drift', value: humanizeToken(trade.runtimeStateDriftState, '—') },
+            { label: 'Drift Nedeni', value: humanizeToken(trade.runtimeStateDriftReason, '—') },
+            { label: 'Tez Kaybı', value: trade.runtimeIntentDecayPct ? `%${(Number(trade.runtimeIntentDecayPct) * 100).toFixed(0)}` : '—' },
+            { label: 'Koruma Modu', value: humanizeToken(trade.runtimeExchangeProtectiveMode, '—') },
+            { label: 'Koruma Yetkisi', value: humanizeToken(trade.runtimeLossProtectionAuthority, '—') },
+            { label: 'Borsa Yetkisi', value: humanizeToken(trade.runtimeExchangeProtectionAuthority, '—') },
+            { label: 'Koruma Rolü', value: humanizeToken(trade.runtimeExchangeProtectionRole, '—') },
+            {
+                label: 'Taktik Stop',
+                value: trade.runtimeTacticalStopPrice
+                    ? `${formatLevel(trade.runtimeTacticalStopPrice)} (${formatPct(trade.runtimeTacticalStopRoiPct, 1)})`
+                    : '—',
+            },
+            {
+                label: 'Acil Taban',
+                value: trade.runtimeEmergencyFloorPrice
+                    ? `${formatLevel(trade.runtimeEmergencyFloorPrice)} (${formatPct(trade.runtimeEmergencyFloorRoiPct, 1)})`
+                    : '—',
+            },
+            {
+                label: 'Yapısal İptal',
+                value: trade.runtimeStructuralInvalidationActive
+                    ? `${humanizeToken(trade.runtimeStructuralInvalidationSource, '—')} @ ${formatLevel(trade.runtimeStructuralInvalidationPrice)}`
+                    : '—',
             },
             {
                 label: 'Re-entry',
@@ -216,6 +258,10 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             },
             { label: 'Re-entry Exec', value: humanizeToken(trade.postExitReentryEntryMode, '—') },
             { label: 'Re-entry Pullback', value: trade.postExitReentryPullbackPctApplied ? `%${Number(trade.postExitReentryPullbackPctApplied).toFixed(2)}` : '—' },
+            { label: 'Reversal Exec', value: humanizeToken(trade.reversalRetestEntryMode, '—') },
+            { label: 'Reversal Pullback', value: trade.reversalRetestPullbackPctApplied ? `%${Number(trade.reversalRetestPullbackPctApplied).toFixed(2)}` : '—' },
+            { label: 'Reversal Zone', value: humanizeToken(trade.reversalRetestZoneState, '—') },
+            { label: 'Zone Güveni', value: trade.reversalRetestZoneConfidence ? `${(Number(trade.reversalRetestZoneConfidence) * 100).toFixed(0)}%` : '—' },
             { label: 'Entry Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Yön Değişti', value: report.side_changed ? 'Evet' : 'Hayır', tone: report.side_changed ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Owner Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
@@ -645,6 +691,106 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchState, '—')}</div>
                                             </div>
                                             <div>
+                                                <div className="text-slate-500 text-xs">Resolution Mode</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitResolutionMode, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Resolution Side</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitResolutionTargetSide, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Setup 15m</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.setupState15m, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Backdrop 1h</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.backdropState1h, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Macro 4h</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.macroState4h, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Transition</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.transitionState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Dominant Side</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.dominantSide, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Preferred Exit</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.preferredExitProfile || replayTrade.trade.runtimeExitProfile, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Exit Owner</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExitOwner, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Exit Owner Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExitOwnerReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">State Drift</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeStateDriftState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Drift Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeStateDriftReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Intent Decay</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.runtimeIntentDecayPct ? `%${(Number(replayTrade.trade.runtimeIntentDecayPct) * 100).toFixed(0)}` : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Koruma Modu</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExchangeProtectiveMode, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Koruma Yetkisi</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeLossProtectionAuthority, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Borsa Yetkisi</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExchangeProtectionAuthority, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Koruma Rolü</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExchangeProtectionRole, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Taktik Stop</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.runtimeTacticalStopPrice
+                                                        ? `${formatLevel(replayTrade.trade.runtimeTacticalStopPrice)} (${formatPct(replayTrade.trade.runtimeTacticalStopRoiPct, 1)})`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Acil Taban</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.runtimeEmergencyFloorPrice
+                                                        ? `${formatLevel(replayTrade.trade.runtimeEmergencyFloorPrice)} (${formatPct(replayTrade.trade.runtimeEmergencyFloorRoiPct, 1)})`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Yapısal İptal</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.runtimeStructuralInvalidationActive
+                                                        ? `${humanizeToken(replayTrade.trade.runtimeStructuralInvalidationSource, '—')} @ ${formatLevel(replayTrade.trade.runtimeStructuralInvalidationPrice)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">State Confidence</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.stateConfidence ? `${(Number(replayTrade.trade.stateConfidence) * 100).toFixed(0)}%` : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
                                                 <div className="text-slate-500 text-xs">Re-entry Triggered</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.postExitReentryTriggered ? 'Evet' : 'Hayır'}</div>
                                             </div>
@@ -680,6 +826,70 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                     {replayTrade.trade.postExitReentryExpiresSec ? `${replayTrade.trade.postExitReentryExpiresSec}s` : '—'}
                                                 </div>
                                             </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Reversal Exec Mode</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestEntryMode, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Reversal Pullback</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestPullbackPctApplied
+                                                        ? `%${Number(replayTrade.trade.reversalRetestPullbackPctApplied).toFixed(2)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Reversal Confirm Delay</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestConfirmDelaySec ? `${replayTrade.trade.reversalRetestConfirmDelaySec}s` : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Reversal Expiry</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestExpiresSec ? `${replayTrade.trade.reversalRetestExpiresSec}s` : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Reversal Zone</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Zone Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneReason, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Zone Source</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneSource, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Zone Pocket</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestPocketPrice
+                                                        ? formatLevel(replayTrade.trade.reversalRetestPocketPrice)
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Retest Distance</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestRetestDistancePct
+                                                        ? `%${Number(replayTrade.trade.reversalRetestRetestDistancePct).toFixed(2)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Touch Ready</div>
+                                                <div className="font-semibold text-white">{replayTrade.trade.reversalRetestTouchReady ? 'Evet' : 'Hayır'}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Zone Confidence</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.reversalRetestZoneConfidence
+                                                        ? `${(Number(replayTrade.trade.reversalRetestZoneConfidence) * 100).toFixed(0)}%`
+                                                        : '—'}
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -695,10 +905,10 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         ) : (
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
-                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
-                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason']),
-                                                ].slice(0, 16);
+                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'runtimeExitProfile', 'runtimeExitProfileReason', 'runtimeExitOwner', 'runtimeExitOwnerReason', 'runtimeExitOwnerTightenBias', 'runtimeExitOwnerAllowHold', 'runtimeTacticalStopRoiPct', 'runtimeTacticalStopSource', 'runtimeEmergencyFloorRoiPct', 'runtimeExchangeProtectiveMode', 'runtimeLossProtectionAuthority', 'runtimeExchangeProtectionAuthority', 'runtimeExchangeProtectionRole', 'runtimeStructuralInvalidationSource', 'runtimeStateDriftState', 'runtimeStateDriftReason', 'runtimeIntentDecayPct', 'reversalRetestEntryMode', 'reversalRetestPullbackPctApplied', 'reversalRetestZoneState', 'reversalRetestZoneReason', 'reversalRetestPocketPrice', 'reversalRetestZoneConfidence']),
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted', 'runtimeExitProfile', 'runtimeExitProfileReason', 'runtimeExitOwner', 'runtimeExitOwnerReason', 'runtimeExitOwnerTightenBias', 'runtimeExitOwnerAllowHold', 'runtimeTacticalStopRoiPct', 'runtimeTacticalStopSource', 'runtimeEmergencyFloorRoiPct', 'runtimeExchangeProtectiveMode', 'runtimeLossProtectionAuthority', 'runtimeExchangeProtectionAuthority', 'runtimeExchangeProtectionRole', 'runtimeStructuralInvalidationSource', 'runtimeStateDriftState', 'runtimeStateDriftReason', 'runtimeIntentDecayPct', 'reversalRetestEntryMode', 'reversalRetestPullbackPctApplied', 'reversalRetestZoneState', 'reversalRetestZoneReason', 'reversalRetestPocketPrice', 'reversalRetestZoneConfidence']),
+                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'runtimeExitProfile', 'runtimeExitProfileReason', 'runtimeExitOwner', 'runtimeExitOwnerReason', 'runtimeExitOwnerTightenBias', 'runtimeExitOwnerAllowHold', 'runtimeTacticalStopRoiPct', 'runtimeTacticalStopSource', 'runtimeEmergencyFloorRoiPct', 'runtimeExchangeProtectiveMode', 'runtimeLossProtectionAuthority', 'runtimeExchangeProtectionAuthority', 'runtimeExchangeProtectionRole', 'runtimeStructuralInvalidationSource', 'runtimeStateDriftState', 'runtimeStateDriftReason', 'runtimeIntentDecayPct', 'reversalRetestEntryMode', 'reversalRetestPullbackPctApplied', 'reversalRetestZoneState', 'reversalRetestZoneReason', 'reversalRetestPocketPrice', 'reversalRetestZoneConfidence']),
+                                                ].slice(0, 22);
                                                 return (
                                                     <details
                                                         key={snapshot.snapshotId}

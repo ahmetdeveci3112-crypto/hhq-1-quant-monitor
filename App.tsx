@@ -330,12 +330,232 @@ const resolveReadablePositionStage = ({
   };
 };
 
+const translateSetupStateLabel = (state: string): string => {
+  switch (state) {
+    case 'CONTINUATION':
+      return 'Devam Kurulumu';
+    case 'RECLAIM':
+      return 'Geri Alma';
+    case 'REVERSAL_RETEST':
+      return 'Dönüş Retesti';
+    case 'RANGE_FADE':
+      return 'Yatay Fade';
+    default:
+      return 'Nötr Kurulum';
+  }
+};
+
+const translateBackdropStateLabel = (state: string): string => {
+  switch (state) {
+    case 'TREND':
+      return 'Trend';
+    case 'RANGE':
+      return 'Yatay';
+    case 'TRANSITION':
+      return 'Geçiş';
+    default:
+      return 'Karışık';
+  }
+};
+
+const translateTransitionStateLabel = (state: string): string => {
+  switch (state) {
+    case 'FAILED_BREAKDOWN':
+      return 'Fake Kırılım Yukarı';
+    case 'FAILED_BREAKOUT':
+      return 'Fake Kırılım Aşağı';
+    case 'RECLAIMING':
+      return 'Seviye Geri Alınıyor';
+    case 'BREAKOUT_RETEST':
+      return 'Kırılım Retesti';
+    case 'EXHAUSTION':
+      return 'Yorgunluk';
+    default:
+      return 'Geçiş Yok';
+  }
+};
+
+const translateDriftStateLabel = (state: string): string => {
+  switch (String(state || '').toUpperCase()) {
+    case 'TREND_SUPPORT':
+      return 'Trend Desteği Güçlü';
+    case 'OPPOSITE_DOMINANT':
+      return 'Karşı Yön Baskın';
+    case 'TRANSITION_DRIFT':
+      return 'Geçiş Baskısı';
+    case 'RANGE_STAGNATION':
+      return 'Yatay Sıkışma';
+    case 'INTENT_DECAY':
+      return 'Tez Zayıflıyor';
+    case 'ALIGNED':
+    default:
+      return 'Uyumlu';
+  }
+};
+
+const translateExitProfileLabel = (profile: string): string => {
+  switch (profile) {
+    case 'TREND_EXPANSION':
+      return 'Trendte Geniş Taşı';
+    case 'RANGE_EFFICIENCY':
+      return 'Yatayda Verimli Çık';
+    case 'TRANSITION_DEFENSE':
+      return 'Geçişte Savun';
+    default:
+      return 'Dengeli Çıkış';
+  }
+};
+
+const translateExchangeProtectiveModeLabel = (mode: string): string => {
+  switch (String(mode || '').toUpperCase()) {
+    case 'EMERGENCY_FLOOR':
+      return 'Acil Taban';
+    case 'TACTICAL_PROFIT_LOCK':
+      return 'Taktik Koruma';
+    default:
+      return 'Koruma Yok';
+  }
+};
+
+const translateProtectionAuthorityLabel = (value: string): string => {
+  switch (String(value || '').toUpperCase()) {
+    case 'ENTRY_STOP_HARD':
+      return 'Giriş Sert Stopu';
+    case 'PRE_STOP_REDUCE':
+      return 'Ön Azaltım';
+    case 'RECOVERY':
+      return 'Toparlanma';
+    case 'TIME_RECOVERY':
+      return 'Süre Bazlı Toparlanma';
+    case 'SIGNAL_INVALIDATION':
+      return 'Sinyal Bozulması';
+    case 'REGIME_DETERIORATION':
+      return 'Rejim Bozulması';
+    case 'EXEC_RISK':
+      return 'Çıkış Riski';
+    case 'CARRY':
+      return 'Taşıma Maliyeti';
+    case 'KILL_SWITCH_FULL':
+      return 'Kill Switch';
+    case 'EMERGENCY_FLOOR':
+      return 'Acil Taban';
+    case 'TACTICAL_PROFIT_LOCK':
+      return 'Taktik Kâr Kilidi';
+    case 'LOSS_FAILSAFE':
+      return 'Zarar Tarafı Son Güvenlik';
+    case 'PROFIT_LOCK':
+      return 'Kâr Kilidi';
+    default:
+      return humanizeDecisionToken(value || 'UNKNOWN');
+  }
+};
+
+const translateProtectiveSourceLabel = (source: string): string => {
+  const safe = String(source || '').toUpperCase();
+  switch (safe) {
+    case 'LOCAL_SUPPORT':
+      return 'Yerel Destek';
+    case 'LOCAL_RESISTANCE':
+      return 'Yerel Direnç';
+    case 'STRUCTURAL_ZONE':
+      return 'Yapısal Bölge';
+    case 'EFFECTIVE_STOP':
+      return 'Ana Stop';
+    case 'LEV_FLOOR':
+      return 'Kaldıraç Tabanı';
+    default:
+      return humanizeDecisionToken(safe || 'UNKNOWN');
+  }
+};
+
+const buildProtectionStackSummary = (pos: any) => {
+  const tacticalStopRoiPct = Number(pos?.runtimeTacticalStopRoiPct ?? pos?.runtimeStopRoiPct ?? 0);
+  const tacticalStopPrice = Number(pos?.runtimeTacticalStopPrice ?? pos?.stopLoss ?? 0);
+  const tacticalStopSource = String(pos?.runtimeTacticalStopSource || 'EFFECTIVE_STOP');
+  const emergencyFloorRoiPct = Number(pos?.runtimeEmergencyFloorRoiPct ?? 0);
+  const emergencyFloorPrice = Number(pos?.runtimeEmergencyFloorPrice ?? 0);
+  const exchangeMode = String(pos?.runtimeExchangeProtectiveMode || 'EMERGENCY_FLOOR');
+  const lossAuthority = String(pos?.runtimeLossProtectionAuthority || 'ENTRY_STOP_HARD');
+  const exchangeAuthority = String(pos?.runtimeExchangeProtectionAuthority || exchangeMode || 'EMERGENCY_FLOOR');
+  const exchangeRole = String(pos?.runtimeExchangeProtectionRole || '');
+  const exchangeProtectiveStopPrice = Number(pos?.runtimeExchangeProtectiveStopPrice ?? 0);
+  const structuralActive = Boolean(pos?.runtimeStructuralInvalidationActive);
+  const structuralSource = String(pos?.runtimeStructuralInvalidationSource || '');
+  const structuralPrice = Number(pos?.runtimeStructuralInvalidationPrice ?? 0);
+  const structuralRoiPct = Number(pos?.runtimeStructuralInvalidationRoiPct ?? 0);
+  const structuralBufferAbs = Number(pos?.runtimeStructuralInvalidationBufferAbs ?? 0);
+
+  const tacticalLabel = tacticalStopPrice > 0
+    ? `${formatPrice(tacticalStopPrice)} (${tacticalStopRoiPct >= 0 ? '+' : ''}${tacticalStopRoiPct.toFixed(1)}%)`
+    : '—';
+  const emergencyLabel = emergencyFloorPrice > 0
+    ? `${formatPrice(emergencyFloorPrice)} (${emergencyFloorRoiPct >= 0 ? '+' : ''}${emergencyFloorRoiPct.toFixed(1)}%)`
+    : '—';
+  const exchangeLabel = exchangeProtectiveStopPrice > 0
+    ? `${translateExchangeProtectiveModeLabel(exchangeMode)} @ ${formatPrice(exchangeProtectiveStopPrice)}`
+    : translateExchangeProtectiveModeLabel(exchangeMode);
+  const authorityLabel = `İç ${translateProtectionAuthorityLabel(lossAuthority)} • Borsa ${translateProtectionAuthorityLabel(exchangeAuthority)}`;
+  const roleLabel = exchangeRole ? translateProtectionAuthorityLabel(exchangeRole) : '—';
+  const structuralLabel = structuralActive && structuralPrice > 0
+    ? `${translateProtectiveSourceLabel(structuralSource)} @ ${formatPrice(structuralPrice)} (${structuralRoiPct >= 0 ? '+' : ''}${structuralRoiPct.toFixed(1)}%)`
+    : '—';
+  const structuralDetail = structuralActive && structuralBufferAbs > 0
+    ? `Buffer ${formatPrice(structuralBufferAbs)}`
+    : '';
+
+  return {
+    tacticalLabel,
+    emergencyLabel,
+    exchangeLabel,
+    authorityLabel,
+    roleLabel,
+    structuralLabel,
+    structuralDetail,
+    tacticalSourceLabel: translateProtectiveSourceLabel(tacticalStopSource),
+  };
+};
+
+const buildCoinStateSummary = (pos: any) => {
+  const setup = String(pos?.setupState15m || 'NEUTRAL');
+  const backdrop = String(pos?.backdropState1h || 'MIXED');
+  const transition = String(pos?.transitionState || 'NONE');
+  const dominantSide = String(pos?.dominantSide || 'NEUTRAL');
+  const preferredExitProfile = String(pos?.preferredExitProfile || pos?.runtimeExitProfile || 'BALANCED');
+  const exitOwner = String(pos?.runtimeExitOwner || 'BALANCED');
+  const confidence = Number(pos?.stateConfidence || 0);
+  const driftState = String(pos?.runtimeStateDriftState || 'ALIGNED');
+  const driftReason = String(pos?.runtimeStateDriftReason || '');
+  const driftSeverity = Number(pos?.runtimeStateDriftSeverity || 0);
+  const intentDecayPct = Number(pos?.runtimeIntentDecayPct || 0);
+
+  const primaryLabel = translateSetupStateLabel(setup);
+  const detailLabel = `15m ${translateSetupStateLabel(setup)} • 1h ${translateBackdropStateLabel(backdrop)} • ${translateTransitionStateLabel(transition)}`;
+  const footerLabel = `Baskın: ${humanizeDecisionToken(dominantSide)} • Çıkış: ${translateExitProfileLabel(preferredExitProfile)} • Sahip: ${humanizeDecisionToken(exitOwner)}${confidence > 0 ? ` • Güven ${(confidence * 100).toFixed(0)}%` : ''}`;
+  const driftLabel = driftState && driftState !== 'ALIGNED'
+    ? `Drift: ${translateDriftStateLabel(driftState)}${intentDecayPct > 0 ? ` • Tez Kaybı %${(intentDecayPct * 100).toFixed(0)}` : ''}`
+    : '';
+  const driftDetail = driftReason && driftReason !== 'COIN_STATE_ALIGNED'
+    ? humanizeDecisionToken(driftReason)
+    : '';
+
+  return {
+    primaryLabel,
+    detailLabel,
+    footerLabel,
+    driftLabel,
+    driftDetail,
+    driftSeverity,
+  };
+};
+
 const getArchetypeChipTone = (value: string): string => {
   switch (String(value || '').toLowerCase()) {
     case 'continuation':
       return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25';
     case 'reclaim':
       return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
+    case 'reversal_retest':
+      return 'bg-violet-500/15 text-violet-300 border border-violet-500/25';
     case 'exhaustion':
       return 'bg-rose-500/15 text-rose-300 border border-rose-500/25';
     case 'recovery':
@@ -762,6 +982,10 @@ export default function App() {
     postExitReentryWatchersActive: 0,
     postExitReentryCandidates: 0,
     postExitReentryTriggered: 0,
+    postExitReentryRecentArmed: 0,
+    postExitReentryRecentCancelled: 0,
+    postExitReentryRecentTriggered: 0,
+    postExitReentryRecentOppositeTriggered: 0,
     lastUpdate: 0
   });
 
@@ -1875,6 +2099,9 @@ export default function App() {
     scannerStats.postExitReentryWatchersActive,
     scannerStats.postExitReentryCandidates,
     scannerStats.postExitReentryTriggered,
+    scannerStats.postExitReentryRecentArmed,
+    scannerStats.postExitReentryRecentCancelled,
+    scannerStats.postExitReentryRecentOppositeTriggered,
   ]);
 
   const fastTickFresh = lastFastTickMs > 0 && (Date.now() - lastFastTickMs) <= 1200;
@@ -1888,10 +2115,16 @@ export default function App() {
   const postExitWatchersActive = scannerStats.postExitReentryWatchersActive ?? 0;
   const postExitWatchersCandidates = scannerStats.postExitReentryCandidates ?? 0;
   const postExitWatchersTriggered = scannerStats.postExitReentryTriggered ?? 0;
+  const postExitWatchersRecentArmed = scannerStats.postExitReentryRecentArmed ?? 0;
+  const postExitWatchersRecentCancelled = scannerStats.postExitReentryRecentCancelled ?? 0;
+  const postExitWatchersRecentOpposite = scannerStats.postExitReentryRecentOppositeTriggered ?? 0;
   const showPostExitWatchSummary = settings.strategyMode === 'SMART_V3_RUNNER'
     || postExitWatchersActive > 0
     || postExitWatchersCandidates > 0
-    || postExitWatchersTriggered > 0;
+    || postExitWatchersTriggered > 0
+    || postExitWatchersRecentArmed > 0
+    || postExitWatchersRecentCancelled > 0
+    || postExitWatchersRecentOpposite > 0;
   const desktopHeaderGridClass = showPostExitWatchSummary
     ? 'hidden lg:grid lg:grid-cols-[minmax(0,1.55fr)_minmax(240px,0.8fr)_minmax(280px,0.95fr)] gap-3'
     : 'hidden lg:grid lg:grid-cols-[minmax(0,1.7fr)_minmax(320px,1fr)] gap-3';
@@ -2030,6 +2263,17 @@ export default function App() {
                   <HeaderStat label="Watch" value={postExitWatchersActive} accentClass="text-violet-200" />
                   <HeaderStat label="Aday" value={postExitWatchersCandidates} accentClass="text-cyan-300" />
                   <HeaderStat label="2. Şans" value={postExitWatchersTriggered} accentClass="text-amber-300" />
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] text-slate-400">
+                  <span className="rounded-full border border-slate-700/80 bg-slate-900/70 px-2 py-1">
+                    Son 1s Arm: <span className="text-violet-200">{postExitWatchersRecentArmed}</span>
+                  </span>
+                  <span className="rounded-full border border-slate-700/80 bg-slate-900/70 px-2 py-1">
+                    İptal: <span className="text-rose-300">{postExitWatchersRecentCancelled}</span>
+                  </span>
+                  <span className="rounded-full border border-slate-700/80 bg-slate-900/70 px-2 py-1">
+                    Ters Yön: <span className="text-emerald-300">{postExitWatchersRecentOpposite}</span>
+                  </span>
                 </div>
               </div>
             )}
@@ -2325,6 +2569,8 @@ export default function App() {
                     const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
                     const positionSummary = getPositionDecisionSummary(pos);
                     const showThesisChip = Boolean(positionSummary.positionThesisState && positionSummary.positionThesisState !== 'ENTRY_THESIS');
+                    const coinStateSummary = buildCoinStateSummary(pos);
+                    const protectionSummary = buildProtectionStackSummary(pos);
 
                     return (
                       <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
@@ -2351,6 +2597,25 @@ export default function App() {
                           <div className="mt-1 text-[10px] text-slate-400">
                             Koruma: {stageDisplay.protectionLabel} • Kâr: {stageDisplay.profitLabel}
                           </div>
+                          <div className="mt-2 text-[10px] text-cyan-300">
+                            {coinStateSummary.primaryLabel}
+                          </div>
+                          <div className="mt-1 text-[10px] text-slate-400">
+                            {coinStateSummary.detailLabel}
+                          </div>
+                          {coinStateSummary.driftLabel && (
+                            <div className={`mt-1 text-[10px] ${coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}`}>
+                              {coinStateSummary.driftLabel}
+                            </div>
+                          )}
+                          {coinStateSummary.driftDetail && (
+                            <div className="mt-1 text-[10px] text-slate-500">
+                              {coinStateSummary.driftDetail}
+                            </div>
+                          )}
+                          <div className="mt-1 text-[10px] text-slate-500">
+                            {coinStateSummary.footerLabel}
+                          </div>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
                           <div><span className="text-slate-500">Yatırılan</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
@@ -2367,6 +2632,21 @@ export default function App() {
                             <span className="text-rose-400">SL: ${formatPrice(activeStop)}</span>{' '}
                             <span className="text-slate-600">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span>
                           </div>
+                        </div>
+                        <div className="mt-2 text-[10px] text-slate-400 space-y-1">
+                          <div>Taktik Stop: <span className="text-slate-200">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
+                          <div>Exchange Koruma: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
+                          <div>Koruma Yetkisi: <span className="text-slate-200">{protectionSummary.authorityLabel}</span></div>
+                          <div>Aktif Rol: <span className="text-slate-200">{protectionSummary.roleLabel}</span></div>
+                          {protectionSummary.emergencyLabel !== '—' && (
+                            <div>Acil Taban: <span className="text-slate-200">{protectionSummary.emergencyLabel}</span></div>
+                          )}
+                          {protectionSummary.structuralLabel !== '—' && (
+                            <div>
+                              Yapısal İptal: <span className="text-slate-200">{protectionSummary.structuralLabel}</span>
+                              {protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}
+                            </div>
+                          )}
                         </div>
                         <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
                           <div className="text-cyan-400">Takip ROI: {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
@@ -2520,6 +2800,8 @@ export default function App() {
                         const runtimeExchangeBreakEvenPrice = Number((pos as any).runtimeExchangeBreakEvenPrice ?? (pos as any).exchangeBreakEvenPrice ?? 0);
                         const positionSummary = getPositionDecisionSummary(pos);
                         const showThesisChip = Boolean(positionSummary.positionThesisState && positionSummary.positionThesisState !== 'ENTRY_THESIS');
+                        const coinStateSummary = buildCoinStateSummary(pos);
+                        const protectionSummary = buildProtectionStackSummary(pos);
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
@@ -2540,6 +2822,25 @@ export default function App() {
                                 {' '}• Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
                                 {' '}• Kâr: <span className="text-slate-300">{stageDisplay.profitLabel}</span>
                               </div>
+                              <div className="mt-1 text-[10px] text-cyan-300">
+                                {coinStateSummary.primaryLabel}
+                              </div>
+                              <div className="mt-1 text-[10px] text-slate-500">
+                                {coinStateSummary.detailLabel}
+                              </div>
+                              {coinStateSummary.driftLabel && (
+                                <div className={`mt-1 text-[10px] ${coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}`}>
+                                  {coinStateSummary.driftLabel}
+                                </div>
+                              )}
+                              {coinStateSummary.driftDetail && (
+                                <div className="mt-1 text-[10px] text-slate-600">
+                                  {coinStateSummary.driftDetail}
+                                </div>
+                              )}
+                              <div className="mt-1 text-[10px] text-slate-600">
+                                {coinStateSummary.footerLabel}
+                              </div>
                               <div className="mt-1 flex flex-wrap gap-1">
                                 {(() => {
                                   const chips = [
@@ -2549,6 +2850,7 @@ export default function App() {
                                     positionSummary.isPostExitReentry ? { label: '2. Şans', className: getReentryChipTone() } : null,
                                     positionSummary.continuationFlowState ? { label: humanizeDecisionToken(positionSummary.continuationFlowState), className: getStateChipTone(positionSummary.continuationFlowState, 'continuation') } : null,
                                     positionSummary.underwaterTapeState ? { label: humanizeDecisionToken(positionSummary.underwaterTapeState), className: getStateChipTone(positionSummary.underwaterTapeState, 'underwater') } : null,
+                                    coinStateSummary.driftLabel ? { label: translateDriftStateLabel((pos as any).runtimeStateDriftState), className: 'bg-sky-500/15 text-sky-300 border border-sky-500/25' } : null,
                                   ].filter(Boolean) as Array<{ label: string; className: string }>;
                                   return chips.map((chip) => (
                                     <span key={`${pos.id}-${chip.label}`} className={`text-[9px] px-1 py-0.5 rounded font-semibold ${chip.className}`}>
@@ -2573,6 +2875,19 @@ export default function App() {
                                 </div>
                                 <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
                                 <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
+                                <div className="text-slate-500">Taktik: <span className="text-slate-300">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
+                                <div className="text-slate-500">Borsa: <span className="text-slate-300">{protectionSummary.exchangeLabel}</span></div>
+                                <div className="text-slate-500">Yetki: <span className="text-slate-300">{protectionSummary.authorityLabel}</span></div>
+                                <div className="text-slate-500">Rol: <span className="text-slate-300">{protectionSummary.roleLabel}</span></div>
+                                {protectionSummary.emergencyLabel !== '—' && (
+                                  <div className="text-slate-600">Acil: <span className="text-slate-300">{protectionSummary.emergencyLabel}</span></div>
+                                )}
+                                {protectionSummary.structuralLabel !== '—' && (
+                                  <div className="text-slate-600">
+                                    Yapısal: <span className="text-slate-300">{protectionSummary.structuralLabel}</span>
+                                    {protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}
+                                  </div>
+                                )}
                               </div>
                             </td>
                             <td className="py-3 px-2 text-center">
