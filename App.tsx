@@ -203,6 +203,133 @@ const getProfitPhaseTone = (phase: string): string => {
   }
 };
 
+const translateProtectionPhaseLabel = (phase: string): string => {
+  switch (phase) {
+    case 'INVALIDATION':
+      return 'Sinyal Zayıfladı';
+    case 'REGIME':
+      return 'Rejim Bozuldu';
+    case 'EXEC-RISK':
+      return 'İşlem Riski Arttı';
+    case 'CARRY':
+      return 'Taşıma Maliyeti Baskısı';
+    case 'PRE-REDUCE':
+      return 'Ön Azaltım Hazır';
+    case 'RECOVERY':
+      return 'Toparlanma Koruması';
+    case 'TIME-RECOVERY':
+      return 'Zaman Bazlı Koruma';
+    case 'TRAIL':
+      return 'Takip Stopu';
+    case 'KS-CAP':
+      return 'Kill Switch Sınırı';
+    case 'SL-PRIMARY':
+    default:
+      return 'Ana Stop';
+  }
+};
+
+const translateProfitPhaseLabel = (phase: string): string => {
+  switch (phase) {
+    case 'MATURITY':
+      return 'Olgunlaşma';
+    case 'WIDE_TRAIL':
+      return 'Geniş Takip';
+    case 'NORMAL_TRAIL':
+      return 'Normal Takip';
+    case 'TIGHT_TRAIL':
+      return 'Sıkı Takip';
+    case 'RUNNER':
+      return 'Runner';
+    case 'WAIT':
+    default:
+      return 'Beklemede';
+  }
+};
+
+const resolveReadablePositionStage = ({
+  protectionPhase,
+  profitPhase,
+  isTrailingActive,
+}: {
+  protectionPhase: string;
+  profitPhase: string;
+  isTrailingActive: boolean;
+}) => {
+  const protectionLabel = translateProtectionPhaseLabel(protectionPhase);
+  const profitLabel = translateProfitPhaseLabel(profitPhase);
+
+  if (['INVALIDATION', 'REGIME', 'EXEC-RISK', 'CARRY', 'PRE-REDUCE', 'RECOVERY', 'TIME-RECOVERY', 'KS-CAP'].includes(protectionPhase)) {
+    return {
+      primaryLabel: protectionLabel,
+      primaryTone: getProtectionPhaseTone(protectionPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (protectionPhase === 'TRAIL' || isTrailingActive) {
+    return {
+      primaryLabel: 'Takip Stopu Aktif',
+      primaryTone: getProtectionPhaseTone('TRAIL'),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (profitPhase === 'RUNNER') {
+    return {
+      primaryLabel: 'Runner Taşınıyor',
+      primaryTone: getProfitPhaseTone(profitPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (profitPhase === 'TIGHT_TRAIL') {
+    return {
+      primaryLabel: 'Sıkı Kâr Koruması',
+      primaryTone: getProfitPhaseTone(profitPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (profitPhase === 'NORMAL_TRAIL') {
+    return {
+      primaryLabel: 'Kâr Koruma',
+      primaryTone: getProfitPhaseTone(profitPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (profitPhase === 'WIDE_TRAIL') {
+    return {
+      primaryLabel: 'Kâr Büyütme',
+      primaryTone: getProfitPhaseTone(profitPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  if (profitPhase === 'MATURITY') {
+    return {
+      primaryLabel: 'Kâr Olgunlaşıyor',
+      primaryTone: getProfitPhaseTone(profitPhase),
+      protectionLabel,
+      profitLabel,
+    };
+  }
+
+  return {
+    primaryLabel: 'Ana Stopta',
+    primaryTone: getProtectionPhaseTone('SL-PRIMARY'),
+    protectionLabel,
+    profitLabel,
+  };
+};
+
 const getArchetypeChipTone = (value: string): string => {
   switch (String(value || '').toLowerCase()) {
     case 'continuation':
@@ -2184,6 +2311,11 @@ export default function App() {
                     const recoveryGivebackPct = Number(recoveryState.givebackPct || 0) * 100;
                     const profitPhase = String((pos as any).runtimeProfitPhase || 'WAIT');
                     const profitOwner = String((pos as any).runtimeProfitOwner || 'NONE');
+                    const stageDisplay = resolveReadablePositionStage({
+                      protectionPhase,
+                      profitPhase,
+                      isTrailingActive,
+                    });
                     const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
                     const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
                     const profitLockRoiPct = Number((pos as any).runtimeProfitLockRoiPct ?? 0);
@@ -2201,9 +2333,7 @@ export default function App() {
                             <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
                             <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
                             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
-                            {isTrailingActive && <span className="text-[9px] bg-amber-500/20 text-amber-400 px-1 py-0.5 rounded">TAKİP</span>}
-                            <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
-                            <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
+                            <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${stageDisplay.primaryTone}`}>{stageDisplay.primaryLabel}</span>
                             {showThesisChip && (
                               <span className={`text-[9px] px-1 py-0.5 rounded ${getThesisChipTone(positionSummary.positionThesisState)}`}>
                                 {humanizeDecisionToken(positionSummary.positionThesisState)}
@@ -2214,6 +2344,13 @@ export default function App() {
                             )}
                           </div>
                           <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
+                        </div>
+                        <div className="mb-2 rounded-lg border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
+                          <div className="text-[9px] uppercase tracking-[0.16em] text-slate-500">Pozisyon Aşaması</div>
+                          <div className="mt-1 text-xs font-semibold text-slate-100">{stageDisplay.primaryLabel}</div>
+                          <div className="mt-1 text-[10px] text-slate-400">
+                            Koruma: {stageDisplay.protectionLabel} • Kâr: {stageDisplay.profitLabel}
+                          </div>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
                           <div><span className="text-slate-500">Yatırılan</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
@@ -2369,6 +2506,11 @@ export default function App() {
                         const recoveryGivebackPct = Number(recoveryState.givebackPct || 0) * 100;
                         const profitPhase = String((pos as any).runtimeProfitPhase || 'WAIT');
                         const profitOwner = String((pos as any).runtimeProfitOwner || 'NONE');
+                        const stageDisplay = resolveReadablePositionStage({
+                          protectionPhase,
+                          profitPhase,
+                          isTrailingActive,
+                        });
                         const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
                         const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
                         const profitLockRoiPct = Number((pos as any).runtimeProfitLockRoiPct ?? 0);
@@ -2391,8 +2533,12 @@ export default function App() {
                                 />
                                 <span className="font-medium text-white">{pos.symbol.replace('USDT', '')}</span>
                                 <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
-                                <span className={`text-[9px] px-1 py-0.5 rounded ${getProtectionPhaseTone(protectionPhase)}`}>{protectionPhase}</span>
-                                <span className={`text-[9px] px-1 py-0.5 rounded ${getProfitPhaseTone(profitPhase)}`}>{profitPhase}</span>
+                                <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${stageDisplay.primaryTone}`}>{stageDisplay.primaryLabel}</span>
+                              </div>
+                              <div className="mt-1 text-[10px] text-slate-400">
+                                Aşama: <span className="text-slate-200">{stageDisplay.primaryLabel}</span>
+                                {' '}• Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
+                                {' '}• Kâr: <span className="text-slate-300">{stageDisplay.profitLabel}</span>
                               </div>
                               <div className="mt-1 flex flex-wrap gap-1">
                                 {(() => {
