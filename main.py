@@ -14,6 +14,7 @@ Features:
 """
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -25,7 +26,7 @@ import uuid
 import websockets
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 
 import ccxt.async_support as ccxt_async
 import ccxt as ccxt_sync
@@ -12593,6 +12594,12 @@ DUAL_REGIME_GATE_ENABLED = os.environ.get('DUAL_REGIME_GATE_ENABLED', 'true').lo
 DUAL_REGIME_CONFLICT_MODE = os.environ.get('DUAL_REGIME_CONFLICT_MODE', 'block')  # block | soft
 DUAL_REGIME_MIN_CONF = float(os.environ.get('DUAL_REGIME_MIN_CONF', '0.60'))
 DUAL_REGIME_SHADOW = os.environ.get('DUAL_REGIME_SHADOW', 'false').lower() == 'true'  # true=log-only
+BTC_REGIME_STALE_SEC = int(os.environ.get('BTC_REGIME_STALE_SEC', '90'))
+BTC_REGIME_AUTHORITY_MODE = str(os.environ.get('BTC_REGIME_AUTHORITY_MODE', 'apply') or 'apply').strip().lower()
+BTC_REGIME_WARMING_SIZE_MULT = float(os.environ.get('BTC_REGIME_WARMING_SIZE_MULT', '0.90'))
+BTC_REGIME_WARMING_LEV_MULT = float(os.environ.get('BTC_REGIME_WARMING_LEV_MULT', '0.90'))
+BTC_REGIME_STALE_SIZE_MULT = float(os.environ.get('BTC_REGIME_STALE_SIZE_MULT', '0.85'))
+BTC_REGIME_STALE_LEV_MULT = float(os.environ.get('BTC_REGIME_STALE_LEV_MULT', '0.85'))
 
 # Pending entry observability + low-risk aged-entry assist
 PENDING_NEAR_ENTRY_FILL_ENABLED = _env_bool("PENDING_NEAR_ENTRY_FILL_ENABLED", True)
@@ -14613,6 +14620,13 @@ V3_POST_EXIT_REENTRY_SIZE_CAP_MULT = 0.35
 V3_POST_EXIT_REENTRY_STOP_MULT = 0.80
 V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE = 70.0
 V3_STRUCTURE_CONTEXT_MODE = str(os.environ.get('V3_STRUCTURE_CONTEXT_MODE', 'apply') or 'apply').strip().lower()
+V3_SIDE_AWARE_STRUCTURE_MODE = str(os.environ.get('V3_SIDE_AWARE_STRUCTURE_MODE', 'apply') or 'apply').strip().lower()
+V3_SIDE_AWARE_BARRIER_BLOCK_ATR_MULT = 0.45
+V3_SIDE_AWARE_BARRIER_CAUTION_ATR_MULT = 0.90
+V3_SIDE_AWARE_BARRIER_BLOCK_MIN_PCT = 0.18
+V3_SIDE_AWARE_BARRIER_CAUTION_MIN_PCT = 0.35
+V3_SIDE_AWARE_BARRIER_SIZE_MULT = 0.82
+V3_SIDE_AWARE_BARRIER_LEVERAGE_CAP = 8
 V3_POST_EXIT_REENTRY_REASON_ALLOWLIST = (
     "SIDEWAYS_RECLAIM_CLOSE",
     "RECLAIM_BE_CLOSE",
@@ -14826,6 +14840,131 @@ def _get_cached_ohlcv_for_structure(symbol: str) -> tuple[list, list]:
     return ohlcv_15m, ohlcv_1h
 
 
+PENDING_OPEN_RESULT_CREATED_PENDING = 'CREATED_PENDING'
+PENDING_OPEN_RESULT_REINFORCED_PENDING = 'REINFORCED_PENDING'
+PENDING_OPEN_RESULT_OPENED_POSITION = 'OPENED_POSITION'
+PENDING_OPEN_RESULT_REJECTED = 'REJECTED'
+
+_PENDING_REINFORCE_STRUCTURE_FIELDS = (
+    'structureTrend',
+    'swingState',
+    'compressionState',
+    'breakoutRetestState',
+    'srContext',
+    'patternBias',
+    'patternConfidence',
+    'patternSource',
+    'structureVersion',
+)
+_PENDING_REINFORCE_BARRIER_FIELDS = (
+    'barrierState',
+    'barrierVerdict',
+    'adverseLevelType',
+    'adverseLevelPrice',
+    'adverseDistancePct',
+    'supportiveLevelType',
+    'supportiveLevelPrice',
+    'supportiveDistancePct',
+    'barrierReason',
+    'barrierConfidence',
+)
+_PENDING_REINFORCE_REENTRY_FIELDS = (
+    'isPostExitReentry',
+    'reentryOrigin',
+    'reentryOriginTradeId',
+    'reentryOriginExitReason',
+    'reentryWatcherId',
+    'postExitReentryEntryMode',
+    'postExitReentryPullbackPctOriginal',
+    'postExitReentryPullbackPctApplied',
+    'postExitReentryConfirmDelaySec',
+    'postExitReentryExpiresSec',
+    'postExitReentryExecutionPriority',
+    'postExitReentrySizeCapMult',
+    'postExitReentryStopMult',
+)
+
+
+def _with_open_result_kind(payload: Optional[dict], result_kind: str) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return payload
+    enriched = dict(payload)
+    enriched['resultKind'] = str(result_kind or '')
+    return enriched
+
+
+def _build_pending_recheck_trace(
+    order: dict,
+    *,
+    opportunity: Optional[dict] = None,
+    recheck_result: Optional[dict] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    safe_order = order if isinstance(order, dict) else {}
+    safe_opp = opportunity if isinstance(opportunity, dict) else {}
+    safe_rv = recheck_result if isinstance(recheck_result, dict) else {}
+    signal_snapshot = safe_order.get('signal_snapshot', safe_order.get('signalSnapshot', {}))
+    signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    trace = {
+        'entryArchetype': str(
+            safe_order.get('entryArchetype', signal_snapshot.get('entryArchetype', '')) or ''
+        ),
+        'runnerContextResolved': str(
+            safe_order.get(
+                'runnerContextResolved',
+                signal_snapshot.get('runnerContextResolved', signal_snapshot.get('runnerContext', '')),
+            )
+            or ''
+        ),
+        'barrierState': str(
+            safe_opp.get('barrierState', safe_order.get('barrierState', signal_snapshot.get('barrierState', 'CLEAR')))
+            or 'CLEAR'
+        ),
+        'barrierVerdict': str(
+            safe_opp.get(
+                'barrierVerdict',
+                safe_order.get('barrierVerdict', signal_snapshot.get('barrierVerdict', 'SUPPORTIVE')),
+            )
+            or 'SUPPORTIVE'
+        ),
+        'adverseDistancePct': round(
+            _coerce_float(
+                safe_opp.get(
+                    'adverseDistancePct',
+                    safe_order.get('adverseDistancePct', signal_snapshot.get('adverseDistancePct', 0.0)),
+                ),
+                0.0,
+            ),
+            4,
+        ),
+        'patternBias': str(
+            safe_opp.get('patternBias', safe_order.get('patternBias', signal_snapshot.get('patternBias', 'NEUTRAL')))
+            or 'NEUTRAL'
+        ),
+        'patternConfidence': round(
+            _coerce_float(
+                safe_opp.get(
+                    'patternConfidence',
+                    safe_order.get('patternConfidence', signal_snapshot.get('patternConfidence', 0.0)),
+                ),
+                0.0,
+            ),
+            4,
+        ),
+        'recheck_score': round(
+            _coerce_float(
+                safe_rv.get('recheck_score', safe_order.get('recheckScore', safe_order.get('signalScore', 0.0))),
+                0.0,
+            ),
+            4,
+        ),
+        'reason_summary': str(safe_rv.get('reason_summary', '') or ''),
+    }
+    if isinstance(extra, dict) and extra:
+        trace.update(extra)
+    return trace
+
+
 def get_market_structure_context(symbol: str, *, side: str = '', force: bool = False) -> dict:
     safe_symbol = str(symbol or '').upper().strip()
     safe_side = str(side or '').upper().strip()
@@ -14908,6 +15047,309 @@ def _structure_context_supports_reentry(structure_ctx: dict = None, side: str = 
         and bias == 'CONTINUATION'
         and _structure_retest_matches_side(safe_ctx, side)
     )
+
+
+def _is_v3_side_aware_structure_enabled() -> bool:
+    return str(V3_SIDE_AWARE_STRUCTURE_MODE or 'apply').strip().lower() != 'off'
+
+
+def _normalize_barrier_candles(candles: Optional[Sequence]) -> list[dict]:
+    normalized = []
+    for idx, candle in enumerate(candles or []):
+        high = low = close = volume = ts = 0.0
+        if isinstance(candle, dict):
+            ts = _coerce_float(candle.get('timestamp', candle.get('ts', idx)), float(idx))
+            high = _coerce_float(candle.get('high', candle.get('h', 0.0)), 0.0)
+            low = _coerce_float(candle.get('low', candle.get('l', 0.0)), 0.0)
+            close = _coerce_float(candle.get('close', candle.get('c', 0.0)), 0.0)
+            volume = _coerce_float(candle.get('volume', candle.get('v', 0.0)), 0.0)
+        elif isinstance(candle, (list, tuple)) and len(candle) >= 5:
+            ts = _coerce_float(candle[0], float(idx))
+            high = _coerce_float(candle[2], 0.0)
+            low = _coerce_float(candle[3], 0.0)
+            close = _coerce_float(candle[4], 0.0)
+            volume = _coerce_float(candle[5] if len(candle) > 5 else 0.0, 0.0)
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            continue
+        normalized.append({
+            'ts': ts,
+            'high': high,
+            'low': low,
+            'close': close,
+            'volume': volume,
+        })
+    return normalized
+
+
+def _merge_barrier_levels(levels: list, merge_gap: float) -> list[dict]:
+    if not levels:
+        return []
+    gap = max(_coerce_float(merge_gap, 0.0), 1e-8)
+    merged = []
+    for level in sorted((lvl for lvl in levels if isinstance(lvl, dict) and _coerce_float(lvl.get('price', 0.0), 0.0) > 0), key=lambda item: item['price']):
+        price = _coerce_float(level.get('price', 0.0), 0.0)
+        if not merged or abs(price - merged[-1]['price']) > gap:
+            merged.append({
+                'price': price,
+                'kind': str(level.get('kind', '') or ''),
+                'source': str(level.get('source', '') or ''),
+            })
+            continue
+        existing = merged[-1]
+        existing['price'] = round((existing['price'] + price) / 2.0, 8)
+        if level.get('kind') and str(level.get('kind', '')) not in str(existing.get('kind', '')):
+            existing['kind'] = f"{existing.get('kind', '')}+{level.get('kind', '')}".strip('+')
+        if level.get('source') and str(level.get('source', '')) not in str(existing.get('source', '')):
+            existing['source'] = f"{existing.get('source', '')}+{level.get('source', '')}".strip('+')
+    return merged
+
+
+def _extract_barrier_levels_from_candles(candles: Optional[Sequence], *, source: str, current_price: float, atr: float) -> tuple[list, list]:
+    normalized = _normalize_barrier_candles(candles)
+    if len(normalized) < 3:
+        return [], []
+    supports = []
+    resistances = []
+    for idx in range(1, len(normalized) - 1):
+        prev_candle = normalized[idx - 1]
+        current = normalized[idx]
+        next_candle = normalized[idx + 1]
+        if current['low'] <= prev_candle['low'] and current['low'] <= next_candle['low']:
+            supports.append({'price': current['low'], 'kind': f'{source}_PIVOT_SUPPORT', 'source': source})
+        if current['high'] >= prev_candle['high'] and current['high'] >= next_candle['high']:
+            resistances.append({'price': current['high'], 'kind': f'{source}_PIVOT_RESISTANCE', 'source': source})
+
+    # Recent rolling extrema help catch the short-term barrier that pivots may miss.
+    tail = normalized[-6:] if len(normalized) >= 6 else normalized
+    if tail:
+        supports.append({'price': min(c['low'] for c in tail), 'kind': f'{source}_RECENT_SUPPORT', 'source': source})
+        resistances.append({'price': max(c['high'] for c in tail), 'kind': f'{source}_RECENT_RESISTANCE', 'source': source})
+
+    merge_gap = max(_coerce_float(atr, 0.0) * 0.20, _coerce_float(current_price, 0.0) * 0.0008)
+    return _merge_barrier_levels(supports, merge_gap), _merge_barrier_levels(resistances, merge_gap)
+
+
+def _get_recent_5m_candles_for_barrier(symbol: str) -> list[dict]:
+    safe_symbol = str(symbol or '').upper().strip()
+    if not safe_symbol or 'multi_coin_scanner' not in globals():
+        return []
+    try:
+        analyzer = getattr(multi_coin_scanner, 'analyzers', {}).get(safe_symbol)
+    except Exception:
+        analyzer = None
+    if analyzer is None:
+        return []
+    highs = list(getattr(analyzer, 'highs', []) or [])
+    lows = list(getattr(analyzer, 'lows', []) or [])
+    closes = list(getattr(analyzer, 'closes', []) or [])
+    volumes = list(getattr(analyzer, 'volumes', []) or [])
+    size = min(len(highs), len(lows), len(closes))
+    if size < 3:
+        return []
+    volumes = volumes[-size:] if len(volumes) >= size else ([0.0] * (size - len(volumes)) + volumes)
+    candles = []
+    base_ts = time.time() - (size * 300.0)
+    for idx in range(size):
+        candles.append({
+            'timestamp': base_ts + (idx * 300.0),
+            'high': _coerce_float(highs[-size + idx], 0.0),
+            'low': _coerce_float(lows[-size + idx], 0.0),
+            'close': _coerce_float(closes[-size + idx], 0.0),
+            'volume': _coerce_float(volumes[-size + idx], 0.0),
+        })
+    return candles
+
+
+def _structure_context_side_supportive(structure_ctx: dict = None, side: str = '') -> bool:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    if not _structure_context_available(safe_ctx):
+        return False
+    safe_side = str(side or '').upper().strip()
+    confidence = _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0)
+    bias = str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    sr_context = str(safe_ctx.get('srContext', 'UNKNOWN') or 'UNKNOWN').upper()
+    retest_supportive = _structure_retest_matches_side(safe_ctx, safe_side)
+    sr_supportive = (
+        sr_context in ('AT_BREAKOUT_LEVEL', 'INSIDE_RANGE')
+        or (safe_side == 'LONG' and sr_context == 'ABOVE_SUPPORT')
+        or (safe_side == 'SHORT' and sr_context == 'BELOW_RESISTANCE')
+    )
+    return bool(confidence >= 0.60 and ((bias == 'CONTINUATION' and (retest_supportive or sr_supportive)) or (bias == 'RECLAIM' and sr_supportive)))
+
+
+def analyze_side_aware_entry_barrier(
+    *,
+    symbol: str,
+    side: str,
+    current_price: float,
+    atr: float,
+    entry_archetype: str = '',
+    runner_context_resolved: str = '',
+    recent_candles: Optional[Sequence] = None,
+    ohlcv_15m: Optional[Sequence] = None,
+    structure_ctx: Optional[dict] = None,
+    sr_levels_4h: Optional[dict] = None,
+    structural_zone: Optional[dict] = None,
+) -> dict:
+    result = {
+        'barrierState': 'CLEAR',
+        'barrierVerdict': 'SUPPORTIVE',
+        'adverseLevelType': '',
+        'adverseLevelPrice': 0.0,
+        'adverseDistancePct': 0.0,
+        'supportiveLevelType': '',
+        'supportiveLevelPrice': 0.0,
+        'supportiveDistancePct': 0.0,
+        'barrierReason': '',
+        'barrierConfidence': 0.0,
+        'levelsDetected': False,
+    }
+    safe_side = str(side or '').upper().strip()
+    price = _coerce_float(current_price, 0.0)
+    if not _is_v3_side_aware_structure_enabled() or safe_side not in ('LONG', 'SHORT') or price <= 0:
+        return result
+
+    safe_entry_arch = str(entry_archetype or '').strip().lower()
+    safe_runner_context = str(runner_context_resolved or '').strip().lower()
+    continuation_like = bool(
+        safe_entry_arch == ENTRY_ARCHETYPE_CONTINUATION
+        or safe_runner_context in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY)
+    )
+    structure = structure_ctx if isinstance(structure_ctx, dict) else {}
+    structure_available = _structure_context_available(structure)
+    structure_supportive = _structure_context_side_supportive(structure, safe_side)
+    retest_state = str(structure.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    structure_failure = retest_state in ('FAILED_BREAKOUT', 'FAILED_BREAKDOWN')
+
+    local_candles = recent_candles if recent_candles else _get_recent_5m_candles_for_barrier(symbol)
+    supports_5m, resistances_5m = _extract_barrier_levels_from_candles(local_candles, source='5M', current_price=price, atr=atr)
+    supports_15m, resistances_15m = _extract_barrier_levels_from_candles(ohlcv_15m, source='15M', current_price=price, atr=atr)
+
+    supports = list(supports_5m) + list(supports_15m)
+    resistances = list(resistances_5m) + list(resistances_15m)
+    sr_snapshot = sr_levels_4h if isinstance(sr_levels_4h, dict) else {}
+    nearest_support = _coerce_float(sr_snapshot.get('nearest_support', 0.0), 0.0)
+    nearest_resistance = _coerce_float(sr_snapshot.get('nearest_resistance', 0.0), 0.0)
+    if nearest_support > 0:
+        supports.append({'price': nearest_support, 'kind': '4H_NEAREST_SUPPORT', 'source': '4H'})
+    if nearest_resistance > 0:
+        resistances.append({'price': nearest_resistance, 'kind': '4H_NEAREST_RESISTANCE', 'source': '4H'})
+
+    zone = structural_zone if isinstance(structural_zone, dict) else {}
+    zone_price = _coerce_float(zone.get('zone_price', 0.0), 0.0)
+    if zone_price > 0:
+        if zone_price <= price:
+            supports.append({'price': zone_price, 'kind': 'STRUCT_ZONE_SUPPORT', 'source': 'EXEC_ZONE'})
+        else:
+            resistances.append({'price': zone_price, 'kind': 'STRUCT_ZONE_RESISTANCE', 'source': 'EXEC_ZONE'})
+
+    merge_gap = max(_coerce_float(atr, 0.0) * 0.20, price * 0.0008)
+    supports = _merge_barrier_levels(supports, merge_gap)
+    resistances = _merge_barrier_levels(resistances, merge_gap)
+    result['levelsDetected'] = bool(supports or resistances)
+
+    level_tolerance = max(_coerce_float(atr, 0.0) * 0.15, price * 0.0008)
+    support_candidates = [lvl for lvl in supports if _coerce_float(lvl.get('price', 0.0), 0.0) <= price + level_tolerance]
+    resistance_candidates = [lvl for lvl in resistances if _coerce_float(lvl.get('price', 0.0), 0.0) >= price - level_tolerance]
+    nearest_support_level = max(support_candidates, key=lambda lvl: _coerce_float(lvl.get('price', 0.0), 0.0), default=None)
+    nearest_resistance_level = min(resistance_candidates, key=lambda lvl: _coerce_float(lvl.get('price', 0.0), 0.0), default=None)
+
+    supportive_level = nearest_support_level if safe_side == 'LONG' else nearest_resistance_level
+    adverse_level = nearest_resistance_level if safe_side == 'LONG' else nearest_support_level
+    supportive_level_type = 'LOCAL_SUPPORT' if safe_side == 'LONG' else 'LOCAL_RESISTANCE'
+    adverse_level_type = 'LOCAL_RESISTANCE' if safe_side == 'LONG' else 'LOCAL_SUPPORT'
+
+    supportive_price = _coerce_float((supportive_level or {}).get('price', 0.0), 0.0)
+    adverse_price = _coerce_float((adverse_level or {}).get('price', 0.0), 0.0)
+
+    supportive_distance_pct = 0.0
+    if supportive_price > 0:
+        if safe_side == 'LONG':
+            supportive_distance_pct = max(0.0, ((price - supportive_price) / price) * 100.0)
+        else:
+            supportive_distance_pct = max(0.0, ((supportive_price - price) / price) * 100.0)
+
+    adverse_distance_pct = 0.0
+    if adverse_price > 0:
+        if safe_side == 'LONG':
+            adverse_distance_pct = max(0.0, ((adverse_price - price) / price) * 100.0)
+        else:
+            adverse_distance_pct = max(0.0, ((price - adverse_price) / price) * 100.0)
+
+    atr_pct = ((_coerce_float(atr, 0.0) / price) * 100.0) if price > 0 and _coerce_float(atr, 0.0) > 0 else 0.0
+    block_band_pct = max(atr_pct * V3_SIDE_AWARE_BARRIER_BLOCK_ATR_MULT, V3_SIDE_AWARE_BARRIER_BLOCK_MIN_PCT)
+    caution_band_pct = max(atr_pct * V3_SIDE_AWARE_BARRIER_CAUTION_ATR_MULT, V3_SIDE_AWARE_BARRIER_CAUTION_MIN_PCT)
+
+    result.update({
+        'adverseLevelType': adverse_level_type if adverse_price > 0 else '',
+        'adverseLevelPrice': round(adverse_price, 8) if adverse_price > 0 else 0.0,
+        'adverseDistancePct': round(adverse_distance_pct, 4) if adverse_distance_pct > 0 else 0.0,
+        'supportiveLevelType': supportive_level_type if supportive_price > 0 else '',
+        'supportiveLevelPrice': round(supportive_price, 8) if supportive_price > 0 else 0.0,
+        'supportiveDistancePct': round(supportive_distance_pct, 4) if supportive_distance_pct > 0 else 0.0,
+    })
+
+    confidence_votes = 0
+    if supports_5m or resistances_5m:
+        confidence_votes += 1
+    if supports_15m or resistances_15m:
+        confidence_votes += 1
+    if nearest_support > 0 or nearest_resistance > 0:
+        confidence_votes += 1
+    if structure_available:
+        confidence_votes += 1
+    result['barrierConfidence'] = round(min(1.0, confidence_votes / 4.0), 4)
+
+    if structure_failure and adverse_distance_pct > 0 and adverse_distance_pct <= caution_band_pct:
+        result.update({
+            'barrierState': 'LONG_INTO_FAILED_BREAKOUT' if safe_side == 'LONG' else 'SHORT_INTO_FAILED_BREAKDOWN',
+            'barrierVerdict': 'BLOCK' if continuation_like else 'CAUTION',
+            'barrierReason': 'STRUCTURE_FAILURE',
+        })
+        return result
+
+    if continuation_like and not result['levelsDetected'] and not structure_available:
+        result.update({
+            'barrierState': 'STRUCTURE_BLIND',
+            'barrierVerdict': 'CAUTION',
+            'barrierReason': 'STRUCTURE_BLIND',
+        })
+        return result
+
+    if adverse_distance_pct > 0 and adverse_distance_pct <= block_band_pct and not structure_supportive:
+        result.update({
+            'barrierState': 'LONG_INTO_RESISTANCE' if safe_side == 'LONG' else 'SHORT_INTO_SUPPORT',
+            'barrierVerdict': 'BLOCK' if continuation_like else 'CAUTION',
+            'barrierReason': 'ADVERSE_BARRIER_TOO_CLOSE',
+        })
+        return result
+
+    if adverse_distance_pct > 0 and adverse_distance_pct <= caution_band_pct:
+        result.update({
+            'barrierState': 'LONG_INTO_RESISTANCE' if safe_side == 'LONG' else 'SHORT_INTO_SUPPORT',
+            'barrierVerdict': 'CAUTION',
+            'barrierReason': 'ADVERSE_BARRIER_NEARBY',
+        })
+        return result
+
+    if structure_supportive or supportive_price > 0:
+        result.update({
+            'barrierState': 'LONG_ABOVE_SUPPORT' if safe_side == 'LONG' else 'SHORT_BELOW_RESISTANCE',
+            'barrierVerdict': 'SUPPORTIVE',
+            'barrierReason': 'SUPPORTIVE_BARRIER_CONTEXT',
+        })
+        return result
+
+    if continuation_like and structure_available:
+        result.update({
+            'barrierState': 'NEUTRAL_STRUCTURE',
+            'barrierVerdict': 'CAUTION',
+            'barrierReason': 'NO_CLEAR_LEVEL_EDGE',
+        })
+        return result
+
+    result['barrierReason'] = 'NO_BARRIER_EDGE'
+    return result
 
 
 def _compact_signal_intent(intent: dict = None) -> dict:
@@ -15013,6 +15455,16 @@ def _compact_decision_inputs(payload: dict = None) -> dict:
         'patternConfidence': round(_coerce_float(data.get('patternConfidence', 0.0), 0.0), 4),
         'patternSource': str(data.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(data.get('structureVersion', 'v1') or 'v1'),
+        'barrierState': str(data.get('barrierState', 'CLEAR') or 'CLEAR').upper(),
+        'barrierVerdict': str(data.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper(),
+        'adverseLevelType': str(data.get('adverseLevelType', '') or '').upper(),
+        'adverseLevelPrice': round(_coerce_float(data.get('adverseLevelPrice', 0.0), 0.0), 8),
+        'adverseDistancePct': round(_coerce_float(data.get('adverseDistancePct', 0.0), 0.0), 4),
+        'supportiveLevelType': str(data.get('supportiveLevelType', '') or '').upper(),
+        'supportiveLevelPrice': round(_coerce_float(data.get('supportiveLevelPrice', 0.0), 0.0), 8),
+        'supportiveDistancePct': round(_coerce_float(data.get('supportiveDistancePct', 0.0), 0.0), 4),
+        'barrierReason': str(data.get('barrierReason', '') or '').upper(),
+        'barrierConfidence': round(_coerce_float(data.get('barrierConfidence', 0.0), 0.0), 4),
     }
 
 
@@ -15243,6 +15695,16 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         'patternConfidence': round(_coerce_float(inputs.get('patternConfidence', 0.0), 0.0), 4),
         'patternSource': str(inputs.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(inputs.get('structureVersion', 'v1') or 'v1'),
+        'barrierState': str(inputs.get('barrierState', 'CLEAR') or 'CLEAR'),
+        'barrierVerdict': str(inputs.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+        'adverseLevelType': str(inputs.get('adverseLevelType', '') or ''),
+        'adverseLevelPrice': round(_coerce_float(inputs.get('adverseLevelPrice', 0.0), 0.0), 8),
+        'adverseDistancePct': round(_coerce_float(inputs.get('adverseDistancePct', 0.0), 0.0), 4),
+        'supportiveLevelType': str(inputs.get('supportiveLevelType', '') or ''),
+        'supportiveLevelPrice': round(_coerce_float(inputs.get('supportiveLevelPrice', 0.0), 0.0), 8),
+        'supportiveDistancePct': round(_coerce_float(inputs.get('supportiveDistancePct', 0.0), 0.0), 4),
+        'barrierReason': str(inputs.get('barrierReason', '') or ''),
+        'barrierConfidence': round(_coerce_float(inputs.get('barrierConfidence', 0.0), 0.0), 4),
     }
 
 
@@ -15744,6 +16206,10 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
         str(safe_pos.get('breakoutRetestState', '') or ''),
         str(safe_pos.get('patternBias', '') or ''),
         f"{_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0):.2f}",
+        str(safe_pos.get('barrierState', '') or ''),
+        str(safe_pos.get('barrierVerdict', '') or ''),
+        str(safe_pos.get('barrierReason', '') or ''),
+        f"{_coerce_float(safe_pos.get('adverseDistancePct', 0.0), 0.0):.2f}",
     ])
     last_state_key = str(safe_pos.get('_decisionSnapshotStateKey', '') or '')
     last_snapshot_ts = int(safe_pos.get('_decisionSnapshotLastTs', 0) or 0)
@@ -15788,6 +16254,16 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'srContext': str(safe_pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
             'patternBias': str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
             'patternConfidence': round(_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0), 4),
+            'barrierState': str(safe_pos.get('barrierState', 'CLEAR') or 'CLEAR'),
+            'barrierVerdict': str(safe_pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            'adverseLevelType': str(safe_pos.get('adverseLevelType', '') or ''),
+            'adverseLevelPrice': round(_coerce_float(safe_pos.get('adverseLevelPrice', 0.0), 0.0), 8),
+            'adverseDistancePct': round(_coerce_float(safe_pos.get('adverseDistancePct', 0.0), 0.0), 4),
+            'supportiveLevelType': str(safe_pos.get('supportiveLevelType', '') or ''),
+            'supportiveLevelPrice': round(_coerce_float(safe_pos.get('supportiveLevelPrice', 0.0), 0.0), 8),
+            'supportiveDistancePct': round(_coerce_float(safe_pos.get('supportiveDistancePct', 0.0), 0.0), 4),
+            'barrierReason': str(safe_pos.get('barrierReason', '') or ''),
+            'barrierConfidence': round(_coerce_float(safe_pos.get('barrierConfidence', 0.0), 0.0), 4),
         },
         outcome={
             'unrealizedPnlPercent': round(_coerce_float(safe_pos.get('unrealizedPnlPercent', 0.0), 0.0), 4),
@@ -15815,6 +16291,16 @@ def maybe_queue_position_state_snapshot(pos: dict, *, reason: str = 'runtime') -
             'srContext': str(safe_pos.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
             'patternBias': str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
             'patternConfidence': round(_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0), 4),
+            'barrierState': str(safe_pos.get('barrierState', 'CLEAR') or 'CLEAR'),
+            'barrierVerdict': str(safe_pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            'adverseLevelType': str(safe_pos.get('adverseLevelType', '') or ''),
+            'adverseLevelPrice': round(_coerce_float(safe_pos.get('adverseLevelPrice', 0.0), 0.0), 8),
+            'adverseDistancePct': round(_coerce_float(safe_pos.get('adverseDistancePct', 0.0), 0.0), 4),
+            'supportiveLevelType': str(safe_pos.get('supportiveLevelType', '') or ''),
+            'supportiveLevelPrice': round(_coerce_float(safe_pos.get('supportiveLevelPrice', 0.0), 0.0), 8),
+            'supportiveDistancePct': round(_coerce_float(safe_pos.get('supportiveDistancePct', 0.0), 0.0), 4),
+            'barrierReason': str(safe_pos.get('barrierReason', '') or ''),
+            'barrierConfidence': round(_coerce_float(safe_pos.get('barrierConfidence', 0.0), 0.0), 4),
         },
         created_ts=now_ms,
     )
@@ -16480,6 +16966,16 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'patternConfidence': round(_coerce_float(safe_trade.get('patternConfidence', close_snapshot.get('patternConfidence', signal_snapshot.get('patternConfidence', 0.0))), 0.0), 4),
         'patternSource': str(safe_trade.get('patternSource', close_snapshot.get('patternSource', signal_snapshot.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED'))) or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(safe_trade.get('structureVersion', close_snapshot.get('structureVersion', signal_snapshot.get('structureVersion', 'v1'))) or 'v1'),
+        'barrierState': str(safe_trade.get('barrierState', close_snapshot.get('barrierState', signal_snapshot.get('barrierState', 'CLEAR'))) or 'CLEAR'),
+        'barrierVerdict': str(safe_trade.get('barrierVerdict', close_snapshot.get('barrierVerdict', signal_snapshot.get('barrierVerdict', 'SUPPORTIVE'))) or 'SUPPORTIVE'),
+        'adverseLevelType': str(safe_trade.get('adverseLevelType', close_snapshot.get('adverseLevelType', signal_snapshot.get('adverseLevelType', ''))) or ''),
+        'adverseLevelPrice': round(_coerce_float(safe_trade.get('adverseLevelPrice', close_snapshot.get('adverseLevelPrice', signal_snapshot.get('adverseLevelPrice', 0.0))), 0.0), 8),
+        'adverseDistancePct': round(_coerce_float(safe_trade.get('adverseDistancePct', close_snapshot.get('adverseDistancePct', signal_snapshot.get('adverseDistancePct', 0.0))), 0.0), 4),
+        'supportiveLevelType': str(safe_trade.get('supportiveLevelType', close_snapshot.get('supportiveLevelType', signal_snapshot.get('supportiveLevelType', ''))) or ''),
+        'supportiveLevelPrice': round(_coerce_float(safe_trade.get('supportiveLevelPrice', close_snapshot.get('supportiveLevelPrice', signal_snapshot.get('supportiveLevelPrice', 0.0))), 0.0), 8),
+        'supportiveDistancePct': round(_coerce_float(safe_trade.get('supportiveDistancePct', close_snapshot.get('supportiveDistancePct', signal_snapshot.get('supportiveDistancePct', 0.0))), 0.0), 4),
+        'barrierReason': str(safe_trade.get('barrierReason', close_snapshot.get('barrierReason', signal_snapshot.get('barrierReason', ''))) or ''),
+        'barrierConfidence': round(_coerce_float(safe_trade.get('barrierConfidence', close_snapshot.get('barrierConfidence', signal_snapshot.get('barrierConfidence', 0.0))), 0.0), 4),
         'peakRoi': round(peak_roi, 4),
         'realizedPeakCaptureRatio': round(capture_ratio, 4),
         'giveback': round(max(0.0, peak_roi - max(realized_roi, 0.0)), 4),
@@ -16537,6 +17033,10 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'fakeoutReclaimHoldArmed': safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False)),
                 'fakeoutReclaimReason': safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')),
                 'fakeoutReclaimReleaseReason': safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')),
+                'barrierState': safe_trade.get('barrierState', close_snapshot.get('barrierState', signal_snapshot.get('barrierState', 'CLEAR'))),
+                'barrierVerdict': safe_trade.get('barrierVerdict', close_snapshot.get('barrierVerdict', signal_snapshot.get('barrierVerdict', 'SUPPORTIVE'))),
+                'adverseDistancePct': safe_trade.get('adverseDistancePct', close_snapshot.get('adverseDistancePct', signal_snapshot.get('adverseDistancePct', 0.0))),
+                'barrierReason': safe_trade.get('barrierReason', close_snapshot.get('barrierReason', signal_snapshot.get('barrierReason', ''))),
             },
             'outcome': {
                 'accepted': True,
@@ -16589,6 +17089,10 @@ def _synthesize_replay_snapshots_from_trade(trade: dict) -> list:
                 'fakeoutReclaimHoldArmed': safe_trade.get('fakeoutReclaimHoldArmed', close_snapshot.get('fakeoutReclaimHoldArmed', False)),
                 'fakeoutReclaimReason': safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')),
                 'fakeoutReclaimReleaseReason': safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')),
+                'barrierState': safe_trade.get('barrierState', close_snapshot.get('barrierState', signal_snapshot.get('barrierState', 'CLEAR'))),
+                'barrierVerdict': safe_trade.get('barrierVerdict', close_snapshot.get('barrierVerdict', signal_snapshot.get('barrierVerdict', 'SUPPORTIVE'))),
+                'adverseDistancePct': safe_trade.get('adverseDistancePct', close_snapshot.get('adverseDistancePct', signal_snapshot.get('adverseDistancePct', 0.0))),
+                'barrierReason': safe_trade.get('barrierReason', close_snapshot.get('barrierReason', signal_snapshot.get('barrierReason', ''))),
             },
             'sourceVersion': 'approx_ohlcv_v1',
             'source_version': 'approx_ohlcv_v1',
@@ -19276,6 +19780,10 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
     order_entry_price = float(order.get('entryPrice', order.get('signalPrice', 0.0)) or 0.0)
     order_atr = float(order.get('atr', 0.0) or 0.0)
     order_pullback_pct = float(order.get('pullbackPct', 0.0) or 0.0)
+    signal_snapshot = order.get('signal_snapshot', order.get('signalSnapshot', {}))
+    signal_snapshot = signal_snapshot if isinstance(signal_snapshot, dict) else {}
+    order_entry_archetype = str(order.get('entryArchetype', signal_snapshot.get('entryArchetype', '')) or '').strip().lower()
+    order_runner_context = str(order.get('runnerContextResolved', signal_snapshot.get('runnerContextResolved', signal_snapshot.get('runnerContext', ''))) or '').strip().lower()
 
     live_side = opportunity.get('signalAction', 'NONE')
     live_spread = float(opportunity.get('spreadPct', 0) or 0)
@@ -19421,6 +19929,58 @@ def revalidate_pending_entry(order: dict, opportunity: dict, now_ms: int, force_
                 reasons.append(f"DRIFT_REJECT({drift_pct:.2f}%>{reject_band:.2f}%)")
     else:
         reasons.append("DRIFT_UNKNOWN")
+
+    continuation_like = bool(
+        order_entry_archetype == ENTRY_ARCHETYPE_CONTINUATION
+        or order_runner_context in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY)
+    )
+    if continuation_like:
+        cached_ohlcv_15m, _ = _get_cached_ohlcv_for_structure(
+            str(order.get('symbol', opportunity.get('symbol', '')) or opportunity.get('symbol', ''))
+        )
+        live_structure_ctx = {
+            'structureTrend': opportunity.get('structureTrend', signal_snapshot.get('structureTrend', 'MIXED')),
+            'swingState': opportunity.get('swingState', signal_snapshot.get('swingState', 'MIXED')),
+            'compressionState': opportunity.get('compressionState', signal_snapshot.get('compressionState', 'NONE')),
+            'breakoutRetestState': opportunity.get('breakoutRetestState', signal_snapshot.get('breakoutRetestState', 'NONE')),
+            'srContext': opportunity.get('srContext', signal_snapshot.get('srContext', 'UNKNOWN')),
+            'patternBias': opportunity.get('patternBias', signal_snapshot.get('patternBias', 'NEUTRAL')),
+            'patternConfidence': opportunity.get('patternConfidence', signal_snapshot.get('patternConfidence', 0.0)),
+            'patternSource': opportunity.get('patternSource', signal_snapshot.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED')),
+            'structureVersion': opportunity.get('structureVersion', signal_snapshot.get('structureVersion', 'v1')),
+        }
+        barrier_ctx = analyze_side_aware_entry_barrier(
+            symbol=str(order.get('symbol', opportunity.get('symbol', '')) or opportunity.get('symbol', '')),
+            side=order_side,
+            current_price=live_price or order_entry_price,
+            atr=order_atr,
+            entry_archetype=order_entry_archetype,
+            runner_context_resolved=order_runner_context,
+            recent_candles=opportunity.get('recent_candles', []),
+            ohlcv_15m=cached_ohlcv_15m,
+            structure_ctx=live_structure_ctx,
+            sr_levels_4h={
+                'nearest_support': order.get('srNearestSupport', signal_snapshot.get('srNearestSupport')),
+                'nearest_resistance': order.get('srNearestResistance', signal_snapshot.get('srNearestResistance')),
+            },
+            structural_zone=order.get('structural_zone', {}),
+        )
+        barrier_verdict = str(barrier_ctx.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+        barrier_state = str(barrier_ctx.get('barrierState', 'CLEAR') or 'CLEAR')
+        barrier_reason = str(barrier_ctx.get('barrierReason', '') or '')
+        barrier_adverse_pct = _coerce_float(barrier_ctx.get('adverseDistancePct', 0.0), 0.0)
+        if barrier_verdict == 'BLOCK':
+            if age_min >= 8:
+                hard_reject = True
+                reasons.append(f"BARRIER_REJECT({barrier_state}:{barrier_adverse_pct:.2f}%/{barrier_reason})")
+            else:
+                score = min(score, 52.0)
+                reasons.append(f"BARRIER_WAIT({barrier_state}:{barrier_adverse_pct:.2f}%/{barrier_reason})")
+        elif barrier_verdict == 'CAUTION':
+            score = max(0.0, score - 8.0)
+            reasons.append(f"BARRIER_CAUTION({barrier_state}:{barrier_adverse_pct:.2f}%/{barrier_reason})")
+        elif barrier_reason:
+            reasons.append(f"BARRIER_OK({barrier_state}:{barrier_adverse_pct:.2f}%/{barrier_reason})")
 
     softened_hard_reject = False
     if should_soften_pending_recheck_hard_reject(
@@ -21999,6 +22559,12 @@ class LightweightCoinAnalyzer:
         )
         
         # Generate signal with VWAP, HTF trend, Basis, Whale, RSI, Volume, Sweep, CoinStats, DailyTrend, ADX
+        try:
+            _btc_regime_ctx = market_regime_detector.get_trade_authority_snapshot()
+        except Exception:
+            _btc_regime_ctx = {}
+        _entry_market_regime = str(_btc_regime_ctx.get('marketRegimeForSignal', 'RANGING') or 'RANGING')
+        _btc_regime_ready_state = str(_btc_regime_ctx.get('readyState', 'waiting') or 'waiting')
         self.last_analysis_context = {
             'hurst': hurst,
             'zscore': zscore,
@@ -22026,7 +22592,8 @@ class LightweightCoinAnalyzer:
             'adx': adx,
             'adx_trend': adx_trend,
             'is_volume_spike': is_volume_spike,
-            'market_regime': market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
+            'market_regime': _entry_market_regime,
+            'btc_regime_ready_state': _btc_regime_ready_state,
             'ob_imbalance_trend': ob_trend_stable,
             'funding_rate': funding_oi_tracker.funding_rates.get(self.symbol, 0.0),
             'coin_wr_penalty': trade_pattern_analyzer.get_coin_penalty(self.symbol),
@@ -22058,7 +22625,7 @@ class LightweightCoinAnalyzer:
             adx=adx,  # ADX value for trend strength
             adx_trend=adx_trend,  # Trend direction: BULLISH/BEARISH/NEUTRAL
             is_volume_spike=is_volume_spike,  # Volume breakout detection
-            market_regime=market_regime_detector.current_regime if 'market_regime_detector' in globals() else 'RANGING',
+            market_regime=_entry_market_regime,
             ob_imbalance_trend=ob_trend_stable,  # Phase 262: Short-term OB flow EMA
             funding_rate=funding_oi_tracker.funding_rates.get(self.symbol, 0.0),  # Phase 157
             coin_wr_penalty=trade_pattern_analyzer.get_coin_penalty(self.symbol),  # Phase 157
@@ -24939,9 +25506,16 @@ async def background_scanner_loop():
                     logger.error(f"⏱️ SCAN TIMEOUT: scan_all_coins > {SCANNER_SCAN_TIMEOUT_SEC:.0f}s (cycle skipped)")
                     # P0-2: Still feed regime even on timeout
                     try:
-                        btc_price, _src = get_btc_reference_price()
+                        _btc_ref = get_btc_reference_price()
+                        btc_price = float(_btc_ref.get('price', 0.0) or 0.0)
+                        _src = str(_btc_ref.get('source', 'none') or 'none')
                         if btc_price > 0:
-                            market_regime_detector.update_btc_price(btc_price, source=f'timeout_{_src}')
+                            market_regime_detector.update_btc_price(
+                                btc_price,
+                                source=f'timeout_{_src}',
+                                source_age_sec=_btc_ref.get('source_age_sec'),
+                                observed_time=_btc_ref.get('observed_ts'),
+                            )
                             market_regime_detector.detect_regime()
                             logger.info(f"REGIME_FEED_RECOVER: btc={btc_price:.0f} src={_src} (timeout path)")
                     except Exception as _tfe:
@@ -24980,9 +25554,16 @@ async def background_scanner_loop():
                 
                 # P0-2: Update market regime with BTC price (multi-source cascade)
                 try:
-                    btc_price, _regime_src = get_btc_reference_price()
+                    _btc_ref = get_btc_reference_price()
+                    btc_price = float(_btc_ref.get('price', 0.0) or 0.0)
+                    _regime_src = str(_btc_ref.get('source', 'none') or 'none')
                     if btc_price and btc_price > 0:
-                        market_regime_detector.update_btc_price(btc_price, source=_regime_src)
+                        market_regime_detector.update_btc_price(
+                            btc_price,
+                            source=_regime_src,
+                            source_age_sec=_btc_ref.get('source_age_sec'),
+                            observed_time=_btc_ref.get('observed_ts'),
+                        )
                         market_regime_detector.detect_regime()
                     else:
                         logger.debug(f"⚠️ REGIME_SKIP_NO_BTC_PRICE: src={_regime_src}")
@@ -25820,12 +26401,6 @@ async def background_scanner_loop():
                 except Exception as pt_error:
                     logger.debug(f"Post-trade update error: {pt_error}")
                 
-                # Phase 224D: Detect market regime periodically (every scan cycle)
-                try:
-                    market_regime_manager.detect_regime()
-                except Exception as mr_err:
-                    logger.debug(f"Regime detection error: {mr_err}")
-                
                 # Phase 224C3: Apply PostTradeTracker tuning recommendations every 15 min
                 if int(datetime.now().timestamp()) % 900 < scan_interval:
                     try:
@@ -25843,9 +26418,16 @@ async def background_scanner_loop():
                     logger.info("🤖 AI Optimizer check triggered (15-min interval)")
                     try:
                         # P0-2: Update market regime with BTC price (multi-source)
-                        btc_price, _opt_src = get_btc_reference_price()
+                        _btc_ref = get_btc_reference_price()
+                        btc_price = float(_btc_ref.get('price', 0.0) or 0.0)
+                        _opt_src = str(_btc_ref.get('source', 'none') or 'none')
                         if btc_price > 0:
-                            market_regime_detector.update_btc_price(btc_price, source=f'optimizer_{_opt_src}')
+                            market_regime_detector.update_btc_price(
+                                btc_price,
+                                source=f'optimizer_{_opt_src}',
+                                source_age_sec=_btc_ref.get('source_age_sec'),
+                                observed_time=_btc_ref.get('observed_ts'),
+                            )
                         regime = market_regime_detector.detect_regime()
                         regime_params = market_regime_detector.get_regime_params()
                         
@@ -28708,12 +29290,31 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # When DCA disabled: legacy Phase 60 behavior
     # =====================================================
     try:
-        _entry_regime = market_regime_detector.fast_regime
-        _entry_dir = market_regime_detector.fast_trend_direction
-        _struct_regime = market_regime_detector.struct_regime
-        _struct_dir = market_regime_detector.struct_trend_direction
+        _regime_truth = market_regime_detector.get_trade_authority_snapshot()
+        _regime_ready_state = _regime_truth.get('readyState', 'waiting')
+        _entry_regime = _regime_truth.get('effectiveFastRegime', market_regime_detector.RANGING)
+        _entry_dir = _regime_truth.get('effectiveFastDirection', 'NEUTRAL')
+        _struct_regime = _regime_truth.get('effectiveStructRegime', market_regime_detector.RANGING)
+        _struct_dir = _regime_truth.get('effectiveStructDirection', 'NEUTRAL')
+        _fast_conf = _coerce_float(_regime_truth.get('effectiveFastConfidence', 0.0), 0.0)
+        _struct_conf = _coerce_float(_regime_truth.get('effectiveStructConfidence', 0.0), 0.0)
         regime_params = market_regime_detector.get_regime_params()
         _regime_action = 'PASS'
+        if _regime_ready_state != 'live':
+            _clamp_size = _clamp(_coerce_float(_regime_truth.get('sizeClampMult', 1.0), 1.0), 0.40, 1.0)
+            _clamp_lev = _clamp(_coerce_float(_regime_truth.get('levClampMult', 1.0), 1.0), 0.40, 1.0)
+            signal['sizeMultiplier'] = signal.get('sizeMultiplier', 1.0) * _clamp_size
+            signal['leverage'] = max(3, min(75, int((signal.get('leverage', 10) or 10) * _clamp_lev)))
+            signal['regime_adjustment'] = (
+                f"REGIME_{str(_regime_ready_state).upper()} "
+                f"size×{_clamp_size:.2f} lev×{_clamp_lev:.2f}"
+            )
+            logger.info(
+                f"🛰️ REGIME_ENTRY_FALLBACK: {action} {symbol} state={_regime_ready_state} "
+                f"fast={_regime_truth.get('actualFastRegime')}({_regime_truth.get('actualFastDirection')}) "
+                f"struct={_regime_truth.get('actualStructRegime')}({_regime_truth.get('actualStructDirection')}) "
+                f"size×{_clamp_size:.2f} lev×{_clamp_lev:.2f}"
+            )
         
         if DUAL_REGIME_GATE_ENABLED:
             # DCA-1: Phase 60 delegates — no score/size mutation here
@@ -28770,9 +29371,6 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
     # =====================================================
     if DUAL_REGIME_GATE_ENABLED:
         try:
-            _fast_conf = market_regime_detector.fast_confidence
-            _struct_conf = market_regime_detector.struct_confidence
-            
             _dca = compute_dual_regime_alignment(
                 signal_side=action,
                 fast_regime=_entry_regime, fast_dir=_entry_dir, fast_conf=_fast_conf,
@@ -28896,6 +29494,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         'dca_lev_mult': _dca_lev_mult_val,
         'dca_reason': _dca_reason_val,
         'regime_action': _regime_action_val,
+        'regime_ready_state': str(locals().get('_regime_ready_state', 'waiting')),
+        'actual_fast_regime': _regime_truth.get('actualFastRegime') if '_regime_truth' in locals() else '',
+        'actual_fast_direction': _regime_truth.get('actualFastDirection') if '_regime_truth' in locals() else '',
+        'actual_struct_regime': _regime_truth.get('actualStructRegime') if '_regime_truth' in locals() else '',
+        'actual_struct_direction': _regime_truth.get('actualStructDirection') if '_regime_truth' in locals() else '',
         'snapshot_ts_utc': int(datetime.now(timezone.utc).timestamp() * 1000),
     }
     signal['truth_snapshot'] = _truth_snapshot
@@ -29619,11 +30222,41 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             symbol=symbol
         )
         if pos:
-            global_paper_trader.pipeline_metrics['open_created'] += 1
+            result_kind = str(pos.get('resultKind', '') or '')
             trends = mtf_result.get('trends', {})
             logger.info(f"🤖 Auto-Trade: {action} {symbol} @ ${price:.4f} | MTF:{mtf_score} | Lev:{signal.get('leverage', 50)}x | 15m:{trends.get('15m','?')}, 1h:{trends.get('1h','?')}, 4h:{trends.get('4h','?')}, 1d:{trends.get('1d','?')}")
             is_pending_entry = bool(pos.get('expiresAt') and not pos.get('openTime'))
-            if is_pending_entry:
+            if result_kind == PENDING_OPEN_RESULT_REINFORCED_PENDING:
+                queue_signal_state(
+                    stage=SIGNAL_STAGE_PENDING_RECHECK,
+                    decision='PASS',
+                    decision_code='PENDING__REINFORCED',
+                    pending_entry_id=str(pos.get('id', '') or ''),
+                    accepted=True,
+                    executable=True,
+                    is_pending=True,
+                    is_opened=False,
+                    score_before=signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)),
+                    score_after=final_signal_score,
+                    leverage_before=signal.get('signalLeverageRaw', signal.get('leverage', 0)),
+                    leverage_after=signal.get('leverage', 0),
+                    size_mult=signal.get('sizeMultiplier', 1.0),
+                    trace={
+                        'pending_entry_id': pos.get('id', ''),
+                        'entry_price': pos.get('entryPrice', 0),
+                        'signal_price': pos.get('signalPrice', 0),
+                        'expires_at': pos.get('expiresAt', 0),
+                        'confirm_after': pos.get('confirmAfter', 0),
+                        'reinforced_count': pos.get('reinforcedCount', 0),
+                        'is_post_exit_reentry': bool(pos.get('isPostExitReentry', False)),
+                        'post_exit_reentry_entry_mode': pos.get('postExitReentryEntryMode', ''),
+                        'post_exit_reentry_pullback_pct_applied': pos.get('postExitReentryPullbackPctApplied', 0.0),
+                        'post_exit_reentry_confirm_delay_sec': pos.get('postExitReentryConfirmDelaySec', 0),
+                        'post_exit_reentry_expires_sec': pos.get('postExitReentryExpiresSec', 0),
+                    },
+                )
+            elif is_pending_entry:
+                global_paper_trader.pipeline_metrics['open_created'] += 1
                 queue_signal_state(
                     stage=SIGNAL_STAGE_PENDING,
                     decision='PASS',
@@ -29652,6 +30285,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     },
                 )
             else:
+                global_paper_trader.pipeline_metrics['open_created'] += 1
                 queue_pass_stage(
                     'OPEN__FILLED',
                     SIGNAL_STAGE_OPENED,
@@ -36682,6 +37316,11 @@ parameter_optimizer = ParameterOptimizer()
 # PHASE 53: MARKET REGIME DETECTOR
 # ============================================================================
 
+def compute_regime_min_samples(window_sec: int) -> int:
+    expected = max(1, int((window_sec or 0) / 30))
+    return max(3, int(expected * 0.25))
+
+
 class MarketRegimeDetector:
     """
     DRU-1: Dual-window regime detection with single execution authority.
@@ -36727,12 +37366,127 @@ class MarketRegimeDetector:
         self.last_input_source = 'none'
         self.last_input_price = 0.0
         self.last_input_time = None
+        self.last_fresh_input_time = None
+        self.last_source_age_sec = None
+        self.last_source_fresh = False
+        self.last_sample_event_time = None
+        self.last_effective_update_time = None
         self.regime_history = []
         self.max_history = 100
         logger.info(f"📊 MarketRegimeDetector initialized — DRU-1 dual-window (fast={self.fast_window_sec}s struct={self.struct_window_sec}s)")
-    
-    def update_btc_price(self, price: float, source: str = 'unknown') -> bool:
-        """BTC fiyatını kaydet — 30s throttle veya %0.05 fiyat değişimi şartı."""
+
+    def _normalize_observed_time(self, observed_time, now: datetime, source_age_sec: Optional[float]) -> datetime:
+        if isinstance(observed_time, datetime):
+            if observed_time.tzinfo is None:
+                return observed_time.replace(tzinfo=timezone.utc)
+            return observed_time.astimezone(timezone.utc)
+        if isinstance(observed_time, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(observed_time), tz=timezone.utc)
+            except Exception:
+                pass
+        if source_age_sec is not None:
+            try:
+                return now - timedelta(seconds=max(0.0, float(source_age_sec)))
+            except Exception:
+                pass
+        return now
+
+    def _compute_window_sample_counts(self, now: Optional[datetime] = None) -> dict:
+        current = now or datetime.now(timezone.utc)
+        fast_cutoff = current - timedelta(seconds=self.fast_window_sec)
+        struct_cutoff = current - timedelta(seconds=self.struct_window_sec)
+        fast_count = sum(1 for p in self.btc_prices if p['time'] >= fast_cutoff)
+        struct_count = sum(1 for p in self.btc_prices if p['time'] >= struct_cutoff)
+        return {
+            'fast': fast_count,
+            'struct': struct_count,
+        }
+
+    def _compute_min_samples(self) -> dict:
+        return {
+            'fast': compute_regime_min_samples(self.fast_window_sec),
+            'struct': compute_regime_min_samples(self.struct_window_sec),
+        }
+
+    def get_authority_state(self) -> dict:
+        now = datetime.now(timezone.utc)
+        counts = self._compute_window_sample_counts(now)
+        mins = self._compute_min_samples()
+        stale_sec = None
+        if self.last_effective_update_time is not None:
+            stale_sec = max(0.0, (now - self.last_effective_update_time).total_seconds())
+        elif self.last_input_time is not None:
+            stale_sec = max(0.0, (now - self.last_input_time).total_seconds())
+
+        if len(self.btc_prices) == 0 and self.last_input_time is None:
+            ready_state = 'waiting'
+        elif stale_sec is not None and stale_sec > BTC_REGIME_STALE_SEC:
+            ready_state = 'stale'
+        elif counts['fast'] < mins['fast'] or counts['struct'] < mins['struct']:
+            ready_state = 'warming_up'
+        else:
+            ready_state = 'live'
+
+        authority_state = 'LIVE' if ready_state == 'live' else 'DEGRADED'
+        return {
+            'readyState': ready_state,
+            'authorityState': authority_state,
+            'staleSec': stale_sec,
+            'fastSamples': counts['fast'],
+            'structSamples': counts['struct'],
+            'fastMinSamples': mins['fast'],
+            'structMinSamples': mins['struct'],
+            'isFresh': bool(self.last_source_fresh),
+            'sourceAgeSec': self.last_source_age_sec,
+        }
+
+    def get_trade_authority_snapshot(self) -> dict:
+        authority = self.get_authority_state()
+        ready_state = authority['readyState']
+        live_ready = (ready_state == 'live') or BTC_REGIME_AUTHORITY_MODE != 'apply'
+        if ready_state == 'warming_up':
+            size_mult = _clamp(BTC_REGIME_WARMING_SIZE_MULT, 0.50, 1.0)
+            lev_mult = _clamp(BTC_REGIME_WARMING_LEV_MULT, 0.50, 1.0)
+        elif ready_state in ('stale', 'error'):
+            size_mult = _clamp(BTC_REGIME_STALE_SIZE_MULT, 0.40, 1.0)
+            lev_mult = _clamp(BTC_REGIME_STALE_LEV_MULT, 0.40, 1.0)
+        else:
+            size_mult = 1.0
+            lev_mult = 1.0
+        return {
+            'readyState': ready_state,
+            'authorityState': authority['authorityState'],
+            'actualFastRegime': self.fast_regime,
+            'actualFastDirection': self.fast_trend_direction,
+            'actualFastConfidence': self.fast_confidence,
+            'actualStructRegime': self.struct_regime,
+            'actualStructDirection': self.struct_trend_direction,
+            'actualStructConfidence': self.struct_confidence,
+            'effectiveFastRegime': self.fast_regime if live_ready else self.RANGING,
+            'effectiveFastDirection': self.fast_trend_direction if live_ready else 'NEUTRAL',
+            'effectiveFastConfidence': self.fast_confidence if live_ready else 0.0,
+            'effectiveStructRegime': self.struct_regime if live_ready else self.RANGING,
+            'effectiveStructDirection': self.struct_trend_direction if live_ready else 'NEUTRAL',
+            'effectiveStructConfidence': self.struct_confidence if live_ready else 0.0,
+            'marketRegimeForSignal': self.fast_regime if live_ready else self.RANGING,
+            'macroTrendDirForSignal': self.fast_trend_direction if live_ready else 'NEUTRAL',
+            'sizeClampMult': size_mult,
+            'levClampMult': lev_mult,
+            'liveReady': live_ready,
+            'staleSec': authority['staleSec'],
+        }
+
+    def update_btc_price(
+        self,
+        price: float,
+        source: str = 'unknown',
+        *,
+        source_age_sec: Optional[float] = None,
+        observed_time=None,
+        allow_stale_sample: bool = False,
+    ) -> bool:
+        """BTC fiyatını kaydet — gerçek source yaşı ile freshness korumalı."""
         try:
             price = float(price)
         except (TypeError, ValueError):
@@ -36742,22 +37496,47 @@ class MarketRegimeDetector:
             logger.debug(f"REGIME_SAMPLE_REJECTED: non-finite price={price} src={source}")
             return False
         now = datetime.now(timezone.utc)
+        observed_dt = self._normalize_observed_time(observed_time, now, source_age_sec)
+        effective_source_age = float(source_age_sec) if source_age_sec is not None else max(0.0, (now - observed_dt).total_seconds())
+        source_is_fresh = effective_source_age <= BTC_REGIME_STALE_SEC
+        self.last_input_source = source or 'unknown'
+        self.last_input_price = price
+        self.last_input_time = observed_dt
+        self.last_sample_event_time = now
+        self.last_source_age_sec = round(effective_source_age, 1)
+        self.last_source_fresh = source_is_fresh
+        if source_is_fresh:
+            self.last_fresh_input_time = observed_dt
+            self.last_effective_update_time = now
+        if not source_is_fresh and not allow_stale_sample:
+            logger.debug(
+                f"REGIME_SOURCE_STALE: src={source} age={effective_source_age:.1f}s "
+                f"price={price:.1f} allow={allow_stale_sample}"
+            )
+            return False
+        sample_time = observed_dt
         if self.btc_prices:
             last = self.btc_prices[-1]
-            elapsed = (now - last['time']).total_seconds()
+            if sample_time <= last['time']:
+                logger.debug(
+                    f"REGIME_SAMPLE_SKIPPED: non_monotonic sample_time={sample_time.isoformat()} "
+                    f"last={last['time'].isoformat()} src={source}"
+                )
+                return False
+            elapsed = (sample_time - last['time']).total_seconds()
             price_change_pct = abs(price - last['price']) / last['price'] * 100 if last['price'] > 0 else 999
             if elapsed < 30 and price_change_pct < 0.05:
                 logger.debug(f"REGIME_SAMPLE_SKIPPED: elapsed={elapsed:.0f}s change={price_change_pct:.3f}% src={source}")
                 return False
         self.btc_prices.append({
             'price': price,
-            'time': now
+            'time': sample_time,
+            'source': source,
+            'source_age_sec': round(effective_source_age, 1),
+            'is_fresh': source_is_fresh,
         })
         if len(self.btc_prices) > 500:
             self.btc_prices = self.btc_prices[-500:]
-        self.last_input_source = source or 'unknown'
-        self.last_input_price = price
-        self.last_input_time = now
         logger.debug(f"REGIME_INPUT_SOURCE={source} price={price:.1f} samples={len(self.btc_prices)}")
         return True
     
@@ -36811,9 +37590,6 @@ class MarketRegimeDetector:
     def detect_regime(self) -> str:
         """Dual-window regime detection.
         Fast (5 min) → entry direction; Structural (2 hr) → exit params."""
-        if len(self.btc_prices) < 5:
-            return self.RANGING
-        
         now = datetime.now(timezone.utc)
         
         # --- Fast window: last fast_window_sec ---
@@ -36913,6 +37689,12 @@ class MarketRegimeDetector:
                 'description': 'Sakin piyasa - agresif giriş, sıkı çıkış'
             }
         }
+        authority = self.get_authority_state()
+        if BTC_REGIME_AUTHORITY_MODE == 'apply' and authority['readyState'] != 'live':
+            neutral = params[self.RANGING].copy()
+            neutral['authority_state'] = authority['readyState']
+            neutral['description'] = f"BTC regime {authority['readyState']} — nötr entry fallback"
+            return neutral
         return params.get(self.fast_regime, params[self.RANGING])
     
     def get_execution_profile(self) -> dict:
@@ -36950,19 +37732,31 @@ class MarketRegimeDetector:
                 'description': '😴 Struct: Sakin — sıkı trail, uzun confirm'
             },
         }
-        profile = _profiles.get(self.struct_regime, _profiles[self.RANGING]).copy()
+        authority = self.get_authority_state()
+        degraded = BTC_REGIME_AUTHORITY_MODE == 'apply' and authority['readyState'] != 'live'
+        profile_regime = self.RANGING if degraded else self.struct_regime
+        profile = _profiles.get(profile_regime, _profiles[self.RANGING]).copy()
         profile['profile_source'] = self.struct_regime
         profile['profile_key'] = self.struct_regime
-        profile['source_kind'] = 'btc_struct_regime'
-        profile['source_label'] = f"BTC Struct • {self.struct_regime}"
+        profile['source_kind'] = 'btc_struct_regime_degraded' if degraded else 'btc_struct_regime'
+        profile['source_label'] = (
+            f"BTC Struct • {self.struct_regime} ({authority['readyState']})"
+            if degraded
+            else f"BTC Struct • {self.struct_regime}"
+        )
+        profile['authority_state'] = authority['readyState']
+        profile['degraded'] = degraded
+        if degraded:
+            profile['description'] = f"BTC regime {authority['readyState']} — nötr execution fallback"
         return profile
 
     def _get_ready_state(self, fast_count: int, struct_count: int, stale_sec: Optional[float]) -> str:
-        if len(self.btc_prices) == 0 or self.last_update is None:
+        mins = self._compute_min_samples()
+        if len(self.btc_prices) == 0 and self.last_input_time is None:
             return 'waiting'
-        if stale_sec is not None and stale_sec > 90:
+        if stale_sec is not None and stale_sec > BTC_REGIME_STALE_SEC:
             return 'stale'
-        if fast_count < 5 or struct_count < 5:
+        if fast_count < mins['fast'] or struct_count < mins['struct']:
             return 'warming_up'
         return 'live'
 
@@ -37014,13 +37808,14 @@ class MarketRegimeDetector:
     
     def get_status(self) -> dict:
         """API durum özeti — DRU-1 dual-window payload."""
-        _stale_sec = None
-        if self.last_update:
-            _stale_sec = (datetime.now(timezone.utc) - self.last_update).total_seconds()
-            if _stale_sec > 90:
-                logger.warning(f"⚠️ REGIME_STALE: lastUpdate {_stale_sec:.0f}s ago")
-        _last_update_ms = int(self.last_update.timestamp() * 1000) if self.last_update else None
+        authority = self.get_authority_state()
+        _stale_sec = authority['staleSec']
+        if _stale_sec is not None and _stale_sec > BTC_REGIME_STALE_SEC:
+            logger.warning(f"⚠️ REGIME_STALE: effectiveUpdate {_stale_sec:.0f}s ago")
+        status_update_dt = self.last_effective_update_time or self.last_input_time or self.last_update
+        _last_update_ms = int(status_update_dt.timestamp() * 1000) if status_update_dt else None
         _last_input_ms = int(self.last_input_time.timestamp() * 1000) if self.last_input_time else None
+        _last_fresh_input_ms = int(self.last_fresh_input_time.timestamp() * 1000) if self.last_fresh_input_time else None
         
         now = datetime.now(timezone.utc)
         fast_cutoff = now - timedelta(seconds=self.fast_window_sec)
@@ -37028,6 +37823,7 @@ class MarketRegimeDetector:
         fast_count = sum(1 for p in self.btc_prices if p['time'] >= fast_cutoff)
         struct_count = sum(1 for p in self.btc_prices if p['time'] >= struct_cutoff)
         ready_state = self._get_ready_state(fast_count, struct_count, _stale_sec)
+        mins = self._compute_min_samples()
         
         exec_profile = self.get_execution_profile()
         
@@ -37035,21 +37831,27 @@ class MarketRegimeDetector:
             # Backward compat
             'currentRegime': self.current_regime,
             'trendDirection': self.trend_direction,
-            'lastUpdate': self.last_update.isoformat() if self.last_update else None,
+            'lastUpdate': status_update_dt.isoformat() if status_update_dt else None,
             'lastUpdateMs': _last_update_ms,
             'staleSec': round(_stale_sec, 1) if _stale_sec is not None else None,
             'priceCount': len(self.btc_prices),
             'params': self.get_regime_params(),
             'recentChanges': self.regime_history[-5:] if self.regime_history else [],
             'readyState': ready_state,
+            'authorityState': authority['authorityState'],
             'dataFlow': {
                 'inputSource': self.last_input_source,
                 'lastBtcPrice': round(self.last_input_price, 2) if self.last_input_price > 0 else None,
                 'lastInputMs': _last_input_ms,
+                'lastFreshInputMs': _last_fresh_input_ms,
                 'isStale': ready_state == 'stale',
+                'isFresh': authority['isFresh'],
+                'sourceAgeSec': authority['sourceAgeSec'],
                 'fastSamples': fast_count,
                 'structSamples': struct_count,
-                'minSamplesPerWindow': 5,
+                'fastMinSamples': mins['fast'],
+                'structMinSamples': mins['struct'],
+                'minSamplesPerWindow': max(mins['fast'], mins['struct']),
                 'readyState': ready_state,
             },
             'dcaPreview': self._build_dca_preview(),
@@ -37079,13 +37881,24 @@ market_regime_detector = MarketRegimeDetector()
 _btc_price_cache = 0.0
 _btc_price_cache_ts = 0.0
 
-def get_btc_reference_price(scan_tickers: dict = None) -> tuple:
+def get_btc_reference_price(scan_tickers: dict = None) -> dict:
     """P0-2: Get BTC reference price from best available source.
     Priority: scan_tickers → WS → btc_filter → last-known cache.
-    Returns (price, source_str). Updates module cache on success.
+    Returns dict with price/source/source_age_sec/is_fresh. Updates module cache on success.
     """
     global _btc_price_cache, _btc_price_cache_ts
     import time as _time
+    _now_ts = _time.time()
+
+    def _result(price: float, source: str, source_ts: float) -> dict:
+        age = max(0.0, _now_ts - float(source_ts or _now_ts))
+        return {
+            'price': float(price or 0.0),
+            'source': source or 'unknown',
+            'source_age_sec': round(age, 1),
+            'is_fresh': age <= BTC_REGIME_STALE_SEC,
+            'observed_ts': float(source_ts or _now_ts),
+        }
     
     # Source 1: scan_all_coins tickers map (freshest during scan cycle)
     if scan_tickers:
@@ -37093,8 +37906,8 @@ def get_btc_reference_price(scan_tickers: dict = None) -> tuple:
         p = float(btc_tk.get('last', 0) or btc_tk.get('lastPrice', 0) or 0)
         if p > 0:
             _btc_price_cache = p
-            _btc_price_cache_ts = _time.time()
-            return (p, 'scan_tickers')
+            _btc_price_cache_ts = _now_ts
+            return _result(p, 'scan_tickers', _now_ts)
     
     # Source 2: WebSocket manager
     try:
@@ -37103,8 +37916,8 @@ def get_btc_reference_price(scan_tickers: dict = None) -> tuple:
             p = float(ws_tickers['BTCUSDT'].get('last', 0) or ws_tickers['BTCUSDT'].get('price', 0) or 0)
             if p > 0:
                 _btc_price_cache = p
-                _btc_price_cache_ts = _time.time()
-                return (p, 'ws_manager')
+                _btc_price_cache_ts = _now_ts
+                return _result(p, 'ws_manager', _now_ts)
     except Exception:
         pass
     
@@ -37113,17 +37926,17 @@ def get_btc_reference_price(scan_tickers: dict = None) -> tuple:
         p = float(getattr(btc_filter, 'btc_price', 0) or 0)
         if p > 0:
             _btc_price_cache = p
-            _btc_price_cache_ts = _time.time()
-            return (p, 'btc_filter')
+            _btc_price_cache_ts = _now_ts
+            return _result(p, 'btc_filter', _now_ts)
     except Exception:
         pass
     
     # Source 4: Last-known-good cache
     if _btc_price_cache > 0:
-        age = _time.time() - _btc_price_cache_ts
-        return (_btc_price_cache, f'cache_{int(age)}s')
+        age = _now_ts - _btc_price_cache_ts
+        return _result(_btc_price_cache, f'cache_{int(age)}s', _btc_price_cache_ts)
     
-    return (0.0, 'none')
+    return _result(0.0, 'none', _now_ts)
 
 
 # ============================================================================
@@ -38451,10 +39264,15 @@ class SignalGenerator:
         )
         strategy_mode = normalize_strategy_mode(requested_strategy_mode)
         pre_signal_side = "SHORT" if zscore > 0 else "LONG"
+        _btc_regime_ctx = {}
+        try:
+            _btc_regime_ctx = market_regime_detector.get_trade_authority_snapshot()
+        except Exception:
+            _btc_regime_ctx = {}
         # Phase 235: Pass macro trend direction for regime-aware directional tuning
         _s2_trend_dir = "NEUTRAL"
         try:
-            _s2_trend_dir = market_regime_detector.trend_direction
+            _s2_trend_dir = str(_btc_regime_ctx.get('macroTrendDirForSignal', market_regime_detector.trend_direction) or 'NEUTRAL')
         except Exception:
             pass
         smart_v2_profile = get_smart_v2_strategy_profile(
@@ -39164,10 +39982,9 @@ class SignalGenerator:
         _blended_dir = "NEUTRAL"  # used by VOLATILE_VETO below
         try:
             # -- BTC macro bias --
-            macro_regime = market_regime_detector.current_regime
-            macro_trend_dir = market_regime_detector.trend_direction
-            btc_regime = market_regime_manager.current_regime
-            btc_bias = compute_btc_macro_bias(macro_regime, macro_trend_dir, btc_regime)
+            macro_regime = str(_btc_regime_ctx.get('effectiveStructRegime', market_regime_detector.current_regime) or 'RANGING')
+            macro_trend_dir = str(_btc_regime_ctx.get('macroTrendDirForSignal', market_regime_detector.trend_direction) or 'NEUTRAL')
+            btc_bias = compute_btc_macro_bias(macro_regime, macro_trend_dir)
 
             # -- Coin macro bias --
             coin_bias = compute_coin_macro_bias(
@@ -40103,7 +40920,67 @@ class SignalGenerator:
                 DECISION_ARCHETYPE_RECOVERY,
             ):
                 entry_archetype = preview_archetype
+        barrier_size_mult = 1.0
+        barrier_leverage_cap = 0
+        barrier_ctx = {
+            'barrierState': 'CLEAR',
+            'barrierVerdict': 'SUPPORTIVE',
+            'adverseLevelType': '',
+            'adverseLevelPrice': 0.0,
+            'adverseDistancePct': 0.0,
+            'supportiveLevelType': '',
+            'supportiveLevelPrice': 0.0,
+            'supportiveDistancePct': 0.0,
+            'barrierReason': '',
+            'barrierConfidence': 0.0,
+        }
+        if is_smart_mode(strategy_mode):
+            _barrier_ohlcv_15m, _ = _get_cached_ohlcv_for_structure(symbol)
+            barrier_ctx = analyze_side_aware_entry_barrier(
+                symbol=symbol,
+                side=signal_side,
+                current_price=price,
+                atr=atr,
+                entry_archetype=entry_archetype,
+                runner_context_resolved=runner_context_preview,
+                ohlcv_15m=_barrier_ohlcv_15m,
+                structure_ctx=decision_context_preview,
+                sr_levels_4h=sr_levels,
+            )
+            decision_context_preview.update({
+                'barrierState': barrier_ctx.get('barrierState', 'CLEAR'),
+                'barrierVerdict': barrier_ctx.get('barrierVerdict', 'SUPPORTIVE'),
+                'adverseLevelType': barrier_ctx.get('adverseLevelType', ''),
+                'adverseLevelPrice': barrier_ctx.get('adverseLevelPrice', 0.0),
+                'adverseDistancePct': barrier_ctx.get('adverseDistancePct', 0.0),
+                'supportiveLevelType': barrier_ctx.get('supportiveLevelType', ''),
+                'supportiveLevelPrice': barrier_ctx.get('supportiveLevelPrice', 0.0),
+                'supportiveDistancePct': barrier_ctx.get('supportiveDistancePct', 0.0),
+                'barrierReason': barrier_ctx.get('barrierReason', ''),
+                'barrierConfidence': barrier_ctx.get('barrierConfidence', 0.0),
+            })
         if entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
+            barrier_verdict = str(barrier_ctx.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+            barrier_state = str(barrier_ctx.get('barrierState', 'CLEAR') or 'CLEAR')
+            barrier_reason = str(barrier_ctx.get('barrierReason', '') or '')
+            adverse_distance_pct = _coerce_float(barrier_ctx.get('adverseDistancePct', 0.0), 0.0)
+            if barrier_verdict == 'BLOCK':
+                logger.info(
+                    f"🚫 CONTINUATION_BARRIER_BLOCK: {symbol} {signal_side} "
+                    f"state={barrier_state} adverse={adverse_distance_pct:.3f}% reason={barrier_reason}"
+                )
+                return None
+            if barrier_verdict == 'CAUTION':
+                score = max(0.0, score - 6.0)
+                barrier_size_mult = V3_SIDE_AWARE_BARRIER_SIZE_MULT
+                barrier_leverage_cap = V3_SIDE_AWARE_BARRIER_LEVERAGE_CAP
+                reasons.append(
+                    f"BARRIER_CAUTION({barrier_state}:{adverse_distance_pct:.2f}%/{barrier_reason or 'nearby'})"
+                )
+            elif barrier_reason:
+                reasons.append(
+                    f"BARRIER_OK({barrier_state}:{adverse_distance_pct:.2f}%/{barrier_reason})"
+                )
             if not (volume_ratio >= 1.35 or is_volume_spike):
                 logger.info(
                     f"🚫 CONTINUATION_LOW_VOLUME: {symbol} {signal_side} "
@@ -40118,10 +40995,16 @@ class SignalGenerator:
                 return None
             reasons.append("ENTRY_ARCH(continuation)")
         elif entry_archetype == DECISION_ARCHETYPE_EXHAUSTION:
+            if barrier_ctx.get('barrierReason'):
+                reasons.append(f"BARRIER_NOTE({barrier_ctx.get('barrierState', 'CLEAR')}:{barrier_ctx.get('barrierReason', '')})")
             reasons.append("ENTRY_ARCH(exhaustion)")
         elif entry_archetype == DECISION_ARCHETYPE_RECOVERY:
+            if barrier_ctx.get('barrierReason'):
+                reasons.append(f"BARRIER_NOTE({barrier_ctx.get('barrierState', 'CLEAR')}:{barrier_ctx.get('barrierReason', '')})")
             reasons.append("ENTRY_ARCH(recovery)")
         else:
+            if barrier_ctx.get('barrierReason'):
+                reasons.append(f"BARRIER_NOTE({barrier_ctx.get('barrierState', 'CLEAR')}:{barrier_ctx.get('barrierReason', '')})")
             reasons.append("ENTRY_ARCH(reclaim)")
 
         # =====================================================================
@@ -40158,6 +41041,9 @@ class SignalGenerator:
             reasons.append("📈 trend_conflict(-15%)")
         
         size_mult *= trend_size_reduction
+        if barrier_size_mult < 0.999:
+            size_mult *= barrier_size_mult
+            reasons.append(f"BARRIER_SIZE({barrier_size_mult:.2f}x)")
         if volatile_soft_risk_cap:
             size_mult *= VOLATILE_VETO_SOFTPASS_SIZE_MULT
             reasons.append(f"VOL_SIZE({VOLATILE_VETO_SOFTPASS_SIZE_MULT:.2f}x)")
@@ -40189,6 +41075,11 @@ class SignalGenerator:
             final_leverage = min(final_leverage, int(forecast_eq_leverage_cap))
             if final_leverage < _forecast_old_lev:
                 reasons.append(f"EQ_FORECAST_CAP({_forecast_old_lev}→{final_leverage}x)")
+        if barrier_leverage_cap:
+            _barrier_old_lev = final_leverage
+            final_leverage = min(final_leverage, int(barrier_leverage_cap))
+            if final_leverage < _barrier_old_lev:
+                reasons.append(f"BARRIER_LEV_CAP({_barrier_old_lev}→{final_leverage}x)")
 
         self.last_signal_time = now
         
@@ -40323,6 +41214,16 @@ class SignalGenerator:
             'currentIsVolumeSpike': bool(is_volume_spike),
             'currentImbalance': round(float(imbalance or 0.0), 4),
             'currentObImbalanceTrend': round(float(ob_imbalance_trend or 0.0), 4),
+            'barrierState': str(barrier_ctx.get('barrierState', 'CLEAR') or 'CLEAR'),
+            'barrierVerdict': str(barrier_ctx.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            'adverseLevelType': str(barrier_ctx.get('adverseLevelType', '') or ''),
+            'adverseLevelPrice': round(_coerce_float(barrier_ctx.get('adverseLevelPrice', 0.0), 0.0), 8),
+            'adverseDistancePct': round(_coerce_float(barrier_ctx.get('adverseDistancePct', 0.0), 0.0), 4),
+            'supportiveLevelType': str(barrier_ctx.get('supportiveLevelType', '') or ''),
+            'supportiveLevelPrice': round(_coerce_float(barrier_ctx.get('supportiveLevelPrice', 0.0), 0.0), 8),
+            'supportiveDistancePct': round(_coerce_float(barrier_ctx.get('supportiveDistancePct', 0.0), 0.0), 4),
+            'barrierReason': str(barrier_ctx.get('barrierReason', '') or ''),
+            'barrierConfidence': round(_coerce_float(barrier_ctx.get('barrierConfidence', 0.0), 0.0), 4),
             'decisionContext': decision_context_preview,
             'indicatorPolicy': decision_context_preview.get('indicatorPolicy', {}),
             'gatePolicy': decision_context_preview.get('gatePolicy', {}),
@@ -41807,47 +42708,137 @@ class PaperTradingEngine:
     def _reinforce_pending_order(self, existing_pending: dict, side: str, price: float, atr: float, signal: dict, trade_symbol: str):
         """Refresh an already-open pending order for the same symbol/side."""
         now_ms = int(datetime.now().timestamp() * 1000)
+        safe_signal = signal if isinstance(signal, dict) else {}
         old_score = int(existing_pending.get('signalScore', 0) or 0)
-        new_score = int(signal.get('confidenceScore', 0) if signal else 0)
+        new_score = int(safe_signal.get('confidenceScore', 0) if safe_signal else 0)
         score_gap = new_score - old_score
         reinforce_count = int(existing_pending.get('reinforcedCount', 0) or 0) + 1
         is_confirmed = bool(existing_pending.get('confirmed', False))
+        is_existing_reentry = bool(existing_pending.get('isPostExitReentry', False))
+        is_incoming_reentry = bool(safe_signal.get('isPostExitReentry', False))
+        existing_snapshot = existing_pending.get('signal_snapshot', existing_pending.get('signalSnapshot', {}))
+        existing_snapshot = existing_snapshot if isinstance(existing_snapshot, dict) else {}
+        merged_snapshot = copy.deepcopy(existing_snapshot)
+        if safe_signal:
+            merged_snapshot.update(copy.deepcopy(safe_signal))
+        if is_existing_reentry:
+            merged_snapshot['isPostExitReentry'] = True
+            for key in _PENDING_REINFORCE_REENTRY_FIELDS:
+                if key in existing_pending:
+                    merged_snapshot[key] = existing_pending.get(key)
 
         existing_pending['reinforcedCount'] = reinforce_count
         existing_pending['signalScore'] = max(old_score, new_score)
         # P2-08: Propagate raw score (max of old and new raw)
         old_raw = int(existing_pending.get('signalScoreRaw', old_score) or 0)
-        new_raw = int(signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)) if signal else 0)
+        new_raw = int(safe_signal.get('_rawConfidenceScore', safe_signal.get('confidenceScore', 0)) if safe_signal else 0)
         existing_pending['signalScoreRaw'] = max(old_raw, new_raw)
         existing_pending['lastReinforceAt'] = now_ms
         existing_pending['volatility_pct'] = (atr / price * 100) if price > 0 else existing_pending.get('volatility_pct', 2.0)
-        existing_pending['spreadPct'] = signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if signal else existing_pending.get('spreadPct', 0.05)
-        existing_pending['volumeRatio'] = signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if signal else existing_pending.get('volumeRatio', 1.0)
+        existing_pending['spreadPct'] = safe_signal.get('spreadPct', existing_pending.get('spreadPct', 0.05)) if safe_signal else existing_pending.get('spreadPct', 0.05)
+        existing_pending['volumeRatio'] = safe_signal.get('volumeRatio', existing_pending.get('volumeRatio', 1.0)) if safe_signal else existing_pending.get('volumeRatio', 1.0)
         existing_pending['atr'] = atr if atr > 0 else existing_pending.get('atr', 0)
-        existing_pending['truth_snapshot'] = signal.get('truth_snapshot', existing_pending.get('truth_snapshot', {})) if signal else existing_pending.get('truth_snapshot', {})
-        existing_pending['regime_adjustment'] = signal.get('regime_adjustment', existing_pending.get('regime_adjustment', '')) if signal else existing_pending.get('regime_adjustment', '')
-        existing_pending['structural_zone'] = signal.get('structural_zone', existing_pending.get('structural_zone', {})) if signal else existing_pending.get('structural_zone', {})
-        existing_pending['structural_sr_levels'] = signal.get('structural_sr_levels', existing_pending.get('structural_sr_levels', {})) if signal else existing_pending.get('structural_sr_levels', {})
-        existing_pending['structural_fallback_stage'] = signal.get('structural_fallback_stage', existing_pending.get('structural_fallback_stage', '')) if signal else existing_pending.get('structural_fallback_stage', '')
-        existing_pending['execution_style'] = signal.get('execution_style', existing_pending.get('execution_style', EXEC_STYLE_MARKET)) if signal else existing_pending.get('execution_style', EXEC_STYLE_MARKET)
-        existing_pending['symbolExecMemoryApplied'] = bool(signal.get('symbolExecMemoryApplied', existing_pending.get('symbolExecMemoryApplied', False))) if signal else existing_pending.get('symbolExecMemoryApplied', False)
-        existing_pending['symbolExecMemorySizeMult'] = _coerce_float(signal.get('symbolExecMemorySizeMult', existing_pending.get('symbolExecMemorySizeMult', 1.0)) if signal else existing_pending.get('symbolExecMemorySizeMult', 1.0), 1.0)
-        existing_pending['symbolExecMemoryLevCap'] = int(signal.get('symbolExecMemoryLevCap', existing_pending.get('symbolExecMemoryLevCap', 0)) if signal else existing_pending.get('symbolExecMemoryLevCap', 0))
-        existing_pending['symbolExecMemoryReason'] = signal.get('symbolExecMemoryReason', existing_pending.get('symbolExecMemoryReason', 'none')) if signal else existing_pending.get('symbolExecMemoryReason', 'none')
-        existing_pending['allocatorPriorityScore'] = _coerce_float(signal.get('allocatorPriorityScore', existing_pending.get('allocatorPriorityScore', 0.0)) if signal else existing_pending.get('allocatorPriorityScore', 0.0), 0.0)
-        existing_pending['allocatorRank'] = int(signal.get('allocatorRank', existing_pending.get('allocatorRank', 0)) if signal else existing_pending.get('allocatorRank', 0) or 0)
-        existing_pending['allocatorSizeMult'] = _coerce_float(signal.get('allocatorSizeMult', existing_pending.get('allocatorSizeMult', 1.0)) if signal else existing_pending.get('allocatorSizeMult', 1.0), 1.0)
-        existing_pending['allocatorReason'] = signal.get('allocatorReason', existing_pending.get('allocatorReason', '')) if signal else existing_pending.get('allocatorReason', '')
-        existing_pending['evContextKey'] = signal.get('evContextKey', existing_pending.get('evContextKey', '')) if signal else existing_pending.get('evContextKey', '')
-        existing_pending['evSoftThresholdApplied'] = _coerce_float(signal.get('evSoftThresholdApplied', existing_pending.get('evSoftThresholdApplied', 0.0)) if signal else existing_pending.get('evSoftThresholdApplied', 0.0), 0.0)
-        existing_pending['evHardThresholdApplied'] = _coerce_float(signal.get('evHardThresholdApplied', existing_pending.get('evHardThresholdApplied', 0.0)) if signal else existing_pending.get('evHardThresholdApplied', 0.0), 0.0)
+        existing_pending['truth_snapshot'] = safe_signal.get('truth_snapshot', existing_pending.get('truth_snapshot', {})) if safe_signal else existing_pending.get('truth_snapshot', {})
+        existing_pending['regime_adjustment'] = safe_signal.get('regime_adjustment', existing_pending.get('regime_adjustment', '')) if safe_signal else existing_pending.get('regime_adjustment', '')
+        existing_pending['structural_zone'] = safe_signal.get('structural_zone', existing_pending.get('structural_zone', {})) if safe_signal else existing_pending.get('structural_zone', {})
+        existing_pending['structural_sr_levels'] = safe_signal.get('structural_sr_levels', existing_pending.get('structural_sr_levels', {})) if safe_signal else existing_pending.get('structural_sr_levels', {})
+        existing_pending['structural_fallback_stage'] = safe_signal.get('structural_fallback_stage', existing_pending.get('structural_fallback_stage', '')) if safe_signal else existing_pending.get('structural_fallback_stage', '')
+        existing_pending['execution_style'] = safe_signal.get('execution_style', existing_pending.get('execution_style', EXEC_STYLE_MARKET)) if safe_signal else existing_pending.get('execution_style', EXEC_STYLE_MARKET)
+        existing_pending['symbolExecMemoryApplied'] = bool(safe_signal.get('symbolExecMemoryApplied', existing_pending.get('symbolExecMemoryApplied', False))) if safe_signal else existing_pending.get('symbolExecMemoryApplied', False)
+        existing_pending['symbolExecMemorySizeMult'] = _coerce_float(safe_signal.get('symbolExecMemorySizeMult', existing_pending.get('symbolExecMemorySizeMult', 1.0)) if safe_signal else existing_pending.get('symbolExecMemorySizeMult', 1.0), 1.0)
+        existing_pending['symbolExecMemoryLevCap'] = int(safe_signal.get('symbolExecMemoryLevCap', existing_pending.get('symbolExecMemoryLevCap', 0)) if safe_signal else existing_pending.get('symbolExecMemoryLevCap', 0))
+        existing_pending['symbolExecMemoryReason'] = safe_signal.get('symbolExecMemoryReason', existing_pending.get('symbolExecMemoryReason', 'none')) if safe_signal else existing_pending.get('symbolExecMemoryReason', 'none')
+        existing_pending['allocatorPriorityScore'] = _coerce_float(safe_signal.get('allocatorPriorityScore', existing_pending.get('allocatorPriorityScore', 0.0)) if safe_signal else existing_pending.get('allocatorPriorityScore', 0.0), 0.0)
+        existing_pending['allocatorRank'] = int(safe_signal.get('allocatorRank', existing_pending.get('allocatorRank', 0)) if safe_signal else existing_pending.get('allocatorRank', 0) or 0)
+        existing_pending['allocatorSizeMult'] = _coerce_float(safe_signal.get('allocatorSizeMult', existing_pending.get('allocatorSizeMult', 1.0)) if safe_signal else existing_pending.get('allocatorSizeMult', 1.0), 1.0)
+        existing_pending['allocatorReason'] = safe_signal.get('allocatorReason', existing_pending.get('allocatorReason', '')) if safe_signal else existing_pending.get('allocatorReason', '')
+        existing_pending['evContextKey'] = safe_signal.get('evContextKey', existing_pending.get('evContextKey', '')) if safe_signal else existing_pending.get('evContextKey', '')
+        existing_pending['evSoftThresholdApplied'] = _coerce_float(safe_signal.get('evSoftThresholdApplied', existing_pending.get('evSoftThresholdApplied', 0.0)) if safe_signal else existing_pending.get('evSoftThresholdApplied', 0.0), 0.0)
+        existing_pending['evHardThresholdApplied'] = _coerce_float(safe_signal.get('evHardThresholdApplied', existing_pending.get('evHardThresholdApplied', 0.0)) if safe_signal else existing_pending.get('evHardThresholdApplied', 0.0), 0.0)
+        existing_pending['entryArchetype'] = str(
+            safe_signal.get('entryArchetype', existing_pending.get('entryArchetype', merged_snapshot.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)))
+            or existing_pending.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)
+        )
+        existing_pending['runnerContextResolved'] = str(
+            safe_signal.get(
+                'runnerContextResolved',
+                safe_signal.get(
+                    'runnerContext',
+                    existing_pending.get(
+                        'runnerContextResolved',
+                        merged_snapshot.get('runnerContextResolved', merged_snapshot.get('runnerContext', '')),
+                    ),
+                ),
+            )
+            or existing_pending.get('runnerContextResolved', '')
+        )
+        existing_pending['decisionContext'] = (
+            copy.deepcopy(
+                safe_signal.get(
+                    'decisionContext',
+                    existing_pending.get('decisionContext', merged_snapshot.get('decisionContext', {})),
+                )
+            )
+            if isinstance(
+                safe_signal.get('decisionContext', existing_pending.get('decisionContext', merged_snapshot.get('decisionContext', {}))),
+                dict,
+            )
+            else {}
+        )
+        existing_pending['expectancy'] = copy.deepcopy(
+            safe_signal.get('expectancy', existing_pending.get('expectancy', merged_snapshot.get('expectancy', {})))
+        ) if isinstance(safe_signal.get('expectancy', existing_pending.get('expectancy', merged_snapshot.get('expectancy', {}))), dict) else {}
+        existing_pending['expectancyBand'] = str(
+            safe_signal.get('expectancyBand', existing_pending.get('expectancyBand', merged_snapshot.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)))
+            or existing_pending.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)
+        )
+        existing_pending['expectancyRankingScore'] = _coerce_float(
+            safe_signal.get('expectancyRankingScore', existing_pending.get('expectancyRankingScore', merged_snapshot.get('expectancyRankingScore', 0.0))),
+            0.0,
+        )
+        existing_pending['pendingPatienceBias'] = _coerce_float(
+            safe_signal.get('pendingPatienceBias', existing_pending.get('pendingPatienceBias', merged_snapshot.get('pendingPatienceBias', 1.0))),
+            1.0,
+        )
+        for key in _PENDING_REINFORCE_STRUCTURE_FIELDS + _PENDING_REINFORCE_BARRIER_FIELDS:
+            if key == 'patternConfidence' or key == 'barrierConfidence':
+                existing_pending[key] = _coerce_float(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, 0.0))),
+                    0.0,
+                )
+            elif key.endswith('Price') or key.endswith('Pct'):
+                existing_pending[key] = _coerce_float(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, 0.0))),
+                    0.0,
+                )
+            else:
+                existing_pending[key] = safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, '')))
+        if is_existing_reentry:
+            existing_pending['isPostExitReentry'] = True
+            for key in _PENDING_REINFORCE_REENTRY_FIELDS:
+                if key == 'isPostExitReentry':
+                    existing_pending[key] = True
+                elif key in existing_pending:
+                    existing_pending[key] = existing_pending.get(key)
+        else:
+            for key in _PENDING_REINFORCE_REENTRY_FIELDS:
+                if key == 'isPostExitReentry':
+                    existing_pending[key] = bool(safe_signal.get(key, existing_pending.get(key, False)))
+                elif key.endswith('PctOriginal') or key.endswith('PctApplied') or key.endswith('Mult'):
+                    existing_pending[key] = _coerce_float(safe_signal.get(key, existing_pending.get(key, 0.0)), existing_pending.get(key, 0.0))
+                elif key.endswith('DelaySec') or key.endswith('ExpiresSec'):
+                    existing_pending[key] = int(safe_signal.get(key, existing_pending.get(key, 0)) or 0)
+                else:
+                    existing_pending[key] = safe_signal.get(key, existing_pending.get(key, ''))
+        existing_pending['signal_snapshot'] = merged_snapshot
+        existing_pending['signalSnapshot'] = merged_snapshot
         existing_pending['minConfidenceScoreSnapshot'] = max(
             float(existing_pending.get('minConfidenceScoreSnapshot', self.min_confidence_score) or self.min_confidence_score),
             float(self.min_confidence_score),
         )
         _runner_payload = {**existing_pending}
-        if signal:
-            _runner_payload.update(signal)
+        if safe_signal:
+            _runner_payload.update(safe_signal)
         _runner_controls = resolve_runner_exit_controls(
             payload=_runner_payload,
             default_mode=getattr(self, 'strategy_mode', STRATEGY_MODE_LEGACY),
@@ -41859,16 +42850,19 @@ class PaperTradingEngine:
         existing_pending['runner_be_buffer_mult'] = _runner_controls['be_buffer_mult']
 
         try:
-            new_entry = float(signal.get('entryPrice', existing_pending.get('entryPrice', price))) if signal else float(existing_pending.get('entryPrice', price))
+            new_entry = float(safe_signal.get('entryPrice', existing_pending.get('entryPrice', price))) if safe_signal else float(existing_pending.get('entryPrice', price))
             old_entry = float(existing_pending.get('entryPrice', new_entry))
             blend_alpha = 0.35 if score_gap >= 0 else 0.20
             blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
 
-            signal_price = extract_signal_anchor_price(signal, existing_pending.get('signalPrice', price))
+            signal_price = extract_signal_anchor_price(safe_signal, existing_pending.get('signalPrice', price))
             locked_entry_frac = extract_signal_pullback_locked_fraction(
-                signal,
+                safe_signal,
                 existing_pending.get('pullbackLocked', 0),
             )
+            if is_existing_reentry and not is_incoming_reentry:
+                signal_price = float(existing_pending.get('signalPrice', signal_price) or signal_price)
+                locked_entry_frac = float(existing_pending.get('pullbackLocked', locked_entry_frac) or locked_entry_frac)
             if signal_price > 0:
                 existing_pending['signalPrice'] = signal_price
             if locked_entry_frac > 0:
@@ -41893,7 +42887,17 @@ class PaperTradingEngine:
                         if is_confirmed else max(blended, _locked_target)
                     )
 
-            existing_pending['entryPrice'] = blended
+            if is_existing_reentry and not is_incoming_reentry:
+                existing_pending['entryPrice'] = float(existing_pending.get('entryPrice', old_entry) or old_entry)
+                existing_pending['pullbackPct'] = _coerce_float(
+                    existing_pending.get(
+                        'postExitReentryPullbackPctApplied',
+                        existing_pending.get('pullbackPct', safe_signal.get('pullbackPct', 0.0)),
+                    ),
+                    _coerce_float(existing_pending.get('pullbackPct', 0.0), 0.0),
+                )
+            else:
+                existing_pending['entryPrice'] = blended
 
             try:
                 _entry_for_levels = float(existing_pending.get('entryPrice', blended))
@@ -41981,17 +42985,29 @@ class PaperTradingEngine:
         except Exception:
             pass
 
-        extend_sec = max(180, int(signal.get('memoryExtensionSec', 0) if signal else 0))
+        extend_sec = max(180, int(safe_signal.get('memoryExtensionSec', 0) if safe_signal else 0))
+        reentry_expires_sec = int(existing_pending.get('postExitReentryExpiresSec', 0) or 0)
         if not is_confirmed:
-            existing_pending['expiresAt'] = max(
-                int(existing_pending.get('expiresAt', now_ms)),
-                now_ms + (extend_sec * 1000)
-            )
+            if is_existing_reentry and reentry_expires_sec > 0:
+                created_at_ms = int(existing_pending.get('createdAt', now_ms) or now_ms)
+                existing_pending['expiresAt'] = min(
+                    int(existing_pending.get('expiresAt', created_at_ms + (reentry_expires_sec * 1000)) or (created_at_ms + (reentry_expires_sec * 1000))),
+                    created_at_ms + (reentry_expires_sec * 1000),
+                )
+            else:
+                existing_pending['expiresAt'] = max(
+                    int(existing_pending.get('expiresAt', now_ms)),
+                    now_ms + (extend_sec * 1000)
+                )
         confirm_after = int(existing_pending.get('confirmAfter', now_ms))
         if (not is_confirmed) and confirm_after > now_ms:
             remaining = confirm_after - now_ms
             speedup = 0.80 if reinforce_count <= 1 else 0.65
-            existing_pending['confirmAfter'] = now_ms + int(remaining * speedup)
+            sped_up_confirm_after = now_ms + int(remaining * speedup)
+            if is_existing_reentry:
+                existing_pending['confirmAfter'] = min(confirm_after, sped_up_confirm_after)
+            else:
+                existing_pending['confirmAfter'] = sped_up_confirm_after
 
         self.pipeline_metrics.setdefault('pending_reinforced', 0)
         self.pipeline_metrics['pending_reinforced'] += 1
@@ -42032,21 +43048,16 @@ class PaperTradingEngine:
             return None
 
         # Handle existing pending for this symbol before exposure/direction gates.
+        replacement_candidate_pending = None
         existing_pending = next((p for p in self.pending_orders if p.get('symbol') == trade_symbol), None)
         if existing_pending:
             existing_side = existing_pending.get('side')
             if existing_side == side:
-                return self._reinforce_pending_order(existing_pending, side, price, atr, signal, trade_symbol)
-            try:
-                self.pending_orders.remove(existing_pending)
-                self.pipeline_metrics.setdefault('pending_flipped', 0)
-                self.pipeline_metrics['pending_flipped'] += 1
-                logger.info(
-                    f"🔀 PENDING CANCEL: {trade_symbol} {existing_side}->{side} "
-                    f"(Opposite direction signal overrides)"
+                return _with_open_result_kind(
+                    self._reinforce_pending_order(existing_pending, side, price, atr, signal, trade_symbol),
+                    PENDING_OPEN_RESULT_REINFORCED_PENDING,
                 )
-            except Exception:
-                pass
+            replacement_candidate_pending = existing_pending
         
         # BLACKLIST CHECK: Skip coins that consistently cause losses
         if self.is_coin_blacklisted(trade_symbol):
@@ -42124,10 +43135,14 @@ class PaperTradingEngine:
         
         # Check position + pending order limits (pending down-weighted to avoid deadlock).
         pending_weight = 0.35
+        pending_orders_for_capacity = [
+            p for p in self.pending_orders
+            if p is not replacement_candidate_pending
+        ]
         pos_count = len(self.positions)
-        pending_count = len(self.pending_orders)
+        pending_count = len(pending_orders_for_capacity)
         effective_exposure = pos_count + int(pending_count * pending_weight)
-        if effective_exposure >= self.max_positions and _apply_pending_recycler('MAX_EXPOSURE'):
+        if effective_exposure >= self.max_positions and replacement_candidate_pending is None and _apply_pending_recycler('MAX_EXPOSURE'):
             pending_count = len(self.pending_orders)
             effective_exposure = pos_count + int(pending_count * pending_weight)
         if effective_exposure >= self.max_positions:
@@ -42141,13 +43156,13 @@ class PaperTradingEngine:
         
         # Phase 217/219: Direction exposure limits — pending orders are partially counted.
         long_pos_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
-        long_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
+        long_pending_count = sum(1 for p in pending_orders_for_capacity if p.get('side') == 'LONG')
         short_pos_count = sum(1 for p in self.positions if p.get('side') == 'SHORT')
-        short_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
+        short_pending_count = sum(1 for p in pending_orders_for_capacity if p.get('side') == 'SHORT')
         long_count = long_pos_count + int(long_pending_count * pending_weight)
         short_count = short_pos_count + int(short_pending_count * pending_weight)
         max_same_direction = max(3, self.max_positions * 70 // 100)
-        if side == 'LONG' and long_count >= max_same_direction and _apply_pending_recycler('DIRECTION_LIMIT_LONG'):
+        if side == 'LONG' and long_count >= max_same_direction and replacement_candidate_pending is None and _apply_pending_recycler('DIRECTION_LIMIT_LONG'):
             long_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'LONG')
             long_count = long_pos_count + int(long_pending_count * pending_weight)
         if side == 'LONG' and long_count >= max_same_direction:
@@ -42157,7 +43172,7 @@ class PaperTradingEngine:
                 f"| positions={long_pos_count}, pending={long_pending_count}, pending_w={pending_weight:.2f}"
             )
             return None
-        if side == 'SHORT' and short_count >= max_same_direction and _apply_pending_recycler('DIRECTION_LIMIT_SHORT'):
+        if side == 'SHORT' and short_count >= max_same_direction and replacement_candidate_pending is None and _apply_pending_recycler('DIRECTION_LIMIT_SHORT'):
             short_pending_count = sum(1 for p in self.pending_orders if p.get('side') == 'SHORT')
             short_count = short_pos_count + int(short_pending_count * pending_weight)
         if side == 'SHORT' and short_count >= max_same_direction:
@@ -42177,10 +43192,10 @@ class PaperTradingEngine:
         )
         same_dir_margin += pending_weight * sum(
             p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
-            for p in self.pending_orders if p.get('side') == side
+            for p in pending_orders_for_capacity if p.get('side') == side
         )
         max_dir_exposure = self.balance * _DIRECTION_EXPOSURE_PCT
-        if same_dir_margin >= max_dir_exposure and _apply_pending_recycler('DIRECTION_EXPOSURE'):
+        if same_dir_margin >= max_dir_exposure and replacement_candidate_pending is None and _apply_pending_recycler('DIRECTION_EXPOSURE'):
             same_dir_margin = sum(
                 p.get('sizeUsd', 0) / max(1, p.get('leverage', 10))
                 for p in self.positions if p.get('side') == side
@@ -42247,7 +43262,7 @@ class PaperTradingEngine:
         # =========================================================================
         # Count entries for this specific coin and direction (positions + pending)
         same_coin_same_dir_pos = [p for p in self.positions if p.get('symbol') == trade_symbol and p.get('side') == side]
-        same_coin_same_dir_pend = [p for p in self.pending_orders if p.get('symbol') == trade_symbol and p.get('side') == side]
+        same_coin_same_dir_pend = [p for p in pending_orders_for_capacity if p.get('symbol') == trade_symbol and p.get('side') == side]
         
         if len(same_coin_same_dir_pos) + len(same_coin_same_dir_pend) >= 3:
             self.set_execution_feedback(trade_symbol, "SCALE_LIMIT")
@@ -43314,6 +44329,16 @@ class PaperTradingEngine:
             "currentMicrostructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
             "currentFlowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 50.0) if signal else 50.0, 50.0),
             "currentExecScore": _coerce_float(signal.get('entryExecScore', 0.0) if signal else 0.0, 0.0),
+            "barrierState": signal.get('barrierState', 'CLEAR') if signal else 'CLEAR',
+            "barrierVerdict": signal.get('barrierVerdict', 'SUPPORTIVE') if signal else 'SUPPORTIVE',
+            "adverseLevelType": signal.get('adverseLevelType', '') if signal else '',
+            "adverseLevelPrice": _coerce_float(signal.get('adverseLevelPrice', 0.0) if signal else 0.0, 0.0),
+            "adverseDistancePct": _coerce_float(signal.get('adverseDistancePct', 0.0) if signal else 0.0, 0.0),
+            "supportiveLevelType": signal.get('supportiveLevelType', '') if signal else '',
+            "supportiveLevelPrice": _coerce_float(signal.get('supportiveLevelPrice', 0.0) if signal else 0.0, 0.0),
+            "supportiveDistancePct": _coerce_float(signal.get('supportiveDistancePct', 0.0) if signal else 0.0, 0.0),
+            "barrierReason": signal.get('barrierReason', '') if signal else '',
+            "barrierConfidence": _coerce_float(signal.get('barrierConfidence', 0.0) if signal else 0.0, 0.0),
             "continuationFlowState": V3_CONTINUATION_NEUTRAL,
             "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
             "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
@@ -43457,6 +44482,36 @@ class PaperTradingEngine:
         self.pending_orders.append(pending_order)
         self.pipeline_metrics['pending_created'] += 1
         self.clear_execution_feedback(trade_symbol)
+        if replacement_candidate_pending and replacement_candidate_pending in self.pending_orders:
+            try:
+                self.pending_orders.remove(replacement_candidate_pending)
+                self.pipeline_metrics.setdefault('pending_flipped', 0)
+                self.pipeline_metrics['pending_flipped'] += 1
+                self.record_pending_recycle_event(
+                    replacement_candidate_pending,
+                    'PENDING__SUPERSEDED',
+                    detail='superseded_by_opposite_signal',
+                    trace={
+                        'replacement_symbol': trade_symbol,
+                        'replacement_side': side,
+                        'replacement_pending_id': pending_order.get('id', ''),
+                        'replacement_signal_id': str(signal.get('signalId', signal.get('signal_id', '')) if signal else ''),
+                    },
+                )
+                self._finalize_forecast_event(
+                    replacement_candidate_pending.get('id', ''),
+                    'CANCELLED',
+                    0,
+                    'superseded',
+                    int(datetime.now().timestamp() * 1000),
+                )
+                logger.info(
+                    f"🔀 PENDING SUPERSEDED: {trade_symbol} "
+                    f"{replacement_candidate_pending.get('side', '?')}→{side} "
+                    f"old={replacement_candidate_pending.get('id', '')} new={pending_order.get('id', '')}"
+                )
+            except Exception as supersede_err:
+                logger.debug(f"Pending supersede finalize error ({trade_symbol}): {supersede_err}")
         # CEDG-1: Preflight canary log
         if _is_canary:
             logger.info(f"🐤 CANARY PREFLIGHT: {side} {trade_symbol} id={_pending_id} is_canary=True")
@@ -43500,7 +44555,7 @@ class PaperTradingEngine:
         except Exception as _efe_err:
             logger.debug(f"Entry forecast event save error: {_efe_err}")
         
-        return pending_order
+        return _with_open_result_kind(pending_order, PENDING_OPEN_RESULT_CREATED_PENDING)
     
     def _finalize_forecast_event(self, order_id: str, status: str, outcome_label: int,
                                   reason: str, ts_ms: int, fill_price: float = None,
@@ -44284,6 +45339,80 @@ class PaperTradingEngine:
         """
         symbol = order.get('symbol', '')
         side = order.get('side', '')
+
+        def _queue_gate_signal_state(
+            *,
+            stage: str,
+            decision: str,
+            decision_code: str,
+            decision_detail: str = '',
+            accepted: bool = True,
+            executable: bool = True,
+            is_pending: bool = False,
+            is_opened: bool = False,
+            trace: Optional[dict] = None,
+        ):
+            signal_id = str(order.get('signalId') or '')
+            if not signal_id:
+                return
+            event_payload = build_signal_event_payload(
+                {
+                    'signal_id': signal_id,
+                    'signalId': signal_id,
+                    'symbol': order.get('symbol', ''),
+                    'action': order.get('side', 'NONE'),
+                    'timestamp': current_time,
+                    'signal_score': order.get('signalScore', 0),
+                    'signal_score_raw': order.get('signalScoreRaw', order.get('signalScore', 0)),
+                },
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                pending_entry_id=str(order.get('id', '') or '') if is_pending else '',
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                score_before=order.get('signalScoreRaw', order.get('signalScore', 0)),
+                score_after=order.get('recheckScore', order.get('signalScore', 0)),
+                leverage_before=order.get('signalLeverageRaw', order.get('leverage', 0)),
+                leverage_after=order.get('leverage', 0),
+                size_mult=order.get('sizeMultiplier', 1.0),
+                trace=trace or {},
+            )
+            record_signal_event_memory(event_payload)
+            if stage in (SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK):
+                set_signal_memory_state(
+                    symbol,
+                    stage=stage,
+                    signal_id=signal_id,
+                    pending_entry_id=str(order.get('id', '') or ''),
+                    score=order.get('recheckScore', order.get('signalScore', 0)),
+                    last_price=fill_price if fill_price > 0 else order.get('entryPrice', 0),
+                )
+            elif stage in (SIGNAL_STAGE_PENDING_CANCELLED, SIGNAL_STAGE_EXPIRED, SIGNAL_STAGE_HARD_REJECT):
+                drop_signal_memory(
+                    symbol,
+                    signal_id=signal_id,
+                    allowed_states=SIGNAL_PENDING_STATES.union({SIGNAL_STAGE_OPEN_ATTEMPT}),
+                )
+            safe_create_task(sqlite_manager.update_signal_decision(
+                signal_id,
+                stage=stage,
+                decision=decision,
+                decision_code=decision_code,
+                decision_detail=decision_detail,
+                accepted=accepted,
+                reject_reason=decision_detail if decision != 'PASS' else '',
+                pending_entry_id=str(order.get('id', '') or '') if is_pending else '',
+                executable=executable,
+                is_pending=is_pending,
+                is_opened=is_opened,
+                decision_trace=trace or {},
+            ))
+            safe_create_task(sqlite_manager.save_signal_event(event_payload))
+            queue_decision_snapshot_from_event_payload(order, event_payload)
         
         # OVP-1: Canary force-market restriction (centralized guard)
         if force_market and order.get('is_canary') and canary_mode.enabled:
@@ -44293,6 +45422,19 @@ class PaperTradingEngine:
                 self.pipeline_metrics.setdefault('canary_market_block', 0)
                 self.pipeline_metrics['canary_market_block'] += 1
                 self.set_pending_execution_feedback(order, "CANARY_MARKET_BLOCK")
+                _queue_gate_signal_state(
+                    stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                    decision='SOFT_REJECT',
+                    decision_code='PENDING__EDGE_GATE_BLOCK',
+                    decision_detail='CANARY_MARKET_BLOCK',
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace=_build_pending_recheck_trace(
+                        order,
+                        extra={'reason_summary': 'CANARY_MARKET_BLOCK'},
+                    ),
+                )
                 self._finalize_forecast_event(order['id'], 'EXPIRED', 0, 'canary_no_market_fallback', current_time)
                 logger.info(f"🐤 CANARY: force-market blocked for {symbol}, order expired")
                 return True  # order removed
@@ -44331,6 +45473,23 @@ class PaperTradingEngine:
                     self.pipeline_metrics['open_reject_reasons'][_hard_reason] = \
                         self.pipeline_metrics['open_reject_reasons'].get(_hard_reason, 0) + 1
                     self.set_pending_execution_feedback(order, _hard_reason)
+                    _queue_gate_signal_state(
+                        stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                        decision='SOFT_REJECT',
+                        decision_code='PENDING__EDGE_GATE_BLOCK',
+                        decision_detail=_hard_reason,
+                        accepted=True,
+                        executable=True,
+                        is_pending=False,
+                        trace=_build_pending_recheck_trace(
+                            order,
+                            extra={
+                                'reason_summary': _hard_reason,
+                                'spread_bps': round(_spread_bps, 4),
+                                'depth_est': round(_depth_est, 4),
+                            },
+                        ),
+                    )
                     self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _hard_reason.lower(), current_time)
                     logger.warning(
                         f"🚫 EDGE_GATE_BLOCK: {side} {symbol} | reason={_hard_reason} "
@@ -44370,6 +45529,24 @@ class PaperTradingEngine:
                         self.pipeline_metrics['open_reject_reasons'][_block_reason] = \
                             self.pipeline_metrics['open_reject_reasons'].get(_block_reason, 0) + 1
                         self.set_pending_execution_feedback(order, _block_reason)
+                        _queue_gate_signal_state(
+                            stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                            decision='SOFT_REJECT',
+                            decision_code='PENDING__EDGE_GATE_BLOCK',
+                            decision_detail=_block_reason,
+                            accepted=True,
+                            executable=True,
+                            is_pending=False,
+                            trace=_build_pending_recheck_trace(
+                                order,
+                                extra={
+                                    'reason_summary': _block_reason,
+                                    'required_edge': round(_required_edge, 6),
+                                    'net_edge': round(_net_edge, 6),
+                                    'cost_est': round(_est_cost, 6),
+                                },
+                            ),
+                        )
                         self._finalize_forecast_event(order['id'], 'CANCELLED', 0, _block_reason.lower(), current_time)
                         logger.warning(f"🚫 EDGE_GATE_BLOCK: {_snap} reason={_block_reason} req={_required_edge:.4f}")
                         return True  # order removed
@@ -44408,6 +45585,16 @@ class PaperTradingEngine:
                 self.pipeline_metrics.setdefault('recheck_fail', 0)
                 self.pipeline_metrics['recheck_fail'] += 1
                 self.set_pending_execution_feedback(order, f"ENTRY_RECHECK_FAIL:{rv['reason_summary']}")
+                _queue_gate_signal_state(
+                    stage=SIGNAL_STAGE_PENDING_CANCELLED,
+                    decision='HARD_REJECT',
+                    decision_code='PENDING__RECHECK_FAIL',
+                    decision_detail=rv.get('reason_summary', 'ENTRY_RECHECK_FAIL'),
+                    accepted=True,
+                    executable=True,
+                    is_pending=False,
+                    trace=_build_pending_recheck_trace(order, opportunity=_opp, recheck_result=rv),
+                )
                 self.add_log(
                     f"🚫 ENTRY_RECHECK_FAIL: {side} {symbol} score={rv['recheck_score']:.0f} "
                     f"| {rv['reason_summary']}"
@@ -44418,6 +45605,16 @@ class PaperTradingEngine:
         if force_market and not allow_market:
             self.pipeline_metrics.setdefault('recheck_market_block', 0)
             self.pipeline_metrics['recheck_market_block'] += 1
+            _queue_gate_signal_state(
+                stage=SIGNAL_STAGE_PENDING_RECHECK,
+                decision='WAIT',
+                decision_code='PENDING__RECHECK_WAIT',
+                decision_detail='ENTRY_RECHECK_MARKET_BLOCK',
+                accepted=True,
+                executable=True,
+                is_pending=True,
+                trace=_build_pending_recheck_trace(order, opportunity=_opp, recheck_result=rv),
+            )
             logger.info(
                 f"🚫 ENTRY_RECHECK_MARKET_BLOCK: {symbol} {side} score={rv['recheck_score']:.0f} "
                 f"| {rv['reason_summary']}"
@@ -44439,6 +45636,21 @@ class PaperTradingEngine:
             )
             order['lastWaitMs'] = wait_ms
             self.set_pending_execution_feedback(order, rv.get('reason_summary', 'WARN_WAIT'), wait=True)
+            _queue_gate_signal_state(
+                stage=SIGNAL_STAGE_PENDING_RECHECK,
+                decision='WAIT',
+                decision_code='PENDING__RECHECK_WAIT',
+                decision_detail=rv.get('reason_summary', 'WARN_WAIT'),
+                accepted=True,
+                executable=True,
+                is_pending=True,
+                trace=_build_pending_recheck_trace(
+                    order,
+                    opportunity=_opp,
+                    recheck_result=rv,
+                    extra={'wait_ms': wait_ms},
+                ),
+            )
             logger.info(
                 f"⚠️ ENTRY_RECHECK_WAIT: {symbol} {side} score={rv['recheck_score']:.0f} "
                 f"→ waiting {wait_ms/1000:.0f}s | {rv['reason_summary']}"
@@ -44491,6 +45703,25 @@ class PaperTradingEngine:
                             f"< min={live_binance_trader.exec_entry_score_min} | sig={escore['signal']:.2f} micro={escore['micro']:.2f} risk={escore['risk']:.2f}"
                         )
                         self.set_pending_execution_feedback(order, f"ENTRY_SCORE_LOW:{escore['final']:.3f}", wait=True)
+                        _queue_gate_signal_state(
+                            stage=SIGNAL_STAGE_PENDING_RECHECK,
+                            decision='WAIT',
+                            decision_code='PENDING__ENTRY_SCORE_WAIT',
+                            decision_detail=f"ENTRY_SCORE_LOW:{escore['final']:.3f}",
+                            accepted=True,
+                            executable=True,
+                            is_pending=True,
+                            trace=_build_pending_recheck_trace(
+                                order,
+                                opportunity=_opp,
+                                recheck_result=rv,
+                                extra={
+                                    'reason_summary': f"ENTRY_SCORE_LOW:{escore['final']:.3f}",
+                                    'entry_exec_score': round(escore['final'], 4),
+                                    'entry_exec_min': round(live_binance_trader.exec_entry_score_min, 4),
+                                },
+                            ),
+                        )
                         return False  # order stays, wait
 
                 # ===== Drift Guard =====
@@ -44506,6 +45737,25 @@ class PaperTradingEngine:
                     else:
                         live_binance_trader._exec_diag['gate_block_total'] += 1
                         self.set_pending_execution_feedback(order, f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps", wait=True)
+                        _queue_gate_signal_state(
+                            stage=SIGNAL_STAGE_PENDING_RECHECK,
+                            decision='WAIT',
+                            decision_code='PENDING__DRIFT_WAIT',
+                            decision_detail=f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps",
+                            accepted=True,
+                            executable=True,
+                            is_pending=True,
+                            trace=_build_pending_recheck_trace(
+                                order,
+                                opportunity=_opp,
+                                recheck_result=rv,
+                                extra={
+                                    'reason_summary': f"BLOCK_OPEN_DRIFT:{drift_bps:.1f}bps",
+                                    'drift_bps': round(drift_bps, 4),
+                                    'drift_reason': str(drift_reason or ''),
+                                },
+                            ),
+                        )
                         logger.warning(f"\U0001f6ab BLOCK_OPEN_DRIFT: {side} {symbol} drift={drift_bps:.1f}bps > max={live_binance_trader.exec_max_drift_bps}bps")
                         return False  # order stays, wait for price to converge
 
@@ -45073,6 +46323,16 @@ class PaperTradingEngine:
             "postExitReentryConfirmDelaySec": int(order.get('postExitReentryConfirmDelaySec', 0) or 0),
             "postExitReentryExpiresSec": int(order.get('postExitReentryExpiresSec', 0) or 0),
             "postExitReentryExecutionPriority": str(order.get('postExitReentryExecutionPriority', '') or ''),
+            "barrierState": str(order.get('barrierState', 'CLEAR') or 'CLEAR'),
+            "barrierVerdict": str(order.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            "adverseLevelType": str(order.get('adverseLevelType', '') or ''),
+            "adverseLevelPrice": _coerce_float(order.get('adverseLevelPrice', 0.0), 0.0),
+            "adverseDistancePct": _coerce_float(order.get('adverseDistancePct', 0.0), 0.0),
+            "supportiveLevelType": str(order.get('supportiveLevelType', '') or ''),
+            "supportiveLevelPrice": _coerce_float(order.get('supportiveLevelPrice', 0.0), 0.0),
+            "supportiveDistancePct": _coerce_float(order.get('supportiveDistancePct', 0.0), 0.0),
+            "barrierReason": str(order.get('barrierReason', '') or ''),
+            "barrierConfidence": _coerce_float(order.get('barrierConfidence', 0.0), 0.0),
             "entryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "entryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "entryStopSoftRoiPct": order.get('entryStopSoftRoiPct', getattr(self, 'entry_stop_soft_roi_pct', ENTRY_STOP_SOFT_ROI_DEFAULT)),
@@ -47611,6 +48871,16 @@ class PaperTradingEngine:
             "patternConfidence": _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
             "patternSource": str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
             "structureVersion": str(pos.get('structureVersion', 'v1') or 'v1'),
+            "barrierState": str(pos.get('barrierState', 'CLEAR') or 'CLEAR'),
+            "barrierVerdict": str(pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            "adverseLevelType": str(pos.get('adverseLevelType', '') or ''),
+            "adverseLevelPrice": _coerce_float(pos.get('adverseLevelPrice', 0.0), 0.0),
+            "adverseDistancePct": _coerce_float(pos.get('adverseDistancePct', 0.0), 0.0),
+            "supportiveLevelType": str(pos.get('supportiveLevelType', '') or ''),
+            "supportiveLevelPrice": _coerce_float(pos.get('supportiveLevelPrice', 0.0), 0.0),
+            "supportiveDistancePct": _coerce_float(pos.get('supportiveDistancePct', 0.0), 0.0),
+            "barrierReason": str(pos.get('barrierReason', '') or ''),
+            "barrierConfidence": _coerce_float(pos.get('barrierConfidence', 0.0), 0.0),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
             "tpCloseSplit": pos.get('tpCloseSplit', ''),
             "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
@@ -47730,6 +49000,16 @@ class PaperTradingEngine:
                 'patternConfidence': _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
                 'patternSource': str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
                 'structureVersion': str(pos.get('structureVersion', 'v1') or 'v1'),
+                'barrierState': str(pos.get('barrierState', 'CLEAR') or 'CLEAR'),
+                'barrierVerdict': str(pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+                'adverseLevelType': str(pos.get('adverseLevelType', '') or ''),
+                'adverseLevelPrice': _coerce_float(pos.get('adverseLevelPrice', 0.0), 0.0),
+                'adverseDistancePct': _coerce_float(pos.get('adverseDistancePct', 0.0), 0.0),
+                'supportiveLevelType': str(pos.get('supportiveLevelType', '') or ''),
+                'supportiveLevelPrice': _coerce_float(pos.get('supportiveLevelPrice', 0.0), 0.0),
+                'supportiveDistancePct': _coerce_float(pos.get('supportiveDistancePct', 0.0), 0.0),
+                'barrierReason': str(pos.get('barrierReason', '') or ''),
+                'barrierConfidence': _coerce_float(pos.get('barrierConfidence', 0.0), 0.0),
                 'continuationFlowState': pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
                 'underwaterTapeState': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
                 'underwaterPriceLossPct': _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
@@ -50533,14 +51813,23 @@ async def optimizer_status():
             "params": {},
             "recentChanges": [],
             "readyState": "error",
+            "authorityState": "DEGRADED",
             "dataFlow": {
                 "inputSource": "error",
                 "lastBtcPrice": None,
                 "lastInputMs": None,
+                "lastFreshInputMs": None,
                 "isStale": True,
+                "isFresh": False,
+                "sourceAgeSec": None,
                 "fastSamples": 0,
                 "structSamples": 0,
-                "minSamplesPerWindow": 5,
+                "fastMinSamples": compute_regime_min_samples(market_regime_detector.fast_window_sec),
+                "structMinSamples": compute_regime_min_samples(market_regime_detector.struct_window_sec),
+                "minSamplesPerWindow": max(
+                    compute_regime_min_samples(market_regime_detector.fast_window_sec),
+                    compute_regime_min_samples(market_regime_detector.struct_window_sec),
+                ),
                 "readyState": "error",
             },
             "dcaPreview": {
@@ -52810,6 +54099,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                         
                         # Phase 235 P2 FIX: Regime-aware params for WS parity with Scanner
                         _ws_market_regime = 'RANGING'
+                        _ws_regime_ready_state = 'waiting'
                         _ws_adx = 25.0
                         _ws_adx_trend = 'NEUTRAL'
                         _ws_coin_daily_trend = 'NEUTRAL'
@@ -52817,7 +54107,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = None):
                         _ws_funding_rate = 0.0
                         _ws_is_volume_spike = False
                         try:
-                            _ws_market_regime = market_regime_detector.current_regime
+                            _ws_regime_ctx = market_regime_detector.get_trade_authority_snapshot()
+                            _ws_market_regime = _ws_regime_ctx.get('marketRegimeForSignal', 'RANGING')
+                            _ws_regime_ready_state = _ws_regime_ctx.get('readyState', 'waiting')
                         except Exception:
                             pass
                         try:

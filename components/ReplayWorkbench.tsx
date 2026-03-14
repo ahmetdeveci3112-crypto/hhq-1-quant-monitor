@@ -204,6 +204,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
             { label: 'Structure', value: humanizeToken(trade.structureTrend, '—') },
             { label: 'Retest', value: humanizeToken(trade.breakoutRetestState, '—') },
+            { label: 'Barrier', value: humanizeToken(trade.barrierVerdict, '—') },
             {
                 label: 'Pattern',
                 value: `${humanizeToken(trade.patternBias, '—')} ${trade.patternConfidence ? `(${Number(trade.patternConfidence).toFixed(2)})` : ''}`.trim(),
@@ -558,6 +559,42 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
+                                                <div className="text-slate-500 text-xs">Barrier</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierVerdict, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Barrier State</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Adverse Level</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.adverseLevelType
+                                                        ? `${humanizeToken(replayTrade.trade.adverseLevelType, '—')} @ ${Number(replayTrade.trade.adverseLevelPrice || 0).toFixed(6)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Adverse Distance</div>
+                                                <div className="font-semibold text-white">
+                                                    {typeof replayTrade.trade.adverseDistancePct === 'number' && replayTrade.trade.adverseDistancePct > 0
+                                                        ? `%${Number(replayTrade.trade.adverseDistancePct).toFixed(2)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Supportive Level</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.supportiveLevelType
+                                                        ? `${humanizeToken(replayTrade.trade.supportiveLevelType, '—')} @ ${Number(replayTrade.trade.supportiveLevelPrice || 0).toFixed(6)}`
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Barrier Reason</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierReason, '—')}</div>
+                                            </div>
+                                            <div>
                                                 <div className="text-slate-500 text-xs">Thesis</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionThesisState, '—')}</div>
                                             </div>
@@ -658,9 +695,9 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         ) : (
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
-                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence']),
-                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
-                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason']),
+                                                    ...compactJson(snapshot.context, ['entryArchetype', 'regimeBucket', 'executionArchetype', 'exitOwnerProfile', 'directionOwner', 'directionReason', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason']),
+                                                    ...compactJson(snapshot.decision, ['decisionCode', 'side', 'entryArchetype', 'directionOwner', 'expectancyBand', 'runnerContextResolved', 'positionThesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason', 'watchState', 'reentryTriggered', 'reentryTriggerReason', 'rescueCandidate', 'rescueAccepted', 'profitHoldCandidate', 'profitHoldAccepted']),
+                                                    ...compactJson(snapshot.outcome, ['decision', 'reason', 'watchState', 'candidateAccepted', 'confirmCount', 'cancelReason', 'reentryTriggered', 'reentryTriggerReason', 'continuationFlowState', 'underwaterTapeState', 'thesisState', 'structureTrend', 'swingState', 'compressionState', 'breakoutRetestState', 'srContext', 'patternBias', 'patternConfidence', 'barrierState', 'barrierVerdict', 'adverseDistancePct', 'barrierReason', 'rescueReason', 'profitHoldReason', 'agedProfitGuardState', 'agedProfitGuardReason', 'agedProfitBeFloorArmedTs', 'fakeoutReclaimHoldArmed', 'fakeoutReclaimHoldUsed', 'fakeoutReclaimHoldUntilTs', 'fakeoutReclaimReason', 'fakeoutReclaimReleaseReason']),
                                                 ].slice(0, 16);
                                                 return (
                                                     <details

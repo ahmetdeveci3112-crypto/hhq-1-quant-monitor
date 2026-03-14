@@ -46,6 +46,7 @@ interface MarketRegime {
     staleSec?: number | null;
     priceCount: number | null;
     readyState?: string;
+    authorityState?: string;
     params: {
         min_score_adjustment: number;
         trail_distance_mult: number;
@@ -61,9 +62,14 @@ interface MarketRegime {
         inputSource?: string;
         lastBtcPrice?: number | null;
         lastInputMs?: number | null;
+        lastFreshInputMs?: number | null;
         isStale?: boolean;
+        isFresh?: boolean;
+        sourceAgeSec?: number | null;
         fastSamples?: number;
         structSamples?: number;
+        fastMinSamples?: number;
+        structMinSamples?: number;
         minSamplesPerWindow?: number;
         readyState?: string;
     };
@@ -137,8 +143,11 @@ interface Props {
     strategyMode?: string;
 }
 
-/** Ratio-based low-sample threshold: avoids spam in longer windows */
-const isLowSampleCount = (samples: number, windowSec: number): boolean => {
+/** Backend authoritative sample threshold; falls back to the previous ratio heuristic. */
+const isLowSampleCount = (samples: number, windowSec: number, minSamples?: number): boolean => {
+    if (typeof minSamples === 'number' && Number.isFinite(minSamples) && minSamples > 0) {
+        return samples < minSamples;
+    }
     const expected = Math.max(1, Math.floor(windowSec / 30));
     const minNeeded = Math.max(3, Math.floor(expected * 0.25));
     return samples < minNeeded;
@@ -225,6 +234,9 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
     const regime = rawRegime ? getRegimeLabel(rawRegime) : { icon: '🛰️', label: 'BTC REJIM', color: 'text-slate-400' };
     const readyInfo = getReadyStateInfo(marketRegime?.dataFlow?.readyState || marketRegime?.readyState);
     const dcaPreview = marketRegime?.dcaPreview;
+    const headlineDesc = readyInfo.label === 'CANLI'
+        ? (marketRegime.executionProfile?.description || marketRegime.params?.description || readyInfo.desc)
+        : readyInfo.desc;
 
     // Format TR time
     const formatTrTime = () => {
@@ -299,7 +311,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                     {hasRegimeSignal ? regime.label : 'BTC REJIM BEKLENIYOR'}
                                 </div>
                                 <div className="text-[10px] text-slate-600">
-                                    {marketRegime.executionProfile?.description || marketRegime.params?.description || readyInfo.desc}
+                                    {headlineDesc}
                                 </div>
                             </div>
                         </div>
@@ -326,11 +338,20 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             Akış: {formatInputSource(marketRegime.dataFlow?.inputSource)}
                         </span>
                         <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-400 border border-slate-700">
-                            Örnek: {marketRegime.dataFlow?.fastSamples ?? 0}/{marketRegime.dataFlow?.structSamples ?? 0}
+                            Örnek: F {marketRegime.dataFlow?.fastSamples ?? 0}/{marketRegime.dataFlow?.fastMinSamples ?? '?'} • S {marketRegime.dataFlow?.structSamples ?? 0}/{marketRegime.dataFlow?.structMinSamples ?? '?'}
                         </span>
+                        {marketRegime.dataFlow?.sourceAgeSec !== undefined && marketRegime.dataFlow?.sourceAgeSec !== null && (
+                            <span className={`px-2 py-1 rounded-lg text-[10px] font-medium border ${
+                                marketRegime.dataFlow?.isFresh
+                                    ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+                                    : 'bg-rose-500/10 text-rose-300 border-rose-500/20'
+                            }`}>
+                                kaynak {Math.round(marketRegime.dataFlow.sourceAgeSec)}sn
+                            </span>
+                        )}
                         {marketRegime.staleSec !== undefined && marketRegime.staleSec !== null && (
                             <span className="px-2 py-1 rounded-lg text-[10px] font-medium bg-slate-800/60 text-slate-400 border border-slate-700">
-                                stale {Math.round(marketRegime.staleSec)}sn
+                                otorite {Math.round(marketRegime.staleSec)}sn
                             </span>
                         )}
                     </div>
@@ -357,7 +378,11 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
                                             {marketRegime.fast.samples} örnek / {formatWindowSec(marketRegime.fast.windowSec)}
-                                            {isLowSampleCount(marketRegime.fast.samples, marketRegime.fast.windowSec) && (
+                                            {isLowSampleCount(
+                                                marketRegime.fast.samples,
+                                                marketRegime.fast.windowSec,
+                                                marketRegime.dataFlow?.fastMinSamples,
+                                            ) && (
                                                 <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">⚠ Düşük örnek</span>
                                             )}
                                         </span>
@@ -390,7 +415,11 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                                         </span>
                                         <span className="text-[9px] text-slate-600 font-mono flex items-center gap-1">
                                             {marketRegime.struct.samples} örnek / {formatWindowSec(marketRegime.struct.windowSec)}
-                                            {isLowSampleCount(marketRegime.struct.samples, marketRegime.struct.windowSec) && (
+                                            {isLowSampleCount(
+                                                marketRegime.struct.samples,
+                                                marketRegime.struct.windowSec,
+                                                marketRegime.dataFlow?.structMinSamples,
+                                            ) && (
                                                 <span className="px-1 py-px rounded bg-amber-500/15 text-amber-400 border border-amber-500/20 text-[8px] font-semibold">⚠ Düşük örnek</span>
                                             )}
                                         </span>

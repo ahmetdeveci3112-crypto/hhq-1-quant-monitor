@@ -242,6 +242,16 @@ export interface Position {
   patternConfidence?: number;
   patternSource?: string;
   structureVersion?: string;
+  barrierState?: string;
+  barrierVerdict?: string;
+  adverseLevelType?: string;
+  adverseLevelPrice?: number;
+  adverseDistancePct?: number;
+  supportiveLevelType?: string;
+  supportiveLevelPrice?: number;
+  supportiveDistancePct?: number;
+  barrierReason?: string;
+  barrierConfidence?: number;
 }
 
 // Phase 139+232: Comprehensive close reason type matching all backend reasons
@@ -385,6 +395,16 @@ export interface Trade {
   patternConfidence?: number;
   patternSource?: string;
   structureVersion?: string;
+  barrierState?: string;
+  barrierVerdict?: string;
+  adverseLevelType?: string;
+  adverseLevelPrice?: number;
+  adverseDistancePct?: number;
+  supportiveLevelType?: string;
+  supportiveLevelPrice?: number;
+  supportiveDistancePct?: number;
+  barrierReason?: string;
+  barrierConfidence?: number;
 }
 
 export interface IndicatorPolicy {
@@ -456,6 +476,16 @@ export interface DecisionContext {
   patternConfidence?: number;
   patternSource?: string;
   structureVersion?: string;
+  barrierState?: string;
+  barrierVerdict?: string;
+  adverseLevelType?: string;
+  adverseLevelPrice?: number;
+  adverseDistancePct?: number;
+  supportiveLevelType?: string;
+  supportiveLevelPrice?: number;
+  supportiveDistancePct?: number;
+  barrierReason?: string;
+  barrierConfidence?: number;
 }
 
 export interface ExpectancyForecast {
@@ -545,6 +575,16 @@ export interface ReplaySearchResult {
   patternConfidence?: number;
   patternSource?: string;
   structureVersion?: string;
+  barrierState?: string;
+  barrierVerdict?: string;
+  adverseLevelType?: string;
+  adverseLevelPrice?: number;
+  adverseDistancePct?: number;
+  supportiveLevelType?: string;
+  supportiveLevelPrice?: number;
+  supportiveDistancePct?: number;
+  barrierReason?: string;
+  barrierConfidence?: number;
   peakRoi?: number;
   realizedPeakCaptureRatio?: number;
   giveback?: number;
