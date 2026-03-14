@@ -92,6 +92,7 @@ SLIPPAGE_EXIT_TICK_TOLERANCE = max(1, int(os.environ.get("SLIPPAGE_EXIT_TICK_TOL
 SLIPPAGE_EXIT_FALLBACK_BPS = max(0.1, float(os.environ.get("SLIPPAGE_EXIT_FALLBACK_BPS", "2.0")))
 SLIPPAGE_EXIT_MAX_VALID_TICK_BPS = max(0.5, float(os.environ.get("SLIPPAGE_EXIT_MAX_VALID_TICK_BPS", "10.0")))
 V3_THESIS_REVALIDATION_MODE = str(os.environ.get("V3_THESIS_REVALIDATION_MODE", "apply") or "apply").strip().lower()
+V3_LIVE_PROTECTION_STACK_MODE = str(os.environ.get("V3_LIVE_PROTECTION_STACK_MODE", "apply") or "apply").strip().lower()
 
 
 def _reason_group_from_reason(reason: str) -> str:
@@ -9927,6 +9928,11 @@ RECOVERY_STAGE2_PROGRESS = 0.55
 RECOVERY_TRAIL_GIVEBACK_CLOSE_PCT = 0.40
 ENTRY_STOP_SOFT_ROI_DEFAULT = -200.0
 ENTRY_STOP_HARD_ROI_DEFAULT = -250.0
+V3_STRUCT_INVALIDATION_BUFFER_ATR_MULT = 0.20
+V3_STRUCT_INVALIDATION_BUFFER_MIN_PCT = 0.12
+V3_STRUCT_INVALIDATION_MIN_WIDEN_ROI_PCT = 6.0
+V3_STRUCT_INVALIDATION_MIN_ACTIVE_ROI_PCT = -8.0
+V3_STRUCT_INVALIDATION_MAX_LEVEL_GAP_PCT = 2.50
 SIGNAL_INVALIDATION_REDUCE_PCT = 0.15
 REGIME_DETERIORATION_REDUCE_PCT = 0.10
 EXECUTION_RISK_REDUCE_PCT = 0.10
@@ -10270,6 +10276,144 @@ def get_effective_stop_price(pos: dict) -> float:
     return stop_loss if stop_loss > 0 else trailing_stop
 
 
+def resolve_structural_invalidation_context(
+    pos: dict,
+    *,
+    current_price: float = None,
+    effective_stop_price: float = 0.0,
+    effective_stop_roi_pct: float = 0.0,
+) -> Dict[str, Any]:
+    """Resolve a wider tactical stop from structural invalidation for reclaim/reversal entries."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    result = {
+        'active': False,
+        'price': 0.0,
+        'roi_pct': 0.0,
+        'source': '',
+        'buffer_abs': 0.0,
+        'supportive_level_price': 0.0,
+        'supportive_level_type': '',
+    }
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return result
+
+    entry_archetype = str(safe_pos.get('entryArchetype', '') or '').strip().lower()
+    if entry_archetype not in (ENTRY_ARCHETYPE_RECLAIM, ENTRY_ARCHETYPE_REVERSAL_RETEST):
+        return result
+
+    entry_price = _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0)
+    if entry_price <= 0:
+        return result
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    if side not in ('LONG', 'SHORT'):
+        return result
+    leverage = max(1.0, _coerce_float(safe_pos.get('leverage', 1.0), 1.0))
+    current_ref_price = _coerce_float(
+        current_price,
+        _coerce_float(
+            safe_pos.get('currentPrice', safe_pos.get('markPrice', entry_price)),
+            entry_price,
+        ),
+    )
+    current_ref_price = current_ref_price if current_ref_price > 0 else entry_price
+    atr = max(_coerce_float(safe_pos.get('atr', 0.0), 0.0), entry_price * 0.0015)
+    tick_size = get_tick_size(str(safe_pos.get('symbol', '') or '').upper()) if str(safe_pos.get('symbol', '') or '').strip() else 0.0
+    buffer_abs = max(
+        atr * V3_STRUCT_INVALIDATION_BUFFER_ATR_MULT,
+        entry_price * (V3_STRUCT_INVALIDATION_BUFFER_MIN_PCT / 100.0),
+        tick_size * 5.0 if tick_size > 0 else 0.0,
+    )
+    max_level_gap_pct = max(
+        0.35,
+        min(V3_STRUCT_INVALIDATION_MAX_LEVEL_GAP_PCT, ((atr / max(entry_price, 1e-8)) * 100.0) * 2.5),
+    )
+    tolerance_abs = max(atr * 0.10, entry_price * 0.0008)
+
+    signal_snapshot = safe_pos.get('signal_snapshot', {}) if isinstance(safe_pos.get('signal_snapshot'), dict) else {}
+    decision_context = safe_pos.get('decisionContext', {}) if isinstance(safe_pos.get('decisionContext'), dict) else {}
+    structural_zone = safe_pos.get('structural_zone', {}) if isinstance(safe_pos.get('structural_zone'), dict) else {}
+
+    candidates = []
+
+    def _register_candidate(price_value: Any, source: str, level_type: str) -> None:
+        price_num = _coerce_float(price_value, 0.0)
+        if price_num <= 0:
+            return
+        if side == 'LONG':
+            if price_num > current_ref_price + tolerance_abs:
+                return
+            gap_pct = max(0.0, ((current_ref_price - price_num) / max(current_ref_price, 1e-8)) * 100.0)
+        else:
+            if price_num < current_ref_price - tolerance_abs:
+                return
+            gap_pct = max(0.0, ((price_num - current_ref_price) / max(current_ref_price, 1e-8)) * 100.0)
+        if gap_pct <= 0 or gap_pct > max_level_gap_pct:
+            return
+        candidates.append({
+            'price': price_num,
+            'source': source,
+            'level_type': level_type,
+            'gap_pct': gap_pct,
+        })
+
+    supportive_price = _coerce_float(
+        safe_pos.get('supportiveLevelPrice', signal_snapshot.get('supportiveLevelPrice', decision_context.get('supportiveLevelPrice', 0.0))),
+        0.0,
+    )
+    supportive_type = str(
+        safe_pos.get('supportiveLevelType', signal_snapshot.get('supportiveLevelType', decision_context.get('supportiveLevelType', 'STRUCT_SUPPORT')))
+        or 'STRUCT_SUPPORT'
+    )
+    _register_candidate(supportive_price, supportive_type, supportive_type)
+
+    zone_price = _coerce_float(structural_zone.get('zone_price', 0.0), 0.0)
+    if zone_price > 0:
+        _register_candidate(
+            zone_price,
+            'STRUCTURAL_ZONE',
+            'STRUCT_ZONE_SUPPORT' if side == 'LONG' else 'STRUCT_ZONE_RESISTANCE',
+        )
+
+    nearest_support = _coerce_float(
+        safe_pos.get('srNearestSupport', signal_snapshot.get('srNearestSupport', decision_context.get('srNearestSupport', 0.0))),
+        0.0,
+    )
+    nearest_resistance = _coerce_float(
+        safe_pos.get('srNearestResistance', signal_snapshot.get('srNearestResistance', decision_context.get('srNearestResistance', 0.0))),
+        0.0,
+    )
+    if side == 'LONG':
+        _register_candidate(nearest_support, 'SR_NEAREST_SUPPORT', 'SR_NEAREST_SUPPORT')
+    else:
+        _register_candidate(nearest_resistance, 'SR_NEAREST_RESISTANCE', 'SR_NEAREST_RESISTANCE')
+
+    if not candidates:
+        return result
+
+    supportive_level = max(candidates, key=lambda item: item['price']) if side == 'LONG' else min(candidates, key=lambda item: item['price'])
+    supportive_level_price = _coerce_float(supportive_level.get('price', 0.0), 0.0)
+    if supportive_level_price <= 0:
+        return result
+
+    invalidation_price = supportive_level_price - buffer_abs if side == 'LONG' else supportive_level_price + buffer_abs
+    if invalidation_price <= 0:
+        return result
+    invalidation_roi_pct = compute_target_roi_pct(entry_price, invalidation_price, side, leverage)
+    if invalidation_roi_pct >= min(effective_stop_roi_pct, V3_STRUCT_INVALIDATION_MIN_ACTIVE_ROI_PCT):
+        return result
+
+    result.update({
+        'active': True,
+        'price': round(invalidation_price, 8),
+        'roi_pct': round(invalidation_roi_pct, 4),
+        'source': str(supportive_level.get('source', supportive_level.get('level_type', 'STRUCTURAL_INVALIDATION')) or 'STRUCTURAL_INVALIDATION'),
+        'buffer_abs': round(buffer_abs, 8),
+        'supportive_level_price': round(supportive_level_price, 8),
+        'supportive_level_type': str(supportive_level.get('level_type', '') or ''),
+    })
+    return result
+
+
 def build_position_profit_ladder(pos: dict, current_price: float = None) -> Dict[str, Any]:
     """Build effective profit thresholds and owners in canonical ROI space."""
     entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
@@ -10487,15 +10631,43 @@ def build_position_protection_ladder(
         -320.0,
         min(-80.0, float(pos.get('entryStopHardRoiPct', entry_stop_hard_roi) or entry_stop_hard_roi)),
     )
+    structural_invalidation_ctx = resolve_structural_invalidation_context(
+        pos,
+        current_price=current_price,
+        effective_stop_price=effective_stop_price,
+        effective_stop_roi_pct=effective_stop_roi_pct,
+    )
+    tactical_stop_roi_pct = round(effective_stop_roi_pct, 4)
+    tactical_stop_source = 'EFFECTIVE_STOP'
+    structural_invalidation_roi_pct = _coerce_float(structural_invalidation_ctx.get('roi_pct', 0.0), 0.0)
+    if bool(structural_invalidation_ctx.get('active', False)):
+        clamped_structural_roi_pct = min(
+            effective_stop_roi_pct,
+            max(structural_invalidation_roi_pct, effective_entry_stop_hard_roi),
+        )
+        if clamped_structural_roi_pct <= (effective_stop_roi_pct - V3_STRUCT_INVALIDATION_MIN_WIDEN_ROI_PCT):
+            tactical_stop_roi_pct = round(clamped_structural_roi_pct, 4)
+            tactical_stop_source = str(structural_invalidation_ctx.get('source', 'STRUCTURAL_INVALIDATION') or 'STRUCTURAL_INVALIDATION')
 
     pre_stop_reduce_roi_pct = None
     kill_switch_full_roi_pct = None
     recovery_arm_roi_pct = None
+    emergency_floor_roi_pct = None
+    if tactical_stop_roi_pct < 0:
+        pre_stop_reduce_roi_pct = max(first_reduction_roi, tactical_stop_roi_pct * 0.60)
+        recovery_arm_roi_pct = min(RECOVERY_ARM_MIN_ROI_PCT, tactical_stop_roi_pct * 0.50)
     if effective_stop_roi_pct < 0:
-        pre_stop_reduce_roi_pct = max(first_reduction_roi, effective_stop_roi_pct * 0.60)
-        recovery_arm_roi_pct = min(RECOVERY_ARM_MIN_ROI_PCT, effective_stop_roi_pct * 0.50)
         if effective_stop_roi_pct < effective_entry_stop_hard_roi:
             kill_switch_full_roi_pct = full_close_roi
+        emergency_floor_roi_pct = min(full_close_roi, effective_entry_stop_hard_roi)
+        if emergency_floor_roi_pct >= effective_stop_roi_pct:
+            emergency_floor_roi_pct = max(
+                -320.0,
+                effective_stop_roi_pct - max(
+                    V3_EXCHANGE_PROTECTIVE_MIN_GAP_ROI_PCT,
+                    abs(effective_stop_roi_pct) * 0.35,
+                ),
+            )
 
     recovery_armed = bool(pos.get('recoveryArmed', False))
     recovery_stage = int(pos.get('recoveryStage', 0) or 0)
@@ -10535,6 +10707,23 @@ def build_position_protection_ladder(
         phase = soft_phase
     elif kill_switch_full_roi_pct is not None:
         phase = 'KS-CAP'
+    loss_protection_authority = 'ENTRY_STOP_HARD'
+    if phase == 'PRE-REDUCE':
+        loss_protection_authority = 'PRE_STOP_REDUCE'
+    elif phase == 'RECOVERY':
+        loss_protection_authority = 'RECOVERY'
+    elif phase == 'TIME-RECOVERY':
+        loss_protection_authority = 'TIME_RECOVERY'
+    elif phase == 'INVALIDATION':
+        loss_protection_authority = 'SIGNAL_INVALIDATION'
+    elif phase == 'REGIME':
+        loss_protection_authority = 'REGIME_DETERIORATION'
+    elif phase == 'EXEC-RISK':
+        loss_protection_authority = 'EXEC_RISK'
+    elif phase == 'CARRY':
+        loss_protection_authority = 'CARRY'
+    elif phase == 'KS-CAP':
+        loss_protection_authority = 'KILL_SWITCH_FULL'
 
     carry_cost_roi_pct = compute_carry_cost_roi_pct(pos)
     exit_risk_roi_pct = estimate_position_exit_risk_roi_pct(pos, current_price=current_price)
@@ -10557,6 +10746,14 @@ def build_position_protection_ladder(
         "effective_stop_roi_pct": round(effective_stop_roi_pct, 4),
         "trail_activation_roi_pct": round(trail_activation_roi_pct, 4),
         "trail_distance_roi_pct": round(trail_distance_roi_pct, 4),
+        "tactical_stop_roi_pct": round(tactical_stop_roi_pct, 4),
+        "tactical_stop_source": tactical_stop_source,
+        "structural_invalidation_active": bool(structural_invalidation_ctx.get('active', False)),
+        "structural_invalidation_source": str(structural_invalidation_ctx.get('source', '') or ''),
+        "structural_invalidation_price": round(_coerce_float(structural_invalidation_ctx.get('price', 0.0), 0.0), 8),
+        "structural_invalidation_roi_pct": round(_coerce_float(structural_invalidation_ctx.get('roi_pct', 0.0), 0.0), 4),
+        "structural_invalidation_buffer_abs": round(_coerce_float(structural_invalidation_ctx.get('buffer_abs', 0.0), 0.0), 8),
+        "emergency_floor_roi_pct": round(emergency_floor_roi_pct, 4) if emergency_floor_roi_pct is not None else None,
         "pre_stop_reduce_roi_pct": round(pre_stop_reduce_roi_pct, 4) if pre_stop_reduce_roi_pct is not None else None,
         "kill_switch_full_roi_pct": round(kill_switch_full_roi_pct, 4) if kill_switch_full_roi_pct is not None else None,
         "recovery_arm_roi_pct": round(recovery_arm_roi_pct, 4) if recovery_arm_roi_pct is not None else None,
@@ -10580,6 +10777,7 @@ def build_position_protection_ladder(
         "regime_flags": regime_flags,
         "signal_invalidation_state": signal_invalidation_state if isinstance(signal_invalidation_state, dict) else {},
         "protection_phase": phase,
+        "loss_protection_authority": loss_protection_authority,
     }
 
 
@@ -10601,6 +10799,14 @@ def update_runtime_protection_telemetry(
     profit_ladder = build_position_profit_ladder(pos=pos, current_price=current_price)
     pos['runtimeTpRoiPct'] = ladder['target_tp_roi_pct']
     pos['runtimeStopRoiPct'] = ladder['effective_stop_roi_pct']
+    pos['runtimeTacticalStopRoiPct'] = ladder['tactical_stop_roi_pct']
+    pos['runtimeTacticalStopSource'] = ladder.get('tactical_stop_source', 'EFFECTIVE_STOP')
+    pos['runtimeEmergencyFloorRoiPct'] = ladder['emergency_floor_roi_pct']
+    pos['runtimeStructuralInvalidationActive'] = bool(ladder.get('structural_invalidation_active', False))
+    pos['runtimeStructuralInvalidationSource'] = str(ladder.get('structural_invalidation_source', '') or '')
+    pos['runtimeStructuralInvalidationPrice'] = ladder.get('structural_invalidation_price', 0.0)
+    pos['runtimeStructuralInvalidationRoiPct'] = ladder.get('structural_invalidation_roi_pct', 0.0)
+    pos['runtimeStructuralInvalidationBufferAbs'] = ladder.get('structural_invalidation_buffer_abs', 0.0)
     pos['runtimeTrailActivationRoiPct'] = ladder['trail_activation_roi_pct']
     pos['runtimeTrailDistanceRoiPct'] = ladder['trail_distance_roi_pct']
     pos['runtimePreStopReduceRoiPct'] = ladder['pre_stop_reduce_roi_pct']
@@ -10614,6 +10820,7 @@ def update_runtime_protection_telemetry(
     pos['runtimeRegimeFlags'] = ladder['regime_flags']
     pos['runtimeSignalInvalidationState'] = ladder['signal_invalidation_state']
     pos['runtimeProtectionPhase'] = ladder['protection_phase']
+    pos['runtimeLossProtectionAuthority'] = str(ladder.get('loss_protection_authority', 'ENTRY_STOP_HARD') or 'ENTRY_STOP_HARD')
     pos['runtimeTp1RoiPct'] = profit_ladder['tp1_roi_pct']
     pos['runtimeTp2RoiPct'] = profit_ladder['tp2_roi_pct']
     pos['runtimeTp3RoiPct'] = profit_ladder['tp3_roi_pct']
@@ -10634,6 +10841,37 @@ def update_runtime_protection_telemetry(
     pos['runtimeProfitLadderVersion'] = 'v2_roi_profit_ladder'
     pos['runtimeTpLevels'] = profit_ladder['tp_levels']
     pos['runtimeGivebackTrailReady'] = profit_ladder['giveback_trail_ready']
+    entry_price = _coerce_float(pos.get('entryPrice', 0.0), 0.0)
+    side = str(pos.get('side', 'LONG')).upper()
+    leverage = max(1.0, _coerce_float(pos.get('leverage', 1.0), 1.0))
+    current_profit_roi_pct = _coerce_float(profit_ladder.get('current_profit_roi_pct', 0.0), 0.0)
+    tactical_stop_roi_pct = _coerce_float(ladder.get('tactical_stop_roi_pct', ladder.get('effective_stop_roi_pct', 0.0)), 0.0)
+    emergency_floor_roi_pct = _coerce_float(ladder.get('emergency_floor_roi_pct', 0.0), 0.0)
+    tactical_stop_price = compute_target_price_from_roi(entry_price, tactical_stop_roi_pct, side, leverage) if entry_price > 0 and tactical_stop_roi_pct != 0 else get_effective_stop_price(pos)
+    emergency_floor_price = compute_target_price_from_roi(entry_price, emergency_floor_roi_pct, side, leverage) if entry_price > 0 and emergency_floor_roi_pct < 0 else 0.0
+    exchange_mode = V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+    exchange_stop_roi_pct = emergency_floor_roi_pct
+    exchange_stop_price = emergency_floor_price
+    exchange_authority = 'EMERGENCY_FLOOR'
+    exchange_role = 'LOSS_FAILSAFE'
+    if current_profit_roi_pct > 0 and (
+        bool(pos.get('isTrailingActive', False))
+        or bool(pos.get('breakeven_activated', False))
+        or _coerce_float(profit_ladder.get('profit_lock_price', 0.0), 0.0) > 0
+        or str(profit_ladder.get('profit_owner', 'NONE') or 'NONE').upper() != 'TP_LADDER'
+    ):
+        exchange_mode = V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL
+        exchange_stop_roi_pct = tactical_stop_roi_pct
+        exchange_stop_price = tactical_stop_price if _coerce_float(tactical_stop_price, 0.0) > 0 else emergency_floor_price
+        exchange_authority = 'TACTICAL_PROFIT_LOCK'
+        exchange_role = 'PROFIT_LOCK'
+    pos['runtimeTacticalStopPrice'] = round(_coerce_float(tactical_stop_price, 0.0), 8) if _coerce_float(tactical_stop_price, 0.0) > 0 else 0.0
+    pos['runtimeEmergencyFloorPrice'] = round(_coerce_float(emergency_floor_price, 0.0), 8) if _coerce_float(emergency_floor_price, 0.0) > 0 else 0.0
+    pos['runtimeExchangeProtectiveMode'] = exchange_mode
+    pos['runtimeExchangeProtectionAuthority'] = exchange_authority
+    pos['runtimeExchangeProtectionRole'] = exchange_role
+    pos['runtimeExchangeProtectiveStopRoiPct'] = round(_coerce_float(exchange_stop_roi_pct, 0.0), 4) if _coerce_float(exchange_stop_roi_pct, 0.0) != 0 else 0.0
+    pos['runtimeExchangeProtectiveStopPrice'] = round(_coerce_float(exchange_stop_price, 0.0), 8) if _coerce_float(exchange_stop_price, 0.0) > 0 else 0.0
     flow_state = str(profit_ladder.get('continuation_flow_state', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
     flow_ctx = profit_ladder.get('continuation_flow', {}) if isinstance(profit_ladder.get('continuation_flow'), dict) else {}
     pos['continuationFlowState'] = flow_state
@@ -14304,6 +14542,7 @@ from risk.signal_intent import (
     resolve_signal_intent,
 )
 from risk.market_structure import analyze_market_structure
+from risk.coin_state import analyze_coin_state
 
 # RFX-3A: Regime-based execution styles
 from risk.execution_style import (
@@ -14561,8 +14800,10 @@ V3_UNDERWATER_RECOVERING = "RECOVERING"
 V3_UNDERWATER_NEUTRAL = "NEUTRAL"
 ENTRY_ARCHETYPE_CONTINUATION = "continuation"
 ENTRY_ARCHETYPE_RECLAIM = "reclaim"
+ENTRY_ARCHETYPE_REVERSAL_RETEST = "reversal_retest"
 DECISION_ARCHETYPE_CONTINUATION = ENTRY_ARCHETYPE_CONTINUATION
 DECISION_ARCHETYPE_RECLAIM = ENTRY_ARCHETYPE_RECLAIM
+DECISION_ARCHETYPE_REVERSAL_RETEST = ENTRY_ARCHETYPE_REVERSAL_RETEST
 DECISION_ARCHETYPE_EXHAUSTION = "exhaustion"
 DECISION_ARCHETYPE_RECOVERY = "recovery"
 DECISION_ARCHETYPE_NEUTRAL = "neutral_fallback"
@@ -14618,7 +14859,32 @@ V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC = 30
 V3_POST_EXIT_REENTRY_EXPIRES_SEC = 240
 V3_POST_EXIT_REENTRY_SIZE_CAP_MULT = 0.35
 V3_POST_EXIT_REENTRY_STOP_MULT = 0.80
+V3_REVERSAL_RETEST_PULLBACK_MIN_PCT = 0.15
+V3_REVERSAL_RETEST_PULLBACK_MAX_PCT = 0.42
+V3_REVERSAL_RETEST_PULLBACK_ATR_MULT = 0.65
+V3_REVERSAL_RETEST_CONFIRM_DELAY_SEC = 30
+V3_REVERSAL_RETEST_EXPIRES_SEC = 300
 V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE = 70.0
+V3_POST_EXIT_REENTRY_OPPOSITE_SIGNAL_SCORE_FLOOR = 72.0
+V3_POST_EXIT_REENTRY_OPPOSITE_EXEC_SCORE_FLOOR = 58.0
+V3_POST_EXIT_REENTRY_OPPOSITE_VOLUME_FLOOR = 1.05
+V3_POST_EXIT_REENTRY_RECENT_WINDOW_SEC = 3600.0
+POST_EXIT_RESOLUTION_MODE_SAME_SIDE = "SAME_SIDE_CONTINUATION"
+POST_EXIT_RESOLUTION_MODE_OPPOSITE = "OPPOSITE_REVERSAL"
+POST_EXIT_RESOLUTION_MODE_NONE = "NONE"
+V3_EXIT_PROFILE_TREND_EXPANSION = "TREND_EXPANSION"
+V3_EXIT_PROFILE_BALANCED = "BALANCED"
+V3_EXIT_PROFILE_RANGE_EFFICIENCY = "RANGE_EFFICIENCY"
+V3_EXIT_PROFILE_TRANSITION_DEFENSE = "TRANSITION_DEFENSE"
+V3_EXIT_OWNER_TREND_CONTINUATION = "TREND_CONTINUATION_OWNER"
+V3_EXIT_OWNER_RANGE_EFFICIENCY = "RANGE_EFFICIENCY_OWNER"
+V3_EXIT_OWNER_TRANSITION_PROTECT = "TRANSITION_PROTECT_OWNER"
+V3_EXIT_OWNER_FAILED_THESIS = "FAILED_THESIS_OWNER"
+V3_EXIT_OWNER_REVERSAL_ESCAPE = "REVERSAL_ESCAPE_OWNER"
+V3_EXIT_OWNER_BALANCED = "BALANCED_OWNER"
+V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY = "EMERGENCY_FLOOR"
+V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL = "TACTICAL_PROFIT_LOCK"
+V3_EXCHANGE_PROTECTIVE_MIN_GAP_ROI_PCT = 20.0
 V3_STRUCTURE_CONTEXT_MODE = str(os.environ.get('V3_STRUCTURE_CONTEXT_MODE', 'apply') or 'apply').strip().lower()
 V3_SIDE_AWARE_STRUCTURE_MODE = str(os.environ.get('V3_SIDE_AWARE_STRUCTURE_MODE', 'apply') or 'apply').strip().lower()
 V3_SIDE_AWARE_BARRIER_BLOCK_ATR_MULT = 0.45
@@ -14727,6 +14993,15 @@ def _is_side_ob_trend_adverse(side: str, ob_trend: float, threshold: float = 2.0
     return False
 
 
+def _opposite_side(side: str) -> str:
+    safe_side = str(side or '').upper().strip()
+    if safe_side == 'LONG':
+        return 'SHORT'
+    if safe_side == 'SHORT':
+        return 'LONG'
+    return ''
+
+
 def _compute_unleveraged_price_loss_pct(entry_price: float, current_price: float, side: str) -> float:
     safe_entry = float(entry_price or 0.0)
     safe_current = float(current_price or 0.0)
@@ -14763,6 +15038,24 @@ def _default_market_structure_context() -> dict:
     }
 
 
+def _default_coin_state_context() -> dict:
+    return {
+        'microState5m': 'RANGE',
+        'setupState15m': 'NEUTRAL',
+        'backdropState1h': 'MIXED',
+        'macroState4h': 'MIXED',
+        'transitionState': 'NONE',
+        'stateConfidence': 0.0,
+        'stateFreshness': 'AVAILABLE',
+        'dominantSide': 'NEUTRAL',
+        'allowedEntryFamilies': [],
+        'preferredExitProfile': V3_EXIT_PROFILE_BALANCED,
+        'coinStateSource': 'INTERNAL_MTF_CONTEXT',
+        'coinStateVersion': 'v1',
+        'coinStateRouteReason': '',
+    }
+
+
 def _is_v3_structure_context_enabled() -> bool:
     return str(V3_STRUCTURE_CONTEXT_MODE or 'apply').strip().lower() != 'off'
 
@@ -14773,6 +15066,15 @@ def _structure_context_available(ctx: dict = None) -> bool:
         _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0) > 0.0
         or str(safe_ctx.get('breakoutRetestState', 'NONE') or 'NONE') != 'NONE'
         or str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL') != 'NEUTRAL'
+    )
+
+
+def _coin_state_context_available(ctx: dict = None) -> bool:
+    safe_ctx = ctx if isinstance(ctx, dict) else {}
+    return bool(
+        _coerce_float(safe_ctx.get('stateConfidence', 0.0), 0.0) > 0.0
+        or str(safe_ctx.get('setupState15m', 'NEUTRAL') or 'NEUTRAL') != 'NEUTRAL'
+        or str(safe_ctx.get('transitionState', 'NONE') or 'NONE') != 'NONE'
     )
 
 
@@ -14812,6 +15114,55 @@ def _apply_market_structure_context_to_payload(payload: dict, structure_ctx: dic
         'structureVersion',
     ):
         safe_payload[key] = safe_ctx.get(key, _default_market_structure_context().get(key))
+    return safe_payload
+
+
+def _apply_coin_state_context_to_payload(payload: dict, coin_state_ctx: dict) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_ctx = coin_state_ctx if isinstance(coin_state_ctx, dict) else _default_coin_state_context()
+    if _coin_state_context_available(safe_payload):
+        for key in (
+            'microState5m',
+            'setupState15m',
+            'backdropState1h',
+            'macroState4h',
+            'transitionState',
+            'stateConfidence',
+            'stateFreshness',
+            'dominantSide',
+            'allowedEntryFamilies',
+            'preferredExitProfile',
+            'coinStateSource',
+            'coinStateVersion',
+            'coinStateRouteReason',
+        ):
+            default_value = _default_coin_state_context().get(key)
+            if key == 'allowedEntryFamilies':
+                safe_payload.setdefault(key, list(default_value) if isinstance(default_value, list) else [])
+            else:
+                safe_payload.setdefault(key, default_value)
+        return safe_payload
+    for key in (
+        'microState5m',
+        'setupState15m',
+        'backdropState1h',
+        'macroState4h',
+        'transitionState',
+        'stateConfidence',
+        'stateFreshness',
+        'dominantSide',
+        'allowedEntryFamilies',
+        'preferredExitProfile',
+        'coinStateSource',
+        'coinStateVersion',
+        'coinStateRouteReason',
+    ):
+        default_value = _default_coin_state_context().get(key)
+        value = safe_ctx.get(key, default_value)
+        if key == 'allowedEntryFamilies':
+            safe_payload[key] = list(value) if isinstance(value, list) else list(default_value or [])
+        else:
+            safe_payload[key] = value
     return safe_payload
 
 
@@ -14855,6 +15206,19 @@ _PENDING_REINFORCE_STRUCTURE_FIELDS = (
     'patternConfidence',
     'patternSource',
     'structureVersion',
+    'microState5m',
+    'setupState15m',
+    'backdropState1h',
+    'macroState4h',
+    'transitionState',
+    'stateConfidence',
+    'stateFreshness',
+    'dominantSide',
+    'allowedEntryFamilies',
+    'preferredExitProfile',
+    'coinStateSource',
+    'coinStateVersion',
+    'coinStateRouteReason',
 )
 _PENDING_REINFORCE_BARRIER_FIELDS = (
     'barrierState',
@@ -14882,6 +15246,23 @@ _PENDING_REINFORCE_REENTRY_FIELDS = (
     'postExitReentryExecutionPriority',
     'postExitReentrySizeCapMult',
     'postExitReentryStopMult',
+)
+_PENDING_REINFORCE_REVERSAL_FIELDS = (
+    'reversalRetestEntryMode',
+    'reversalRetestPullbackPctOriginal',
+    'reversalRetestPullbackPctApplied',
+    'reversalRetestConfirmDelaySec',
+    'reversalRetestExpiresSec',
+    'reversalRetestExecutionPriority',
+    'reversalRetestZoneState',
+    'reversalRetestZoneReason',
+    'reversalRetestZoneSource',
+    'reversalRetestZonePrice',
+    'reversalRetestZoneWidth',
+    'reversalRetestPocketPrice',
+    'reversalRetestRetestDistancePct',
+    'reversalRetestTouchReady',
+    'reversalRetestZoneConfidence',
 )
 
 
@@ -14992,12 +15373,63 @@ def get_market_structure_context(symbol: str, *, side: str = '', force: bool = F
     return dict(ctx)
 
 
+def get_coin_state_context(
+    symbol: str,
+    *,
+    side: str = '',
+    structure_ctx: Optional[dict] = None,
+    force: bool = False,
+) -> dict:
+    safe_symbol = str(symbol or '').upper().strip()
+    safe_side = str(side or '').upper().strip()
+    if not safe_symbol or not _is_v3_structure_context_enabled():
+        return _default_coin_state_context()
+    ohlcv_15m, ohlcv_1h = _get_cached_ohlcv_for_structure(safe_symbol)
+    if len(ohlcv_15m) < 8 or len(ohlcv_1h) < 8:
+        return _default_coin_state_context()
+
+    last_15m_ts = int((ohlcv_15m[-1][0] if ohlcv_15m else 0) or 0)
+    last_1h_ts = int((ohlcv_1h[-1][0] if ohlcv_1h else 0) or 0)
+    cache_key = (safe_symbol, safe_side, last_15m_ts, last_1h_ts)
+    now_ts = time.time()
+    cached = coin_state_cache.get(cache_key) if isinstance(globals().get('coin_state_cache'), dict) else None
+    if not force and isinstance(cached, dict) and (now_ts - _coerce_float(cached.get('ts', 0.0), 0.0)) <= 60.0:
+        return dict(cached.get('ctx', _default_coin_state_context()))
+
+    effective_structure_ctx = structure_ctx if isinstance(structure_ctx, dict) else get_market_structure_context(
+        safe_symbol,
+        side=safe_side,
+        force=force,
+    )
+    ctx = analyze_coin_state(
+        safe_symbol,
+        ohlcv_15m,
+        ohlcv_1h,
+        side=safe_side,
+        structure_ctx=effective_structure_ctx,
+    )
+    if not isinstance(ctx, dict):
+        ctx = _default_coin_state_context()
+    coin_state_cache[cache_key] = {
+        'ts': now_ts,
+        'ctx': dict(ctx),
+    }
+    return dict(ctx)
+
+
 def apply_market_structure_context(payload: dict, *, symbol: str = '', side: str = '', force: bool = False) -> dict:
     safe_payload = payload if isinstance(payload, dict) else {}
     resolved_symbol = str(symbol or safe_payload.get('symbol', '') or '').upper().strip()
     resolved_side = str(side or safe_payload.get('side', safe_payload.get('action', '')) or '').upper().strip()
-    ctx = get_market_structure_context(resolved_symbol, side=resolved_side, force=force)
-    return _apply_market_structure_context_to_payload(safe_payload, ctx)
+    structure_ctx = get_market_structure_context(resolved_symbol, side=resolved_side, force=force)
+    coin_state_ctx = get_coin_state_context(
+        resolved_symbol,
+        side=resolved_side,
+        structure_ctx=structure_ctx,
+        force=force,
+    )
+    enriched = _apply_market_structure_context_to_payload(safe_payload, structure_ctx)
+    return _apply_coin_state_context_to_payload(enriched, coin_state_ctx)
 
 
 def _structure_retest_matches_side(structure_ctx: dict = None, side: str = '') -> bool:
@@ -15047,6 +15479,114 @@ def _structure_context_supports_reentry(structure_ctx: dict = None, side: str = 
         and bias == 'CONTINUATION'
         and _structure_retest_matches_side(safe_ctx, side)
     )
+
+
+def _structure_context_supports_opposite_reversal(structure_ctx: dict = None, side: str = '') -> tuple[bool, str]:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    if not _structure_context_available(safe_ctx):
+        return False, 'STRUCTURE_UNAVAILABLE'
+    safe_side = str(side or '').upper().strip()
+    confidence = _coerce_float(safe_ctx.get('patternConfidence', 0.0), 0.0)
+    bias = str(safe_ctx.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    retest_state = str(safe_ctx.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    sr_context = str(safe_ctx.get('srContext', 'UNKNOWN') or 'UNKNOWN').upper()
+
+    if confidence >= 0.55 and _structure_retest_matches_side(safe_ctx, safe_side):
+        return True, 'OPPOSITE_RETEST_HOLD'
+    if safe_side == 'LONG' and retest_state == 'FAILED_BREAKDOWN' and confidence >= 0.45:
+        return True, 'FAILED_BREAKDOWN_REVERSAL'
+    if safe_side == 'SHORT' and retest_state == 'FAILED_BREAKOUT' and confidence >= 0.45:
+        return True, 'FAILED_BREAKOUT_REVERSAL'
+
+    sr_supportive = (
+        sr_context in ('AT_BREAKOUT_LEVEL', 'INSIDE_RANGE')
+        or (safe_side == 'LONG' and sr_context == 'ABOVE_SUPPORT')
+        or (safe_side == 'SHORT' and sr_context == 'BELOW_RESISTANCE')
+    )
+    if bias == 'RECLAIM' and sr_supportive and confidence >= 0.45:
+        return True, 'OPPOSITE_RECLAIM'
+    return False, 'NO_OPPOSITE_STRUCTURE'
+
+
+def _coin_state_supports_resolution(mode: str, coin_ctx: dict = None, side: str = '') -> tuple[bool, str, float]:
+    safe_ctx = coin_ctx if isinstance(coin_ctx, dict) else {}
+    if not _coin_state_context_available(safe_ctx):
+        return True, 'COIN_STATE_UNAVAILABLE', 0.0
+
+    resolution_mode = str(mode or POST_EXIT_RESOLUTION_MODE_SAME_SIDE)
+    safe_side = str(side or '').upper().strip()
+    confidence = _coerce_float(safe_ctx.get('stateConfidence', 0.0), 0.0)
+    dominant_side = str(safe_ctx.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    setup_state = str(safe_ctx.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    transition_state = str(safe_ctx.get('transitionState', 'NONE') or 'NONE').upper()
+    preferred_exit_profile = str(safe_ctx.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED).upper()
+    allowed_families = [str(item or '').lower() for item in (safe_ctx.get('allowedEntryFamilies', []) or []) if str(item or '').strip()]
+
+    boost = min(8.0, confidence * 8.0)
+    if resolution_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE:
+        if dominant_side not in ('NEUTRAL', safe_side) and confidence >= 0.5:
+            return False, 'COIN_STATE_OPPOSITE_DOMINANT', 0.0
+        if setup_state == 'REVERSAL_RETEST' and confidence >= 0.45:
+            return False, 'COIN_STATE_REVERSAL_ACTIVE', 0.0
+        if allowed_families and 'continuation' not in allowed_families and setup_state in ('RANGE_FADE', 'REVERSAL_RETEST'):
+            return False, 'COIN_STATE_NO_CONTINUATION', 0.0
+        if preferred_exit_profile == V3_EXIT_PROFILE_TREND_EXPANSION:
+            boost += 2.0
+        return True, 'COIN_STATE_SAME_SIDE_OK', round(boost, 4)
+
+    if dominant_side == safe_side and confidence >= 0.45:
+        boost += 2.0
+    elif dominant_side not in ('NEUTRAL', safe_side) and confidence >= 0.55:
+        return False, 'COIN_STATE_WRONG_SIDE', 0.0
+
+    reversal_allowed = 'reversal_retest' in allowed_families or 'reclaim' in allowed_families
+    reversal_transition = transition_state in (
+        'FAILED_BREAKDOWN',
+        'FAILED_BREAKOUT',
+        'RECLAIMING',
+        'BREAKOUT_RETEST',
+    )
+    if not (reversal_allowed or reversal_transition):
+        return False, 'COIN_STATE_NO_REVERSAL', 0.0
+    if preferred_exit_profile == V3_EXIT_PROFILE_TRANSITION_DEFENSE:
+        boost += 2.5
+    if setup_state == 'REVERSAL_RETEST':
+        boost += 2.0
+    return True, 'COIN_STATE_OPPOSITE_OK', round(boost, 4)
+
+
+def _record_post_exit_reentry_watch_event(watch: dict, reason: str) -> None:
+    if not isinstance(watch, dict):
+        return
+    significant_reasons = {
+        'armed',
+        'candidate',
+        'confirmed',
+        'cancelled',
+        'expired',
+        'dispatch_rejected',
+        'superseded',
+        'replaced',
+    }
+    safe_reason = str(reason or '').strip().lower()
+    if safe_reason not in significant_reasons:
+        return
+    history = post_exit_reentry_watch_history if isinstance(globals().get('post_exit_reentry_watch_history'), list) else None
+    if history is None:
+        return
+    now_ts = time.time()
+    min_ts = now_ts - (V3_POST_EXIT_REENTRY_RECENT_WINDOW_SEC * 1.5)
+    history[:] = [item for item in history if isinstance(item, dict) and _coerce_float(item.get('ts', 0.0), 0.0) >= min_ts]
+    history.append({
+        'ts': now_ts,
+        'reason': safe_reason,
+        'symbol': str(watch.get('symbol', '') or '').upper(),
+        'watchState': str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
+        'resolutionMode': str(watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'resolutionTargetSide': str(watch.get('resolutionTargetSide', watch.get('side', '')) or watch.get('side', '')).upper(),
+        'reentryTriggered': bool(watch.get('reentryTriggered', False)),
+        'cancelReason': str(watch.get('cancelReason', '') or ''),
+    })
 
 
 def _is_v3_side_aware_structure_enabled() -> bool:
@@ -15175,6 +15715,525 @@ def _structure_context_side_supportive(structure_ctx: dict = None, side: str = '
         or (safe_side == 'SHORT' and sr_context == 'BELOW_RESISTANCE')
     )
     return bool(confidence >= 0.60 and ((bias == 'CONTINUATION' and (retest_supportive or sr_supportive)) or (bias == 'RECLAIM' and sr_supportive)))
+
+
+def _structure_trend_aligns_with_side(structure_ctx: dict = None, side: str = '') -> bool:
+    safe_ctx = structure_ctx if isinstance(structure_ctx, dict) else {}
+    safe_side = str(side or '').upper().strip()
+    trend = str(safe_ctx.get('structureTrend', 'MIXED') or 'MIXED').upper()
+    if safe_side == 'LONG':
+        return trend == 'UP'
+    if safe_side == 'SHORT':
+        return trend == 'DOWN'
+    return False
+
+
+def evaluate_v3_coin_state_drift(
+    pos: dict,
+    *,
+    current_price: float,
+    profit_ladder: Optional[dict] = None,
+    underwater_ctx: Optional[dict] = None,
+    thesis_ctx: Optional[dict] = None,
+) -> dict:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else {}
+    safe_thesis = thesis_ctx if isinstance(thesis_ctx, dict) else {}
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    current_roi_pct = _coerce_float(
+        ladder.get('current_profit_roi_pct', compute_position_roi_pct(safe_pos, current_price=current_price)),
+        compute_position_roi_pct(safe_pos, current_price=current_price),
+    )
+    continuation_state = str(ladder.get('continuation_flow_state', safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)) or V3_CONTINUATION_NEUTRAL)
+    thesis_state = str(safe_thesis.get('thesis_state', safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY)) or POSITION_THESIS_ENTRY)
+    setup_state = str(safe_pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    backdrop_state = str(safe_pos.get('backdropState1h', 'MIXED') or 'MIXED').upper()
+    macro_state = str(safe_pos.get('macroState4h', 'MIXED') or 'MIXED').upper()
+    transition_state = str(safe_pos.get('transitionState', 'NONE') or 'NONE').upper()
+    dominant_side = str(safe_pos.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    state_confidence = _coerce_float(safe_pos.get('stateConfidence', 0.0), 0.0)
+    preferred_exit_profile = str(safe_pos.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED).upper()
+    trend_mode = bool(safe_pos.get('trend_mode', False))
+    supportive_structure = _structure_context_side_supportive(safe_pos, side)
+    aligned_structure = _structure_trend_aligns_with_side(safe_pos, side)
+    adverse_tape = str(state_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL) in (
+        V3_UNDERWATER_ADVERSE_STRONG,
+        V3_UNDERWATER_ADVERSE_WEAK,
+    )
+    price_loss_pct = _coerce_float(state_ctx.get('price_loss_pct', 0.0), 0.0)
+    open_time_ms = _coerce_float(safe_pos.get('openTime', 0.0), 0.0)
+    age_sec = max(0.0, time.time() - (open_time_ms / 1000.0)) if open_time_ms > 0 else 0.0
+    barrier_verdict = str(safe_pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+
+    result = {
+        'state': 'ALIGNED',
+        'reason': 'COIN_STATE_ALIGNED',
+        'severity': 0.0,
+        'intent_decay_pct': 0.0,
+        'profile_hint': '',
+    }
+
+    strong_trend_support = bool(
+        setup_state == 'CONTINUATION'
+        and dominant_side in ('NEUTRAL', side)
+        and backdrop_state == 'TREND'
+        and macro_state in ('TREND', 'TRANSITION')
+        and aligned_structure
+        and supportive_structure
+        and state_confidence >= 0.58
+        and continuation_state in (V3_CONTINUATION_SUPPORTING, V3_CONTINUATION_NEUTRAL)
+        and not adverse_tape
+    )
+    if strong_trend_support:
+        result.update({
+            'state': 'TREND_SUPPORT',
+            'reason': 'STRONG_TREND_ALIGNMENT',
+            'severity': 0.0,
+            'intent_decay_pct': 0.0,
+            'profile_hint': V3_EXIT_PROFILE_TREND_EXPANSION,
+        })
+        return result
+
+    if dominant_side not in ('NEUTRAL', side) and state_confidence >= 0.60:
+        severity = min(1.0, 0.60 + ((state_confidence - 0.60) * 1.2))
+        severity += 0.10 if age_sec >= 45 * 60 else 0.0
+        if adverse_tape:
+            severity += 0.10
+        result.update({
+            'state': 'OPPOSITE_DOMINANT',
+            'reason': 'COIN_STATE_OPPOSITE_DOMINANT',
+            'severity': round(_clamp(severity, 0.0, 1.0), 4),
+            'intent_decay_pct': round(_clamp(0.55 + severity * 0.35, 0.0, 0.95), 4),
+            'profile_hint': V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        })
+        return result
+
+    if transition_state != 'NONE' and continuation_state != V3_CONTINUATION_SUPPORTING:
+        severity = 0.45 + (0.15 if age_sec >= 90 * 60 else 0.0) + (0.10 if adverse_tape else 0.0)
+        if preferred_exit_profile == V3_EXIT_PROFILE_TRANSITION_DEFENSE:
+            severity += 0.10
+        result.update({
+            'state': 'TRANSITION_DRIFT',
+            'reason': 'COIN_STATE_TRANSITION_DRIFT',
+            'severity': round(_clamp(severity, 0.0, 1.0), 4),
+            'intent_decay_pct': round(_clamp(0.40 + severity * 0.40, 0.0, 0.95), 4),
+            'profile_hint': V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        })
+        return result
+
+    if (
+        age_sec >= (3 * 60 * 60)
+        and setup_state in ('RANGE_FADE', 'NEUTRAL', 'RECLAIM')
+        and continuation_state in (V3_CONTINUATION_CHOP, V3_CONTINUATION_NEUTRAL, V3_CONTINUATION_FADING)
+        and current_roi_pct <= 6.0
+    ):
+        severity = 0.40 + min(0.30, age_sec / (10 * 60 * 60))
+        if price_loss_pct > 0:
+            severity += 0.08
+        result.update({
+            'state': 'RANGE_STAGNATION',
+            'reason': 'COIN_STATE_RANGE_STAGNATION',
+            'severity': round(_clamp(severity, 0.0, 1.0), 4),
+            'intent_decay_pct': round(_clamp(0.45 + severity * 0.35, 0.0, 0.95), 4),
+            'profile_hint': V3_EXIT_PROFILE_RANGE_EFFICIENCY,
+        })
+        return result
+
+    if (
+        age_sec >= (2 * 60 * 60)
+        and thesis_state == POSITION_THESIS_ENTRY
+        and continuation_state != V3_CONTINUATION_SUPPORTING
+        and current_roi_pct <= 3.0
+    ):
+        severity = 0.35 + (0.10 if barrier_verdict == 'CAUTION' else 0.0) + (0.10 if adverse_tape else 0.0)
+        if trend_mode and not supportive_structure:
+            severity += 0.08
+        result.update({
+            'state': 'INTENT_DECAY',
+            'reason': 'ENTRY_THESIS_STALLED',
+            'severity': round(_clamp(severity, 0.0, 1.0), 4),
+            'intent_decay_pct': round(_clamp(0.35 + severity * 0.40, 0.0, 0.95), 4),
+            'profile_hint': V3_EXIT_PROFILE_RANGE_EFFICIENCY if setup_state in ('RANGE_FADE', 'NEUTRAL', 'RECLAIM') else V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        })
+        return result
+
+    return result
+
+
+def resolve_v3_exit_owner(
+    *,
+    profile: str,
+    drift_state: str,
+    drift_severity: float,
+    continuation_state: str,
+    thesis_state: str,
+    current_roi_pct: float,
+    age_sec: float,
+    setup_state: str,
+    transition_state: str,
+    dominant_side: str,
+    side: str,
+) -> dict:
+    safe_profile = str(profile or V3_EXIT_PROFILE_BALANCED).upper()
+    safe_drift_state = str(drift_state or 'ALIGNED').upper()
+    safe_continuation = str(continuation_state or V3_CONTINUATION_NEUTRAL)
+    safe_thesis = str(thesis_state or POSITION_THESIS_ENTRY)
+    safe_setup = str(setup_state or 'NEUTRAL').upper()
+    safe_transition = str(transition_state or 'NONE').upper()
+    safe_dominant = str(dominant_side or 'NEUTRAL').upper()
+    safe_side = str(side or 'LONG').upper()
+    transition_adverse = bool(
+        (safe_side == 'LONG' and safe_transition == 'FAILED_BREAKOUT')
+        or (safe_side == 'SHORT' and safe_transition == 'FAILED_BREAKDOWN')
+    )
+
+    if safe_drift_state == 'OPPOSITE_DOMINANT' and safe_dominant not in ('NEUTRAL', safe_side):
+        return {
+            'owner': V3_EXIT_OWNER_REVERSAL_ESCAPE,
+            'reason': 'OPPOSITE_DOMINANT_ESCAPE',
+            'tighten_bias': 0.90,
+            'allow_hold': False,
+        }
+    if safe_thesis == POSITION_THESIS_ENTRY and age_sec >= (2 * 60 * 60) and safe_continuation != V3_CONTINUATION_SUPPORTING and current_roi_pct <= 3.0:
+        return {
+            'owner': V3_EXIT_OWNER_FAILED_THESIS,
+            'reason': 'ENTRY_THESIS_DECAY',
+            'tighten_bias': 0.70,
+            'allow_hold': False,
+        }
+    if (
+        safe_profile == V3_EXIT_PROFILE_TREND_EXPANSION
+        and safe_continuation in (V3_CONTINUATION_SUPPORTING, V3_CONTINUATION_NEUTRAL)
+        and not transition_adverse
+    ):
+        return {
+            'owner': V3_EXIT_OWNER_TREND_CONTINUATION,
+            'reason': 'TREND_CONTINUATION_CARRY',
+            'tighten_bias': 0.0,
+            'allow_hold': True,
+        }
+    if safe_profile == V3_EXIT_PROFILE_TRANSITION_DEFENSE or safe_drift_state == 'TRANSITION_DRIFT' or transition_adverse:
+        return {
+            'owner': V3_EXIT_OWNER_TRANSITION_PROTECT,
+            'reason': 'TRANSITION_PROTECTION',
+            'tighten_bias': 0.60,
+            'allow_hold': False,
+        }
+    if safe_profile == V3_EXIT_PROFILE_RANGE_EFFICIENCY or safe_drift_state in ('RANGE_STAGNATION', 'INTENT_DECAY') or safe_setup in ('RANGE_FADE', 'NEUTRAL'):
+        return {
+            'owner': V3_EXIT_OWNER_RANGE_EFFICIENCY,
+            'reason': 'RANGE_EFFICIENCY_CONTROL',
+            'tighten_bias': 0.55,
+            'allow_hold': False,
+        }
+    return {
+        'owner': V3_EXIT_OWNER_BALANCED,
+        'reason': 'BALANCED_EXIT_CONTROL',
+        'tighten_bias': 0.30,
+        'allow_hold': False,
+    }
+
+
+def analyze_reversal_retest_zone_context(
+    signal: dict,
+    *,
+    current_price: float,
+    atr: float,
+    side: str,
+) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_side = str(side or safe_signal.get('action', safe_signal.get('side', 'LONG')) or 'LONG').upper()
+    price = _coerce_float(current_price, 0.0)
+    if price <= 0:
+        return {
+            'zoneState': 'UNAVAILABLE',
+            'zoneReason': 'NO_PRICE',
+            'zoneSource': '',
+            'zonePrice': 0.0,
+            'zoneWidth': 0.0,
+            'pocketPrice': 0.0,
+            'retestDistancePct': 0.0,
+            'touchReady': False,
+            'confidence': 0.0,
+        }
+
+    structural_zone = safe_signal.get('structural_zone', {}) if isinstance(safe_signal.get('structural_zone'), dict) else {}
+    zone_price = _coerce_float(structural_zone.get('zone_price', 0.0), 0.0)
+    zone_width = _coerce_float(structural_zone.get('zone_width', 0.0), 0.0)
+    zone_source = str(structural_zone.get('zone_source', '') or '')
+    zone_confidence = _coerce_float(structural_zone.get('zone_confidence', 0.0), 0.0)
+    supportive_price = _coerce_float(safe_signal.get('supportiveLevelPrice', 0.0), 0.0)
+    supportive_distance_pct = _coerce_float(safe_signal.get('supportiveDistancePct', 0.0), 0.0)
+    transition_state = str(safe_signal.get('transitionState', 'NONE') or 'NONE').upper()
+    retest_state = str(safe_signal.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    pattern_confidence = _coerce_float(safe_signal.get('patternConfidence', 0.0), 0.0)
+
+    min_width = max(_coerce_float(atr, 0.0) * 0.35, price * 0.0012)
+    if zone_price <= 0 and supportive_price > 0:
+        zone_price = supportive_price
+        zone_source = str(safe_signal.get('supportiveLevelType', 'SUPPORTIVE_LEVEL') or 'SUPPORTIVE_LEVEL')
+        if supportive_distance_pct > 0:
+            zone_width = max(min_width, price * (supportive_distance_pct / 100.0))
+    zone_width = max(zone_width, min_width) if zone_price > 0 else 0.0
+    if zone_price <= 0:
+        return {
+            'zoneState': 'UNAVAILABLE',
+            'zoneReason': 'NO_STRUCTURAL_ZONE',
+            'zoneSource': '',
+            'zonePrice': 0.0,
+            'zoneWidth': 0.0,
+            'pocketPrice': 0.0,
+            'retestDistancePct': 0.0,
+            'touchReady': False,
+            'confidence': 0.0,
+        }
+
+    retest_distance_pct = abs(price - zone_price) / max(price, 1e-8) * 100.0
+    touch_band = max(zone_width * 1.25, _coerce_float(atr, 0.0) * 0.20, price * 0.0012)
+    touch_ready = abs(price - zone_price) <= touch_band
+    pocket_offset = min(zone_width * 0.45, max(zone_width * 0.18, _coerce_float(atr, 0.0) * 0.18))
+    pocket_price = zone_price + pocket_offset if safe_side == 'SHORT' else zone_price - pocket_offset
+    confidence = max(zone_confidence, pattern_confidence)
+    if retest_state in ('BULL_RETEST_HOLD', 'BEAR_RETEST_HOLD'):
+        confidence = max(confidence, 0.62)
+    if transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT'):
+        confidence = max(confidence, 0.58)
+
+    zone_state = 'READY' if touch_ready else 'WAIT_ZONE'
+    zone_reason = 'ZONE_RETEST_READY' if touch_ready else 'WAIT_RETEST_POCKET'
+    return {
+        'zoneState': zone_state,
+        'zoneReason': zone_reason,
+        'zoneSource': zone_source or 'STRUCTURAL_ZONE',
+        'zonePrice': round(zone_price, 8),
+        'zoneWidth': round(zone_width, 8),
+        'pocketPrice': round(pocket_price, 8),
+        'retestDistancePct': round(retest_distance_pct, 4),
+        'touchReady': bool(touch_ready),
+        'confidence': round(_clamp(confidence, 0.0, 1.0), 4),
+    }
+
+
+def resolve_v3_exit_behavior_profile(
+    pos: dict,
+    *,
+    current_price: float,
+    profit_ladder: Optional[dict] = None,
+    underwater_ctx: Optional[dict] = None,
+    thesis_ctx: Optional[dict] = None,
+) -> dict:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else {}
+    safe_thesis = thesis_ctx if isinstance(thesis_ctx, dict) else {}
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    continuation_state = str(ladder.get('continuation_flow_state', safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)) or V3_CONTINUATION_NEUTRAL)
+    thesis_state = str(safe_thesis.get('thesis_state', safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY)) or POSITION_THESIS_ENTRY)
+    pattern_bias = str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    preferred_exit_profile = str(safe_pos.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED).upper()
+    coin_state_confidence = _coerce_float(safe_pos.get('stateConfidence', 0.0), 0.0)
+    transition_state = str(safe_pos.get('transitionState', 'NONE') or 'NONE').upper()
+    setup_state = str(safe_pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    backdrop_state = str(safe_pos.get('backdropState1h', 'MIXED') or 'MIXED').upper()
+    macro_state = str(safe_pos.get('macroState4h', 'MIXED') or 'MIXED').upper()
+    trend_mode = bool(safe_pos.get('trend_mode', False))
+    supportive_structure = _structure_context_side_supportive(safe_pos, side)
+    aligned_structure = _structure_trend_aligns_with_side(safe_pos, side)
+    adverse_tape = str(state_ctx.get('state', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL) in (
+        V3_UNDERWATER_ADVERSE_STRONG,
+        V3_UNDERWATER_ADVERSE_WEAK,
+    )
+    price_loss_pct = _coerce_float(state_ctx.get('price_loss_pct', 0.0), 0.0)
+    small_loss_band_pct = max(1.0, _coerce_float(state_ctx.get('small_loss_band_pct', 1.0), 1.0))
+    current_roi_pct = _coerce_float(
+        ladder.get('current_profit_roi_pct', compute_position_roi_pct(safe_pos, current_price=current_price)),
+        compute_position_roi_pct(safe_pos, current_price=current_price),
+    )
+    leverage = max(1.0, _coerce_float(safe_pos.get('leverage', 1.0), 1.0))
+    open_time_ms = _coerce_float(safe_pos.get('openTime', 0.0), 0.0)
+    age_sec = max(0.0, time.time() - (open_time_ms / 1000.0)) if open_time_ms > 0 else 0.0
+    base_delay = int(safe_pos.get('tp1ArmDelaySec', 90 if trend_mode else 45) or (90 if trend_mode else 45))
+    base_atr_req_mult = _coerce_float(safe_pos.get('tp1ArmAtrReq', 0.4 if trend_mode else 0.2), 0.4 if trend_mode else 0.2)
+    drift_ctx = evaluate_v3_coin_state_drift(
+        safe_pos,
+        current_price=current_price,
+        profit_ladder=ladder,
+        underwater_ctx=state_ctx,
+        thesis_ctx=safe_thesis,
+    )
+    drift_state = str(drift_ctx.get('state', 'ALIGNED') or 'ALIGNED').upper()
+    drift_reason = str(drift_ctx.get('reason', 'COIN_STATE_ALIGNED') or 'COIN_STATE_ALIGNED')
+    drift_severity = _coerce_float(drift_ctx.get('severity', 0.0), 0.0)
+    intent_decay_pct = _coerce_float(drift_ctx.get('intent_decay_pct', 0.0), 0.0)
+    drift_profile_hint = str(drift_ctx.get('profile_hint', '') or '').upper()
+    strong_mtf_trend = bool(
+        setup_state == 'CONTINUATION'
+        and backdrop_state == 'TREND'
+        and macro_state in ('TREND', 'TRANSITION')
+        and aligned_structure
+        and supportive_structure
+        and coin_state_confidence >= 0.55
+    )
+    aged_range_stagnation = bool(
+        age_sec >= (4 * 60 * 60)
+        and setup_state in ('RANGE_FADE', 'NEUTRAL', 'RECLAIM')
+        and continuation_state in (V3_CONTINUATION_CHOP, V3_CONTINUATION_NEUTRAL, V3_CONTINUATION_FADING)
+        and current_roi_pct <= 8.0
+    )
+    aged_transition_drift = bool(
+        age_sec >= (6 * 60 * 60)
+        and transition_state != 'NONE'
+        and continuation_state != V3_CONTINUATION_SUPPORTING
+    )
+
+    profile = V3_EXIT_PROFILE_BALANCED
+    reason = 'BALANCED_FLOW'
+    if drift_profile_hint == V3_EXIT_PROFILE_TRANSITION_DEFENSE and drift_state in ('OPPOSITE_DOMINANT', 'TRANSITION_DRIFT'):
+        profile = V3_EXIT_PROFILE_TRANSITION_DEFENSE
+        reason = 'COIN_STATE_OPPOSITE_DOMINANT' if drift_state == 'OPPOSITE_DOMINANT' else 'COIN_STATE_TRANSITION_DEFENSE'
+    elif drift_profile_hint == V3_EXIT_PROFILE_RANGE_EFFICIENCY and drift_state in ('RANGE_STAGNATION', 'INTENT_DECAY'):
+        profile = V3_EXIT_PROFILE_RANGE_EFFICIENCY
+        reason = 'AGED_RANGE_STAGNATION' if drift_state == 'RANGE_STAGNATION' else drift_reason
+    elif drift_profile_hint == V3_EXIT_PROFILE_TREND_EXPANSION and drift_state == 'TREND_SUPPORT':
+        profile = V3_EXIT_PROFILE_TREND_EXPANSION
+        reason = 'MTF_TREND_CONTINUATION' if strong_mtf_trend else drift_reason
+    elif preferred_exit_profile == V3_EXIT_PROFILE_TRANSITION_DEFENSE and (coin_state_confidence >= 0.45 or transition_state != 'NONE'):
+        profile = V3_EXIT_PROFILE_TRANSITION_DEFENSE
+        reason = 'COIN_STATE_TRANSITION_DEFENSE'
+    elif preferred_exit_profile == V3_EXIT_PROFILE_TREND_EXPANSION and coin_state_confidence >= 0.55 and setup_state == 'CONTINUATION':
+        profile = V3_EXIT_PROFILE_TREND_EXPANSION
+        reason = 'COIN_STATE_TREND_EXPANSION'
+    elif preferred_exit_profile == V3_EXIT_PROFILE_RANGE_EFFICIENCY and coin_state_confidence >= 0.45 and setup_state in ('RANGE_FADE', 'NEUTRAL', 'RECLAIM'):
+        profile = V3_EXIT_PROFILE_RANGE_EFFICIENCY
+        reason = 'COIN_STATE_RANGE_EFFICIENCY'
+    elif aged_transition_drift:
+        profile = V3_EXIT_PROFILE_TRANSITION_DEFENSE
+        reason = 'AGED_TRANSITION_DEFENSE'
+    elif aged_range_stagnation:
+        profile = V3_EXIT_PROFILE_RANGE_EFFICIENCY
+        reason = 'AGED_RANGE_STAGNATION'
+    elif strong_mtf_trend and continuation_state in (V3_CONTINUATION_SUPPORTING, V3_CONTINUATION_NEUTRAL, V3_CONTINUATION_FADING) and not adverse_tape:
+        profile = V3_EXIT_PROFILE_TREND_EXPANSION
+        reason = 'MTF_TREND_CONTINUATION'
+    elif (
+        trend_mode
+        and aligned_structure
+        and supportive_structure
+        and pattern_bias == 'CONTINUATION'
+        and continuation_state in (V3_CONTINUATION_SUPPORTING, V3_CONTINUATION_NEUTRAL, V3_CONTINUATION_FADING)
+        and thesis_state != POSITION_THESIS_EXIT_CONFIRMED
+        and not adverse_tape
+    ):
+        profile = V3_EXIT_PROFILE_TREND_EXPANSION
+        reason = 'TREND_ALIGN_CONTINUATION'
+    elif (
+        continuation_state == V3_CONTINUATION_CHOP
+        or (str(safe_pos.get('structureTrend', 'MIXED') or 'MIXED').upper() in ('RANGE', 'MIXED') and pattern_bias == 'NEUTRAL')
+    ):
+        profile = V3_EXIT_PROFILE_RANGE_EFFICIENCY
+        reason = 'CHOP_RANGE_EFFICIENCY'
+    elif (
+        adverse_tape
+        or thesis_state == POSITION_THESIS_REVALIDATING
+        or (continuation_state == V3_CONTINUATION_FADING and not supportive_structure)
+    ):
+        profile = V3_EXIT_PROFILE_TRANSITION_DEFENSE
+        reason = 'TRANSITION_OR_ADVERSE'
+
+    chop_reclaim_min_age_sec = 600.0
+    tp1_arm_delay_sec = base_delay
+    tp1_arm_atr_req_mult = base_atr_req_mult
+    allow_sideways_reclaim_hold = False
+    if profile == V3_EXIT_PROFILE_TREND_EXPANSION:
+        chop_reclaim_min_age_sec = 1200.0
+        tp1_arm_delay_sec = max(base_delay, 120)
+        tp1_arm_atr_req_mult = max(base_atr_req_mult, 0.45)
+        allow_sideways_reclaim_hold = bool(
+            price_loss_pct <= (small_loss_band_pct * 1.10)
+            and not bool(state_ctx.get('adverse_flow', False))
+            and not bool(state_ctx.get('hostile_imbalance', False))
+            and current_roi_pct >= -max(8.0, small_loss_band_pct * leverage)
+        )
+    elif profile == V3_EXIT_PROFILE_RANGE_EFFICIENCY:
+        chop_reclaim_min_age_sec = 180.0 if aged_range_stagnation else 300.0
+        tp1_arm_delay_sec = max(15, min(base_delay, 25 if aged_range_stagnation else 30))
+        tp1_arm_atr_req_mult = min(base_atr_req_mult, 0.12 if aged_range_stagnation else 0.15) if base_atr_req_mult > 0 else (0.12 if aged_range_stagnation else 0.15)
+    elif profile == V3_EXIT_PROFILE_TRANSITION_DEFENSE:
+        chop_reclaim_min_age_sec = 120.0 if aged_transition_drift else 180.0
+        tp1_arm_delay_sec = max(12, min(base_delay, 20 if aged_transition_drift else 25))
+        tp1_arm_atr_req_mult = min(base_atr_req_mult, 0.08 if aged_transition_drift else 0.10) if base_atr_req_mult > 0 else (0.08 if aged_transition_drift else 0.10)
+
+    if drift_state in ('OPPOSITE_DOMINANT', 'TRANSITION_DRIFT'):
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 150.0 if drift_state == 'OPPOSITE_DOMINANT' else 180.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 18 if drift_state == 'OPPOSITE_DOMINANT' else 22)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.08 if drift_state == 'OPPOSITE_DOMINANT' else 0.10)
+    elif drift_state in ('RANGE_STAGNATION', 'INTENT_DECAY'):
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 180.0 if drift_state == 'RANGE_STAGNATION' else 240.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 24 if drift_state == 'RANGE_STAGNATION' else 28)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.12 if drift_state == 'RANGE_STAGNATION' else 0.14)
+
+    exit_owner_ctx = resolve_v3_exit_owner(
+        profile=profile,
+        drift_state=drift_state,
+        drift_severity=drift_severity,
+        continuation_state=continuation_state,
+        thesis_state=thesis_state,
+        current_roi_pct=current_roi_pct,
+        age_sec=age_sec,
+        setup_state=setup_state,
+        transition_state=transition_state,
+        dominant_side=str(safe_pos.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+        side=side,
+    )
+    exit_owner = str(exit_owner_ctx.get('owner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED)
+    exit_owner_reason = str(exit_owner_ctx.get('reason', 'BALANCED_EXIT_CONTROL') or 'BALANCED_EXIT_CONTROL')
+    exit_owner_tighten_bias = _coerce_float(exit_owner_ctx.get('tighten_bias', 0.0), 0.0)
+    exit_owner_allow_hold = bool(exit_owner_ctx.get('allow_hold', False))
+
+    if exit_owner == V3_EXIT_OWNER_TREND_CONTINUATION:
+        allow_sideways_reclaim_hold = allow_sideways_reclaim_hold or (
+            continuation_state in (V3_CONTINUATION_SUPPORTING, V3_CONTINUATION_NEUTRAL)
+            and thesis_state != POSITION_THESIS_EXIT_CONFIRMED
+            and current_roi_pct >= -max(10.0, small_loss_band_pct * leverage)
+        )
+        chop_reclaim_min_age_sec = max(chop_reclaim_min_age_sec, 1200.0)
+    elif exit_owner == V3_EXIT_OWNER_REVERSAL_ESCAPE:
+        allow_sideways_reclaim_hold = False
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 120.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 18)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.08)
+    elif exit_owner == V3_EXIT_OWNER_FAILED_THESIS:
+        allow_sideways_reclaim_hold = False
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 150.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 20)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.10)
+    elif exit_owner == V3_EXIT_OWNER_RANGE_EFFICIENCY:
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 180.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 24)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.12)
+    elif exit_owner == V3_EXIT_OWNER_TRANSITION_PROTECT:
+        allow_sideways_reclaim_hold = False
+        chop_reclaim_min_age_sec = min(chop_reclaim_min_age_sec, 150.0)
+        tp1_arm_delay_sec = min(tp1_arm_delay_sec, 20)
+        tp1_arm_atr_req_mult = min(tp1_arm_atr_req_mult, 0.10)
+
+    return {
+        'profile': profile,
+        'reason': reason,
+        'exit_owner': exit_owner,
+        'exit_owner_reason': exit_owner_reason,
+        'exit_owner_tighten_bias': round(exit_owner_tighten_bias, 4),
+        'exit_owner_allow_hold': exit_owner_allow_hold,
+        'drift_state': drift_state,
+        'drift_reason': drift_reason,
+        'drift_severity': round(drift_severity, 4),
+        'intent_decay_pct': round(intent_decay_pct, 4),
+        'chop_reclaim_min_age_sec': round(chop_reclaim_min_age_sec, 2),
+        'tp1_arm_delay_sec': int(tp1_arm_delay_sec),
+        'tp1_arm_atr_req_mult': round(tp1_arm_atr_req_mult, 4),
+        'allow_sideways_reclaim_hold': allow_sideways_reclaim_hold,
+    }
 
 
 def analyze_side_aware_entry_barrier(
@@ -15455,6 +16514,22 @@ def _compact_decision_inputs(payload: dict = None) -> dict:
         'patternConfidence': round(_coerce_float(data.get('patternConfidence', 0.0), 0.0), 4),
         'patternSource': str(data.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(data.get('structureVersion', 'v1') or 'v1'),
+        'microState5m': str(data.get('microState5m', 'RANGE') or 'RANGE').upper(),
+        'setupState15m': str(data.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper(),
+        'backdropState1h': str(data.get('backdropState1h', 'MIXED') or 'MIXED').upper(),
+        'macroState4h': str(data.get('macroState4h', 'MIXED') or 'MIXED').upper(),
+        'transitionState': str(data.get('transitionState', 'NONE') or 'NONE').upper(),
+        'stateConfidence': round(_coerce_float(data.get('stateConfidence', 0.0), 0.0), 4),
+        'stateFreshness': str(data.get('stateFreshness', 'AVAILABLE') or 'AVAILABLE').upper(),
+        'dominantSide': str(data.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper(),
+        'allowedEntryFamilies': [
+            str(item or '').lower()
+            for item in (data.get('allowedEntryFamilies', []) or [])
+            if str(item or '').strip()
+        ],
+        'preferredExitProfile': str(data.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED).upper(),
+        'coinStateSource': str(data.get('coinStateSource', 'INTERNAL_MTF_CONTEXT') or 'INTERNAL_MTF_CONTEXT'),
+        'coinStateVersion': str(data.get('coinStateVersion', 'v1') or 'v1'),
         'barrierState': str(data.get('barrierState', 'CLEAR') or 'CLEAR').upper(),
         'barrierVerdict': str(data.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper(),
         'adverseLevelType': str(data.get('adverseLevelType', '') or '').upper(),
@@ -15485,6 +16560,14 @@ def _decision_primary_secondary_suppressed(archetype: str) -> tuple[list[str], l
             ['limited_market_override', 'pure_breakout_bonus'],
             'structural_limit',
             'reclaim_structural',
+        )
+    if safe_arch == DECISION_ARCHETYPE_REVERSAL_RETEST:
+        return (
+            ['failed_breakout', 'retest_hold', 'structural_sr', 'volume'],
+            ['microstructure', 'forecast', 'obi'],
+            ['pure_breakout_bonus', 'aggressive_market_override'],
+            'reversal_confirmed',
+            'transition_defense',
         )
     if safe_arch == DECISION_ARCHETYPE_EXHAUSTION:
         return (
@@ -15537,6 +16620,7 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     if explicit_archetype not in (
         DECISION_ARCHETYPE_CONTINUATION,
         DECISION_ARCHETYPE_RECLAIM,
+        DECISION_ARCHETYPE_REVERSAL_RETEST,
         DECISION_ARCHETYPE_EXHAUSTION,
         DECISION_ARCHETYPE_RECOVERY,
     ):
@@ -15565,6 +16649,16 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     daily_trend = str(inputs.get('coinDailyTrend', 'NEUTRAL') or 'NEUTRAL').upper()
     continuation_flow = str(inputs.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
     underwater_state = str(inputs.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL) or V3_UNDERWATER_NEUTRAL)
+    setup_state = str(inputs.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    transition_state = str(inputs.get('transitionState', 'NONE') or 'NONE').upper()
+    dominant_side = str(inputs.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    state_confidence = _coerce_float(inputs.get('stateConfidence', 0.0), 0.0)
+    allowed_entry_families = [
+        str(item or '').lower()
+        for item in (inputs.get('allowedEntryFamilies', []) or [])
+        if str(item or '').strip()
+    ]
+    preferred_exit_profile = str(inputs.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED).upper()
     safety_blocked = bool(data.get('emergencyBlock', False) or data.get('safetyBlocked', False))
 
     aligned_daily = (side == 'LONG' and _is_bullish_daily_trend(daily_trend)) or (side == 'SHORT' and _is_bearish_daily_trend(daily_trend))
@@ -15595,6 +16689,21 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
             or bool(data.get('recoveryArmed', False))
         )
     )
+    reversal_retest_ready = bool(
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and (
+            setup_state == 'REVERSAL_RETEST'
+            or transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT', 'BREAKOUT_RETEST', 'RECLAIMING')
+        )
+        and state_confidence >= 0.45
+        and ('reversal_retest' in allowed_entry_families or not allowed_entry_families)
+        and dominant_side in ('NEUTRAL', side)
+        and (
+            str(inputs.get('breakoutRetestState', 'NONE') or 'NONE').upper() in ('BULL_RETEST_HOLD', 'BEAR_RETEST_HOLD', 'FAILED_BREAKDOWN', 'FAILED_BREAKOUT')
+            or str(inputs.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper() in ('CONTINUATION', 'RECLAIM')
+            or bool(data.get('supportiveLevelPrice'))
+        )
+    )
     explicit_intent = bool(
         mode == STRATEGY_MODE_SMART_V3_RUNNER
         and explicit_archetype
@@ -15613,6 +16722,9 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     elif exhaustion_ready:
         archetype = DECISION_ARCHETYPE_EXHAUSTION
         reason = 'LIQUIDATION_ECHO'
+    elif reversal_retest_ready:
+        archetype = DECISION_ARCHETYPE_REVERSAL_RETEST
+        reason = transition_state or setup_state or 'REVERSAL_RETEST'
     elif continuation_ready and not opposed_daily:
         archetype = DECISION_ARCHETYPE_CONTINUATION
         reason = 'BREAKOUT_VOLUME_OBI'
@@ -15635,6 +16747,11 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
     elif archetype == DECISION_ARCHETYPE_RECLAIM:
         context_confidence += min(0.18, zscore * 0.06)
         context_confidence += 0.06 if bool(data.get('fibActive', False)) else 0.0
+    elif archetype == DECISION_ARCHETYPE_REVERSAL_RETEST:
+        context_confidence += min(0.20, state_confidence * 0.25)
+        context_confidence += 0.10 if setup_state == 'REVERSAL_RETEST' else 0.0
+        context_confidence += 0.08 if transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT', 'BREAKOUT_RETEST', 'RECLAIMING') else 0.0
+        context_confidence += 0.06 if dominant_side == side else 0.0
     elif archetype == DECISION_ARCHETYPE_EXHAUSTION:
         context_confidence += min(0.20, liq_echo / 25.0)
         context_confidence += min(0.08, max(0.0, micro_score) / 20.0)
@@ -15660,13 +16777,14 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         'allow_soft_rescue': archetype != DECISION_ARCHETYPE_EXHAUSTION,
         'allow_continuation_market_override': archetype == DECISION_ARCHETYPE_CONTINUATION,
         'allow_structural_only_reclaim': archetype == DECISION_ARCHETYPE_RECLAIM,
+        'allow_reversal_retest_entry': archetype == DECISION_ARCHETYPE_REVERSAL_RETEST,
         'prefer_soft_over_hard': archetype in (DECISION_ARCHETYPE_CONTINUATION, DECISION_ARCHETYPE_RECLAIM, DECISION_ARCHETYPE_NEUTRAL),
     }
     forecast_policy = {
         'weight_bias': archetype,
         'prefer_ranking_owner': True,
-        'prefer_pending_patience': archetype in (DECISION_ARCHETYPE_CONTINUATION, DECISION_ARCHETYPE_RECOVERY),
-        'prefer_size_defense': archetype in (DECISION_ARCHETYPE_EXHAUSTION, DECISION_ARCHETYPE_RECOVERY),
+        'prefer_pending_patience': archetype in (DECISION_ARCHETYPE_CONTINUATION, DECISION_ARCHETYPE_RECOVERY, DECISION_ARCHETYPE_REVERSAL_RETEST),
+        'prefer_size_defense': archetype in (DECISION_ARCHETYPE_EXHAUSTION, DECISION_ARCHETYPE_RECOVERY, DECISION_ARCHETYPE_REVERSAL_RETEST),
     }
     return {
         'regimeBucket': regime_bucket,
@@ -15695,6 +16813,18 @@ def build_decision_context(payload: dict = None, default_mode: str = STRATEGY_MO
         'patternConfidence': round(_coerce_float(inputs.get('patternConfidence', 0.0), 0.0), 4),
         'patternSource': str(inputs.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(inputs.get('structureVersion', 'v1') or 'v1'),
+        'microState5m': str(inputs.get('microState5m', 'RANGE') or 'RANGE'),
+        'setupState15m': setup_state,
+        'backdropState1h': str(inputs.get('backdropState1h', 'MIXED') or 'MIXED'),
+        'macroState4h': str(inputs.get('macroState4h', 'MIXED') or 'MIXED'),
+        'transitionState': transition_state,
+        'stateConfidence': round(state_confidence, 4),
+        'stateFreshness': str(inputs.get('stateFreshness', 'AVAILABLE') or 'AVAILABLE'),
+        'dominantSide': dominant_side,
+        'allowedEntryFamilies': list(allowed_entry_families),
+        'preferredExitProfile': preferred_exit_profile,
+        'coinStateSource': str(inputs.get('coinStateSource', 'INTERNAL_MTF_CONTEXT') or 'INTERNAL_MTF_CONTEXT'),
+        'coinStateVersion': str(inputs.get('coinStateVersion', 'v1') or 'v1'),
         'barrierState': str(inputs.get('barrierState', 'CLEAR') or 'CLEAR'),
         'barrierVerdict': str(inputs.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
         'adverseLevelType': str(inputs.get('adverseLevelType', '') or ''),
@@ -16319,8 +17449,12 @@ def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None,
         'symbol': safe_watch.get('symbol', ''),
         'side': safe_watch.get('side', ''),
         'strategyMode': STRATEGY_MODE_SMART_V3_RUNNER,
-        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'entryArchetype': safe_watch.get('resolutionEntryArchetype', ENTRY_ARCHETYPE_CONTINUATION),
         'runnerContextResolved': safe_watch.get('runnerContextResolved', ''),
+        'postExitResolutionMode': safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'postExitResolutionTargetSide': safe_watch.get('resolutionTargetSide', safe_watch.get('side', '')),
+        'postExitResolutionReason': safe_watch.get('resolutionReason', ''),
+        'postExitResolutionConfidence': safe_watch.get('resolutionConfidence', 0.0),
         'reentryOriginTradeId': safe_watch.get('originalTradeId', ''),
         'reentryOriginExitReason': safe_watch.get('exitReason', ''),
         'reentryWatcherId': safe_watch.get('watcherId', ''),
@@ -16379,6 +17513,10 @@ def _build_post_exit_reentry_watch_inputs(watch: dict, opportunity: dict = None,
             'signalScoreRaw': safe_signal.get('_rawConfidenceScore', merged.get('signalScoreRaw', merged.get('signalScore', 0.0))),
             'entryArchetype': safe_signal.get('entryArchetype', merged.get('entryArchetype', ENTRY_ARCHETYPE_CONTINUATION)),
             'runnerContextResolved': safe_signal.get('runnerContextResolved', merged.get('runnerContextResolved', '')),
+            'postExitResolutionMode': safe_signal.get('postExitResolutionMode', merged.get('postExitResolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE)),
+            'postExitResolutionTargetSide': safe_signal.get('postExitResolutionTargetSide', merged.get('postExitResolutionTargetSide', merged.get('side', ''))),
+            'postExitResolutionReason': safe_signal.get('postExitResolutionReason', merged.get('postExitResolutionReason', '')),
+            'postExitResolutionConfidence': safe_signal.get('postExitResolutionConfidence', merged.get('postExitResolutionConfidence', 0.0)),
             'directionOwner': safe_signal.get('directionOwner', ''),
             'directionConfidence': safe_signal.get('directionConfidence', 0.0),
             'directionReason': safe_signal.get('directionReason', ''),
@@ -16414,8 +17552,12 @@ def queue_post_exit_reentry_watch_snapshot(
     decision = {
         'reason': str(reason or ''),
         'side': str(safe_watch.get('side', '') or ''),
-        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'entryArchetype': str(safe_watch.get('resolutionEntryArchetype', ENTRY_ARCHETYPE_CONTINUATION) or ENTRY_ARCHETYPE_CONTINUATION),
         'runnerContextResolved': str(safe_watch.get('runnerContextResolved', '') or ''),
+        'postExitResolutionMode': str(safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'postExitResolutionTargetSide': str(safe_watch.get('resolutionTargetSide', safe_watch.get('side', '')) or safe_watch.get('side', '')),
+        'postExitResolutionReason': str(safe_watch.get('resolutionReason', '') or ''),
+        'postExitResolutionConfidence': round(_coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0), 4),
         'watchState': str(safe_watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
         'reentryOriginTradeId': str(safe_watch.get('originalTradeId', '') or ''),
         'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
@@ -16433,6 +17575,10 @@ def queue_post_exit_reentry_watch_snapshot(
         'watchState': str(safe_watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED) or POST_EXIT_REENTRY_STATE_ARMED),
         'cancelReason': str(safe_watch.get('cancelReason', '') or ''),
         'candidateAccepted': bool(safe_watch.get('watchState') == POST_EXIT_REENTRY_STATE_CANDIDATE),
+        'postExitResolutionMode': str(safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'postExitResolutionTargetSide': str(safe_watch.get('resolutionTargetSide', safe_watch.get('side', '')) or safe_watch.get('side', '')),
+        'postExitResolutionReason': str(safe_watch.get('resolutionReason', '') or ''),
+        'postExitResolutionConfidence': round(_coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0), 4),
         'confirmCount': int(safe_watch.get('confirmCount', 0) or 0),
         'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
         'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
@@ -16463,6 +17609,7 @@ def queue_post_exit_reentry_watch_snapshot(
         outcome=outcome,
         created_ts=created_ts,
     )
+    _record_post_exit_reentry_watch_event(safe_watch, reason)
     return True
 
 
@@ -16493,12 +17640,17 @@ def _is_symbol_close_pending(symbol: str) -> bool:
 def build_post_exit_reentry_watchers_summary(now_ts: Optional[float] = None) -> dict:
     now_ts = float(now_ts or time.time())
     watchers = post_exit_reentry_watchers if isinstance(globals().get('post_exit_reentry_watchers'), dict) else {}
+    history = post_exit_reentry_watch_history if isinstance(globals().get('post_exit_reentry_watch_history'), list) else []
     items = []
     counts = {
         'active': 0,
         'candidate': 0,
         'confirmed': 0,
         'triggered': 0,
+        'recentArmed': 0,
+        'recentCancelled': 0,
+        'recentTriggered': 0,
+        'recentOppositeTriggered': 0,
     }
     for symbol, watch in watchers.items():
         if not isinstance(watch, dict):
@@ -16515,6 +17667,8 @@ def build_post_exit_reentry_watchers_summary(now_ts: Optional[float] = None) -> 
             'confirmCount': int(watch.get('confirmCount', 0) or 0),
             'reentryTriggered': bool(watch.get('reentryTriggered', False)),
             'cancelReason': str(watch.get('cancelReason', '') or ''),
+            'resolutionMode': str(watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+            'resolutionTargetSide': str(watch.get('resolutionTargetSide', watch.get('side', '')) or watch.get('side', '')),
             'expiresInSec': round(expires_in, 1),
         })
         if state in (POST_EXIT_REENTRY_STATE_ARMED, POST_EXIT_REENTRY_STATE_CANDIDATE):
@@ -16525,6 +17679,19 @@ def build_post_exit_reentry_watchers_summary(now_ts: Optional[float] = None) -> 
             counts['confirmed'] += 1
         if bool(watch.get('reentryTriggered', False)):
             counts['triggered'] += 1
+    recent_min_ts = now_ts - V3_POST_EXIT_REENTRY_RECENT_WINDOW_SEC
+    for item in history:
+        if not isinstance(item, dict) or _coerce_float(item.get('ts', 0.0), 0.0) < recent_min_ts:
+            continue
+        reason = str(item.get('reason', '') or '').lower()
+        if reason == 'armed':
+            counts['recentArmed'] += 1
+        if reason in ('cancelled', 'expired', 'dispatch_rejected', 'superseded', 'replaced'):
+            counts['recentCancelled'] += 1
+        if bool(item.get('reentryTriggered', False)) and reason == 'confirmed':
+            counts['recentTriggered'] += 1
+            if str(item.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE) == POST_EXIT_RESOLUTION_MODE_OPPOSITE:
+                counts['recentOppositeTriggered'] += 1
     items.sort(key=lambda item: item.get('expiresInSec', 0.0))
     return {
         **counts,
@@ -16602,6 +17769,11 @@ def register_post_exit_reentry_watch(
         'reentryPendingEntryId': '',
         'reentryPositionId': '',
         'cancelReason': '',
+        'resolutionMode': POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+        'resolutionTargetSide': str(safe_pos.get('side', safe_trade.get('side', 'LONG')) or 'LONG').upper(),
+        'resolutionReason': 'WATCH_ARMED',
+        'resolutionConfidence': 0.0,
+        'resolutionEntryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
         'decisionContext': signal_snapshot.get('decisionContext', safe_pos.get('decisionContext', {})),
         'expectancyBand': str(expectancy.get('expectancyBand', safe_trade.get('expectancyBand', DECISION_EXPECTANCY_BAND_NEUTRAL)) or DECISION_EXPECTANCY_BAND_NEUTRAL),
         'expectancyRankingScore': _coerce_float(expectancy.get('rankingScore', safe_trade.get('expectancyRankingScore', 0.0)), 0.0),
@@ -16849,6 +18021,10 @@ def _extract_post_exit_reentry_watch_summary(snapshots: list) -> dict:
             'postExitReentryReason': '',
             'postExitReentryOutcome': '',
             'postExitReentryTradeId': '',
+            'postExitResolutionMode': '',
+            'postExitResolutionTargetSide': '',
+            'postExitResolutionReason': '',
+            'postExitResolutionConfidence': 0.0,
         }
 
     latest = max(watch_snaps, key=lambda snap: int(snap.get('createdTs', snap.get('created_ts', 0)) or 0))
@@ -16872,6 +18048,10 @@ def _extract_post_exit_reentry_watch_summary(snapshots: list) -> dict:
         'postExitReentryReason': reason,
         'postExitReentryOutcome': outcome,
         'postExitReentryTradeId': '',
+        'postExitResolutionMode': str(latest_outcome.get('postExitResolutionMode', latest_decision.get('postExitResolutionMode', '')) or ''),
+        'postExitResolutionTargetSide': str(latest_outcome.get('postExitResolutionTargetSide', latest_decision.get('postExitResolutionTargetSide', '')) or ''),
+        'postExitResolutionReason': str(latest_outcome.get('postExitResolutionReason', latest_decision.get('postExitResolutionReason', '')) or ''),
+        'postExitResolutionConfidence': round(_coerce_float(latest_outcome.get('postExitResolutionConfidence', latest_decision.get('postExitResolutionConfidence', 0.0)), 0.0), 4),
     }
 
 
@@ -16951,12 +18131,29 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
         'postExitReentryOutcome': str(safe_trade.get('postExitReentryOutcome', '') or ''),
         'postExitReentryTradeId': str(safe_trade.get('postExitReentryTradeId', '') or ''),
+        'postExitResolutionMode': str(safe_trade.get('postExitResolutionMode', close_snapshot.get('postExitResolutionMode', signal_snapshot.get('postExitResolutionMode', ''))) or ''),
+        'postExitResolutionTargetSide': str(safe_trade.get('postExitResolutionTargetSide', close_snapshot.get('postExitResolutionTargetSide', signal_snapshot.get('postExitResolutionTargetSide', ''))) or ''),
+        'postExitResolutionReason': str(safe_trade.get('postExitResolutionReason', close_snapshot.get('postExitResolutionReason', signal_snapshot.get('postExitResolutionReason', ''))) or ''),
+        'postExitResolutionConfidence': round(_coerce_float(safe_trade.get('postExitResolutionConfidence', close_snapshot.get('postExitResolutionConfidence', signal_snapshot.get('postExitResolutionConfidence', 0.0))), 0.0), 4),
         'postExitReentryEntryMode': str(safe_trade.get('postExitReentryEntryMode', close_snapshot.get('postExitReentryEntryMode', signal_snapshot.get('postExitReentryEntryMode', ''))) or ''),
         'postExitReentryPullbackPctOriginal': _coerce_float(safe_trade.get('postExitReentryPullbackPctOriginal', close_snapshot.get('postExitReentryPullbackPctOriginal', signal_snapshot.get('postExitReentryPullbackPctOriginal', 0.0))), 0.0),
         'postExitReentryPullbackPctApplied': _coerce_float(safe_trade.get('postExitReentryPullbackPctApplied', close_snapshot.get('postExitReentryPullbackPctApplied', signal_snapshot.get('postExitReentryPullbackPctApplied', 0.0))), 0.0),
         'postExitReentryConfirmDelaySec': int(safe_trade.get('postExitReentryConfirmDelaySec', close_snapshot.get('postExitReentryConfirmDelaySec', signal_snapshot.get('postExitReentryConfirmDelaySec', 0))) or 0),
         'postExitReentryExpiresSec': int(safe_trade.get('postExitReentryExpiresSec', close_snapshot.get('postExitReentryExpiresSec', signal_snapshot.get('postExitReentryExpiresSec', 0))) or 0),
         'postExitReentryExecutionPriority': str(safe_trade.get('postExitReentryExecutionPriority', close_snapshot.get('postExitReentryExecutionPriority', signal_snapshot.get('postExitReentryExecutionPriority', ''))) or ''),
+        'microState5m': str(safe_trade.get('microState5m', close_snapshot.get('microState5m', signal_snapshot.get('microState5m', 'RANGE'))) or 'RANGE'),
+        'setupState15m': str(safe_trade.get('setupState15m', close_snapshot.get('setupState15m', signal_snapshot.get('setupState15m', 'NEUTRAL'))) or 'NEUTRAL'),
+        'backdropState1h': str(safe_trade.get('backdropState1h', close_snapshot.get('backdropState1h', signal_snapshot.get('backdropState1h', 'MIXED'))) or 'MIXED'),
+        'macroState4h': str(safe_trade.get('macroState4h', close_snapshot.get('macroState4h', signal_snapshot.get('macroState4h', 'MIXED'))) or 'MIXED'),
+        'transitionState': str(safe_trade.get('transitionState', close_snapshot.get('transitionState', signal_snapshot.get('transitionState', 'NONE'))) or 'NONE'),
+        'stateConfidence': round(_coerce_float(safe_trade.get('stateConfidence', close_snapshot.get('stateConfidence', signal_snapshot.get('stateConfidence', 0.0))), 0.0), 4),
+        'stateFreshness': str(safe_trade.get('stateFreshness', close_snapshot.get('stateFreshness', signal_snapshot.get('stateFreshness', 'AVAILABLE'))) or 'AVAILABLE'),
+        'dominantSide': str(safe_trade.get('dominantSide', close_snapshot.get('dominantSide', signal_snapshot.get('dominantSide', 'NEUTRAL'))) or 'NEUTRAL'),
+        'allowedEntryFamilies': list(safe_trade.get('allowedEntryFamilies', close_snapshot.get('allowedEntryFamilies', signal_snapshot.get('allowedEntryFamilies', []))) or []),
+        'preferredExitProfile': str(safe_trade.get('preferredExitProfile', close_snapshot.get('preferredExitProfile', signal_snapshot.get('preferredExitProfile', ''))) or ''),
+        'coinStateSource': str(safe_trade.get('coinStateSource', close_snapshot.get('coinStateSource', signal_snapshot.get('coinStateSource', 'INTERNAL_MTF_CONTEXT'))) or 'INTERNAL_MTF_CONTEXT'),
+        'coinStateVersion': str(safe_trade.get('coinStateVersion', close_snapshot.get('coinStateVersion', signal_snapshot.get('coinStateVersion', 'v1'))) or 'v1'),
+        'coinStateRouteReason': str(safe_trade.get('coinStateRouteReason', close_snapshot.get('coinStateRouteReason', signal_snapshot.get('coinStateRouteReason', ''))) or ''),
         'structureTrend': str(safe_trade.get('structureTrend', close_snapshot.get('structureTrend', signal_snapshot.get('structureTrend', 'MIXED'))) or 'MIXED'),
         'swingState': str(safe_trade.get('swingState', close_snapshot.get('swingState', signal_snapshot.get('swingState', 'MIXED'))) or 'MIXED'),
         'compressionState': str(safe_trade.get('compressionState', close_snapshot.get('compressionState', signal_snapshot.get('compressionState', 'NONE'))) or 'NONE'),
@@ -16966,6 +18163,47 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'patternConfidence': round(_coerce_float(safe_trade.get('patternConfidence', close_snapshot.get('patternConfidence', signal_snapshot.get('patternConfidence', 0.0))), 0.0), 4),
         'patternSource': str(safe_trade.get('patternSource', close_snapshot.get('patternSource', signal_snapshot.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED'))) or 'TRADING_PATTERN_SCANNER_INSPIRED'),
         'structureVersion': str(safe_trade.get('structureVersion', close_snapshot.get('structureVersion', signal_snapshot.get('structureVersion', 'v1'))) or 'v1'),
+        'runtimeTacticalStopRoiPct': round(_coerce_float(safe_trade.get('runtimeTacticalStopRoiPct', close_snapshot.get('runtimeTacticalStopRoiPct', 0.0)), 0.0), 4),
+        'runtimeTacticalStopSource': str(safe_trade.get('runtimeTacticalStopSource', close_snapshot.get('runtimeTacticalStopSource', 'EFFECTIVE_STOP')) or 'EFFECTIVE_STOP'),
+        'runtimeTacticalStopPrice': round(_coerce_float(safe_trade.get('runtimeTacticalStopPrice', close_snapshot.get('runtimeTacticalStopPrice', 0.0)), 0.0), 8),
+        'runtimeEmergencyFloorRoiPct': round(_coerce_float(safe_trade.get('runtimeEmergencyFloorRoiPct', close_snapshot.get('runtimeEmergencyFloorRoiPct', 0.0)), 0.0), 4),
+        'runtimeEmergencyFloorPrice': round(_coerce_float(safe_trade.get('runtimeEmergencyFloorPrice', close_snapshot.get('runtimeEmergencyFloorPrice', 0.0)), 0.0), 8),
+        'runtimeExchangeProtectiveMode': str(safe_trade.get('runtimeExchangeProtectiveMode', close_snapshot.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)) or V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY),
+        'runtimeLossProtectionAuthority': str(safe_trade.get('runtimeLossProtectionAuthority', close_snapshot.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD')) or 'ENTRY_STOP_HARD'),
+        'runtimeExchangeProtectionAuthority': str(safe_trade.get('runtimeExchangeProtectionAuthority', close_snapshot.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR')) or 'EMERGENCY_FLOOR'),
+        'runtimeExchangeProtectionRole': str(safe_trade.get('runtimeExchangeProtectionRole', close_snapshot.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE')) or 'LOSS_FAILSAFE'),
+        'runtimeExchangeProtectiveStopRoiPct': round(_coerce_float(safe_trade.get('runtimeExchangeProtectiveStopRoiPct', close_snapshot.get('runtimeExchangeProtectiveStopRoiPct', 0.0)), 0.0), 4),
+        'runtimeExchangeProtectiveStopPrice': round(_coerce_float(safe_trade.get('runtimeExchangeProtectiveStopPrice', close_snapshot.get('runtimeExchangeProtectiveStopPrice', 0.0)), 0.0), 8),
+        'runtimeExitProfile': str(safe_trade.get('runtimeExitProfile', close_snapshot.get('runtimeExitProfile', '')) or ''),
+        'runtimeExitProfileReason': str(safe_trade.get('runtimeExitProfileReason', close_snapshot.get('runtimeExitProfileReason', '')) or ''),
+        'runtimeExitOwner': str(safe_trade.get('runtimeExitOwner', close_snapshot.get('runtimeExitOwner', '')) or ''),
+        'runtimeExitOwnerReason': str(safe_trade.get('runtimeExitOwnerReason', close_snapshot.get('runtimeExitOwnerReason', '')) or ''),
+        'runtimeExitOwnerTightenBias': round(_coerce_float(safe_trade.get('runtimeExitOwnerTightenBias', close_snapshot.get('runtimeExitOwnerTightenBias', 0.0)), 0.0), 4),
+        'runtimeExitOwnerAllowHold': bool(safe_trade.get('runtimeExitOwnerAllowHold', close_snapshot.get('runtimeExitOwnerAllowHold', False))),
+        'runtimeStateDriftState': str(safe_trade.get('runtimeStateDriftState', close_snapshot.get('runtimeStateDriftState', 'ALIGNED')) or 'ALIGNED'),
+        'runtimeStateDriftReason': str(safe_trade.get('runtimeStateDriftReason', close_snapshot.get('runtimeStateDriftReason', 'COIN_STATE_ALIGNED')) or 'COIN_STATE_ALIGNED'),
+        'runtimeStateDriftSeverity': round(_coerce_float(safe_trade.get('runtimeStateDriftSeverity', close_snapshot.get('runtimeStateDriftSeverity', 0.0)), 0.0), 4),
+        'runtimeIntentDecayPct': round(_coerce_float(safe_trade.get('runtimeIntentDecayPct', close_snapshot.get('runtimeIntentDecayPct', 0.0)), 0.0), 4),
+        'runtimeStructuralInvalidationActive': bool(safe_trade.get('runtimeStructuralInvalidationActive', close_snapshot.get('runtimeStructuralInvalidationActive', False))),
+        'runtimeStructuralInvalidationSource': str(safe_trade.get('runtimeStructuralInvalidationSource', close_snapshot.get('runtimeStructuralInvalidationSource', '')) or ''),
+        'runtimeStructuralInvalidationPrice': round(_coerce_float(safe_trade.get('runtimeStructuralInvalidationPrice', close_snapshot.get('runtimeStructuralInvalidationPrice', 0.0)), 0.0), 8),
+        'runtimeStructuralInvalidationRoiPct': round(_coerce_float(safe_trade.get('runtimeStructuralInvalidationRoiPct', close_snapshot.get('runtimeStructuralInvalidationRoiPct', 0.0)), 0.0), 4),
+        'runtimeStructuralInvalidationBufferAbs': round(_coerce_float(safe_trade.get('runtimeStructuralInvalidationBufferAbs', close_snapshot.get('runtimeStructuralInvalidationBufferAbs', 0.0)), 0.0), 8),
+        'reversalRetestEntryMode': str(safe_trade.get('reversalRetestEntryMode', close_snapshot.get('reversalRetestEntryMode', signal_snapshot.get('reversalRetestEntryMode', ''))) or ''),
+        'reversalRetestPullbackPctOriginal': round(_coerce_float(safe_trade.get('reversalRetestPullbackPctOriginal', close_snapshot.get('reversalRetestPullbackPctOriginal', signal_snapshot.get('reversalRetestPullbackPctOriginal', 0.0))), 0.0), 4),
+        'reversalRetestPullbackPctApplied': round(_coerce_float(safe_trade.get('reversalRetestPullbackPctApplied', close_snapshot.get('reversalRetestPullbackPctApplied', signal_snapshot.get('reversalRetestPullbackPctApplied', 0.0))), 0.0), 4),
+        'reversalRetestConfirmDelaySec': int(safe_trade.get('reversalRetestConfirmDelaySec', close_snapshot.get('reversalRetestConfirmDelaySec', signal_snapshot.get('reversalRetestConfirmDelaySec', 0))) or 0),
+        'reversalRetestExpiresSec': int(safe_trade.get('reversalRetestExpiresSec', close_snapshot.get('reversalRetestExpiresSec', signal_snapshot.get('reversalRetestExpiresSec', 0))) or 0),
+        'reversalRetestExecutionPriority': str(safe_trade.get('reversalRetestExecutionPriority', close_snapshot.get('reversalRetestExecutionPriority', signal_snapshot.get('reversalRetestExecutionPriority', ''))) or ''),
+        'reversalRetestZoneState': str(safe_trade.get('reversalRetestZoneState', close_snapshot.get('reversalRetestZoneState', signal_snapshot.get('reversalRetestZoneState', ''))) or ''),
+        'reversalRetestZoneReason': str(safe_trade.get('reversalRetestZoneReason', close_snapshot.get('reversalRetestZoneReason', signal_snapshot.get('reversalRetestZoneReason', ''))) or ''),
+        'reversalRetestZoneSource': str(safe_trade.get('reversalRetestZoneSource', close_snapshot.get('reversalRetestZoneSource', signal_snapshot.get('reversalRetestZoneSource', ''))) or ''),
+        'reversalRetestZonePrice': round(_coerce_float(safe_trade.get('reversalRetestZonePrice', close_snapshot.get('reversalRetestZonePrice', signal_snapshot.get('reversalRetestZonePrice', 0.0))), 0.0), 8),
+        'reversalRetestZoneWidth': round(_coerce_float(safe_trade.get('reversalRetestZoneWidth', close_snapshot.get('reversalRetestZoneWidth', signal_snapshot.get('reversalRetestZoneWidth', 0.0))), 0.0), 8),
+        'reversalRetestPocketPrice': round(_coerce_float(safe_trade.get('reversalRetestPocketPrice', close_snapshot.get('reversalRetestPocketPrice', signal_snapshot.get('reversalRetestPocketPrice', 0.0))), 0.0), 8),
+        'reversalRetestRetestDistancePct': round(_coerce_float(safe_trade.get('reversalRetestRetestDistancePct', close_snapshot.get('reversalRetestRetestDistancePct', signal_snapshot.get('reversalRetestRetestDistancePct', 0.0))), 0.0), 4),
+        'reversalRetestTouchReady': bool(safe_trade.get('reversalRetestTouchReady', close_snapshot.get('reversalRetestTouchReady', signal_snapshot.get('reversalRetestTouchReady', False)))),
+        'reversalRetestZoneConfidence': round(_coerce_float(safe_trade.get('reversalRetestZoneConfidence', close_snapshot.get('reversalRetestZoneConfidence', signal_snapshot.get('reversalRetestZoneConfidence', 0.0))), 0.0), 4),
         'barrierState': str(safe_trade.get('barrierState', close_snapshot.get('barrierState', signal_snapshot.get('barrierState', 'CLEAR'))) or 'CLEAR'),
         'barrierVerdict': str(safe_trade.get('barrierVerdict', close_snapshot.get('barrierVerdict', signal_snapshot.get('barrierVerdict', 'SUPPORTIVE'))) or 'SUPPORTIVE'),
         'adverseLevelType': str(safe_trade.get('adverseLevelType', close_snapshot.get('adverseLevelType', signal_snapshot.get('adverseLevelType', ''))) or ''),
@@ -17116,7 +18354,7 @@ async def _get_trade_for_replay_by_id(trade_id: str) -> Optional[dict]:
 
 
 def classify_signal_entry_archetype(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
-    """Split entries into continuation vs reclaim without changing non-runner logic."""
+    """Split entries into continuation, reclaim or reversal-retest without changing non-runner logic."""
     data = payload or {}
     mode = normalize_strategy_mode(data.get('strategyMode', data.get('strategy_mode', default_mode)))
     explicit_archetype = str(data.get('entryArchetype', data.get('entry_archetype', '')) or '').strip().lower()
@@ -17127,6 +18365,7 @@ def classify_signal_entry_archetype(payload: dict = None, default_mode: str = ST
         and explicit_archetype in (
             DECISION_ARCHETYPE_CONTINUATION,
             DECISION_ARCHETYPE_RECLAIM,
+            DECISION_ARCHETYPE_REVERSAL_RETEST,
             DECISION_ARCHETYPE_EXHAUSTION,
             DECISION_ARCHETYPE_RECOVERY,
         )
@@ -17138,11 +18377,89 @@ def classify_signal_entry_archetype(payload: dict = None, default_mode: str = ST
         return ENTRY_ARCHETYPE_RECLAIM
 
     runner_context = classify_v3_runner_context(data, default_mode=mode) if mode == STRATEGY_MODE_SMART_V3_RUNNER else ''
+    setup_state = str(data.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    transition_state = str(data.get('transitionState', 'NONE') or 'NONE').upper()
+    dominant_side = str(data.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    state_confidence = _coerce_float(data.get('stateConfidence', 0.0), 0.0)
+    allowed_families = [
+        str(item or '').lower()
+        for item in (data.get('allowedEntryFamilies', []) or [])
+        if str(item or '').strip()
+    ]
+    if (
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and setup_state == 'REVERSAL_RETEST'
+        and state_confidence >= 0.45
+        and dominant_side in ('NEUTRAL', side)
+        and ('reversal_retest' in allowed_families or not allowed_families)
+    ):
+        return ENTRY_ARCHETYPE_REVERSAL_RETEST
+    if (
+        mode == STRATEGY_MODE_SMART_V3_RUNNER
+        and transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT', 'BREAKOUT_RETEST', 'RECLAIMING')
+        and state_confidence >= 0.45
+        and dominant_side in ('NEUTRAL', side)
+        and ('reversal_retest' in allowed_families or not allowed_families)
+    ):
+        return ENTRY_ARCHETYPE_REVERSAL_RETEST
     if _breakout_matches_side(breakout, side):
         return ENTRY_ARCHETYPE_CONTINUATION
     if runner_context in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY):
         return ENTRY_ARCHETYPE_CONTINUATION
     return ENTRY_ARCHETYPE_RECLAIM
+
+
+def reconcile_entry_archetype_with_coin_state(
+    entry_archetype: str,
+    side: str,
+    coin_ctx: dict = None,
+    *,
+    allow_block: bool = True,
+) -> tuple[str, str]:
+    safe_side = str(side or '').upper().strip()
+    safe_arch = str(entry_archetype or ENTRY_ARCHETYPE_RECLAIM).strip().lower()
+    if safe_arch not in (
+        ENTRY_ARCHETYPE_CONTINUATION,
+        ENTRY_ARCHETYPE_RECLAIM,
+        ENTRY_ARCHETYPE_REVERSAL_RETEST,
+    ):
+        safe_arch = ENTRY_ARCHETYPE_RECLAIM
+    safe_ctx = coin_ctx if isinstance(coin_ctx, dict) else {}
+    if not _coin_state_context_available(safe_ctx):
+        return safe_arch, 'COIN_STATE_UNAVAILABLE'
+
+    dominant_side = str(safe_ctx.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    setup_state = str(safe_ctx.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+    transition_state = str(safe_ctx.get('transitionState', 'NONE') or 'NONE').upper()
+    state_confidence = _coerce_float(safe_ctx.get('stateConfidence', 0.0), 0.0)
+    allowed_families = [
+        str(item or '').lower()
+        for item in (safe_ctx.get('allowedEntryFamilies', []) or [])
+        if str(item or '').strip()
+    ]
+    reversal_ready = bool(
+        transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT', 'BREAKOUT_RETEST', 'RECLAIMING')
+        or setup_state == 'REVERSAL_RETEST'
+    )
+    if (
+        safe_arch == ENTRY_ARCHETYPE_CONTINUATION
+        and dominant_side not in ('NEUTRAL', safe_side)
+        and state_confidence >= 0.55
+    ):
+        if 'reversal_retest' in allowed_families and reversal_ready:
+            return ENTRY_ARCHETYPE_REVERSAL_RETEST, 'COIN_STATE_ROUTE_REVERSAL'
+        return ('', 'COIN_STATE_CONTINUATION_BLOCKED') if allow_block else (safe_arch, 'COIN_STATE_CONTINUATION_BLOCKED')
+
+    if not allowed_families or safe_arch in allowed_families:
+        return safe_arch, 'COIN_STATE_KEEP'
+
+    if 'reversal_retest' in allowed_families and reversal_ready and dominant_side in ('NEUTRAL', safe_side):
+        return ENTRY_ARCHETYPE_REVERSAL_RETEST, 'COIN_STATE_ROUTE_REVERSAL'
+    if 'continuation' in allowed_families and setup_state == 'CONTINUATION' and dominant_side in ('NEUTRAL', safe_side):
+        return ENTRY_ARCHETYPE_CONTINUATION, 'COIN_STATE_ROUTE_CONTINUATION'
+    if 'reclaim' in allowed_families and setup_state in ('RECLAIM', 'RANGE_FADE', 'NEUTRAL'):
+        return ENTRY_ARCHETYPE_RECLAIM, 'COIN_STATE_ROUTE_RECLAIM'
+    return ('', 'COIN_STATE_FAMILY_BLOCKED') if allow_block else (safe_arch, 'COIN_STATE_FAMILY_BLOCKED')
 
 
 def classify_v3_runner_context(payload: dict = None, default_mode: str = STRATEGY_MODE_LEGACY) -> str:
@@ -23747,6 +25064,26 @@ def dedupe_position_snapshots(positions: list) -> list:
                 'runtimeExchangeBreakEvenPrice', 'currentPrice', 'markPrice', 'openTime',
                 'stopLoss', 'takeProfit', 'trailingStop', 'trailActivation', 'trailDistance',
                 'isTrailingActive', 'runtimeTpRoiPct', 'runtimeStopRoiPct',
+                'runtimeTacticalStopRoiPct', 'runtimeEmergencyFloorRoiPct',
+                'runtimeTacticalStopPrice', 'runtimeEmergencyFloorPrice',
+                'runtimeExchangeProtectiveMode', 'runtimeExchangeProtectiveStopRoiPct',
+                'runtimeExchangeProtectiveStopPrice', 'runtimeLossProtectionAuthority',
+                'runtimeExchangeProtectionAuthority', 'runtimeExchangeProtectionRole',
+                'runtimeExitProfile',
+                'runtimeExitProfileReason', 'runtimeExitOwner',
+                'runtimeExitOwnerReason', 'runtimeExitOwnerTightenBias',
+                'runtimeExitOwnerAllowHold', 'runtimeStateDriftState',
+                'runtimeStateDriftReason', 'runtimeStateDriftSeverity',
+                'runtimeIntentDecayPct',
+                'microState5m', 'setupState15m', 'backdropState1h', 'macroState4h',
+                'transitionState', 'stateConfidence', 'stateFreshness',
+                'dominantSide', 'allowedEntryFamilies', 'preferredExitProfile',
+                'coinStateSource', 'coinStateVersion',
+                'reversalRetestZoneState', 'reversalRetestZoneReason',
+                'reversalRetestZoneSource', 'reversalRetestZonePrice',
+                'reversalRetestZoneWidth', 'reversalRetestPocketPrice',
+                'reversalRetestRetestDistancePct', 'reversalRetestTouchReady',
+                'reversalRetestZoneConfidence',
                 'runtimeProfitPhase', 'runtimeProfitOwner', 'runtimeProfitPeakRoiPct',
                 'runtimeProfitGivebackRoiPct', 'runtimeTrailDistanceRoiPct',
                 'runtimeTrailActivationRoiPct', 'unrealizedPnl', 'unrealizedPnlPercent',
@@ -25229,6 +26566,22 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         )
                         merged['runtimeTpRoiPct'] = paper_pos.get('runtimeTpRoiPct', 0.0)
                         merged['runtimeStopRoiPct'] = paper_pos.get('runtimeStopRoiPct', 0.0)
+                        merged['runtimeTacticalStopRoiPct'] = paper_pos.get('runtimeTacticalStopRoiPct', merged['runtimeStopRoiPct'])
+                        merged['runtimeTacticalStopSource'] = paper_pos.get('runtimeTacticalStopSource', 'EFFECTIVE_STOP')
+                        merged['runtimeEmergencyFloorRoiPct'] = paper_pos.get('runtimeEmergencyFloorRoiPct')
+                        merged['runtimeTacticalStopPrice'] = paper_pos.get('runtimeTacticalStopPrice', paper_pos.get('stopLoss', 0.0))
+                        merged['runtimeEmergencyFloorPrice'] = paper_pos.get('runtimeEmergencyFloorPrice', 0.0)
+                        merged['runtimeStructuralInvalidationActive'] = bool(paper_pos.get('runtimeStructuralInvalidationActive', False))
+                        merged['runtimeStructuralInvalidationSource'] = paper_pos.get('runtimeStructuralInvalidationSource', '')
+                        merged['runtimeStructuralInvalidationPrice'] = paper_pos.get('runtimeStructuralInvalidationPrice', 0.0)
+                        merged['runtimeStructuralInvalidationRoiPct'] = paper_pos.get('runtimeStructuralInvalidationRoiPct', 0.0)
+                        merged['runtimeStructuralInvalidationBufferAbs'] = paper_pos.get('runtimeStructuralInvalidationBufferAbs', 0.0)
+                        merged['runtimeExchangeProtectiveMode'] = paper_pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)
+                        merged['runtimeLossProtectionAuthority'] = paper_pos.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD')
+                        merged['runtimeExchangeProtectionAuthority'] = paper_pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR')
+                        merged['runtimeExchangeProtectionRole'] = paper_pos.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE')
+                        merged['runtimeExchangeProtectiveStopRoiPct'] = paper_pos.get('runtimeExchangeProtectiveStopRoiPct', merged['runtimeStopRoiPct'])
+                        merged['runtimeExchangeProtectiveStopPrice'] = paper_pos.get('runtimeExchangeProtectiveStopPrice', merged['runtimeTacticalStopPrice'])
                         merged['runtimeEntryStopGateMode'] = paper_pos.get('runtimeEntryStopGateMode', 'normal')
                         merged['runtimeEntryStopRoiPct'] = paper_pos.get('runtimeEntryStopRoiPct', merged['runtimeStopRoiPct'])
                         merged['runtimePreStopReduceRoiPct'] = paper_pos.get('runtimePreStopReduceRoiPct')
@@ -25240,6 +26593,38 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['runtimeRegimeFlags'] = paper_pos.get('runtimeRegimeFlags', [])
                         merged['runtimeSignalInvalidationState'] = paper_pos.get('runtimeSignalInvalidationState', {})
                         merged['runtimeProtectionPhase'] = paper_pos.get('runtimeProtectionPhase', 'SL-PRIMARY')
+                        merged['runtimeExitProfile'] = paper_pos.get('runtimeExitProfile', V3_EXIT_PROFILE_BALANCED)
+                        merged['runtimeExitProfileReason'] = paper_pos.get('runtimeExitProfileReason', 'BALANCED_FLOW')
+                        merged['runtimeExitOwner'] = paper_pos.get('runtimeExitOwner', V3_EXIT_OWNER_BALANCED)
+                        merged['runtimeExitOwnerReason'] = paper_pos.get('runtimeExitOwnerReason', 'BALANCED_EXIT_CONTROL')
+                        merged['runtimeExitOwnerTightenBias'] = paper_pos.get('runtimeExitOwnerTightenBias', 0.0)
+                        merged['runtimeExitOwnerAllowHold'] = bool(paper_pos.get('runtimeExitOwnerAllowHold', False))
+                        merged['runtimeStateDriftState'] = paper_pos.get('runtimeStateDriftState', 'ALIGNED')
+                        merged['runtimeStateDriftReason'] = paper_pos.get('runtimeStateDriftReason', 'COIN_STATE_ALIGNED')
+                        merged['runtimeStateDriftSeverity'] = paper_pos.get('runtimeStateDriftSeverity', 0.0)
+                        merged['runtimeIntentDecayPct'] = paper_pos.get('runtimeIntentDecayPct', 0.0)
+                        merged['microState5m'] = paper_pos.get('microState5m', 'RANGE')
+                        merged['setupState15m'] = paper_pos.get('setupState15m', 'NEUTRAL')
+                        merged['backdropState1h'] = paper_pos.get('backdropState1h', 'MIXED')
+                        merged['macroState4h'] = paper_pos.get('macroState4h', 'MIXED')
+                        merged['transitionState'] = paper_pos.get('transitionState', 'NONE')
+                        merged['stateConfidence'] = paper_pos.get('stateConfidence', 0.0)
+                        merged['stateFreshness'] = paper_pos.get('stateFreshness', 'AVAILABLE')
+                        merged['dominantSide'] = paper_pos.get('dominantSide', 'NEUTRAL')
+                        merged['allowedEntryFamilies'] = paper_pos.get('allowedEntryFamilies', [])
+                        merged['preferredExitProfile'] = paper_pos.get('preferredExitProfile', merged['runtimeExitProfile'])
+                        merged['coinStateSource'] = paper_pos.get('coinStateSource', 'INTERNAL_MTF_CONTEXT')
+                        merged['coinStateVersion'] = paper_pos.get('coinStateVersion', 'v1')
+                        merged['coinStateRouteReason'] = paper_pos.get('coinStateRouteReason', '')
+                        merged['reversalRetestZoneState'] = paper_pos.get('reversalRetestZoneState', '')
+                        merged['reversalRetestZoneReason'] = paper_pos.get('reversalRetestZoneReason', '')
+                        merged['reversalRetestZoneSource'] = paper_pos.get('reversalRetestZoneSource', '')
+                        merged['reversalRetestZonePrice'] = paper_pos.get('reversalRetestZonePrice', 0.0)
+                        merged['reversalRetestZoneWidth'] = paper_pos.get('reversalRetestZoneWidth', 0.0)
+                        merged['reversalRetestPocketPrice'] = paper_pos.get('reversalRetestPocketPrice', 0.0)
+                        merged['reversalRetestRetestDistancePct'] = paper_pos.get('reversalRetestRetestDistancePct', 0.0)
+                        merged['reversalRetestTouchReady'] = bool(paper_pos.get('reversalRetestTouchReady', False))
+                        merged['reversalRetestZoneConfidence'] = paper_pos.get('reversalRetestZoneConfidence', 0.0)
                         merged['runtimeTrailActivationMovePct'] = paper_pos.get('runtimeTrailActivationMovePct', 0.0)
                         merged['runtimeTrailActivationRoiPct'] = paper_pos.get('runtimeTrailActivationRoiPct', 0.0)
                         merged['runtimeTrailThresholdMult'] = paper_pos.get('runtimeTrailThresholdMult', 1.0)
@@ -25291,6 +26676,22 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         )
                         merged['runtimeTpRoiPct'] = compute_target_roi_pct(entry, merged.get('takeProfit', 0), merged.get('side', 'LONG'), merged.get('leverage', 1))
                         merged['runtimeStopRoiPct'] = compute_target_roi_pct(entry, get_effective_stop_price(merged), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                        merged['runtimeTacticalStopRoiPct'] = merged['runtimeStopRoiPct']
+                        merged['runtimeTacticalStopSource'] = 'EFFECTIVE_STOP'
+                        merged['runtimeEmergencyFloorRoiPct'] = None
+                        merged['runtimeTacticalStopPrice'] = get_effective_stop_price(merged)
+                        merged['runtimeEmergencyFloorPrice'] = 0.0
+                        merged['runtimeStructuralInvalidationActive'] = False
+                        merged['runtimeStructuralInvalidationSource'] = ''
+                        merged['runtimeStructuralInvalidationPrice'] = 0.0
+                        merged['runtimeStructuralInvalidationRoiPct'] = 0.0
+                        merged['runtimeStructuralInvalidationBufferAbs'] = 0.0
+                        merged['runtimeExchangeProtectiveMode'] = V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+                        merged['runtimeLossProtectionAuthority'] = 'ENTRY_STOP_HARD'
+                        merged['runtimeExchangeProtectionAuthority'] = 'EMERGENCY_FLOOR'
+                        merged['runtimeExchangeProtectionRole'] = 'LOSS_FAILSAFE'
+                        merged['runtimeExchangeProtectiveStopRoiPct'] = merged['runtimeEmergencyFloorRoiPct'] if merged['runtimeEmergencyFloorRoiPct'] is not None else merged['runtimeStopRoiPct']
+                        merged['runtimeExchangeProtectiveStopPrice'] = merged['runtimeEmergencyFloorPrice'] or merged['runtimeTacticalStopPrice']
                         merged['runtimeEntryStopGateMode'] = merged.get('entryStopGateMode', 'normal')
                         merged['runtimeEntryStopRoiPct'] = merged['runtimeStopRoiPct']
                         merged['runtimePreStopReduceRoiPct'] = None
@@ -25302,6 +26703,38 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         merged['runtimeRegimeFlags'] = []
                         merged['runtimeSignalInvalidationState'] = {}
                         merged['runtimeProtectionPhase'] = 'SL-PRIMARY'
+                        merged['runtimeExitProfile'] = V3_EXIT_PROFILE_BALANCED
+                        merged['runtimeExitProfileReason'] = 'BALANCED_FLOW'
+                        merged['runtimeExitOwner'] = V3_EXIT_OWNER_BALANCED
+                        merged['runtimeExitOwnerReason'] = 'BALANCED_EXIT_CONTROL'
+                        merged['runtimeExitOwnerTightenBias'] = 0.0
+                        merged['runtimeExitOwnerAllowHold'] = False
+                        merged['runtimeStateDriftState'] = 'ALIGNED'
+                        merged['runtimeStateDriftReason'] = 'COIN_STATE_ALIGNED'
+                        merged['runtimeStateDriftSeverity'] = 0.0
+                        merged['runtimeIntentDecayPct'] = 0.0
+                        merged['microState5m'] = merged.get('microState5m', 'RANGE')
+                        merged['setupState15m'] = merged.get('setupState15m', 'NEUTRAL')
+                        merged['backdropState1h'] = merged.get('backdropState1h', 'MIXED')
+                        merged['macroState4h'] = merged.get('macroState4h', 'MIXED')
+                        merged['transitionState'] = merged.get('transitionState', 'NONE')
+                        merged['stateConfidence'] = merged.get('stateConfidence', 0.0)
+                        merged['stateFreshness'] = merged.get('stateFreshness', 'AVAILABLE')
+                        merged['dominantSide'] = merged.get('dominantSide', 'NEUTRAL')
+                        merged['allowedEntryFamilies'] = merged.get('allowedEntryFamilies', [])
+                        merged['preferredExitProfile'] = merged.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED)
+                        merged['coinStateSource'] = merged.get('coinStateSource', 'INTERNAL_MTF_CONTEXT')
+                        merged['coinStateVersion'] = merged.get('coinStateVersion', 'v1')
+                        merged['coinStateRouteReason'] = merged.get('coinStateRouteReason', '')
+                        merged['reversalRetestZoneState'] = merged.get('reversalRetestZoneState', '')
+                        merged['reversalRetestZoneReason'] = merged.get('reversalRetestZoneReason', '')
+                        merged['reversalRetestZoneSource'] = merged.get('reversalRetestZoneSource', '')
+                        merged['reversalRetestZonePrice'] = merged.get('reversalRetestZonePrice', 0.0)
+                        merged['reversalRetestZoneWidth'] = merged.get('reversalRetestZoneWidth', 0.0)
+                        merged['reversalRetestPocketPrice'] = merged.get('reversalRetestPocketPrice', 0.0)
+                        merged['reversalRetestRetestDistancePct'] = merged.get('reversalRetestRetestDistancePct', 0.0)
+                        merged['reversalRetestTouchReady'] = bool(merged.get('reversalRetestTouchReady', False))
+                        merged['reversalRetestZoneConfidence'] = merged.get('reversalRetestZoneConfidence', 0.0)
                         merged['runtimeTrailActivationMovePct'] = 0.0
                         merged['runtimeTrailActivationRoiPct'] = 0.0
                         merged['runtimeTrailThresholdMult'] = 1.0
@@ -27353,6 +28786,97 @@ def _is_post_exit_reentry_signal_eligible(watch: dict, signal: dict) -> bool:
     )
 
 
+def _is_post_exit_opposite_reversal_signal_eligible(
+    watch: dict,
+    signal: dict,
+    *,
+    structure_ctx: Optional[dict] = None,
+) -> tuple[bool, str]:
+    safe_watch = watch if isinstance(watch, dict) else {}
+    safe_signal = signal if isinstance(signal, dict) else {}
+    decision_ctx = safe_signal.get('decisionContext') if isinstance(safe_signal.get('decisionContext'), dict) else {}
+    if not safe_signal:
+        return False, 'NO_SIGNAL'
+
+    previous_side = str(safe_watch.get('side', '') or '').upper()
+    opposite_side = _opposite_side(previous_side)
+    signal_side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    if not previous_side or signal_side != opposite_side:
+        return False, 'WRONG_SIDE'
+
+    signal_score = max(
+        _coerce_float(safe_signal.get('confidenceScore', 0.0), 0.0),
+        _coerce_float(safe_signal.get('signalScore', 0.0), 0.0),
+    )
+    if signal_score < V3_POST_EXIT_REENTRY_OPPOSITE_SIGNAL_SCORE_FLOOR:
+        return False, 'LOW_SCORE'
+
+    volume_ratio = _coerce_float(
+        safe_signal.get('currentVolumeRatio', safe_signal.get('volumeRatio', safe_watch.get('currentVolumeRatio', 0.0))),
+        _coerce_float(safe_watch.get('currentVolumeRatio', 0.0), 0.0),
+    )
+    is_volume_spike = bool(
+        safe_signal.get('currentIsVolumeSpike', safe_signal.get('isVolumeSpike', safe_watch.get('currentIsVolumeSpike', False)))
+    )
+    exec_score = _coerce_float(
+        safe_signal.get('currentExecScore', safe_signal.get('entryExecScore', safe_watch.get('currentExecScore', 0.0))),
+        _coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0),
+    )
+    ob_trend = _coerce_float(
+        safe_signal.get('currentObImbalanceTrend', safe_signal.get('obImbalanceTrend', safe_watch.get('currentObImbalanceTrend', 0.0))),
+        _coerce_float(safe_watch.get('currentObImbalanceTrend', 0.0), 0.0),
+    )
+    imbalance = _coerce_float(
+        safe_signal.get('currentImbalance', safe_signal.get('imbalance', safe_watch.get('currentImbalance', 0.0))),
+        _coerce_float(safe_watch.get('currentImbalance', 0.0), 0.0),
+    )
+    structure = structure_ctx if isinstance(structure_ctx, dict) else safe_signal
+    structure_ok, structure_reason = _structure_context_supports_opposite_reversal(structure, opposite_side)
+
+    tape_aligned = bool(
+        _is_side_ob_trend_aligned(opposite_side, ob_trend, threshold=max(1.5, V3_THESIS_OBI_ALIGN_THRESHOLD - 0.5))
+        or _is_side_imbalance_hostile(previous_side, imbalance, threshold=6.0)
+    )
+    volume_ok = volume_ratio >= V3_POST_EXIT_REENTRY_OPPOSITE_VOLUME_FLOOR or is_volume_spike
+    exec_ok = exec_score >= V3_POST_EXIT_REENTRY_OPPOSITE_EXEC_SCORE_FLOOR
+    signal_entry_arch = str(safe_signal.get('entryArchetype', decision_ctx.get('entryArchetype', '')) or '').lower()
+    direction_owner = str(safe_signal.get('directionOwner', decision_ctx.get('directionOwner', '')) or '').lower()
+    direction_ok = bool(
+        signal_entry_arch in (ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM)
+        or direction_owner in ('continuation', 'reclaim', 'recovery')
+    )
+    if not direction_ok:
+        return False, 'NO_REVERSAL_INTENT'
+    if not exec_ok:
+        return False, 'LOW_EXEC'
+    if not (structure_ok or tape_aligned):
+        return False, structure_reason or 'NO_OPPOSITE_EDGE'
+    if not (volume_ok or tape_aligned):
+        return False, 'LOW_VOLUME'
+    return True, 'OPPOSITE_REVERSAL'
+
+
+def _score_post_exit_resolution_candidate(mode: str, signal: dict, watch: dict, *, structure_boost: float = 0.0) -> float:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_watch = watch if isinstance(watch, dict) else {}
+    base_score = max(
+        _coerce_float(safe_signal.get('confidenceScore', 0.0), 0.0),
+        _coerce_float(safe_signal.get('signalScore', 0.0), 0.0),
+    )
+    exec_score = _coerce_float(
+        safe_signal.get('currentExecScore', safe_signal.get('entryExecScore', safe_watch.get('currentExecScore', 0.0))),
+        _coerce_float(safe_watch.get('currentExecScore', 0.0), 0.0),
+    )
+    volume_ratio = _coerce_float(
+        safe_signal.get('currentVolumeRatio', safe_signal.get('volumeRatio', safe_watch.get('currentVolumeRatio', 0.0))),
+        _coerce_float(safe_watch.get('currentVolumeRatio', 0.0), 0.0),
+    )
+    score = base_score + min(12.0, max(0.0, exec_score - 55.0) * 0.20) + min(6.0, max(0.0, volume_ratio - 1.0) * 10.0)
+    if str(mode or '') == POST_EXIT_RESOLUTION_MODE_OPPOSITE:
+        score += 4.0
+    return round(score + float(structure_boost or 0.0), 4)
+
+
 def resolve_post_exit_reentry_entry_profile(signal: dict, opportunity: dict, watch: dict) -> dict:
     safe_signal = signal if isinstance(signal, dict) else {}
     safe_opp = opportunity if isinstance(opportunity, dict) else {}
@@ -27425,6 +28949,107 @@ def resolve_post_exit_reentry_entry_profile(signal: dict, opportunity: dict, wat
     }
 
 
+def resolve_reversal_retest_entry_profile(signal: dict, *, current_price: float, atr: float, side: str) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    safe_side = str(side or safe_signal.get('action', safe_signal.get('side', 'LONG')) or 'LONG').upper()
+    if str(safe_signal.get('entryArchetype', '') or '').strip().lower() != ENTRY_ARCHETYPE_REVERSAL_RETEST:
+        return {}
+
+    current_price = _coerce_float(current_price, 0.0)
+    if current_price <= 0:
+        return {}
+
+    zone_ctx = analyze_reversal_retest_zone_context(
+        safe_signal,
+        current_price=current_price,
+        atr=atr,
+        side=safe_side,
+    )
+    zone_state = str(zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE').upper()
+    if zone_state == 'UNAVAILABLE':
+        return {}
+
+    raw_entry_price = _coerce_float(safe_signal.get('entryPrice', current_price), current_price)
+    original_pullback_pct = _coerce_float(
+        safe_signal.get(
+            'pullbackDynFinal',
+            safe_signal.get(
+                'pullbackPct',
+                abs(current_price - raw_entry_price) / max(current_price, 1e-8) * 100.0 if raw_entry_price > 0 else 0.0,
+            ),
+        ),
+        0.0,
+    )
+    if original_pullback_pct <= 0 and raw_entry_price > 0:
+        original_pullback_pct = abs(current_price - raw_entry_price) / max(current_price, 1e-8) * 100.0
+
+    supportive_distance_pct = _coerce_float(
+        safe_signal.get(
+            'supportiveDistancePct',
+            ((abs(current_price - _coerce_float(safe_signal.get('supportiveLevelPrice', 0.0), 0.0)) / current_price) * 100.0)
+            if _coerce_float(safe_signal.get('supportiveLevelPrice', 0.0), 0.0) > 0 else 0.0,
+        ),
+        0.0,
+    )
+    atr_pct = _coerce_float(
+        safe_signal.get('currentAtrPct', safe_signal.get('atrPct', 0.0)),
+        0.0,
+    )
+    if atr_pct <= 0 and atr > 0:
+        atr_pct = (atr / current_price) * 100.0
+
+    target_pullback_pct = max(
+        V3_REVERSAL_RETEST_PULLBACK_MIN_PCT,
+        min(V3_REVERSAL_RETEST_PULLBACK_MAX_PCT, atr_pct * V3_REVERSAL_RETEST_PULLBACK_ATR_MULT),
+    )
+    if supportive_distance_pct > 0:
+        supportive_cap = max(
+            V3_REVERSAL_RETEST_PULLBACK_MIN_PCT,
+            min(V3_REVERSAL_RETEST_PULLBACK_MAX_PCT, supportive_distance_pct * 1.10),
+        )
+        target_pullback_pct = min(target_pullback_pct, supportive_cap)
+
+    retest_state = str(safe_signal.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    transition_state = str(safe_signal.get('transitionState', 'NONE') or 'NONE').upper()
+    if retest_state in ('BULL_RETEST_HOLD', 'BEAR_RETEST_HOLD'):
+        target_pullback_pct = min(target_pullback_pct, max(V3_REVERSAL_RETEST_PULLBACK_MIN_PCT, target_pullback_pct * 0.90))
+    if transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT'):
+        target_pullback_pct = min(target_pullback_pct, max(V3_REVERSAL_RETEST_PULLBACK_MIN_PCT, target_pullback_pct * 0.92))
+
+    if original_pullback_pct <= 0:
+        original_pullback_pct = target_pullback_pct
+    effective_pullback_pct = min(original_pullback_pct, target_pullback_pct)
+    pocket_price = _coerce_float(zone_ctx.get('pocketPrice', 0.0), 0.0)
+    if pocket_price > 0:
+        entry_price = pocket_price
+        effective_pullback_pct = max(
+            V3_REVERSAL_RETEST_PULLBACK_MIN_PCT,
+            abs(current_price - pocket_price) / max(current_price, 1e-8) * 100.0,
+        )
+    else:
+        entry_price = current_price * (1.0 + (effective_pullback_pct / 100.0)) if safe_side == 'SHORT' else current_price * (1.0 - (effective_pullback_pct / 100.0))
+
+    return {
+        'reversalRetestEntryMode': 'RETEST_POCKET',
+        'reversalRetestPullbackPctOriginal': round(original_pullback_pct, 4),
+        'reversalRetestPullbackPctApplied': round(effective_pullback_pct, 4),
+        'reversalRetestConfirmDelaySec': V3_REVERSAL_RETEST_CONFIRM_DELAY_SEC,
+        'reversalRetestExpiresSec': V3_REVERSAL_RETEST_EXPIRES_SEC,
+        'reversalRetestExecutionPriority': 'REVERSAL_RETEST',
+        'signalPrice': current_price,
+        'entryPrice': entry_price,
+        'reversalRetestZoneState': str(zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+        'reversalRetestZoneReason': str(zone_ctx.get('zoneReason', '') or ''),
+        'reversalRetestZoneSource': str(zone_ctx.get('zoneSource', '') or ''),
+        'reversalRetestZonePrice': round(_coerce_float(zone_ctx.get('zonePrice', 0.0), 0.0), 8),
+        'reversalRetestZoneWidth': round(_coerce_float(zone_ctx.get('zoneWidth', 0.0), 0.0), 8),
+        'reversalRetestPocketPrice': round(_coerce_float(zone_ctx.get('pocketPrice', 0.0), 0.0), 8),
+        'reversalRetestRetestDistancePct': round(_coerce_float(zone_ctx.get('retestDistancePct', 0.0), 0.0), 4),
+        'reversalRetestTouchReady': bool(zone_ctx.get('touchReady', False)),
+        'reversalRetestZoneConfidence': round(_coerce_float(zone_ctx.get('confidence', 0.0), 0.0), 4),
+    }
+
+
 def _should_suppress_generic_signal_for_post_exit_watch(signal: dict) -> bool:
     safe_signal = signal if isinstance(signal, dict) else {}
     if not safe_signal or bool(safe_signal.get('isPostExitReentry', False)):
@@ -27443,7 +29068,7 @@ def _should_suppress_generic_signal_for_post_exit_watch(signal: dict) -> bool:
     ):
         return False
     signal_side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
-    watch_side = str(watch.get('side', '') or '').upper()
+    watch_side = str(watch.get('resolutionTargetSide', watch.get('side', '')) or watch.get('side', '')).upper()
     return bool(signal_side and watch_side and signal_side == watch_side)
 
 
@@ -27454,7 +29079,14 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
     safe_signal = _reentry_copy.deepcopy(signal if isinstance(signal, dict) else {})
     safe_opp = opportunity if isinstance(opportunity, dict) else {}
     symbol = str(safe_watch.get('symbol', safe_signal.get('symbol', safe_opp.get('symbol', ''))) or '').upper()
-    side = str(safe_watch.get('side', safe_signal.get('action', safe_signal.get('side', 'LONG'))) or 'LONG').upper()
+    side = str(
+        safe_watch.get(
+            'resolutionTargetSide',
+            safe_signal.get('action', safe_signal.get('side', safe_watch.get('side', 'LONG'))),
+        )
+        or safe_watch.get('side', 'LONG')
+    ).upper()
+    resolution_mode = str(safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE)
     safe_opp = apply_market_structure_context(dict(safe_opp), symbol=symbol, side=side) if isinstance(safe_opp, dict) and safe_opp else safe_opp
     safe_signal = apply_market_structure_context(safe_signal, symbol=symbol, side=side) if isinstance(safe_signal, dict) else safe_signal
     safe_watch = apply_market_structure_context(safe_watch, symbol=symbol, side=side) if isinstance(safe_watch, dict) else safe_watch
@@ -27467,6 +29099,47 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         _coerce_float(safe_watch.get('originalSignalScore', 0.0), 0.0),
     )
     base_size_mult = _coerce_float(safe_signal.get('sizeMultiplier', 1.0), 1.0)
+    original_target_entry_archetype = str(
+        safe_watch.get(
+            'resolutionEntryArchetype',
+            safe_signal.get('entryArchetype', safe_signal.get('decisionContext', {}).get('entryArchetype', ENTRY_ARCHETYPE_CONTINUATION)),
+        )
+        or ENTRY_ARCHETYPE_CONTINUATION
+    ).lower()
+    target_entry_archetype = str(
+        safe_watch.get(
+            'resolutionEntryArchetype',
+            safe_signal.get('entryArchetype', safe_signal.get('decisionContext', {}).get('entryArchetype', ENTRY_ARCHETYPE_CONTINUATION)),
+        )
+        or ENTRY_ARCHETYPE_CONTINUATION
+    ).lower()
+    if resolution_mode == POST_EXIT_RESOLUTION_MODE_OPPOSITE and target_entry_archetype in ('', ENTRY_ARCHETYPE_CONTINUATION):
+        target_entry_archetype = ENTRY_ARCHETYPE_REVERSAL_RETEST
+    target_entry_archetype, _coin_route_reason = reconcile_entry_archetype_with_coin_state(
+        target_entry_archetype,
+        side,
+        safe_signal if isinstance(safe_signal, dict) and safe_signal else safe_opp,
+        allow_block=False,
+    )
+    if (
+        resolution_mode == POST_EXIT_RESOLUTION_MODE_OPPOSITE
+        and original_target_entry_archetype in ('', ENTRY_ARCHETYPE_CONTINUATION)
+        and target_entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST
+        and _coin_route_reason == 'COIN_STATE_KEEP'
+    ):
+        _coin_route_reason = 'COIN_STATE_ROUTE_REVERSAL'
+    if not target_entry_archetype:
+        target_entry_archetype = ENTRY_ARCHETYPE_CONTINUATION if resolution_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else ENTRY_ARCHETYPE_REVERSAL_RETEST
+    if target_entry_archetype not in (
+        ENTRY_ARCHETYPE_CONTINUATION,
+        ENTRY_ARCHETYPE_RECLAIM,
+        ENTRY_ARCHETYPE_REVERSAL_RETEST,
+    ):
+        target_entry_archetype = (
+            ENTRY_ARCHETYPE_CONTINUATION
+            if resolution_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+            else ENTRY_ARCHETYPE_REVERSAL_RETEST
+        )
     safe_signal.pop('signalId', None)
     safe_signal.pop('signal_id', None)
     safe_signal.update({
@@ -27483,9 +29156,12 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'execution_profile_source': 'post_exit_reentry_shallow',
         'confidenceScore': base_score,
         'signalScore': base_score,
-        'entryArchetype': ENTRY_ARCHETYPE_CONTINUATION,
+        'entryArchetype': target_entry_archetype,
         'runnerContextResolved': str(
-            safe_signal.get('runnerContextResolved', safe_signal.get('runnerContext', safe_watch.get('runnerContextResolved', V3_RUNNER_CONTEXT_TREND)))
+            safe_watch.get(
+                'resolutionRunnerContext',
+                safe_signal.get('runnerContextResolved', safe_signal.get('runnerContext', safe_watch.get('runnerContextResolved', V3_RUNNER_CONTEXT_TREND))),
+            )
             or safe_watch.get('runnerContextResolved', V3_RUNNER_CONTEXT_TREND)
         ),
         'strategyMode': STRATEGY_MODE_SMART_V3_RUNNER,
@@ -27500,6 +29176,11 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'reentryOriginExitReason': str(safe_watch.get('exitReason', '') or ''),
         'reentryWatcherId': str(safe_watch.get('watcherId', '') or ''),
         'reentryOriginSignalId': str(safe_watch.get('signalId', '') or ''),
+        'postExitResolutionMode': resolution_mode,
+        'postExitResolutionTargetSide': side,
+        'postExitResolutionReason': str(safe_watch.get('resolutionReason', '') or ''),
+        'postExitResolutionConfidence': _coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0),
+        'coinStateRouteReason': _coin_route_reason,
         'postExitReentryEntryMode': str(reentry_profile.get('postExitReentryEntryMode', 'SHALLOW_PULLBACK') or 'SHALLOW_PULLBACK'),
         'postExitReentryPullbackPctOriginal': _coerce_float(reentry_profile.get('postExitReentryPullbackPctOriginal', 0.0), 0.0),
         'postExitReentryPullbackPctApplied': _coerce_float(reentry_profile.get('postExitReentryPullbackPctApplied', 0.0), 0.0),
@@ -27518,8 +29199,14 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
     if safe_signal.get('entryExecScore', 0.0) <= 0:
         safe_signal['entryExecScore'] = safe_signal.get('currentExecScore', 0.0)
     if not safe_signal.get('directionOwner'):
-        safe_signal['directionOwner'] = 'continuation'
-    safe_signal['directionReason'] = str(safe_signal.get('directionReason', '') or 'POST_EXIT_CONTINUATION_REENTRY')
+        safe_signal['directionOwner'] = 'continuation' if resolution_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else 'reversal_retest'
+    safe_signal['directionReason'] = str(
+        safe_signal.get(
+            'directionReason',
+            ''
+        )
+        or ('POST_EXIT_CONTINUATION_REENTRY' if resolution_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else 'POST_EXIT_OPPOSITE_REVERSAL')
+    )
     telemetry = safe_signal.get('telemetry', {})
     if not isinstance(telemetry, dict):
         telemetry = {}
@@ -27528,6 +29215,9 @@ def _build_post_exit_reentry_signal(watch: dict, signal: dict, opportunity: dict
         'reentryOriginTradeId': safe_signal['reentryOriginTradeId'],
         'reentryOriginExitReason': safe_signal['reentryOriginExitReason'],
         'reentryWatcherId': safe_signal['reentryWatcherId'],
+        'postExitResolutionMode': resolution_mode,
+        'postExitResolutionTargetSide': side,
+        'coinStateRouteReason': _coin_route_reason,
         'postExitReentryEntryMode': safe_signal.get('postExitReentryEntryMode', 'SHALLOW_PULLBACK'),
         'postExitReentryPullbackPctApplied': safe_signal.get('postExitReentryPullbackPctApplied', 0.0),
         'postExitReentryConfirmDelaySec': safe_signal.get('postExitReentryConfirmDelaySec', V3_POST_EXIT_REENTRY_CONFIRM_DELAY_SEC),
@@ -27576,7 +29266,7 @@ async def dispatch_post_exit_reentry_watch(watch: dict, signal: dict, opportunit
         safe_watch['watchExpiresTs'] = max(_coerce_float(safe_watch.get('watchExpiresTs', 0.0), 0.0), time.time() + 120.0)
         queue_post_exit_reentry_watch_snapshot(safe_watch, reason='confirmed', opportunity=opportunity, signal=reentry_signal)
         logger.info(
-            f"🚀 POST_EXIT_REENTRY_TRIGGERED: {symbol} {safe_watch.get('side', 'LONG')} "
+            f"🚀 POST_EXIT_REENTRY_TRIGGERED: {symbol} {safe_watch.get('resolutionTargetSide', safe_watch.get('side', 'LONG'))} "
             f"watcher={safe_watch.get('watcherId', '')} pending={safe_watch.get('reentryPendingEntryId', '')} "
             f"position={safe_watch.get('reentryPositionId', '')}"
         )
@@ -27587,7 +29277,7 @@ async def dispatch_post_exit_reentry_watch(watch: dict, signal: dict, opportunit
     queue_post_exit_reentry_watch_snapshot(safe_watch, reason='dispatch_rejected', opportunity=opportunity, signal=reentry_signal)
     post_exit_reentry_watchers.pop(symbol, None)
     logger.info(
-        f"🚫 POST_EXIT_REENTRY_REJECTED: {symbol} {safe_watch.get('side', 'LONG')} "
+        f"🚫 POST_EXIT_REENTRY_REJECTED: {symbol} {safe_watch.get('resolutionTargetSide', safe_watch.get('side', 'LONG'))} "
         f"reason={safe_watch.get('cancelReason', 'CANCELLED_REJECTED')}"
     )
     return False
@@ -27607,6 +29297,7 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         if symbol and symbol not in opp_by_symbol:
             opp_by_symbol[symbol] = opp
     signal_by_symbol = {}
+    signal_by_symbol_side = {}
     for sig in signals or []:
         if not isinstance(sig, dict):
             continue
@@ -27617,6 +29308,11 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
         current_best = signal_by_symbol.get(symbol)
         if current_best is None or score > _coerce_float(current_best.get('confidenceScore', 0.0), 0.0):
             signal_by_symbol[symbol] = sig
+        side_key = str(sig.get('action', sig.get('side', '')) or '').upper()
+        if side_key in ('LONG', 'SHORT'):
+            current_side_best = signal_by_symbol_side.get((symbol, side_key))
+            if current_side_best is None or score > _coerce_float(current_side_best.get('confidenceScore', 0.0), 0.0):
+                signal_by_symbol_side[(symbol, side_key)] = sig
 
     for symbol, watch in list(post_exit_reentry_watchers.items()):
         if not isinstance(watch, dict):
@@ -27639,103 +29335,270 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
             post_exit_reentry_watchers.pop(symbol, None)
             continue
 
-        opp = opp_by_symbol.get(symbol)
-        sig = signal_by_symbol.get(symbol)
-        if not isinstance(opp, dict):
-            opp = _build_post_exit_reentry_fallback_opportunity(watch, sig)
-        if not isinstance(opp, dict):
-            continue
-        opp = apply_market_structure_context(opp, symbol=symbol, side=watch.get('side', ''))
-        watch = apply_market_structure_context(watch, symbol=symbol, side=watch.get('side', ''))
+        previous_side = str(watch.get('side', '') or '').upper()
+        opposite_side = _opposite_side(previous_side)
+        base_opp = opp_by_symbol.get(symbol)
+        same_sig = signal_by_symbol_side.get((symbol, previous_side))
+        opposite_sig = signal_by_symbol_side.get((symbol, opposite_side))
+        same_opp = None
+        opposite_opp = None
+        if isinstance(base_opp, dict):
+            opp_action = str(base_opp.get('signalAction', '') or '').upper()
+            if opp_action == previous_side:
+                same_opp = base_opp
+            elif opp_action == opposite_side:
+                opposite_opp = base_opp
+        if not isinstance(same_opp, dict):
+            same_opp = _build_post_exit_reentry_fallback_opportunity(watch, same_sig)
+        if not isinstance(opposite_opp, dict):
+            opposite_opp = _build_post_exit_reentry_fallback_opportunity(
+                {**watch, 'side': opposite_side, 'resolutionTargetSide': opposite_side},
+                opposite_sig,
+            )
+        same_opp = apply_market_structure_context(same_opp, symbol=symbol, side=previous_side) if isinstance(same_opp, dict) else same_opp
+        opposite_opp = apply_market_structure_context(opposite_opp, symbol=symbol, side=opposite_side) if isinstance(opposite_opp, dict) else opposite_opp
+        watch = apply_market_structure_context(watch, symbol=symbol, side=previous_side)
         post_exit_reentry_watchers[symbol] = watch
-        if isinstance(sig, dict):
-            sig = apply_market_structure_context(sig, symbol=symbol, side=watch.get('side', ''))
-        current_price = _coerce_float(opp.get('price', watch.get('lastPrice', watch.get('exitPrice', 0.0))), 0.0)
-        live_ctx = _build_live_flow_context_from_opportunity(watch, opp, side=watch.get('side', ''))
+        if isinstance(same_sig, dict):
+            same_sig = apply_market_structure_context(same_sig, symbol=symbol, side=previous_side)
+        if isinstance(opposite_sig, dict):
+            opposite_sig = apply_market_structure_context(opposite_sig, symbol=symbol, side=opposite_side)
+
+        dominant_signal = signal_by_symbol.get(symbol)
+        dominant_opp = base_opp if isinstance(base_opp, dict) else (
+            same_opp if isinstance(same_opp, dict) else opposite_opp
+        )
+        dominant_side = str(
+            (dominant_opp or {}).get(
+                'signalAction',
+                (dominant_signal or {}).get('action', watch.get('resolutionTargetSide', previous_side)),
+            )
+            or watch.get('resolutionTargetSide', previous_side)
+        ).upper()
+        current_price = _coerce_float(
+            (dominant_opp or {}).get('price', watch.get('lastPrice', watch.get('exitPrice', 0.0))),
+            0.0,
+        )
+        live_ctx = _build_live_flow_context_from_opportunity(watch, dominant_opp or {}, side=dominant_side)
         watch['lastPrice'] = current_price
         watch['currentVolumeRatio'] = _coerce_float(live_ctx.get('currentVolumeRatio', 0.0), 0.0)
         watch['currentIsVolumeSpike'] = bool(live_ctx.get('currentIsVolumeSpike', False))
         watch['currentObImbalanceTrend'] = _coerce_float(live_ctx.get('currentObImbalanceTrend', 0.0), 0.0)
         watch['currentImbalance'] = _coerce_float(live_ctx.get('currentImbalance', 0.0), 0.0)
         watch['currentExecScore'] = _coerce_float(live_ctx.get('currentExecScore', 0.0), 0.0)
-        watch['continuationFlowState'] = str(
-            opp.get('continuationFlowState', sig.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) if isinstance(sig, dict) else V3_CONTINUATION_NEUTRAL)
-            or V3_CONTINUATION_NEUTRAL
-        )
+        watch['continuationFlowState'] = str((dominant_opp or {}).get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
 
-        current_spread_pct = _coerce_float(live_ctx.get('currentSpreadPct', opp.get('spreadPct', 0.05)), 0.05)
-        hostile_imbalance = _is_side_imbalance_hostile(watch.get('side', ''), watch.get('currentImbalance', 0.0), threshold=8.0)
-        opp_action = str(opp.get('signalAction', sig.get('action', '')) if isinstance(sig, dict) else opp.get('signalAction', '') or '').upper()
-        opp_score = max(
-            _coerce_float(opp.get('signalScore', 0.0), 0.0),
-            _coerce_float(sig.get('confidenceScore', 0.0), 0.0) if isinstance(sig, dict) else 0.0,
-        )
+        current_spread_pct = _coerce_float(live_ctx.get('currentSpreadPct', (dominant_opp or {}).get('spreadPct', 0.05)), 0.05)
         spread_broken = current_spread_pct > 0.25
-        if hostile_imbalance or spread_broken or (opp_action in ('LONG', 'SHORT') and opp_action != watch.get('side', '') and opp_score >= V3_POST_EXIT_REENTRY_OPPOSITE_CANCEL_SCORE):
+        if spread_broken:
             watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
-            watch['cancelReason'] = 'HOSTILE_IMBALANCE' if hostile_imbalance else ('SPREAD_DETERIORATION' if spread_broken else 'OPPOSITE_SIGNAL')
-            queue_post_exit_reentry_watch_snapshot(watch, reason='cancelled', opportunity=opp, signal=sig)
+            watch['cancelReason'] = 'SPREAD_DETERIORATION'
+            queue_post_exit_reentry_watch_snapshot(watch, reason='cancelled', opportunity=dominant_opp, signal=dominant_signal)
             post_exit_reentry_watchers.pop(symbol, None)
             continue
 
         if now_ts < _coerce_float(watch.get('cooldownUntilTs', 0.0), 0.0):
             continue
 
-        signal_reentry_eligible = _is_post_exit_reentry_signal_eligible(watch, sig)
-        atr_distance = max(
-            _coerce_float(opp.get('atr', watch.get('atr', 0.0)), 0.0),
-            _coerce_float(current_price * (_coerce_float(opp.get('atrPct', opp.get('volatility_pct', 0.0)), 0.0) / 100.0), 0.0),
-        )
-        breakout_passed, breakout_distance = _post_exit_reentry_breakout_distance(
-            str(watch.get('side', 'LONG') or 'LONG').upper(),
-            exit_price=_coerce_float(watch.get('exitPrice', 0.0), 0.0),
-            current_price=current_price,
-            atr_distance=atr_distance,
-        )
-        watch['breakoutDistancePrice'] = breakout_distance
-        volume_ok = watch['currentVolumeRatio'] >= V3_POST_EXIT_REENTRY_VOLUME_FLOOR or bool(watch.get('currentIsVolumeSpike', False))
-        obi_ok = _is_side_ob_trend_aligned(watch.get('side', ''), watch.get('currentObImbalanceTrend', 0.0), threshold=V3_THESIS_OBI_ALIGN_THRESHOLD)
-        exec_ok = watch['currentExecScore'] >= V3_POST_EXIT_REENTRY_EXEC_SCORE_FLOOR
-        continuation_state = str(watch.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
-        continuation_ok = bool(
-            continuation_state == V3_CONTINUATION_SUPPORTING
-            or (
-                signal_reentry_eligible
-                and volume_ok
-                and obi_ok
-                and exec_ok
+        same_candidate_ok = False
+        same_candidate_score = 0.0
+        same_breakout_distance = 0.0
+        if isinstance(same_opp, dict) and isinstance(same_sig, dict):
+            same_signal_eligible = _is_post_exit_reentry_signal_eligible(watch, same_sig)
+            same_price = _coerce_float(same_opp.get('price', current_price), current_price)
+            same_atr_distance = max(
+                _coerce_float(same_opp.get('atr', watch.get('atr', 0.0)), 0.0),
+                _coerce_float(same_price * (_coerce_float(same_opp.get('atrPct', same_opp.get('volatility_pct', 0.0)), 0.0) / 100.0), 0.0),
             )
-        )
-        signal_ok = bool(
-            isinstance(sig, dict)
-            and str(sig.get('action', '') or '').upper() == str(watch.get('side', '') or '').upper()
-            and signal_reentry_eligible
-            and opp_action == str(watch.get('side', '') or '').upper()
-            and opp_score > 0
-        )
-        structure_ok = _structure_context_supports_reentry(opp, watch.get('side', ''))
-        candidate_ok = bool(signal_ok and continuation_ok and volume_ok and obi_ok and exec_ok and breakout_passed and structure_ok)
-        if not candidate_ok:
+            same_breakout_ok, same_breakout_distance = _post_exit_reentry_breakout_distance(
+                previous_side,
+                exit_price=_coerce_float(watch.get('exitPrice', 0.0), 0.0),
+                current_price=same_price,
+                atr_distance=same_atr_distance,
+            )
+            same_volume_ok = _coerce_float(same_opp.get('volumeRatio', 0.0), 0.0) >= V3_POST_EXIT_REENTRY_VOLUME_FLOOR or bool(same_opp.get('isVolumeSpike', False))
+            same_obi_ok = _is_side_ob_trend_aligned(previous_side, same_opp.get('obImbalanceTrend', 0.0), threshold=V3_THESIS_OBI_ALIGN_THRESHOLD)
+            same_exec_ok = _coerce_float(same_opp.get('currentExecScore', same_opp.get('entryExecScore', 0.0)), 0.0) >= V3_POST_EXIT_REENTRY_EXEC_SCORE_FLOOR
+            same_continuation_state = str(same_opp.get('continuationFlowState', V3_CONTINUATION_NEUTRAL) or V3_CONTINUATION_NEUTRAL)
+            same_continuation_ok = bool(
+                same_continuation_state == V3_CONTINUATION_SUPPORTING
+                or (same_signal_eligible and same_volume_ok and same_obi_ok and same_exec_ok)
+            )
+            same_structure_ok = _structure_context_supports_reentry(same_opp, previous_side)
+            same_coin_ok, same_coin_reason, same_coin_boost = _coin_state_supports_resolution(
+                POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+                same_opp,
+                previous_side,
+            )
+            same_signal_ok = bool(
+                str(same_sig.get('action', '') or '').upper() == previous_side
+                and same_signal_eligible
+                and str(same_opp.get('signalAction', '') or '').upper() == previous_side
+            )
+            same_candidate_ok = bool(
+                same_signal_ok
+                and same_continuation_ok
+                and same_volume_ok
+                and same_obi_ok
+                and same_exec_ok
+                and same_breakout_ok
+                and same_structure_ok
+                and same_coin_ok
+            )
+            if same_candidate_ok:
+                same_candidate_score = _score_post_exit_resolution_candidate(
+                    POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+                    same_sig,
+                    watch,
+                    structure_boost=(6.0 if same_structure_ok else 0.0) + same_coin_boost,
+                )
+            elif same_coin_reason and str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE:
+                watch['resolutionReason'] = same_coin_reason
+
+        opposite_candidate_ok = False
+        opposite_candidate_score = 0.0
+        opposite_breakout_distance = 0.0
+        opposite_reason = ''
+        if isinstance(opposite_opp, dict) and isinstance(opposite_sig, dict):
+            opposite_eligible, opposite_reason = _is_post_exit_opposite_reversal_signal_eligible(
+                watch,
+                opposite_sig,
+                structure_ctx=opposite_opp,
+            )
+            opposite_price = _coerce_float(opposite_opp.get('price', current_price), current_price)
+            opposite_atr_distance = max(
+                _coerce_float(opposite_opp.get('atr', watch.get('atr', 0.0)), 0.0),
+                _coerce_float(opposite_price * (_coerce_float(opposite_opp.get('atrPct', opposite_opp.get('volatility_pct', 0.0)), 0.0) / 100.0), 0.0),
+            )
+            opposite_breakout_ok, opposite_breakout_distance = _post_exit_reentry_breakout_distance(
+                opposite_side,
+                exit_price=_coerce_float(watch.get('exitPrice', 0.0), 0.0),
+                current_price=opposite_price,
+                atr_distance=opposite_atr_distance,
+            )
+            opposite_structure_ok, structure_reason = _structure_context_supports_opposite_reversal(opposite_opp, opposite_side)
+            opposite_coin_ok, opposite_coin_reason, opposite_coin_boost = _coin_state_supports_resolution(
+                POST_EXIT_RESOLUTION_MODE_OPPOSITE,
+                opposite_opp,
+                opposite_side,
+            )
+            opposite_exec_ok = _coerce_float(opposite_opp.get('currentExecScore', opposite_opp.get('entryExecScore', 0.0)), 0.0) >= V3_POST_EXIT_REENTRY_OPPOSITE_EXEC_SCORE_FLOOR
+            opposite_volume_ok = _coerce_float(opposite_opp.get('volumeRatio', 0.0), 0.0) >= V3_POST_EXIT_REENTRY_OPPOSITE_VOLUME_FLOOR or bool(opposite_opp.get('isVolumeSpike', False))
+            opposite_tape_ok = bool(
+                _is_side_ob_trend_aligned(opposite_side, opposite_opp.get('obImbalanceTrend', 0.0), threshold=max(1.5, V3_THESIS_OBI_ALIGN_THRESHOLD - 0.5))
+                or _is_side_imbalance_hostile(previous_side, opposite_opp.get('imbalance', 0.0), threshold=6.0)
+            )
+            opposite_signal_ok = bool(
+                str(opposite_sig.get('action', '') or '').upper() == opposite_side
+                and str(opposite_opp.get('signalAction', '') or '').upper() == opposite_side
+            )
+            opposite_candidate_ok = bool(
+                opposite_signal_ok
+                and opposite_eligible
+                and opposite_breakout_ok
+                and opposite_exec_ok
+                and (opposite_volume_ok or opposite_tape_ok)
+                and (opposite_structure_ok or opposite_tape_ok)
+                and opposite_coin_ok
+            )
+            if opposite_candidate_ok:
+                opposite_candidate_score = _score_post_exit_resolution_candidate(
+                    POST_EXIT_RESOLUTION_MODE_OPPOSITE,
+                    opposite_sig,
+                    watch,
+                    structure_boost=(6.0 if opposite_structure_ok else 2.0) + opposite_coin_boost,
+                )
+                if structure_reason and not opposite_reason:
+                    opposite_reason = structure_reason
+                if opposite_coin_reason and not opposite_reason:
+                    opposite_reason = opposite_coin_reason
+
+        selected_mode = POST_EXIT_RESOLUTION_MODE_NONE
+        selected_signal = None
+        selected_opp = None
+        selected_score = 0.0
+        selected_reason = ''
+        selected_breakout_distance = 0.0
+        hostile_to_previous = _is_side_imbalance_hostile(previous_side, watch.get('currentImbalance', 0.0), threshold=8.0)
+        if same_candidate_ok and opposite_candidate_ok:
+            if hostile_to_previous or opposite_candidate_score >= (same_candidate_score + 3.0):
+                selected_mode = POST_EXIT_RESOLUTION_MODE_OPPOSITE
+                selected_signal = opposite_sig
+                selected_opp = opposite_opp
+                selected_score = opposite_candidate_score
+                selected_reason = opposite_reason or 'OPPOSITE_REVERSAL'
+                selected_breakout_distance = opposite_breakout_distance
+            else:
+                selected_mode = POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+                selected_signal = same_sig
+                selected_opp = same_opp
+                selected_score = same_candidate_score
+                selected_reason = 'SAME_SIDE_CONTINUATION'
+                selected_breakout_distance = same_breakout_distance
+        elif same_candidate_ok:
+            selected_mode = POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+            selected_signal = same_sig
+            selected_opp = same_opp
+            selected_score = same_candidate_score
+            selected_reason = 'SAME_SIDE_CONTINUATION'
+            selected_breakout_distance = same_breakout_distance
+        elif opposite_candidate_ok:
+            selected_mode = POST_EXIT_RESOLUTION_MODE_OPPOSITE
+            selected_signal = opposite_sig
+            selected_opp = opposite_opp
+            selected_score = opposite_candidate_score
+            selected_reason = opposite_reason or 'OPPOSITE_REVERSAL'
+            selected_breakout_distance = opposite_breakout_distance
+
+        if selected_mode == POST_EXIT_RESOLUTION_MODE_NONE:
             if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE:
                 watch['watchState'] = POST_EXIT_REENTRY_STATE_ARMED
                 watch['candidateSinceTs'] = 0.0
                 watch['confirmCount'] = 0
-                queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_lost', opportunity=opp, signal=sig)
+                watch['resolutionMode'] = POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+                watch['resolutionTargetSide'] = previous_side
+                watch['resolutionReason'] = 'CANDIDATE_LOST'
+                watch['resolutionConfidence'] = 0.0
+                queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_lost', opportunity=dominant_opp, signal=dominant_signal)
             continue
 
-        if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) != POST_EXIT_REENTRY_STATE_CANDIDATE:
+        selected_side = str((selected_signal or {}).get('action', (selected_opp or {}).get('signalAction', watch.get('side', ''))) or watch.get('side', '')).upper()
+        watch['resolutionMode'] = selected_mode
+        watch['resolutionTargetSide'] = selected_side
+        watch['resolutionReason'] = selected_reason
+        watch['resolutionConfidence'] = round(min(0.99, max(0.0, selected_score / 100.0)), 4)
+        watch['resolutionEntryArchetype'] = str(
+            (selected_signal or {}).get('entryArchetype', ENTRY_ARCHETYPE_CONTINUATION if selected_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else ENTRY_ARCHETYPE_REVERSAL_RETEST)
+            or (ENTRY_ARCHETYPE_CONTINUATION if selected_mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else ENTRY_ARCHETYPE_REVERSAL_RETEST)
+        ).lower()
+        watch['resolutionRunnerContext'] = str(
+            (selected_signal or {}).get('runnerContextResolved', (selected_signal or {}).get('runnerContext', watch.get('runnerContextResolved', '')))
+            or watch.get('runnerContextResolved', '')
+        )
+        watch['breakoutDistancePrice'] = selected_breakout_distance
+
+        candidate_mode_changed = bool(
+            str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE
+            and (
+                str(watch.get('_candidateMode', selected_mode) or selected_mode) != selected_mode
+                or str(watch.get('_candidateSide', selected_side) or selected_side) != selected_side
+            )
+        )
+        if str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) != POST_EXIT_REENTRY_STATE_CANDIDATE or candidate_mode_changed:
             watch['watchState'] = POST_EXIT_REENTRY_STATE_CANDIDATE
             watch['candidateSinceTs'] = now_ts
             watch['confirmCount'] = 1
-            queue_post_exit_reentry_watch_snapshot(watch, reason='candidate', opportunity=opp, signal=sig)
+            watch['_candidateMode'] = selected_mode
+            watch['_candidateSide'] = selected_side
+            queue_post_exit_reentry_watch_snapshot(watch, reason='candidate', opportunity=selected_opp, signal=selected_signal)
             continue
 
         watch['confirmCount'] = int(watch.get('confirmCount', 0) or 0) + 1
         persistence_sec = max(0.0, now_ts - _coerce_float(watch.get('candidateSinceTs', now_ts), now_ts))
-        queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_progress', opportunity=opp, signal=sig)
+        queue_post_exit_reentry_watch_snapshot(watch, reason='candidate_progress', opportunity=selected_opp, signal=selected_signal)
         if watch['confirmCount'] < V3_POST_EXIT_REENTRY_CONFIRM_SCANS or persistence_sec < V3_POST_EXIT_REENTRY_PERSISTENCE_SEC:
             continue
-        await dispatch_post_exit_reentry_watch(watch, sig, opp)
+        await dispatch_post_exit_reentry_watch(watch, selected_signal, selected_opp)
 
 
 def resolve_reentry_cooldown_gate(signal: dict, existing_signal: dict, now_ts: float) -> dict:
@@ -33220,6 +35083,25 @@ class TimeBasedPositionManager:
         logger.info("📊 TimeBasedPositionManager initialized")
 
     @staticmethod
+    def _resolve_loss_ladder_thresholds() -> tuple[float, float]:
+        return (
+            float(
+                getattr(
+                    global_paper_trader,
+                    'first_reduction_pct',
+                    getattr(daily_kill_switch, 'first_reduction_pct', -100.0),
+                ) or getattr(daily_kill_switch, 'first_reduction_pct', -100.0)
+            ),
+            float(
+                getattr(
+                    global_paper_trader,
+                    'full_close_pct',
+                    getattr(daily_kill_switch, 'full_close_pct', -150.0),
+                ) or getattr(daily_kill_switch, 'full_close_pct', -150.0)
+            ),
+        )
+
+    @staticmethod
     def _time_recovery_fields(key: str) -> Dict[str, str]:
         suffix = str(key or '').lower().replace('h', 'H')
         return {
@@ -33868,23 +35750,146 @@ class TimeBasedPositionManager:
             pos['lastExitDecision'] = f"{reason}_RETRY"
             logger.warning(f"⚠️ V3_PROTECTION_RETRY: {symbol} {side} stop=${stop_price:.6f} reason={reason} err={e}")
 
+    async def _bootstrap_live_protection_for_new_position(self, pos: dict, reason: str) -> bool:
+        if not pos.get('isLive', False) or not live_binance_trader:
+            return True
+        symbol = str(pos.get('symbol', '') or '')
+        side = str(pos.get('side', 'LONG') or 'LONG')
+        stop_price = 0.0
+        if V3_LIVE_PROTECTION_STACK_MODE == 'apply':
+            stop_price = self._resolve_live_protective_stop_price(pos)
+        else:
+            stop_price = _coerce_float(pos.get('stopLoss', 0.0), 0.0)
+        contracts = abs(_coerce_float(pos.get('contracts', pos.get('size', 0.0)), 0.0))
+        if stop_price <= 0 or contracts <= 0:
+            logger.error(
+                f"🚨 SL_ORDER_ABORT: {symbol} {side} | "
+                f"stop=${stop_price:.6f} amount={contracts:.6f} | "
+                f"INVALID — closing position on exchange"
+            )
+            self.pipeline_metrics.setdefault('sl_order_failed', 0)
+            self.pipeline_metrics['sl_order_failed'] += 1
+            try:
+                abort_amount = contracts
+                if abort_amount <= 0:
+                    try:
+                        binance_positions = await live_binance_trader.get_positions(fast=True)
+                        for binance_pos in binance_positions:
+                            if binance_pos.get('symbol') == symbol:
+                                abort_amount = abs(float(binance_pos.get('contracts', binance_pos.get('size', 0)) or 0))
+                                break
+                    except Exception:
+                        abort_amount = 0
+                if abort_amount > 0:
+                    await live_binance_trader.close_position(symbol=symbol, side=side, amount=abort_amount)
+                else:
+                    logger.error(f"❌ SL_ABORT: {symbol} cannot determine position size — MANUAL CLOSE REQUIRED")
+            except Exception as abort_err:
+                logger.error(
+                    f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {side} | "
+                    f"MANUAL INTERVENTION REQUIRED | error={abort_err}"
+                )
+            self.add_log(f"🚨 GÜVENLİK: {symbol} koruma emri doğrulanamadı — pozisyon açılmadı")
+            self.set_execution_feedback(symbol, "SL_ABORT_INVALID_PARAMS")
+            return False
+
+        logger.info(
+            f"🔒 SL_ORDER_PLACE_ATTEMPT: {symbol} {side} | "
+            f"mode={pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)} "
+            f"stop=${stop_price:.6f} | amount={contracts} | "
+            f"authority={pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR')}"
+        )
+        try:
+            sl_result = await live_binance_trader.set_stop_loss(
+                symbol=symbol,
+                side=side,
+                amount=contracts,
+                stop_price=stop_price,
+            )
+            if sl_result and sl_result.get('id'):
+                record_position_protective_order_id(pos, sl_result.get('id'))
+                pos['exchange_sl_price'] = sl_result.get('stopPrice', stop_price)
+                pos['internalProtectionOnly'] = False
+                pos['protectionRetryAt'] = 0
+                pos['protectionRetryPrice'] = 0.0
+                self.pipeline_metrics.setdefault('sl_order_placed', 0)
+                self.pipeline_metrics['sl_order_placed'] += 1
+                logger.warning(
+                    f"🔒 SL_ORDER_PLACE_SUCCESS: {symbol} {side} | "
+                    f"order_id={sl_result['id']} | stop=${stop_price:.6f} | "
+                    f"mode={pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)}"
+                )
+                return True
+            raise RuntimeError(f"set_stop_loss returned invalid result: {sl_result}")
+        except Exception as stop_err:
+            logger.error(
+                f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {side} | "
+                f"stop=${stop_price:.6f} | err={stop_err}"
+            )
+            self.pipeline_metrics.setdefault('sl_order_failed', 0)
+            self.pipeline_metrics['sl_order_failed'] += 1
+            try:
+                await live_binance_trader.close_position(symbol=symbol, side=side, amount=contracts)
+                logger.warning(
+                    f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {side} | "
+                    f"reason={reason}"
+                )
+            except Exception as close_err:
+                logger.error(
+                    f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {side} | "
+                    f"MANUAL INTERVENTION REQUIRED | error={close_err}"
+                )
+            self.add_log(f"🚨 GÜVENLİK: {symbol} borsa koruması kurulamadı — pozisyon geri kapatıldı")
+            self.set_execution_feedback(symbol, "SL_ENFORCEMENT_CLOSE")
+            return False
+
     @staticmethod
     def _resolve_live_protective_stop_price(pos: dict) -> float:
         side = pos.get('side', 'LONG')
-        candidates = [
+        emergency_floor = _coerce_float(pos.get('runtimeEmergencyFloorPrice', 0.0), 0.0)
+        exchange_price = _coerce_float(pos.get('runtimeExchangeProtectiveStopPrice', 0.0), 0.0)
+        tactical_candidates = [
+            _coerce_float(pos.get('runtimeTacticalStopPrice', 0.0), 0.0),
             _coerce_float(pos.get('trailingStop', 0.0), 0.0),
             _coerce_float(pos.get('stopLoss', 0.0), 0.0),
             _coerce_float(pos.get('exchange_sl_price', 0.0), 0.0),
         ]
-        candidates = [price for price in candidates if price > 0]
-        if not candidates:
-            return 0.0
-        return max(candidates) if side == 'LONG' else min(candidates)
+        tactical_candidates = [price for price in tactical_candidates if price > 0]
+        tactical_price = 0.0
+        if tactical_candidates:
+            tactical_price = max(tactical_candidates) if side == 'LONG' else min(tactical_candidates)
+
+        mode = str(pos.get('runtimeExchangeProtectiveMode', '') or '').upper()
+        current_price = _coerce_float(
+            pos.get('currentPrice', pos.get('markPrice', pos.get('entryPrice', 0.0))),
+            _coerce_float(pos.get('entryPrice', 0.0), 0.0),
+        )
+        current_roi_pct = compute_position_roi_pct(pos, current_price=current_price) if current_price > 0 else _coerce_float(pos.get('unrealizedPnlPercent', 0.0), 0.0)
+        profit_locked = bool(
+            current_roi_pct > 0
+            and (
+                bool(pos.get('isTrailingActive', False))
+                or bool(pos.get('breakeven_activated', False))
+                or _coerce_float(pos.get('runtimeProfitLockPrice', 0.0), 0.0) > 0
+            )
+        )
+        if mode == V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL or profit_locked:
+            if exchange_price > 0:
+                return exchange_price
+            if tactical_price > 0:
+                return tactical_price
+        if emergency_floor > 0:
+            return emergency_floor
+        if exchange_price > 0:
+            return exchange_price
+        return 0.0
 
     async def _sync_live_protection_to_current_stop(self, pos: dict, reason: str) -> None:
         if not pos.get('isLive', False) or not live_binance_trader:
             return
         stop_price = self._resolve_live_protective_stop_price(pos)
+        if stop_price <= 0:
+            stop_price = _coerce_float(get_effective_stop_price(pos), 0.0)
         if stop_price <= 0:
             logger.warning(
                 f"⚠️ LIVE_PROTECTION_SKIP: {pos.get('symbol', '?')} "
@@ -33937,6 +35942,7 @@ class TimeBasedPositionManager:
 
     async def _handle_v3_runner_position(self, paper_trader, pos: dict, current_price: float, actions: dict) -> bool:
         now_ts = time.time()
+        first_reduction_roi, full_close_roi = self._resolve_loss_ladder_thresholds()
         _ensure_v3_thesis_state_fields(pos)
         pos.setdefault('exitOwner', V3_EXIT_OWNER)
         pos.setdefault('runnerContext', classify_v3_runner_context(pos, default_mode=STRATEGY_MODE_SMART_V3_RUNNER))
@@ -34018,6 +36024,26 @@ class TimeBasedPositionManager:
             thesis_ctx=thesis_ctx,
         )
         apply_market_structure_context(pos, symbol=pos.get('symbol', ''), side=pos.get('side', ''))
+        exit_profile = resolve_v3_exit_behavior_profile(
+            pos,
+            current_price=current_price,
+            profit_ladder=profit_ladder,
+            underwater_ctx=underwater_ctx,
+            thesis_ctx=thesis_ctx,
+        )
+        pos['runtimeExitProfile'] = exit_profile.get('profile', V3_EXIT_PROFILE_BALANCED)
+        pos['runtimeExitProfileReason'] = exit_profile.get('reason', 'BALANCED_FLOW')
+        pos['runtimeExitOwner'] = exit_profile.get('exit_owner', V3_EXIT_OWNER_BALANCED)
+        pos['runtimeExitOwnerReason'] = exit_profile.get('exit_owner_reason', 'BALANCED_EXIT_CONTROL')
+        pos['runtimeExitOwnerTightenBias'] = exit_profile.get('exit_owner_tighten_bias', 0.0)
+        pos['runtimeExitOwnerAllowHold'] = bool(exit_profile.get('exit_owner_allow_hold', False))
+        pos['runtimeStateDriftState'] = exit_profile.get('drift_state', 'ALIGNED')
+        pos['runtimeStateDriftReason'] = exit_profile.get('drift_reason', 'COIN_STATE_ALIGNED')
+        pos['runtimeStateDriftSeverity'] = exit_profile.get('drift_severity', 0.0)
+        pos['runtimeIntentDecayPct'] = exit_profile.get('intent_decay_pct', 0.0)
+        pos['runtimeChopReclaimMinAgeSec'] = exit_profile.get('chop_reclaim_min_age_sec', 600.0)
+        pos['runtimeTp1ArmDelaySecResolved'] = exit_profile.get('tp1_arm_delay_sec', int(pos.get('tp1ArmDelaySec', 0) or 0))
+        pos['runtimeTp1ArmAtrReqResolved'] = exit_profile.get('tp1_arm_atr_req_mult', _coerce_float(pos.get('tp1ArmAtrReq', 0.0), 0.0))
         maybe_queue_position_state_snapshot(pos, reason='v3_runner_runtime')
         if thesis_ctx.get('thesis_state') != prev_thesis_state or thesis_ctx.get('armed', False):
             maybe_queue_position_state_snapshot(pos, reason='v3_thesis_revalidation')
@@ -34038,7 +36064,14 @@ class TimeBasedPositionManager:
                 if not already_protected:
                     pos['breakeven_activated'] = True
                     if pos.get('isLive', False):
-                        await self._sync_v3_protective_order(pos, candidate_floor, 'AGED_PROFIT_BE_GUARD')
+                        update_runtime_protection_telemetry(
+                            pos=pos,
+                            current_price=current_price,
+                            user_first_reduction_roi=first_reduction_roi,
+                            user_full_close_roi=full_close_roi,
+                            entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                        )
+                        await self._sync_live_protection_to_current_stop(pos, 'AGED_PROFIT_BE_GUARD')
                 logger.info(
                     f"🛡️ AGED_PROFIT_BE_GUARD: {pos.get('symbol', '?')} {pos.get('side', 'LONG')} "
                     f"roi={current_roi:.1f}% flow={profit_ladder.get('continuation_flow_state', V3_CONTINUATION_NEUTRAL)} "
@@ -34061,6 +36094,13 @@ class TimeBasedPositionManager:
                         paper_trader.pipeline_metrics['v3_continuation_rescue_count'] += 1
                         pos['_reclaimRescueMetricTagged'] = True
                 maybe_queue_position_state_snapshot(pos, reason='v3_continuation_rescue_hold')
+                return True
+            if bool(exit_profile.get('allow_sideways_reclaim_hold', False)) and bool(pos.get('runtimeExitOwnerAllowHold', False)):
+                pos['lastExitDecision'] = 'TREND_CONTINUATION_HOLD'
+                if hasattr(paper_trader, 'pipeline_metrics'):
+                    paper_trader.pipeline_metrics.setdefault('v3_trend_continuation_hold_count', 0)
+                    paper_trader.pipeline_metrics['v3_trend_continuation_hold_count'] += 1
+                maybe_queue_position_state_snapshot(pos, reason='v3_trend_continuation_hold')
                 return True
             fakeout_guard = evaluate_v3_fakeout_reclaim_guard(
                 pos,
@@ -34094,9 +36134,10 @@ class TimeBasedPositionManager:
             pos['chopSinceTs'] = now_ts
         chop_since_ts = float(pos.get('chopSinceTs', 0) or 0)
         chop_age_sec = max(0.0, now_ts - chop_since_ts) if continuation_state == V3_CONTINUATION_CHOP and chop_since_ts > 0 else 0.0
+        chop_reclaim_min_age_sec = _coerce_float(exit_profile.get('chop_reclaim_min_age_sec', 600.0), 600.0)
         if (
             continuation_state == V3_CONTINUATION_CHOP
-            and chop_age_sec >= 600.0
+            and chop_age_sec >= chop_reclaim_min_age_sec
             and current_roi >= _coerce_float(profit_ladder.get('breakeven_floor_roi_pct', 0.0), 0.0)
         ):
             if thesis_ctx.get('fire_profit_hold', False):
@@ -34173,8 +36214,9 @@ class TimeBasedPositionManager:
                 favorable = current_price - arm_price
             else:
                 favorable = arm_price - current_price
-            arm_delay = int(pos.get('tp1ArmDelaySec', 0) or 0)
-            arm_atr_req = float(pos.get('tp1ArmAtrReq', 0.0) or 0.0) * atr
+            arm_delay = int(exit_profile.get('tp1_arm_delay_sec', pos.get('tp1ArmDelaySec', 0) or 0) or 0)
+            arm_atr_req_mult = _coerce_float(exit_profile.get('tp1_arm_atr_req_mult', pos.get('tp1ArmAtrReq', 0.0) or 0.0), 0.0)
+            arm_atr_req = arm_atr_req_mult * atr
             pos['trailArmElapsedSec'] = int(elapsed)
             if elapsed >= arm_delay and favorable >= arm_atr_req:
                 trail_dist = float(pos.get('trailDistance', atr * 1.5) or (atr * 1.5))
@@ -34197,7 +36239,14 @@ class TimeBasedPositionManager:
                     breakeven_sl = be_ctx.get('price', 0.0)
                     apply_sl_floor(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
                     pos['breakeven_activated'] = True
-                    await self._sync_v3_protective_order(pos, breakeven_sl, 'V3_BE_AFTER_TRAIL')
+                    update_runtime_protection_telemetry(
+                        pos=pos,
+                        current_price=current_price,
+                        user_first_reduction_roi=first_reduction_roi,
+                        user_full_close_roi=full_close_roi,
+                        entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+                    )
+                    await self._sync_live_protection_to_current_stop(pos, 'V3_BE_AFTER_TRAIL')
                 return True
 
         armed_any = False
@@ -40855,7 +42904,7 @@ class SignalGenerator:
             },
             default_mode=strategy_mode,
         )
-        decision_context_seed_payload = {
+        decision_context_seed_payload = apply_market_structure_context({
             'strategyMode': strategy_mode,
             'symbol': symbol,
             'side': signal_side,
@@ -40881,7 +42930,7 @@ class SignalGenerator:
             'fibActive': fib_context.get('fib_active', False) if fib_context else False,
             'srNearestSupport': sr_levels.get('nearest_support') if sr_levels else None,
             'srNearestResistance': sr_levels.get('nearest_resistance') if sr_levels else None,
-        }
+        }, symbol=symbol, side=signal_side)
         decision_context_preview = build_decision_context(
             decision_context_seed_payload,
             default_mode=strategy_mode,
@@ -40892,12 +42941,14 @@ class SignalGenerator:
                 preview_archetype not in (
                     ENTRY_ARCHETYPE_CONTINUATION,
                     ENTRY_ARCHETYPE_RECLAIM,
+                    ENTRY_ARCHETYPE_REVERSAL_RETEST,
                     DECISION_ARCHETYPE_EXHAUSTION,
                     DECISION_ARCHETYPE_RECOVERY,
                 )
                 and entry_archetype in (
                     ENTRY_ARCHETYPE_CONTINUATION,
                     ENTRY_ARCHETYPE_RECLAIM,
+                    ENTRY_ARCHETYPE_REVERSAL_RETEST,
                     DECISION_ARCHETYPE_EXHAUSTION,
                     DECISION_ARCHETYPE_RECOVERY,
                 )
@@ -40916,12 +42967,47 @@ class SignalGenerator:
             if preview_archetype in (
                 ENTRY_ARCHETYPE_CONTINUATION,
                 ENTRY_ARCHETYPE_RECLAIM,
+                ENTRY_ARCHETYPE_REVERSAL_RETEST,
                 DECISION_ARCHETYPE_EXHAUSTION,
                 DECISION_ARCHETYPE_RECOVERY,
             ):
                 entry_archetype = preview_archetype
+        entry_archetype, coin_state_route_reason = reconcile_entry_archetype_with_coin_state(
+            entry_archetype,
+            signal_side,
+            decision_context_preview,
+        )
+        if not entry_archetype:
+            logger.info(
+                f"🚫 COIN_STATE_ENTRY_BLOCK: {symbol} {signal_side} "
+                f"reason={coin_state_route_reason or 'COIN_STATE_FAMILY_BLOCKED'}"
+            )
+            return None
+        if coin_state_route_reason.startswith('COIN_STATE_ROUTE_'):
+            reasons.append(coin_state_route_reason)
+            decision_context_preview = build_decision_context(
+                {
+                    **decision_context_seed_payload,
+                    'entryArchetype': entry_archetype,
+                    'directionOwner': direction_metadata.get('directionOwner', ''),
+                    'directionConfidence': direction_metadata.get('directionConfidence', 0.0),
+                    'directionReason': direction_metadata.get('directionReason', ''),
+                },
+                default_mode=strategy_mode,
+            )
         barrier_size_mult = 1.0
         barrier_leverage_cap = 0
+        reversal_zone_ctx = {
+            'zoneState': 'UNAVAILABLE',
+            'zoneReason': '',
+            'zoneSource': '',
+            'zonePrice': 0.0,
+            'zoneWidth': 0.0,
+            'pocketPrice': 0.0,
+            'retestDistancePct': 0.0,
+            'touchReady': False,
+            'confidence': 0.0,
+        }
         barrier_ctx = {
             'barrierState': 'CLEAR',
             'barrierVerdict': 'SUPPORTIVE',
@@ -40994,6 +43080,92 @@ class SignalGenerator:
                 )
                 return None
             reasons.append("ENTRY_ARCH(continuation)")
+        elif entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST:
+            barrier_verdict = str(barrier_ctx.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+            barrier_state = str(barrier_ctx.get('barrierState', 'CLEAR') or 'CLEAR')
+            barrier_reason = str(barrier_ctx.get('barrierReason', '') or '')
+            adverse_distance_pct = _coerce_float(barrier_ctx.get('adverseDistancePct', 0.0), 0.0)
+            supportive_distance_pct = _coerce_float(barrier_ctx.get('supportiveDistancePct', 0.0), 0.0)
+            retest_state = str(decision_context_preview.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+            transition_state_preview = str(decision_context_preview.get('transitionState', 'NONE') or 'NONE').upper()
+            dominant_side_preview = str(decision_context_preview.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+            state_confidence_preview = _coerce_float(decision_context_preview.get('stateConfidence', 0.0), 0.0)
+            reversal_structure_ready = bool(
+                retest_state in ('BULL_RETEST_HOLD', 'BEAR_RETEST_HOLD', 'FAILED_BREAKDOWN', 'FAILED_BREAKOUT')
+                or transition_state_preview in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT', 'BREAKOUT_RETEST', 'RECLAIMING')
+                or _coerce_float(barrier_ctx.get('supportiveLevelPrice', 0.0), 0.0) > 0
+            )
+            reversal_flow_ready = bool(
+                volume_ratio >= 1.05
+                or is_volume_spike
+                or (supportive_distance_pct > 0 and supportive_distance_pct <= 0.65)
+            )
+            reversal_zone_ctx = analyze_reversal_retest_zone_context(
+                {
+                    **decision_context_preview,
+                    **barrier_ctx,
+                    'structural_zone': decision_context_preview.get('structural_zone', {}) if isinstance(decision_context_preview.get('structural_zone', {}), dict) else {},
+                },
+                current_price=price,
+                atr=atr,
+                side=signal_side,
+            )
+            decision_context_preview.update({
+                'reversalRetestZoneState': reversal_zone_ctx.get('zoneState', 'UNAVAILABLE'),
+                'reversalRetestZoneReason': reversal_zone_ctx.get('zoneReason', ''),
+                'reversalRetestZoneSource': reversal_zone_ctx.get('zoneSource', ''),
+                'reversalRetestZonePrice': reversal_zone_ctx.get('zonePrice', 0.0),
+                'reversalRetestZoneWidth': reversal_zone_ctx.get('zoneWidth', 0.0),
+                'reversalRetestPocketPrice': reversal_zone_ctx.get('pocketPrice', 0.0),
+                'reversalRetestRetestDistancePct': reversal_zone_ctx.get('retestDistancePct', 0.0),
+                'reversalRetestTouchReady': reversal_zone_ctx.get('touchReady', False),
+                'reversalRetestZoneConfidence': reversal_zone_ctx.get('confidence', 0.0),
+            })
+            if dominant_side_preview not in ('NEUTRAL', signal_side) and state_confidence_preview >= 0.55:
+                logger.info(
+                    f"🚫 REVERSAL_SIDE_MISMATCH: {symbol} {signal_side} "
+                    f"dominant={dominant_side_preview} conf={state_confidence_preview:.2f}"
+                )
+                return None
+            if str(reversal_zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE').upper() == 'UNAVAILABLE':
+                logger.info(
+                    f"🚫 REVERSAL_ZONE_UNAVAILABLE: {symbol} {signal_side} "
+                    f"reason={reversal_zone_ctx.get('zoneReason', 'NO_STRUCTURAL_ZONE')}"
+                )
+                return None
+            if not reversal_structure_ready:
+                logger.info(
+                    f"🚫 REVERSAL_STRUCTURE_MISSING: {symbol} {signal_side} "
+                    f"transition={transition_state_preview} retest={retest_state}"
+                )
+                return None
+            if _is_side_ob_trend_adverse(signal_side, ob_imbalance_trend, threshold=2.0) and not (volume_ratio >= 1.15 or is_volume_spike):
+                logger.info(
+                    f"🚫 REVERSAL_OB_ADVERSE: {symbol} {signal_side} ob_trend={ob_imbalance_trend:.2f} "
+                    f"vol={volume_ratio:.2f} spike={is_volume_spike}"
+                )
+                return None
+            if not reversal_flow_ready:
+                score = max(0.0, score - 5.0)
+                barrier_size_mult = min(barrier_size_mult, 0.88)
+                reasons.append("REV_FLOW_CAUTION")
+            if barrier_verdict == 'CAUTION':
+                score = max(0.0, score - 4.0)
+                barrier_size_mult = min(barrier_size_mult, 0.92)
+                reasons.append(
+                    f"REV_BARRIER({barrier_state}:{adverse_distance_pct:.2f}%/{barrier_reason or 'nearby'})"
+                )
+            elif barrier_reason:
+                reasons.append(
+                    f"REV_SETUP({barrier_state}:{adverse_distance_pct:.2f}%/{barrier_reason})"
+                )
+            zone_state = str(reversal_zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE')
+            zone_distance_pct = _coerce_float(reversal_zone_ctx.get('retestDistancePct', 0.0), 0.0)
+            zone_reason = str(reversal_zone_ctx.get('zoneReason', '') or '')
+            reasons.append(
+                f"REV_ZONE({zone_state}:{zone_distance_pct:.2f}%/{zone_reason or 'zone'})"
+            )
+            reasons.append("ENTRY_ARCH(reversal_retest)")
         elif entry_archetype == DECISION_ARCHETYPE_EXHAUSTION:
             if barrier_ctx.get('barrierReason'):
                 reasons.append(f"BARRIER_NOTE({barrier_ctx.get('barrierState', 'CLEAR')}:{barrier_ctx.get('barrierReason', '')})")
@@ -41224,6 +43396,15 @@ class SignalGenerator:
             'supportiveDistancePct': round(_coerce_float(barrier_ctx.get('supportiveDistancePct', 0.0), 0.0), 4),
             'barrierReason': str(barrier_ctx.get('barrierReason', '') or ''),
             'barrierConfidence': round(_coerce_float(barrier_ctx.get('barrierConfidence', 0.0), 0.0), 4),
+            'reversalRetestZoneState': str(reversal_zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+            'reversalRetestZoneReason': str(reversal_zone_ctx.get('zoneReason', '') or ''),
+            'reversalRetestZoneSource': str(reversal_zone_ctx.get('zoneSource', '') or ''),
+            'reversalRetestZonePrice': round(_coerce_float(reversal_zone_ctx.get('zonePrice', 0.0), 0.0), 8),
+            'reversalRetestZoneWidth': round(_coerce_float(reversal_zone_ctx.get('zoneWidth', 0.0), 0.0), 8),
+            'reversalRetestPocketPrice': round(_coerce_float(reversal_zone_ctx.get('pocketPrice', 0.0), 0.0), 8),
+            'reversalRetestRetestDistancePct': round(_coerce_float(reversal_zone_ctx.get('retestDistancePct', 0.0), 0.0), 4),
+            'reversalRetestTouchReady': bool(reversal_zone_ctx.get('touchReady', False)),
+            'reversalRetestZoneConfidence': round(_coerce_float(reversal_zone_ctx.get('confidence', 0.0), 0.0), 4),
             'decisionContext': decision_context_preview,
             'indicatorPolicy': decision_context_preview.get('indicatorPolicy', {}),
             'gatePolicy': decision_context_preview.get('gatePolicy', {}),
@@ -42716,6 +44897,8 @@ class PaperTradingEngine:
         is_confirmed = bool(existing_pending.get('confirmed', False))
         is_existing_reentry = bool(existing_pending.get('isPostExitReentry', False))
         is_incoming_reentry = bool(safe_signal.get('isPostExitReentry', False))
+        is_existing_reversal = str(existing_pending.get('entryArchetype', '') or '').strip().lower() == ENTRY_ARCHETYPE_REVERSAL_RETEST
+        is_incoming_reversal = str(safe_signal.get('entryArchetype', '') or '').strip().lower() == ENTRY_ARCHETYPE_REVERSAL_RETEST
         existing_snapshot = existing_pending.get('signal_snapshot', existing_pending.get('signalSnapshot', {}))
         existing_snapshot = existing_snapshot if isinstance(existing_snapshot, dict) else {}
         merged_snapshot = copy.deepcopy(existing_snapshot)
@@ -42724,6 +44907,10 @@ class PaperTradingEngine:
         if is_existing_reentry:
             merged_snapshot['isPostExitReentry'] = True
             for key in _PENDING_REINFORCE_REENTRY_FIELDS:
+                if key in existing_pending:
+                    merged_snapshot[key] = existing_pending.get(key)
+        if is_existing_reversal:
+            for key in _PENDING_REINFORCE_REVERSAL_FIELDS:
                 if key in existing_pending:
                     merged_snapshot[key] = existing_pending.get(key)
 
@@ -42825,6 +45012,18 @@ class PaperTradingEngine:
                 if key == 'isPostExitReentry':
                     existing_pending[key] = bool(safe_signal.get(key, existing_pending.get(key, False)))
                 elif key.endswith('PctOriginal') or key.endswith('PctApplied') or key.endswith('Mult'):
+                    existing_pending[key] = _coerce_float(safe_signal.get(key, existing_pending.get(key, 0.0)), existing_pending.get(key, 0.0))
+                elif key.endswith('DelaySec') or key.endswith('ExpiresSec'):
+                    existing_pending[key] = int(safe_signal.get(key, existing_pending.get(key, 0)) or 0)
+                else:
+                    existing_pending[key] = safe_signal.get(key, existing_pending.get(key, ''))
+        if is_existing_reversal and not is_incoming_reversal:
+            for key in _PENDING_REINFORCE_REVERSAL_FIELDS:
+                if key in existing_pending:
+                    existing_pending[key] = existing_pending.get(key)
+        else:
+            for key in _PENDING_REINFORCE_REVERSAL_FIELDS:
+                if key.endswith('PctOriginal') or key.endswith('PctApplied'):
                     existing_pending[key] = _coerce_float(safe_signal.get(key, existing_pending.get(key, 0.0)), existing_pending.get(key, 0.0))
                 elif key.endswith('DelaySec') or key.endswith('ExpiresSec'):
                     existing_pending[key] = int(safe_signal.get(key, existing_pending.get(key, 0)) or 0)
@@ -44047,6 +46246,7 @@ class PaperTradingEngine:
                 return default
 
         _sig = signal if isinstance(signal, dict) else {}
+        _entry_archetype = str(_sig.get('entryArchetype', '') or '').strip().lower()
         _reentry_entry_mode = str(_sig.get('postExitReentryEntryMode', '') or '')
         _reentry_pullback_pct_original = _safe_float(_sig.get('postExitReentryPullbackPctOriginal', pullback_pct), pullback_pct)
         _reentry_pullback_pct_applied = _safe_float(_sig.get('postExitReentryPullbackPctApplied', pullback_pct), pullback_pct)
@@ -44059,6 +46259,27 @@ class PaperTradingEngine:
             int(_safe_float(_sig.get('postExitReentryExpiresSec', V3_POST_EXIT_REENTRY_EXPIRES_SEC), V3_POST_EXIT_REENTRY_EXPIRES_SEC)),
         )
         _reentry_exec_priority = str(_sig.get('postExitReentryExecutionPriority', '') or '')
+        _reversal_entry_mode = str(_sig.get('reversalRetestEntryMode', '') or '')
+        _reversal_pullback_pct_original = _safe_float(_sig.get('reversalRetestPullbackPctOriginal', pullback_pct), pullback_pct)
+        _reversal_pullback_pct_applied = _safe_float(_sig.get('reversalRetestPullbackPctApplied', pullback_pct), pullback_pct)
+        _reversal_confirm_delay_sec = max(
+            1,
+            int(_safe_float(_sig.get('reversalRetestConfirmDelaySec', V3_REVERSAL_RETEST_CONFIRM_DELAY_SEC), V3_REVERSAL_RETEST_CONFIRM_DELAY_SEC)),
+        )
+        _reversal_expires_sec = max(
+            _reversal_confirm_delay_sec + 30,
+            int(_safe_float(_sig.get('reversalRetestExpiresSec', V3_REVERSAL_RETEST_EXPIRES_SEC), V3_REVERSAL_RETEST_EXPIRES_SEC)),
+        )
+        _reversal_exec_priority = str(_sig.get('reversalRetestExecutionPriority', '') or '')
+        _reversal_zone_state = str(_sig.get('reversalRetestZoneState', '') or '')
+        _reversal_zone_reason = str(_sig.get('reversalRetestZoneReason', '') or '')
+        _reversal_zone_source = str(_sig.get('reversalRetestZoneSource', '') or '')
+        _reversal_zone_price = _safe_float(_sig.get('reversalRetestZonePrice', 0.0), 0.0)
+        _reversal_zone_width = _safe_float(_sig.get('reversalRetestZoneWidth', 0.0), 0.0)
+        _reversal_pocket_price = _safe_float(_sig.get('reversalRetestPocketPrice', 0.0), 0.0)
+        _reversal_retest_distance_pct = _safe_float(_sig.get('reversalRetestRetestDistancePct', 0.0), 0.0)
+        _reversal_touch_ready = bool(_sig.get('reversalRetestTouchReady', False))
+        _reversal_zone_confidence = _safe_float(_sig.get('reversalRetestZoneConfidence', 0.0), 0.0)
         _dyn_floor = _safe_float(_sig.get('pullbackDynFloor', _sig.get('pullbackMinDyn', pullback_pct)), pullback_pct)
         _dyn_base = _safe_float(_sig.get('pullbackDynBase', 0), 0.0)
         _dyn_adj = _safe_float(_sig.get('pullbackDynAdj', 0), 0.0)
@@ -44100,6 +46321,47 @@ class PaperTradingEngine:
                 'entry_mode': _reentry_entry_mode or 'SHALLOW_PULLBACK',
                 'execution_priority': _reentry_exec_priority or 'WATCHER',
             }
+        elif _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST:
+            _reversal_profile = resolve_reversal_retest_entry_profile(_sig, current_price=price, atr=atr, side=side)
+            if _reversal_profile:
+                _reversal_entry_mode = str(_reversal_profile.get('reversalRetestEntryMode', 'RETEST_POCKET') or 'RETEST_POCKET')
+                _reversal_pullback_pct_original = _safe_float(_reversal_profile.get('reversalRetestPullbackPctOriginal', _reversal_pullback_pct_original), _reversal_pullback_pct_original)
+                _reversal_pullback_pct_applied = _safe_float(_reversal_profile.get('reversalRetestPullbackPctApplied', _reversal_pullback_pct_applied), _reversal_pullback_pct_applied)
+                _reversal_confirm_delay_sec = max(
+                    1,
+                    int(_safe_float(_reversal_profile.get('reversalRetestConfirmDelaySec', _reversal_confirm_delay_sec), _reversal_confirm_delay_sec)),
+                )
+                _reversal_expires_sec = max(
+                    _reversal_confirm_delay_sec + 30,
+                    int(_safe_float(_reversal_profile.get('reversalRetestExpiresSec', _reversal_expires_sec), _reversal_expires_sec)),
+                )
+                _reversal_exec_priority = str(_reversal_profile.get('reversalRetestExecutionPriority', _reversal_exec_priority) or _reversal_exec_priority)
+                _reversal_zone_state = str(_reversal_profile.get('reversalRetestZoneState', _reversal_zone_state) or _reversal_zone_state)
+                _reversal_zone_reason = str(_reversal_profile.get('reversalRetestZoneReason', _reversal_zone_reason) or _reversal_zone_reason)
+                _reversal_zone_source = str(_reversal_profile.get('reversalRetestZoneSource', _reversal_zone_source) or _reversal_zone_source)
+                _reversal_zone_price = _safe_float(_reversal_profile.get('reversalRetestZonePrice', _reversal_zone_price), _reversal_zone_price)
+                _reversal_zone_width = _safe_float(_reversal_profile.get('reversalRetestZoneWidth', _reversal_zone_width), _reversal_zone_width)
+                _reversal_pocket_price = _safe_float(_reversal_profile.get('reversalRetestPocketPrice', _reversal_pocket_price), _reversal_pocket_price)
+                _reversal_retest_distance_pct = _safe_float(_reversal_profile.get('reversalRetestRetestDistancePct', _reversal_retest_distance_pct), _reversal_retest_distance_pct)
+                _reversal_touch_ready = bool(_reversal_profile.get('reversalRetestTouchReady', _reversal_touch_ready))
+                _reversal_zone_confidence = _safe_float(_reversal_profile.get('reversalRetestZoneConfidence', _reversal_zone_confidence), _reversal_zone_confidence)
+                _pullback_pct_requested = _reversal_pullback_pct_original if _reversal_pullback_pct_original > 0 else _reversal_pullback_pct_applied
+                if _reversal_pullback_pct_applied > 0:
+                    _dyn_floor = _reversal_pullback_pct_applied
+                    _dyn_base = _reversal_pullback_pct_applied
+                    _dyn_adj = _reversal_pullback_pct_applied - _pullback_pct_requested
+                    _dyn_final = _reversal_pullback_pct_applied
+                    _dyn_band = 'reversal_retest'
+                    pullback_pct = _reversal_pullback_pct_applied
+                    entry_price = _safe_float(_reversal_profile.get('entryPrice', entry_price), entry_price)
+                _forecast_source = 'reversal_retest'
+                _forecast_model_version = 'reversal_retest_v1'
+                _forecast_features = {
+                    'entry_mode': _reversal_entry_mode or 'RETEST_POCKET',
+                    'execution_priority': _reversal_exec_priority or 'REVERSAL_RETEST',
+                    'zone_state': _reversal_zone_state or 'UNAVAILABLE',
+                    'touch_ready': _reversal_touch_ready,
+                }
         elif ENTRY_FORECAST_ENABLED:
             try:
                 # Build features dict for the ML service
@@ -44218,6 +46480,13 @@ class PaperTradingEngine:
             _confirm_after_regime_sec = signal_confirmation_delay_seconds
             _confirm_clamp_min = min(_confirm_clamp_min, signal_confirmation_delay_seconds)
             _confirm_clamp_max = max(_confirm_clamp_max, signal_confirmation_delay_seconds)
+        elif _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST and _reversal_confirm_delay_sec > 0:
+            signal_confirmation_delay_seconds = _reversal_confirm_delay_sec
+            pending_timeout_seconds = _reversal_expires_sec
+            _confirm_base_sec = signal_confirmation_delay_seconds
+            _confirm_after_regime_sec = signal_confirmation_delay_seconds
+            _confirm_clamp_min = min(_confirm_clamp_min, signal_confirmation_delay_seconds)
+            _confirm_clamp_max = max(_confirm_clamp_max, signal_confirmation_delay_seconds)
 
         _limited_market_override = compute_limited_market_override_plan(signal or {}, pending_passed=False)
 
@@ -44272,6 +46541,21 @@ class PaperTradingEngine:
             "postExitReentryConfirmDelaySec": _reentry_confirm_delay_sec if is_post_exit_reentry else 0,
             "postExitReentryExpiresSec": _reentry_expires_sec if is_post_exit_reentry else 0,
             "postExitReentryExecutionPriority": _reentry_exec_priority if is_post_exit_reentry else '',
+            "reversalRetestEntryMode": _reversal_entry_mode if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else '',
+            "reversalRetestPullbackPctOriginal": _reversal_pullback_pct_original if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestPullbackPctApplied": _reversal_pullback_pct_applied if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestConfirmDelaySec": _reversal_confirm_delay_sec if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0,
+            "reversalRetestExpiresSec": _reversal_expires_sec if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0,
+            "reversalRetestExecutionPriority": _reversal_exec_priority if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else '',
+            "reversalRetestZoneState": _reversal_zone_state if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else '',
+            "reversalRetestZoneReason": _reversal_zone_reason if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else '',
+            "reversalRetestZoneSource": _reversal_zone_source if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else '',
+            "reversalRetestZonePrice": _reversal_zone_price if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestZoneWidth": _reversal_zone_width if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestPocketPrice": _reversal_pocket_price if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestRetestDistancePct": _reversal_retest_distance_pct if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
+            "reversalRetestTouchReady": _reversal_touch_ready if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else False,
+            "reversalRetestZoneConfidence": _reversal_zone_confidence if _entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST else 0.0,
             "decisionContext": signal.get('decisionContext', {}) if signal else {},
             "indicatorPolicy": signal.get('indicatorPolicy', {}) if signal else {},
             "gatePolicy": signal.get('gatePolicy', {}) if signal else {},
@@ -44285,6 +46569,28 @@ class PaperTradingEngine:
             "expectedMaeBucket": signal.get('expectedMaeBucket', 'MEDIUM') if signal else 'MEDIUM',
             "holdProfile": signal.get('holdProfile', 'CHOP') if signal else 'CHOP',
             "replayFidelity": signal.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX) if signal else DECISION_REPLAY_FIDELITY_APPROX,
+            "structureTrend": str(signal.get('structureTrend', 'MIXED') if signal else 'MIXED' or 'MIXED'),
+            "swingState": str(signal.get('swingState', 'MIXED') if signal else 'MIXED' or 'MIXED'),
+            "compressionState": str(signal.get('compressionState', 'NONE') if signal else 'NONE' or 'NONE'),
+            "breakoutRetestState": str(signal.get('breakoutRetestState', 'NONE') if signal else 'NONE' or 'NONE'),
+            "srContext": str(signal.get('srContext', 'UNKNOWN') if signal else 'UNKNOWN' or 'UNKNOWN'),
+            "patternBias": str(signal.get('patternBias', 'NEUTRAL') if signal else 'NEUTRAL' or 'NEUTRAL'),
+            "patternConfidence": _coerce_float(signal.get('patternConfidence', 0.0) if signal else 0.0, 0.0),
+            "patternSource": str(signal.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') if signal else 'TRADING_PATTERN_SCANNER_INSPIRED' or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+            "structureVersion": str(signal.get('structureVersion', 'v1') if signal else 'v1' or 'v1'),
+            "microState5m": str(signal.get('microState5m', 'RANGE') if signal else 'RANGE' or 'RANGE'),
+            "setupState15m": str(signal.get('setupState15m', 'NEUTRAL') if signal else 'NEUTRAL' or 'NEUTRAL'),
+            "backdropState1h": str(signal.get('backdropState1h', 'MIXED') if signal else 'MIXED' or 'MIXED'),
+            "macroState4h": str(signal.get('macroState4h', 'MIXED') if signal else 'MIXED' or 'MIXED'),
+            "transitionState": str(signal.get('transitionState', 'NONE') if signal else 'NONE' or 'NONE'),
+            "stateConfidence": _coerce_float(signal.get('stateConfidence', 0.0) if signal else 0.0, 0.0),
+            "stateFreshness": str(signal.get('stateFreshness', 'AVAILABLE') if signal else 'AVAILABLE' or 'AVAILABLE'),
+            "dominantSide": str(signal.get('dominantSide', 'NEUTRAL') if signal else 'NEUTRAL' or 'NEUTRAL'),
+            "allowedEntryFamilies": list(signal.get('allowedEntryFamilies', []) if signal and isinstance(signal.get('allowedEntryFamilies', []), list) else []),
+            "preferredExitProfile": str(signal.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) if signal else V3_EXIT_PROFILE_BALANCED or V3_EXIT_PROFILE_BALANCED),
+            "coinStateSource": str(signal.get('coinStateSource', 'INTERNAL_MTF_CONTEXT') if signal else 'INTERNAL_MTF_CONTEXT' or 'INTERNAL_MTF_CONTEXT'),
+            "coinStateVersion": str(signal.get('coinStateVersion', 'v1') if signal else 'v1' or 'v1'),
+            "coinStateRouteReason": str(signal.get('coinStateRouteReason', '') if signal else '' or ''),
             "microstructureScore": _coerce_float(signal.get('microstructureScore', 0.0) if signal else 0.0, 0.0),
             "flowToxicityScore": _coerce_float(signal.get('flowToxicityScore', 0.0) if signal else 0.0, 0.0),
             "refillFailureScore": _coerce_float(signal.get('refillFailureScore', 0.0) if signal else 0.0, 0.0),
@@ -45773,6 +48079,98 @@ class PaperTradingEngine:
         await self.execute_pending_order(order, fill_price, force_market=force_market)
         return True
 
+    async def _bootstrap_live_protection_for_new_position(self, pos: dict, reason: str) -> bool:
+        if not pos.get('isLive', False) or not live_binance_trader:
+            return True
+        symbol = str(pos.get('symbol', '') or '')
+        side = str(pos.get('side', 'LONG') or 'LONG')
+        if V3_LIVE_PROTECTION_STACK_MODE == 'apply':
+            stop_price = TimeBasedPositionManager._resolve_live_protective_stop_price(pos)
+        else:
+            stop_price = _coerce_float(pos.get('stopLoss', 0.0), 0.0)
+        contracts = abs(_coerce_float(pos.get('contracts', pos.get('size', 0.0)), 0.0))
+        if stop_price <= 0 or contracts <= 0:
+            logger.error(
+                f"🚨 SL_ORDER_ABORT: {symbol} {side} | "
+                f"stop=${stop_price:.6f} amount={contracts:.6f} | "
+                f"INVALID — closing position on exchange"
+            )
+            self.pipeline_metrics.setdefault('sl_order_failed', 0)
+            self.pipeline_metrics['sl_order_failed'] += 1
+            try:
+                abort_amount = contracts
+                if abort_amount <= 0:
+                    try:
+                        binance_positions = await live_binance_trader.get_positions(fast=True)
+                        for binance_pos in binance_positions:
+                            if binance_pos.get('symbol') == symbol:
+                                abort_amount = abs(float(binance_pos.get('contracts', binance_pos.get('size', 0)) or 0))
+                                break
+                    except Exception:
+                        abort_amount = 0
+                if abort_amount > 0:
+                    await live_binance_trader.close_position(symbol=symbol, side=side, amount=abort_amount)
+                else:
+                    logger.error(f"❌ SL_ABORT: {symbol} cannot determine position size — MANUAL CLOSE REQUIRED")
+            except Exception as abort_err:
+                logger.error(
+                    f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {side} | "
+                    f"MANUAL INTERVENTION REQUIRED | error={abort_err}"
+                )
+            self.add_log(f"🚨 GÜVENLİK: {symbol} koruma emri doğrulanamadı — pozisyon açılmadı")
+            self.set_execution_feedback(symbol, "SL_ABORT_INVALID_PARAMS")
+            return False
+
+        logger.info(
+            f"🔒 SL_ORDER_PLACE_ATTEMPT: {symbol} {side} | "
+            f"mode={pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)} "
+            f"stop=${stop_price:.6f} | amount={contracts} | "
+            f"authority={pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR')}"
+        )
+        try:
+            sl_result = await live_binance_trader.set_stop_loss(
+                symbol=symbol,
+                side=side,
+                amount=contracts,
+                stop_price=stop_price,
+            )
+            if sl_result and sl_result.get('id'):
+                record_position_protective_order_id(pos, sl_result.get('id'))
+                pos['exchange_sl_price'] = sl_result.get('stopPrice', stop_price)
+                pos['internalProtectionOnly'] = False
+                pos['protectionRetryAt'] = 0
+                pos['protectionRetryPrice'] = 0.0
+                self.pipeline_metrics.setdefault('sl_order_placed', 0)
+                self.pipeline_metrics['sl_order_placed'] += 1
+                logger.warning(
+                    f"🔒 SL_ORDER_PLACE_SUCCESS: {symbol} {side} | "
+                    f"order_id={sl_result['id']} | stop=${stop_price:.6f} | "
+                    f"mode={pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)}"
+                )
+                return True
+            raise RuntimeError(f"set_stop_loss returned invalid result: {sl_result}")
+        except Exception as stop_err:
+            logger.error(
+                f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {side} | "
+                f"stop=${stop_price:.6f} | err={stop_err}"
+            )
+            self.pipeline_metrics.setdefault('sl_order_failed', 0)
+            self.pipeline_metrics['sl_order_failed'] += 1
+            try:
+                await live_binance_trader.close_position(symbol=symbol, side=side, amount=contracts)
+                logger.warning(
+                    f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {side} | "
+                    f"reason={reason}"
+                )
+            except Exception as close_err:
+                logger.error(
+                    f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {side} | "
+                    f"MANUAL INTERVENTION REQUIRED | error={close_err}"
+                )
+            self.add_log(f"🚨 GÜVENLİK: {symbol} borsa koruması kurulamadı — pozisyon geri kapatıldı")
+            self.set_execution_feedback(symbol, "SL_ENFORCEMENT_CLOSE")
+            return False
+
     async def execute_pending_order(self, order: dict, fill_price: float, force_market: bool = False):
         """Execute a pending order at the fill price.
         Args:
@@ -46310,6 +48708,7 @@ class PaperTradingEngine:
             "expectedMaeBucket": order.get('expectedMaeBucket', 'MEDIUM'),
             "holdProfile": order.get('holdProfile', 'CHOP'),
             "replayFidelity": order.get('replayFidelity', DECISION_REPLAY_FIDELITY_APPROX),
+            "positionThesisState": str(order.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY),
             "isPostExitReentry": bool(order.get('isPostExitReentry', False)),
             "reentryOrigin": order.get('reentryOrigin', ''),
             "reentryOriginTradeId": str(order.get('reentryOriginTradeId', '') or ''),
@@ -46323,6 +48722,21 @@ class PaperTradingEngine:
             "postExitReentryConfirmDelaySec": int(order.get('postExitReentryConfirmDelaySec', 0) or 0),
             "postExitReentryExpiresSec": int(order.get('postExitReentryExpiresSec', 0) or 0),
             "postExitReentryExecutionPriority": str(order.get('postExitReentryExecutionPriority', '') or ''),
+            "reversalRetestEntryMode": str(order.get('reversalRetestEntryMode', '') or ''),
+            "reversalRetestPullbackPctOriginal": _coerce_float(order.get('reversalRetestPullbackPctOriginal', 0.0), 0.0),
+            "reversalRetestPullbackPctApplied": _coerce_float(order.get('reversalRetestPullbackPctApplied', 0.0), 0.0),
+            "reversalRetestConfirmDelaySec": int(order.get('reversalRetestConfirmDelaySec', 0) or 0),
+            "reversalRetestExpiresSec": int(order.get('reversalRetestExpiresSec', 0) or 0),
+            "reversalRetestExecutionPriority": str(order.get('reversalRetestExecutionPriority', '') or ''),
+            "reversalRetestZoneState": str(order.get('reversalRetestZoneState', '') or ''),
+            "reversalRetestZoneReason": str(order.get('reversalRetestZoneReason', '') or ''),
+            "reversalRetestZoneSource": str(order.get('reversalRetestZoneSource', '') or ''),
+            "reversalRetestZonePrice": _coerce_float(order.get('reversalRetestZonePrice', 0.0), 0.0),
+            "reversalRetestZoneWidth": _coerce_float(order.get('reversalRetestZoneWidth', 0.0), 0.0),
+            "reversalRetestPocketPrice": _coerce_float(order.get('reversalRetestPocketPrice', 0.0), 0.0),
+            "reversalRetestRetestDistancePct": _coerce_float(order.get('reversalRetestRetestDistancePct', 0.0), 0.0),
+            "reversalRetestTouchReady": bool(order.get('reversalRetestTouchReady', False)),
+            "reversalRetestZoneConfidence": _coerce_float(order.get('reversalRetestZoneConfidence', 0.0), 0.0),
             "barrierState": str(order.get('barrierState', 'CLEAR') or 'CLEAR'),
             "barrierVerdict": str(order.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
             "adverseLevelType": str(order.get('adverseLevelType', '') or ''),
@@ -46459,6 +48873,35 @@ class PaperTradingEngine:
             "runtimeTrailDistanceRoiPct": round(price_distance_to_roi_pct(trail_distance, fill_price, order.get('leverage', 1)), 2),
             "runtimeTpRoiPct": round(compute_target_roi_pct(fill_price, tp, side, order.get('leverage', 1)), 2),
             "runtimeStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, order.get('leverage', 1)), 2),
+            "runtimeTacticalStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, order.get('leverage', 1)), 2),
+            "runtimeTacticalStopSource": "EFFECTIVE_STOP",
+            "runtimeEmergencyFloorRoiPct": float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+            "runtimeTacticalStopPrice": round(sl, 8),
+            "runtimeEmergencyFloorPrice": round(
+                compute_target_price_from_roi(
+                    fill_price,
+                    float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+                    side,
+                    order.get('leverage', 1),
+                ),
+                8,
+            ),
+            "runtimeStructuralInvalidationActive": False,
+            "runtimeStructuralInvalidationSource": "",
+            "runtimeStructuralInvalidationPrice": 0.0,
+            "runtimeStructuralInvalidationRoiPct": 0.0,
+            "runtimeStructuralInvalidationBufferAbs": 0.0,
+            "runtimeExchangeProtectiveMode": V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY,
+            "runtimeExchangeProtectiveStopRoiPct": float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+            "runtimeExchangeProtectiveStopPrice": round(
+                compute_target_price_from_roi(
+                    fill_price,
+                    float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+                    side,
+                    order.get('leverage', 1),
+                ),
+                8,
+            ),
             "runtimeEntryStopGateMode": order.get('entryStopGateMode', 'normal'),
             "runtimeEntryStopRoiPct": order.get('entryStopRoiPct', planned_stop_roi_pct),
             "runtimePreStopReduceRoiPct": None,
@@ -46470,6 +48913,29 @@ class PaperTradingEngine:
             "runtimeRegimeFlags": [],
             "runtimeSignalInvalidationState": {},
             "runtimeProtectionPhase": "SL-PRIMARY",
+            "runtimeExitProfile": str(order.get('runtimeExitProfile', order.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED)) or V3_EXIT_PROFILE_BALANCED),
+            "runtimeExitProfileReason": str(order.get('runtimeExitProfileReason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED'),
+            "runtimeExitOwner": str(order.get('runtimeExitOwner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED),
+            "runtimeExitOwnerReason": str(order.get('runtimeExitOwnerReason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED'),
+            "runtimeExitOwnerTightenBias": _coerce_float(order.get('runtimeExitOwnerTightenBias', 0.0), 0.0),
+            "runtimeExitOwnerAllowHold": bool(order.get('runtimeExitOwnerAllowHold', False)),
+            "runtimeStateDriftState": "ALIGNED",
+            "runtimeStateDriftReason": "COIN_STATE_ALIGNED",
+            "runtimeStateDriftSeverity": 0.0,
+            "runtimeIntentDecayPct": 0.0,
+            "microState5m": str(order.get('microState5m', 'RANGE') or 'RANGE'),
+            "setupState15m": str(order.get('setupState15m', 'NEUTRAL') or 'NEUTRAL'),
+            "backdropState1h": str(order.get('backdropState1h', 'MIXED') or 'MIXED'),
+            "macroState4h": str(order.get('macroState4h', 'MIXED') or 'MIXED'),
+            "transitionState": str(order.get('transitionState', 'NONE') or 'NONE'),
+            "stateConfidence": _coerce_float(order.get('stateConfidence', 0.0), 0.0),
+            "stateFreshness": str(order.get('stateFreshness', 'AVAILABLE') or 'AVAILABLE'),
+            "dominantSide": str(order.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+            "allowedEntryFamilies": list(order.get('allowedEntryFamilies', []) or []),
+            "preferredExitProfile": str(order.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+            "coinStateSource": str(order.get('coinStateSource', 'INTERNAL_MTF_CONTEXT') or 'INTERNAL_MTF_CONTEXT'),
+            "coinStateVersion": str(order.get('coinStateVersion', 'v1') or 'v1'),
+            "coinStateRouteReason": str(order.get('coinStateRouteReason', '') or ''),
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
@@ -46488,6 +48954,27 @@ class PaperTradingEngine:
             # RFX-2B: Distance truth telemetry (recalculated at fill)
             "distance_truth": _levels.get('distance_truth', order.get('distance_truth', {})),
         }
+        try:
+            initial_exit_profile = resolve_v3_exit_behavior_profile(
+                new_position,
+                current_price=fill_price,
+                thesis_ctx={'thesis_state': str(new_position.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY)},
+            )
+            new_position['runtimeExitProfile'] = str(initial_exit_profile.get('profile', new_position.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED)) or new_position.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED))
+            new_position['runtimeExitProfileReason'] = str(initial_exit_profile.get('reason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED')
+            new_position['runtimeExitOwner'] = str(initial_exit_profile.get('exit_owner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED)
+            new_position['runtimeExitOwnerReason'] = str(initial_exit_profile.get('exit_owner_reason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED')
+            new_position['runtimeExitOwnerTightenBias'] = _coerce_float(initial_exit_profile.get('exit_owner_tighten_bias', 0.0), 0.0)
+            new_position['runtimeExitOwnerAllowHold'] = bool(initial_exit_profile.get('exit_owner_allow_hold', False))
+        except Exception as _entry_exit_profile_err:
+            logger.debug(f"Entry exit-profile bootstrap error ({symbol}): {_entry_exit_profile_err}")
+        update_runtime_protection_telemetry(
+            pos=new_position,
+            current_price=fill_price,
+            user_first_reduction_roi=getattr(self, 'first_reduction_pct', getattr(global_paper_trader, 'first_reduction_pct', -100.0)),
+            user_full_close_roi=getattr(self, 'full_close_pct', getattr(global_paper_trader, 'full_close_pct', -150.0)),
+            entry_stop_hard_roi=getattr(self, 'entry_stop_hard_roi_pct', getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT)),
+        )
         # RFX-2B.1: Quality tag — mark source
         _dt_pos = new_position.get('distance_truth', {})
         if _dt_pos:
@@ -46918,129 +49405,12 @@ class PaperTradingEngine:
                 "ts": time.time(),
                 "source": "live_fill_pending_sl",
             }
-            _sl_price = new_position.get('stopLoss', 0)
-            _sl_amount = new_position.get('contracts', new_position.get('size', 0))
-            _sl_side = new_position.get('side', 'LONG')
-            
-            # Gate: SL price and amount MUST be valid — no degraded mode
-            if _sl_price <= 0 or _sl_amount <= 0:
-                logger.error(
-                    f"🚨 SL_ORDER_ABORT: {symbol} {_sl_side} | "
-                    f"sl_price={_sl_price} amount={_sl_amount} | "
-                    f"INVALID — closing position on exchange"
-                )
-                self.pipeline_metrics.setdefault('sl_order_failed', 0)
-                self.pipeline_metrics['sl_order_failed'] += 1
-                try:
-                    # Fetch actual position size from Binance when local amount invalid
-                    _abort_amount = abs(_sl_amount) if _sl_amount > 0 else 0
-                    if _abort_amount <= 0:
-                        try:
-                            _binance_positions = await live_binance_trader.get_positions(fast=True)
-                            for _bp in _binance_positions:
-                                if _bp.get('symbol') == symbol:
-                                    _abort_amount = abs(float(_bp.get('contracts', _bp.get('size', 0))))
-                                    break
-                        except Exception:
-                            pass
-                    if _abort_amount > 0:
-                        await live_binance_trader.close_position(
-                            symbol=symbol, side=_sl_side, amount=_abort_amount
-                        )
-                    else:
-                        logger.error(
-                            f"❌ SL_ABORT: {symbol} cannot determine position size — "
-                            f"MANUAL CLOSE REQUIRED"
-                        )
-                    logger.warning(
-                        f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {_sl_side} | "
-                        f"reason=INVALID_SL_PARAMS"
-                    )
-                except Exception as _abort_err:
-                    logger.error(
-                        f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {_sl_side} | "
-                        f"MANUAL INTERVENTION REQUIRED | error={_abort_err}"
-                    )
-                self.add_log(
-                    f"🚨 GÜVENLİK: {symbol} SL parametreleri geçersiz — "
-                    f"pozisyon açılmadı"
-                )
-                self.set_execution_feedback(symbol, "SL_ABORT_INVALID_PARAMS")
+            if not await self._bootstrap_live_protection_for_new_position(
+                new_position,
+                reason="ENTRY_BOOTSTRAP",
+            ):
                 self.entry_activation_hints.pop(symbol, None)
                 return  # Position never enters self.positions
-            
-            # Place STOP_MARKET on exchange
-            logger.info(
-                f"🔒 SL_ORDER_PLACE_ATTEMPT: {symbol} {_sl_side} | "
-                f"stopPrice=${_sl_price:.6f} | amount={_sl_amount} | "
-                f"leverage={new_position.get('leverage', 10)}x"
-            )
-            
-            _sl_placement_ok = False
-            try:
-                _sl_result = await live_binance_trader.set_stop_loss(
-                    symbol=symbol,
-                    side=_sl_side,
-                    amount=abs(_sl_amount),
-                    stop_price=_sl_price
-                )
-                
-                if _sl_result and _sl_result.get('id'):
-                    # SUCCESS — record order ID and proceed to append
-                    record_position_protective_order_id(new_position, _sl_result.get('id'))
-                    new_position['exchange_sl_price'] = _sl_result.get('stopPrice', _sl_price)
-                    self.pipeline_metrics.setdefault('sl_order_placed', 0)
-                    self.pipeline_metrics['sl_order_placed'] += 1
-                    _sl_placement_ok = True
-                    logger.warning(
-                        f"🔒 SL_ORDER_PLACE_SUCCESS: {symbol} {_sl_side} | "
-                        f"order_id={_sl_result['id']} | stopPrice=${_sl_price:.6f} | "
-                        f"stopLoss(engine)=${new_position['stopLoss']:.6f}"
-                    )
-                else:
-                    logger.error(
-                        f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {_sl_side} | "
-                        f"stopPrice=${_sl_price:.6f} | result={_sl_result}"
-                    )
-            except Exception as _sl_err:
-                logger.error(
-                    f"🚨 SL_ORDER_PLACE_FAILED: {symbol} {_sl_side} | "
-                    f"stopPrice=${_sl_price:.6f} | error={_sl_err}"
-                )
-            
-            if not _sl_placement_ok:
-                # FAIL — close on Binance, do NOT append to positions
-                self.pipeline_metrics.setdefault('sl_order_failed', 0)
-                self.pipeline_metrics['sl_order_failed'] += 1
-                
-                _enforcement_close_ok = False
-                try:
-                    _close_result = await live_binance_trader.close_position(
-                        symbol=symbol,
-                        side=_sl_side,
-                        amount=abs(_sl_amount)
-                    )
-                    _enforcement_close_ok = bool(_close_result)
-                    logger.warning(
-                        f"🚨 SL_ORDER_ENFORCEMENT_CLOSE: {symbol} {_sl_side} | "
-                        f"reason=SL_PLACEMENT_FAILED | amount={_sl_amount} | "
-                        f"close_ok={_enforcement_close_ok}"
-                    )
-                except Exception as _close_err:
-                    logger.error(
-                        f"❌ SL_ENFORCEMENT_CLOSE_ALSO_FAILED: {symbol} {_sl_side} | "
-                        f"MANUAL INTERVENTION REQUIRED | error={_close_err}"
-                    )
-                
-                self.add_log(
-                    f"🚨 GÜVENLİK: {symbol} SL emri gönderilemedi — "
-                    f"pozisyon güvenlik için kapatıldı"
-                )
-                self.set_execution_feedback(symbol, "SL_ENFORCEMENT_CLOSE")
-                self.entry_activation_hints.pop(symbol, None)
-                return  # Position never enters self.positions
-            
-            # SL confirmed — NOW safe to add position to active list
             self.positions.append(new_position)
             self.pipeline_metrics['filled'] += 1
             self.clear_execution_feedback(symbol)
@@ -48862,6 +51232,21 @@ class PaperTradingEngine:
             "postExitReentryConfirmDelaySec": int(pos.get('postExitReentryConfirmDelaySec', 0) or 0),
             "postExitReentryExpiresSec": int(pos.get('postExitReentryExpiresSec', 0) or 0),
             "postExitReentryExecutionPriority": str(pos.get('postExitReentryExecutionPriority', '') or ''),
+            "reversalRetestEntryMode": str(pos.get('reversalRetestEntryMode', '') or ''),
+            "reversalRetestPullbackPctOriginal": _coerce_float(pos.get('reversalRetestPullbackPctOriginal', 0.0), 0.0),
+            "reversalRetestPullbackPctApplied": _coerce_float(pos.get('reversalRetestPullbackPctApplied', 0.0), 0.0),
+            "reversalRetestConfirmDelaySec": int(pos.get('reversalRetestConfirmDelaySec', 0) or 0),
+            "reversalRetestExpiresSec": int(pos.get('reversalRetestExpiresSec', 0) or 0),
+            "reversalRetestExecutionPriority": str(pos.get('reversalRetestExecutionPriority', '') or ''),
+            "reversalRetestZoneState": str(pos.get('reversalRetestZoneState', '') or ''),
+            "reversalRetestZoneReason": str(pos.get('reversalRetestZoneReason', '') or ''),
+            "reversalRetestZoneSource": str(pos.get('reversalRetestZoneSource', '') or ''),
+            "reversalRetestZonePrice": _coerce_float(pos.get('reversalRetestZonePrice', 0.0), 0.0),
+            "reversalRetestZoneWidth": _coerce_float(pos.get('reversalRetestZoneWidth', 0.0), 0.0),
+            "reversalRetestPocketPrice": _coerce_float(pos.get('reversalRetestPocketPrice', 0.0), 0.0),
+            "reversalRetestRetestDistancePct": _coerce_float(pos.get('reversalRetestRetestDistancePct', 0.0), 0.0),
+            "reversalRetestTouchReady": bool(pos.get('reversalRetestTouchReady', False)),
+            "reversalRetestZoneConfidence": _coerce_float(pos.get('reversalRetestZoneConfidence', 0.0), 0.0),
             "structureTrend": str(pos.get('structureTrend', 'MIXED') or 'MIXED'),
             "swingState": str(pos.get('swingState', 'MIXED') or 'MIXED'),
             "compressionState": str(pos.get('compressionState', 'NONE') or 'NONE'),
@@ -48871,6 +51256,19 @@ class PaperTradingEngine:
             "patternConfidence": _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
             "patternSource": str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
             "structureVersion": str(pos.get('structureVersion', 'v1') or 'v1'),
+            "microState5m": str(pos.get('microState5m', 'NEUTRAL') or 'NEUTRAL'),
+            "setupState15m": str(pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL'),
+            "backdropState1h": str(pos.get('backdropState1h', 'MIXED') or 'MIXED'),
+            "macroState4h": str(pos.get('macroState4h', 'MIXED') or 'MIXED'),
+            "transitionState": str(pos.get('transitionState', 'NONE') or 'NONE'),
+            "stateConfidence": _coerce_float(pos.get('stateConfidence', 0.0), 0.0),
+            "stateFreshness": str(pos.get('stateFreshness', 'UNKNOWN') or 'UNKNOWN'),
+            "dominantSide": str(pos.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+            "allowedEntryFamilies": list(pos.get('allowedEntryFamilies', []) or []),
+            "preferredExitProfile": str(pos.get('preferredExitProfile', '') or ''),
+            "coinStateSource": str(pos.get('coinStateSource', '') or ''),
+            "coinStateVersion": str(pos.get('coinStateVersion', '') or ''),
+            "coinStateRouteReason": str(pos.get('coinStateRouteReason', '') or ''),
             "barrierState": str(pos.get('barrierState', 'CLEAR') or 'CLEAR'),
             "barrierVerdict": str(pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
             "adverseLevelType": str(pos.get('adverseLevelType', '') or ''),
@@ -48881,6 +51279,29 @@ class PaperTradingEngine:
             "supportiveDistancePct": _coerce_float(pos.get('supportiveDistancePct', 0.0), 0.0),
             "barrierReason": str(pos.get('barrierReason', '') or ''),
             "barrierConfidence": _coerce_float(pos.get('barrierConfidence', 0.0), 0.0),
+            "runtimeExitProfile": str(pos.get('runtimeExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+            "runtimeExitProfileReason": str(pos.get('runtimeExitProfileReason', 'BALANCED_FLOW') or 'BALANCED_FLOW'),
+            "runtimeExitOwner": str(pos.get('runtimeExitOwner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED),
+            "runtimeExitOwnerReason": str(pos.get('runtimeExitOwnerReason', 'BALANCED_EXIT_CONTROL') or 'BALANCED_EXIT_CONTROL'),
+            "runtimeExitOwnerTightenBias": _coerce_float(pos.get('runtimeExitOwnerTightenBias', 0.0), 0.0),
+            "runtimeExitOwnerAllowHold": bool(pos.get('runtimeExitOwnerAllowHold', False)),
+            "runtimeTacticalStopRoiPct": _coerce_float(pos.get('runtimeTacticalStopRoiPct', pos.get('runtimeStopRoiPct', 0.0)), 0.0),
+            "runtimeTacticalStopSource": str(pos.get('runtimeTacticalStopSource', 'EFFECTIVE_STOP') or 'EFFECTIVE_STOP'),
+            "runtimeTacticalStopPrice": _coerce_float(pos.get('runtimeTacticalStopPrice', pos.get('stopLoss', 0.0)), 0.0),
+            "runtimeEmergencyFloorRoiPct": _coerce_float(pos.get('runtimeEmergencyFloorRoiPct', 0.0), 0.0),
+            "runtimeEmergencyFloorPrice": _coerce_float(pos.get('runtimeEmergencyFloorPrice', 0.0), 0.0),
+            "runtimeExchangeProtectiveMode": str(pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY) or V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY),
+            "runtimeLossProtectionAuthority": str(pos.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD') or 'ENTRY_STOP_HARD'),
+            "runtimeExchangeProtectionAuthority": str(pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR') or 'EMERGENCY_FLOOR'),
+            "runtimeExchangeProtectionRole": str(pos.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE') or 'LOSS_FAILSAFE'),
+            "runtimeExchangeProtectiveStopRoiPct": _coerce_float(pos.get('runtimeExchangeProtectiveStopRoiPct', 0.0), 0.0),
+            "runtimeExchangeProtectiveStopPrice": _coerce_float(pos.get('runtimeExchangeProtectiveStopPrice', 0.0), 0.0),
+            "runtimeProtectionPhase": str(pos.get('runtimeProtectionPhase', 'SL-PRIMARY') or 'SL-PRIMARY'),
+            "runtimeStructuralInvalidationActive": bool(pos.get('runtimeStructuralInvalidationActive', False)),
+            "runtimeStructuralInvalidationSource": str(pos.get('runtimeStructuralInvalidationSource', '') or ''),
+            "runtimeStructuralInvalidationPrice": _coerce_float(pos.get('runtimeStructuralInvalidationPrice', 0.0), 0.0),
+            "runtimeStructuralInvalidationRoiPct": _coerce_float(pos.get('runtimeStructuralInvalidationRoiPct', 0.0), 0.0),
+            "runtimeStructuralInvalidationBufferAbs": _coerce_float(pos.get('runtimeStructuralInvalidationBufferAbs', 0.0), 0.0),
             "exitOwner": pos.get('exitOwner', LEGACY_EXIT_OWNER),
             "tpCloseSplit": pos.get('tpCloseSplit', ''),
             "tpLadderVersion": pos.get('tpLadderVersion', pos.get('tp_ladder_version', '')),
@@ -48991,6 +51412,21 @@ class PaperTradingEngine:
                 'postExitReentryConfirmDelaySec': int(pos.get('postExitReentryConfirmDelaySec', 0) or 0),
                 'postExitReentryExpiresSec': int(pos.get('postExitReentryExpiresSec', 0) or 0),
                 'postExitReentryExecutionPriority': str(pos.get('postExitReentryExecutionPriority', '') or ''),
+                'reversalRetestEntryMode': str(pos.get('reversalRetestEntryMode', '') or ''),
+                'reversalRetestPullbackPctOriginal': _coerce_float(pos.get('reversalRetestPullbackPctOriginal', 0.0), 0.0),
+                'reversalRetestPullbackPctApplied': _coerce_float(pos.get('reversalRetestPullbackPctApplied', 0.0), 0.0),
+                'reversalRetestConfirmDelaySec': int(pos.get('reversalRetestConfirmDelaySec', 0) or 0),
+                'reversalRetestExpiresSec': int(pos.get('reversalRetestExpiresSec', 0) or 0),
+                'reversalRetestExecutionPriority': str(pos.get('reversalRetestExecutionPriority', '') or ''),
+                'reversalRetestZoneState': str(pos.get('reversalRetestZoneState', '') or ''),
+                'reversalRetestZoneReason': str(pos.get('reversalRetestZoneReason', '') or ''),
+                'reversalRetestZoneSource': str(pos.get('reversalRetestZoneSource', '') or ''),
+                'reversalRetestZonePrice': _coerce_float(pos.get('reversalRetestZonePrice', 0.0), 0.0),
+                'reversalRetestZoneWidth': _coerce_float(pos.get('reversalRetestZoneWidth', 0.0), 0.0),
+                'reversalRetestPocketPrice': _coerce_float(pos.get('reversalRetestPocketPrice', 0.0), 0.0),
+                'reversalRetestRetestDistancePct': _coerce_float(pos.get('reversalRetestRetestDistancePct', 0.0), 0.0),
+                'reversalRetestTouchReady': bool(pos.get('reversalRetestTouchReady', False)),
+                'reversalRetestZoneConfidence': _coerce_float(pos.get('reversalRetestZoneConfidence', 0.0), 0.0),
                 'structureTrend': str(pos.get('structureTrend', 'MIXED') or 'MIXED'),
                 'swingState': str(pos.get('swingState', 'MIXED') or 'MIXED'),
                 'compressionState': str(pos.get('compressionState', 'NONE') or 'NONE'),
@@ -49000,6 +51436,19 @@ class PaperTradingEngine:
                 'patternConfidence': _coerce_float(pos.get('patternConfidence', 0.0), 0.0),
                 'patternSource': str(pos.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
                 'structureVersion': str(pos.get('structureVersion', 'v1') or 'v1'),
+                'microState5m': str(pos.get('microState5m', 'NEUTRAL') or 'NEUTRAL'),
+                'setupState15m': str(pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL'),
+                'backdropState1h': str(pos.get('backdropState1h', 'MIXED') or 'MIXED'),
+                'macroState4h': str(pos.get('macroState4h', 'MIXED') or 'MIXED'),
+                'transitionState': str(pos.get('transitionState', 'NONE') or 'NONE'),
+                'stateConfidence': _coerce_float(pos.get('stateConfidence', 0.0), 0.0),
+                'stateFreshness': str(pos.get('stateFreshness', 'UNKNOWN') or 'UNKNOWN'),
+                'dominantSide': str(pos.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+                'allowedEntryFamilies': list(pos.get('allowedEntryFamilies', []) or []),
+                'preferredExitProfile': str(pos.get('preferredExitProfile', '') or ''),
+                'coinStateSource': str(pos.get('coinStateSource', '') or ''),
+                'coinStateVersion': str(pos.get('coinStateVersion', '') or ''),
+                'coinStateRouteReason': str(pos.get('coinStateRouteReason', '') or ''),
                 'barrierState': str(pos.get('barrierState', 'CLEAR') or 'CLEAR'),
                 'barrierVerdict': str(pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
                 'adverseLevelType': str(pos.get('adverseLevelType', '') or ''),
@@ -49010,6 +51459,29 @@ class PaperTradingEngine:
                 'supportiveDistancePct': _coerce_float(pos.get('supportiveDistancePct', 0.0), 0.0),
                 'barrierReason': str(pos.get('barrierReason', '') or ''),
                 'barrierConfidence': _coerce_float(pos.get('barrierConfidence', 0.0), 0.0),
+                'runtimeExitProfile': str(pos.get('runtimeExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+                'runtimeExitProfileReason': str(pos.get('runtimeExitProfileReason', 'BALANCED_FLOW') or 'BALANCED_FLOW'),
+                'runtimeExitOwner': str(pos.get('runtimeExitOwner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED),
+                'runtimeExitOwnerReason': str(pos.get('runtimeExitOwnerReason', 'BALANCED_EXIT_CONTROL') or 'BALANCED_EXIT_CONTROL'),
+                'runtimeExitOwnerTightenBias': _coerce_float(pos.get('runtimeExitOwnerTightenBias', 0.0), 0.0),
+                'runtimeExitOwnerAllowHold': bool(pos.get('runtimeExitOwnerAllowHold', False)),
+                'runtimeTacticalStopRoiPct': _coerce_float(pos.get('runtimeTacticalStopRoiPct', pos.get('runtimeStopRoiPct', 0.0)), 0.0),
+                'runtimeTacticalStopSource': str(pos.get('runtimeTacticalStopSource', 'EFFECTIVE_STOP') or 'EFFECTIVE_STOP'),
+                'runtimeTacticalStopPrice': _coerce_float(pos.get('runtimeTacticalStopPrice', pos.get('stopLoss', 0.0)), 0.0),
+                'runtimeEmergencyFloorRoiPct': _coerce_float(pos.get('runtimeEmergencyFloorRoiPct', 0.0), 0.0),
+                'runtimeEmergencyFloorPrice': _coerce_float(pos.get('runtimeEmergencyFloorPrice', 0.0), 0.0),
+                'runtimeExchangeProtectiveMode': str(pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY) or V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY),
+                'runtimeLossProtectionAuthority': str(pos.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD') or 'ENTRY_STOP_HARD'),
+                'runtimeExchangeProtectionAuthority': str(pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR') or 'EMERGENCY_FLOOR'),
+                'runtimeExchangeProtectionRole': str(pos.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE') or 'LOSS_FAILSAFE'),
+                'runtimeExchangeProtectiveStopRoiPct': _coerce_float(pos.get('runtimeExchangeProtectiveStopRoiPct', 0.0), 0.0),
+                'runtimeExchangeProtectiveStopPrice': _coerce_float(pos.get('runtimeExchangeProtectiveStopPrice', 0.0), 0.0),
+                'runtimeProtectionPhase': str(pos.get('runtimeProtectionPhase', 'SL-PRIMARY') or 'SL-PRIMARY'),
+                'runtimeStructuralInvalidationActive': bool(pos.get('runtimeStructuralInvalidationActive', False)),
+                'runtimeStructuralInvalidationSource': str(pos.get('runtimeStructuralInvalidationSource', '') or ''),
+                'runtimeStructuralInvalidationPrice': _coerce_float(pos.get('runtimeStructuralInvalidationPrice', 0.0), 0.0),
+                'runtimeStructuralInvalidationRoiPct': _coerce_float(pos.get('runtimeStructuralInvalidationRoiPct', 0.0), 0.0),
+                'runtimeStructuralInvalidationBufferAbs': _coerce_float(pos.get('runtimeStructuralInvalidationBufferAbs', 0.0), 0.0),
                 'continuationFlowState': pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL),
                 'underwaterTapeState': pos.get('underwaterTapeState', V3_UNDERWATER_NEUTRAL),
                 'underwaterPriceLossPct': _coerce_float(pos.get('underwaterPriceLossPct', 0.0), 0.0),
@@ -50785,7 +53257,9 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 # Signals persist until invalidated by confirmed counter-signal
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
 post_exit_reentry_watchers = {}  # {symbol: {watcherId, originalTradeId, watchState, ...}}
+post_exit_reentry_watch_history = []  # [{ts, symbol, reason, resolutionMode, resolutionTargetSide, reentryTriggered, ...}]
 market_structure_cache = {}
+coin_state_cache = {}
 signal_event_buffer = deque(maxlen=2000)
 
 SIGNAL_STAGE_RAW = 'RAW_GENERATED'
@@ -51327,6 +53801,10 @@ async def paper_trading_status():
         "postExitReentryWatchersActive": post_exit_reentry_summary.get("active", 0),
         "postExitReentryCandidates": post_exit_reentry_summary.get("candidate", 0),
         "postExitReentryTriggered": post_exit_reentry_summary.get("triggered", 0),
+        "postExitReentryRecentArmed": post_exit_reentry_summary.get("recentArmed", 0),
+        "postExitReentryRecentCancelled": post_exit_reentry_summary.get("recentCancelled", 0),
+        "postExitReentryRecentTriggered": post_exit_reentry_summary.get("recentTriggered", 0),
+        "postExitReentryRecentOppositeTriggered": post_exit_reentry_summary.get("recentOppositeTriggered", 0),
         "lastOrderError": live_binance_trader.last_order_error,
         "executionDiagnostics": build_execution_diagnostics_snapshot(live_binance_trader),
         # Phase 237D: Reject attribution summary
@@ -51433,6 +53911,22 @@ async def live_trading_status():
                 )
                 merged['runtimeTpRoiPct'] = paper_pos.get('runtimeTpRoiPct', 0.0)
                 merged['runtimeStopRoiPct'] = paper_pos.get('runtimeStopRoiPct', 0.0)
+                merged['runtimeTacticalStopRoiPct'] = paper_pos.get('runtimeTacticalStopRoiPct', merged['runtimeStopRoiPct'])
+                merged['runtimeTacticalStopSource'] = paper_pos.get('runtimeTacticalStopSource', 'EFFECTIVE_STOP')
+                merged['runtimeEmergencyFloorRoiPct'] = paper_pos.get('runtimeEmergencyFloorRoiPct')
+                merged['runtimeTacticalStopPrice'] = paper_pos.get('runtimeTacticalStopPrice', paper_pos.get('stopLoss', 0.0))
+                merged['runtimeEmergencyFloorPrice'] = paper_pos.get('runtimeEmergencyFloorPrice', 0.0)
+                merged['runtimeStructuralInvalidationActive'] = bool(paper_pos.get('runtimeStructuralInvalidationActive', False))
+                merged['runtimeStructuralInvalidationSource'] = paper_pos.get('runtimeStructuralInvalidationSource', '')
+                merged['runtimeStructuralInvalidationPrice'] = paper_pos.get('runtimeStructuralInvalidationPrice', 0.0)
+                merged['runtimeStructuralInvalidationRoiPct'] = paper_pos.get('runtimeStructuralInvalidationRoiPct', 0.0)
+                merged['runtimeStructuralInvalidationBufferAbs'] = paper_pos.get('runtimeStructuralInvalidationBufferAbs', 0.0)
+                merged['runtimeExchangeProtectiveMode'] = paper_pos.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY)
+                merged['runtimeLossProtectionAuthority'] = paper_pos.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD')
+                merged['runtimeExchangeProtectionAuthority'] = paper_pos.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR')
+                merged['runtimeExchangeProtectionRole'] = paper_pos.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE')
+                merged['runtimeExchangeProtectiveStopRoiPct'] = paper_pos.get('runtimeExchangeProtectiveStopRoiPct', merged['runtimeStopRoiPct'])
+                merged['runtimeExchangeProtectiveStopPrice'] = paper_pos.get('runtimeExchangeProtectiveStopPrice', merged['runtimeTacticalStopPrice'])
                 merged['runtimeEntryStopGateMode'] = paper_pos.get('runtimeEntryStopGateMode', 'normal')
                 merged['runtimeEntryStopRoiPct'] = paper_pos.get('runtimeEntryStopRoiPct', merged['runtimeStopRoiPct'])
                 merged['runtimePreStopReduceRoiPct'] = paper_pos.get('runtimePreStopReduceRoiPct')
@@ -51444,6 +53938,38 @@ async def live_trading_status():
                 merged['runtimeRegimeFlags'] = paper_pos.get('runtimeRegimeFlags', [])
                 merged['runtimeSignalInvalidationState'] = paper_pos.get('runtimeSignalInvalidationState', {})
                 merged['runtimeProtectionPhase'] = paper_pos.get('runtimeProtectionPhase', 'SL-PRIMARY')
+                merged['runtimeExitProfile'] = paper_pos.get('runtimeExitProfile', V3_EXIT_PROFILE_BALANCED)
+                merged['runtimeExitProfileReason'] = paper_pos.get('runtimeExitProfileReason', 'BALANCED_FLOW')
+                merged['runtimeExitOwner'] = paper_pos.get('runtimeExitOwner', V3_EXIT_OWNER_BALANCED)
+                merged['runtimeExitOwnerReason'] = paper_pos.get('runtimeExitOwnerReason', 'BALANCED_EXIT_CONTROL')
+                merged['runtimeExitOwnerTightenBias'] = paper_pos.get('runtimeExitOwnerTightenBias', 0.0)
+                merged['runtimeExitOwnerAllowHold'] = bool(paper_pos.get('runtimeExitOwnerAllowHold', False))
+                merged['runtimeStateDriftState'] = paper_pos.get('runtimeStateDriftState', 'ALIGNED')
+                merged['runtimeStateDriftReason'] = paper_pos.get('runtimeStateDriftReason', 'COIN_STATE_ALIGNED')
+                merged['runtimeStateDriftSeverity'] = paper_pos.get('runtimeStateDriftSeverity', 0.0)
+                merged['runtimeIntentDecayPct'] = paper_pos.get('runtimeIntentDecayPct', 0.0)
+                merged['microState5m'] = paper_pos.get('microState5m', 'RANGE')
+                merged['setupState15m'] = paper_pos.get('setupState15m', 'NEUTRAL')
+                merged['backdropState1h'] = paper_pos.get('backdropState1h', 'MIXED')
+                merged['macroState4h'] = paper_pos.get('macroState4h', 'MIXED')
+                merged['transitionState'] = paper_pos.get('transitionState', 'NONE')
+                merged['stateConfidence'] = paper_pos.get('stateConfidence', 0.0)
+                merged['stateFreshness'] = paper_pos.get('stateFreshness', 'AVAILABLE')
+                merged['dominantSide'] = paper_pos.get('dominantSide', 'NEUTRAL')
+                merged['allowedEntryFamilies'] = paper_pos.get('allowedEntryFamilies', [])
+                merged['preferredExitProfile'] = paper_pos.get('preferredExitProfile', merged['runtimeExitProfile'])
+                merged['coinStateSource'] = paper_pos.get('coinStateSource', 'INTERNAL_MTF_CONTEXT')
+                merged['coinStateVersion'] = paper_pos.get('coinStateVersion', 'v1')
+                merged['coinStateRouteReason'] = paper_pos.get('coinStateRouteReason', '')
+                merged['reversalRetestZoneState'] = paper_pos.get('reversalRetestZoneState', '')
+                merged['reversalRetestZoneReason'] = paper_pos.get('reversalRetestZoneReason', '')
+                merged['reversalRetestZoneSource'] = paper_pos.get('reversalRetestZoneSource', '')
+                merged['reversalRetestZonePrice'] = paper_pos.get('reversalRetestZonePrice', 0.0)
+                merged['reversalRetestZoneWidth'] = paper_pos.get('reversalRetestZoneWidth', 0.0)
+                merged['reversalRetestPocketPrice'] = paper_pos.get('reversalRetestPocketPrice', 0.0)
+                merged['reversalRetestRetestDistancePct'] = paper_pos.get('reversalRetestRetestDistancePct', 0.0)
+                merged['reversalRetestTouchReady'] = bool(paper_pos.get('reversalRetestTouchReady', False))
+                merged['reversalRetestZoneConfidence'] = paper_pos.get('reversalRetestZoneConfidence', 0.0)
                 merged['runtimeTrailActivationMovePct'] = paper_pos.get('runtimeTrailActivationMovePct', 0.0)
                 merged['runtimeTrailActivationRoiPct'] = paper_pos.get('runtimeTrailActivationRoiPct', 0.0)
                 merged['runtimeTrailThresholdMult'] = paper_pos.get('runtimeTrailThresholdMult', 1.0)
@@ -51479,6 +54005,22 @@ async def live_trading_status():
                 entry = merged.get('entryPrice', 0)
                 merged['runtimeTpRoiPct'] = compute_target_roi_pct(entry, merged.get('takeProfit', 0), merged.get('side', 'LONG'), merged.get('leverage', 1))
                 merged['runtimeStopRoiPct'] = compute_target_roi_pct(entry, get_effective_stop_price(merged), merged.get('side', 'LONG'), merged.get('leverage', 1))
+                merged['runtimeTacticalStopRoiPct'] = merged['runtimeStopRoiPct']
+                merged['runtimeTacticalStopSource'] = 'EFFECTIVE_STOP'
+                merged['runtimeEmergencyFloorRoiPct'] = None
+                merged['runtimeTacticalStopPrice'] = get_effective_stop_price(merged)
+                merged['runtimeEmergencyFloorPrice'] = 0.0
+                merged['runtimeStructuralInvalidationActive'] = False
+                merged['runtimeStructuralInvalidationSource'] = ''
+                merged['runtimeStructuralInvalidationPrice'] = 0.0
+                merged['runtimeStructuralInvalidationRoiPct'] = 0.0
+                merged['runtimeStructuralInvalidationBufferAbs'] = 0.0
+                merged['runtimeExchangeProtectiveMode'] = V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+                merged['runtimeLossProtectionAuthority'] = 'ENTRY_STOP_HARD'
+                merged['runtimeExchangeProtectionAuthority'] = 'EMERGENCY_FLOOR'
+                merged['runtimeExchangeProtectionRole'] = 'LOSS_FAILSAFE'
+                merged['runtimeExchangeProtectiveStopRoiPct'] = merged['runtimeEmergencyFloorRoiPct'] if merged['runtimeEmergencyFloorRoiPct'] is not None else merged['runtimeStopRoiPct']
+                merged['runtimeExchangeProtectiveStopPrice'] = merged['runtimeEmergencyFloorPrice'] or merged['runtimeTacticalStopPrice']
                 merged['runtimeEntryStopGateMode'] = merged.get('entryStopGateMode', 'normal')
                 merged['runtimeEntryStopRoiPct'] = merged['runtimeStopRoiPct']
                 merged['runtimePreStopReduceRoiPct'] = None
@@ -51490,6 +54032,38 @@ async def live_trading_status():
                 merged['runtimeRegimeFlags'] = []
                 merged['runtimeSignalInvalidationState'] = {}
                 merged['runtimeProtectionPhase'] = 'SL-PRIMARY'
+                merged['runtimeExitProfile'] = V3_EXIT_PROFILE_BALANCED
+                merged['runtimeExitProfileReason'] = 'BALANCED_FLOW'
+                merged['runtimeExitOwner'] = V3_EXIT_OWNER_BALANCED
+                merged['runtimeExitOwnerReason'] = 'BALANCED_EXIT_CONTROL'
+                merged['runtimeExitOwnerTightenBias'] = 0.0
+                merged['runtimeExitOwnerAllowHold'] = False
+                merged['runtimeStateDriftState'] = 'ALIGNED'
+                merged['runtimeStateDriftReason'] = 'COIN_STATE_ALIGNED'
+                merged['runtimeStateDriftSeverity'] = 0.0
+                merged['runtimeIntentDecayPct'] = 0.0
+                merged['microState5m'] = merged.get('microState5m', 'RANGE')
+                merged['setupState15m'] = merged.get('setupState15m', 'NEUTRAL')
+                merged['backdropState1h'] = merged.get('backdropState1h', 'MIXED')
+                merged['macroState4h'] = merged.get('macroState4h', 'MIXED')
+                merged['transitionState'] = merged.get('transitionState', 'NONE')
+                merged['stateConfidence'] = merged.get('stateConfidence', 0.0)
+                merged['stateFreshness'] = merged.get('stateFreshness', 'AVAILABLE')
+                merged['dominantSide'] = merged.get('dominantSide', 'NEUTRAL')
+                merged['allowedEntryFamilies'] = merged.get('allowedEntryFamilies', [])
+                merged['preferredExitProfile'] = merged.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED)
+                merged['coinStateSource'] = merged.get('coinStateSource', 'INTERNAL_MTF_CONTEXT')
+                merged['coinStateVersion'] = merged.get('coinStateVersion', 'v1')
+                merged['coinStateRouteReason'] = merged.get('coinStateRouteReason', '')
+                merged['reversalRetestZoneState'] = merged.get('reversalRetestZoneState', '')
+                merged['reversalRetestZoneReason'] = merged.get('reversalRetestZoneReason', '')
+                merged['reversalRetestZoneSource'] = merged.get('reversalRetestZoneSource', '')
+                merged['reversalRetestZonePrice'] = merged.get('reversalRetestZonePrice', 0.0)
+                merged['reversalRetestZoneWidth'] = merged.get('reversalRetestZoneWidth', 0.0)
+                merged['reversalRetestPocketPrice'] = merged.get('reversalRetestPocketPrice', 0.0)
+                merged['reversalRetestRetestDistancePct'] = merged.get('reversalRetestRetestDistancePct', 0.0)
+                merged['reversalRetestTouchReady'] = bool(merged.get('reversalRetestTouchReady', False))
+                merged['reversalRetestZoneConfidence'] = merged.get('reversalRetestZoneConfidence', 0.0)
                 merged['runtimeTp1RoiPct'] = 0.0
                 merged['runtimeTp2RoiPct'] = 0.0
                 merged['runtimeTp3RoiPct'] = 0.0
@@ -52443,6 +55017,10 @@ async def scanner_status():
         "postExitReentryWatchersActive": post_exit_reentry_summary.get("active", 0),
         "postExitReentryCandidates": post_exit_reentry_summary.get("candidate", 0),
         "postExitReentryTriggered": post_exit_reentry_summary.get("triggered", 0),
+        "postExitReentryRecentArmed": post_exit_reentry_summary.get("recentArmed", 0),
+        "postExitReentryRecentCancelled": post_exit_reentry_summary.get("recentCancelled", 0),
+        "postExitReentryRecentTriggered": post_exit_reentry_summary.get("recentTriggered", 0),
+        "postExitReentryRecentOppositeTriggered": post_exit_reentry_summary.get("recentOppositeTriggered", 0),
     })
 
 # Phase 17: Settings endpoints
@@ -53473,7 +56051,109 @@ async def paper_trading_market_order(request: Request):
         sl = _mo_levels['sl']
         tp = _mo_levels['tp']
         sl_distance = abs(fill_price - sl)
-        
+
+        _manual_state_seed = apply_market_structure_context(
+            {
+                "symbol": symbol,
+                "side": side,
+                "action": side,
+                "price": fill_price,
+                "entryPrice": fill_price,
+                "atr": atr,
+                "strategyMode": _mo_runner_controls['mode'],
+                "structural_zone": {},
+            },
+            symbol=symbol,
+            side=side,
+            force=True,
+        )
+        _manual_setup_state = str(_manual_state_seed.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper()
+        _manual_transition_state = str(_manual_state_seed.get('transitionState', 'NONE') or 'NONE').upper()
+        _manual_entry_archetype_seed = ENTRY_ARCHETYPE_RECLAIM
+        if _manual_setup_state == 'CONTINUATION':
+            _manual_entry_archetype_seed = ENTRY_ARCHETYPE_CONTINUATION
+        elif _manual_setup_state == 'REVERSAL_RETEST' or _manual_transition_state in (
+            'FAILED_BREAKDOWN',
+            'FAILED_BREAKOUT',
+            'BREAKOUT_RETEST',
+            'RECLAIMING',
+        ):
+            _manual_entry_archetype_seed = ENTRY_ARCHETYPE_REVERSAL_RETEST
+        _manual_entry_archetype, _manual_coin_route_reason = reconcile_entry_archetype_with_coin_state(
+            _manual_entry_archetype_seed,
+            side,
+            _manual_state_seed,
+            allow_block=False,
+        )
+        if not _manual_entry_archetype:
+            _manual_entry_archetype = _manual_entry_archetype_seed
+        if _manual_coin_route_reason == 'COIN_STATE_KEEP':
+            if _manual_entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
+                _manual_coin_route_reason = 'COIN_STATE_ROUTE_CONTINUATION'
+            elif _manual_entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST:
+                _manual_coin_route_reason = 'COIN_STATE_ROUTE_REVERSAL'
+            elif _manual_entry_archetype == ENTRY_ARCHETYPE_RECLAIM:
+                _manual_coin_route_reason = 'COIN_STATE_ROUTE_RECLAIM'
+        _manual_state_seed['entryArchetype'] = _manual_entry_archetype
+        _manual_state_seed['coinStateRouteReason'] = str(_manual_coin_route_reason or '')
+        _manual_runner_context_resolved = classify_v3_runner_context(
+            {
+                **_manual_state_seed,
+                "symbol": symbol,
+                "side": side,
+                "action": side,
+                "entryArchetype": _manual_entry_archetype,
+                "strategyMode": _mo_runner_controls['mode'],
+            },
+            default_mode=_mo_runner_controls['mode'],
+        )
+        _manual_ohlcv_15m, _ = _get_cached_ohlcv_for_structure(symbol)
+        _manual_barrier_ctx = analyze_side_aware_entry_barrier(
+            symbol=symbol,
+            side=side,
+            current_price=fill_price,
+            atr=atr,
+            entry_archetype=_manual_entry_archetype,
+            runner_context_resolved=_manual_runner_context_resolved,
+            ohlcv_15m=_manual_ohlcv_15m,
+            structure_ctx=_manual_state_seed,
+        )
+        _manual_reversal_profile = {}
+        if _manual_entry_archetype == ENTRY_ARCHETYPE_REVERSAL_RETEST:
+            _manual_reversal_signal = {
+                **_manual_state_seed,
+                **_manual_barrier_ctx,
+                "symbol": symbol,
+                "side": side,
+                "action": side,
+                "entryArchetype": _manual_entry_archetype,
+                "runnerContextResolved": _manual_runner_context_resolved,
+            }
+            _manual_reversal_profile = resolve_reversal_retest_entry_profile(
+                _manual_reversal_signal,
+                current_price=fill_price,
+                atr=atr,
+                side=side,
+            )
+        _manual_signal_snapshot = {
+            **_manual_state_seed,
+            **_manual_barrier_ctx,
+            **_manual_reversal_profile,
+            "symbol": symbol,
+            "side": side,
+            "action": side,
+            "price": fill_price,
+            "entryPrice": fill_price,
+            "atr": atr,
+            "strategyMode": _mo_runner_controls['mode'],
+            "entryArchetype": _manual_entry_archetype,
+            "runnerContextResolved": _manual_runner_context_resolved,
+        }
+        _manual_decision_context = build_decision_context(
+            _manual_signal_snapshot,
+            default_mode=_mo_runner_controls['mode'],
+        )
+
         # Create position for paper tracker (tracking/UI)
         position = {
             "id": f"manual_{int(datetime.now().timestamp() * 1000)}",
@@ -53482,6 +56162,7 @@ async def paper_trading_market_order(request: Request):
             "entryPrice": fill_price,
             "currentPrice": fill_price,
             "size": filled_amount,
+            "contracts": filled_amount,
             "sizeUsd": filled_usd,
             "stopLoss": sl,
             "takeProfit": tp,
@@ -53495,6 +56176,9 @@ async def paper_trading_market_order(request: Request):
             "leverage": leverage,
             "isLive": live_binance_trader.enabled,
             "strategyMode": _mo_runner_controls['mode'],
+            "entryArchetype": _manual_entry_archetype,
+            "runnerContextResolved": _manual_runner_context_resolved,
+            "positionThesisState": POSITION_THESIS_ENTRY,
             "execution_profile_source": "manual",
             "runner_trail_act_mult": _mo_runner_controls['trail_act_mult'],
             "runner_trail_dist_mult": _mo_runner_controls['trail_dist_mult'],
@@ -53521,17 +56205,170 @@ async def paper_trading_market_order(request: Request):
             "runtimeTrailDistanceRoiPct": round(price_distance_to_roi_pct(_mo_levels['trail_distance'], fill_price, leverage), 2),
             "runtimeTpRoiPct": round(compute_target_roi_pct(fill_price, tp, side, leverage), 2),
             "runtimeStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, leverage), 2),
+            "runtimeTacticalStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, leverage), 2),
+            "runtimeTacticalStopSource": "EFFECTIVE_STOP",
+            "runtimeEmergencyFloorRoiPct": float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+            "runtimeTacticalStopPrice": round(sl, 8),
+            "runtimeEmergencyFloorPrice": round(
+                compute_target_price_from_roi(
+                    fill_price,
+                    float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+                    side,
+                    leverage,
+                ),
+                8,
+            ),
+            "runtimeStructuralInvalidationActive": False,
+            "runtimeStructuralInvalidationSource": "",
+            "runtimeStructuralInvalidationPrice": 0.0,
+            "runtimeStructuralInvalidationRoiPct": 0.0,
+            "runtimeStructuralInvalidationBufferAbs": 0.0,
+            "runtimeExchangeProtectiveMode": V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY,
+            "runtimeLossProtectionAuthority": "ENTRY_STOP_HARD",
+            "runtimeExchangeProtectionAuthority": "EMERGENCY_FLOOR",
+            "runtimeExchangeProtectionRole": "LOSS_FAILSAFE",
+            "runtimeExchangeProtectiveStopRoiPct": float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+            "runtimeExchangeProtectiveStopPrice": round(
+                compute_target_price_from_roi(
+                    fill_price,
+                    float(getattr(global_paper_trader, 'full_close_pct', -150.0)),
+                    side,
+                    leverage,
+                ),
+                8,
+            ),
+            "runtimeEntryStopGateMode": "normal",
+            "runtimeEntryStopRoiPct": round(compute_target_roi_pct(fill_price, sl, side, leverage), 2),
             "runtimePreStopReduceRoiPct": None,
             "runtimeKillSwitchFullRoiPct": None,
             "runtimeRecoveryState": {},
+            "runtimeLossGateState": {},
+            "runtimeCarryCostRoiPct": 0.0,
+            "runtimeExitRiskRoiPct": 0.0,
+            "runtimeRegimeFlags": [],
+            "runtimeSignalInvalidationState": {},
             "runtimeProtectionPhase": "SL-PRIMARY",
+            "runtimeExitProfile": str(_manual_signal_snapshot.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+            "runtimeExitProfileReason": "ENTRY_INITIALIZED",
+            "runtimeExitOwner": V3_EXIT_OWNER_BALANCED,
+            "runtimeExitOwnerReason": "ENTRY_INITIALIZED",
+            "runtimeExitOwnerTightenBias": 0.0,
+            "runtimeExitOwnerAllowHold": False,
+            "runtimeStateDriftState": "ALIGNED",
+            "runtimeStateDriftReason": "COIN_STATE_ALIGNED",
+            "runtimeStateDriftSeverity": 0.0,
+            "runtimeIntentDecayPct": 0.0,
+            "microState5m": str(_manual_signal_snapshot.get('microState5m', 'RANGE') or 'RANGE'),
+            "setupState15m": str(_manual_signal_snapshot.get('setupState15m', 'NEUTRAL') or 'NEUTRAL'),
+            "backdropState1h": str(_manual_signal_snapshot.get('backdropState1h', 'MIXED') or 'MIXED'),
+            "macroState4h": str(_manual_signal_snapshot.get('macroState4h', 'MIXED') or 'MIXED'),
+            "transitionState": str(_manual_signal_snapshot.get('transitionState', 'NONE') or 'NONE'),
+            "stateConfidence": _coerce_float(_manual_signal_snapshot.get('stateConfidence', 0.0), 0.0),
+            "stateFreshness": str(_manual_signal_snapshot.get('stateFreshness', 'AVAILABLE') or 'AVAILABLE'),
+            "dominantSide": str(_manual_signal_snapshot.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+            "allowedEntryFamilies": list(_manual_signal_snapshot.get('allowedEntryFamilies', []) or []),
+            "preferredExitProfile": str(_manual_signal_snapshot.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+            "coinStateSource": str(_manual_signal_snapshot.get('coinStateSource', 'INTERNAL_MTF_CONTEXT') or 'INTERNAL_MTF_CONTEXT'),
+            "coinStateVersion": str(_manual_signal_snapshot.get('coinStateVersion', 'v1') or 'v1'),
+            "coinStateRouteReason": str(_manual_signal_snapshot.get('coinStateRouteReason', '') or ''),
+            "structureTrend": str(_manual_signal_snapshot.get('structureTrend', 'MIXED') or 'MIXED'),
+            "swingState": str(_manual_signal_snapshot.get('swingState', 'MIXED') or 'MIXED'),
+            "compressionState": str(_manual_signal_snapshot.get('compressionState', 'NONE') or 'NONE'),
+            "breakoutRetestState": str(_manual_signal_snapshot.get('breakoutRetestState', 'NONE') or 'NONE'),
+            "srContext": str(_manual_signal_snapshot.get('srContext', 'UNKNOWN') or 'UNKNOWN'),
+            "patternBias": str(_manual_signal_snapshot.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+            "patternConfidence": _coerce_float(_manual_signal_snapshot.get('patternConfidence', 0.0), 0.0),
+            "patternSource": str(_manual_signal_snapshot.get('patternSource', 'TRADING_PATTERN_SCANNER_INSPIRED') or 'TRADING_PATTERN_SCANNER_INSPIRED'),
+            "structureVersion": str(_manual_signal_snapshot.get('structureVersion', 'v1') or 'v1'),
+            "barrierState": str(_manual_signal_snapshot.get('barrierState', 'CLEAR') or 'CLEAR'),
+            "barrierVerdict": str(_manual_signal_snapshot.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+            "adverseLevelType": str(_manual_signal_snapshot.get('adverseLevelType', '') or ''),
+            "adverseLevelPrice": _coerce_float(_manual_signal_snapshot.get('adverseLevelPrice', 0.0), 0.0),
+            "adverseDistancePct": _coerce_float(_manual_signal_snapshot.get('adverseDistancePct', 0.0), 0.0),
+            "supportiveLevelType": str(_manual_signal_snapshot.get('supportiveLevelType', '') or ''),
+            "supportiveLevelPrice": _coerce_float(_manual_signal_snapshot.get('supportiveLevelPrice', 0.0), 0.0),
+            "supportiveDistancePct": _coerce_float(_manual_signal_snapshot.get('supportiveDistancePct', 0.0), 0.0),
+            "barrierReason": str(_manual_signal_snapshot.get('barrierReason', '') or ''),
+            "barrierConfidence": _coerce_float(_manual_signal_snapshot.get('barrierConfidence', 0.0), 0.0),
+            "reversalRetestEntryMode": str(_manual_signal_snapshot.get('reversalRetestEntryMode', '') or ''),
+            "reversalRetestPullbackPctOriginal": _coerce_float(_manual_signal_snapshot.get('reversalRetestPullbackPctOriginal', 0.0), 0.0),
+            "reversalRetestPullbackPctApplied": _coerce_float(_manual_signal_snapshot.get('reversalRetestPullbackPctApplied', 0.0), 0.0),
+            "reversalRetestConfirmDelaySec": int(_manual_signal_snapshot.get('reversalRetestConfirmDelaySec', 0) or 0),
+            "reversalRetestExpiresSec": int(_manual_signal_snapshot.get('reversalRetestExpiresSec', 0) or 0),
+            "reversalRetestExecutionPriority": str(_manual_signal_snapshot.get('reversalRetestExecutionPriority', '') or ''),
+            "reversalRetestZoneState": str(_manual_signal_snapshot.get('reversalRetestZoneState', '') or ''),
+            "reversalRetestZoneReason": str(_manual_signal_snapshot.get('reversalRetestZoneReason', '') or ''),
+            "reversalRetestZoneSource": str(_manual_signal_snapshot.get('reversalRetestZoneSource', '') or ''),
+            "reversalRetestZonePrice": _coerce_float(_manual_signal_snapshot.get('reversalRetestZonePrice', 0.0), 0.0),
+            "reversalRetestZoneWidth": _coerce_float(_manual_signal_snapshot.get('reversalRetestZoneWidth', 0.0), 0.0),
+            "reversalRetestPocketPrice": _coerce_float(_manual_signal_snapshot.get('reversalRetestPocketPrice', 0.0), 0.0),
+            "reversalRetestRetestDistancePct": _coerce_float(_manual_signal_snapshot.get('reversalRetestRetestDistancePct', 0.0), 0.0),
+            "reversalRetestTouchReady": bool(_manual_signal_snapshot.get('reversalRetestTouchReady', False)),
+            "reversalRetestZoneConfidence": _coerce_float(_manual_signal_snapshot.get('reversalRetestZoneConfidence', 0.0), 0.0),
+            "decisionContext": _manual_decision_context,
+            "signal_snapshot": _manual_signal_snapshot,
             "runtimeTrailActivationMovePct": 0.0,
             "runtimeTrailActivationRoiPct": 0.0,
             "runtimeTrailThresholdMult": 1.0,
             "runtimeTrailLastUpdateTs": int(datetime.now().timestamp() * 1000),
         }
-        
+        try:
+            _manual_initial_exit_profile = resolve_v3_exit_behavior_profile(
+                position,
+                current_price=fill_price,
+                thesis_ctx={'thesis_state': POSITION_THESIS_ENTRY},
+            )
+            position['runtimeExitProfile'] = str(
+                _manual_initial_exit_profile.get(
+                    'profile',
+                    position.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED),
+                )
+                or position.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED)
+            )
+            position['runtimeExitProfileReason'] = str(
+                _manual_initial_exit_profile.get('reason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED'
+            )
+            position['runtimeExitOwner'] = str(
+                _manual_initial_exit_profile.get('exit_owner', V3_EXIT_OWNER_BALANCED) or V3_EXIT_OWNER_BALANCED
+            )
+            position['runtimeExitOwnerReason'] = str(
+                _manual_initial_exit_profile.get('exit_owner_reason', 'ENTRY_INITIALIZED') or 'ENTRY_INITIALIZED'
+            )
+            position['runtimeExitOwnerTightenBias'] = _coerce_float(
+                _manual_initial_exit_profile.get('exit_owner_tighten_bias', 0.0),
+                0.0,
+            )
+            position['runtimeExitOwnerAllowHold'] = bool(
+                _manual_initial_exit_profile.get('exit_owner_allow_hold', False)
+            )
+        except Exception as _manual_exit_profile_err:
+            logger.debug(f"Manual entry exit-profile bootstrap error ({symbol}): {_manual_exit_profile_err}")
+
+        update_runtime_protection_telemetry(
+            pos=position,
+            current_price=fill_price,
+            user_first_reduction_roi=getattr(global_paper_trader, 'first_reduction_pct', -100.0),
+            user_full_close_roi=getattr(global_paper_trader, 'full_close_pct', -150.0),
+            entry_stop_hard_roi=getattr(global_paper_trader, 'entry_stop_hard_roi_pct', ENTRY_STOP_HARD_ROI_DEFAULT),
+        )
+
+        if live_binance_trader.enabled and position.get('isLive', False):
+            global_paper_trader.entry_activation_hints[symbol] = {
+                "ts": time.time(),
+                "source": "manual_live_fill_pending_sl",
+            }
+            if not await global_paper_trader._bootstrap_live_protection_for_new_position(
+                position,
+                reason="MANUAL_ENTRY_BOOTSTRAP",
+            ):
+                global_paper_trader.entry_activation_hints.pop(symbol, None)
+                return JSONResponse(
+                    {"success": False, "error": "Borsa koruması kurulamadı, pozisyon geri kapatıldı"},
+                    status_code=502,
+                )
+
         global_paper_trader.positions.append(position)
+        global_paper_trader.entry_activation_hints.pop(symbol, None)
         global_paper_trader.add_log(f"🛒 MARKET ORDER: {side} {symbol} @ ${fill_price:.4f} | {leverage}x | SL: ${sl:.4f} | TP: ${tp:.4f}")
         global_paper_trader.save_state()
         

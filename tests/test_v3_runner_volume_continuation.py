@@ -397,6 +397,7 @@ def test_v3_runner_reclaim_close_exits_chop_after_tp1(monkeypatch):
     time_manager = main.TimeBasedPositionManager()
     monkeypatch.setattr(time_manager, "_get_v3_opposite_pressure", lambda pos: (False, 0.0))
     monkeypatch.setattr(time_manager, "_select_triggered_tp_slice_trail", lambda pos, price: None)
+    monkeypatch.setattr(main, "apply_market_structure_context", lambda payload, **kwargs: payload)
     trader = DummyTrader()
 
     pos = _build_v3_position(
@@ -417,8 +418,259 @@ def test_v3_runner_reclaim_close_exits_chop_after_tp1(monkeypatch):
 
     assert handled is True
     assert actions["time_closed"] == ["CHOPUSDT reclaim_be"]
+
+
+def test_resolve_v3_exit_behavior_profile_prefers_coin_state_profile_when_confident():
+    pos = _build_v3_position(
+        side="SHORT",
+        preferredExitProfile=main.V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        stateConfidence=0.72,
+        transitionState="FAILED_BREAKOUT",
+        setupState15m="REVERSAL_RETEST",
+        structureTrend="UP",
+        patternBias="RECLAIM",
+        patternConfidence=0.66,
+        continuationFlowState=main.V3_CONTINUATION_FADING,
+    )
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=99.8,
+        profit_ladder={"continuation_flow_state": main.V3_CONTINUATION_FADING, "current_profit_roi_pct": -1.0},
+        underwater_ctx={"state": main.V3_UNDERWATER_ADVERSE_WEAK, "price_loss_pct": 0.8, "small_loss_band_pct": 1.2},
+        thesis_ctx={"thesis_state": main.POSITION_THESIS_REVALIDATING},
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_TRANSITION_DEFENSE
+    assert profile["reason"] == "COIN_STATE_TRANSITION_DEFENSE"
+    assert profile["exit_owner"] == main.V3_EXIT_OWNER_TRANSITION_PROTECT
+
+
+def test_v3_runner_reclaim_close_holds_small_loss_when_trend_expansion_profile_is_active(monkeypatch):
+    pos = _build_v3_position(
+        symbol="TRENDHOLDUSDT",
+        trend_mode=True,
+        structureTrend="UP",
+        breakoutRetestState="BULL_RETEST_HOLD",
+        srContext="ABOVE_SUPPORT",
+        patternBias="CONTINUATION",
+        patternConfidence=0.84,
+        currentVolumeRatio=0.86,
+        currentIsVolumeSpike=False,
+        currentObImbalanceTrend=0.0,
+        currentImbalance=0.0,
+        currentAtrPct=0.8,
+        currentPrice=99.96,
+        openTime=int((time.time() - 30 * 60) * 1000),
+        sidewaysSinceTs=time.time() - 800.0,
+        worstUnderwaterPrice=99.4,
+        worstUnderwaterTs=time.time() - 900.0,
+        runtimeBreakevenFloorRoiPct=0.5,
+        runnerContext=main.V3_RUNNER_CONTEXT_TREND,
+    )
+    profit_ladder = {
+        "current_profit_roi_pct": -0.4,
+        "continuation_flow_state": main.V3_CONTINUATION_SUPPORTING,
+    }
+    underwater_ctx = {
+        "state": main.V3_UNDERWATER_SIDEWAYS,
+        "price_loss_pct": 0.04,
+        "small_loss_band_pct": 1.0,
+        "adverse_flow": False,
+        "hostile_imbalance": False,
+    }
+    thesis_ctx = {"thesis_state": main.POSITION_THESIS_ENTRY}
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=99.96,
+        profit_ladder=profit_ladder,
+        underwater_ctx=underwater_ctx,
+        thesis_ctx=thesis_ctx,
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_TREND_EXPANSION
+    assert profile["allow_sideways_reclaim_hold"] is True
+
+
+def test_v3_runner_reclaim_close_uses_faster_range_efficiency_chop_threshold(monkeypatch):
+    class DummyTrader:
+        def __init__(self):
+            self.closed = []
+            self.pipeline_metrics = {}
+
+        def close_via_engine(self, pos, exit_price, reason, source):
+            self.closed.append((pos["symbol"], exit_price, reason, source))
+            return {"reason": reason}
+
+    time_manager = main.TimeBasedPositionManager()
+    monkeypatch.setattr(time_manager, "_get_v3_opposite_pressure", lambda pos: (False, 0.0))
+    monkeypatch.setattr(time_manager, "_select_triggered_tp_slice_trail", lambda pos, price: None)
+    trader = DummyTrader()
+
+    pos = _build_v3_position(
+        symbol="RANGEFASTUSDT",
+        structureTrend="RANGE",
+        patternBias="NEUTRAL",
+        patternConfidence=0.28,
+        currentVolumeRatio=0.84,
+        currentObImbalanceTrend=0.0,
+        currentImbalance=0.0,
+        partial_tp_state={"tp1": True},
+        runtimeTp1RoiPct=4.0,
+        runtimeProfitPeakRoiPct=10.0,
+        profitPeakRoiPct=10.0,
+        chopSinceTs=time.time() - 350.0,
+        runnerContext=main.V3_RUNNER_CONTEXT_INTRADAY,
+    )
+    actions = {"time_closed": [], "partial_tp": []}
+
+    handled = asyncio.run(time_manager._handle_v3_runner_position(trader, pos, 100.15, actions))
+
+    assert handled is True
+    assert actions["time_closed"] == ["RANGEFASTUSDT reclaim_be"]
     assert trader.closed[0][2] == "RECLAIM_BE_CLOSE"
-    assert trader.pipeline_metrics["v3_chop_tighten_count"] == 1
+    assert pos["runtimeExitProfile"] == main.V3_EXIT_PROFILE_RANGE_EFFICIENCY
+
+
+def test_resolve_v3_exit_behavior_profile_detects_aged_range_stagnation():
+    pos = _build_v3_position(
+        openTime=int((time.time() - (5 * 60 * 60)) * 1000),
+        setupState15m="RECLAIM",
+        backdropState1h="RANGE",
+        macroState4h="RANGE",
+        stateConfidence=0.38,
+        preferredExitProfile=main.V3_EXIT_PROFILE_BALANCED,
+        structureTrend="MIXED",
+        patternBias="NEUTRAL",
+        patternConfidence=0.24,
+        continuationFlowState=main.V3_CONTINUATION_CHOP,
+    )
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=99.9,
+        profit_ladder={"continuation_flow_state": main.V3_CONTINUATION_CHOP, "current_profit_roi_pct": -1.4},
+        underwater_ctx={"state": main.V3_UNDERWATER_SIDEWAYS, "price_loss_pct": 0.4, "small_loss_band_pct": 1.0},
+        thesis_ctx={"thesis_state": main.POSITION_THESIS_ENTRY},
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_RANGE_EFFICIENCY
+    assert profile["reason"] == "AGED_RANGE_STAGNATION"
+    assert profile["chop_reclaim_min_age_sec"] == 150.0
+    assert profile["exit_owner"] == main.V3_EXIT_OWNER_FAILED_THESIS
+
+
+def test_resolve_v3_exit_behavior_profile_promotes_strong_mtf_trend_continuation():
+    pos = _build_v3_position(
+        trend_mode=False,
+        openTime=int((time.time() - (90 * 60)) * 1000),
+        setupState15m="CONTINUATION",
+        backdropState1h="TREND",
+        macroState4h="TREND",
+        stateConfidence=0.74,
+        preferredExitProfile=main.V3_EXIT_PROFILE_BALANCED,
+        structureTrend="UP",
+        srContext="ABOVE_SUPPORT",
+        breakoutRetestState="BULL_RETEST_HOLD",
+        patternBias="CONTINUATION",
+        patternConfidence=0.82,
+        continuationFlowState=main.V3_CONTINUATION_SUPPORTING,
+    )
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=100.6,
+        profit_ladder={"continuation_flow_state": main.V3_CONTINUATION_SUPPORTING, "current_profit_roi_pct": 6.0},
+        underwater_ctx={"state": main.V3_UNDERWATER_NEUTRAL, "price_loss_pct": 0.0, "small_loss_band_pct": 1.0},
+        thesis_ctx={"thesis_state": main.POSITION_THESIS_ENTRY},
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_TREND_EXPANSION
+    assert profile["reason"] == "MTF_TREND_CONTINUATION"
+    assert profile["exit_owner"] == main.V3_EXIT_OWNER_TREND_CONTINUATION
+
+
+def test_resolve_v3_exit_behavior_profile_keeps_trend_owner_on_supportive_breakout_retest():
+    pos = _build_v3_position(
+        side="LONG",
+        trend_mode=False,
+        openTime=int((time.time() - (75 * 60)) * 1000),
+        setupState15m="CONTINUATION",
+        backdropState1h="TREND",
+        macroState4h="TRANSITION",
+        transitionState="BREAKOUT_RETEST",
+        stateConfidence=0.71,
+        preferredExitProfile=main.V3_EXIT_PROFILE_BALANCED,
+        structureTrend="UP",
+        srContext="ABOVE_SUPPORT",
+        breakoutRetestState="BULL_RETEST_HOLD",
+        patternBias="CONTINUATION",
+        patternConfidence=0.84,
+        continuationFlowState=main.V3_CONTINUATION_SUPPORTING,
+    )
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=100.5,
+        profit_ladder={"continuation_flow_state": main.V3_CONTINUATION_SUPPORTING, "current_profit_roi_pct": 5.0},
+        underwater_ctx={"state": main.V3_UNDERWATER_NEUTRAL, "price_loss_pct": 0.0, "small_loss_band_pct": 1.0},
+        thesis_ctx={"thesis_state": main.POSITION_THESIS_ENTRY},
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_TREND_EXPANSION
+    assert profile["exit_owner"] == main.V3_EXIT_OWNER_TREND_CONTINUATION
+    assert profile["exit_owner_allow_hold"] is True
+
+
+def test_resolve_v3_exit_owner_uses_transition_protect_for_adverse_failed_breakout():
+    owner = main.resolve_v3_exit_owner(
+        profile=main.V3_EXIT_PROFILE_TREND_EXPANSION,
+        drift_state="ALIGNED",
+        drift_severity=0.0,
+        continuation_state=main.V3_CONTINUATION_SUPPORTING,
+        thesis_state=main.POSITION_THESIS_ENTRY,
+        current_roi_pct=4.0,
+        age_sec=30 * 60,
+        setup_state="CONTINUATION",
+        transition_state="FAILED_BREAKOUT",
+        dominant_side="LONG",
+        side="LONG",
+    )
+
+    assert owner["owner"] == main.V3_EXIT_OWNER_TRANSITION_PROTECT
+    assert owner["allow_hold"] is False
+
+
+def test_resolve_v3_exit_behavior_profile_detects_opposite_dominant_state_drift():
+    pos = _build_v3_position(
+        openTime=int((time.time() - (80 * 60)) * 1000),
+        setupState15m="CONTINUATION",
+        backdropState1h="MIXED",
+        macroState4h="TRANSITION",
+        transitionState="FAILED_BREAKOUT",
+        dominantSide="SHORT",
+        stateConfidence=0.78,
+        preferredExitProfile=main.V3_EXIT_PROFILE_BALANCED,
+        structureTrend="MIXED",
+        patternBias="NEUTRAL",
+        patternConfidence=0.32,
+        continuationFlowState=main.V3_CONTINUATION_NEUTRAL,
+    )
+
+    profile = main.resolve_v3_exit_behavior_profile(
+        pos,
+        current_price=99.6,
+        profit_ladder={"continuation_flow_state": main.V3_CONTINUATION_NEUTRAL, "current_profit_roi_pct": -0.8},
+        underwater_ctx={"state": main.V3_UNDERWATER_ADVERSE_WEAK, "price_loss_pct": 0.7, "small_loss_band_pct": 1.0},
+        thesis_ctx={"thesis_state": main.POSITION_THESIS_ENTRY},
+    )
+
+    assert profile["profile"] == main.V3_EXIT_PROFILE_TRANSITION_DEFENSE
+    assert profile["reason"] == "COIN_STATE_OPPOSITE_DOMINANT"
+    assert profile["drift_state"] == "OPPOSITE_DOMINANT"
+    assert profile["intent_decay_pct"] > 0.5
+    assert profile["exit_owner"] == main.V3_EXIT_OWNER_REVERSAL_ESCAPE
 
 
 def test_evaluate_v3_underwater_tape_state_detects_sideways_small_loss():

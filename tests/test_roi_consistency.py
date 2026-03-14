@@ -49,6 +49,7 @@ def _make_entry_engine(monkeypatch, stop_loss: float):
         "order_attempted": 0,
         "order_success": 0,
     }
+    engine.entry_activation_hints = {}
     engine.calculate_dynamic_atr_multiplier = lambda atr, price: 1.0
     engine.add_log = lambda _msg: None
     engine.save_state = lambda: None
@@ -389,6 +390,293 @@ def test_runtime_protection_telemetry_populates_canonical_fields():
     assert pos["runtimeTpRoiPct"] == 100.0
     assert pos["runtimeStopRoiPct"] == -100.0
     assert pos["runtimeProtectionPhase"] == "SL-PRIMARY"
+
+
+def test_runtime_protection_telemetry_splits_tactical_and_exchange_emergency_stop():
+    pos = {
+        "entryPrice": 100.0,
+        "currentPrice": 95.0,
+        "side": "LONG",
+        "leverage": 10,
+        "stopLoss": 90.0,
+        "takeProfit": 110.0,
+        "trailActivation": 103.0,
+        "trailDistance": 2.0,
+        "runtimeTrailDistance": 2.0,
+        "runtimeTrailActivationRoiPct": 12.0,
+        "unrealizedPnlPercent": -50.0,
+        "isTrailingActive": False,
+    }
+
+    update_runtime_protection_telemetry(pos, 95.0, -100.0, -150.0)
+
+    assert pos["runtimeTacticalStopRoiPct"] == -100.0
+    assert pos["runtimeEmergencyFloorRoiPct"] < pos["runtimeTacticalStopRoiPct"]
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+    assert TimeBasedPositionManager._resolve_live_protective_stop_price(pos) == pos["runtimeEmergencyFloorPrice"]
+
+
+def test_protection_ladder_widens_tactical_stop_to_structural_invalidation_for_reclaim():
+    pos = {
+        "symbol": "RECLAIMUSDT",
+        "strategyMode": main.STRATEGY_MODE_SMART_V3_RUNNER,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "entryPrice": 100.0,
+        "currentPrice": 99.5,
+        "side": "LONG",
+        "leverage": 10,
+        "stopLoss": 99.0,
+        "takeProfit": 106.0,
+        "trailActivation": 101.0,
+        "trailDistance": 1.0,
+        "unrealizedPnlPercent": -5.0,
+        "atr": 1.0,
+        "supportiveLevelPrice": 98.0,
+        "supportiveLevelType": "LOCAL_SUPPORT",
+    }
+
+    ladder = build_position_protection_ladder(pos, -100.0, -150.0, current_price=99.5)
+
+    assert ladder["effective_stop_roi_pct"] == -10.0
+    assert ladder["structural_invalidation_active"] is True
+    assert ladder["tactical_stop_roi_pct"] < ladder["effective_stop_roi_pct"]
+    assert ladder["tactical_stop_source"] == "LOCAL_SUPPORT"
+    assert ladder["pre_stop_reduce_roi_pct"] < -10.0
+
+
+def test_protection_ladder_clamps_structural_invalidation_by_entry_stop_hard():
+    pos = {
+        "symbol": "REVUSDT",
+        "strategyMode": main.STRATEGY_MODE_SMART_V3_RUNNER,
+        "entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST,
+        "entryPrice": 100.0,
+        "currentPrice": 99.5,
+        "side": "LONG",
+        "leverage": 100,
+        "stopLoss": 99.0,
+        "takeProfit": 106.0,
+        "trailActivation": 101.0,
+        "trailDistance": 1.0,
+        "unrealizedPnlPercent": -5.0,
+        "atr": 1.0,
+        "supportiveLevelPrice": 97.1,
+        "supportiveLevelType": "LOCAL_SUPPORT",
+        "entryStopHardRoiPct": -250.0,
+    }
+
+    ladder = build_position_protection_ladder(pos, -100.0, -150.0, current_price=99.5)
+
+    assert ladder["structural_invalidation_active"] is True
+    assert ladder["tactical_stop_roi_pct"] == -250.0
+
+
+def test_runtime_protection_telemetry_persists_structural_invalidation_fields(monkeypatch):
+    pos = {
+        "symbol": "REVUSDT",
+        "strategyMode": main.STRATEGY_MODE_SMART_V3_RUNNER,
+        "entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST,
+        "entryPrice": 100.0,
+        "currentPrice": 99.5,
+        "side": "SHORT",
+        "leverage": 10,
+        "stopLoss": 101.0,
+        "takeProfit": 94.0,
+        "trailActivation": 99.0,
+        "trailDistance": 1.0,
+        "runtimeTrailDistance": 1.0,
+        "runtimeTrailActivationRoiPct": 10.0,
+        "unrealizedPnlPercent": 5.0,
+        "atr": 1.0,
+        "supportiveLevelPrice": 101.9,
+        "supportiveLevelType": "LOCAL_RESISTANCE",
+    }
+
+    monkeypatch.setattr(main, "safe_create_task", lambda coro, name=None: coro.close() if hasattr(coro, "close") else None)
+    update_runtime_protection_telemetry(pos, 99.5, -100.0, -150.0)
+
+    assert pos["runtimeStructuralInvalidationActive"] is True
+    assert pos["runtimeStructuralInvalidationSource"] == "LOCAL_RESISTANCE"
+    assert pos["runtimeStructuralInvalidationPrice"] > 0
+    assert pos["runtimeTacticalStopSource"] == "LOCAL_RESISTANCE"
+
+
+def test_live_protective_stop_uses_tactical_lock_when_profit_is_protected():
+    pos = {
+        "entryPrice": 100.0,
+        "currentPrice": 102.0,
+        "side": "LONG",
+        "leverage": 10,
+        "stopLoss": 100.6,
+        "trailingStop": 101.1,
+        "takeProfit": 110.0,
+        "trailActivation": 103.0,
+        "trailDistance": 1.2,
+        "runtimeTrailDistance": 1.2,
+        "runtimeTrailActivationRoiPct": 12.0,
+        "runtimeTrailDistanceRoiPct": 12.0,
+        "unrealizedPnlPercent": 20.0,
+        "isTrailingActive": True,
+        "breakeven_activated": True,
+        "runtimeProfitLockPrice": 100.8,
+    }
+
+    update_runtime_protection_telemetry(pos, 102.0, -100.0, -150.0)
+
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL
+    assert TimeBasedPositionManager._resolve_live_protective_stop_price(pos) == pos["runtimeExchangeProtectiveStopPrice"]
+    assert pos["runtimeExchangeProtectiveStopPrice"] == pos["trailingStop"]
+
+
+def test_live_protective_sync_uses_runtime_tactical_lock(monkeypatch):
+    captured = {}
+
+    async def _set_stop_loss(symbol, side, amount, stop_price):
+        captured.update(
+            {
+                "symbol": symbol,
+                "side": side,
+                "amount": amount,
+                "stop_price": stop_price,
+            }
+        )
+        return {"id": "sl_sync_1", "stopPrice": stop_price}
+
+    monkeypatch.setattr(
+        main,
+        "live_binance_trader",
+        SimpleNamespace(set_stop_loss=_set_stop_loss),
+    )
+    monkeypatch.setattr(main, "safe_create_task", lambda coro, name=None: coro.close() if hasattr(coro, "close") else None)
+
+    manager = TimeBasedPositionManager.__new__(TimeBasedPositionManager)
+    pos = {
+        "symbol": "AAVEUSDT",
+        "entryPrice": 100.0,
+        "currentPrice": 102.0,
+        "side": "LONG",
+        "leverage": 10,
+        "contracts": 1.0,
+        "isLive": True,
+        "stopLoss": 100.6,
+        "trailingStop": 101.1,
+        "takeProfit": 110.0,
+        "trailActivation": 103.0,
+        "trailDistance": 1.2,
+        "runtimeTrailDistance": 1.2,
+        "runtimeTrailActivationRoiPct": 12.0,
+        "runtimeTrailDistanceRoiPct": 12.0,
+        "unrealizedPnlPercent": 20.0,
+        "isTrailingActive": True,
+        "breakeven_activated": True,
+        "runtimeProfitLockPrice": 100.8,
+    }
+
+    update_runtime_protection_telemetry(pos, 102.0, -100.0, -150.0)
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL
+
+    asyncio.run(manager._sync_live_protection_to_current_stop(pos, "TACTICAL_LOCK_TEST"))
+
+    assert captured["stop_price"] == pos["runtimeExchangeProtectiveStopPrice"]
+    assert captured["stop_price"] == pos["runtimeTacticalStopPrice"]
+    assert captured["stop_price"] != pos["runtimeEmergencyFloorPrice"]
+
+
+def test_runtime_protection_stays_emergency_on_loss_side():
+    pos = {
+        "entryPrice": 100.0,
+        "currentPrice": 99.4,
+        "side": "LONG",
+        "leverage": 10,
+        "stopLoss": 99.0,
+        "trailingStop": 99.0,
+        "takeProfit": 110.0,
+        "trailActivation": 103.0,
+        "trailDistance": 1.2,
+        "runtimeTrailDistance": 1.2,
+        "runtimeTrailActivationRoiPct": 12.0,
+        "runtimeTrailDistanceRoiPct": 12.0,
+        "unrealizedPnlPercent": -6.0,
+        "isTrailingActive": False,
+        "breakeven_activated": False,
+        "runtimeProfitLockPrice": 0.0,
+    }
+
+    update_runtime_protection_telemetry(pos, 99.4, -100.0, -150.0)
+
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+    assert pos["runtimeExchangeProtectionAuthority"] == "EMERGENCY_FLOOR"
+    assert pos["runtimeExchangeProtectionRole"] == "LOSS_FAILSAFE"
+    assert pos["runtimeExchangeProtectiveStopPrice"] == pos["runtimeEmergencyFloorPrice"]
+    assert pos["runtimeExchangeProtectiveStopPrice"] != pos["runtimeTacticalStopPrice"]
+    assert TimeBasedPositionManager._resolve_live_protective_stop_price(pos) == pos["runtimeEmergencyFloorPrice"]
+
+
+def test_bootstrap_live_protection_uses_runtime_emergency_floor(monkeypatch):
+    engine = _make_entry_engine(monkeypatch, stop_loss=99.0)
+    engine.pipeline_metrics["sl_order_placed"] = 0
+    engine.pipeline_metrics["sl_order_failed"] = 0
+    protective_stop = {}
+
+    async def _set_stop_loss(symbol, side, amount, stop_price):
+        protective_stop.update({
+            "symbol": symbol,
+            "side": side,
+            "amount": amount,
+            "stop_price": stop_price,
+        })
+        return {"id": "sl_bootstrap_1", "stopPrice": stop_price}
+
+    async def _close_position(symbol, side, amount):
+        protective_stop["closed"] = (symbol, side, amount)
+        return {"closed": True}
+
+    async def _get_positions(fast=True):
+        return []
+
+    monkeypatch.setattr(
+        main,
+        "live_binance_trader",
+        SimpleNamespace(
+            enabled=True,
+            trading_mode="live",
+            exec_entry_score_min=0.10,
+            last_order_error=None,
+            set_stop_loss=_set_stop_loss,
+            close_position=_close_position,
+            get_positions=_get_positions,
+        ),
+    )
+
+    pos = {
+        "symbol": "AAVEUSDT",
+        "side": "LONG",
+        "entryPrice": 100.0,
+        "currentPrice": 100.0,
+        "size": 1.0,
+        "contracts": 1.0,
+        "stopLoss": 99.0,
+        "trailingStop": 99.0,
+        "takeProfit": 110.0,
+        "trailActivation": 103.0,
+        "trailDistance": 1.2,
+        "runtimeTrailDistance": 1.2,
+        "leverage": 10,
+        "isLive": True,
+        "isTrailingActive": False,
+        "breakeven_activated": False,
+        "runtimeProfitLockPrice": 0.0,
+    }
+
+    update_runtime_protection_telemetry(pos, 100.0, -100.0, -150.0)
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+
+    result = asyncio.run(engine._bootstrap_live_protection_for_new_position(pos, "ENTRY_BOOTSTRAP"))
+
+    assert result is True
+    assert protective_stop["stop_price"] == pos["runtimeExchangeProtectiveStopPrice"]
+    assert protective_stop["stop_price"] == pos["runtimeEmergencyFloorPrice"]
+    assert protective_stop["stop_price"] != pos["stopLoss"]
+    assert pos["runtimeExchangeProtectionAuthority"] == "EMERGENCY_FLOOR"
 
 
 def test_profit_ladder_uses_exchange_break_even_anchor_and_roi_phases():

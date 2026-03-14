@@ -77,6 +77,11 @@ def _build_watch(**overrides):
         "reentryPendingEntryId": "",
         "reentryPositionId": "",
         "cancelReason": "",
+        "resolutionMode": main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+        "resolutionTargetSide": "LONG",
+        "resolutionReason": "WATCH_ARMED",
+        "resolutionConfidence": 0.0,
+        "resolutionEntryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
         "decisionContext": {"directionOwner": "reclaim"},
         "expectancyBand": main.DECISION_EXPECTANCY_BAND_GOOD,
         "expectancyRankingScore": 118.0,
@@ -469,11 +474,127 @@ def test_evaluate_post_exit_reentry_watchers_cancels_on_hostile_imbalance(monkey
     asyncio.run(
         main.evaluate_post_exit_reentry_watchers(
             [_build_candidate_opp(imbalance=-9.5)],
-            [_build_candidate_signal()],
+            [],
         )
     )
 
-    assert "AAVEUSDT" not in main.post_exit_reentry_watchers
+    assert "AAVEUSDT" in main.post_exit_reentry_watchers
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
+
+
+def test_evaluate_post_exit_reentry_watchers_can_flip_to_opposite_reversal(monkeypatch):
+    events = []
+    watch = _build_watch(
+        side="SHORT",
+        symbol="AEVOUSDT",
+        watcherId="PEW_AEVO",
+        signalId="SIG_RECLAIM_AEVO",
+        positionId="POS_RECLAIM_AEVO",
+        originalTradeId="TRD_RECLAIM_AEVO",
+        resolutionTargetSide="SHORT",
+        cooldownUntilTs=1000.0,
+    )
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AEVOUSDT": watch})
+    monkeypatch.setattr(main, "post_exit_reentry_watch_history", [])
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
+
+    async def _fake_dispatch(safe_watch, signal, opportunity):
+        safe_watch["watchState"] = main.POST_EXIT_REENTRY_STATE_CONFIRMED
+        safe_watch["reentryUsed"] = True
+        safe_watch["reentryTriggered"] = True
+        safe_watch["reentryTriggerReason"] = "OPPOSITE_REVERSAL"
+        events.append(
+            (
+                safe_watch["watcherId"],
+                safe_watch["resolutionMode"],
+                safe_watch["resolutionTargetSide"],
+                signal["action"],
+                opportunity["symbol"],
+            )
+        )
+        return True
+
+    opposite_signal = _build_candidate_signal(
+        symbol="AEVOUSDT",
+        action="LONG",
+        confidenceScore=78.0,
+        currentExecScore=68.0,
+        currentVolumeRatio=1.18,
+        currentObImbalanceTrend=2.8,
+        currentImbalance=9.4,
+        patternBias="CONTINUATION",
+        patternConfidence=0.74,
+        breakoutRetestState="BULL_RETEST_HOLD",
+        entryArchetype=main.ENTRY_ARCHETYPE_RECLAIM,
+        directionOwner="reclaim",
+        runnerContextResolved=main.V3_RUNNER_CONTEXT_COUNTER,
+    )
+    opposite_opp = _build_candidate_opp(
+        symbol="AEVOUSDT",
+        signalAction="LONG",
+        signalScore=78.0,
+        price=100.85,
+        currentExecScore=68.0,
+        entryExecScore=68.0,
+        volumeRatio=1.18,
+        obImbalanceTrend=2.8,
+        imbalance=9.4,
+        patternBias="CONTINUATION",
+        patternConfidence=0.74,
+        breakoutRetestState="BULL_RETEST_HOLD",
+    )
+
+    monkeypatch.setattr(main, "dispatch_post_exit_reentry_watch", _fake_dispatch)
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+    asyncio.run(main.evaluate_post_exit_reentry_watchers([opposite_opp], [opposite_signal]))
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_CANDIDATE
+    assert watch["resolutionMode"] == main.POST_EXIT_RESOLUTION_MODE_OPPOSITE
+    assert watch["resolutionTargetSide"] == "LONG"
+
+    monkeypatch.setattr(main.time, "time", lambda: 1061.0)
+    asyncio.run(main.evaluate_post_exit_reentry_watchers([opposite_opp], [opposite_signal]))
+
+    assert events == [("PEW_AEVO", main.POST_EXIT_RESOLUTION_MODE_OPPOSITE, "LONG", "LONG", "AEVOUSDT")]
+    assert watch["reentryTriggered"] is True
+
+
+def test_coin_state_resolution_helper_blocks_same_side_when_opposite_side_is_dominant():
+    ok, reason, boost = main._coin_state_supports_resolution(
+        main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+        {
+            "setupState15m": "REVERSAL_RETEST",
+            "transitionState": "FAILED_BREAKDOWN",
+            "dominantSide": "LONG",
+            "stateConfidence": 0.74,
+            "allowedEntryFamilies": ["reversal_retest", "reclaim"],
+            "preferredExitProfile": main.V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        },
+        "SHORT",
+    )
+
+    assert ok is False
+    assert reason == "COIN_STATE_OPPOSITE_DOMINANT"
+    assert boost == 0.0
+
+
+def test_coin_state_resolution_helper_supports_opposite_reversal_when_transition_is_active():
+    ok, reason, boost = main._coin_state_supports_resolution(
+        main.POST_EXIT_RESOLUTION_MODE_OPPOSITE,
+        {
+            "setupState15m": "REVERSAL_RETEST",
+            "transitionState": "FAILED_BREAKDOWN",
+            "dominantSide": "LONG",
+            "stateConfidence": 0.78,
+            "allowedEntryFamilies": ["reversal_retest", "reclaim"],
+            "preferredExitProfile": main.V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        },
+        "LONG",
+    )
+
+    assert ok is True
+    assert reason == "COIN_STATE_OPPOSITE_OK"
+    assert boost > 0.0
 
 
 def test_build_post_exit_reentry_watchers_summary_reports_counts(monkeypatch):
@@ -496,6 +617,15 @@ def test_build_post_exit_reentry_watchers_summary_reports_counts(monkeypatch):
             ),
         },
     )
+    monkeypatch.setattr(
+        main,
+        "post_exit_reentry_watch_history",
+        [
+            {"ts": 1000.0, "reason": "armed", "resolutionMode": main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE, "reentryTriggered": False},
+            {"ts": 1010.0, "reason": "cancelled", "resolutionMode": main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE, "reentryTriggered": False},
+            {"ts": 1020.0, "reason": "confirmed", "resolutionMode": main.POST_EXIT_RESOLUTION_MODE_OPPOSITE, "reentryTriggered": True},
+        ],
+    )
 
     summary = main.build_post_exit_reentry_watchers_summary(now_ts=1005.0)
 
@@ -503,6 +633,69 @@ def test_build_post_exit_reentry_watchers_summary_reports_counts(monkeypatch):
     assert summary["candidate"] == 1
     assert summary["confirmed"] == 1
     assert summary["triggered"] == 1
+    assert summary["recentArmed"] == 1
+    assert summary["recentCancelled"] == 1
+    assert summary["recentTriggered"] == 1
+    assert summary["recentOppositeTriggered"] == 1
+
+
+def test_build_post_exit_reentry_signal_defaults_opposite_mode_to_reversal_retest():
+    watch = _build_watch(
+        symbol="AEVOUSDT",
+        side="SHORT",
+        resolutionMode=main.POST_EXIT_RESOLUTION_MODE_OPPOSITE,
+        resolutionTargetSide="LONG",
+        resolutionEntryArchetype="",
+    )
+    signal = _build_candidate_signal(
+        symbol="AEVOUSDT",
+        action="LONG",
+        entryArchetype="",
+        decisionContext={},
+        directionOwner="",
+    )
+    opp = _build_candidate_opp(
+        symbol="AEVOUSDT",
+        signalAction="LONG",
+        price=100.8,
+        breakoutRetestState="BULL_RETEST_HOLD",
+        patternBias="CONTINUATION",
+        patternConfidence=0.72,
+    )
+
+    built = main._build_post_exit_reentry_signal(watch, signal, opp)
+
+    assert built["entryArchetype"] == main.ENTRY_ARCHETYPE_REVERSAL_RETEST
+
+
+def test_build_post_exit_reentry_signal_exposes_coin_state_route_reason():
+    watch = {
+        "symbol": "AEVOUSDT",
+        "side": "SHORT",
+        "resolutionMode": main.POST_EXIT_RESOLUTION_MODE_OPPOSITE,
+        "resolutionTargetSide": "LONG",
+        "watcherId": "PEW_TEST",
+        "originalTradeId": "TRD_TEST",
+        "exitReason": "SIDEWAYS_RECLAIM_CLOSE",
+    }
+    signal = {
+        "symbol": "AEVOUSDT",
+        "action": "LONG",
+        "price": 100.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "setupState15m": "REVERSAL_RETEST",
+        "transitionState": "FAILED_BREAKDOWN",
+        "dominantSide": "LONG",
+        "stateConfidence": 0.71,
+        "allowedEntryFamilies": ["reversal_retest", "reclaim"],
+    }
+    opp = {"symbol": "AEVOUSDT", "price": 100.0}
+
+    built = main._build_post_exit_reentry_signal(watch, signal, opp)
+
+    assert built["entryArchetype"] == main.ENTRY_ARCHETYPE_REVERSAL_RETEST
+    assert built["coinStateRouteReason"] == "COIN_STATE_ROUTE_REVERSAL"
+    assert built["directionOwner"] == "reversal_retest"
 
 
 def test_extract_post_exit_reentry_watch_summary_reads_trigger_and_reason():

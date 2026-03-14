@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import pytest
@@ -39,6 +40,19 @@ def _build_post_exit_signal():
         "srContext": "ABOVE_SUPPORT",
         "patternBias": "CONTINUATION",
         "patternConfidence": 0.78,
+        "microState5m": "TREND_UP",
+        "setupState15m": "CONTINUATION",
+        "backdropState1h": "TREND",
+        "macroState4h": "TREND",
+        "transitionState": "BREAKOUT_RETEST",
+        "stateConfidence": 0.74,
+        "stateFreshness": "AVAILABLE",
+        "dominantSide": "LONG",
+        "allowedEntryFamilies": ["continuation", "reclaim"],
+        "preferredExitProfile": main.V3_EXIT_PROFILE_TREND_EXPANSION,
+        "coinStateSource": "INTERNAL_MTF_CONTEXT",
+        "coinStateVersion": "v1",
+        "coinStateRouteReason": "COIN_STATE_ROUTE_CONTINUATION",
         "barrierState": "LONG_ABOVE_SUPPORT",
         "barrierVerdict": "SUPPORTIVE",
         "adverseDistancePct": 0.65,
@@ -73,6 +87,14 @@ def _configure_trader_for_open(monkeypatch, trader):
         return None
 
     monkeypatch.setattr(main.sqlite_manager, "save_entry_forecast_event", _noop_save_entry_forecast_event)
+
+
+class _DummyRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
 
 
 def test_open_position_keeps_opposite_pending_when_replacement_signal_rejected(monkeypatch):
@@ -138,6 +160,27 @@ def test_open_position_supersedes_opposite_pending_only_after_success(monkeypatc
     assert trader.pending_orders[0]["id"] != "PO_OLD"
     assert recycled and recycled[0][1] == "PENDING__SUPERSEDED"
     assert finalized and finalized[0] == ("PO_OLD", "CANCELLED", "superseded")
+
+
+def test_open_position_carries_coin_state_context_into_pending(monkeypatch):
+    trader = main.global_paper_trader
+    _configure_trader_for_open(monkeypatch, trader)
+    monkeypatch.setattr(trader, "pending_orders", [])
+
+    result = asyncio.run(
+        trader.open_position("LONG", 100.0, 0.30, _build_post_exit_signal(), symbol="AAVEUSDT")
+    )
+
+    assert result is not None
+    assert result["microState5m"] == "TREND_UP"
+    assert result["setupState15m"] == "CONTINUATION"
+    assert result["backdropState1h"] == "TREND"
+    assert result["macroState4h"] == "TREND"
+    assert result["transitionState"] == "BREAKOUT_RETEST"
+    assert result["dominantSide"] == "LONG"
+    assert result["allowedEntryFamilies"] == ["continuation", "reclaim"]
+    assert result["preferredExitProfile"] == main.V3_EXIT_PROFILE_TREND_EXPANSION
+    assert result["coinStateRouteReason"] == "COIN_STATE_ROUTE_CONTINUATION"
 
 
 def test_reinforce_pending_refreshes_context_and_preserves_shallow_reentry(monkeypatch):
@@ -266,6 +309,271 @@ def test_revalidate_pending_entry_uses_cached_15m_structure_for_barrier_parity(m
 
     assert result["decision"] == "FAIL_DROP"
     assert any(reason.startswith("BARRIER_REJECT") for reason in result["reasons"])
+
+
+def test_open_position_uses_reversal_retest_pending_profile(monkeypatch):
+    trader = main.global_paper_trader
+    _configure_trader_for_open(monkeypatch, trader)
+    monkeypatch.setattr(trader, "pending_orders", [])
+    signal = {
+        "signalId": "SIG_REVERSAL",
+        "symbol": "AEVOUSDT",
+        "action": "LONG",
+        "confidenceScore": 84.0,
+        "_rawConfidenceScore": 87.0,
+        "entryPrice": 99.0,
+        "pullbackPct": 0.95,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.18,
+        "atr": 0.30,
+        "leverage": 8,
+        "entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "decisionContext": {"entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST, "directionOwner": "reversal_retest"},
+        "expectancy": {"rankingScore": 108.0},
+        "expectancyBand": main.DECISION_EXPECTANCY_BAND_GOOD,
+        "pendingPatienceBias": 0.9,
+        "breakoutRetestState": "FAILED_BREAKDOWN",
+        "transitionState": "FAILED_BREAKDOWN",
+        "supportiveLevelPrice": 99.82,
+        "supportiveDistancePct": 0.18,
+        "barrierState": "LONG_ABOVE_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "SUPPORTIVE_BARRIER_CONTEXT",
+    }
+
+    result = asyncio.run(
+        trader.open_position("LONG", 100.0, 0.30, signal, symbol="AEVOUSDT")
+    )
+
+    assert result is not None
+    assert result["resultKind"] == main.PENDING_OPEN_RESULT_CREATED_PENDING
+    assert result["entryArchetype"] == main.ENTRY_ARCHETYPE_REVERSAL_RETEST
+    assert result["reversalRetestEntryMode"] == "RETEST_POCKET"
+    assert result["reversalRetestPullbackPctApplied"] < 0.30
+    assert result["pullbackPct"] == pytest.approx(result["reversalRetestPullbackPctApplied"], rel=1e-6)
+    assert result["reversalRetestConfirmDelaySec"] == main.V3_REVERSAL_RETEST_CONFIRM_DELAY_SEC
+    assert result["reversalRetestExpiresSec"] == main.V3_REVERSAL_RETEST_EXPIRES_SEC
+    assert result["reversalRetestZoneState"] == "READY"
+    assert result["reversalRetestPocketPrice"] > 0
+    assert result["reversalRetestZoneConfidence"] > 0.5
+
+
+def test_gate_and_execute_bootstraps_position_runtime_state_from_pending(monkeypatch):
+    trader = main.global_paper_trader
+    _configure_trader_for_open(monkeypatch, trader)
+    monkeypatch.setattr(trader, "pending_orders", [])
+    monkeypatch.setattr(trader, "positions", [])
+    signal = {
+        "signalId": "SIG_REV_BOOT",
+        "symbol": "AEVOUSDT",
+        "action": "LONG",
+        "confidenceScore": 86.0,
+        "_rawConfidenceScore": 89.0,
+        "entryPrice": 99.0,
+        "pullbackPct": 0.85,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.22,
+        "atr": 0.30,
+        "leverage": 8,
+        "entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "decisionContext": {"entryArchetype": main.ENTRY_ARCHETYPE_REVERSAL_RETEST, "directionOwner": "reversal_retest"},
+        "expectancy": {"rankingScore": 112.0},
+        "expectancyBand": main.DECISION_EXPECTANCY_BAND_GOOD,
+        "pendingPatienceBias": 0.9,
+        "structureTrend": "UP",
+        "swingState": "HH_HL",
+        "compressionState": "MILD",
+        "breakoutRetestState": "FAILED_BREAKDOWN",
+        "srContext": "ABOVE_SUPPORT",
+        "patternBias": "RECLAIM",
+        "patternConfidence": 0.72,
+        "microState5m": "REVERSAL_ATTEMPT",
+        "setupState15m": "REVERSAL_RETEST",
+        "backdropState1h": "TREND",
+        "macroState4h": "TRANSITION",
+        "transitionState": "FAILED_BREAKDOWN",
+        "stateConfidence": 0.72,
+        "stateFreshness": "AVAILABLE",
+        "dominantSide": "LONG",
+        "allowedEntryFamilies": ["reversal_retest", "reclaim"],
+        "preferredExitProfile": main.V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+        "coinStateSource": "INTERNAL_MTF_CONTEXT",
+        "coinStateVersion": "v1",
+        "coinStateRouteReason": "COIN_STATE_ROUTE_REVERSAL",
+        "supportiveLevelPrice": 99.82,
+        "supportiveDistancePct": 0.18,
+        "barrierState": "LONG_ABOVE_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "SUPPORTIVE_BARRIER_CONTEXT",
+    }
+    pending = asyncio.run(trader.open_position("LONG", 100.0, 0.30, signal, symbol="AEVOUSDT"))
+    assert pending is not None
+    order = trader.pending_orders[0]
+    order["confirmed"] = True
+    order["confirmAfter"] = int(time.time() * 1000) - 1000
+    monkeypatch.setattr(main.live_binance_trader, "enabled", False)
+    monkeypatch.setattr(
+        main,
+        "revalidate_pending_entry",
+        lambda order, opportunity, now_ms, force_market=False: {
+            "decision": "PASS",
+            "allow_market": False,
+            "hard_reject": False,
+            "recheck_score": float(order.get("signalScore", 0.0)),
+            "reasons": ["PASS"],
+            "reason_summary": "PASS",
+        },
+    )
+    monkeypatch.setattr(main, "queue_decision_snapshot_from_event_payload", lambda *args, **kwargs: None)
+
+    async def _noop_update_signal_decision(*args, **kwargs):
+        return None
+
+    async def _noop_save_signal_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main.sqlite_manager, "update_signal_decision", _noop_update_signal_decision)
+    monkeypatch.setattr(main.sqlite_manager, "save_signal_event", _noop_save_signal_event)
+
+    now_ms = int(time.time() * 1000)
+    result = asyncio.run(trader._gate_and_execute(order, order["entryPrice"], [{"symbol": "AEVOUSDT"}], now_ms))
+
+    assert result is True
+    assert trader.positions
+    pos = trader.positions[0]
+    assert pos["positionThesisState"] == main.POSITION_THESIS_ENTRY
+    assert pos["microState5m"] == "REVERSAL_ATTEMPT"
+    assert pos["setupState15m"] == "REVERSAL_RETEST"
+    assert pos["transitionState"] == "FAILED_BREAKDOWN"
+    assert pos["preferredExitProfile"] == main.V3_EXIT_PROFILE_TRANSITION_DEFENSE
+    assert pos["coinStateRouteReason"] == "COIN_STATE_ROUTE_REVERSAL"
+    assert pos["reversalRetestZoneState"] == "READY"
+    assert pos["reversalRetestPocketPrice"] > 0
+    assert pos["runtimeExitProfile"] == main.V3_EXIT_PROFILE_TRANSITION_DEFENSE
+    assert pos["runtimeExitOwner"] == main.V3_EXIT_OWNER_TRANSITION_PROTECT
+
+
+def test_manual_market_order_bootstraps_coin_state_and_exit_owner(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(trader, "positions", [])
+    monkeypatch.setattr(trader, "balance", 100.0)
+    monkeypatch.setattr(trader, "max_positions", 10)
+    monkeypatch.setattr(trader, "risk_per_trade", 0.02)
+    monkeypatch.setattr(trader, "leverage", 8)
+    monkeypatch.setattr(trader, "strategy_mode", main.STRATEGY_MODE_SMART_V3_RUNNER)
+    monkeypatch.setattr(trader, "exit_tightness", 1.0)
+    monkeypatch.setattr(trader, "sl_atr", 2.0)
+    monkeypatch.setattr(trader, "tp_atr", 3.0)
+    monkeypatch.setattr(trader, "trail_activation_atr", 1.0)
+    monkeypatch.setattr(trader, "trail_distance_atr", 1.0)
+    monkeypatch.setattr(trader, "is_coin_blacklisted", lambda symbol: False)
+    monkeypatch.setattr(trader, "add_log", lambda message: None)
+    monkeypatch.setattr(trader, "save_state", lambda: None)
+    monkeypatch.setattr(main.multi_coin_scanner, "analyzers", {})
+    monkeypatch.setattr(main.live_binance_trader, "enabled", True)
+
+    async def _set_leverage(symbol, leverage):
+        return True
+
+    async def _place_market_order(symbol, side, size_usd, leverage):
+        return {"average": 100.0, "filled": 1.0}
+
+    protective_stop = {}
+
+    async def _set_stop_loss(symbol, side, amount, stop_price):
+        protective_stop.update({
+            "symbol": symbol,
+            "side": side,
+            "amount": amount,
+            "stop_price": stop_price,
+        })
+        return {"id": "sl_manual_1", "stopPrice": stop_price}
+
+    async def _noop_save_open_position(position):
+        return None
+
+    monkeypatch.setattr(main.live_binance_trader, "set_leverage", _set_leverage)
+    monkeypatch.setattr(main.live_binance_trader, "place_market_order", _place_market_order)
+    monkeypatch.setattr(main.live_binance_trader, "set_stop_loss", _set_stop_loss)
+    monkeypatch.setattr(main.sqlite_manager, "save_open_position", _noop_save_open_position)
+    monkeypatch.setattr(
+        main,
+        "apply_market_structure_context",
+        lambda payload, **kwargs: {
+            **payload,
+            "microState5m": "TREND_UP",
+            "setupState15m": "CONTINUATION",
+            "backdropState1h": "TREND",
+            "macroState4h": "TREND",
+            "transitionState": "BREAKOUT_RETEST",
+            "stateConfidence": 0.74,
+            "stateFreshness": "AVAILABLE",
+            "dominantSide": "LONG",
+            "allowedEntryFamilies": ["continuation", "reclaim"],
+            "preferredExitProfile": main.V3_EXIT_PROFILE_TREND_EXPANSION,
+            "coinStateSource": "INTERNAL_MTF_CONTEXT",
+            "coinStateVersion": "v1",
+            "structureTrend": "UP",
+            "swingState": "HH_HL",
+            "compressionState": "TIGHT",
+            "breakoutRetestState": "BULL_RETEST_HOLD",
+            "srContext": "ABOVE_SUPPORT",
+            "patternBias": "CONTINUATION",
+            "patternConfidence": 0.82,
+        },
+    )
+    monkeypatch.setattr(main, "classify_v3_runner_context", lambda payload, default_mode=None: main.V3_RUNNER_CONTEXT_TREND)
+    monkeypatch.setattr(
+        main,
+        "analyze_side_aware_entry_barrier",
+        lambda **kwargs: {
+            "barrierState": "LONG_ABOVE_SUPPORT",
+            "barrierVerdict": "SUPPORTIVE",
+            "adverseLevelType": "LOCAL_RESISTANCE",
+            "adverseLevelPrice": 101.2,
+            "adverseDistancePct": 1.2,
+            "supportiveLevelType": "LOCAL_SUPPORT",
+            "supportiveLevelPrice": 99.7,
+            "supportiveDistancePct": 0.3,
+            "barrierReason": "SUPPORTIVE_BARRIER_CONTEXT",
+            "barrierConfidence": 0.75,
+            "levelsDetected": True,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_v3_exit_behavior_profile",
+        lambda pos, **kwargs: {
+            "profile": main.V3_EXIT_PROFILE_TREND_EXPANSION,
+            "reason": "COIN_STATE_TREND_EXPANSION",
+            "exit_owner": main.V3_EXIT_OWNER_TREND_CONTINUATION,
+            "exit_owner_reason": "TREND_CONTINUATION_CONTROL",
+            "exit_owner_tighten_bias": -0.12,
+            "exit_owner_allow_hold": True,
+        },
+    )
+
+    response = asyncio.run(
+        main.paper_trading_market_order(
+            _DummyRequest({"symbol": "AAVEUSDT", "side": "LONG", "price": 100.0, "signalLeverage": 8})
+        )
+    )
+
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    pos = payload["position"]
+    assert pos["entryArchetype"] == main.ENTRY_ARCHETYPE_CONTINUATION
+    assert pos["positionThesisState"] == main.POSITION_THESIS_ENTRY
+    assert pos["coinStateRouteReason"] == "COIN_STATE_ROUTE_CONTINUATION"
+    assert pos["runtimeExitProfile"] == main.V3_EXIT_PROFILE_TREND_EXPANSION
+    assert pos["runtimeExitOwner"] == main.V3_EXIT_OWNER_TREND_CONTINUATION
+    assert pos["barrierState"] == "LONG_ABOVE_SUPPORT"
+    assert pos["runtimeExchangeProtectiveMode"] == main.V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY
+    assert pos["runtimeExchangeProtectionAuthority"] == "EMERGENCY_FLOOR"
+    assert pos["runtimeExchangeProtectionRole"] == "LOSS_FAILSAFE"
+    assert protective_stop["stop_price"] == pos["runtimeExchangeProtectiveStopPrice"]
 
 
 def test_gate_and_execute_emits_recheck_wait_event(monkeypatch):
