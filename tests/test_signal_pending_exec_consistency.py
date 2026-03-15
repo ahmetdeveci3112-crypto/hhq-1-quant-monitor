@@ -97,6 +97,30 @@ class _DummyRequest:
         return self.payload
 
 
+def _patch_pending_event_sinks(monkeypatch, trader, events, finalized=None, logs=None):
+    monkeypatch.setattr(main, "record_signal_event_memory", lambda payload: events.append(payload))
+    monkeypatch.setattr(main, "queue_decision_snapshot_from_event_payload", lambda *args, **kwargs: None)
+
+    async def _noop_update_signal_decision(*args, **kwargs):
+        return None
+
+    async def _noop_save_signal_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main.sqlite_manager, "update_signal_decision", _noop_update_signal_decision)
+    monkeypatch.setattr(main.sqlite_manager, "save_signal_event", _noop_save_signal_event)
+    monkeypatch.setattr(
+        trader,
+        "_finalize_forecast_event",
+        lambda *args, **kwargs: finalized.append((args, kwargs)) if finalized is not None else None,
+    )
+    monkeypatch.setattr(
+        trader,
+        "add_log",
+        lambda message: logs.append(message) if logs is not None else None,
+    )
+
+
 def test_open_position_keeps_opposite_pending_when_replacement_signal_rejected(monkeypatch):
     trader = main.global_paper_trader
     _configure_trader_for_open(monkeypatch, trader)
@@ -268,6 +292,209 @@ def test_reinforce_pending_refreshes_context_and_preserves_shallow_reentry(monke
     assert reinforced["entryPrice"] == pytest.approx(99.775)
     assert reinforced["pullbackPct"] == pytest.approx(0.225)
     assert reinforced["postExitReentryEntryMode"] == "SHALLOW_PULLBACK"
+
+
+def test_reinforce_pending_tracks_latest_suggested_entry_and_drift_for_countertrend_reentry(monkeypatch):
+    trader = main.global_paper_trader
+    now_ms = int(time.time() * 1000)
+    pending = {
+        "id": "PO_CT_REENTRY",
+        "signalId": "SIG_CT_ORIGIN",
+        "symbol": "1000LUNCUSDT",
+        "side": "LONG",
+        "signalScore": 84.0,
+        "signalScoreRaw": 86.0,
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.0,
+        "pendingEntryDriftPct": 0.0,
+        "signalPrice": 100.4,
+        "pullbackPct": 0.25,
+        "pullbackLocked": 0.0025,
+        "createdAt": now_ms - 30000,
+        "confirmAfter": now_ms + 30000,
+        "expiresAt": now_ms + 180000,
+        "atr": 0.30,
+        "currentAtrPct": 0.30,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.05,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "decisionContext": {"directionOwner": "reclaim"},
+        "expectancy": {"rankingScore": 108.0},
+        "expectancyBand": main.DECISION_EXPECTANCY_BAND_NEUTRAL,
+        "pendingPatienceBias": 1.0,
+        "barrierState": "LONG_NEAR_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "RECLAIM_HOLD",
+        "marketFallbackDisallowed": False,
+        "marketFallbackBlockReason": "",
+        "countertrendFallbackProtected": True,
+        "isPostExitReentry": True,
+        "postExitReentryEntryMode": "SHALLOW_PULLBACK",
+        "postExitReentryPullbackPctOriginal": 0.90,
+        "postExitReentryPullbackPctApplied": 0.25,
+        "postExitReentryConfirmDelaySec": 30,
+        "postExitReentryExpiresSec": 240,
+        "postExitReentryExecutionPriority": "WATCHER",
+        "postExitReentrySizeCapMult": 0.40,
+        "postExitReentryStopMult": 0.80,
+        "signal_snapshot": {
+            "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+            "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+            "isPostExitReentry": True,
+        },
+    }
+    signal = {
+        "signalId": "SIG_CT_REFRESH",
+        "confidenceScore": 90.0,
+        "_rawConfidenceScore": 92.0,
+        "entryPrice": 101.0,
+        "latestSuggestedEntryPrice": 101.0,
+        "pullbackPct": 0.80,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.20,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "decisionContext": {"directionOwner": "reclaim", "note": "fresh"},
+        "expectancy": {"rankingScore": 118.0},
+        "expectancyBand": main.DECISION_EXPECTANCY_BAND_GOOD,
+        "pendingPatienceBias": 0.95,
+        "barrierState": "LONG_NEAR_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "RECLAIM_HOLD",
+        "countertrendFallbackProtected": True,
+        "marketFallbackDisallowed": False,
+    }
+
+    reinforced = trader._reinforce_pending_order(pending, "LONG", 100.6, 0.30, signal, "1000LUNCUSDT")
+
+    assert reinforced["entryPrice"] == pytest.approx(100.0)
+    assert reinforced["latestSuggestedEntryPrice"] == pytest.approx(101.0)
+    assert reinforced["pendingEntryDriftPct"] == pytest.approx(1.0)
+    assert reinforced["countertrendFallbackProtected"] is True
+    assert reinforced["decisionContext"]["note"] == "fresh"
+
+
+def test_reinforce_pending_tracks_latest_suggested_entry_and_drift_for_continuation(monkeypatch):
+    trader = main.global_paper_trader
+    now_ms = int(time.time() * 1000)
+    pending = {
+        "id": "PO_CONT_STALE",
+        "signalId": "SIG_CONT_ORIGIN",
+        "symbol": "ACTUSDT",
+        "side": "LONG",
+        "signalScore": 86.0,
+        "signalScoreRaw": 88.0,
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.0,
+        "pendingEntryDriftPct": 0.0,
+        "createdAt": now_ms - 20000,
+        "confirmAfter": now_ms + 10000,
+        "expiresAt": now_ms + 120000,
+        "atr": 0.20,
+        "currentAtrPct": 0.20,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.10,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        "barrierState": "LONG_ABOVE_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "SUPPORTIVE_BARRIER_CONTEXT",
+        "signal_snapshot": {
+            "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+            "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        },
+    }
+    signal = {
+        "signalId": "SIG_CONT_REFRESH",
+        "confidenceScore": 91.0,
+        "_rawConfidenceScore": 93.0,
+        "entryPrice": 100.35,
+        "latestSuggestedEntryPrice": 100.35,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.24,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        "barrierState": "LONG_ABOVE_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "SUPPORTIVE_BARRIER_CONTEXT",
+    }
+
+    reinforced = trader._reinforce_pending_order(pending, "LONG", 100.10, 0.20, signal, "ACTUSDT")
+
+    assert reinforced["latestSuggestedEntryPrice"] == pytest.approx(100.35)
+    assert reinforced["pendingEntryDriftPct"] == pytest.approx(
+        round(
+            main.compute_pending_entry_drift_pct(
+                "LONG",
+                reinforced["entryPrice"],
+                reinforced["latestSuggestedEntryPrice"],
+            ),
+            4,
+        )
+    )
+
+
+def test_reinforce_pending_stops_extending_expiry_when_countertrend_entry_turns_stale(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED", True)
+    now_ms = int(time.time() * 1000)
+    original_expiry = now_ms + 60000
+    pending = {
+        "id": "PO_CT_STALE",
+        "signalId": "SIG_CT_STALE",
+        "symbol": "1000LUNCUSDT",
+        "side": "LONG",
+        "signalScore": 83.0,
+        "signalScoreRaw": 85.0,
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.0,
+        "pendingEntryDriftPct": 0.0,
+        "createdAt": now_ms - 20000,
+        "confirmAfter": now_ms + 10000,
+        "expiresAt": original_expiry,
+        "atr": 0.20,
+        "currentAtrPct": 0.10,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.00,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "barrierState": "LONG_NEAR_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "RECLAIM_HOLD",
+        "marketFallbackDisallowed": False,
+        "marketFallbackBlockReason": "",
+        "countertrendFallbackProtected": True,
+        "signal_snapshot": {
+            "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+            "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        },
+    }
+    signal = {
+        "signalId": "SIG_CT_STALE_REFRESH",
+        "confidenceScore": 89.0,
+        "_rawConfidenceScore": 91.0,
+        "entryPrice": 100.40,
+        "latestSuggestedEntryPrice": 100.40,
+        "pullbackPct": 0.60,
+        "spreadPct": 0.05,
+        "volumeRatio": 1.10,
+        "memoryExtensionSec": 600,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_COUNTER,
+        "barrierState": "LONG_NEAR_SUPPORT",
+        "barrierVerdict": "SUPPORTIVE",
+        "barrierReason": "RECLAIM_HOLD",
+        "countertrendFallbackProtected": True,
+        "marketFallbackDisallowed": False,
+    }
+    stale_before = trader.pipeline_metrics.get("countertrend_pending_stale", 0)
+
+    reinforced = trader._reinforce_pending_order(pending, "LONG", 100.2, 0.20, signal, "1000LUNCUSDT")
+
+    assert reinforced["expiresAt"] == original_expiry
+    assert reinforced["pendingEntryDriftPct"] > main.resolve_countertrend_pending_stale_drift_threshold_pct(reinforced)
+    assert trader.pipeline_metrics["countertrend_pending_stale"] == stale_before + 1
 
 
 def test_revalidate_pending_entry_uses_cached_15m_structure_for_barrier_parity(monkeypatch):
@@ -705,3 +932,259 @@ def test_gate_and_execute_emits_recheck_fail_event(monkeypatch):
 
     assert result is True
     assert any(event.get("decision_code") == "PENDING__RECHECK_FAIL" for event in events)
+
+
+def test_check_pending_orders_blocks_countertrend_market_fallback_chase_on_expire(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED", True)
+    order = {
+        "id": "PO_LUNC_BLOCK",
+        "signalId": "SIG_LUNC_BLOCK",
+        "symbol": "1000LUNCUSDT",
+        "side": "LONG",
+        "entryPrice": 0.041048,
+        "latestSuggestedEntryPrice": 0.0413,
+        "pendingEntryDriftPct": 0.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "countertrendFallbackProtected": True,
+        "marketFallbackDisallowed": False,
+        "marketFallbackBlockReason": "",
+        "barrierVerdict": "SUPPORTIVE",
+        "signalScore": 92.0,
+        "signalScoreRaw": 94.0,
+        "minConfidenceScoreSnapshot": 74.0,
+        "sizeMultiplier": 1.0,
+        "leverage": 6,
+        "confirmed": True,
+        "expiresAt": 0,
+        "atr": 0.00045,
+        "currentAtrPct": 1.0,
+    }
+    events = []
+    finalized = []
+    logs = []
+    _patch_pending_event_sinks(monkeypatch, trader, events, finalized=finalized, logs=logs)
+    monkeypatch.setattr(main, "apply_live_flow_context_to_pending_order", lambda order, opp: None)
+    gate_calls = []
+
+    async def _unexpected_gate(*args, **kwargs):
+        gate_calls.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(trader, "_gate_and_execute", _unexpected_gate)
+    monkeypatch.setattr(trader, "pending_orders", [order])
+    blocked_before = trader.pipeline_metrics.get("countertrend_fallback_blocked", 0)
+    expired_before = trader.pipeline_metrics.get("pending_expired", 0)
+
+    asyncio.run(trader.check_pending_orders([{"symbol": "1000LUNCUSDT", "price": 0.04161}]))
+
+    assert gate_calls == []
+    assert trader.pending_orders == []
+    assert trader.pipeline_metrics["countertrend_fallback_blocked"] == blocked_before + 1
+    assert trader.pipeline_metrics["pending_expired"] == expired_before + 1
+    assert order["marketFallbackBlockReason"] == "COUNTERTREND_FALLBACK_CHASE_BLOCK"
+    assert any(event.get("decision_code") == "PENDING__COUNTERTREND_FALLBACK_BLOCK" for event in events)
+    assert any(event.get("decision_detail") == "COUNTERTREND_FALLBACK_CHASE_BLOCK" for event in events)
+    assert finalized
+
+
+def test_check_pending_orders_allows_countertrend_market_fallback_when_price_is_still_close(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED", True)
+    order = {
+        "id": "PO_LUNC_ALLOW",
+        "signalId": "SIG_LUNC_ALLOW",
+        "symbol": "1000LUNCUSDT",
+        "side": "LONG",
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.05,
+        "pendingEntryDriftPct": 0.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "countertrendFallbackProtected": True,
+        "marketFallbackDisallowed": False,
+        "marketFallbackBlockReason": "",
+        "barrierVerdict": "SUPPORTIVE",
+        "signalScore": 91.0,
+        "signalScoreRaw": 93.0,
+        "minConfidenceScoreSnapshot": 74.0,
+        "sizeMultiplier": 1.0,
+        "leverage": 6,
+        "confirmed": True,
+        "expiresAt": 0,
+        "atr": 0.6,
+        "currentAtrPct": 0.6,
+    }
+    events = []
+    _patch_pending_event_sinks(monkeypatch, trader, events)
+    monkeypatch.setattr(main, "apply_live_flow_context_to_pending_order", lambda order, opp: None)
+    gate_calls = []
+
+    async def _gate_stub(order_arg, current_price, opportunities, current_time, force_market=False):
+        gate_calls.append(
+            {
+                "order_id": order_arg["id"],
+                "current_price": current_price,
+                "force_market": force_market,
+            }
+        )
+        if order_arg in trader.pending_orders:
+            trader.pending_orders.remove(order_arg)
+        return True
+
+    monkeypatch.setattr(trader, "_gate_and_execute", _gate_stub)
+    monkeypatch.setattr(trader, "pending_orders", [order])
+
+    asyncio.run(trader.check_pending_orders([{"symbol": "1000LUNCUSDT", "price": 100.10}]))
+
+    assert gate_calls and gate_calls[0]["force_market"] is True
+    assert gate_calls[0]["order_id"] == "PO_LUNC_ALLOW"
+    assert trader.pending_orders == []
+
+
+def test_check_pending_orders_blocks_continuation_market_fallback_when_entry_is_stale(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED", True)
+    order = {
+        "id": "PO_CONT_BLOCK",
+        "signalId": "SIG_CONT_BLOCK",
+        "symbol": "ACTUSDT",
+        "side": "LONG",
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.40,
+        "pendingEntryDriftPct": 0.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        "barrierVerdict": "SUPPORTIVE",
+        "signalScore": 90.0,
+        "signalScoreRaw": 91.0,
+        "minConfidenceScoreSnapshot": 74.0,
+        "sizeMultiplier": 1.0,
+        "leverage": 8,
+        "confirmed": True,
+        "expiresAt": 0,
+        "atr": 0.4,
+        "currentAtrPct": 0.4,
+    }
+    events = []
+    _patch_pending_event_sinks(monkeypatch, trader, events)
+    monkeypatch.setattr(main, "apply_live_flow_context_to_pending_order", lambda order, opp: None)
+    gate_calls = []
+
+    async def _gate_stub(order_arg, current_price, opportunities, current_time, force_market=False):
+        gate_calls.append((order_arg["id"], current_price, force_market))
+        if order_arg in trader.pending_orders:
+            trader.pending_orders.remove(order_arg)
+        return True
+
+    monkeypatch.setattr(trader, "_gate_and_execute", _gate_stub)
+    monkeypatch.setattr(trader, "pending_orders", [order])
+
+    asyncio.run(trader.check_pending_orders([{"symbol": "ACTUSDT", "price": 100.45}]))
+
+    assert gate_calls == []
+    assert trader.pending_orders == []
+    assert any(event.get("decision_code") == "PENDING__CONTINUATION_FALLBACK_BLOCK" for event in events)
+
+
+def test_check_pending_orders_allows_supportive_continuation_market_fallback(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED", True)
+    order = {
+        "id": "PO_CONT_ALLOW",
+        "signalId": "SIG_CONT_ALLOW",
+        "symbol": "ACTUSDT",
+        "side": "LONG",
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.05,
+        "pendingEntryDriftPct": 0.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        "barrierVerdict": "SUPPORTIVE",
+        "signalScore": 90.0,
+        "signalScoreRaw": 91.0,
+        "minConfidenceScoreSnapshot": 74.0,
+        "sizeMultiplier": 1.0,
+        "leverage": 8,
+        "confirmed": True,
+        "expiresAt": 0,
+        "atr": 0.4,
+        "currentAtrPct": 0.4,
+    }
+    events = []
+    _patch_pending_event_sinks(monkeypatch, trader, events)
+    monkeypatch.setattr(main, "apply_live_flow_context_to_pending_order", lambda order, opp: None)
+    gate_calls = []
+
+    async def _gate_stub(order_arg, current_price, opportunities, current_time, force_market=False):
+        gate_calls.append((order_arg["id"], current_price, force_market))
+        if order_arg in trader.pending_orders:
+            trader.pending_orders.remove(order_arg)
+        return True
+
+    monkeypatch.setattr(trader, "_gate_and_execute", _gate_stub)
+    monkeypatch.setattr(trader, "pending_orders", [order])
+
+    asyncio.run(trader.check_pending_orders([{"symbol": "ACTUSDT", "price": 100.08}]))
+
+    assert gate_calls == [("PO_CONT_ALLOW", 100.08, True)]
+    assert trader.pending_orders == []
+    assert not any(event.get("decision_code") == "PENDING__CONTINUATION_FALLBACK_BLOCK" for event in events)
+
+
+def test_check_pending_orders_blocks_continuation_fallback_on_market_relation_deterioration(monkeypatch):
+    trader = main.global_paper_trader
+    monkeypatch.setattr(main, "MARKET_RELATION_PENDING_GUARD_ENABLED", True)
+    order = {
+        "id": "PO_CONT_REL_BLOCK",
+        "signalId": "SIG_CONT_REL_BLOCK",
+        "symbol": "ACTUSDT",
+        "side": "LONG",
+        "entryPrice": 100.0,
+        "latestSuggestedEntryPrice": 100.02,
+        "pendingEntryDriftPct": 0.0,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+        "barrierVerdict": "SUPPORTIVE",
+        "marketRelationState": "SUPPORTIVE",
+        "altBtcState": "STRONG",
+        "triangleState": "CLEAR",
+        "signalScore": 90.0,
+        "signalScoreRaw": 91.0,
+        "minConfidenceScoreSnapshot": 74.0,
+        "sizeMultiplier": 1.0,
+        "leverage": 8,
+        "confirmed": True,
+        "expiresAt": 0,
+        "atr": 0.4,
+        "currentAtrPct": 0.4,
+    }
+    events = []
+    _patch_pending_event_sinks(monkeypatch, trader, events)
+    gate_calls = []
+
+    async def _gate_stub(order_arg, current_price, opportunities, current_time, force_market=False):
+        gate_calls.append((order_arg["id"], current_price, force_market))
+        if order_arg in trader.pending_orders:
+            trader.pending_orders.remove(order_arg)
+        return True
+
+    monkeypatch.setattr(trader, "_gate_and_execute", _gate_stub)
+    monkeypatch.setattr(trader, "pending_orders", [order])
+
+    asyncio.run(
+        trader.check_pending_orders(
+            [
+                {
+                    "symbol": "ACTUSDT",
+                    "price": 100.06,
+                    "marketRelationState": "CAUTION",
+                    "altBtcState": "WEAK",
+                    "triangleState": "CLEAR",
+                }
+            ]
+        )
+    )
+
+    assert gate_calls == []
+    assert trader.pending_orders == []
+    assert any(event.get("decision_code") == "PENDING__MARKET_RELATION_BLOCK" for event in events)

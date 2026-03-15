@@ -184,3 +184,59 @@ def test_revalidate_pending_entry_drops_stale_short_into_support():
     assert result["decision"] == "FAIL_DROP"
     assert result["hard_reject"] is True
     assert any(reason.startswith("BARRIER_REJECT") for reason in result["reasons"])
+
+
+def test_countertrend_barrier_guard_hard_blocks_reclaim_long_signal():
+    result = main.evaluate_countertrend_barrier_guard(
+        main.ENTRY_ARCHETYPE_RECLAIM,
+        {
+            "barrierVerdict": "BLOCK",
+            "barrierState": "LONG_INTO_RESISTANCE",
+            "adverseDistancePct": 0.18,
+            "barrierReason": "LOCAL_RESISTANCE_NEARBY",
+        },
+        hard_block_enabled=True,
+    )
+
+    assert result["countertrendFallbackProtected"] is True
+    assert result["marketFallbackDisallowed"] is True
+    assert result["marketFallbackBlockReason"] == "COUNTERTREND_BARRIER_BLOCK"
+    assert result["rejectSignal"] is True
+    assert result["decisionCode"] == "ENTRY__COUNTERTREND_BARRIER_BLOCK"
+
+
+def test_countertrend_barrier_guard_hard_blocks_reversal_retest_long_signal():
+    result = main.evaluate_countertrend_barrier_guard(
+        main.ENTRY_ARCHETYPE_REVERSAL_RETEST,
+        {
+            "barrierVerdict": "BLOCK",
+            "barrierState": "LONG_INTO_RESISTANCE",
+            "adverseDistancePct": 0.22,
+            "barrierReason": "FAILED_BREAKDOWN_INTO_RESISTANCE",
+        },
+        hard_block_enabled=True,
+    )
+
+    assert result["countertrendFallbackProtected"] is True
+    assert result["marketFallbackDisallowed"] is True
+    assert result["marketFallbackBlockReason"] == "COUNTERTREND_BARRIER_BLOCK"
+    assert result["rejectSignal"] is True
+    assert result["decisionCode"] == "ENTRY__COUNTERTREND_BARRIER_BLOCK"
+
+
+def test_countertrend_barrier_guard_locks_market_fallback_on_caution():
+    result = main.evaluate_countertrend_barrier_guard(
+        main.ENTRY_ARCHETYPE_RECLAIM,
+        {
+            "barrierVerdict": "CAUTION",
+            "barrierState": "LONG_NEAR_RESISTANCE",
+            "adverseDistancePct": 0.41,
+            "barrierReason": "LOCAL_RESISTANCE_NEARBY",
+        },
+        hard_block_enabled=False,
+    )
+
+    assert result["countertrendFallbackProtected"] is True
+    assert result["marketFallbackDisallowed"] is True
+    assert result["marketFallbackBlockReason"] == "COUNTERTREND_BARRIER_CAUTION"
+    assert result["rejectSignal"] is False

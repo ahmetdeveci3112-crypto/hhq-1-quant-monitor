@@ -169,3 +169,70 @@ def test_reconcile_entry_archetype_with_coin_state_blocks_continuation_against_d
 
     assert archetype == ""
     assert reason == "COIN_STATE_CONTINUATION_BLOCKED"
+
+
+def test_get_coin_state_context_marks_freshness_unavailable_without_cached_ohlcv(monkeypatch):
+    monkeypatch.setattr(main, "_get_cached_ohlcv_for_structure", lambda symbol: ([], []))
+
+    ctx = main.get_coin_state_context("TESTUSDT", side="LONG", force=True)
+
+    assert ctx["stateFreshness"] == "UNAVAILABLE"
+
+
+def test_get_coin_state_context_marks_freshness_stale_when_cached_ohlcv_is_old(monkeypatch):
+    now_ts = 1_760_000_000.0
+    old_15m_ms = int((now_ts - (65 * 60)) * 1000)
+    old_1h_ms = int((now_ts - (2 * 60 * 60)) * 1000)
+    ohlcv_15m = _candles_from_closes([100, 101, 102, 103, 104, 105, 106, 107], start_ts=old_15m_ms - (7 * 900000))
+    ohlcv_1h = _candles_from_closes([100, 101, 102, 103, 104, 105, 106, 107], start_ts=old_1h_ms - (7 * 3600000), step_ms=3600000)
+    monkeypatch.setattr(main, "_get_cached_ohlcv_for_structure", lambda symbol: (ohlcv_15m, ohlcv_1h))
+    monkeypatch.setattr(main.time, "time", lambda: now_ts)
+
+    ctx = main.get_coin_state_context(
+        "TESTUSDT",
+        side="LONG",
+        structure_ctx={
+            "structureTrend": "UP",
+            "patternBias": "CONTINUATION",
+            "patternConfidence": 0.72,
+            "breakoutRetestState": "BULL_RETEST_HOLD",
+        },
+        force=True,
+    )
+
+    assert ctx["stateFreshness"] == "STALE"
+
+
+def test_evaluate_mtf_coin_state_override_guard_blocks_unavailable_continuation():
+    guard = main.evaluate_mtf_coin_state_override_guard(
+        {
+            "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+            "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+            "stateFreshness": "UNAVAILABLE",
+            "coinStateRouteReason": "COIN_STATE_UNAVAILABLE",
+            "dominantSide": "NEUTRAL",
+            "stateConfidence": 0.0,
+            "allowedEntryFamilies": [],
+        },
+        "LONG",
+    )
+
+    assert guard["blocked"] is True
+    assert guard["reason_code"] == "COIN_STATE_UNAVAILABLE"
+
+
+def test_evaluate_mtf_coin_state_override_guard_allows_ready_continuation_consensus():
+    guard = main.evaluate_mtf_coin_state_override_guard(
+        {
+            "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+            "runnerContextResolved": main.V3_RUNNER_CONTEXT_TREND,
+            "stateFreshness": "READY",
+            "coinStateRouteReason": "COIN_STATE_ROUTE_CONTINUATION",
+            "dominantSide": "LONG",
+            "stateConfidence": 0.74,
+            "allowedEntryFamilies": ["continuation", "reclaim"],
+        },
+        "LONG",
+    )
+
+    assert guard["blocked"] is False

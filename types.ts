@@ -994,6 +994,18 @@ export interface BackendSignal {
   alternateIntent?: AlternateIntent;
   signalIntentApplied?: boolean;
   decisionContext?: DecisionContext;
+  marketRelationAvailable?: boolean;
+  marketRelationState?: string;
+  marketRelationConfidence?: number;
+  symbolBasisPct?: number;
+  symbolBasisZScore?: number;
+  basisBias?: string;
+  basisState?: string;
+  altBtcState?: string;
+  altBtcRelStrengthPct?: number;
+  triangleResidualBps?: number;
+  triangleState?: string;
+  crowdingSide?: string;
 }
 
 export interface PendingOrder {
@@ -1010,6 +1022,10 @@ export interface PendingOrder {
   timestamp: number;     // Creation time for timeout
   structure?: string;
   reason?: string;
+  marketRelationState?: string;
+  symbolBasisPct?: number;
+  altBtcState?: string;
+  triangleState?: string;
 }
 
 export interface PivotLevel {

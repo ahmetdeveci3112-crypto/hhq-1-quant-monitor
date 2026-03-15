@@ -26,7 +26,7 @@ import uuid
 import websockets
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Sequence
+from typing import Optional, Dict, Any, Iterable, Sequence
 
 import ccxt.async_support as ccxt_async
 import ccxt as ccxt_sync
@@ -9338,6 +9338,11 @@ MTF_SOFT_OVERRIDE_PENALTY = 12
 MTF_SOFT_OVERRIDE_MIN_EQ = 2
 MTF_SOFT_OVERRIDE_SMART_SCORE_RELAX = 10
 MTF_SOFT_OVERRIDE_SMART_MIN_EQ = 1
+MTF_SOFT_OVERRIDE_REQUIRE_FRESH_COIN_STATE = _env_bool("MTF_SOFT_OVERRIDE_REQUIRE_FRESH_COIN_STATE", False)
+COIN_STATE_READY_15M_MAX_SEC = int(os.getenv("COIN_STATE_READY_15M_MAX_SEC", "2100"))
+COIN_STATE_READY_1H_MAX_SEC = int(os.getenv("COIN_STATE_READY_1H_MAX_SEC", "5400"))
+COIN_STATE_STALE_15M_MAX_SEC = int(os.getenv("COIN_STATE_STALE_15M_MAX_SEC", "7200"))
+COIN_STATE_STALE_1H_MAX_SEC = int(os.getenv("COIN_STATE_STALE_1H_MAX_SEC", "14400"))
 
 # Strong counter-trend MTF relax (pass with strict risk caps)
 MTF_COUNTERTREND_SOFTPASS_ENABLED = True
@@ -9348,6 +9353,31 @@ MTF_COUNTERTREND_SOFTPASS_PENALTY = 14
 MTF_COUNTERTREND_SOFTPASS_STRONG_EXTRA_PENALTY = 6
 MTF_COUNTERTREND_SOFTPASS_MAX_LEVERAGE = 12
 MTF_COUNTERTREND_SOFTPASS_SIZE_MULT = 0.65
+COUNTERTREND_BARRIER_HARD_BLOCK_ENABLED = _env_bool("COUNTERTREND_BARRIER_HARD_BLOCK_ENABLED", False)
+COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED = _env_bool("COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED", False)
+COUNTERTREND_MARKET_FALLBACK_MAX_CHASE_PCT = float(os.getenv("COUNTERTREND_MARKET_FALLBACK_MAX_CHASE_PCT", "0.20"))
+COUNTERTREND_PENDING_STALE_DRIFT_ATR_MULT = float(os.getenv("COUNTERTREND_PENDING_STALE_DRIFT_ATR_MULT", "1.25"))
+COUNTERTREND_PENDING_STALE_DRIFT_MIN_PCT = float(os.getenv("COUNTERTREND_PENDING_STALE_DRIFT_MIN_PCT", "0.25"))
+CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED = _env_bool("CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED", False)
+CONTINUATION_PENDING_STALE_DRIFT_ATR_MULT = float(os.getenv("CONTINUATION_PENDING_STALE_DRIFT_ATR_MULT", "0.90"))
+CONTINUATION_PENDING_STALE_DRIFT_MIN_PCT = float(os.getenv("CONTINUATION_PENDING_STALE_DRIFT_MIN_PCT", "0.18"))
+MARKET_RELATION_OVERLAY_ENABLED = _env_bool("MARKET_RELATION_OVERLAY_ENABLED", False)
+MARKET_RELATION_SHADOW_MODE = _env_bool("MARKET_RELATION_SHADOW_MODE", True)
+SYMBOL_BASIS_FEATURES_ENABLED = _env_bool("SYMBOL_BASIS_FEATURES_ENABLED", False)
+ALTBTC_RELATIVE_STRENGTH_ENABLED = _env_bool("ALTBTC_RELATIVE_STRENGTH_ENABLED", False)
+TRIANGLE_RESIDUAL_FILTER_ENABLED = _env_bool("TRIANGLE_RESIDUAL_FILTER_ENABLED", False)
+MARKET_RELATION_PENDING_GUARD_ENABLED = _env_bool("MARKET_RELATION_PENDING_GUARD_ENABLED", False)
+MARKET_RELATION_EXIT_TIGHTENING_ENABLED = _env_bool("MARKET_RELATION_EXIT_TIGHTENING_ENABLED", False)
+MARKET_RELATION_OPEN_INTEREST_ENABLED = _env_bool("MARKET_RELATION_OPEN_INTEREST_ENABLED", False)
+MARKET_RELATION_OI_MAX_SYMBOLS = int(os.getenv("MARKET_RELATION_OI_MAX_SYMBOLS", "25"))
+MARKET_RELATION_SPOT_STALE_SEC = int(os.getenv("MARKET_RELATION_SPOT_STALE_SEC", "10"))
+MARKET_RELATION_ALTBTC_STALE_SEC = int(os.getenv("MARKET_RELATION_ALTBTC_STALE_SEC", "20"))
+MARKET_RELATION_PREMIUM_STALE_SEC = int(os.getenv("MARKET_RELATION_PREMIUM_STALE_SEC", "60"))
+BASIS_Z_SUPPORTIVE_MIN = float(os.getenv("BASIS_Z_SUPPORTIVE_MIN", "0.5"))
+BASIS_Z_EXTREME_MIN = float(os.getenv("BASIS_Z_EXTREME_MIN", "2.0"))
+TRIANGLE_RESIDUAL_MAX_BPS = float(os.getenv("TRIANGLE_RESIDUAL_MAX_BPS", "12"))
+ALTBTC_RS_MIN_PCT = float(os.getenv("ALTBTC_RS_MIN_PCT", "0.20"))
+MARKET_RELATION_MIN_SPOT_VOLUME_USD = float(os.getenv("MARKET_RELATION_MIN_SPOT_VOLUME_USD", "1000000"))
 
 # Volatile regime: strict by default, but allow near-threshold high-quality soft pass
 TREND_PENALTY_MODE = _env_bool("TREND_PENALTY_MODE", True)
@@ -14611,6 +14641,12 @@ from risk.signal_intent import (
 )
 from risk.market_structure import analyze_market_structure
 from risk.coin_state import analyze_coin_state
+from risk.market_relation import (
+    MarketRelationTracker,
+    build_backtest_market_relation_snapshots,
+    compute_market_relation_overlay,
+    default_market_relation_context,
+)
 
 # RFX-3A: Regime-based execution styles
 from risk.execution_style import (
@@ -15149,6 +15185,25 @@ def _default_coin_state_context() -> dict:
     }
 
 
+def _default_market_relation_context() -> dict:
+    return default_market_relation_context()
+
+
+def _market_relation_context_available(ctx: dict = None) -> bool:
+    safe_ctx = ctx if isinstance(ctx, dict) else {}
+    return bool(safe_ctx.get('marketRelationAvailable', False))
+
+
+def _apply_market_relation_context_to_payload(payload: dict, market_relation_ctx: dict = None) -> dict:
+    safe_payload = dict(payload) if isinstance(payload, dict) else {}
+    safe_ctx = market_relation_ctx if isinstance(market_relation_ctx, dict) else _default_market_relation_context()
+    if _market_relation_context_available(safe_payload):
+        return safe_payload
+    for key, default_value in _default_market_relation_context().items():
+        safe_payload[key] = safe_ctx.get(key, default_value)
+    return safe_payload
+
+
 def _is_v3_structure_context_enabled() -> bool:
     return str(V3_STRUCTURE_CONTEXT_MODE or 'apply').strip().lower() != 'off'
 
@@ -15169,6 +15224,33 @@ def _coin_state_context_available(ctx: dict = None) -> bool:
         or str(safe_ctx.get('setupState15m', 'NEUTRAL') or 'NEUTRAL') != 'NEUTRAL'
         or str(safe_ctx.get('transitionState', 'NONE') or 'NONE') != 'NONE'
     )
+
+
+def _with_coin_state_freshness(ctx: dict = None, freshness: str = 'UNAVAILABLE') -> dict:
+    safe_ctx = dict(ctx) if isinstance(ctx, dict) else _default_coin_state_context()
+    safe_ctx['stateFreshness'] = str(freshness or 'UNAVAILABLE').upper()
+    return safe_ctx
+
+
+def _resolve_coin_state_freshness(last_15m_ts: Any, last_1h_ts: Any, now_ts: float = None) -> str:
+    safe_now = float(now_ts if now_ts is not None else time.time())
+    ts_15m = _coerce_float(last_15m_ts, 0.0)
+    ts_1h = _coerce_float(last_1h_ts, 0.0)
+    if ts_15m <= 0 or ts_1h <= 0:
+        return 'UNAVAILABLE'
+
+    if ts_15m > 1e11:
+        ts_15m /= 1000.0
+    if ts_1h > 1e11:
+        ts_1h /= 1000.0
+
+    age_15m_sec = max(0.0, safe_now - ts_15m)
+    age_1h_sec = max(0.0, safe_now - ts_1h)
+    if age_15m_sec <= COIN_STATE_READY_15M_MAX_SEC and age_1h_sec <= COIN_STATE_READY_1H_MAX_SEC:
+        return 'READY'
+    if age_15m_sec <= COIN_STATE_STALE_15M_MAX_SEC and age_1h_sec <= COIN_STATE_STALE_1H_MAX_SEC:
+        return 'STALE'
+    return 'UNAVAILABLE'
 
 
 def _symbol_to_ccxt_perp(symbol: str) -> str:
@@ -15324,6 +15406,36 @@ _PENDING_REINFORCE_BARRIER_FIELDS = (
     'supportiveDistancePct',
     'barrierReason',
     'barrierConfidence',
+    'latestSuggestedEntryPrice',
+    'pendingEntryDriftPct',
+    'marketFallbackDisallowed',
+    'marketFallbackBlockReason',
+    'countertrendFallbackProtected',
+)
+_PENDING_REINFORCE_MARKET_RELATION_FIELDS = (
+    'marketRelationAvailable',
+    'marketRelationState',
+    'marketRelationConfidence',
+    'marketRelationSource',
+    'marketRelationVersion',
+    'spotPrice',
+    'perpPrice',
+    'symbolBasisPct',
+    'symbolBasisZScore',
+    'basisVelocityBps1m',
+    'basisBias',
+    'basisState',
+    'altBtcSymbol',
+    'altBtcPrice',
+    'altBtcRetPct1m',
+    'altBtcRetPct5m',
+    'altBtcRelStrengthPct',
+    'altBtcState',
+    'triangleResidualBps',
+    'triangleState',
+    'crowdingSide',
+    'fundingRate',
+    'openInterestChangePct5m',
 )
 _PENDING_REINFORCE_REENTRY_FIELDS = (
     'isPostExitReentry',
@@ -15490,10 +15602,10 @@ def get_coin_state_context(
     safe_symbol = str(symbol or '').upper().strip()
     safe_side = str(side or '').upper().strip()
     if not safe_symbol or not _is_v3_structure_context_enabled():
-        return _default_coin_state_context()
+        return _with_coin_state_freshness(_default_coin_state_context(), 'UNAVAILABLE')
     ohlcv_15m, ohlcv_1h = _get_cached_ohlcv_for_structure(safe_symbol)
     if len(ohlcv_15m) < 8 or len(ohlcv_1h) < 8:
-        return _default_coin_state_context()
+        return _with_coin_state_freshness(_default_coin_state_context(), 'UNAVAILABLE')
 
     last_15m_ts = int((ohlcv_15m[-1][0] if ohlcv_15m else 0) or 0)
     last_1h_ts = int((ohlcv_1h[-1][0] if ohlcv_1h else 0) or 0)
@@ -15517,6 +15629,10 @@ def get_coin_state_context(
     )
     if not isinstance(ctx, dict):
         ctx = _default_coin_state_context()
+    ctx = _with_coin_state_freshness(
+        ctx,
+        _resolve_coin_state_freshness(last_15m_ts, last_1h_ts, now_ts=now_ts),
+    )
     coin_state_cache[cache_key] = {
         'ts': now_ts,
         'ctx': dict(ctx),
@@ -15660,6 +15776,78 @@ def _coin_state_supports_resolution(mode: str, coin_ctx: dict = None, side: str 
     if setup_state == 'REVERSAL_RETEST':
         boost += 2.0
     return True, 'COIN_STATE_OPPOSITE_OK', round(boost, 4)
+
+
+def is_continuation_like_entry(entry_archetype: str, runner_context_resolved: str = '') -> bool:
+    safe_arch = str(entry_archetype or '').strip().lower()
+    safe_runner = str(runner_context_resolved or '').strip().lower()
+    return bool(
+        safe_arch == ENTRY_ARCHETYPE_CONTINUATION
+        or safe_runner in (V3_RUNNER_CONTEXT_TREND, V3_RUNNER_CONTEXT_INTRADAY)
+    )
+
+
+def evaluate_mtf_coin_state_override_guard(signal: dict, action: str) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    decision_context = safe_signal.get('decisionContext', {})
+    decision_context = decision_context if isinstance(decision_context, dict) else {}
+    entry_archetype = str(
+        safe_signal.get(
+            'entryArchetype',
+            decision_context.get('entryArchetype', ''),
+        )
+        or ''
+    ).strip().lower()
+    runner_context_resolved = str(
+        safe_signal.get(
+            'runnerContextResolved',
+            safe_signal.get('runnerContext', decision_context.get('runnerContextResolved', '')),
+        )
+        or ''
+    ).strip().lower()
+    if not is_continuation_like_entry(entry_archetype, runner_context_resolved):
+        return {
+            'blocked': False,
+            'reason_code': '',
+            'detail': '',
+            'trace': {'entry_archetype': entry_archetype, 'runner_context_resolved': runner_context_resolved},
+        }
+
+    safe_action = str(action or safe_signal.get('action', safe_signal.get('side', '')) or '').upper().strip()
+    freshness = str(safe_signal.get('stateFreshness', 'UNAVAILABLE') or 'UNAVAILABLE').upper()
+    route_reason = str(safe_signal.get('coinStateRouteReason', '') or '')
+    dominant_side = str(safe_signal.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    state_confidence = _coerce_float(safe_signal.get('stateConfidence', 0.0), 0.0)
+    allowed_families = [
+        str(item or '').lower()
+        for item in (safe_signal.get('allowedEntryFamilies', []) or [])
+        if str(item or '').strip()
+    ]
+    trace = {
+        'entry_archetype': entry_archetype,
+        'runner_context_resolved': runner_context_resolved,
+        'state_freshness': freshness,
+        'coin_state_route_reason': route_reason,
+        'dominant_side': dominant_side,
+        'state_confidence': round(state_confidence, 4),
+        'allowed_entry_families': list(allowed_families),
+    }
+    reason_code = ''
+    if freshness == 'UNAVAILABLE' or route_reason == 'COIN_STATE_UNAVAILABLE':
+        reason_code = 'COIN_STATE_UNAVAILABLE'
+    elif freshness != 'READY':
+        reason_code = 'COIN_STATE_NOT_READY'
+    elif dominant_side not in ('NEUTRAL', safe_action) and state_confidence >= 0.55:
+        reason_code = 'COIN_STATE_OPPOSITE_DOMINANT'
+    elif allowed_families and ENTRY_ARCHETYPE_CONTINUATION not in allowed_families and state_confidence >= 0.45:
+        reason_code = 'COIN_STATE_NO_CONTINUATION'
+
+    return {
+        'blocked': bool(reason_code),
+        'reason_code': reason_code,
+        'detail': str(reason_code or ''),
+        'trace': trace,
+    }
 
 
 def _record_post_exit_reentry_watch_event(watch: dict, reason: str) -> None:
@@ -19098,6 +19286,16 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'supportiveDistancePct': round(_coerce_float(safe_trade.get('supportiveDistancePct', close_snapshot.get('supportiveDistancePct', signal_snapshot.get('supportiveDistancePct', 0.0))), 0.0), 4),
         'barrierReason': str(safe_trade.get('barrierReason', close_snapshot.get('barrierReason', signal_snapshot.get('barrierReason', ''))) or ''),
         'barrierConfidence': round(_coerce_float(safe_trade.get('barrierConfidence', close_snapshot.get('barrierConfidence', signal_snapshot.get('barrierConfidence', 0.0))), 0.0), 4),
+        'marketRelationAvailable': bool(safe_trade.get('marketRelationAvailable', signal_snapshot.get('marketRelationAvailable', False))),
+        'marketRelationState': str(safe_trade.get('marketRelationState', signal_snapshot.get('marketRelationState', 'UNAVAILABLE')) or 'UNAVAILABLE'),
+        'marketRelationConfidence': round(_coerce_float(safe_trade.get('marketRelationConfidence', signal_snapshot.get('marketRelationConfidence', 0.0)), 0.0), 4),
+        'symbolBasisPct': round(_coerce_float(safe_trade.get('symbolBasisPct', signal_snapshot.get('symbolBasisPct', 0.0)), 0.0), 6),
+        'altBtcState': str(safe_trade.get('altBtcState', signal_snapshot.get('altBtcState', 'UNAVAILABLE')) or 'UNAVAILABLE'),
+        'altBtcRelStrengthPct': round(_coerce_float(safe_trade.get('altBtcRelStrengthPct', signal_snapshot.get('altBtcRelStrengthPct', 0.0)), 0.0), 4),
+        'triangleResidualBps': round(_coerce_float(safe_trade.get('triangleResidualBps', signal_snapshot.get('triangleResidualBps', 0.0)), 0.0), 4),
+        'triangleState': str(safe_trade.get('triangleState', signal_snapshot.get('triangleState', 'UNAVAILABLE')) or 'UNAVAILABLE'),
+        'crowdingSide': str(safe_trade.get('crowdingSide', signal_snapshot.get('crowdingSide', 'NEUTRAL')) or 'NEUTRAL'),
+        'openInterestChangePct5m': round(_coerce_float(safe_trade.get('openInterestChangePct5m', signal_snapshot.get('openInterestChangePct5m', 0.0)), 0.0), 4),
         'peakRoi': round(peak_roi, 4),
         'realizedPeakCaptureRatio': round(capture_ratio, 4),
         'giveback': round(max(0.0, peak_roi - max(realized_roi, 0.0)), 4),
@@ -20016,6 +20214,10 @@ def evaluate_v3_position_thesis_revalidation(
             or giveback_roi_pct >= max(1.0, min(giveback_arm_roi_pct, 1.5) if giveback_arm_roi_pct > 0 else 1.0)
         )
     )
+    relation_exit_ctx = evaluate_market_relation_exit_tightening(safe_pos)
+    safe_pos['marketRelationExitTightenActive'] = bool(relation_exit_ctx.get('active', False))
+    safe_pos['marketRelationExitTightenSeverity'] = _coerce_float(relation_exit_ctx.get('severity', 0.0), 0.0)
+    safe_pos['marketRelationExitTightenReason'] = ",".join(relation_exit_ctx.get('reasons', []))
 
     rescue_confidence = _clamp(
         0.45
@@ -20035,6 +20237,12 @@ def evaluate_v3_position_thesis_revalidation(
         0.0,
         0.95,
     )
+    if relation_exit_ctx.get('active', False):
+        profit_hold_confidence = _clamp(
+            profit_hold_confidence - min(0.25, _coerce_float(relation_exit_ctx.get('severity', 0.0), 0.0) * 0.12),
+            0.0,
+            0.95,
+        )
 
     rescue_support = bool(
         entry_archetype == ENTRY_ARCHETYPE_RECLAIM or runner_context_resolved == V3_RUNNER_CONTEXT_COUNTER or str(safe_pos.get('runnerContext', '')) == V3_RUNNER_CONTEXT_COUNTER
@@ -20063,6 +20271,7 @@ def evaluate_v3_position_thesis_revalidation(
         and not hostile_imbalance
         and not opposite_signal_persistent
         and not adverse_state
+        and relation_exit_ctx.get('allow_profit_hold', True)
     )
 
     rescue_expire_ts = _coerce_float(safe_pos.get('reclaimRescueExpireTs', 0.0), 0.0)
@@ -20105,7 +20314,10 @@ def evaluate_v3_position_thesis_revalidation(
             })
             return result
         safe_pos['profitContinuationHoldExpireTs'] = 0.0
-        safe_pos['profitContinuationHoldReleaseReason'] = 'TIME' if now_ts >= profit_hold_expire_ts else 'FLOW_FADE'
+        safe_pos['profitContinuationHoldReleaseReason'] = (
+            str(relation_exit_ctx.get('primary_reason', '') or '')
+            or ('TIME' if now_ts >= profit_hold_expire_ts else 'FLOW_FADE')
+        )
 
     if rescue_support and not bool(safe_pos.get('_reclaimRescueUsed', False)):
         rescue_candidate_since = _coerce_float(safe_pos.get('_reclaimRescueCandidateSinceTs', 0.0), 0.0)
@@ -20192,6 +20404,98 @@ def evaluate_v3_position_thesis_revalidation(
             safe_pos['runnerContextResolved'] = str(safe_pos.get('baseRunnerContext', safe_pos.get('runnerContext', runner_context_resolved)) or runner_context_resolved)
     result['thesis_state'] = str(safe_pos.get('positionThesisState', POSITION_THESIS_ENTRY) or POSITION_THESIS_ENTRY)
     return result
+
+
+def evaluate_market_relation_exit_tightening(pos: Optional[dict]) -> dict:
+    """Tighten profitable continuation exits when market-relation support deteriorates."""
+    safe_pos = pos if isinstance(pos, dict) else {}
+    side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    entry_state = str(safe_pos.get('marketRelationState', 'UNAVAILABLE') or 'UNAVAILABLE').upper()
+    current_state = str(
+        safe_pos.get('currentMarketRelationState', safe_pos.get('marketRelationState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+    ).upper()
+    entry_altbtc = str(safe_pos.get('altBtcState', 'UNAVAILABLE') or 'UNAVAILABLE').upper()
+    current_altbtc = str(
+        safe_pos.get('currentAltBtcState', safe_pos.get('altBtcState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+    ).upper()
+    current_triangle = str(
+        safe_pos.get('currentTriangleState', safe_pos.get('triangleState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+    ).upper()
+    current_crowding = str(
+        safe_pos.get('currentCrowdingSide', safe_pos.get('crowdingSide', 'NEUTRAL')) or 'NEUTRAL'
+    ).upper()
+    current_oi_change = _coerce_float(
+        safe_pos.get('currentOpenInterestChangePct5m', safe_pos.get('openInterestChangePct5m', 0.0)),
+        _coerce_float(safe_pos.get('openInterestChangePct5m', 0.0), 0.0),
+    )
+
+    reasons = []
+    severity = 0.0
+    if not MARKET_RELATION_EXIT_TIGHTENING_ENABLED:
+        return {
+            'active': False,
+            'severity': 0.0,
+            'trail_mult': 1.0,
+            'activation_mult': 1.0,
+            'allow_profit_hold': True,
+            'reasons': reasons,
+            'primary_reason': '',
+            'trace': {
+                'enabled': False,
+                'entry_state': entry_state,
+                'current_state': current_state,
+                'current_triangle': current_triangle,
+                'current_altbtc': current_altbtc,
+                'current_crowding': current_crowding,
+                'current_oi_change_pct_5m': round(current_oi_change, 4),
+            },
+        }
+
+    if current_triangle == 'WIDE':
+        severity += 1.0
+        reasons.append('MR_EXIT_TRIANGLE_WIDE')
+    if entry_state == 'SUPPORTIVE' and current_state in ('CAUTION', 'BLOCK'):
+        severity += 1.0 if current_state == 'BLOCK' else 0.7
+        reasons.append('MR_EXIT_RELATION_FADE')
+    if side == 'LONG' and entry_altbtc == 'STRONG' and current_altbtc == 'WEAK':
+        severity += 0.9
+        reasons.append('MR_EXIT_ALTBTC_FLIP')
+    elif side == 'SHORT' and entry_altbtc == 'WEAK' and current_altbtc == 'STRONG':
+        severity += 0.9
+        reasons.append('MR_EXIT_ALTBTC_FLIP')
+    if current_crowding == side and current_oi_change >= 4.0:
+        severity += 0.8 if current_oi_change >= 6.0 else 0.5
+        reasons.append('MR_EXIT_CROWD_BUILD')
+
+    active = severity > 0.0
+    if severity >= 1.8:
+        trail_mult = 0.72
+        activation_mult = 0.78
+    elif severity >= 1.0:
+        trail_mult = 0.82
+        activation_mult = 0.88
+    else:
+        trail_mult = 0.90
+        activation_mult = 0.94
+
+    return {
+        'active': active,
+        'severity': round(severity, 4),
+        'trail_mult': trail_mult if active else 1.0,
+        'activation_mult': activation_mult if active else 1.0,
+        'allow_profit_hold': severity < 0.75,
+        'reasons': reasons,
+        'primary_reason': reasons[0] if reasons else '',
+        'trace': {
+            'enabled': True,
+            'entry_state': entry_state,
+            'current_state': current_state,
+            'current_triangle': current_triangle,
+            'current_altbtc': current_altbtc,
+            'current_crowding': current_crowding,
+            'current_oi_change_pct_5m': round(current_oi_change, 4),
+        },
+    }
 
 
 def _trail_fakeout_supportive_transition(side: str, transition_state: str) -> bool:
@@ -21228,6 +21532,45 @@ def _build_live_flow_context_from_opportunity(
         'currentExecScore': _coerce_float(
             current_exec_score,
             _coerce_float(safe_target.get('currentExecScore', safe_target.get('entryExecScoreSnapshot', safe_target.get('entryExecScore', 0.0))), 0.0),
+        ),
+        'currentMarketRelationState': str(
+            safe_opp.get('marketRelationState', safe_target.get('currentMarketRelationState', safe_target.get('marketRelationState', 'UNAVAILABLE')))
+            or safe_target.get('marketRelationState', 'UNAVAILABLE')
+        ),
+        'currentMarketRelationConfidence': _coerce_float(
+            safe_opp.get('marketRelationConfidence', safe_target.get('currentMarketRelationConfidence', safe_target.get('marketRelationConfidence', 0.0))),
+            _coerce_float(safe_target.get('marketRelationConfidence', 0.0), 0.0),
+        ),
+        'currentSymbolBasisPct': _coerce_float(
+            safe_opp.get('symbolBasisPct', safe_target.get('currentSymbolBasisPct', safe_target.get('symbolBasisPct', 0.0))),
+            _coerce_float(safe_target.get('symbolBasisPct', 0.0), 0.0),
+        ),
+        'currentAltBtcState': str(
+            safe_opp.get('altBtcState', safe_target.get('currentAltBtcState', safe_target.get('altBtcState', 'UNAVAILABLE')))
+            or safe_target.get('altBtcState', 'UNAVAILABLE')
+        ),
+        'currentAltBtcRelStrengthPct': _coerce_float(
+            safe_opp.get('altBtcRelStrengthPct', safe_target.get('currentAltBtcRelStrengthPct', safe_target.get('altBtcRelStrengthPct', 0.0))),
+            _coerce_float(safe_target.get('altBtcRelStrengthPct', 0.0), 0.0),
+        ),
+        'currentTriangleResidualBps': _coerce_float(
+            safe_opp.get('triangleResidualBps', safe_target.get('currentTriangleResidualBps', safe_target.get('triangleResidualBps', 0.0))),
+            _coerce_float(safe_target.get('triangleResidualBps', 0.0), 0.0),
+        ),
+        'currentTriangleState': str(
+            safe_opp.get('triangleState', safe_target.get('currentTriangleState', safe_target.get('triangleState', 'UNAVAILABLE')))
+            or safe_target.get('triangleState', 'UNAVAILABLE')
+        ),
+        'currentCrowdingSide': str(
+            safe_opp.get('crowdingSide', safe_target.get('currentCrowdingSide', safe_target.get('crowdingSide', 'NEUTRAL')))
+            or safe_target.get('crowdingSide', 'NEUTRAL')
+        ),
+        'currentOpenInterestChangePct5m': _coerce_float(
+            safe_opp.get(
+                'openInterestChangePct5m',
+                safe_target.get('currentOpenInterestChangePct5m', safe_target.get('openInterestChangePct5m', 0.0)),
+            ),
+            _coerce_float(safe_target.get('openInterestChangePct5m', 0.0), 0.0),
         ),
     }
 
@@ -23028,6 +23371,8 @@ def apply_v3_continuation_trail_overlay(
             'threshold_mult': threshold_mult,
             'state': V3_CONTINUATION_NEUTRAL,
             'chop_tighten_active': False,
+            'market_relation_tighten_active': False,
+            'market_relation_tighten_reason': '',
         }
 
     state_ctx = evaluate_v3_continuation_flow_state(
@@ -23056,6 +23401,15 @@ def apply_v3_continuation_trail_overlay(
         activation_mult = 0.85
         chop_tighten_active = bool(tp1_taken or (tp1_roi > 0 and peak_roi >= tp1_roi))
 
+    relation_exit_ctx = evaluate_market_relation_exit_tightening(safe_pos)
+    if relation_exit_ctx.get('active', False):
+        trail_mult *= _coerce_float(relation_exit_ctx.get('trail_mult', 1.0), 1.0)
+        activation_mult *= _coerce_float(relation_exit_ctx.get('activation_mult', 1.0), 1.0)
+        chop_tighten_active = True
+    safe_pos['marketRelationExitTightenActive'] = bool(relation_exit_ctx.get('active', False))
+    safe_pos['marketRelationExitTightenSeverity'] = _coerce_float(relation_exit_ctx.get('severity', 0.0), 0.0)
+    safe_pos['marketRelationExitTightenReason'] = ",".join(relation_exit_ctx.get('reasons', []))
+
     safe_trail = max(0.0, float(dynamic_trail_distance or 0.0) * trail_mult)
     safe_move = max(0.05, float(min_price_move_pct or 0.0) * activation_mult)
     safe_roi = max(0.5, float(min_roi_pct or 0.0) * activation_mult)
@@ -23075,6 +23429,8 @@ def apply_v3_continuation_trail_overlay(
         'threshold_mult': safe_threshold,
         'state': state,
         'chop_tighten_active': chop_tighten_active,
+        'market_relation_tighten_active': bool(relation_exit_ctx.get('active', False)),
+        'market_relation_tighten_reason': ",".join(relation_exit_ctx.get('reasons', [])),
     }
 
 
@@ -24230,6 +24586,15 @@ class CoinOpportunity:
         self.recheck_score: float = 0.0
         self.recheck_decision: str = ''
         self.recheck_reasons: list = []
+        self.market_relation_state: str = 'UNAVAILABLE'
+        self.market_relation_confidence: float = 0.0
+        self.symbol_basis_pct: float = 0.0
+        self.symbol_basis_zscore: float = 0.0
+        self.altbtc_state: str = 'UNAVAILABLE'
+        self.altbtc_rel_strength_pct: float = 0.0
+        self.triangle_residual_bps: float = 0.0
+        self.triangle_state: str = 'UNAVAILABLE'
+        self.crowding_side: str = 'NEUTRAL'
 
     def reset_scan_signal_state(self) -> None:
         """Clear per-scan signal snapshot fields so stale signal state does not persist."""
@@ -24277,6 +24642,18 @@ class CoinOpportunity:
         self.ob_imbalance_trend = float(ob_imbalance_trend or 0.0)
         self.entry_exec_score = float(live_exec_score or 0.0)
         self.entry_exec_passed = bool(self.entry_exec_score >= EXEC_QUALITY_MIN_SCORE) if self.entry_exec_score > 0 else False
+
+    def update_market_relation_snapshot(self, snapshot: dict) -> None:
+        safe_snapshot = snapshot if isinstance(snapshot, dict) else {}
+        self.market_relation_state = str(safe_snapshot.get('marketRelationState', 'UNAVAILABLE') or 'UNAVAILABLE')
+        self.market_relation_confidence = float(safe_snapshot.get('marketRelationConfidence', 0.0) or 0.0)
+        self.symbol_basis_pct = float(safe_snapshot.get('symbolBasisPct', 0.0) or 0.0)
+        self.symbol_basis_zscore = float(safe_snapshot.get('symbolBasisZScore', 0.0) or 0.0)
+        self.altbtc_state = str(safe_snapshot.get('altBtcState', 'UNAVAILABLE') or 'UNAVAILABLE')
+        self.altbtc_rel_strength_pct = float(safe_snapshot.get('altBtcRelStrengthPct', 0.0) or 0.0)
+        self.triangle_residual_bps = float(safe_snapshot.get('triangleResidualBps', 0.0) or 0.0)
+        self.triangle_state = str(safe_snapshot.get('triangleState', 'UNAVAILABLE') or 'UNAVAILABLE')
+        self.crowding_side = str(safe_snapshot.get('crowdingSide', 'NEUTRAL') or 'NEUTRAL')
     
     def to_dict(self) -> dict:
         return {
@@ -24331,6 +24708,15 @@ class CoinOpportunity:
                 "recheckScore": round(float(self.recheck_score), 1),
                 "recheckDecision": str(self.recheck_decision),
                 "recheckReasons": list(self.recheck_reasons) if self.recheck_reasons else [],
+                "marketRelationState": self.market_relation_state,
+                "marketRelationConfidence": round(float(self.market_relation_confidence), 4),
+                "symbolBasisPct": round(float(self.symbol_basis_pct), 6),
+                "symbolBasisZScore": round(float(self.symbol_basis_zscore), 4),
+                "altBtcState": self.altbtc_state,
+                "altBtcRelStrengthPct": round(float(self.altbtc_rel_strength_pct), 4),
+                "triangleResidualBps": round(float(self.triangle_residual_bps), 4),
+                "triangleState": self.triangle_state,
+                "crowdingSide": self.crowding_side,
             }
 
 
@@ -24916,6 +25302,56 @@ class LightweightCoinAnalyzer:
             _btc_regime_ctx = {}
         _entry_market_regime = str(_btc_regime_ctx.get('marketRegimeForSignal', 'RANGING') or 'RANGING')
         _btc_regime_ready_state = str(_btc_regime_ctx.get('readyState', 'waiting') or 'waiting')
+        market_relation_snapshot = _default_market_relation_context()
+        try:
+            if (
+                SYMBOL_BASIS_FEATURES_ENABLED
+                or ALTBTC_RELATIVE_STRENGTH_ENABLED
+                or TRIANGLE_RESIDUAL_FILTER_ENABLED
+                or MARKET_RELATION_OVERLAY_ENABLED
+                or MARKET_RELATION_PENDING_GUARD_ENABLED
+                or MARKET_RELATION_EXIT_TIGHTENING_ENABLED
+                or MARKET_RELATION_OPEN_INTEREST_ENABLED
+            ):
+                market_relation_snapshot = market_relation_tracker.build_snapshot(
+                    self.symbol,
+                    perp_price=self.opportunity.price,
+                    funding_rate=funding_oi_tracker.funding_rates.get(self.symbol, 0.0),
+                    open_interest_change_pct_5m=(
+                        funding_oi_tracker.get_open_interest_change_pct(self.symbol)
+                        if MARKET_RELATION_OPEN_INTEREST_ENABLED else 0.0
+                    ),
+                )
+                self.opportunity.update_market_relation_snapshot(market_relation_snapshot)
+                if 'global_paper_trader' in globals() and global_paper_trader:
+                    if market_relation_snapshot.get('marketRelationAvailable', False):
+                        global_paper_trader.pipeline_metrics['market_relation_snapshot_ready'] = (
+                            global_paper_trader.pipeline_metrics.get('market_relation_snapshot_ready', 0) + 1
+                        )
+                        if market_relation_snapshot.get('basisState') == 'SUPPORTIVE':
+                            global_paper_trader.pipeline_metrics['basis_supportive_count'] = (
+                                global_paper_trader.pipeline_metrics.get('basis_supportive_count', 0) + 1
+                            )
+                        elif market_relation_snapshot.get('basisState') == 'EXTREME_CROWD':
+                            global_paper_trader.pipeline_metrics['basis_extreme_crowd_count'] = (
+                                global_paper_trader.pipeline_metrics.get('basis_extreme_crowd_count', 0) + 1
+                            )
+                        if market_relation_snapshot.get('altBtcState') == 'STRONG':
+                            global_paper_trader.pipeline_metrics['altbtc_strength_support_count'] = (
+                                global_paper_trader.pipeline_metrics.get('altbtc_strength_support_count', 0) + 1
+                            )
+                        if market_relation_snapshot.get('triangleState') == 'WIDE':
+                            global_paper_trader.pipeline_metrics['triangle_residual_caution_count'] = (
+                                global_paper_trader.pipeline_metrics.get('triangle_residual_caution_count', 0) + 1
+                            )
+                    else:
+                        global_paper_trader.pipeline_metrics['market_relation_unavailable'] = (
+                            global_paper_trader.pipeline_metrics.get('market_relation_unavailable', 0) + 1
+                        )
+        except Exception as relation_exc:
+            logger.debug(f"Market relation snapshot error {self.symbol}: {relation_exc}")
+            market_relation_snapshot = _default_market_relation_context()
+            self.opportunity.update_market_relation_snapshot(market_relation_snapshot)
         self.last_analysis_context = {
             'hurst': hurst,
             'zscore': zscore,
@@ -24951,7 +25387,12 @@ class LightweightCoinAnalyzer:
             'side_wr_penalty': 0,
             'enhanced_indicators': enhanced_ind,
             'fib_context': cs_fib_context,
+            'market_relation_snapshot': dict(market_relation_snapshot),
         }
+        self.last_analysis_context = _apply_market_relation_context_to_payload(
+            self.last_analysis_context,
+            market_relation_snapshot,
+        )
         signal = self.signal_generator.generate_signal(
             hurst=hurst,
             zscore=zscore,
@@ -24983,6 +25424,7 @@ class LightweightCoinAnalyzer:
             side_wr_penalty=0,  # Phase 157: calculated inside generate_signal where signal_side is known
             enhanced_indicators=enhanced_ind,  # Phase 193: MACD, BB, StochRSI, EMA cross
             fib_context=cs_fib_context,  # Phase FIB: Fibonacci context
+            market_relation_snapshot=market_relation_snapshot,
         )
         
         if signal:
@@ -25017,6 +25459,7 @@ class LightweightCoinAnalyzer:
                 self.opportunity.entry_exec_score = signal.get('entryExecScore', signal.get('confidenceScore', 0))
                 self.opportunity.entry_exec_passed = signal.get('entryExecPassed', True)
                 self.opportunity.strategy_mode = signal.get('strategyMode', STRATEGY_MODE_LEGACY)
+                self.opportunity.update_market_relation_snapshot(signal)
                 self.opportunity.active_strategy = signal.get('activeStrategy', 'legacy')
                 self.opportunity.strategy_label = signal.get('strategyLabel', 'Legacy')
                 # Execution-stage reject reason (if any) for UI observability
@@ -25519,6 +25962,12 @@ class FundingOITracker:
         self.fetch_interval: float = 300  # 5 dakika
         self.fetch_count: int = 0
         self.last_error: str = ""
+        self.open_interest: Dict[str, float] = {}
+        self.open_interest_history: Dict[str, deque] = {}
+        self.last_oi_fetch_time: float = 0
+        self.oi_fetch_interval: float = 60.0
+        self.oi_fetch_count: int = 0
+        self.last_oi_error: str = ""
         logger.info("💰 FundingOITracker initialized (Phase 157)")
     
     async def fetch_funding_rates(self, exchange) -> bool:
@@ -25608,6 +26057,101 @@ class FundingOITracker:
                 return (3, f"FR({rate_pct:.3f}%)", False)
         
         return (0, "", False)
+
+    def _record_open_interest(self, symbol: str, value: float, *, ts: Optional[float] = None) -> None:
+        safe_symbol = str(symbol or '').upper().strip()
+        safe_value = _coerce_float(value, 0.0)
+        if not safe_symbol or safe_value <= 0:
+            return
+        now_ts = _coerce_float(ts, datetime.now().timestamp())
+        self.open_interest[safe_symbol] = safe_value
+        history = self.open_interest_history.setdefault(safe_symbol, deque(maxlen=128))
+        history.append((now_ts, safe_value))
+        cutoff = now_ts - 3900.0
+        while history and _coerce_float(history[0][0], 0.0) < cutoff:
+            history.popleft()
+
+    async def fetch_open_interest(self, exchange, symbols: Optional[Iterable[str]] = None, *, max_symbols: int = 25) -> bool:
+        """Fetch open interest snapshots for a bounded symbol set and preserve 5m change history."""
+        now = datetime.now().timestamp()
+        if now - self.last_oi_fetch_time < self.oi_fetch_interval:
+            return True
+
+        tracked_symbols: list[str] = []
+        seen: set[str] = set()
+        for raw_symbol in list(symbols or []):
+            safe_symbol = str(raw_symbol or '').upper().strip()
+            if not safe_symbol or not safe_symbol.endswith('USDT'):
+                continue
+            if safe_symbol in seen:
+                continue
+            tracked_symbols.append(safe_symbol)
+            seen.add(safe_symbol)
+            if len(tracked_symbols) >= max(1, int(max_symbols or 25)):
+                break
+
+        if not tracked_symbols:
+            self.last_oi_fetch_time = now
+            return True
+
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                success_count = 0
+                for safe_symbol in tracked_symbols:
+                    url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={safe_symbol}"
+                    try:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                continue
+                            payload = await response.json()
+                    except Exception:
+                        continue
+                    oi_value = _coerce_float((payload or {}).get('openInterest', 0.0), 0.0)
+                    if oi_value <= 0:
+                        continue
+                    self._record_open_interest(safe_symbol, oi_value, ts=now)
+                    success_count += 1
+
+            self.last_oi_fetch_time = now
+            self.oi_fetch_count += 1
+            self.last_oi_error = ""
+            if success_count > 0 and (self.oi_fetch_count <= 3 or self.oi_fetch_count % 20 == 0):
+                btc_oi = self.open_interest.get('BTCUSDT', 0.0)
+                logger.info(
+                    f"📘 Open interest updated: {success_count} coins | BTC={btc_oi:.2f} | fetch #{self.oi_fetch_count}"
+                )
+            return success_count > 0
+        except Exception as e:
+            self.last_oi_error = str(e)[:100]
+            if self.oi_fetch_count < 5:
+                logger.warning(f"📘 Open interest fetch error: {self.last_oi_error}")
+            return False
+
+    def get_open_interest_change_pct(self, symbol: str, window_sec: int = 300) -> float:
+        safe_symbol = str(symbol or '').upper().strip()
+        history = self.open_interest_history.get(safe_symbol)
+        if not history or len(history) < 2:
+            return 0.0
+        current_ts = _coerce_float(history[-1][0], 0.0)
+        current_value = _coerce_float(history[-1][1], 0.0)
+        if current_ts <= 0 or current_value <= 0:
+            return 0.0
+        target_ts = current_ts - max(1, int(window_sec or 300))
+        anchor_value = _coerce_float(history[0][1], 0.0)
+        for ts, value in reversed(history):
+            safe_ts = _coerce_float(ts, 0.0)
+            safe_value = _coerce_float(value, 0.0)
+            if safe_value <= 0:
+                continue
+            anchor_value = safe_value
+            if safe_ts <= target_ts:
+                break
+        if anchor_value <= 0:
+            return 0.0
+        return round(((current_value - anchor_value) / anchor_value) * 100.0, 4)
     
     def get_status(self) -> dict:
         """Tracker durumunu döndür."""
@@ -25618,6 +26162,11 @@ class FundingOITracker:
             "last_error": self.last_error,
             "btc_funding": self.funding_rates.get('BTCUSDT', 0) * 100,
             "eth_funding": self.funding_rates.get('ETHUSDT', 0) * 100,
+            "oi_coins_tracked": len(self.open_interest),
+            "last_oi_fetch": self.last_oi_fetch_time,
+            "oi_fetch_count": self.oi_fetch_count,
+            "last_oi_error": self.last_oi_error,
+            "btc_open_interest": self.open_interest.get('BTCUSDT', 0.0),
         }
 
 # Global Funding+OI Tracker
@@ -28019,6 +28568,44 @@ async def background_scanner_loop():
                         await funding_oi_tracker.fetch_funding_rates(multi_coin_scanner.exchange)
                 except Exception as e:
                     logger.debug(f"Funding rate fetch error: {e}")
+
+                try:
+                    if (
+                        multi_coin_scanner.exchange
+                        and MARKET_RELATION_OPEN_INTEREST_ENABLED
+                        and (
+                            SYMBOL_BASIS_FEATURES_ENABLED
+                            or ALTBTC_RELATIVE_STRENGTH_ENABLED
+                            or TRIANGLE_RESIDUAL_FILTER_ENABLED
+                            or MARKET_RELATION_OVERLAY_ENABLED
+                            or MARKET_RELATION_PENDING_GUARD_ENABLED
+                            or MARKET_RELATION_EXIT_TIGHTENING_ENABLED
+                        )
+                    ):
+                        await funding_oi_tracker.fetch_open_interest(
+                            multi_coin_scanner.exchange,
+                            multi_coin_scanner.coins,
+                            max_symbols=MARKET_RELATION_OI_MAX_SYMBOLS,
+                        )
+                except Exception as e:
+                    logger.debug(f"Open interest fetch error: {e}")
+
+                try:
+                    if (
+                        multi_coin_scanner.exchange
+                        and (
+                            SYMBOL_BASIS_FEATURES_ENABLED
+                            or ALTBTC_RELATIVE_STRENGTH_ENABLED
+                            or TRIANGLE_RESIDUAL_FILTER_ENABLED
+                            or MARKET_RELATION_OVERLAY_ENABLED
+                            or MARKET_RELATION_PENDING_GUARD_ENABLED
+                            or MARKET_RELATION_EXIT_TIGHTENING_ENABLED
+                            or MARKET_RELATION_OPEN_INTEREST_ENABLED
+                        )
+                    ):
+                        await market_relation_tracker.refresh_spot_prices(multi_coin_scanner.coins)
+                except Exception as e:
+                    logger.debug(f"Market relation refresh error: {e}")
                 
                 # Phase 157: Trade pattern analysis (cached — only runs every 1 hour)
                 try:
@@ -32600,6 +33187,27 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
         eq_count = len(signal.get('entryQualityReasons') or [])
         strategy_mode_upper = str(signal.get('strategyMode', STRATEGY_MODE_LEGACY)).upper()
         exec_score = float(signal.get('entryExecScore', signal_score) or signal_score)
+        mtf_coin_state_guard = evaluate_mtf_coin_state_override_guard(signal, action)
+        if MTF_SOFT_OVERRIDE_REQUIRE_FRESH_COIN_STATE and mtf_coin_state_guard.get('blocked', False):
+            global_paper_trader.pipeline_metrics['mtf_soft_override_blocked_coin_state'] += 1
+            logger.info(
+                f"🚫 MACRO__REGIME_CONSENSUS_BLOCK: {action} {symbol} "
+                f"reason={mtf_coin_state_guard.get('reason_code', 'COIN_STATE_NOT_READY')}"
+            )
+            return reject_signal(
+                'MACRO__REGIME_CONSENSUS_BLOCK',
+                f"REGIME_CONSENSUS_BLOCKED:{mtf_coin_state_guard.get('reason_code', 'COIN_STATE_NOT_READY')}",
+                feedback_reason=f"REGIME_CONSENSUS_BLOCKED:{mtf_coin_state_guard.get('reason_code', 'COIN_STATE_NOT_READY')}",
+                trace={
+                    'mtf_score': mtf_result.get('mtf_score', 0),
+                    'mtf_reason': mtf_result.get('reason', ''),
+                    **mtf_coin_state_guard.get('trace', {}),
+                },
+                attribution_reason='REGIME_CONSENSUS_BLOCKED',
+                attribution_score=signal_score,
+                metric_key='mtf_rejected',
+                hard_reject_count=True,
+            )
         adaptive_mode = is_adaptive_mode(strategy_mode_upper)
         smart_relax_enabled = (
             adaptive_mode
@@ -42407,6 +43015,7 @@ class SignalGenerator:
         side_wr_penalty: int = 0,  # Phase 157: Side WR penalty from trade pattern analysis
         enhanced_indicators: Optional[Dict] = None,  # Phase 193: MACD, BB, StochRSI, EMA cross
         fib_context: Optional[Dict] = None,  # Phase FIB: Fibonacci retracement context
+        market_relation_snapshot: Optional[Dict] = None,
         event_alpha_override: Optional[Dict] = None,
     ) -> Optional[Dict[str, Any]]:
         """
@@ -42418,6 +43027,10 @@ class SignalGenerator:
         # Phase 249 fix: None-safe guards for ADX and coin_daily_trend
         adx = float(adx or 25.0)
         coin_daily_trend = coin_daily_trend or 'NEUTRAL'
+        market_relation_snapshot = _apply_market_relation_context_to_payload(
+            {},
+            market_relation_snapshot if isinstance(market_relation_snapshot, dict) else _default_market_relation_context(),
+        )
         
         # PHASE 102: Debug signal generation attempts (log every 100th)
         if not hasattr(self, '_attempt_count'):
@@ -44176,6 +44789,8 @@ class SignalGenerator:
             )
         barrier_size_mult = 1.0
         barrier_leverage_cap = 0
+        market_relation_size_mult = 1.0
+        market_relation_leverage_cap = 0
         reversal_zone_ctx = {
             'zoneState': 'UNAVAILABLE',
             'zoneReason': '',
@@ -44224,6 +44839,28 @@ class SignalGenerator:
                 'barrierReason': barrier_ctx.get('barrierReason', ''),
                 'barrierConfidence': barrier_ctx.get('barrierConfidence', 0.0),
             })
+        countertrend_barrier_guard = evaluate_countertrend_barrier_guard(
+            entry_archetype,
+            barrier_ctx,
+            hard_block_enabled=COUNTERTREND_BARRIER_HARD_BLOCK_ENABLED,
+        )
+        countertrend_fallback_protected = bool(countertrend_barrier_guard.get('countertrendFallbackProtected', False))
+        market_fallback_disallowed = bool(countertrend_barrier_guard.get('marketFallbackDisallowed', False))
+        market_fallback_block_reason = str(countertrend_barrier_guard.get('marketFallbackBlockReason', '') or '')
+        if countertrend_barrier_guard.get('rejectSignal', False):
+            if 'global_paper_trader' in globals() and global_paper_trader:
+                global_paper_trader.pipeline_metrics['countertrend_barrier_block'] = (
+                    global_paper_trader.pipeline_metrics.get('countertrend_barrier_block', 0) + 1
+                )
+            logger.info(
+                f"🚫 ENTRY__COUNTERTREND_BARRIER_BLOCK: {symbol} {signal_side} "
+                f"state={countertrend_barrier_guard.get('barrierState', 'CLEAR')} "
+                f"adverse={countertrend_barrier_guard.get('adverseDistancePct', 0.0):.3f}% "
+                f"reason={countertrend_barrier_guard.get('barrierReason', '') or 'nearby'}"
+            )
+            return None
+        if market_fallback_disallowed and market_fallback_block_reason:
+            reasons.append(f"CT_FALLBACK_LOCK({market_fallback_block_reason})")
         if entry_archetype == ENTRY_ARCHETYPE_CONTINUATION:
             barrier_verdict = str(barrier_ctx.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
             barrier_state = str(barrier_ctx.get('barrierState', 'CLEAR') or 'CLEAR')
@@ -44358,6 +44995,27 @@ class SignalGenerator:
                 reasons.append(f"BARRIER_NOTE({barrier_ctx.get('barrierState', 'CLEAR')}:{barrier_ctx.get('barrierReason', '')})")
             reasons.append("ENTRY_ARCH(reclaim)")
 
+        relation_overlay = compute_market_relation_overlay(
+            market_relation_snapshot,
+            signal_side,
+            entry_archetype=entry_archetype,
+        )
+        if relation_overlay.get('applied', False):
+            if MARKET_RELATION_OVERLAY_ENABLED:
+                score = max(0.0, score + _coerce_float(relation_overlay.get('score_delta', 0.0), 0.0))
+                market_relation_size_mult = min(market_relation_size_mult, _coerce_float(relation_overlay.get('size_mult', 1.0), 1.0))
+                market_relation_leverage_cap = int(relation_overlay.get('leverage_cap', 0) or 0)
+                for code in relation_overlay.get('reason_codes', []):
+                    reasons.append(str(code))
+                if 'global_paper_trader' in globals() and global_paper_trader:
+                    global_paper_trader.pipeline_metrics['market_relation_overlay_applied'] = (
+                        global_paper_trader.pipeline_metrics.get('market_relation_overlay_applied', 0) + 1
+                    )
+            elif MARKET_RELATION_SHADOW_MODE:
+                reasons.append(
+                    f"MR_SHADOW({','.join(str(code) for code in relation_overlay.get('reason_codes', []))})"
+                )
+
         # =====================================================================
         # PHASE 29: BALANCE-PROTECTED SIZE MULTIPLIER
         # =====================================================================
@@ -44395,6 +45053,9 @@ class SignalGenerator:
         if barrier_size_mult < 0.999:
             size_mult *= barrier_size_mult
             reasons.append(f"BARRIER_SIZE({barrier_size_mult:.2f}x)")
+        if market_relation_size_mult < 0.999:
+            size_mult *= market_relation_size_mult
+            reasons.append(f"MR_SIZE({market_relation_size_mult:.2f}x)")
         if volatile_soft_risk_cap:
             size_mult *= VOLATILE_VETO_SOFTPASS_SIZE_MULT
             reasons.append(f"VOL_SIZE({VOLATILE_VETO_SOFTPASS_SIZE_MULT:.2f}x)")
@@ -44431,6 +45092,11 @@ class SignalGenerator:
             final_leverage = min(final_leverage, int(barrier_leverage_cap))
             if final_leverage < _barrier_old_lev:
                 reasons.append(f"BARRIER_LEV_CAP({_barrier_old_lev}→{final_leverage}x)")
+        if market_relation_leverage_cap:
+            _mr_old_lev = final_leverage
+            final_leverage = min(final_leverage, int(market_relation_leverage_cap))
+            if final_leverage < _mr_old_lev:
+                reasons.append(f"MR_LEV_CAP({_mr_old_lev}→{final_leverage}x)")
 
         self.last_signal_time = now
         
@@ -44493,6 +45159,28 @@ class SignalGenerator:
             'whaleContextZScore': round(float(whale_zscore or 0.0), 4),
             'fundingContextRate': round(float(funding_rate or 0.0), 6),
             'fundingRate': round(float(funding_rate or 0.0), 6),
+            'marketRelationAvailable': bool(market_relation_snapshot.get('marketRelationAvailable', False)),
+            'marketRelationState': str(market_relation_snapshot.get('marketRelationState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+            'marketRelationConfidence': round(float(market_relation_snapshot.get('marketRelationConfidence', 0.0) or 0.0), 4),
+            'marketRelationSource': str(market_relation_snapshot.get('marketRelationSource', '') or ''),
+            'marketRelationVersion': str(market_relation_snapshot.get('marketRelationVersion', '') or ''),
+            'spotPrice': round(float(market_relation_snapshot.get('spotPrice', 0.0) or 0.0), 8),
+            'perpPrice': round(float(market_relation_snapshot.get('perpPrice', price) or price), 8),
+            'symbolBasisPct': round(float(market_relation_snapshot.get('symbolBasisPct', 0.0) or 0.0), 6),
+            'symbolBasisZScore': round(float(market_relation_snapshot.get('symbolBasisZScore', 0.0) or 0.0), 4),
+            'basisVelocityBps1m': round(float(market_relation_snapshot.get('basisVelocityBps1m', 0.0) or 0.0), 4),
+            'basisBias': str(market_relation_snapshot.get('basisBias', 'NEUTRAL') or 'NEUTRAL'),
+            'basisState': str(market_relation_snapshot.get('basisState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+            'altBtcSymbol': str(market_relation_snapshot.get('altBtcSymbol', '') or ''),
+            'altBtcPrice': round(float(market_relation_snapshot.get('altBtcPrice', 0.0) or 0.0), 12),
+            'altBtcRetPct1m': round(float(market_relation_snapshot.get('altBtcRetPct1m', 0.0) or 0.0), 4),
+            'altBtcRetPct5m': round(float(market_relation_snapshot.get('altBtcRetPct5m', 0.0) or 0.0), 4),
+            'altBtcRelStrengthPct': round(float(market_relation_snapshot.get('altBtcRelStrengthPct', 0.0) or 0.0), 4),
+            'altBtcState': str(market_relation_snapshot.get('altBtcState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+            'triangleResidualBps': round(float(market_relation_snapshot.get('triangleResidualBps', 0.0) or 0.0), 4),
+            'triangleState': str(market_relation_snapshot.get('triangleState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+            'crowdingSide': str(market_relation_snapshot.get('crowdingSide', 'NEUTRAL') or 'NEUTRAL'),
+            'openInterestChangePct5m': round(float(market_relation_snapshot.get('openInterestChangePct5m', 0.0) or 0.0), 4),
             'pullbackPct': round(pullback_pct * 100, 2),
             'pullbackMinDyn': round(dyn_min_pb_pct, 4),
             'pullbackModelVersion': 'v2',
@@ -44575,6 +45263,11 @@ class SignalGenerator:
             'supportiveDistancePct': round(_coerce_float(barrier_ctx.get('supportiveDistancePct', 0.0), 0.0), 4),
             'barrierReason': str(barrier_ctx.get('barrierReason', '') or ''),
             'barrierConfidence': round(_coerce_float(barrier_ctx.get('barrierConfidence', 0.0), 0.0), 4),
+            'latestSuggestedEntryPrice': round(ideal_entry, 8),
+            'pendingEntryDriftPct': 0.0,
+            'marketFallbackDisallowed': market_fallback_disallowed,
+            'marketFallbackBlockReason': market_fallback_block_reason,
+            'countertrendFallbackProtected': countertrend_fallback_protected,
             'reversalRetestZoneState': str(reversal_zone_ctx.get('zoneState', 'UNAVAILABLE') or 'UNAVAILABLE'),
             'reversalRetestZoneReason': str(reversal_zone_ctx.get('zoneReason', '') or ''),
             'reversalRetestZoneSource': str(reversal_zone_ctx.get('zoneSource', '') or ''),
@@ -44810,6 +45503,350 @@ def extract_signal_pullback_locked_fraction(signal: dict, fallback: float = 0.0)
         return _clamp(value, 0.0, 0.25)
 
     return _clamp(float(fallback or 0.0), 0.0, 0.25)
+
+
+def is_countertrend_fallback_protected_entry(entry_archetype: str) -> bool:
+    """Countertrend entries need stricter pending fallback handling than pro-trend setups."""
+    safe_arch = str(entry_archetype or '').strip().lower()
+    return safe_arch in (ENTRY_ARCHETYPE_RECLAIM, ENTRY_ARCHETYPE_REVERSAL_RETEST)
+
+
+def is_continuation_fallback_protected_entry(entry_archetype: str, runner_context_resolved: str = '') -> bool:
+    """Continuation entries can use market fallback, but stale ideas should not chase on expiry."""
+    return is_continuation_like_entry(entry_archetype, runner_context_resolved)
+
+
+def evaluate_countertrend_barrier_guard(
+    entry_archetype: str,
+    barrier_ctx: Optional[dict],
+    *,
+    hard_block_enabled: bool = False,
+) -> dict:
+    """Translate barrier analysis into countertrend-specific signal and fallback protections."""
+    safe_barrier = barrier_ctx if isinstance(barrier_ctx, dict) else {}
+    barrier_verdict = str(safe_barrier.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+    barrier_state = str(safe_barrier.get('barrierState', 'CLEAR') or 'CLEAR')
+    barrier_reason = str(safe_barrier.get('barrierReason', '') or '')
+    adverse_distance_pct = _coerce_float(safe_barrier.get('adverseDistancePct', 0.0), 0.0)
+    countertrend_protected = is_countertrend_fallback_protected_entry(entry_archetype)
+
+    result = {
+        'countertrendFallbackProtected': countertrend_protected,
+        'marketFallbackDisallowed': False,
+        'marketFallbackBlockReason': '',
+        'rejectSignal': False,
+        'decisionCode': '',
+        'barrierVerdict': barrier_verdict,
+        'barrierState': barrier_state,
+        'barrierReason': barrier_reason,
+        'adverseDistancePct': adverse_distance_pct,
+    }
+    if not countertrend_protected:
+        return result
+
+    if barrier_verdict == 'BLOCK':
+        result['marketFallbackDisallowed'] = True
+        result['marketFallbackBlockReason'] = 'COUNTERTREND_BARRIER_BLOCK'
+        if hard_block_enabled:
+            result['rejectSignal'] = True
+            result['decisionCode'] = 'ENTRY__COUNTERTREND_BARRIER_BLOCK'
+    elif barrier_verdict == 'CAUTION':
+        result['marketFallbackDisallowed'] = True
+        result['marketFallbackBlockReason'] = 'COUNTERTREND_BARRIER_CAUTION'
+
+    return result
+
+
+def compute_pending_entry_drift_pct(side: str, entry_price: float, latest_suggested_entry_price: float) -> float:
+    """Measure only adverse drift between the frozen pending entry and the latest suggested entry."""
+    frozen_entry = _coerce_float(entry_price, 0.0)
+    latest_entry = _coerce_float(latest_suggested_entry_price, 0.0)
+    if frozen_entry <= 0 or latest_entry <= 0:
+        return 0.0
+
+    safe_side = str(side or '').upper()
+    if safe_side == 'LONG':
+        adverse_abs = max(0.0, latest_entry - frozen_entry)
+    elif safe_side == 'SHORT':
+        adverse_abs = max(0.0, frozen_entry - latest_entry)
+    else:
+        return 0.0
+
+    return (adverse_abs / frozen_entry) * 100.0 if frozen_entry > 0 else 0.0
+
+
+def compute_countertrend_pending_entry_drift_pct(side: str, entry_price: float, latest_suggested_entry_price: float) -> float:
+    return compute_pending_entry_drift_pct(side, entry_price, latest_suggested_entry_price)
+
+
+def resolve_countertrend_pending_stale_drift_threshold_pct(order: Optional[dict]) -> float:
+    """ATR-aware stale threshold for countertrend pending entry drift."""
+    safe_order = order if isinstance(order, dict) else {}
+    atr_pct = _coerce_float(
+        safe_order.get(
+            'currentAtrPct',
+            safe_order.get('atrPct', safe_order.get('volatility_pct', safe_order.get('volatilityPct', 0.0))),
+        ),
+        0.0,
+    )
+    if atr_pct <= 0:
+        entry_price = _coerce_float(safe_order.get('entryPrice', 0.0), 0.0)
+        atr = _coerce_float(safe_order.get('atr', 0.0), 0.0)
+        if entry_price > 0 and atr > 0:
+            atr_pct = (atr / entry_price) * 100.0
+
+    return max(
+        atr_pct * COUNTERTREND_PENDING_STALE_DRIFT_ATR_MULT,
+        COUNTERTREND_PENDING_STALE_DRIFT_MIN_PCT,
+    )
+
+
+def resolve_continuation_pending_stale_drift_threshold_pct(order: Optional[dict]) -> float:
+    """ATR-aware stale threshold for continuation pending entry drift."""
+    safe_order = order if isinstance(order, dict) else {}
+    atr_pct = _coerce_float(
+        safe_order.get(
+            'currentAtrPct',
+            safe_order.get('atrPct', safe_order.get('volatility_pct', safe_order.get('volatilityPct', 0.0))),
+        ),
+        0.0,
+    )
+    if atr_pct <= 0:
+        entry_price = _coerce_float(safe_order.get('entryPrice', 0.0), 0.0)
+        atr = _coerce_float(safe_order.get('atr', 0.0), 0.0)
+        if entry_price > 0 and atr > 0:
+            atr_pct = (atr / entry_price) * 100.0
+
+    return max(
+        atr_pct * CONTINUATION_PENDING_STALE_DRIFT_ATR_MULT,
+        CONTINUATION_PENDING_STALE_DRIFT_MIN_PCT,
+    )
+
+
+def refresh_countertrend_pending_fallback_state(order: Optional[dict], latest_suggested_entry_price: float = 0.0) -> dict:
+    """Keep pending fallback guard state in sync without changing frozen reentry semantics."""
+    safe_order = order if isinstance(order, dict) else {}
+    entry_archetype = str(safe_order.get('entryArchetype', '') or '').strip().lower()
+    countertrend_protected = is_countertrend_fallback_protected_entry(entry_archetype)
+    resolved_latest_entry = _coerce_float(latest_suggested_entry_price, 0.0)
+    if resolved_latest_entry <= 0:
+        resolved_latest_entry = _coerce_float(
+            safe_order.get('latestSuggestedEntryPrice', safe_order.get('entryPrice', 0.0)),
+            _coerce_float(safe_order.get('entryPrice', 0.0), 0.0),
+        )
+    if resolved_latest_entry > 0:
+        safe_order['latestSuggestedEntryPrice'] = round(resolved_latest_entry, 8)
+    drift_pct = compute_pending_entry_drift_pct(
+        safe_order.get('side', ''),
+        safe_order.get('entryPrice', 0.0),
+        resolved_latest_entry,
+    )
+    safe_order['pendingEntryDriftPct'] = round(drift_pct, 4)
+    safe_order['countertrendFallbackProtected'] = countertrend_protected
+
+    stale_threshold_pct = resolve_countertrend_pending_stale_drift_threshold_pct(safe_order) if countertrend_protected else 0.0
+    is_stale = bool(countertrend_protected and drift_pct > stale_threshold_pct > 0)
+    return {
+        'countertrendFallbackProtected': countertrend_protected,
+        'latestSuggestedEntryPrice': resolved_latest_entry,
+        'pendingEntryDriftPct': drift_pct,
+        'staleThresholdPct': stale_threshold_pct,
+        'stale': is_stale,
+    }
+
+
+def refresh_continuation_pending_fallback_state(order: Optional[dict], latest_suggested_entry_price: float = 0.0) -> dict:
+    """Track stale continuation pending ideas without changing the normal pending lifecycle."""
+    safe_order = order if isinstance(order, dict) else {}
+    entry_archetype = str(safe_order.get('entryArchetype', '') or '').strip().lower()
+    runner_context_resolved = str(
+        safe_order.get('runnerContextResolved', safe_order.get('runnerContext', '')) or ''
+    ).strip().lower()
+    continuation_protected = is_continuation_fallback_protected_entry(entry_archetype, runner_context_resolved)
+    resolved_latest_entry = _coerce_float(latest_suggested_entry_price, 0.0)
+    if resolved_latest_entry <= 0:
+        resolved_latest_entry = _coerce_float(
+            safe_order.get('latestSuggestedEntryPrice', safe_order.get('entryPrice', 0.0)),
+            _coerce_float(safe_order.get('entryPrice', 0.0), 0.0),
+        )
+    if resolved_latest_entry > 0:
+        safe_order['latestSuggestedEntryPrice'] = round(resolved_latest_entry, 8)
+    drift_pct = compute_pending_entry_drift_pct(
+        safe_order.get('side', ''),
+        safe_order.get('entryPrice', 0.0),
+        resolved_latest_entry,
+    )
+    safe_order['pendingEntryDriftPct'] = round(drift_pct, 4)
+
+    stale_threshold_pct = resolve_continuation_pending_stale_drift_threshold_pct(safe_order) if continuation_protected else 0.0
+    is_stale = bool(continuation_protected and drift_pct > stale_threshold_pct > 0)
+    return {
+        'continuationFallbackProtected': continuation_protected,
+        'latestSuggestedEntryPrice': resolved_latest_entry,
+        'pendingEntryDriftPct': drift_pct,
+        'staleThresholdPct': stale_threshold_pct,
+        'stale': is_stale,
+    }
+
+
+def evaluate_countertrend_market_fallback_guard(order: Optional[dict], current_price: float) -> dict:
+    """Block unsafe timeout-to-market chases for reclaim and reversal-retest pending orders."""
+    safe_order = order if isinstance(order, dict) else {}
+    state = refresh_countertrend_pending_fallback_state(safe_order)
+    trace = {
+        'countertrend_fallback_protected': state['countertrendFallbackProtected'],
+        'latest_suggested_entry_price': round(state['latestSuggestedEntryPrice'], 8),
+        'pending_entry_drift_pct': round(state['pendingEntryDriftPct'], 4),
+        'stale_threshold_pct': round(state['staleThresholdPct'], 4),
+        'barrier_verdict': str(safe_order.get('barrierVerdict', '') or ''),
+        'market_fallback_disallowed': bool(safe_order.get('marketFallbackDisallowed', False)),
+    }
+    result = {
+        'blocked': False,
+        'reason_code': '',
+        'detail': '',
+        'trace': trace,
+    }
+    if not COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED or not state['countertrendFallbackProtected']:
+        return result
+
+    reason_code = ''
+    if bool(safe_order.get('marketFallbackDisallowed', False)):
+        reason_code = str(safe_order.get('marketFallbackBlockReason', '') or 'COUNTERTREND_BARRIER_CAUTION')
+    elif state['stale']:
+        reason_code = 'COUNTERTREND_STALE_ENTRY_DRIFT'
+    else:
+        latest_entry = state['latestSuggestedEntryPrice']
+        safe_current_price = _coerce_float(current_price, 0.0)
+        adverse_chase_pct = 0.0
+        if safe_current_price > 0 and latest_entry > 0:
+            side = str(safe_order.get('side', '') or '').upper()
+            if side == 'LONG' and safe_current_price > latest_entry:
+                adverse_chase_pct = ((safe_current_price - latest_entry) / latest_entry) * 100.0
+            elif side == 'SHORT' and safe_current_price < latest_entry:
+                adverse_chase_pct = ((latest_entry - safe_current_price) / latest_entry) * 100.0
+        trace['adverse_chase_pct'] = round(adverse_chase_pct, 4)
+        if adverse_chase_pct > COUNTERTREND_MARKET_FALLBACK_MAX_CHASE_PCT:
+            reason_code = 'COUNTERTREND_FALLBACK_CHASE_BLOCK'
+
+    if not reason_code:
+        trace.setdefault('adverse_chase_pct', 0.0)
+        return result
+
+    detail = str(reason_code)
+    trace['reason_code'] = reason_code
+    result.update({
+        'blocked': True,
+        'reason_code': reason_code,
+        'detail': detail,
+        'trace': trace,
+    })
+    return result
+
+
+def evaluate_continuation_market_fallback_guard(order: Optional[dict], current_price: float) -> dict:
+    """Block stale or structurally degraded continuation ideas from chasing at market on expiry."""
+    safe_order = order if isinstance(order, dict) else {}
+    state = refresh_continuation_pending_fallback_state(safe_order)
+    trace = {
+        'continuation_fallback_protected': state['continuationFallbackProtected'],
+        'latest_suggested_entry_price': round(state['latestSuggestedEntryPrice'], 8),
+        'pending_entry_drift_pct': round(state['pendingEntryDriftPct'], 4),
+        'stale_threshold_pct': round(state['staleThresholdPct'], 4),
+        'barrier_verdict': str(safe_order.get('barrierVerdict', '') or ''),
+        'current_price': round(_coerce_float(current_price, 0.0), 8),
+    }
+    result = {
+        'blocked': False,
+        'reason_code': '',
+        'detail': '',
+        'trace': trace,
+    }
+    if not CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED or not state['continuationFallbackProtected']:
+        return result
+
+    reason_code = ''
+    barrier_verdict = str(safe_order.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE').upper()
+    if state['stale']:
+        reason_code = 'CONTINUATION_STALE_ENTRY_DRIFT'
+    elif barrier_verdict in ('CAUTION', 'BLOCK'):
+        reason_code = 'CONTINUATION_BARRIER_DETERIORATION'
+
+    if not reason_code:
+        return result
+
+    trace['reason_code'] = reason_code
+    result.update({
+        'blocked': True,
+        'reason_code': reason_code,
+        'detail': str(reason_code),
+        'trace': trace,
+    })
+    return result
+
+
+def evaluate_market_relation_pending_guard(order: Optional[dict]) -> dict:
+    """Block continuation expiry fallback when relation support materially deteriorates."""
+    safe_order = order if isinstance(order, dict) else {}
+    trace = {
+        'market_relation_enabled': bool(MARKET_RELATION_PENDING_GUARD_ENABLED),
+        'entry_market_relation_state': str(safe_order.get('marketRelationState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+        'current_market_relation_state': str(
+            safe_order.get('currentMarketRelationState', safe_order.get('marketRelationState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+        ),
+        'entry_altbtc_state': str(safe_order.get('altBtcState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+        'current_altbtc_state': str(
+            safe_order.get('currentAltBtcState', safe_order.get('altBtcState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+        ),
+        'entry_triangle_state': str(safe_order.get('triangleState', 'UNAVAILABLE') or 'UNAVAILABLE'),
+        'current_triangle_state': str(
+            safe_order.get('currentTriangleState', safe_order.get('triangleState', 'UNAVAILABLE')) or 'UNAVAILABLE'
+        ),
+        'entry_archetype': str(safe_order.get('entryArchetype', '') or '').lower(),
+    }
+    result = {
+        'blocked': False,
+        'reason_code': '',
+        'detail': '',
+        'trace': trace,
+    }
+    if not MARKET_RELATION_PENDING_GUARD_ENABLED:
+        return result
+
+    entry_archetype = trace['entry_archetype']
+    if entry_archetype != ENTRY_ARCHETYPE_CONTINUATION:
+        return result
+
+    side = str(safe_order.get('side', '') or '').upper()
+    entry_state = trace['entry_market_relation_state']
+    current_state = trace['current_market_relation_state']
+    current_triangle = trace['current_triangle_state']
+    entry_altbtc = trace['entry_altbtc_state']
+    current_altbtc = trace['current_altbtc_state']
+
+    reason_code = ''
+    if current_triangle == 'WIDE':
+        reason_code = 'MARKET_RELATION_TRIANGLE_WIDE'
+    elif entry_state == 'SUPPORTIVE' and current_state in ('CAUTION', 'BLOCK'):
+        reason_code = 'MARKET_RELATION_DETERIORATION'
+    elif side == 'LONG' and entry_altbtc == 'STRONG' and current_altbtc == 'WEAK':
+        reason_code = 'MARKET_RELATION_ALTBTC_FLIP'
+    elif side == 'SHORT' and entry_altbtc == 'WEAK' and current_altbtc == 'STRONG':
+        reason_code = 'MARKET_RELATION_ALTBTC_FLIP'
+
+    if not reason_code:
+        return result
+
+    trace['reason_code'] = reason_code
+    result.update(
+        {
+            'blocked': True,
+            'reason_code': reason_code,
+            'detail': str(reason_code),
+            'trace': trace,
+        }
+    )
+    return result
 
 
 def resolve_pending_rescue_score_min(min_confidence_score: float, configured_floor: float) -> float:
@@ -45225,6 +46262,21 @@ class PaperTradingEngine:
             'microstructure_cooldown_block': 0,
             'forecast_soft_rescues': 0,
             'forecast_band_counts': {},
+            'countertrend_barrier_block': 0,
+            'countertrend_pending_stale': 0,
+            'countertrend_fallback_blocked': 0,
+            'continuation_pending_stale': 0,
+            'continuation_fallback_blocked': 0,
+            'mtf_soft_override_blocked_coin_state': 0,
+            'market_relation_snapshot_ready': 0,
+            'market_relation_unavailable': 0,
+            'basis_supportive_count': 0,
+            'basis_extreme_crowd_count': 0,
+            'altbtc_strength_support_count': 0,
+            'triangle_residual_caution_count': 0,
+            'market_relation_overlay_applied': 0,
+            'market_relation_overlay_blocked': 0,
+            'market_relation_pending_blocked': 0,
         }
         # Settings log spam guard
         self._last_settings_log_ts = 0
@@ -46167,8 +47219,17 @@ class PaperTradingEngine:
             safe_signal.get('pendingPatienceBias', existing_pending.get('pendingPatienceBias', merged_snapshot.get('pendingPatienceBias', 1.0))),
             1.0,
         )
-        for key in _PENDING_REINFORCE_STRUCTURE_FIELDS + _PENDING_REINFORCE_BARRIER_FIELDS:
+        for key in _PENDING_REINFORCE_STRUCTURE_FIELDS + _PENDING_REINFORCE_BARRIER_FIELDS + _PENDING_REINFORCE_MARKET_RELATION_FIELDS:
             if key == 'patternConfidence' or key == 'barrierConfidence':
+                existing_pending[key] = _coerce_float(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, 0.0))),
+                    0.0,
+                )
+            elif key == 'marketRelationAvailable':
+                existing_pending[key] = bool(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, False)))
+                )
+            elif key in ('marketRelationConfidence', 'symbolBasisZScore', 'basisVelocityBps1m', 'triangleResidualBps'):
                 existing_pending[key] = _coerce_float(
                     safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, 0.0))),
                     0.0,
@@ -46196,6 +47257,23 @@ class PaperTradingEngine:
                 )
             else:
                 existing_pending[key] = safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, '')))
+        derived_countertrend_guard = evaluate_countertrend_barrier_guard(
+            existing_pending.get('entryArchetype', ''),
+            existing_pending,
+            hard_block_enabled=False,
+        )
+        if 'marketFallbackDisallowed' not in safe_signal:
+            existing_pending['marketFallbackDisallowed'] = bool(
+                derived_countertrend_guard.get('marketFallbackDisallowed', existing_pending.get('marketFallbackDisallowed', False))
+            )
+        if 'marketFallbackBlockReason' not in safe_signal:
+            existing_pending['marketFallbackBlockReason'] = str(
+                derived_countertrend_guard.get('marketFallbackBlockReason', existing_pending.get('marketFallbackBlockReason', '')) or ''
+            )
+        if 'countertrendFallbackProtected' not in safe_signal:
+            existing_pending['countertrendFallbackProtected'] = bool(
+                derived_countertrend_guard.get('countertrendFallbackProtected', existing_pending.get('countertrendFallbackProtected', False))
+            )
         if is_existing_reentry:
             existing_pending['isPostExitReentry'] = True
             for key in _PENDING_REINFORCE_REENTRY_FIELDS:
@@ -46244,8 +47322,14 @@ class PaperTradingEngine:
         existing_pending['runner_tp_tighten'] = _runner_controls['tp_tighten']
         existing_pending['runner_be_buffer_mult'] = _runner_controls['be_buffer_mult']
 
+        countertrend_pending_stale = False
+        continuation_pending_stale = False
         try:
             new_entry = float(safe_signal.get('entryPrice', existing_pending.get('entryPrice', price))) if safe_signal else float(existing_pending.get('entryPrice', price))
+            latest_suggested_entry_price = _coerce_float(
+                safe_signal.get('latestSuggestedEntryPrice', new_entry) if safe_signal else existing_pending.get('latestSuggestedEntryPrice', new_entry),
+                new_entry,
+            )
             old_entry = float(existing_pending.get('entryPrice', new_entry))
             blend_alpha = 0.35 if score_gap >= 0 else 0.20
             blended = old_entry * (1 - blend_alpha) + new_entry * blend_alpha
@@ -46293,6 +47377,45 @@ class PaperTradingEngine:
                 )
             else:
                 existing_pending['entryPrice'] = blended
+
+            countertrend_state = refresh_countertrend_pending_fallback_state(
+                existing_pending,
+                latest_suggested_entry_price,
+            )
+            countertrend_pending_stale = bool(
+                COUNTERTREND_MARKET_FALLBACK_GUARD_ENABLED
+                and countertrend_state.get('stale', False)
+            )
+            if countertrend_pending_stale:
+                self.pipeline_metrics['countertrend_pending_stale'] = (
+                    self.pipeline_metrics.get('countertrend_pending_stale', 0) + 1
+                )
+                logger.info(
+                    f"⚠️ COUNTERTREND_STALE_ENTRY_DRIFT: {trade_symbol} {side} "
+                    f"drift={countertrend_state.get('pendingEntryDriftPct', 0.0):.3f}% "
+                    f"threshold={countertrend_state.get('staleThresholdPct', 0.0):.3f}% "
+                    f"entry={existing_pending.get('entryPrice', 0.0):.6f} "
+                    f"latest={countertrend_state.get('latestSuggestedEntryPrice', 0.0):.6f}"
+                )
+            continuation_state = refresh_continuation_pending_fallback_state(
+                existing_pending,
+                latest_suggested_entry_price,
+            )
+            continuation_pending_stale = bool(
+                CONTINUATION_MARKET_FALLBACK_GUARD_ENABLED
+                and continuation_state.get('stale', False)
+            )
+            if continuation_pending_stale:
+                self.pipeline_metrics['continuation_pending_stale'] = (
+                    self.pipeline_metrics.get('continuation_pending_stale', 0) + 1
+                )
+                logger.info(
+                    f"⚠️ CONTINUATION_STALE_ENTRY_DRIFT: {trade_symbol} {side} "
+                    f"drift={continuation_state.get('pendingEntryDriftPct', 0.0):.3f}% "
+                    f"threshold={continuation_state.get('staleThresholdPct', 0.0):.3f}% "
+                    f"entry={existing_pending.get('entryPrice', 0.0):.6f} "
+                    f"latest={continuation_state.get('latestSuggestedEntryPrice', 0.0):.6f}"
+                )
 
             try:
                 _entry_for_levels = float(existing_pending.get('entryPrice', blended))
@@ -46383,17 +47506,18 @@ class PaperTradingEngine:
         extend_sec = max(180, int(safe_signal.get('memoryExtensionSec', 0) if safe_signal else 0))
         reentry_expires_sec = int(existing_pending.get('postExitReentryExpiresSec', 0) or 0)
         if not is_confirmed:
-            if is_existing_reentry and reentry_expires_sec > 0:
-                created_at_ms = int(existing_pending.get('createdAt', now_ms) or now_ms)
-                existing_pending['expiresAt'] = min(
-                    int(existing_pending.get('expiresAt', created_at_ms + (reentry_expires_sec * 1000)) or (created_at_ms + (reentry_expires_sec * 1000))),
-                    created_at_ms + (reentry_expires_sec * 1000),
-                )
-            else:
-                existing_pending['expiresAt'] = max(
-                    int(existing_pending.get('expiresAt', now_ms)),
-                    now_ms + (extend_sec * 1000)
-                )
+            if not countertrend_pending_stale:
+                if is_existing_reentry and reentry_expires_sec > 0:
+                    created_at_ms = int(existing_pending.get('createdAt', now_ms) or now_ms)
+                    existing_pending['expiresAt'] = min(
+                        int(existing_pending.get('expiresAt', created_at_ms + (reentry_expires_sec * 1000)) or (created_at_ms + (reentry_expires_sec * 1000))),
+                        created_at_ms + (reentry_expires_sec * 1000),
+                    )
+                else:
+                    existing_pending['expiresAt'] = max(
+                        int(existing_pending.get('expiresAt', now_ms)),
+                        now_ms + (extend_sec * 1000)
+                    )
         confirm_after = int(existing_pending.get('confirmAfter', now_ms))
         if (not is_confirmed) and confirm_after > now_ms:
             remaining = confirm_after - now_ms
@@ -47467,6 +48591,7 @@ class PaperTradingEngine:
 
         _sig = signal if isinstance(signal, dict) else {}
         _entry_archetype = str(_sig.get('entryArchetype', '') or '').strip().lower()
+        _countertrend_guard = evaluate_countertrend_barrier_guard(_entry_archetype, _sig, hard_block_enabled=False)
         _reentry_entry_mode = str(_sig.get('postExitReentryEntryMode', '') or '')
         _reentry_pullback_pct_original = _safe_float(_sig.get('postExitReentryPullbackPctOriginal', pullback_pct), pullback_pct)
         _reentry_pullback_pct_applied = _safe_float(_sig.get('postExitReentryPullbackPctApplied', pullback_pct), pullback_pct)
@@ -47866,6 +48991,43 @@ class PaperTradingEngine:
             "supportiveDistancePct": _coerce_float(signal.get('supportiveDistancePct', 0.0) if signal else 0.0, 0.0),
             "barrierReason": signal.get('barrierReason', '') if signal else '',
             "barrierConfidence": _coerce_float(signal.get('barrierConfidence', 0.0) if signal else 0.0, 0.0),
+            "latestSuggestedEntryPrice": _coerce_float(
+                signal.get('latestSuggestedEntryPrice', signal.get('entryPrice', entry_price)) if signal else entry_price,
+                entry_price,
+            ),
+            "pendingEntryDriftPct": _coerce_float(signal.get('pendingEntryDriftPct', 0.0) if signal else 0.0, 0.0),
+            "marketFallbackDisallowed": bool(
+                signal.get('marketFallbackDisallowed', _countertrend_guard.get('marketFallbackDisallowed', False))
+            ) if signal else False,
+            "marketFallbackBlockReason": str(
+                signal.get('marketFallbackBlockReason', _countertrend_guard.get('marketFallbackBlockReason', ''))
+                if signal else ''
+            ),
+            "countertrendFallbackProtected": bool(
+                signal.get('countertrendFallbackProtected', _countertrend_guard.get('countertrendFallbackProtected', False))
+            ) if signal else False,
+            "marketRelationAvailable": bool(signal.get('marketRelationAvailable', False)) if signal else False,
+            "marketRelationState": str(signal.get('marketRelationState', 'UNAVAILABLE') if signal else 'UNAVAILABLE' or 'UNAVAILABLE'),
+            "marketRelationConfidence": _coerce_float(signal.get('marketRelationConfidence', 0.0) if signal else 0.0, 0.0),
+            "marketRelationSource": str(signal.get('marketRelationSource', '') if signal else '' or ''),
+            "marketRelationVersion": str(signal.get('marketRelationVersion', '') if signal else '' or ''),
+            "spotPrice": _coerce_float(signal.get('spotPrice', 0.0) if signal else 0.0, 0.0),
+            "perpPrice": _coerce_float(signal.get('perpPrice', entry_price) if signal else entry_price, entry_price),
+            "symbolBasisPct": _coerce_float(signal.get('symbolBasisPct', 0.0) if signal else 0.0, 0.0),
+            "symbolBasisZScore": _coerce_float(signal.get('symbolBasisZScore', 0.0) if signal else 0.0, 0.0),
+            "basisVelocityBps1m": _coerce_float(signal.get('basisVelocityBps1m', 0.0) if signal else 0.0, 0.0),
+            "basisBias": str(signal.get('basisBias', 'NEUTRAL') if signal else 'NEUTRAL' or 'NEUTRAL'),
+            "basisState": str(signal.get('basisState', 'UNAVAILABLE') if signal else 'UNAVAILABLE' or 'UNAVAILABLE'),
+            "altBtcSymbol": str(signal.get('altBtcSymbol', '') if signal else '' or ''),
+            "altBtcPrice": _coerce_float(signal.get('altBtcPrice', 0.0) if signal else 0.0, 0.0),
+            "altBtcRetPct1m": _coerce_float(signal.get('altBtcRetPct1m', 0.0) if signal else 0.0, 0.0),
+            "altBtcRetPct5m": _coerce_float(signal.get('altBtcRetPct5m', 0.0) if signal else 0.0, 0.0),
+            "altBtcRelStrengthPct": _coerce_float(signal.get('altBtcRelStrengthPct', 0.0) if signal else 0.0, 0.0),
+            "altBtcState": str(signal.get('altBtcState', 'UNAVAILABLE') if signal else 'UNAVAILABLE' or 'UNAVAILABLE'),
+            "triangleResidualBps": _coerce_float(signal.get('triangleResidualBps', 0.0) if signal else 0.0, 0.0),
+            "triangleState": str(signal.get('triangleState', 'UNAVAILABLE') if signal else 'UNAVAILABLE' or 'UNAVAILABLE'),
+            "crowdingSide": str(signal.get('crowdingSide', 'NEUTRAL') if signal else 'NEUTRAL' or 'NEUTRAL'),
+            "openInterestChangePct5m": _coerce_float(signal.get('openInterestChangePct5m', 0.0) if signal else 0.0, 0.0),
             "continuationFlowState": V3_CONTINUATION_NEUTRAL,
             "trailEntryMinMovePct": signal.get('trailEntryMinMovePct', 0.0) if signal else 0.0,
             "trailEntryMinRoiPct": signal.get('trailEntryMinRoiPct', 0.0) if signal else 0.0,
@@ -48235,6 +49397,155 @@ class PaperTradingEngine:
             # Check expiration first (with high-score market fallback for confirmed signals)
             if current_time > expires_at:
                 if is_confirmed and current_price and current_price > 0:
+                    countertrend_fallback_guard = evaluate_countertrend_market_fallback_guard(order, current_price)
+                    if countertrend_fallback_guard.get('blocked', False):
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
+                        order['marketFallbackBlockReason'] = countertrend_fallback_guard.get('reason_code', '')
+                        order['pendingEntryDriftPct'] = countertrend_fallback_guard.get('trace', {}).get(
+                            'pending_entry_drift_pct',
+                            order.get('pendingEntryDriftPct', 0.0),
+                        )
+                        order['latestSuggestedEntryPrice'] = countertrend_fallback_guard.get('trace', {}).get(
+                            'latest_suggested_entry_price',
+                            order.get('latestSuggestedEntryPrice', 0.0),
+                        )
+                        self.pipeline_metrics['pending_expired'] += 1
+                        self.pipeline_metrics['countertrend_fallback_blocked'] += 1
+                        self.set_pending_execution_feedback(
+                            order,
+                            f"PENDING__COUNTERTREND_FALLBACK_BLOCK:{countertrend_fallback_guard.get('reason_code', '')}",
+                        )
+                        _queue_pending_signal_state(
+                            order,
+                            stage=SIGNAL_STAGE_EXPIRED,
+                            decision='HARD_REJECT',
+                            decision_code='PENDING__COUNTERTREND_FALLBACK_BLOCK',
+                            decision_detail=countertrend_fallback_guard.get('detail', ''),
+                            accepted=True,
+                            executable=False,
+                            is_pending=False,
+                            trace={
+                                'entry_price': entry_price,
+                                'expires_at': expires_at,
+                                **countertrend_fallback_guard.get('trace', {}),
+                            },
+                        )
+                        self.add_log(
+                            f"⛔ COUNTERTREND FALLBACK BLOCKED: {side} {symbol} "
+                            f"reason={countertrend_fallback_guard.get('reason_code', '')}"
+                        )
+                        logger.info(
+                            f"⛔ PENDING__COUNTERTREND_FALLBACK_BLOCK: {side} {symbol} "
+                            f"reason={countertrend_fallback_guard.get('reason_code', '')} "
+                            f"trace={countertrend_fallback_guard.get('trace', {})}"
+                        )
+                        self._finalize_forecast_event(
+                            order['id'],
+                            'EXPIRED',
+                            0,
+                            'countertrend_market_fallback_block',
+                            current_time,
+                        )
+                        if PENDING_SM_V2_ENABLED:
+                            transition_pending_state(order, 'EXPIRED', 'countertrend_market_fallback_block', current_time)
+                        continue
+                    continuation_fallback_guard = evaluate_continuation_market_fallback_guard(order, current_price)
+                    if continuation_fallback_guard.get('blocked', False):
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
+                        order['pendingEntryDriftPct'] = continuation_fallback_guard.get('trace', {}).get(
+                            'pending_entry_drift_pct',
+                            order.get('pendingEntryDriftPct', 0.0),
+                        )
+                        order['latestSuggestedEntryPrice'] = continuation_fallback_guard.get('trace', {}).get(
+                            'latest_suggested_entry_price',
+                            order.get('latestSuggestedEntryPrice', 0.0),
+                        )
+                        self.pipeline_metrics['pending_expired'] += 1
+                        self.pipeline_metrics['continuation_fallback_blocked'] += 1
+                        self.set_pending_execution_feedback(
+                            order,
+                            f"PENDING__CONTINUATION_FALLBACK_BLOCK:{continuation_fallback_guard.get('reason_code', '')}",
+                        )
+                        _queue_pending_signal_state(
+                            order,
+                            stage=SIGNAL_STAGE_EXPIRED,
+                            decision='HARD_REJECT',
+                            decision_code='PENDING__CONTINUATION_FALLBACK_BLOCK',
+                            decision_detail=continuation_fallback_guard.get('detail', ''),
+                            accepted=True,
+                            executable=False,
+                            is_pending=False,
+                            trace={
+                                'entry_price': entry_price,
+                                'expires_at': expires_at,
+                                **continuation_fallback_guard.get('trace', {}),
+                            },
+                        )
+                        self.add_log(
+                            f"⛔ CONTINUATION FALLBACK BLOCKED: {side} {symbol} "
+                            f"reason={continuation_fallback_guard.get('reason_code', '')}"
+                        )
+                        logger.info(
+                            f"⛔ PENDING__CONTINUATION_FALLBACK_BLOCK: {side} {symbol} "
+                            f"reason={continuation_fallback_guard.get('reason_code', '')} "
+                            f"trace={continuation_fallback_guard.get('trace', {})}"
+                        )
+                        self._finalize_forecast_event(
+                            order['id'],
+                            'EXPIRED',
+                            0,
+                            'continuation_market_fallback_block',
+                            current_time,
+                        )
+                        if PENDING_SM_V2_ENABLED:
+                            transition_pending_state(order, 'EXPIRED', 'continuation_market_fallback_block', current_time)
+                        continue
+                    market_relation_guard = evaluate_market_relation_pending_guard(order)
+                    if market_relation_guard.get('blocked', False):
+                        if order in self.pending_orders:
+                            self.pending_orders.remove(order)
+                        self.pipeline_metrics['pending_expired'] += 1
+                        self.pipeline_metrics['market_relation_pending_blocked'] += 1
+                        self.set_pending_execution_feedback(
+                            order,
+                            f"PENDING__MARKET_RELATION_BLOCK:{market_relation_guard.get('reason_code', '')}",
+                        )
+                        _queue_pending_signal_state(
+                            order,
+                            stage=SIGNAL_STAGE_EXPIRED,
+                            decision='HARD_REJECT',
+                            decision_code='PENDING__MARKET_RELATION_BLOCK',
+                            decision_detail=market_relation_guard.get('detail', ''),
+                            accepted=True,
+                            executable=False,
+                            is_pending=False,
+                            trace={
+                                'entry_price': entry_price,
+                                'expires_at': expires_at,
+                                **market_relation_guard.get('trace', {}),
+                            },
+                        )
+                        self.add_log(
+                            f"⛔ MARKET RELATION BLOCKED: {side} {symbol} "
+                            f"reason={market_relation_guard.get('reason_code', '')}"
+                        )
+                        logger.info(
+                            f"⛔ PENDING__MARKET_RELATION_BLOCK: {side} {symbol} "
+                            f"reason={market_relation_guard.get('reason_code', '')} "
+                            f"trace={market_relation_guard.get('trace', {})}"
+                        )
+                        self._finalize_forecast_event(
+                            order['id'],
+                            'EXPIRED',
+                            0,
+                            'market_relation_fallback_block',
+                            current_time,
+                        )
+                        if PENDING_SM_V2_ENABLED:
+                            transition_pending_state(order, 'EXPIRED', 'market_relation_fallback_block', current_time)
+                        continue
                     if signal_score >= fb_min_score:
                         self.pipeline_metrics['market_fallback'] += 1
                         self.pipeline_metrics['fallback_on_expire'] += 1
@@ -54559,6 +55870,12 @@ post_exit_followthrough_memory = {}  # {symbol: {preferredSide, followthroughMod
 live_close_pending_positions = {}  # {symbol: {uiClosePending, uiCloseScheduledAt, ...}}
 market_structure_cache = {}
 coin_state_cache = {}
+market_relation_tracker = MarketRelationTracker(
+    refresh_interval_sec=30.0,
+    basis_supportive_z_min=BASIS_Z_SUPPORTIVE_MIN,
+    basis_extreme_z_min=BASIS_Z_EXTREME_MIN,
+    triangle_max_bps=TRIANGLE_RESIDUAL_MAX_BPS,
+)
 signal_event_buffer = deque(maxlen=2000)
 
 SIGNAL_STAGE_RAW = 'RAW_GENERATED'
@@ -58697,11 +60014,161 @@ class BacktestResult(BaseModel):
     stats: dict
 
 
+def _fetch_backtest_ohlcv_range(exchange, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> list:
+    """Fetch historical candles across the requested range with simple pagination."""
+    all_ohlcv = []
+    current_ts = int(start_ts or 0)
+    while current_ts < int(end_ts or 0):
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
+        if not ohlcv:
+            break
+        all_ohlcv.extend(ohlcv)
+        current_ts = int(ohlcv[-1][0]) + 1
+        if len(ohlcv) < 1000:
+            break
+    return [c for c in all_ohlcv if start_ts <= int(c[0]) <= end_ts]
+
+
+def _fetch_backtest_open_interest_change_series(
+    exchange,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    period: str = "5m",
+    limit: int = 500,
+) -> list[tuple[int, float]]:
+    """Fetch Binance futures OI history and convert it into 5m-ish change percentages."""
+    safe_symbol = str(symbol or "").upper().strip()
+    if not safe_symbol.endswith("USDT"):
+        return []
+
+    current_ts = int(start_ts or 0)
+    safe_end_ts = int(end_ts or 0)
+    safe_limit = max(1, min(int(limit or 500), 500))
+    series: list[tuple[int, float]] = []
+    last_oi: Optional[float] = None
+    seen_timestamps: set[int] = set()
+    guard_loops = 0
+
+    while current_ts < safe_end_ts and guard_loops < 256:
+        guard_loops += 1
+        query = (
+            "https://fapi.binance.com/futures/data/openInterestHist"
+            f"?symbol={safe_symbol}&period={period}&limit={safe_limit}"
+            f"&startTime={current_ts}&endTime={safe_end_ts}"
+        )
+        payload = exchange.fetch(query)
+        if not isinstance(payload, list) or not payload:
+            break
+
+        batch_advanced = False
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            ts_ms = int(_coerce_float(item.get("timestamp", 0.0), 0.0) or 0)
+            oi_value = _coerce_float(item.get("sumOpenInterest", item.get("openInterest", 0.0)), 0.0)
+            if ts_ms <= 0 or oi_value <= 0 or ts_ms in seen_timestamps:
+                continue
+            seen_timestamps.add(ts_ms)
+            oi_change_pct = 0.0
+            if last_oi and last_oi > 0:
+                oi_change_pct = ((oi_value - last_oi) / last_oi) * 100.0
+            series.append((ts_ms, round(oi_change_pct, 4)))
+            last_oi = oi_value
+            current_ts = max(current_ts, ts_ms + 1)
+            batch_advanced = True
+
+        if not batch_advanced or len(payload) < safe_limit:
+            break
+
+    return [row for row in series if start_ts <= int(row[0]) <= safe_end_ts]
+
+
+def _build_backtest_market_relation_inputs(
+    symbol: str,
+    timeframe: str,
+    start_ts: int,
+    end_ts: int,
+    perp_ohlcv: list,
+    *,
+    futures_exchange=None,
+) -> dict[int, dict]:
+    relation_needed = bool(
+        SYMBOL_BASIS_FEATURES_ENABLED
+        or ALTBTC_RELATIVE_STRENGTH_ENABLED
+        or TRIANGLE_RESIDUAL_FILTER_ENABLED
+        or MARKET_RELATION_OVERLAY_ENABLED
+        or MARKET_RELATION_PENDING_GUARD_ENABLED
+        or MARKET_RELATION_EXIT_TIGHTENING_ENABLED
+        or MARKET_RELATION_OPEN_INTEREST_ENABLED
+    )
+    safe_symbol = str(symbol or '').upper().strip()
+    if not relation_needed or not perp_ohlcv or not safe_symbol.endswith('USDT'):
+        return {}
+
+    base_asset = safe_symbol[:-4]
+    spot_symbol = safe_symbol.replace('USDT', '/USDT')
+    altbtc_symbol = f"{base_asset}/BTC" if base_asset and base_asset != 'BTC' else ''
+    btc_symbol = "BTC/USDT"
+    spot_exchange = ccxt_sync.binance({'enableRateLimit': True})
+    oi_change_series = []
+    try:
+        spot_ohlcv = _fetch_backtest_ohlcv_range(spot_exchange, spot_symbol, timeframe, start_ts, end_ts)
+    except Exception as exc:
+        logger.debug(f"Backtest relation spot fetch unavailable for {spot_symbol}: {exc}")
+        spot_ohlcv = []
+    try:
+        btc_ohlcv = _fetch_backtest_ohlcv_range(spot_exchange, btc_symbol, timeframe, start_ts, end_ts)
+    except Exception as exc:
+        logger.debug(f"Backtest relation BTC fetch unavailable: {exc}")
+        btc_ohlcv = []
+    altbtc_ohlcv = []
+    if altbtc_symbol:
+        try:
+            altbtc_ohlcv = _fetch_backtest_ohlcv_range(spot_exchange, altbtc_symbol, timeframe, start_ts, end_ts)
+        except Exception as exc:
+            logger.debug(f"Backtest relation ALTBTC fetch unavailable for {altbtc_symbol}: {exc}")
+            altbtc_ohlcv = []
+    if MARKET_RELATION_OPEN_INTEREST_ENABLED and futures_exchange is not None:
+        try:
+            oi_change_series = _fetch_backtest_open_interest_change_series(
+                futures_exchange,
+                safe_symbol,
+                start_ts,
+                end_ts,
+                period="5m",
+            )
+        except Exception as exc:
+            logger.debug(f"Backtest relation OI fetch unavailable for {safe_symbol}: {exc}")
+            oi_change_series = []
+    try:
+        return build_backtest_market_relation_snapshots(
+            safe_symbol,
+            perp_ohlcv=perp_ohlcv,
+            spot_ohlcv=spot_ohlcv,
+            btc_ohlcv=btc_ohlcv,
+            altbtc_ohlcv=altbtc_ohlcv,
+            open_interest_change_series=oi_change_series,
+            supportive_z_min=BASIS_Z_SUPPORTIVE_MIN,
+            extreme_z_min=BASIS_Z_EXTREME_MIN,
+            triangle_max_bps=TRIANGLE_RESIDUAL_MAX_BPS,
+        )
+    finally:
+        try:
+            spot_exchange.close()
+        except Exception:
+            pass
+
+
 def run_backtest_simulation(
     ohlcv_data: list,
     initial_balance: float,
     leverage: int,
-    risk_per_trade: float
+    risk_per_trade: float,
+    *,
+    symbol: str = "BTCUSDT",
+    market_relation_snapshots: Optional[Dict[int, dict]] = None,
 ) -> tuple:
     """
     Run backtest simulation on historical OHLCV data.
@@ -58853,6 +60320,10 @@ def run_backtest_simulation(
             'tp_atr': 3.0,
             'is_backtest': True  # Flag to skip adaptive threshold
         }
+        market_relation_snapshot = _apply_market_relation_context_to_payload(
+            {},
+            (market_relation_snapshots or {}).get(int(timestamp), _default_market_relation_context()),
+        )
             
         signal_dict = generator.generate_signal(
             hurst=hurst,
@@ -58863,11 +60334,14 @@ def run_backtest_simulation(
             vwap_zscore=vwap_zscore,
             htf_trend=htf_trend,
             leverage=leverage,
-            basis_pct=0.0,  # Backtest doesn't support Spot/Basis yet
+            basis_pct=_coerce_float(market_relation_snapshot.get('symbolBasisPct', 0.0), 0.0),
             whale_zscore=0.0,  # Backtest doesn't support Whale Flow yet
             spread_pct=simulated_spread_pct,  # Phase 29: Spread simulation
             volatility_ratio=volatility_ratio,  # Phase 29: Volatility ratio
-            coin_profile=coin_profile  # Phase 29: Coin profile
+            coin_profile=coin_profile,  # Phase 29: Coin profile
+            symbol=symbol,
+            funding_rate=_coerce_float(market_relation_snapshot.get('fundingRate', 0.0), 0.0),
+            market_relation_snapshot=market_relation_snapshot,
         )
         
 
@@ -59159,33 +60633,26 @@ async def run_backtest(request: BacktestRequest):
         
         # Fetch OHLCV data
         symbol = request.symbol.replace("USDT", "/USDT")
-        all_ohlcv = []
-        current_ts = start_ts
-        
-        while current_ts < end_ts:
-            logger.info(f"Fetching from {current_ts}...")
-            ohlcv = exchange.fetch_ohlcv(symbol, request.timeframe, since=current_ts, limit=1000)
-            if not ohlcv:
-                logger.warning("No data returned from fetch_ohlcv")
-                break
-            
-            logger.info(f"Fetched {len(ohlcv)} candles. First: {ohlcv[0][0]}, Last: {ohlcv[-1][0]}")
-            all_ohlcv.extend(ohlcv)
-            current_ts = ohlcv[-1][0] + 1
-            if len(ohlcv) < 1000:
-                break
-        
-        # Filter to date range
-        all_ohlcv = [c for c in all_ohlcv if start_ts <= c[0] <= end_ts]
+        all_ohlcv = _fetch_backtest_ohlcv_range(exchange, symbol, request.timeframe, start_ts, end_ts)
         
         logger.info(f"Total candles after filter: {len(all_ohlcv)}")
+        market_relation_snapshots = _build_backtest_market_relation_inputs(
+            request.symbol,
+            request.timeframe,
+            start_ts,
+            end_ts,
+            all_ohlcv,
+            futures_exchange=exchange,
+        )
         
         # Run simulation
         trades, equity_curve, stats = run_backtest_simulation(
             all_ohlcv,
             request.initialBalance,
             request.leverage,
-            request.riskPerTrade
+            request.riskPerTrade,
+            symbol=request.symbol,
+            market_relation_snapshots=market_relation_snapshots,
         )
         
         # Format price data for chart
@@ -59208,7 +60675,7 @@ async def run_backtest(request: BacktestRequest):
             "equityCurve": equity_curve[::max(1, len(equity_curve)//500)],
             "priceData": price_data,
             "stats": stats,
-            "fidelity": "approx_ohlcv",
+            "fidelity": "approx_ohlcv_relation" if market_relation_snapshots else "approx_ohlcv",
         }
         
     except Exception as e:

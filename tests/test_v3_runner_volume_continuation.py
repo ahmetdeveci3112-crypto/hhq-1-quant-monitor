@@ -297,6 +297,36 @@ def test_apply_v3_continuation_trail_overlay_widens_supporting_and_tightens_chop
     assert chop["chop_tighten_active"] is True
 
 
+def test_apply_v3_continuation_trail_overlay_tightens_when_market_relation_deteriorates(monkeypatch):
+    monkeypatch.setattr(main, "MARKET_RELATION_EXIT_TIGHTENING_ENABLED", True)
+    pos = _build_v3_position(
+        currentVolumeRatio=1.28,
+        currentObImbalanceTrend=2.8,
+        currentImbalance=1.0,
+        marketRelationState="SUPPORTIVE",
+        currentMarketRelationState="BLOCK",
+        altBtcState="STRONG",
+        currentAltBtcState="WEAK",
+        currentTriangleState="WIDE",
+        currentCrowdingSide="LONG",
+        currentOpenInterestChangePct5m=6.5,
+    )
+
+    tightened = main.apply_v3_continuation_trail_overlay(
+        pos,
+        current_price=100.30,
+        dynamic_trail_distance=1.0,
+        min_price_move_pct=0.8,
+        min_roi_pct=8.0,
+        threshold_mult=1.0,
+        current_roi_pct=2.5,
+    )
+
+    assert tightened["market_relation_tighten_active"] is True
+    assert tightened["trail_distance"] < 1.0
+    assert "MR_EXIT_TRIANGLE_WIDE" in tightened["market_relation_tighten_reason"]
+
+
 def test_compute_limited_market_override_plan_requires_guarded_continuation():
     eligible = main.compute_limited_market_override_plan(
         {

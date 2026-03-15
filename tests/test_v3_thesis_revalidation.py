@@ -173,6 +173,42 @@ def test_evaluate_v3_position_thesis_revalidation_fires_profit_hold_on_supportin
     assert pos["positionThesisState"] == main.POSITION_THESIS_PROFIT_CONTINUATION_HOLD
 
 
+def test_evaluate_v3_position_thesis_revalidation_blocks_profit_hold_when_market_relation_breaks(monkeypatch):
+    monkeypatch.setattr(main, "MARKET_RELATION_EXIT_TIGHTENING_ENABLED", True)
+    now_ts = time.time()
+    pos = _build_v3_position(
+        currentVolumeRatio=1.20,
+        currentObImbalanceTrend=2.5,
+        currentExecScore=81.0,
+        runnerContext=main.V3_RUNNER_CONTEXT_TREND,
+        runnerContextResolved=main.V3_RUNNER_CONTEXT_TREND,
+        baseRunnerContext=main.V3_RUNNER_CONTEXT_TREND,
+        entryArchetype=main.ENTRY_ARCHETYPE_CONTINUATION,
+        marketRelationState="SUPPORTIVE",
+        currentMarketRelationState="BLOCK",
+        altBtcState="STRONG",
+        currentAltBtcState="WEAK",
+        currentTriangleState="WIDE",
+        _profitContinuationHoldCandidateSinceTs=now_ts - 46.0,
+    )
+
+    result = main.evaluate_v3_position_thesis_revalidation(
+        pos,
+        current_price=100.35,
+        current_roi_pct=3.5,
+        profit_ladder=_supporting_profit_ladder(
+            profit_giveback_roi_pct=1.8,
+            profit_giveback_arm_roi_pct=1.2,
+            giveback_trail_ready=True,
+        ),
+        underwater_ctx=_sideways_underwater_ctx(state=main.V3_UNDERWATER_NEUTRAL),
+    )
+
+    assert result["fire_profit_hold"] is False
+    assert pos["marketRelationExitTightenActive"] is True
+    assert "MR_EXIT_TRIANGLE_WIDE" in pos["marketRelationExitTightenReason"]
+
+
 def test_evaluate_v3_position_thesis_revalidation_rejects_profit_hold_when_flow_fading():
     now_ts = time.time()
     pos = _build_v3_position(
