@@ -359,6 +359,41 @@ def test_open_position_uses_reversal_retest_pending_profile(monkeypatch):
     assert result["reversalRetestZoneConfidence"] > 0.5
 
 
+def test_open_position_uses_post_exit_exposure_reserve_on_max_exposure(monkeypatch):
+    trader = main.global_paper_trader
+    _configure_trader_for_open(monkeypatch, trader)
+    monkeypatch.setattr(trader, "positions", [{"symbol": "SOLUSDT", "side": "LONG", "sizeUsd": 15.0, "leverage": 5}])
+    monkeypatch.setattr(trader, "pending_orders", [])
+    monkeypatch.setattr(trader, "max_positions", 1)
+
+    signal = _build_post_exit_signal()
+    signal.update({
+        "symbol": "SAHARAUSDT",
+        "action": "SHORT",
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "runnerContextResolved": main.V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+        "postExitFollowthroughActive": True,
+        "postExitFollowthroughMode": main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+        "postExitPreferredSide": "SHORT",
+        "postExitPreferredEntryFamilies": [main.ENTRY_ARCHETYPE_CONTINUATION, main.ENTRY_ARCHETYPE_RECLAIM],
+        "postExitFollowthroughConfidence": 0.78,
+        "postExitWatchRegisterResult": "REGISTERED",
+        "postExitWatchRegisterReason": "REGISTER_OK",
+        "entryExecScore": 74.0,
+        "sizeMultiplier": 1.0,
+    })
+
+    result = asyncio.run(
+        trader.open_position("SHORT", 0.0245, 0.0003, signal, symbol="SAHARAUSDT")
+    )
+
+    assert result is not None
+    assert result["resultKind"] == main.PENDING_OPEN_RESULT_CREATED_PENDING
+    assert result["postExitExposureReserveUsed"] is True
+    assert result["postExitExposureReserveReason"] == "POST_EXIT_EXPOSURE_RESERVE"
+    assert result["sizeMultiplier"] <= main.V3_POST_EXIT_EXPOSURE_RESERVE_SIZE_MULT
+
+
 def test_gate_and_execute_bootstraps_position_runtime_state_from_pending(monkeypatch):
     trader = main.global_paper_trader
     _configure_trader_for_open(monkeypatch, trader)

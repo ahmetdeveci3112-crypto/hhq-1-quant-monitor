@@ -286,3 +286,83 @@ def test_maybe_defer_v3_profit_exit_arms_hold_and_resets_breach_counters(monkeyp
     assert pos["positionThesisState"] == main.POSITION_THESIS_PROFIT_CONTINUATION_HOLD
     assert pos["trailBreachCount"] == 0
     assert pos["slConfirmCount"] == 0
+
+
+def test_maybe_defer_v3_profit_exit_holds_wide_trail_fakeout_when_supportive(monkeypatch):
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    now_ts = time.time()
+    pos = _build_v3_position(
+        symbol="WIDEHOLDUSDT",
+        currentPrice=100.92,
+        trailingStop=100.90,
+        currentVolumeRatio=1.24,
+        currentIsVolumeSpike=False,
+        currentImbalance=1.8,
+        currentObImbalanceTrend=2.1,
+        currentExecScore=82.0,
+        patternBias="CONTINUATION",
+        patternConfidence=0.78,
+        breakoutRetestState="BULL_RETEST_HOLD",
+        transitionState="BREAKOUT_RETEST",
+        setupState15m="CONTINUATION",
+        preferredExitProfile=main.V3_EXIT_PROFILE_TREND_EXPANSION,
+        runtimeStateDriftState="TREND_SUPPORT",
+        trailBreachCount=2,
+        trailBreachStartTime=now_ts - 10.0,
+    )
+
+    deferred = main.maybe_defer_v3_profit_exit(
+        pos,
+        current_price=100.92,
+        profit_ladder=_supporting_profit_ladder(
+            profit_phase="WIDE_TRAIL",
+            profit_peak_roi_pct=12.0,
+            profit_giveback_roi_pct=7.8,
+            profit_giveback_arm_roi_pct=6.4,
+            giveback_trail_ready=True,
+        ),
+        note="test_wide_fakeout",
+    )
+
+    assert deferred is True
+    assert pos["lastExitDecision"] == "TRAIL_WIDE_FAKEOUT_HOLD"
+    assert pos["trailFakeoutGuardArmed"] is True
+    assert pos["trailFakeoutGuardState"] == "HOLD_FAKEOUT_WINDOW"
+    assert pos["trailBreachCount"] == 0
+
+
+def test_maybe_defer_v3_profit_exit_does_not_hold_wide_trail_on_adverse_transition(monkeypatch):
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    pos = _build_v3_position(
+        symbol="WIDEEXITUSDT",
+        currentPrice=100.92,
+        trailingStop=100.90,
+        currentVolumeRatio=1.24,
+        currentIsVolumeSpike=False,
+        currentImbalance=1.8,
+        currentObImbalanceTrend=-12.4,
+        currentExecScore=82.0,
+        patternBias="CONTINUATION",
+        patternConfidence=0.78,
+        breakoutRetestState="FAILED_BREAKOUT",
+        transitionState="FAILED_BREAKOUT",
+        setupState15m="CONTINUATION",
+        preferredExitProfile=main.V3_EXIT_PROFILE_TREND_EXPANSION,
+    )
+
+    deferred = main.maybe_defer_v3_profit_exit(
+        pos,
+        current_price=100.92,
+        profit_ladder=_supporting_profit_ladder(
+            profit_phase="WIDE_TRAIL",
+            profit_peak_roi_pct=12.0,
+            profit_giveback_roi_pct=7.8,
+            profit_giveback_arm_roi_pct=6.4,
+            giveback_trail_ready=True,
+        ),
+        note="test_wide_exit",
+    )
+
+    assert deferred is False
+    assert pos.get("trailFakeoutGuardArmed", False) is False
+    assert pos["trailFakeoutGuardState"] == "ALLOW_EXIT"

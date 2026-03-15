@@ -3610,6 +3610,10 @@ class LiveBinanceTrader:
         self.last_order_error = None
         self.last_balance = 0.0
         self.last_positions = []
+        self.last_positions_observed_at = 0.0
+        self.last_positions_source_age_sec = 0.0
+        self.last_positions_is_stale = False
+        self.last_positions_authority = 'bootstrap'
         self.last_sync_time = 0
         self.trading_mode = os.environ.get('TRADING_MODE', 'paper')  # paper, live
         # Phase 146: Persistent trailing state for live positions
@@ -3655,6 +3659,25 @@ class LiveBinanceTrader:
         # P0 orphan fix: recently-closed symbols for sweep fallback (TTL 30min)
         self._recently_closed_symbols: deque = deque(maxlen=200)  # (symbol, ts_ms)
         logger.info(f"📊 LiveBinanceTrader initialized | Mode: {self.trading_mode}")
+
+    def remember_positions_snapshot(
+        self,
+        positions: list,
+        *,
+        authority: str,
+        observed_at: Optional[float] = None,
+        is_stale: bool = False,
+        source_age_sec: Optional[float] = None,
+    ) -> list:
+        safe_positions = dedupe_position_snapshots(list(positions or []))
+        observed_ts = float(observed_at or time.time())
+        age_sec = max(0.0, _coerce_float(source_age_sec, 0.0))
+        self.last_positions = safe_positions
+        self.last_positions_observed_at = observed_ts
+        self.last_positions_source_age_sec = age_sec
+        self.last_positions_is_stale = bool(is_stale)
+        self.last_positions_authority = str(authority or 'unknown')
+        return safe_positions
     
     async def initialize(self):
         """Binance bağlantısını başlat."""
@@ -3843,6 +3866,24 @@ class LiveBinanceTrader:
                             'currentPrice': mark_price,
                             'openTime': open_time_val
                         }))
+                    elif bp.get('uiClosePending'):
+                        merged['uiClosePending'] = True
+                        merged['uiClosePendingReason'] = bp.get('uiClosePendingReason', '')
+                        merged['uiCloseScheduledAt'] = bp.get('uiCloseScheduledAt', 0.0)
+                        merged.setdefault('stopLoss', bp.get('stopLoss', 0.0))
+                        merged.setdefault('takeProfit', bp.get('takeProfit', 0.0))
+                        merged.setdefault('trailingStop', bp.get('trailingStop', bp.get('stopLoss', 0.0)))
+                        merged.setdefault('atr', bp.get('atr', 0.0))
+                        merged.setdefault('runtimeTacticalStopPrice', bp.get('runtimeTacticalStopPrice', bp.get('stopLoss', 0.0)))
+                        merged.setdefault('runtimeTacticalStopRoiPct', bp.get('runtimeTacticalStopRoiPct', bp.get('runtimeStopRoiPct', 0.0)))
+                        merged.setdefault('runtimeEmergencyFloorPrice', bp.get('runtimeEmergencyFloorPrice', 0.0))
+                        merged.setdefault('runtimeEmergencyFloorRoiPct', bp.get('runtimeEmergencyFloorRoiPct', 0.0))
+                        merged.setdefault('runtimeExchangeProtectiveMode', bp.get('runtimeExchangeProtectiveMode', V3_EXCHANGE_PROTECTIVE_MODE_EMERGENCY))
+                        merged.setdefault('runtimeLossProtectionAuthority', bp.get('runtimeLossProtectionAuthority', 'ENTRY_STOP_HARD'))
+                        merged.setdefault('runtimeExchangeProtectionAuthority', bp.get('runtimeExchangeProtectionAuthority', 'EMERGENCY_FLOOR'))
+                        merged.setdefault('runtimeExchangeProtectionRole', bp.get('runtimeExchangeProtectionRole', 'LOSS_FAILSAFE'))
+                        merged.setdefault('runtimeExchangeProtectiveStopPrice', bp.get('runtimeExchangeProtectiveStopPrice', bp.get('runtimeEmergencyFloorPrice', 0.0)))
+                        merged.setdefault('runtimeExchangeProtectiveStopRoiPct', bp.get('runtimeExchangeProtectiveStopRoiPct', bp.get('runtimeEmergencyFloorRoiPct', 0.0)))
                     else:
                         # Track symbols with 0 positionAmt
                         if symbol.endswith('USDT'):
@@ -4271,12 +4312,21 @@ class LiveBinanceTrader:
                 self.pending_closes = []
             
             logger.info(f"get_positions returning {len(result)} active positions")
-            self.last_positions = result
-            return result
+            return self.remember_positions_snapshot(
+                result,
+                authority='binance_api',
+                observed_at=time.time(),
+                is_stale=False,
+                source_age_sec=0.0,
+            )
             
         except Exception as e:
             logger.error(f"Positions fetch error: {e}")
-            return self.last_positions
+            fallback_age = max(0.0, time.time() - float(getattr(self, 'last_positions_observed_at', 0.0) or 0.0))
+            self.last_positions_is_stale = True
+            self.last_positions_source_age_sec = fallback_age
+            self.last_positions_authority = 'binance_api_stale'
+            return list(self.last_positions)
     
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Kaldıraç ayarla."""
@@ -7666,8 +7716,14 @@ async def binance_position_sync_loop():
                 binance_positions = await live_binance_trader.get_positions(fast=True)
                 logger.info(f"📊 Binance sync: {len(binance_positions)} positions from API")
                 
-                # Store for fallback access
-                live_binance_trader.last_positions = binance_positions
+                # Store for fallback access with freshness metadata.
+                live_binance_trader.remember_positions_snapshot(
+                    binance_positions,
+                    authority='binance_sync',
+                    observed_at=time.time(),
+                    is_stale=False,
+                    source_age_sec=0.0,
+                )
                 
                 # ================================================================
                 # PHASE 228: Fetch bookTicker for real bid-ask spread
@@ -8300,6 +8356,7 @@ async def binance_position_sync_loop():
                             global_paper_trader.stats['losingTrades'] += 1
                     
                     logger.info(f"📥 CLOSE RECORDED: {pos.get('side')} {symbol} | PnL: ${trade.get('pnl', 0):.2f} | Reason: {trade.get('reason')}")
+                    _clear_live_close_pending(symbol, resolution_reason='SYNC_CONFIRMED')
                     
                     # Patch C: Feed PostTradeTracker from sync close path (idempotent)
                     try:
@@ -13733,6 +13790,17 @@ def compute_signal_opportunity_priority(signal: dict) -> float:
         priority += 1.5
     elif expectancy_band == DECISION_EXPECTANCY_BAND_WEAK:
         priority -= 3.0
+    if bool(safe_signal.get('postExitFollowthroughActive', False)):
+        preferred_side = str(safe_signal.get('postExitPreferredSide', '') or '').upper()
+        action = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+        entry_arch = str(safe_signal.get('entryArchetype', '') or '').lower()
+        preferred_families = _normalize_post_exit_followthrough_families(
+            safe_signal.get('postExitPreferredEntryFamilies', []),
+        )
+        if action in ('LONG', 'SHORT') and action == preferred_side and (not preferred_families or entry_arch in preferred_families):
+            priority += 4.0
+        elif entry_arch == ENTRY_ARCHETYPE_RECLAIM and bool(safe_signal.get('oppositeReclaimSuppressed', False)):
+            priority -= 5.0
     if allocator_priority != 0:
         priority = (priority * 0.75) + (allocator_priority * 0.25)
     return round(priority, 2)
@@ -14830,6 +14898,11 @@ V3_THESIS_OBI_ALIGN_THRESHOLD = 2.0
 V3_FAKEOUT_RECLAIM_HOLD_WINDOW_SEC = 120.0
 V3_FAKEOUT_RECLAIM_RECOVERY_PERSISTENCE_SEC = 30.0
 V3_FAKEOUT_RECLAIM_INVALIDATION_ROI_DELTA_PCT = 2.0
+V3_TRAIL_WIDE_FAKEOUT_HOLD_WINDOW_SEC = 45.0
+V3_TRAIL_WIDE_FAKEOUT_MIN_ROI_PCT = 8.0
+V3_TRAIL_WIDE_FAKEOUT_PERSIST_TICKS = 3
+LIVE_POSITIONS_STALE_TTL_SEC = 20.0
+LIVE_CLOSE_PENDING_UI_TTL_SEC = 120.0
 V3_AGED_PROFIT_GUARD_MODE = str(os.environ.get('V3_AGED_PROFIT_GUARD_MODE', 'apply') or 'apply').strip().lower()
 AGED_PROFIT_GUARD_STATE_IDLE = "IDLE"
 AGED_PROFIT_GUARD_STATE_WATCHING = "WATCHING"
@@ -14869,6 +14942,23 @@ V3_POST_EXIT_REENTRY_OPPOSITE_SIGNAL_SCORE_FLOOR = 72.0
 V3_POST_EXIT_REENTRY_OPPOSITE_EXEC_SCORE_FLOOR = 58.0
 V3_POST_EXIT_REENTRY_OPPOSITE_VOLUME_FLOOR = 1.05
 V3_POST_EXIT_REENTRY_RECENT_WINDOW_SEC = 3600.0
+V3_POST_EXIT_FOLLOWTHROUGH_MODE = str(os.environ.get('V3_POST_EXIT_FOLLOWTHROUGH_MODE', 'apply') or 'apply').strip().lower()
+V3_POST_EXIT_FOLLOWTHROUGH_WINDOW_SEC = float(os.environ.get('V3_POST_EXIT_FOLLOWTHROUGH_WINDOW_SEC', '720') or 720.0)
+V3_POST_EXIT_FOLLOWTHROUGH_FALLBACK_INTENT_WINDOW_SEC = float(os.environ.get('V3_POST_EXIT_FOLLOWTHROUGH_FALLBACK_INTENT_WINDOW_SEC', '180') or 180.0)
+V3_POST_EXIT_FOLLOWTHROUGH_INTENT_BOOST = float(os.environ.get('V3_POST_EXIT_FOLLOWTHROUGH_INTENT_BOOST', '8') or 8.0)
+V3_POST_EXIT_THIN_BOOK_GRACE_MODE = str(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_MODE', 'apply') or 'apply').strip().lower()
+V3_POST_EXIT_THIN_BOOK_GRACE_MAX_SPREAD = float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_MAX_SPREAD', '0.16') or 0.16)
+V3_POST_EXIT_THIN_BOOK_GRACE_MIN_EXEC_SCORE = float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_MIN_EXEC_SCORE', '64') or 64.0)
+V3_POST_EXIT_THIN_BOOK_GRACE_MAX_IMPACT_PCT = float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_MAX_IMPACT_PCT', '0.010') or 0.010)
+V3_POST_EXIT_THIN_BOOK_GRACE_NOTIONAL_DEPTH_RATIO = float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_NOTIONAL_DEPTH_RATIO', '0.010') or 0.010)
+V3_POST_EXIT_THIN_BOOK_GRACE_SIZE_MULT = float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_SIZE_MULT', '0.72') or 0.72)
+V3_POST_EXIT_THIN_BOOK_GRACE_LEVERAGE_CAP = int(float(os.environ.get('V3_POST_EXIT_THIN_BOOK_GRACE_LEVERAGE_CAP', '8') or 8))
+V3_POST_EXIT_EXPOSURE_RESERVE_MODE = str(os.environ.get('V3_POST_EXIT_EXPOSURE_RESERVE_MODE', 'apply') or 'apply').strip().lower()
+V3_POST_EXIT_EXPOSURE_RESERVE_SLOTS = int(float(os.environ.get('V3_POST_EXIT_EXPOSURE_RESERVE_SLOTS', '1') or 1))
+V3_POST_EXIT_EXPOSURE_RESERVE_MIN_SCORE = float(os.environ.get('V3_POST_EXIT_EXPOSURE_RESERVE_MIN_SCORE', '78') or 78.0)
+V3_POST_EXIT_EXPOSURE_RESERVE_MIN_EXEC_SCORE = float(os.environ.get('V3_POST_EXIT_EXPOSURE_RESERVE_MIN_EXEC_SCORE', '66') or 66.0)
+V3_POST_EXIT_EXPOSURE_RESERVE_SIZE_MULT = float(os.environ.get('V3_POST_EXIT_EXPOSURE_RESERVE_SIZE_MULT', '0.60') or 0.60)
+V3_OPPOSITE_RECLAIM_SUPPRESSION_MODE = str(os.environ.get('V3_OPPOSITE_RECLAIM_SUPPRESSION_MODE', 'apply') or 'apply').strip().lower()
 POST_EXIT_RESOLUTION_MODE_SAME_SIDE = "SAME_SIDE_CONTINUATION"
 POST_EXIT_RESOLUTION_MODE_OPPOSITE = "OPPOSITE_REVERSAL"
 POST_EXIT_RESOLUTION_MODE_NONE = "NONE"
@@ -14897,6 +14987,9 @@ V3_POST_EXIT_REENTRY_REASON_ALLOWLIST = (
     "SIDEWAYS_RECLAIM_CLOSE",
     "RECLAIM_BE_CLOSE",
     "PROFIT_GIVEBACK_EXIT",
+    "TRAIL_WIDE_EXIT",
+    "TRAIL_EXIT",
+    "FAILED_CONTINUATION",
 )
 V3_POST_EXIT_REENTRY_RUNNER_CONTEXT_ALLOWLIST = (
     V3_RUNNER_CONTEXT_COUNTER,
@@ -15264,6 +15357,20 @@ _PENDING_REINFORCE_REVERSAL_FIELDS = (
     'reversalRetestTouchReady',
     'reversalRetestZoneConfidence',
 )
+_PENDING_REINFORCE_FOLLOWTHROUGH_FIELDS = (
+    'postExitFollowthroughActive',
+    'postExitFollowthroughMode',
+    'postExitPreferredSide',
+    'postExitPreferredEntryFamilies',
+    'postExitFollowthroughConfidence',
+    'postExitFollowthroughAgeSec',
+    'postExitWatchRegisterResult',
+    'postExitWatchRegisterReason',
+    'postExitThinBookGraceUsed',
+    'postExitExposureReserveUsed',
+    'postExitExposureReserveReason',
+    'oppositeReclaimSuppressed',
+)
 
 
 def _with_open_result_kind(payload: Optional[dict], result_kind: str) -> Optional[dict]:
@@ -15559,6 +15666,9 @@ def _record_post_exit_reentry_watch_event(watch: dict, reason: str) -> None:
     if not isinstance(watch, dict):
         return
     significant_reasons = {
+        'register_attempt',
+        'registered',
+        'skipped',
         'armed',
         'candidate',
         'confirmed',
@@ -15567,6 +15677,8 @@ def _record_post_exit_reentry_watch_event(watch: dict, reason: str) -> None:
         'dispatch_rejected',
         'superseded',
         'replaced',
+        'triggered_same_side',
+        'triggered_opposite',
     }
     safe_reason = str(reason or '').strip().lower()
     if safe_reason not in significant_reasons:
@@ -15587,6 +15699,602 @@ def _record_post_exit_reentry_watch_event(watch: dict, reason: str) -> None:
         'reentryTriggered': bool(watch.get('reentryTriggered', False)),
         'cancelReason': str(watch.get('cancelReason', '') or ''),
     })
+
+
+def _is_v3_post_exit_followthrough_enabled() -> bool:
+    return str(V3_POST_EXIT_FOLLOWTHROUGH_MODE or 'apply').strip().lower() != 'off'
+
+
+def _prune_post_exit_followthrough_memory(now_ts: Optional[float] = None) -> None:
+    memory = globals().get('post_exit_followthrough_memory')
+    if not isinstance(memory, dict):
+        return
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    cutoff_ts = now_ts - max(60.0, float(V3_POST_EXIT_FOLLOWTHROUGH_WINDOW_SEC))
+    for symbol, item in list(memory.items()):
+        if not isinstance(item, dict):
+            memory.pop(symbol, None)
+            continue
+        close_ts = _coerce_float(item.get('closeTs', 0.0), 0.0)
+        if bool(item.get('consumed', False)) or bool(item.get('expired', False)) or close_ts <= 0 or close_ts < cutoff_ts:
+            memory.pop(symbol, None)
+
+
+def _normalize_post_exit_followthrough_families(items: Optional[Sequence]) -> list[str]:
+    families = []
+    for item in items or []:
+        safe_item = str(item or '').strip().lower()
+        if safe_item and safe_item not in families:
+            families.append(safe_item)
+    return families
+
+
+def _side_matches_state_bias(
+    side: str,
+    *,
+    dominant_side: str = '',
+    structure_trend: str = '',
+    swing_state: str = '',
+) -> bool:
+    safe_side = str(side or '').upper().strip()
+    safe_dominant = str(dominant_side or '').upper().strip()
+    safe_structure = str(structure_trend or '').upper().strip()
+    safe_swing = str(swing_state or '').upper().strip()
+    if safe_side not in ('LONG', 'SHORT'):
+        return False
+    if safe_dominant in ('LONG', 'SHORT'):
+        return safe_dominant == safe_side
+    if safe_side == 'LONG':
+        return safe_structure == 'UP' or safe_swing == 'HH_HL'
+    return safe_structure == 'DOWN' or safe_swing == 'LH_LL'
+
+
+def _post_exit_transition_supports_side(side: str, transition_state: str) -> bool:
+    safe_side = str(side or '').upper().strip()
+    safe_transition = str(transition_state or 'NONE').upper().strip()
+    if safe_side == 'LONG':
+        return safe_transition in ('BREAKOUT_RETEST', 'RECLAIMING', 'FAILED_BREAKDOWN')
+    if safe_side == 'SHORT':
+        return safe_transition in ('BREAKOUT_RETEST', 'RECLAIMING', 'FAILED_BREAKOUT')
+    return False
+
+
+def _post_exit_followthrough_supports_payload(payload: dict, side: str, preferred_families: Optional[Sequence] = None) -> bool:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_side = str(side or '').upper().strip()
+    if safe_side not in ('LONG', 'SHORT'):
+        return False
+    dominant_side = str(safe_payload.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    structure_trend = str(safe_payload.get('structureTrend', 'MIXED') or 'MIXED').upper()
+    swing_state = str(safe_payload.get('swingState', 'MIXED') or 'MIXED').upper()
+    transition_state = str(safe_payload.get('transitionState', 'NONE') or 'NONE').upper()
+    pattern_bias = str(safe_payload.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    breakout_retest_state = str(safe_payload.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    state_confidence = _coerce_float(safe_payload.get('stateConfidence', 0.0), 0.0)
+    supportive_state = _side_matches_state_bias(
+        safe_side,
+        dominant_side=dominant_side,
+        structure_trend=structure_trend,
+        swing_state=swing_state,
+    )
+    supportive_transition = _post_exit_transition_supports_side(safe_side, transition_state)
+    supportive_retest = _structure_retest_matches_side(safe_payload, safe_side) or (
+        safe_side == 'LONG' and breakout_retest_state == 'FAILED_BREAKDOWN'
+    ) or (
+        safe_side == 'SHORT' and breakout_retest_state == 'FAILED_BREAKOUT'
+    )
+    continuation_support = pattern_bias == 'CONTINUATION'
+    if preferred_families:
+        families = _normalize_post_exit_followthrough_families(preferred_families)
+        if ENTRY_ARCHETYPE_CONTINUATION in families and continuation_support and (supportive_state or supportive_transition or supportive_retest):
+            return True
+        if ENTRY_ARCHETYPE_RECLAIM in families and (supportive_retest or supportive_transition):
+            return True
+        if ENTRY_ARCHETYPE_REVERSAL_RETEST in families and (supportive_transition or supportive_retest):
+            return True
+    return bool((supportive_state and state_confidence >= 0.45) or supportive_transition or supportive_retest or continuation_support)
+
+
+def _should_suppress_opposite_reclaim_from_followthrough(payload: dict, preferred_side: str) -> bool:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    if str(V3_OPPOSITE_RECLAIM_SUPPRESSION_MODE or 'apply').strip().lower() == 'off':
+        return False
+    safe_preferred = str(preferred_side or '').upper().strip()
+    if safe_preferred not in ('LONG', 'SHORT'):
+        return False
+    dominant_side = str(safe_payload.get('dominantSide', 'NEUTRAL') or 'NEUTRAL').upper()
+    pattern_bias = str(safe_payload.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper()
+    transition_state = str(safe_payload.get('transitionState', 'NONE') or 'NONE').upper()
+    breakout_retest_state = str(safe_payload.get('breakoutRetestState', 'NONE') or 'NONE').upper()
+    state_confidence = _coerce_float(safe_payload.get('stateConfidence', 0.0), 0.0)
+    supportive_transition = _post_exit_transition_supports_side(safe_preferred, transition_state)
+    supportive_retest = _structure_retest_matches_side(safe_payload, safe_preferred)
+    if safe_preferred == 'LONG' and breakout_retest_state == 'FAILED_BREAKDOWN':
+        supportive_retest = True
+    if safe_preferred == 'SHORT' and breakout_retest_state == 'FAILED_BREAKOUT':
+        supportive_retest = True
+    adverse_transition = transition_state in ('FAILED_BREAKDOWN', 'FAILED_BREAKOUT') and not supportive_transition
+    if adverse_transition:
+        return False
+    if dominant_side in ('LONG', 'SHORT') and dominant_side != safe_preferred and state_confidence >= 0.55:
+        return False
+    if pattern_bias == 'CONTINUATION' and (supportive_transition or supportive_retest):
+        return True
+    if _side_matches_state_bias(
+        safe_preferred,
+        dominant_side=dominant_side,
+        structure_trend=str(safe_payload.get('structureTrend', 'MIXED') or 'MIXED'),
+        swing_state=str(safe_payload.get('swingState', 'MIXED') or 'MIXED'),
+    ) and state_confidence >= 0.55 and supportive_transition:
+        return True
+    return False
+
+
+def _build_post_exit_followthrough_seed(
+    *,
+    symbol: str,
+    close_reason: str,
+    origin_side: str,
+    close_ts: float,
+    close_price: float,
+    mode: str,
+    preferred_side: str,
+    preferred_entry_families: Optional[Sequence] = None,
+    confidence: float = 0.0,
+    coin_state_snapshot: Optional[dict] = None,
+    structure_snapshot: Optional[dict] = None,
+    watch_registration_result: str = '',
+    watch_registration_reason: str = '',
+    watch_state: str = '',
+    source: str = 'CLOSE',
+    consumed: bool = False,
+) -> dict:
+    return {
+        'symbol': str(symbol or '').upper(),
+        'originSide': str(origin_side or '').upper(),
+        'closeReason': str(close_reason or '').upper(),
+        'closeTs': _coerce_float(close_ts, 0.0),
+        'closePrice': _coerce_float(close_price, 0.0),
+        'followthroughMode': str(mode or POST_EXIT_RESOLUTION_MODE_NONE).upper(),
+        'preferredSide': str(preferred_side or '').upper(),
+        'preferredEntryFamilies': _normalize_post_exit_followthrough_families(preferred_entry_families),
+        'followthroughConfidence': round(_clamp(_coerce_float(confidence, 0.0), 0.0, 1.0), 4),
+        'followthroughWindowSec': int(max(60.0, float(V3_POST_EXIT_FOLLOWTHROUGH_WINDOW_SEC))),
+        'coinStateSnapshot': coin_state_snapshot if isinstance(coin_state_snapshot, dict) else {},
+        'structureSnapshot': structure_snapshot if isinstance(structure_snapshot, dict) else {},
+        'watchRegistrationResult': str(watch_registration_result or '').upper(),
+        'watchRegistrationReason': str(watch_registration_reason or '').upper(),
+        'watchState': str(watch_state or '').upper(),
+        'source': str(source or 'CLOSE').upper(),
+        'consumed': bool(consumed),
+        'expired': False,
+        'usedTs': 0.0,
+    }
+
+
+def _seed_post_exit_followthrough_memory(
+    pos: dict,
+    trade: dict,
+    *,
+    original_reason: str = '',
+    normalized_reason: str = '',
+    watch_registration: Optional[dict] = None,
+    watch: Optional[dict] = None,
+) -> dict:
+    if not _is_v3_post_exit_followthrough_enabled():
+        return {}
+    safe_pos = pos if isinstance(pos, dict) else {}
+    safe_trade = trade if isinstance(trade, dict) else {}
+    symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
+    if not symbol:
+        return {}
+    reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
+    origin_side = str(safe_pos.get('side', safe_trade.get('side', '')) or '').upper()
+    if origin_side not in ('LONG', 'SHORT'):
+        return {}
+    mode = POST_EXIT_RESOLUTION_MODE_NONE
+    preferred_side = ''
+    preferred_families: list[str] = []
+    confidence = 0.0
+    if reason_core in ('TRAIL_WIDE_EXIT', 'TRAIL_EXIT', 'PROFIT_GIVEBACK_EXIT', 'FAILED_CONTINUATION'):
+        mode = POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+        preferred_side = origin_side
+        preferred_families = [ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM, ENTRY_ARCHETYPE_REVERSAL_RETEST]
+        confidence = 0.72
+    elif reason_core in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE', 'FAILED_THESIS'):
+        mode = POST_EXIT_RESOLUTION_MODE_OPPOSITE
+        preferred_side = _opposite_side(origin_side)
+        preferred_families = [ENTRY_ARCHETYPE_REVERSAL_RETEST, ENTRY_ARCHETYPE_RECLAIM]
+        confidence = 0.68
+    if mode == POST_EXIT_RESOLUTION_MODE_NONE or preferred_side not in ('LONG', 'SHORT'):
+        return {}
+    coin_state_snapshot = {
+        'microState5m': str(safe_pos.get('microState5m', 'RANGE') or 'RANGE'),
+        'setupState15m': str(safe_pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL'),
+        'backdropState1h': str(safe_pos.get('backdropState1h', 'MIXED') or 'MIXED'),
+        'macroState4h': str(safe_pos.get('macroState4h', 'MIXED') or 'MIXED'),
+        'transitionState': str(safe_pos.get('transitionState', 'NONE') or 'NONE'),
+        'dominantSide': str(safe_pos.get('dominantSide', 'NEUTRAL') or 'NEUTRAL'),
+        'stateConfidence': round(_coerce_float(safe_pos.get('stateConfidence', 0.0), 0.0), 4),
+        'preferredExitProfile': str(safe_pos.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+    }
+    structure_snapshot = {
+        'structureTrend': str(safe_pos.get('structureTrend', 'MIXED') or 'MIXED'),
+        'swingState': str(safe_pos.get('swingState', 'MIXED') or 'MIXED'),
+        'breakoutRetestState': str(safe_pos.get('breakoutRetestState', 'NONE') or 'NONE'),
+        'patternBias': str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0), 4),
+        'barrierVerdict': str(safe_pos.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+    }
+    registration = watch_registration if isinstance(watch_registration, dict) else {}
+    live_watch = watch if isinstance(watch, dict) else {}
+    memory_item = _build_post_exit_followthrough_seed(
+        symbol=symbol,
+        close_reason=reason_core,
+        origin_side=origin_side,
+        close_ts=time.time(),
+        close_price=_coerce_float(safe_trade.get('exitPrice', safe_pos.get('currentPrice', safe_pos.get('entryPrice', 0.0))), 0.0),
+        mode=mode,
+        preferred_side=preferred_side,
+        preferred_entry_families=preferred_families,
+        confidence=confidence,
+        coin_state_snapshot=coin_state_snapshot,
+        structure_snapshot=structure_snapshot,
+        watch_registration_result='REGISTERED' if live_watch else 'SKIPPED',
+        watch_registration_reason=str(registration.get('reason', '') or ''),
+        watch_state=str(live_watch.get('watchState', '') or ''),
+        source='CLOSE',
+    )
+    post_exit_followthrough_memory[symbol] = memory_item
+    _prune_post_exit_followthrough_memory()
+    return memory_item
+
+
+def _refresh_post_exit_followthrough_memory_from_watch(
+    watch: dict,
+    *,
+    reason: str = '',
+    selected_signal: Optional[dict] = None,
+    selected_opportunity: Optional[dict] = None,
+) -> dict:
+    if not _is_v3_post_exit_followthrough_enabled():
+        return {}
+    safe_watch = watch if isinstance(watch, dict) else {}
+    symbol = str(safe_watch.get('symbol', '') or '').upper()
+    if not symbol:
+        return {}
+    preferred_side = str(
+        safe_watch.get('resolutionTargetSide', safe_watch.get('side', ''))
+        or safe_watch.get('side', '')
+    ).upper()
+    mode = str(safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_NONE) or POST_EXIT_RESOLUTION_MODE_NONE).upper()
+    if preferred_side not in ('LONG', 'SHORT') or mode == POST_EXIT_RESOLUTION_MODE_NONE:
+        return {}
+    selected_signal = selected_signal if isinstance(selected_signal, dict) else {}
+    selected_opp = selected_opportunity if isinstance(selected_opportunity, dict) else {}
+    if mode == POST_EXIT_RESOLUTION_MODE_SAME_SIDE:
+        families = [ENTRY_ARCHETYPE_CONTINUATION, ENTRY_ARCHETYPE_RECLAIM, ENTRY_ARCHETYPE_REVERSAL_RETEST]
+    else:
+        families = [ENTRY_ARCHETYPE_REVERSAL_RETEST, ENTRY_ARCHETYPE_RECLAIM]
+    memory_item = _build_post_exit_followthrough_seed(
+        symbol=symbol,
+        close_reason=str(safe_watch.get('exitReason', '') or ''),
+        origin_side=str(safe_watch.get('side', '') or ''),
+        close_ts=_coerce_float(safe_watch.get('exitTs', time.time()), time.time()),
+        close_price=_coerce_float(safe_watch.get('exitPrice', 0.0), 0.0),
+        mode=mode,
+        preferred_side=preferred_side,
+        preferred_entry_families=families,
+        confidence=max(
+            _coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0),
+            _coerce_float(selected_signal.get('directionConfidence', 0.0), 0.0),
+        ),
+        coin_state_snapshot={
+            'dominantSide': str(selected_opp.get('dominantSide', safe_watch.get('resolutionTargetSide', 'NEUTRAL')) or 'NEUTRAL'),
+            'transitionState': str(selected_opp.get('transitionState', 'NONE') or 'NONE'),
+            'stateConfidence': round(_coerce_float(selected_opp.get('stateConfidence', 0.0), 0.0), 4),
+            'preferredExitProfile': str(selected_opp.get('preferredExitProfile', V3_EXIT_PROFILE_BALANCED) or V3_EXIT_PROFILE_BALANCED),
+        },
+        structure_snapshot={
+            'structureTrend': str(selected_opp.get('structureTrend', 'MIXED') or 'MIXED'),
+            'swingState': str(selected_opp.get('swingState', 'MIXED') or 'MIXED'),
+            'breakoutRetestState': str(selected_opp.get('breakoutRetestState', 'NONE') or 'NONE'),
+            'patternBias': str(selected_opp.get('patternBias', 'NEUTRAL') or 'NEUTRAL'),
+            'patternConfidence': round(_coerce_float(selected_opp.get('patternConfidence', 0.0), 0.0), 4),
+            'barrierVerdict': str(selected_opp.get('barrierVerdict', 'SUPPORTIVE') or 'SUPPORTIVE'),
+        },
+        watch_registration_result='REGISTERED',
+        watch_registration_reason=str(reason or safe_watch.get('resolutionReason', '') or ''),
+        watch_state=str(safe_watch.get('watchState', '') or ''),
+        source='WATCH',
+    )
+    post_exit_followthrough_memory[symbol] = memory_item
+    _prune_post_exit_followthrough_memory()
+    return memory_item
+
+
+def get_post_exit_followthrough_context(symbol: str, *, now_ts: Optional[float] = None) -> dict:
+    if not _is_v3_post_exit_followthrough_enabled():
+        return {}
+    safe_symbol = str(symbol or '').upper().strip()
+    if not safe_symbol:
+        return {}
+    _prune_post_exit_followthrough_memory(now_ts=now_ts)
+    item = post_exit_followthrough_memory.get(safe_symbol)
+    if not isinstance(item, dict):
+        return {}
+    close_ts = _coerce_float(item.get('closeTs', 0.0), 0.0)
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    if close_ts <= 0:
+        return {}
+    age_sec = max(0.0, now_ts - close_ts)
+    if age_sec > max(60.0, float(item.get('followthroughWindowSec', V3_POST_EXIT_FOLLOWTHROUGH_WINDOW_SEC))):
+        post_exit_followthrough_memory.pop(safe_symbol, None)
+        return {}
+    return {
+        **item,
+        'symbol': safe_symbol,
+        'ageSec': round(age_sec, 2),
+        'active': not bool(item.get('consumed', False)),
+    }
+
+
+def consume_post_exit_followthrough_context(symbol: str, *, reason: str = '', used_ts: Optional[float] = None) -> None:
+    safe_symbol = str(symbol or '').upper().strip()
+    item = post_exit_followthrough_memory.get(safe_symbol) if isinstance(globals().get('post_exit_followthrough_memory'), dict) else None
+    if not isinstance(item, dict):
+        return
+    item['consumed'] = True
+    item['usedTs'] = float(used_ts if used_ts is not None else time.time())
+    if reason:
+        item['consumeReason'] = str(reason or '')
+
+
+def _post_exit_followthrough_fallback_intent(payload: dict, ctx: dict) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_ctx = ctx if isinstance(ctx, dict) else {}
+    preferred_side = str(safe_ctx.get('preferredSide', '') or '').upper()
+    if preferred_side not in ('LONG', 'SHORT'):
+        return {}
+    preferred_families = _normalize_post_exit_followthrough_families(safe_ctx.get('preferredEntryFamilies', []))
+    if not _post_exit_followthrough_supports_payload(safe_payload, preferred_side, preferred_families):
+        return {}
+    if _coerce_float(safe_ctx.get('ageSec', 9999.0), 9999.0) > V3_POST_EXIT_FOLLOWTHROUGH_FALLBACK_INTENT_WINDOW_SEC:
+        return {}
+    confidence = _clamp(max(0.58, _coerce_float(safe_ctx.get('followthroughConfidence', 0.0), 0.0)), 0.0, 0.92)
+    entry_archetype = preferred_families[0] if preferred_families else ENTRY_ARCHETYPE_CONTINUATION
+    runner_hint = V3_RUNNER_CONTEXT_INTRADAY if str(safe_ctx.get('followthroughMode', '') or '').upper() == POST_EXIT_RESOLUTION_MODE_SAME_SIDE else V3_RUNNER_CONTEXT_COUNTER
+    return _compact_signal_intent({
+        'accepted': True,
+        'side': preferred_side,
+        'entryArchetype': entry_archetype,
+        'directionOwner': 'post_exit_followthrough',
+        'directionConfidence': confidence,
+        'directionReason': f"FOLLOWTHROUGH_{str(safe_ctx.get('followthroughMode', 'NONE') or 'NONE').upper()}",
+        'intentScore': 66.0 + min(10.0, confidence * 10.0),
+        'runnerContextHint': runner_hint,
+        'policyMode': SIGNAL_INTENT_POLICY_APPLY,
+        'signalIntentVersion': SIGNAL_INTENT_VERSION,
+        'alternateIntent': {},
+    })
+
+
+def _apply_post_exit_followthrough_to_intent_candidate(payload: dict, resolved: dict) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_resolved = resolved if isinstance(resolved, dict) else {}
+    symbol = str(safe_payload.get('symbol', '') or '').upper()
+    ctx = get_post_exit_followthrough_context(symbol)
+    if not ctx or not bool(ctx.get('active', False)):
+        return _compact_signal_intent(safe_resolved)
+    preferred_side = str(ctx.get('preferredSide', '') or '').upper()
+    preferred_families = _normalize_post_exit_followthrough_families(ctx.get('preferredEntryFamilies', []))
+    if not safe_resolved or not safe_resolved.get('accepted', False):
+        return _post_exit_followthrough_fallback_intent(safe_payload, ctx)
+    candidate = dict(safe_resolved)
+    candidate_side = str(candidate.get('side', '') or '').upper()
+    candidate_arch = str(candidate.get('entryArchetype', '') or '').lower()
+    if (
+        candidate_arch == ENTRY_ARCHETYPE_RECLAIM
+        and preferred_side in ('LONG', 'SHORT')
+        and candidate_side in ('LONG', 'SHORT')
+        and candidate_side != preferred_side
+        and _should_suppress_opposite_reclaim_from_followthrough(safe_payload, preferred_side)
+    ):
+        return {}
+    if candidate_side == preferred_side and candidate_arch in preferred_families:
+        candidate['directionConfidence'] = _clamp(
+            _coerce_float(candidate.get('directionConfidence', 0.0), 0.0) + 0.08,
+            0.0,
+            0.97,
+        )
+        candidate['intentScore'] = _coerce_float(candidate.get('intentScore', 0.0), 0.0) + V3_POST_EXIT_FOLLOWTHROUGH_INTENT_BOOST
+        base_reason = str(candidate.get('directionReason', '') or '').strip()
+        suffix = f"FOLLOWTHROUGH_{str(ctx.get('followthroughMode', 'NONE') or 'NONE').upper()}"
+        candidate['directionReason'] = f"{base_reason}+{suffix}" if base_reason else suffix
+        if not candidate.get('runnerContextHint'):
+            candidate['runnerContextHint'] = (
+                V3_RUNNER_CONTEXT_INTRADAY
+                if str(ctx.get('followthroughMode', '') or '').upper() == POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+                else V3_RUNNER_CONTEXT_COUNTER
+            )
+    return _compact_signal_intent(candidate)
+
+
+def _apply_post_exit_followthrough_to_payload(payload: dict) -> dict:
+    safe_payload = dict(payload) if isinstance(payload, dict) else {}
+    symbol = str(safe_payload.get('symbol', '') or '').upper()
+    ctx = get_post_exit_followthrough_context(symbol)
+    if not ctx or not bool(ctx.get('active', False)):
+        safe_payload.setdefault('postExitFollowthroughActive', False)
+        safe_payload.setdefault('postExitFollowthroughMode', '')
+        safe_payload.setdefault('postExitPreferredSide', '')
+        safe_payload.setdefault('postExitPreferredEntryFamilies', [])
+        safe_payload.setdefault('postExitFollowthroughConfidence', 0.0)
+        safe_payload.setdefault('postExitFollowthroughAgeSec', 0.0)
+        safe_payload.setdefault('postExitWatchRegisterResult', '')
+        safe_payload.setdefault('postExitWatchRegisterReason', '')
+        safe_payload.setdefault('postExitThinBookGraceUsed', False)
+        safe_payload.setdefault('postExitExposureReserveUsed', False)
+        safe_payload.setdefault('postExitExposureReserveReason', '')
+        safe_payload.setdefault('oppositeReclaimSuppressed', False)
+        return safe_payload
+    safe_payload.update({
+        'postExitFollowthroughActive': True,
+        'postExitFollowthroughMode': str(ctx.get('followthroughMode', '') or ''),
+        'postExitPreferredSide': str(ctx.get('preferredSide', '') or ''),
+        'postExitPreferredEntryFamilies': _normalize_post_exit_followthrough_families(ctx.get('preferredEntryFamilies', [])),
+        'postExitFollowthroughConfidence': round(_coerce_float(ctx.get('followthroughConfidence', 0.0), 0.0), 4),
+        'postExitFollowthroughAgeSec': round(_coerce_float(ctx.get('ageSec', 0.0), 0.0), 2),
+        'postExitWatchRegisterResult': str(ctx.get('watchRegistrationResult', '') or ''),
+        'postExitWatchRegisterReason': str(ctx.get('watchRegistrationReason', '') or ''),
+    })
+    side = str(safe_payload.get('action', safe_payload.get('side', '')) or '').upper()
+    preferred_side = str(ctx.get('preferredSide', '') or '').upper()
+    safe_payload['oppositeReclaimSuppressed'] = bool(
+        str(safe_payload.get('entryArchetype', '') or '').lower() == ENTRY_ARCHETYPE_RECLAIM
+        and side in ('LONG', 'SHORT')
+        and preferred_side in ('LONG', 'SHORT')
+        and side != preferred_side
+        and _should_suppress_opposite_reclaim_from_followthrough(safe_payload, preferred_side)
+    )
+    return safe_payload
+
+
+def _extract_post_exit_followthrough_fields(payload: dict) -> dict:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    return {
+        'postExitFollowthroughActive': bool(safe_payload.get('postExitFollowthroughActive', False)),
+        'postExitFollowthroughMode': str(safe_payload.get('postExitFollowthroughMode', '') or ''),
+        'postExitPreferredSide': str(safe_payload.get('postExitPreferredSide', '') or ''),
+        'postExitPreferredEntryFamilies': _normalize_post_exit_followthrough_families(
+            safe_payload.get('postExitPreferredEntryFamilies', []),
+        ),
+        'postExitFollowthroughConfidence': round(_coerce_float(safe_payload.get('postExitFollowthroughConfidence', 0.0), 0.0), 4),
+        'postExitFollowthroughAgeSec': round(_coerce_float(safe_payload.get('postExitFollowthroughAgeSec', 0.0), 0.0), 2),
+        'postExitWatchRegisterResult': str(safe_payload.get('postExitWatchRegisterResult', '') or ''),
+        'postExitWatchRegisterReason': str(safe_payload.get('postExitWatchRegisterReason', '') or ''),
+        'postExitThinBookGraceUsed': bool(safe_payload.get('postExitThinBookGraceUsed', False)),
+        'postExitExposureReserveUsed': bool(safe_payload.get('postExitExposureReserveUsed', False)),
+        'postExitExposureReserveReason': str(safe_payload.get('postExitExposureReserveReason', '') or ''),
+        'oppositeReclaimSuppressed': bool(safe_payload.get('oppositeReclaimSuppressed', False)),
+    }
+
+
+def evaluate_post_exit_followthrough_thin_book_grace(
+    signal: dict,
+    *,
+    total_depth_usd: float,
+    dynamic_depth_threshold: float,
+    exec_score: float,
+    spread_pct: float,
+    leverage: int,
+    bid_depth_usd: float = 0.0,
+    ask_depth_usd: float = 0.0,
+) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    if str(V3_POST_EXIT_THIN_BOOK_GRACE_MODE or 'apply').strip().lower() == 'off':
+        return {'allow': False, 'reason': 'FEATURE_OFF'}
+    if not bool(safe_signal.get('postExitFollowthroughActive', False)):
+        return {'allow': False, 'reason': 'NO_FOLLOWTHROUGH'}
+    action = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    preferred_side = str(safe_signal.get('postExitPreferredSide', '') or '').upper()
+    entry_arch = str(safe_signal.get('entryArchetype', '') or '').lower()
+    preferred_families = _normalize_post_exit_followthrough_families(safe_signal.get('postExitPreferredEntryFamilies', []))
+    if action not in ('LONG', 'SHORT') or action != preferred_side or (preferred_families and entry_arch not in preferred_families):
+        return {'allow': False, 'reason': 'SIDE_OR_FAMILY_MISMATCH'}
+    safe_spread = _coerce_float(spread_pct, 0.0)
+    safe_exec = _coerce_float(exec_score, 0.0)
+    if safe_spread > V3_POST_EXIT_THIN_BOOK_GRACE_MAX_SPREAD or safe_exec < V3_POST_EXIT_THIN_BOOK_GRACE_MIN_EXEC_SCORE:
+        return {'allow': False, 'reason': 'QUALITY_GUARD'}
+    balance = _coerce_float(getattr(global_paper_trader, 'balance', 0.0), 0.0)
+    risk_per_trade = _coerce_float(getattr(global_paper_trader, 'risk_per_trade', 0.02), 0.02)
+    size_mult = _coerce_float(safe_signal.get('sizeMultiplier', 1.0), 1.0)
+    planned_margin_usd = max(1.0, balance * risk_per_trade * max(0.15, size_mult))
+    planned_notional_usd = planned_margin_usd * max(1, int(leverage or 1))
+    safe_total_depth = max(0.0, _coerce_float(total_depth_usd, 0.0))
+    notional_depth_ratio = planned_notional_usd / max(safe_total_depth, 1.0)
+    impact_ratio = 999.0
+    if _RFX_MODULES_AVAILABLE and (bid_depth_usd > 0 or ask_depth_usd > 0):
+        try:
+            impact = rfx_compute_order_impact(
+                planned_margin_usd=planned_margin_usd,
+                leverage=max(1, int(leverage or 1)),
+                side=action,
+                bid_depth_usd=max(0.0, _coerce_float(bid_depth_usd, 0.0)),
+                ask_depth_usd=max(0.0, _coerce_float(ask_depth_usd, 0.0)),
+                max_impact_pct=V3_POST_EXIT_THIN_BOOK_GRACE_MAX_IMPACT_PCT,
+                min_depth_floor_usd=min(
+                    max(500.0, safe_total_depth * 0.25),
+                    max(1500.0, _coerce_float(dynamic_depth_threshold, 0.0) * 0.20),
+                ),
+            )
+            impact_ratio = _coerce_float(impact.impact_ratio, 999.0)
+            if not impact.passes and notional_depth_ratio > V3_POST_EXIT_THIN_BOOK_GRACE_NOTIONAL_DEPTH_RATIO:
+                return {
+                    'allow': False,
+                    'reason': f"IMPACT_TOO_HIGH:{impact.reason}",
+                    'plannedNotionalUsd': round(planned_notional_usd, 2),
+                    'depthCoverageRatio': round(notional_depth_ratio, 5),
+                    'estimatedEntryImpactPct': round(impact_ratio * 100.0, 5),
+                }
+        except Exception:
+            pass
+    if safe_total_depth <= 0 or notional_depth_ratio > V3_POST_EXIT_THIN_BOOK_GRACE_NOTIONAL_DEPTH_RATIO:
+        return {
+            'allow': False,
+            'reason': 'NOTIONAL_DEPTH_RATIO',
+            'plannedNotionalUsd': round(planned_notional_usd, 2),
+            'depthCoverageRatio': round(notional_depth_ratio, 5),
+            'estimatedEntryImpactPct': round(impact_ratio * 100.0, 5),
+        }
+    return {
+        'allow': True,
+        'reason': 'POST_EXIT_THIN_BOOK_GRACE',
+        'sizeMultCap': V3_POST_EXIT_THIN_BOOK_GRACE_SIZE_MULT,
+        'leverageCap': V3_POST_EXIT_THIN_BOOK_GRACE_LEVERAGE_CAP,
+        'scorePenalty': 4,
+        'plannedNotionalUsd': round(planned_notional_usd, 2),
+        'depthCoverageRatio': round(notional_depth_ratio, 5),
+        'estimatedEntryImpactPct': round(impact_ratio * 100.0, 5),
+    }
+
+
+def evaluate_post_exit_followthrough_exposure_reserve(
+    signal: dict,
+    *,
+    reserve_slots_used: int,
+) -> dict:
+    safe_signal = signal if isinstance(signal, dict) else {}
+    if str(V3_POST_EXIT_EXPOSURE_RESERVE_MODE or 'apply').strip().lower() == 'off':
+        return {'allow': False, 'reason': 'FEATURE_OFF'}
+    if not bool(safe_signal.get('postExitFollowthroughActive', False)):
+        return {'allow': False, 'reason': 'NO_FOLLOWTHROUGH'}
+    if reserve_slots_used >= max(0, int(V3_POST_EXIT_EXPOSURE_RESERVE_SLOTS or 0)):
+        return {'allow': False, 'reason': 'RESERVE_EXHAUSTED'}
+    side = str(safe_signal.get('action', safe_signal.get('side', '')) or '').upper()
+    preferred_side = str(safe_signal.get('postExitPreferredSide', '') or '').upper()
+    if side not in ('LONG', 'SHORT') or side != preferred_side:
+        return {'allow': False, 'reason': 'SIDE_MISMATCH'}
+    signal_score = _coerce_float(safe_signal.get('confidenceScore', safe_signal.get('signalScore', 0.0)), 0.0)
+    exec_score = _coerce_float(
+        safe_signal.get('entryExecScore', safe_signal.get('currentExecScore', 0.0)),
+        0.0,
+    )
+    if signal_score < V3_POST_EXIT_EXPOSURE_RESERVE_MIN_SCORE:
+        return {'allow': False, 'reason': 'LOW_SCORE', 'signalScore': round(signal_score, 4)}
+    if exec_score < V3_POST_EXIT_EXPOSURE_RESERVE_MIN_EXEC_SCORE:
+        return {'allow': False, 'reason': 'LOW_EXEC', 'execScore': round(exec_score, 4)}
+    preferred_families = _normalize_post_exit_followthrough_families(
+        safe_signal.get('postExitPreferredEntryFamilies', []),
+    )
+    entry_archetype = str(safe_signal.get('entryArchetype', '') or '').lower()
+    if preferred_families and entry_archetype and entry_archetype not in preferred_families:
+        return {'allow': False, 'reason': 'ARCHETYPE_MISMATCH'}
+    return {
+        'allow': True,
+        'reason': 'POST_EXIT_EXPOSURE_RESERVE',
+        'sizeMultCap': _clamp(float(V3_POST_EXIT_EXPOSURE_RESERVE_SIZE_MULT or 1.0), 0.10, 1.0),
+    }
 
 
 def _is_v3_side_aware_structure_enabled() -> bool:
@@ -16431,7 +17139,7 @@ def _compact_signal_intent(intent: dict = None) -> dict:
 
 
 def _resolve_signal_intent_candidate(payload: dict = None, *, policy_mode: str = SIGNAL_INTENT_V3_MODE) -> dict:
-    safe_payload = payload if isinstance(payload, dict) else {}
+    safe_payload = _apply_post_exit_followthrough_to_payload(payload if isinstance(payload, dict) else {})
     mode = normalize_strategy_mode(
         safe_payload.get('strategyMode', safe_payload.get('strategy_mode', STRATEGY_MODE_LEGACY))
     )
@@ -16446,7 +17154,7 @@ def _resolve_signal_intent_candidate(payload: dict = None, *, policy_mode: str =
         'recoveryArmed': bool(safe_payload.get('recoveryArmed', False)),
     })
     resolved = resolve_signal_intent(intent_inputs, mode=mode, policy_mode=policy_mode)
-    return _compact_signal_intent(resolved)
+    return _apply_post_exit_followthrough_to_intent_candidate(safe_payload, resolved)
 
 
 def _build_baseline_direction_metadata(
@@ -16540,6 +17248,18 @@ def _compact_decision_inputs(payload: dict = None) -> dict:
         'supportiveDistancePct': round(_coerce_float(data.get('supportiveDistancePct', 0.0), 0.0), 4),
         'barrierReason': str(data.get('barrierReason', '') or '').upper(),
         'barrierConfidence': round(_coerce_float(data.get('barrierConfidence', 0.0), 0.0), 4),
+        'postExitFollowthroughActive': bool(data.get('postExitFollowthroughActive', False)),
+        'postExitFollowthroughMode': str(data.get('postExitFollowthroughMode', '') or '').upper(),
+        'postExitPreferredSide': str(data.get('postExitPreferredSide', '') or '').upper(),
+        'postExitPreferredEntryFamilies': [
+            str(item or '').lower()
+            for item in (data.get('postExitPreferredEntryFamilies', []) or [])
+            if str(item or '').strip()
+        ],
+        'postExitFollowthroughConfidence': round(_coerce_float(data.get('postExitFollowthroughConfidence', 0.0), 0.0), 4),
+        'postExitFollowthroughAgeSec': round(_coerce_float(data.get('postExitFollowthroughAgeSec', 0.0), 0.0), 2),
+        'postExitWatchRegisterResult': str(data.get('postExitWatchRegisterResult', '') or '').upper(),
+        'postExitWatchRegisterReason': str(data.get('postExitWatchRegisterReason', '') or '').upper(),
     }
 
 
@@ -17699,6 +18419,141 @@ def build_post_exit_reentry_watchers_summary(now_ts: Optional[float] = None) -> 
     }
 
 
+def evaluate_post_exit_reentry_watch_registration(
+    pos: dict,
+    trade: dict,
+    *,
+    original_reason: str = '',
+    normalized_reason: str = '',
+) -> dict:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    safe_trade = trade if isinstance(trade, dict) else {}
+    if not _is_v3_post_exit_reentry_enabled():
+        return {'eligible': False, 'reason': 'FEATURE_OFF'}
+    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
+        return {'eligible': False, 'reason': 'NON_V3'}
+    symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
+    if not symbol:
+        return {'eligible': False, 'reason': 'NO_SYMBOL'}
+    if _has_symbol_exposure(symbol, exclude_position_id=str(safe_pos.get('id', '') or safe_trade.get('positionId', ''))):
+        return {'eligible': False, 'reason': 'EXPOSURE_ACTIVE'}
+    reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
+    if reason_core not in V3_POST_EXIT_REENTRY_REASON_ALLOWLIST:
+        return {'eligible': False, 'reason': 'REASON_NOT_ELIGIBLE', 'reason_core': reason_core}
+    entry_archetype = str(safe_pos.get('entryArchetype', safe_trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM).lower()
+    if reason_core in ('SIDEWAYS_RECLAIM_CLOSE', 'RECLAIM_BE_CLOSE') and entry_archetype != ENTRY_ARCHETYPE_RECLAIM:
+        return {'eligible': False, 'reason': 'NO_ELIGIBLE_ARCHETYPE', 'reason_core': reason_core, 'entry_archetype': entry_archetype}
+    if reason_core in ('TRAIL_WIDE_EXIT', 'TRAIL_EXIT', 'PROFIT_GIVEBACK_EXIT', 'FAILED_CONTINUATION') and entry_archetype not in (
+        ENTRY_ARCHETYPE_RECLAIM,
+        ENTRY_ARCHETYPE_CONTINUATION,
+        ENTRY_ARCHETYPE_REVERSAL_RETEST,
+    ):
+        return {'eligible': False, 'reason': 'NO_ELIGIBLE_ARCHETYPE', 'reason_core': reason_core, 'entry_archetype': entry_archetype}
+    runner_context_resolved = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
+    if runner_context_resolved not in V3_POST_EXIT_REENTRY_RUNNER_CONTEXT_ALLOWLIST:
+        return {
+            'eligible': False,
+            'reason': 'RUNNER_CONTEXT_BLOCKED',
+            'reason_core': reason_core,
+            'entry_archetype': entry_archetype,
+            'runner_context_resolved': runner_context_resolved,
+        }
+    return {
+        'eligible': True,
+        'reason': 'REGISTER_OK',
+        'reason_core': reason_core,
+        'entry_archetype': entry_archetype,
+        'runner_context_resolved': runner_context_resolved,
+        'symbol': symbol,
+    }
+
+
+def queue_post_exit_reentry_watch_registration_snapshot(
+    pos: dict,
+    trade: dict,
+    *,
+    outcome_reason: str,
+    original_reason: str = '',
+    normalized_reason: str = '',
+    exit_price: float = 0.0,
+    watch: Optional[dict] = None,
+) -> None:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    safe_trade = trade if isinstance(trade, dict) else {}
+    safe_watch = watch if isinstance(watch, dict) else {}
+    symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
+    if not symbol:
+        return
+    registration = evaluate_post_exit_reentry_watch_registration(
+        safe_pos,
+        safe_trade,
+        original_reason=original_reason,
+        normalized_reason=normalized_reason,
+    )
+    watch_state = str(safe_watch.get('watchState', 'SKIPPED') or 'SKIPPED')
+    outcome = {
+        'watchState': watch_state,
+        'cancelReason': '' if safe_watch else str(outcome_reason or ''),
+        'candidateAccepted': False,
+        'postExitResolutionMode': str(safe_watch.get('resolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'postExitResolutionTargetSide': str(safe_watch.get('resolutionTargetSide', safe_watch.get('side', safe_pos.get('side', ''))) or safe_pos.get('side', '')),
+        'postExitResolutionReason': str(safe_watch.get('resolutionReason', registration.get('reason_core', '')) or registration.get('reason_core', '')),
+        'postExitResolutionConfidence': round(_coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0), 4),
+        'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
+        'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
+        'continuationFlowState': str(safe_watch.get('continuationFlowState', safe_pos.get('continuationFlowState', V3_CONTINUATION_NEUTRAL)) or V3_CONTINUATION_NEUTRAL),
+        'currentVolumeRatio': round(_coerce_float(safe_watch.get('currentVolumeRatio', safe_pos.get('currentVolumeRatio', 0.0)), 0.0), 4),
+        'currentObImbalanceTrend': round(_coerce_float(safe_watch.get('currentObImbalanceTrend', safe_pos.get('currentObImbalanceTrend', 0.0)), 0.0), 4),
+        'currentExecScore': round(_coerce_float(safe_watch.get('currentExecScore', safe_pos.get('currentExecScore', 0.0)), 0.0), 4),
+        'structureTrend': str(safe_watch.get('structureTrend', safe_pos.get('structureTrend', 'MIXED')) or 'MIXED'),
+        'swingState': str(safe_watch.get('swingState', safe_pos.get('swingState', 'MIXED')) or 'MIXED'),
+        'compressionState': str(safe_watch.get('compressionState', safe_pos.get('compressionState', 'NONE')) or 'NONE'),
+        'breakoutRetestState': str(safe_watch.get('breakoutRetestState', safe_pos.get('breakoutRetestState', 'NONE')) or 'NONE'),
+        'srContext': str(safe_watch.get('srContext', safe_pos.get('srContext', 'UNKNOWN')) or 'UNKNOWN'),
+        'patternBias': str(safe_watch.get('patternBias', safe_pos.get('patternBias', 'NEUTRAL')) or 'NEUTRAL'),
+        'patternConfidence': round(_coerce_float(safe_watch.get('patternConfidence', safe_pos.get('patternConfidence', 0.0)), 0.0), 4),
+        'watchRegisterResult': str(outcome_reason or '').upper(),
+        'watchRegisterReason': str(registration.get('reason', '') or ''),
+    }
+    decision = {
+        'reason': str(outcome_reason or ''),
+        'side': str(safe_pos.get('side', safe_trade.get('side', '')) or ''),
+        'entryArchetype': str(registration.get('entry_archetype', safe_pos.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM),
+        'runnerContextResolved': str(registration.get('runner_context_resolved', safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', ''))) or ''),
+        'postExitResolutionMode': str(outcome.get('postExitResolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE) or POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'postExitResolutionTargetSide': str(outcome.get('postExitResolutionTargetSide', safe_pos.get('side', '')) or safe_pos.get('side', '')),
+        'postExitResolutionReason': str(registration.get('reason_core', '') or ''),
+        'postExitResolutionConfidence': round(_coerce_float(safe_watch.get('resolutionConfidence', 0.0), 0.0), 4),
+        'watchState': watch_state,
+        'reentryOriginTradeId': str(safe_trade.get('tradeId', safe_trade.get('id', '')) or ''),
+        'reentryOriginExitReason': str(original_reason or normalized_reason or safe_trade.get('reason', '')) or '',
+        'reentryTriggered': bool(safe_watch.get('reentryTriggered', False)),
+        'reentryTriggerReason': str(safe_watch.get('reentryTriggerReason', '') or ''),
+        'exitPrice': round(_coerce_float(exit_price or safe_trade.get('exitPrice', 0.0), 0.0), 8),
+    }
+    queue_decision_snapshot(
+        stage='post_exit_reentry_watch',
+        symbol=symbol,
+        signal_id=str(safe_trade.get('signalId', safe_pos.get('signalId', safe_pos.get('signal_id', ''))) or ''),
+        trade_id=str(safe_trade.get('tradeId', safe_trade.get('id', '')) or ''),
+        position_id=str(safe_trade.get('positionId', safe_pos.get('id', '')) or ''),
+        context=safe_pos.get('decisionContext', safe_trade.get('decisionContext', {})) if isinstance(safe_pos.get('decisionContext', safe_trade.get('decisionContext', {})), dict) else {},
+        inputs=_build_post_exit_reentry_watch_inputs(safe_watch, None, None),
+        decision=decision,
+        outcome=outcome,
+        created_ts=int(datetime.now().timestamp() * 1000),
+    )
+    pseudo_watch = {
+        'symbol': symbol,
+        'watchState': watch_state,
+        'resolutionMode': outcome.get('postExitResolutionMode', POST_EXIT_RESOLUTION_MODE_SAME_SIDE),
+        'resolutionTargetSide': outcome.get('postExitResolutionTargetSide', safe_pos.get('side', '')),
+        'reentryTriggered': bool(outcome.get('reentryTriggered', False)),
+        'cancelReason': str(outcome.get('watchRegisterReason', '') or outcome_reason or ''),
+    }
+    _record_post_exit_reentry_watch_event(pseudo_watch, outcome_reason)
+
+
 def register_post_exit_reentry_watch(
     pos: dict,
     trade: dict,
@@ -17709,24 +18564,27 @@ def register_post_exit_reentry_watch(
 ) -> Optional[dict]:
     safe_pos = pos if isinstance(pos, dict) else {}
     safe_trade = trade if isinstance(trade, dict) else {}
-    if not _is_v3_post_exit_reentry_enabled():
+    registration = evaluate_post_exit_reentry_watch_registration(
+        safe_pos,
+        safe_trade,
+        original_reason=original_reason,
+        normalized_reason=normalized_reason,
+    )
+    if not registration.get('eligible', False):
+        queue_post_exit_reentry_watch_registration_snapshot(
+            safe_pos,
+            safe_trade,
+            outcome_reason='skipped',
+            original_reason=original_reason,
+            normalized_reason=normalized_reason,
+            exit_price=exit_price,
+            watch=None,
+        )
         return None
-    if normalize_strategy_mode(safe_pos.get('strategyMode', STRATEGY_MODE_LEGACY)) != STRATEGY_MODE_SMART_V3_RUNNER:
-        return None
-    symbol = str(safe_pos.get('symbol', safe_trade.get('symbol', '')) or '').upper()
-    if not symbol:
-        return None
-    if _has_symbol_exposure(symbol, exclude_position_id=str(safe_pos.get('id', '') or safe_trade.get('positionId', ''))):
-        return None
-    reason_core = _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))
-    if reason_core not in V3_POST_EXIT_REENTRY_REASON_ALLOWLIST:
-        return None
-    entry_archetype = str(safe_pos.get('entryArchetype', safe_trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM)) or ENTRY_ARCHETYPE_RECLAIM).lower()
-    if entry_archetype != ENTRY_ARCHETYPE_RECLAIM:
-        return None
-    runner_context_resolved = str(safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', '')) or '')
-    if runner_context_resolved not in V3_POST_EXIT_REENTRY_RUNNER_CONTEXT_ALLOWLIST:
-        return None
+    symbol = str(registration.get('symbol', safe_pos.get('symbol', safe_trade.get('symbol', ''))) or '').upper()
+    reason_core = str(registration.get('reason_core', _canonical_reason_core(original_reason or normalized_reason or safe_trade.get('reason', ''))) or '')
+    entry_archetype = str(registration.get('entry_archetype', safe_pos.get('entryArchetype', safe_trade.get('entryArchetype', ENTRY_ARCHETYPE_RECLAIM))) or ENTRY_ARCHETYPE_RECLAIM).lower()
+    runner_context_resolved = str(registration.get('runner_context_resolved', safe_pos.get('runnerContextResolved', safe_pos.get('runnerContext', ''))) or '')
     existing_watch = post_exit_reentry_watchers.get(symbol)
     if isinstance(existing_watch, dict):
         existing_watch['watchState'] = POST_EXIT_REENTRY_STATE_CANCELLED
@@ -17788,6 +18646,15 @@ def register_post_exit_reentry_watch(
         'breakoutDistancePrice': 0.0,
     }
     post_exit_reentry_watchers[symbol] = watch
+    queue_post_exit_reentry_watch_registration_snapshot(
+        safe_pos,
+        safe_trade,
+        outcome_reason='registered',
+        original_reason=original_reason,
+        normalized_reason=normalized_reason,
+        exit_price=exit_price,
+        watch=watch,
+    )
     queue_post_exit_reentry_watch_snapshot(watch, reason='armed')
     logger.info(
         f"🛰️ POST_EXIT_WATCH_ARMED: {symbol} {watch['side']} "
@@ -18021,6 +18888,8 @@ def _extract_post_exit_reentry_watch_summary(snapshots: list) -> dict:
             'postExitReentryReason': '',
             'postExitReentryOutcome': '',
             'postExitReentryTradeId': '',
+            'postExitWatchRegisterResult': '',
+            'postExitWatchRegisterReason': '',
             'postExitResolutionMode': '',
             'postExitResolutionTargetSide': '',
             'postExitResolutionReason': '',
@@ -18048,6 +18917,8 @@ def _extract_post_exit_reentry_watch_summary(snapshots: list) -> dict:
         'postExitReentryReason': reason,
         'postExitReentryOutcome': outcome,
         'postExitReentryTradeId': '',
+        'postExitWatchRegisterResult': str(latest_outcome.get('watchRegisterResult', '') or ''),
+        'postExitWatchRegisterReason': str(latest_outcome.get('watchRegisterReason', cancel_reason or '') or cancel_reason or ''),
         'postExitResolutionMode': str(latest_outcome.get('postExitResolutionMode', latest_decision.get('postExitResolutionMode', '')) or ''),
         'postExitResolutionTargetSide': str(latest_outcome.get('postExitResolutionTargetSide', latest_decision.get('postExitResolutionTargetSide', '')) or ''),
         'postExitResolutionReason': str(latest_outcome.get('postExitResolutionReason', latest_decision.get('postExitResolutionReason', '')) or ''),
@@ -18126,11 +18997,20 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'fakeoutReclaimArmRoiPct': _coerce_float(safe_trade.get('fakeoutReclaimArmRoiPct', close_snapshot.get('fakeoutReclaimArmRoiPct', 0.0)), 0.0),
         'fakeoutReclaimReason': str(safe_trade.get('fakeoutReclaimReason', close_snapshot.get('fakeoutReclaimReason', '')) or ''),
         'fakeoutReclaimReleaseReason': str(safe_trade.get('fakeoutReclaimReleaseReason', close_snapshot.get('fakeoutReclaimReleaseReason', '')) or ''),
+        'trailFakeoutGuardArmed': bool(safe_trade.get('trailFakeoutGuardArmed', close_snapshot.get('trailFakeoutGuardArmed', False))),
+        'trailFakeoutGuardUsed': bool(safe_trade.get('trailFakeoutGuardUsed', close_snapshot.get('trailFakeoutGuardUsed', False))),
+        'trailFakeoutGuardUntilTs': _coerce_float(safe_trade.get('trailFakeoutGuardUntilTs', close_snapshot.get('trailFakeoutGuardUntilTs', 0.0)), 0.0),
+        'trailFakeoutGuardTickCount': int(safe_trade.get('trailFakeoutGuardTickCount', close_snapshot.get('trailFakeoutGuardTickCount', 0)) or 0),
+        'trailFakeoutGuardReason': str(safe_trade.get('trailFakeoutGuardReason', close_snapshot.get('trailFakeoutGuardReason', '')) or ''),
+        'trailFakeoutGuardReleaseReason': str(safe_trade.get('trailFakeoutGuardReleaseReason', close_snapshot.get('trailFakeoutGuardReleaseReason', '')) or ''),
+        'trailFakeoutGuardState': str(safe_trade.get('trailFakeoutGuardState', close_snapshot.get('trailFakeoutGuardState', 'IDLE')) or 'IDLE'),
         'postExitWatchState': str(safe_trade.get('postExitWatchState', '') or ''),
         'postExitReentryTriggered': bool(safe_trade.get('postExitReentryTriggered', False)),
         'postExitReentryReason': str(safe_trade.get('postExitReentryReason', '') or ''),
         'postExitReentryOutcome': str(safe_trade.get('postExitReentryOutcome', '') or ''),
         'postExitReentryTradeId': str(safe_trade.get('postExitReentryTradeId', '') or ''),
+        'postExitWatchRegisterResult': str(safe_trade.get('postExitWatchRegisterResult', close_snapshot.get('postExitWatchRegisterResult', '')) or ''),
+        'postExitWatchRegisterReason': str(safe_trade.get('postExitWatchRegisterReason', close_snapshot.get('postExitWatchRegisterReason', '')) or ''),
         'postExitResolutionMode': str(safe_trade.get('postExitResolutionMode', close_snapshot.get('postExitResolutionMode', signal_snapshot.get('postExitResolutionMode', ''))) or ''),
         'postExitResolutionTargetSide': str(safe_trade.get('postExitResolutionTargetSide', close_snapshot.get('postExitResolutionTargetSide', signal_snapshot.get('postExitResolutionTargetSide', ''))) or ''),
         'postExitResolutionReason': str(safe_trade.get('postExitResolutionReason', close_snapshot.get('postExitResolutionReason', signal_snapshot.get('postExitResolutionReason', ''))) or ''),
@@ -18184,6 +19064,10 @@ def _build_replay_trade_summary(trade: dict) -> dict:
         'runtimeStateDriftReason': str(safe_trade.get('runtimeStateDriftReason', close_snapshot.get('runtimeStateDriftReason', 'COIN_STATE_ALIGNED')) or 'COIN_STATE_ALIGNED'),
         'runtimeStateDriftSeverity': round(_coerce_float(safe_trade.get('runtimeStateDriftSeverity', close_snapshot.get('runtimeStateDriftSeverity', 0.0)), 0.0), 4),
         'runtimeIntentDecayPct': round(_coerce_float(safe_trade.get('runtimeIntentDecayPct', close_snapshot.get('runtimeIntentDecayPct', 0.0)), 0.0), 4),
+        'positionsObservedAt': _coerce_float(safe_trade.get('positionsObservedAt', close_snapshot.get('positionsObservedAt', 0.0)), 0.0),
+        'positionsSourceStale': bool(safe_trade.get('positionsSourceStale', close_snapshot.get('positionsSourceStale', False))),
+        'positionsSourceAgeSec': round(_coerce_float(safe_trade.get('positionsSourceAgeSec', close_snapshot.get('positionsSourceAgeSec', 0.0)), 0.0), 4),
+        'positionsAuthority': str(safe_trade.get('positionsAuthority', close_snapshot.get('positionsAuthority', '')) or ''),
         'runtimeStructuralInvalidationActive': bool(safe_trade.get('runtimeStructuralInvalidationActive', close_snapshot.get('runtimeStructuralInvalidationActive', False))),
         'runtimeStructuralInvalidationSource': str(safe_trade.get('runtimeStructuralInvalidationSource', close_snapshot.get('runtimeStructuralInvalidationSource', '')) or ''),
         'runtimeStructuralInvalidationPrice': round(_coerce_float(safe_trade.get('runtimeStructuralInvalidationPrice', close_snapshot.get('runtimeStructuralInvalidationPrice', 0.0)), 0.0), 8),
@@ -19310,6 +20194,133 @@ def evaluate_v3_position_thesis_revalidation(
     return result
 
 
+def _trail_fakeout_supportive_transition(side: str, transition_state: str) -> bool:
+    safe_transition = str(transition_state or 'NONE').upper()
+    if safe_transition in ('BREAKOUT_RETEST', 'RECLAIMING'):
+        return True
+    return False
+
+
+def _trail_fakeout_adverse_transition(side: str, transition_state: str) -> bool:
+    safe_side = str(side or 'LONG').upper()
+    safe_transition = str(transition_state or 'NONE').upper()
+    return bool(
+        (safe_side == 'LONG' and safe_transition == 'FAILED_BREAKOUT')
+        or (safe_side == 'SHORT' and safe_transition == 'FAILED_BREAKDOWN')
+    )
+
+
+def evaluate_v3_profit_trail_fakeout_guard(
+    pos: dict,
+    *,
+    current_price: float,
+    current_roi_pct: float,
+    profit_ladder: Optional[dict] = None,
+    trail_price: float = 0.0,
+) -> dict:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    ladder = profit_ladder if isinstance(profit_ladder, dict) else {}
+    result = {
+        'armed': bool(safe_pos.get('trailFakeoutGuardArmed', False)),
+        'fire_hold': False,
+        'reason': 'OUT_OF_SCOPE',
+        'release_reason': '',
+        'hold_window_sec': 0.0,
+        'tick_count': int(safe_pos.get('trailFakeoutGuardTickCount', 0) or 0),
+    }
+    profit_phase = str(ladder.get('profit_phase', safe_pos.get('runtimeProfitPhase', 'WAIT')) or safe_pos.get('runtimeProfitPhase', 'WAIT')).upper()
+    if profit_phase != 'WIDE_TRAIL':
+        safe_pos['trailFakeoutGuardArmed'] = False
+        safe_pos['trailFakeoutGuardUntilTs'] = 0.0
+        safe_pos['trailFakeoutGuardTickCount'] = 0
+        safe_pos['trailFakeoutGuardState'] = 'IDLE'
+        result['reason'] = 'NON_WIDE_TRAIL'
+        return result
+    if current_roi_pct < V3_TRAIL_WIDE_FAKEOUT_MIN_ROI_PCT:
+        result['reason'] = 'LOW_ROI'
+        return result
+
+    safe_side = str(safe_pos.get('side', 'LONG') or 'LONG').upper()
+    atr = max(_coerce_float(safe_pos.get('atr', 0.0), 0.0), _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0) * 0.0012)
+    active_trail_price = _coerce_float(trail_price, _coerce_float(safe_pos.get('trailingStop', safe_pos.get('stopLoss', 0.0)), 0.0))
+    if active_trail_price <= 0:
+        result['reason'] = 'NO_TRAIL_PRICE'
+        return result
+    displacement_buffer = max(atr * 0.18, _coerce_float(safe_pos.get('entryPrice', 0.0), 0.0) * 0.0012)
+    if safe_side == 'LONG':
+        displacement_confirmed = float(current_price or 0.0) < (active_trail_price - displacement_buffer)
+        recovered = float(current_price or 0.0) >= active_trail_price
+        hostile_imbalance = _coerce_float(safe_pos.get('currentObImbalanceTrend', 0.0), 0.0) <= -8.0
+    else:
+        displacement_confirmed = float(current_price or 0.0) > (active_trail_price + displacement_buffer)
+        recovered = float(current_price or 0.0) <= active_trail_price
+        hostile_imbalance = _coerce_float(safe_pos.get('currentObImbalanceTrend', 0.0), 0.0) >= 8.0
+
+    transition_state = str(safe_pos.get('transitionState', 'NONE') or 'NONE').upper()
+    supportive_transition = _trail_fakeout_supportive_transition(safe_side, transition_state)
+    adverse_transition = _trail_fakeout_adverse_transition(safe_side, transition_state)
+    supportive_retest = _structure_retest_matches_side(safe_pos, safe_side)
+    supportive_pattern = str(safe_pos.get('patternBias', 'NEUTRAL') or 'NEUTRAL').upper() == 'CONTINUATION' and _coerce_float(safe_pos.get('patternConfidence', 0.0), 0.0) >= 0.50
+    supportive_coin_state = str(safe_pos.get('preferredExitProfile', safe_pos.get('runtimeExitProfile', V3_EXIT_PROFILE_BALANCED)) or V3_EXIT_PROFILE_BALANCED).upper() == V3_EXIT_PROFILE_TREND_EXPANSION
+    supportive_coin_state = supportive_coin_state or str(safe_pos.get('setupState15m', 'NEUTRAL') or 'NEUTRAL').upper() == 'CONTINUATION'
+    supportive_coin_state = supportive_coin_state or str(safe_pos.get('runtimeStateDriftState', 'ALIGNED') or 'ALIGNED').upper() == 'TREND_SUPPORT'
+    supportive = bool((supportive_retest or supportive_transition) and supportive_pattern and supportive_coin_state and not hostile_imbalance and not adverse_transition)
+
+    now_ts = time.time()
+    hold_until_ts = _coerce_float(safe_pos.get('trailFakeoutGuardUntilTs', 0.0), 0.0)
+    tick_count = int(safe_pos.get('trailFakeoutGuardTickCount', 0) or 0)
+    if bool(safe_pos.get('trailFakeoutGuardArmed', False)):
+        result['armed'] = True
+        if adverse_transition or hostile_imbalance or displacement_confirmed:
+            safe_pos['trailFakeoutGuardArmed'] = False
+            safe_pos['trailFakeoutGuardState'] = 'ABANDON_GUARD'
+            safe_pos['trailFakeoutGuardReleaseReason'] = 'ADVERSE_CONFIRMATION'
+            result['reason'] = 'ADVERSE_CONFIRMATION'
+            result['release_reason'] = 'ADVERSE_CONFIRMATION'
+            return result
+        if now_ts <= hold_until_ts and (supportive or recovered):
+            tick_count += 1
+            safe_pos['trailFakeoutGuardTickCount'] = tick_count
+            safe_pos['trailFakeoutGuardUsed'] = True
+            safe_pos['trailFakeoutGuardState'] = 'HOLD_FAKEOUT_WINDOW'
+            safe_pos['trailFakeoutGuardReason'] = 'SUPPORTIVE_RETEST_HOLD'
+            result.update({
+                'armed': True,
+                'fire_hold': True,
+                'reason': 'SUPPORTIVE_RETEST_HOLD',
+                'hold_window_sec': round(max(0.0, hold_until_ts - now_ts), 2),
+                'tick_count': tick_count,
+            })
+            return result
+        safe_pos['trailFakeoutGuardArmed'] = False
+        safe_pos['trailFakeoutGuardState'] = 'ALLOW_EXIT'
+        safe_pos['trailFakeoutGuardReleaseReason'] = 'WINDOW_EXPIRED'
+        result['reason'] = 'WINDOW_EXPIRED'
+        result['release_reason'] = 'WINDOW_EXPIRED'
+        return result
+
+    if not supportive or displacement_confirmed:
+        result['reason'] = 'NO_SUPPORTIVE_CONTINUATION'
+        safe_pos['trailFakeoutGuardState'] = 'ALLOW_EXIT'
+        return result
+
+    safe_pos['trailFakeoutGuardArmed'] = True
+    safe_pos['trailFakeoutGuardUsed'] = False
+    safe_pos['trailFakeoutGuardUntilTs'] = now_ts + V3_TRAIL_WIDE_FAKEOUT_HOLD_WINDOW_SEC
+    safe_pos['trailFakeoutGuardTickCount'] = 1
+    safe_pos['trailFakeoutGuardReason'] = 'SUPPORTIVE_RETEST_HOLD'
+    safe_pos['trailFakeoutGuardReleaseReason'] = ''
+    safe_pos['trailFakeoutGuardState'] = 'HOLD_FAKEOUT_WINDOW'
+    result.update({
+        'armed': True,
+        'fire_hold': True,
+        'reason': 'SUPPORTIVE_RETEST_HOLD',
+        'hold_window_sec': V3_TRAIL_WIDE_FAKEOUT_HOLD_WINDOW_SEC,
+        'tick_count': 1,
+    })
+    return result
+
+
 def maybe_defer_v3_profit_exit(
     pos: dict,
     current_price: float,
@@ -19324,6 +20335,8 @@ def maybe_defer_v3_profit_exit(
         return False
     current_roi_pct = compute_position_roi_pct(safe_pos, current_price=current_price)
     ladder = profit_ladder if isinstance(profit_ladder, dict) else build_position_profit_ladder(safe_pos, current_price=current_price)
+    profit_phase = str(ladder.get('profit_phase', safe_pos.get('runtimeProfitPhase', 'WAIT')) or safe_pos.get('runtimeProfitPhase', 'WAIT')).upper()
+    trail_price = _coerce_float(safe_pos.get('trailingStop', safe_pos.get('stopLoss', 0.0)), 0.0)
     state_ctx = underwater_ctx if isinstance(underwater_ctx, dict) else evaluate_v3_underwater_tape_state(
         safe_pos,
         current_price,
@@ -19337,6 +20350,27 @@ def maybe_defer_v3_profit_exit(
         profit_ladder=ladder,
         underwater_ctx=state_ctx,
     )
+    fakeout_guard = evaluate_v3_profit_trail_fakeout_guard(
+        safe_pos,
+        current_price=current_price,
+        current_roi_pct=current_roi_pct,
+        profit_ladder=ladder,
+        trail_price=trail_price,
+    )
+    if fakeout_guard.get('fire_hold', False):
+        safe_pos['lastExitDecision'] = 'TRAIL_WIDE_FAKEOUT_HOLD'
+        safe_pos['trailBreachCount'] = 0
+        safe_pos['trailBreachStartTime'] = 0
+        safe_pos['slConfirmCount'] = 0
+        safe_pos['slBreachStartTime'] = 0
+        clear_trail_breach_telemetry(safe_pos)
+        maybe_queue_position_state_snapshot(safe_pos, reason='v3_trail_fakeout_hold')
+        logger.info(
+            f"🟢 V3_TRAIL_FAKEOUT_HOLD: {safe_pos.get('symbol', '?')} {safe_pos.get('side', 'LONG')} "
+            f"roi={current_roi_pct:.1f}% phase={profit_phase} note={note or 'profit_exit'} "
+            f"reason={fakeout_guard.get('reason', 'TRAIL_WIDE_FAKEOUT')} hold={fakeout_guard.get('hold_window_sec', 0)}s"
+        )
+        return True
     if not thesis_ctx.get('fire_profit_hold', False):
         return False
     safe_pos['lastExitDecision'] = 'PROFIT_CONTINUATION_HOLD'
@@ -24796,6 +25830,10 @@ class UIStateCache:
         self.balance = 0
         self.live_balance = None
         self.positions = []
+        self.positions_observed_at = 0.0
+        self.positions_source_stale = False
+        self.positions_source_age_sec = 0.0
+        self.positions_authority = ''
         self.trades = []
         self.binance_trades = []  # Phase 157: Trades fetched from Binance
         self.pnl_data = {
@@ -24842,6 +25880,10 @@ class UIStateCache:
             "portfolio": {
                 "balance": self.balance,
                 "positions": self.positions,
+                "positionsObservedAt": self.positions_observed_at,
+                "positionsSourceStale": self.positions_source_stale,
+                "positionsSourceAgeSec": self.positions_source_age_sec,
+                "positionsAuthority": self.positions_authority,
                 "trades": sorted(self.trades, key=lambda t: t.get('closeTime', 0), reverse=True),
                 "stats": {
                     **self.pnl_data,
@@ -24852,6 +25894,10 @@ class UIStateCache:
                 "logs": self.logs[-100:],
                 "enabled": self.enabled
             },
+            "positionsObservedAt": self.positions_observed_at,
+            "positionsSourceStale": self.positions_source_stale,
+            "positionsSourceAgeSec": self.positions_source_age_sec,
+            "positionsAuthority": self.positions_authority,
             "tradingMode": self.trading_mode,
             "timestamp": self.last_update,
             "message": "Cache data" if self._initialized else "Initializing..."
@@ -24916,18 +25962,68 @@ def _resolve_live_positions_for_ui(prefer_cache: bool = False) -> tuple[list, st
     Once Binance sync has produced at least one snapshot, an empty Binance list is
     authoritative and must not fall back to stale engine memory.
     """
+    _prune_live_close_pending_positions()
     if prefer_cache and getattr(ui_state_cache, 'trading_mode', '') == 'live':
         cached_positions = list(getattr(ui_state_cache, 'positions', []) or [])
         if cached_positions:
             return cached_positions, 'ui_cache'
+        if str(getattr(ui_state_cache, 'positions_authority', '') or '').startswith('binance_sync_empty'):
+            return [], 'ui_cache_empty_authoritative'
         if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
             return [], 'ui_cache_empty'
 
+    pending_snapshots = {
+        str(symbol).upper(): _normalize_position_snapshot(dict(snapshot))
+        for symbol, snapshot in (live_close_pending_positions.items() if isinstance(globals().get('live_close_pending_positions'), dict) else [])
+        if isinstance(snapshot, dict)
+    }
     binance_positions = dedupe_position_snapshots(list(getattr(live_binance_trader, 'last_positions', []) or []))
-    if binance_positions:
-        return binance_positions, 'binance_sync'
-    if getattr(live_binance_trader, 'last_sync_time', 0) > 0:
+    last_sync_time = int(getattr(live_binance_trader, 'last_sync_time', 0) or 0)
+    source_is_stale = bool(getattr(live_binance_trader, 'last_positions_is_stale', False))
+    source_age_sec = max(0.0, _coerce_float(getattr(live_binance_trader, 'last_positions_source_age_sec', 0.0), 0.0))
+    source_authority = str(getattr(live_binance_trader, 'last_positions_authority', 'binance_sync') or 'binance_sync')
+
+    if binance_positions and not source_is_stale:
+        resolved = []
+        for pos in binance_positions:
+            symbol = str(pos.get('symbol', '') or '').upper()
+            pending = pending_snapshots.get(symbol)
+            if pending:
+                merged_pending = dict(pos)
+                merged_pending.update(pending)
+                merged_pending['positionsAuthority'] = 'close_pending'
+                merged_pending['positionsSourceStale'] = False
+                merged_pending['positionsSourceAgeSec'] = 0.0
+                resolved.append(_normalize_position_snapshot(merged_pending))
+            else:
+                resolved.append(_normalize_position_snapshot(pos))
+        return dedupe_position_snapshots(resolved), source_authority or 'binance_sync'
+
+    if last_sync_time > 0 and not source_is_stale and not binance_positions:
         return [], 'binance_sync_empty'
+
+    if pending_snapshots:
+        for snapshot in pending_snapshots.values():
+            snapshot['positionsSourceStale'] = bool(source_is_stale)
+            snapshot['positionsSourceAgeSec'] = round(source_age_sec, 2)
+        return dedupe_position_snapshots(list(pending_snapshots.values())), 'close_pending'
+
+    if source_is_stale and binance_positions:
+        if source_age_sec <= LIVE_POSITIONS_STALE_TTL_SEC:
+            stale_positions = []
+            for pos in binance_positions:
+                stale_pos = dict(pos)
+                stale_pos['positionsSourceStale'] = True
+                stale_pos['positionsSourceAgeSec'] = round(source_age_sec, 2)
+                stale_pos['positionsAuthority'] = 'binance_stale_fallback'
+                stale_positions.append(_normalize_position_snapshot(stale_pos))
+            return dedupe_position_snapshots(stale_positions), 'binance_stale_fallback'
+        logger.info(
+            f"LIVE_CLOSE__STALE_CACHE_SUPPRESSED: age={source_age_sec:.1f}s "
+            f"authority={source_authority or 'binance_sync'} count={len(binance_positions)}"
+        )
+        if last_sync_time > 0:
+            return [], 'binance_stale_suppressed'
 
     fallback_positions = dedupe_position_snapshots([dict(p) for p in global_paper_trader.positions if p.get('isLive')])
     return fallback_positions, 'engine_fallback'
@@ -26526,6 +27622,12 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         "unrealizedPnl": 0.0,
                     }
                 positions, position_source = _resolve_live_positions_for_ui()
+                positions_meta = _build_live_positions_source_meta(
+                    position_source,
+                    observed_at=getattr(live_binance_trader, 'last_positions_observed_at', 0.0),
+                    is_stale=bool(getattr(live_binance_trader, 'last_positions_is_stale', False)),
+                    source_age_sec=_coerce_float(getattr(live_binance_trader, 'last_positions_source_age_sec', 0.0), 0.0),
+                )
                 
                 # Phase 155: Merge Binance positions with exit params from global_paper_trader
                 # global_paper_trader.positions has TP/SL/Trail data from sync loop
@@ -26743,9 +27845,18 @@ async def update_ui_cache(opportunities: list, stats: dict):
                     merged_positions.append(_normalize_position_snapshot(merged))
 
                 merged_positions = dedupe_position_snapshots(merged_positions)
+                for merged in merged_positions:
+                    merged['positionsObservedAt'] = positions_meta['positionsObservedAt']
+                    merged['positionsSourceStale'] = positions_meta['positionsSourceStale']
+                    merged['positionsSourceAgeSec'] = positions_meta['positionsSourceAgeSec']
+                    merged['positionsAuthority'] = positions_meta['positionsAuthority']
                 ui_state_cache.balance = balance_data.get('walletBalance', 0)
                 ui_state_cache.live_balance = balance_data
                 ui_state_cache.positions = sorted(merged_positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                ui_state_cache.positions_observed_at = positions_meta['positionsObservedAt']
+                ui_state_cache.positions_source_stale = positions_meta['positionsSourceStale']
+                ui_state_cache.positions_source_age_sec = positions_meta['positionsSourceAgeSec']
+                ui_state_cache.positions_authority = positions_meta['positionsAuthority']
                 # Keep trade history live from engine memory; dedup via single-authority helper.
                 _deduped, _ = dedupe_trades_for_ui(global_paper_trader.trades)
                 ui_state_cache.trades = _deduped
@@ -26768,10 +27879,31 @@ async def update_ui_cache(opportunities: list, stats: dict):
                         
             except Exception as e:
                 logger.warning(f"Binance data fetch error: {e}")
+                fallback_positions, fallback_source = _resolve_live_positions_for_ui()
+                fallback_meta = _build_live_positions_source_meta(
+                    fallback_source,
+                    observed_at=getattr(live_binance_trader, 'last_positions_observed_at', 0.0),
+                    is_stale=bool(getattr(live_binance_trader, 'last_positions_is_stale', True)),
+                    source_age_sec=_coerce_float(getattr(live_binance_trader, 'last_positions_source_age_sec', 0.0), 0.0),
+                )
+                for merged in fallback_positions:
+                    merged['positionsObservedAt'] = fallback_meta['positionsObservedAt']
+                    merged['positionsSourceStale'] = fallback_meta['positionsSourceStale']
+                    merged['positionsSourceAgeSec'] = fallback_meta['positionsSourceAgeSec']
+                    merged['positionsAuthority'] = fallback_meta['positionsAuthority']
+                ui_state_cache.positions = sorted(fallback_positions, key=lambda p: p.get('openTime', 0), reverse=True)
+                ui_state_cache.positions_observed_at = fallback_meta['positionsObservedAt']
+                ui_state_cache.positions_source_stale = fallback_meta['positionsSourceStale']
+                ui_state_cache.positions_source_age_sec = fallback_meta['positionsSourceAgeSec']
+                ui_state_cache.positions_authority = fallback_meta['positionsAuthority']
         else:
             # Paper trading mode
             ui_state_cache.balance = global_paper_trader.balance
             ui_state_cache.positions = global_paper_trader.positions
+            ui_state_cache.positions_observed_at = time.time()
+            ui_state_cache.positions_source_stale = False
+            ui_state_cache.positions_source_age_sec = 0.0
+            ui_state_cache.positions_authority = 'paper_engine'
             ui_state_cache.pnl_data = global_paper_trader.get_today_pnl()
             ui_state_cache.trading_mode = "paper"
             # Phase 232: Sync trades on every cycle (dedup via single-authority helper)
@@ -29576,6 +30708,12 @@ async def evaluate_post_exit_reentry_watchers(opportunities: list, signals: list
             or watch.get('runnerContextResolved', '')
         )
         watch['breakoutDistancePrice'] = selected_breakout_distance
+        _refresh_post_exit_followthrough_memory_from_watch(
+            watch,
+            reason=selected_reason,
+            selected_signal=selected_signal,
+            selected_opportunity=selected_opp,
+        )
 
         candidate_mode_changed = bool(
             str(watch.get('watchState', POST_EXIT_REENTRY_STATE_ARMED)) == POST_EXIT_REENTRY_STATE_CANDIDATE
@@ -30789,6 +31927,19 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 and signal_volume_ratio >= THIN_BOOK_SUPER_SOFTPASS_MIN_VOL_RATIO
                 and total_depth >= dynamic_depth_threshold * THIN_BOOK_SUPER_SOFTPASS_DEPTH_RATIO
             )
+            _bid_depth = float(depth_data.get('total_bid_usd', 0) or 0)
+            _ask_depth = float(depth_data.get('total_ask_usd', 0) or 0)
+            post_exit_thin_book_grace = evaluate_post_exit_followthrough_thin_book_grace(
+                signal,
+                total_depth_usd=total_depth,
+                dynamic_depth_threshold=dynamic_depth_threshold,
+                exec_score=exec_score,
+                spread_pct=signal_spread,
+                leverage=signal_leverage,
+                bid_depth_usd=_bid_depth,
+                ask_depth_usd=_ask_depth,
+            )
+            grace_soft_pass = bool(post_exit_thin_book_grace.get('allow', False))
             # ═══════════════════════════════════════════════════════
             # RFX-1C: Order-size-aware depth gate
             # shadow: telemetry only, legacy decides
@@ -30797,8 +31948,6 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
             _rfx1c_bypass = False  # True if enforce mode passes
             if RFX1C_DEPTH_GATE_MODE != 'off' and _RFX_MODULES_AVAILABLE:
                 try:
-                    _bid_depth = float(depth_data.get('total_bid_usd', 0) or 0)
-                    _ask_depth = float(depth_data.get('total_ask_usd', 0) or 0)
                     _size_mult = float(signal.get('sizeMultiplier', 1.0) or 1.0)
                     # process_signal_for_paper_trading is a module-level coroutine.
                     # Use the live paper-trader state instead of nonexistent method scope.
@@ -30864,7 +32013,7 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                 except Exception as _rfx1c_err:
                     logger.warning(f"⚠️ RFX1C_ERROR: {symbol} {_rfx1c_err} — legacy fallback")
             
-            if not _rfx1c_bypass and 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass):
+            if not _rfx1c_bypass and 0 < total_depth < dynamic_depth_threshold and not (near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass or grace_soft_pass):
                 # Phase 237: Soft Risk Gate fallback before hard reject
                 if SOFT_RISK_GATE_ENABLED:
                     _rg = evaluate_risk_gate(signal, {
@@ -30929,9 +32078,11 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                         attribution_score=signal_score,
                         metric_key='thin_book_rejected',
                     )
-            elif near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass:
+            elif near_threshold_soft_pass or legacy_soft_pass or legacy_micro_soft_pass or smart_soft_pass or super_soft_pass or grace_soft_pass:
                 original_score = signal.get('confidenceScore', 60)
-                if near_threshold_soft_pass:
+                if grace_soft_pass:
+                    score_penalty = int(post_exit_thin_book_grace.get('scorePenalty', 4) or 4)
+                elif near_threshold_soft_pass:
                     score_penalty = 6
                 elif legacy_micro_soft_pass:
                     score_penalty = 9
@@ -30943,7 +32094,35 @@ async def process_signal_for_paper_trading(signal: dict, price: float):
                     score_penalty = THIN_BOOK_SMART_SOFTPASS_PENALTY
                 signal['confidenceScore'] = max(40, int(original_score) - score_penalty)
                 global_paper_trader.pipeline_metrics['memory_soft_pass'] += 1
-                if super_soft_pass:
+                if grace_soft_pass:
+                    signal['postExitThinBookGraceUsed'] = True
+                    signal['postExitThinBookGraceReason'] = str(post_exit_thin_book_grace.get('reason', 'POST_EXIT_THIN_BOOK_GRACE') or 'POST_EXIT_THIN_BOOK_GRACE')
+                    signal['sizeMultiplier'] = min(
+                        float(signal.get('sizeMultiplier', 1.0) or 1.0),
+                        _coerce_float(post_exit_thin_book_grace.get('sizeMultCap', 1.0), 1.0),
+                    )
+                    _grace_old_lev = int(signal.get('leverage', signal_leverage) or signal_leverage)
+                    _grace_lev_cap = int(post_exit_thin_book_grace.get('leverageCap', _grace_old_lev) or _grace_old_lev)
+                    signal['leverage'] = max(3, min(_grace_old_lev, _grace_lev_cap))
+                    if signal['leverage'] < _grace_old_lev:
+                        signal['leverageCapApplied'] = True
+                        signal['leverageCapValue'] = _grace_lev_cap
+                        signal['leverageCapReason'] = 'POST_EXIT_THIN_BOOK_GRACE'
+                    signal_log_data['post_exit_thin_book_grace'] = {
+                        'used': True,
+                        'reason': signal['postExitThinBookGraceReason'],
+                        'planned_notional_usd': post_exit_thin_book_grace.get('plannedNotionalUsd', 0.0),
+                        'depth_coverage_ratio': post_exit_thin_book_grace.get('depthCoverageRatio', 0.0),
+                        'estimated_entry_impact_pct': post_exit_thin_book_grace.get('estimatedEntryImpactPct', 0.0),
+                    }
+                    logger.info(
+                        f"🟦 POST_EXIT_THIN_BOOK_GRACE: {action} {symbol} depth=${total_depth:.0f} "
+                        f"th=${dynamic_depth_threshold:.0f} notional=${post_exit_thin_book_grace.get('plannedNotionalUsd', 0.0):.0f} "
+                        f"cover={post_exit_thin_book_grace.get('depthCoverageRatio', 0.0):.3f} "
+                        f"impact={post_exit_thin_book_grace.get('estimatedEntryImpactPct', 0.0):.3f}% "
+                        f"score {original_score}->{signal['confidenceScore']} lev {signal_leverage}x->{signal['leverage']}x"
+                    )
+                elif super_soft_pass:
                     global_paper_trader.pipeline_metrics['thin_book_super_override'] = (
                         global_paper_trader.pipeline_metrics.get('thin_book_super_override', 0) + 1
                     )
@@ -43412,6 +44591,7 @@ class SignalGenerator:
             'contextConfidence': decision_context_preview.get('contextConfidence', 0.5),
             'replayFidelity': DECISION_REPLAY_FIDELITY_APPROX,
         }
+        _signal_core_payload = _apply_post_exit_followthrough_to_payload(_signal_core_payload)
         _signal_core_payload['entryArchetype'] = entry_archetype
         _signal_core_payload['decisionContext']['entryArchetype'] = entry_archetype
         _signal_core_payload['decisionContext']['directionOwner'] = direction_metadata.get('directionOwner', '')
@@ -45000,6 +46180,22 @@ class PaperTradingEngine:
                 )
             else:
                 existing_pending[key] = safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, '')))
+        for key in _PENDING_REINFORCE_FOLLOWTHROUGH_FIELDS:
+            if key in ('postExitFollowthroughConfidence', 'postExitFollowthroughAgeSec'):
+                existing_pending[key] = _coerce_float(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, 0.0))),
+                    _coerce_float(existing_pending.get(key, 0.0), 0.0),
+                )
+            elif key in ('postExitFollowthroughActive', 'postExitThinBookGraceUsed', 'postExitExposureReserveUsed', 'oppositeReclaimSuppressed'):
+                existing_pending[key] = bool(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, False)))
+                )
+            elif key == 'postExitPreferredEntryFamilies':
+                existing_pending[key] = _normalize_post_exit_followthrough_families(
+                    safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, []))),
+                )
+            else:
+                existing_pending[key] = safe_signal.get(key, existing_pending.get(key, merged_snapshot.get(key, '')))
         if is_existing_reentry:
             existing_pending['isPostExitReentry'] = True
             for key in _PENDING_REINFORCE_REENTRY_FIELDS:
@@ -45338,6 +46534,17 @@ class PaperTradingEngine:
             p for p in self.pending_orders
             if p is not replacement_candidate_pending
         ]
+        reserve_slots_used = sum(
+            1 for p in self.positions
+            if bool(p.get('postExitExposureReserveUsed', False))
+        ) + sum(
+            1 for p in pending_orders_for_capacity
+            if bool(p.get('postExitExposureReserveUsed', False))
+        )
+        post_exit_reserve_ctx = evaluate_post_exit_followthrough_exposure_reserve(
+            signal,
+            reserve_slots_used=reserve_slots_used,
+        ) if isinstance(signal, dict) else {'allow': False, 'reason': 'NO_SIGNAL'}
         pos_count = len(self.positions)
         pending_count = len(pending_orders_for_capacity)
         effective_exposure = pos_count + int(pending_count * pending_weight)
@@ -45345,13 +46552,26 @@ class PaperTradingEngine:
             pending_count = len(self.pending_orders)
             effective_exposure = pos_count + int(pending_count * pending_weight)
         if effective_exposure >= self.max_positions:
-            self.set_execution_feedback(trade_symbol, "MAX_EXPOSURE")
-            logger.info(
-                f"🚫 OPEN_POS SKIP: Max exposure reached "
-                f"(effective={effective_exposure}/{self.max_positions}, "
-                f"positions={pos_count}, pending={pending_count}, pending_w={pending_weight:.2f})"
-            )
-            return None  # Silently skip to avoid log spam
+            if replacement_candidate_pending is None and bool(post_exit_reserve_ctx.get('allow', False)) and isinstance(signal, dict):
+                signal['postExitExposureReserveUsed'] = True
+                signal['postExitExposureReserveReason'] = str(post_exit_reserve_ctx.get('reason', 'POST_EXIT_EXPOSURE_RESERVE') or 'POST_EXIT_EXPOSURE_RESERVE')
+                signal['sizeMultiplier'] = min(
+                    float(signal.get('sizeMultiplier', 1.0) or 1.0),
+                    _coerce_float(post_exit_reserve_ctx.get('sizeMultCap', 1.0), 1.0),
+                )
+                logger.info(
+                    f"🟪 POST_EXIT_EXPOSURE_RESERVE: {trade_symbol} {side} "
+                    f"effective={effective_exposure}/{self.max_positions} reserve_slot={reserve_slots_used + 1}/{V3_POST_EXIT_EXPOSURE_RESERVE_SLOTS} "
+                    f"size_mult={signal.get('sizeMultiplier', 1.0):.2f}"
+                )
+            else:
+                self.set_execution_feedback(trade_symbol, "MAX_EXPOSURE")
+                logger.info(
+                    f"🚫 OPEN_POS SKIP: Max exposure reached "
+                    f"(effective={effective_exposure}/{self.max_positions}, "
+                    f"positions={pos_count}, pending={pending_count}, pending_w={pending_weight:.2f})"
+                )
+                return None  # Silently skip to avoid log spam
         
         # Phase 217/219: Direction exposure limits — pending orders are partially counted.
         long_pos_count = sum(1 for p in self.positions if p.get('side') == 'LONG')
@@ -46610,6 +47830,7 @@ class PaperTradingEngine:
             "trailDistance": trail_distance,
             "leverage": adjusted_leverage,
             "spreadLevel": spread_level,
+            "sizeMultiplier": _coerce_float(signal.get('sizeMultiplier', 1.0) if signal else 1.0, 1.0),
             "signalScore": signal.get('confidenceScore', 0) if signal else 0,
             "signalScoreRaw": signal.get('_rawConfidenceScore', signal.get('confidenceScore', 0)) if signal else 0,
             "mtfScore": signal.get('mtf_score', 0) if signal else 0,
@@ -46784,10 +48005,13 @@ class PaperTradingEngine:
             # RFX-2B: Distance truth telemetry
             "distance_truth": _levels.get('distance_truth', {}),
         }
+        pending_order.update(_extract_post_exit_followthrough_fields(signal))
         
         self.pending_orders.append(pending_order)
         self.pipeline_metrics['pending_created'] += 1
         self.clear_execution_feedback(trade_symbol)
+        if bool(pending_order.get('postExitFollowthroughActive', False)):
+            consume_post_exit_followthrough_context(trade_symbol, reason='pending_created')
         if replacement_candidate_pending and replacement_candidate_pending in self.pending_orders:
             try:
                 self.pending_orders.remove(replacement_candidate_pending)
@@ -48621,6 +49845,7 @@ class PaperTradingEngine:
             "entryPrice": fill_price,
             "size": order['size'],
             "sizeUsd": order['sizeUsd'],
+            "sizeMultiplier": _coerce_float(order.get('sizeMultiplier', 1.0), 1.0),
             "contracts": order['size'],  # Phase 223b: needed for partial TP
             "stopLoss": sl,
             "takeProfit": tp,
@@ -48722,6 +49947,18 @@ class PaperTradingEngine:
             "postExitReentryConfirmDelaySec": int(order.get('postExitReentryConfirmDelaySec', 0) or 0),
             "postExitReentryExpiresSec": int(order.get('postExitReentryExpiresSec', 0) or 0),
             "postExitReentryExecutionPriority": str(order.get('postExitReentryExecutionPriority', '') or ''),
+            "postExitFollowthroughActive": bool(order.get('postExitFollowthroughActive', False)),
+            "postExitFollowthroughMode": str(order.get('postExitFollowthroughMode', '') or ''),
+            "postExitPreferredSide": str(order.get('postExitPreferredSide', '') or ''),
+            "postExitPreferredEntryFamilies": _normalize_post_exit_followthrough_families(order.get('postExitPreferredEntryFamilies', [])),
+            "postExitFollowthroughConfidence": _coerce_float(order.get('postExitFollowthroughConfidence', 0.0), 0.0),
+            "postExitFollowthroughAgeSec": _coerce_float(order.get('postExitFollowthroughAgeSec', 0.0), 0.0),
+            "postExitWatchRegisterResult": str(order.get('postExitWatchRegisterResult', '') or ''),
+            "postExitWatchRegisterReason": str(order.get('postExitWatchRegisterReason', '') or ''),
+            "postExitThinBookGraceUsed": bool(order.get('postExitThinBookGraceUsed', False)),
+            "postExitExposureReserveUsed": bool(order.get('postExitExposureReserveUsed', False)),
+            "postExitExposureReserveReason": str(order.get('postExitExposureReserveReason', '') or ''),
+            "oppositeReclaimSuppressed": bool(order.get('oppositeReclaimSuppressed', False)),
             "reversalRetestEntryMode": str(order.get('reversalRetestEntryMode', '') or ''),
             "reversalRetestPullbackPctOriginal": _coerce_float(order.get('reversalRetestPullbackPctOriginal', 0.0), 0.0),
             "reversalRetestPullbackPctApplied": _coerce_float(order.get('reversalRetestPullbackPctApplied', 0.0), 0.0),
@@ -50478,6 +51715,7 @@ class PaperTradingEngine:
             "entryPrice": current_price,
             "size": position_size,
             "sizeUsd": position_size_usd,
+            "sizeMultiplier": _coerce_float(signal.get('sizeMultiplier', 1.0), 1.0),
             "marginUsd": _manual_margin_usd,  # P0-2: explicit margin
             "contracts": position_size,  # Phase 223b: needed for partial TP
             "stopLoss": signal['sl'],
@@ -50548,6 +51786,7 @@ class PaperTradingEngine:
             # RFX-2B: Distance truth telemetry
             "distance_truth": signal.get('distance_truth', {}),
         }
+        new_position.update(_extract_post_exit_followthrough_fields(signal))
         # RFX-2B.1: Fallback recompute — signal-direct path has no distance_truth
         if not new_position.get('distance_truth') and _RFX_MODULES_AVAILABLE:
             try:
@@ -50587,6 +51826,8 @@ class PaperTradingEngine:
         self.balance -= initial_margin
         
         self.positions.append(new_position)
+        if bool(new_position.get('postExitFollowthroughActive', False)):
+            consume_post_exit_followthrough_context(self.symbol, reason='manual_position_opened')
         
         # Save to SQLite for persistent openTime tracking
         try:
@@ -51221,6 +52462,25 @@ class PaperTradingEngine:
             "fakeoutReclaimArmRoiPct": _coerce_float(pos.get('fakeoutReclaimArmRoiPct', 0.0), 0.0),
             "fakeoutReclaimReason": pos.get('fakeoutReclaimReason', ''),
             "fakeoutReclaimReleaseReason": pos.get('fakeoutReclaimReleaseReason', ''),
+            "trailFakeoutGuardArmed": bool(pos.get('trailFakeoutGuardArmed', False)),
+            "trailFakeoutGuardUsed": bool(pos.get('trailFakeoutGuardUsed', False)),
+            "trailFakeoutGuardUntilTs": _coerce_float(pos.get('trailFakeoutGuardUntilTs', 0.0), 0.0),
+            "trailFakeoutGuardTickCount": int(pos.get('trailFakeoutGuardTickCount', 0) or 0),
+            "trailFakeoutGuardReason": str(pos.get('trailFakeoutGuardReason', '') or ''),
+            "trailFakeoutGuardReleaseReason": str(pos.get('trailFakeoutGuardReleaseReason', '') or ''),
+            "trailFakeoutGuardState": str(pos.get('trailFakeoutGuardState', 'IDLE') or 'IDLE'),
+            "postExitWatchRegisterResult": str(pos.get('postExitWatchRegisterResult', '') or ''),
+            "postExitWatchRegisterReason": str(pos.get('postExitWatchRegisterReason', '') or ''),
+            "postExitFollowthroughActive": bool(pos.get('postExitFollowthroughActive', False)),
+            "postExitFollowthroughMode": str(pos.get('postExitFollowthroughMode', '') or ''),
+            "postExitPreferredSide": str(pos.get('postExitPreferredSide', '') or ''),
+            "postExitPreferredEntryFamilies": _normalize_post_exit_followthrough_families(pos.get('postExitPreferredEntryFamilies', [])),
+            "postExitFollowthroughConfidence": _coerce_float(pos.get('postExitFollowthroughConfidence', 0.0), 0.0),
+            "postExitFollowthroughAgeSec": _coerce_float(pos.get('postExitFollowthroughAgeSec', 0.0), 0.0),
+            "postExitThinBookGraceUsed": bool(pos.get('postExitThinBookGraceUsed', False)),
+            "postExitExposureReserveUsed": bool(pos.get('postExitExposureReserveUsed', False)),
+            "postExitExposureReserveReason": str(pos.get('postExitExposureReserveReason', '') or ''),
+            "oppositeReclaimSuppressed": bool(pos.get('oppositeReclaimSuppressed', False)),
             "isPostExitReentry": bool(pos.get('isPostExitReentry', False)),
             "reentryOrigin": pos.get('reentryOrigin', ''),
             "reentryOriginTradeId": str(pos.get('reentryOriginTradeId', '') or ''),
@@ -51297,6 +52557,13 @@ class PaperTradingEngine:
             "runtimeExchangeProtectiveStopRoiPct": _coerce_float(pos.get('runtimeExchangeProtectiveStopRoiPct', 0.0), 0.0),
             "runtimeExchangeProtectiveStopPrice": _coerce_float(pos.get('runtimeExchangeProtectiveStopPrice', 0.0), 0.0),
             "runtimeProtectionPhase": str(pos.get('runtimeProtectionPhase', 'SL-PRIMARY') or 'SL-PRIMARY'),
+            "uiClosePending": bool(pos.get('uiClosePending', False)),
+            "uiClosePendingReason": str(pos.get('uiClosePendingReason', '') or ''),
+            "uiCloseScheduledAt": _coerce_float(pos.get('uiCloseScheduledAt', 0.0), 0.0),
+            "positionsObservedAt": _coerce_float(pos.get('positionsObservedAt', 0.0), 0.0),
+            "positionsSourceStale": bool(pos.get('positionsSourceStale', False)),
+            "positionsSourceAgeSec": _coerce_float(pos.get('positionsSourceAgeSec', 0.0), 0.0),
+            "positionsAuthority": str(pos.get('positionsAuthority', '') or ''),
             "runtimeStructuralInvalidationActive": bool(pos.get('runtimeStructuralInvalidationActive', False)),
             "runtimeStructuralInvalidationSource": str(pos.get('runtimeStructuralInvalidationSource', '') or ''),
             "runtimeStructuralInvalidationPrice": _coerce_float(pos.get('runtimeStructuralInvalidationPrice', 0.0), 0.0),
@@ -51516,13 +52783,42 @@ class PaperTradingEngine:
         }
 
         try:
-            register_post_exit_reentry_watch(
+            _watch_registration = evaluate_post_exit_reentry_watch_registration(
+                pos,
+                trade,
+                original_reason=original_reason,
+                normalized_reason=reason,
+            )
+            _registered_watch = register_post_exit_reentry_watch(
                 pos,
                 trade,
                 original_reason=original_reason,
                 normalized_reason=reason,
                 exit_price=exit_price,
             )
+            trade['postExitWatchRegisterResult'] = 'REGISTERED' if _registered_watch else 'SKIPPED'
+            trade['postExitWatchRegisterReason'] = str(_watch_registration.get('reason', '') or '')
+            pos['postExitWatchRegisterResult'] = trade['postExitWatchRegisterResult']
+            pos['postExitWatchRegisterReason'] = trade['postExitWatchRegisterReason']
+            _followthrough_seed = _seed_post_exit_followthrough_memory(
+                pos,
+                trade,
+                original_reason=original_reason,
+                normalized_reason=reason,
+                watch_registration=_watch_registration,
+                watch=_registered_watch,
+            )
+            if _followthrough_seed:
+                trade['postExitFollowthroughMode'] = str(_followthrough_seed.get('followthroughMode', '') or '')
+                trade['postExitPreferredSide'] = str(_followthrough_seed.get('preferredSide', '') or '')
+                trade['postExitPreferredEntryFamilies'] = list(_followthrough_seed.get('preferredEntryFamilies', []) or [])
+                trade['postExitFollowthroughConfidence'] = round(_coerce_float(_followthrough_seed.get('followthroughConfidence', 0.0), 0.0), 4)
+                trade['postExitFollowthroughActive'] = not bool(_followthrough_seed.get('consumed', False))
+                pos['postExitFollowthroughMode'] = trade['postExitFollowthroughMode']
+                pos['postExitPreferredSide'] = trade['postExitPreferredSide']
+                pos['postExitPreferredEntryFamilies'] = trade['postExitPreferredEntryFamilies']
+                pos['postExitFollowthroughConfidence'] = trade['postExitFollowthroughConfidence']
+                pos['postExitFollowthroughActive'] = trade['postExitFollowthroughActive']
         except Exception as reentry_watch_err:
             logger.debug(f"Post-exit re-entry watch register error: {reentry_watch_err}")
         
@@ -51640,6 +52936,7 @@ class PaperTradingEngine:
                 "trade_data": trade,  # Full trade data for Binance sync to use
                 "entry_order_id": pos.get('binance_order_id', ''),  # Phase 229
             }
+            _mark_live_close_pending(pos, reason=detailed_reason, exit_price=exit_price)
             logger.info(f"📋 PENDING REASON SET: {symbol} = {detailed_reason}")
             
             # Phase 187: Save to position_closes with ALL settings data
@@ -53258,6 +54555,8 @@ pending_close_reasons = {}  # {symbol: {"reason": str, "details": dict, "timesta
 active_signals = {}  # {symbol: {side, score, created_ts, last_refresh_ts, ttl_sec, state, counter_count, counter_first_ts, reentry_count, last_close_ts}}
 post_exit_reentry_watchers = {}  # {symbol: {watcherId, originalTradeId, watchState, ...}}
 post_exit_reentry_watch_history = []  # [{ts, symbol, reason, resolutionMode, resolutionTargetSide, reentryTriggered, ...}]
+post_exit_followthrough_memory = {}  # {symbol: {preferredSide, followthroughMode, closeTs, consumed, ...}}
+live_close_pending_positions = {}  # {symbol: {uiClosePending, uiCloseScheduledAt, ...}}
 market_structure_cache = {}
 coin_state_cache = {}
 signal_event_buffer = deque(maxlen=2000)
@@ -53280,6 +54579,62 @@ SIGNAL_STAGE_EXPIRED = 'EXPIRED'
 SIGNAL_EXECUTABLE_STATES = {'ACTIVE', SIGNAL_STAGE_EXECUTABLE}
 SIGNAL_PENDING_STATES = {SIGNAL_STAGE_PENDING, SIGNAL_STAGE_PENDING_RECHECK}
 SIGNAL_OPEN_STATES = {SIGNAL_STAGE_OPEN_ATTEMPT, SIGNAL_STAGE_OPENED}
+
+
+def _prune_live_close_pending_positions(now_ts: Optional[float] = None) -> None:
+    now_ts = float(now_ts or time.time())
+    pending = live_close_pending_positions if isinstance(globals().get('live_close_pending_positions'), dict) else None
+    if pending is None:
+        return
+    expiry_ts = now_ts - LIVE_CLOSE_PENDING_UI_TTL_SEC
+    stale_symbols = [
+        symbol
+        for symbol, snap in pending.items()
+        if not isinstance(snap, dict) or _coerce_float(snap.get('uiCloseScheduledAt', 0.0), 0.0) < expiry_ts
+    ]
+    for symbol in stale_symbols:
+        pending.pop(symbol, None)
+
+
+def _mark_live_close_pending(pos: dict, *, reason: str, exit_price: float) -> None:
+    safe_pos = pos if isinstance(pos, dict) else {}
+    symbol = str(safe_pos.get('symbol', '') or '').upper()
+    if not symbol:
+        return
+    now_ts = time.time()
+    snapshot = _normalize_position_snapshot(dict(safe_pos))
+    snapshot.update({
+        'uiClosePending': True,
+        'uiClosePendingReason': str(reason or ''),
+        'uiCloseScheduledAt': now_ts,
+        'uiCloseExpectedPrice': _coerce_float(exit_price, 0.0),
+        'positionsAuthority': 'close_pending',
+        'positionsSourceStale': False,
+        'positionsSourceAgeSec': 0.0,
+    })
+    live_close_pending_positions[symbol] = snapshot
+    logger.info(f"LIVE_CLOSE__UI_PENDING: {symbol} reason={reason}")
+
+
+def _clear_live_close_pending(symbol: str, *, resolution_reason: str = '') -> None:
+    safe_symbol = str(symbol or '').upper()
+    if not safe_symbol:
+        return
+    removed = live_close_pending_positions.pop(safe_symbol, None)
+    if removed is not None:
+        logger.info(f"LIVE_CLOSE__SYNC_CONFIRMED: {safe_symbol} reason={resolution_reason or 'SYNC_CONFIRMED'}")
+
+
+def _build_live_positions_source_meta(source: str = '', *, observed_at: float = 0.0, is_stale: bool = False, source_age_sec: float = 0.0) -> dict:
+    observed = _coerce_float(observed_at, 0.0)
+    age = max(0.0, _coerce_float(source_age_sec, 0.0))
+    authority = str(source or 'unknown')
+    return {
+        'positionsObservedAt': observed,
+        'positionsSourceStale': bool(is_stale),
+        'positionsSourceAgeSec': round(age, 2),
+        'positionsAuthority': authority,
+    }
 
 
 def is_executable_signal_state(state: Any) -> bool:

@@ -251,13 +251,24 @@ const resolveReadablePositionStage = ({
   protectionPhase,
   profitPhase,
   isTrailingActive,
+  uiClosePending,
 }: {
   protectionPhase: string;
   profitPhase: string;
   isTrailingActive: boolean;
+  uiClosePending?: boolean;
 }) => {
   const protectionLabel = translateProtectionPhaseLabel(protectionPhase);
   const profitLabel = translateProfitPhaseLabel(profitPhase);
+
+  if (uiClosePending) {
+    return {
+      primaryLabel: 'Kapanış Onaylanıyor',
+      primaryTone: 'bg-amber-500/15 text-amber-300',
+      protectionLabel,
+      profitLabel,
+    };
+  }
 
   if (['INVALIDATION', 'REGIME', 'EXEC-RISK', 'CARRY', 'PRE-REDUCE', 'RECOVERY', 'TIME-RECOVERY', 'KS-CAP'].includes(protectionPhase)) {
     return {
@@ -2559,6 +2570,7 @@ export default function App() {
                       protectionPhase,
                       profitPhase,
                       isTrailingActive,
+                      uiClosePending: Boolean((pos as any).uiClosePending),
                     });
                     const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
                     const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
@@ -2597,6 +2609,21 @@ export default function App() {
                           <div className="mt-1 text-[10px] text-slate-400">
                             Koruma: {stageDisplay.protectionLabel} • Kâr: {stageDisplay.profitLabel}
                           </div>
+                          {Boolean((pos as any).uiClosePending) && (
+                            <div className="mt-1 text-[10px] text-amber-300">
+                              Kapanış nedeni: {humanizeDecisionToken(String((pos as any).uiClosePendingReason || 'Borsa Teyidi Bekleniyor'))}
+                            </div>
+                          )}
+                          {Boolean((pos as any).positionsSourceStale) && (
+                            <div className="mt-1 text-[10px] text-amber-200">
+                              Canlı Kaynak Bayat • Yaş {Number((pos as any).positionsSourceAgeSec || 0).toFixed(0)} sn
+                            </div>
+                          )}
+                          {Boolean((pos as any).uiClosePending) && (
+                            <div className="mt-1 text-[10px] text-slate-500">
+                              Borsa Teyidi Bekleniyor
+                            </div>
+                          )}
                           <div className="mt-2 text-[10px] text-cyan-300">
                             {coinStateSummary.primaryLabel}
                           </div>
@@ -2616,6 +2643,24 @@ export default function App() {
                           <div className="mt-1 text-[10px] text-slate-500">
                             {coinStateSummary.footerLabel}
                           </div>
+                          {Boolean((pos as any).postExitFollowthroughActive) && (
+                            <div className="mt-1 text-[10px] text-sky-300">
+                              Çıkış Sonrası Takip: {humanizeDecisionToken(String((pos as any).postExitFollowthroughMode || ''))}
+                              {String((pos as any).postExitPreferredSide || '') ? ` • Tercih ${humanizeDecisionToken(String((pos as any).postExitPreferredSide || ''))}` : ''}
+                            </div>
+                          )}
+                          {Boolean((pos as any).postExitThinBookGraceUsed) && (
+                            <div className="mt-1 text-[10px] text-cyan-300">Likidite Nedeniyle Küçültülmüş Giriş</div>
+                          )}
+                          {Boolean((pos as any).postExitExposureReserveUsed) && (
+                            <div className="mt-1 text-[10px] text-violet-300">
+                              Portföy Rezervi Kullanıldı
+                              {String((pos as any).postExitExposureReserveReason || '') ? ` • ${humanizeDecisionToken(String((pos as any).postExitExposureReserveReason || ''))}` : ''}
+                            </div>
+                          )}
+                          {Boolean((pos as any).oppositeReclaimSuppressed) && (
+                            <div className="mt-1 text-[10px] text-amber-300">Karşı Yön Reclaim Baskılandı</div>
+                          )}
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
                           <div><span className="text-slate-500">Yatırılan</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
@@ -2638,6 +2683,9 @@ export default function App() {
                           <div>Exchange Koruma: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
                           <div>Koruma Yetkisi: <span className="text-slate-200">{protectionSummary.authorityLabel}</span></div>
                           <div>Aktif Rol: <span className="text-slate-200">{protectionSummary.roleLabel}</span></div>
+                          {String((pos as any).positionsAuthority || '') && (
+                            <div>Canlı Kaynak: <span className="text-slate-200">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>
+                          )}
                           {protectionSummary.emergencyLabel !== '—' && (
                             <div>Acil Taban: <span className="text-slate-200">{protectionSummary.emergencyLabel}</span></div>
                           )}
@@ -2790,6 +2838,7 @@ export default function App() {
                           protectionPhase,
                           profitPhase,
                           isTrailingActive,
+                          uiClosePending: Boolean((pos as any).uiClosePending),
                         });
                         const profitPeakRoiPct = Number((pos as any).runtimeProfitPeakRoiPct ?? 0);
                         const profitGivebackRoiPct = Number((pos as any).runtimeProfitGivebackRoiPct ?? 0);
@@ -2819,9 +2868,22 @@ export default function App() {
                               </div>
                               <div className="mt-1 text-[10px] text-slate-400">
                                 Aşama: <span className="text-slate-200">{stageDisplay.primaryLabel}</span>
-                                {' '}• Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
-                                {' '}• Kâr: <span className="text-slate-300">{stageDisplay.profitLabel}</span>
+                              {' '}• Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
+                              {' '}• Kâr: <span className="text-slate-300">{stageDisplay.profitLabel}</span>
+                            </div>
+                            {Boolean((pos as any).uiClosePending) && (
+                              <div className="mt-1 text-[11px] text-amber-300">
+                                Kapanış nedeni: {humanizeDecisionToken(String((pos as any).uiClosePendingReason || 'Borsa Teyidi Bekleniyor'))}
                               </div>
+                            )}
+                            {Boolean((pos as any).positionsSourceStale) && (
+                              <div className="mt-1 text-[11px] text-amber-200">
+                                Canlı Kaynak Bayat • Yaş {Number((pos as any).positionsSourceAgeSec || 0).toFixed(0)} sn
+                              </div>
+                            )}
+                            {Boolean((pos as any).uiClosePending) && (
+                              <div className="mt-1 text-[11px] text-slate-500">Borsa Teyidi Bekleniyor</div>
+                            )}
                               <div className="mt-1 text-[10px] text-cyan-300">
                                 {coinStateSummary.primaryLabel}
                               </div>
@@ -2841,6 +2903,24 @@ export default function App() {
                               <div className="mt-1 text-[10px] text-slate-600">
                                 {coinStateSummary.footerLabel}
                               </div>
+                              {Boolean((pos as any).postExitFollowthroughActive) && (
+                                <div className="mt-1 text-[10px] text-sky-300">
+                                  Çıkış Sonrası Takip: {humanizeDecisionToken(String((pos as any).postExitFollowthroughMode || ''))}
+                                  {String((pos as any).postExitPreferredSide || '') ? ` • Tercih ${humanizeDecisionToken(String((pos as any).postExitPreferredSide || ''))}` : ''}
+                                </div>
+                              )}
+                              {Boolean((pos as any).postExitThinBookGraceUsed) && (
+                                <div className="mt-1 text-[10px] text-cyan-300">Likidite Nedeniyle Küçültülmüş Giriş</div>
+                              )}
+                              {Boolean((pos as any).postExitExposureReserveUsed) && (
+                                <div className="mt-1 text-[10px] text-violet-300">
+                                  Portföy Rezervi Kullanıldı
+                                  {String((pos as any).postExitExposureReserveReason || '') ? ` • ${humanizeDecisionToken(String((pos as any).postExitExposureReserveReason || ''))}` : ''}
+                                </div>
+                              )}
+                              {Boolean((pos as any).oppositeReclaimSuppressed) && (
+                                <div className="mt-1 text-[10px] text-amber-300">Karşı Yön Reclaim Baskılandı</div>
+                              )}
                               <div className="mt-1 flex flex-wrap gap-1">
                                 {(() => {
                                   const chips = [
@@ -2877,6 +2957,9 @@ export default function App() {
                                 <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
                                 <div className="text-slate-500">Taktik: <span className="text-slate-300">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
                                 <div className="text-slate-500">Borsa: <span className="text-slate-300">{protectionSummary.exchangeLabel}</span></div>
+                                {String((pos as any).positionsAuthority || '') && (
+                                  <div className="text-slate-500">Canlı Kaynak: <span className="text-slate-300">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>
+                                )}
                                 <div className="text-slate-500">Yetki: <span className="text-slate-300">{protectionSummary.authorityLabel}</span></div>
                                 <div className="text-slate-500">Rol: <span className="text-slate-300">{protectionSummary.roleLabel}</span></div>
                                 {protectionSummary.emergencyLabel !== '—' && (

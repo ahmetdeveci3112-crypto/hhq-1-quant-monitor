@@ -209,7 +209,10 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Thesis', value: humanizeToken(trade.positionThesisState, '—') },
             { label: 'Aged Guard', value: humanizeToken(trade.agedProfitGuardState, '—') },
             { label: 'Fake-Out', value: trade.fakeoutReclaimHoldArmed || trade.fakeoutReclaimHoldUsed ? humanizeToken(trade.fakeoutReclaimReleaseReason || trade.fakeoutReclaimReason || 'ARMED') : '—' },
+            { label: 'Trail Fakeout', value: trade.trailFakeoutGuardArmed || trade.trailFakeoutGuardUsed ? humanizeToken(trade.trailFakeoutGuardState || trade.trailFakeoutGuardReleaseReason || trade.trailFakeoutGuardReason || 'ARMED') : '—' },
             { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
+            { label: 'Watch Register', value: humanizeToken(trade.postExitWatchRegisterResult, '—') },
+            { label: 'Watch Sebebi', value: humanizeToken(trade.postExitWatchRegisterReason, '—') },
             { label: 'Resolution', value: humanizeToken(trade.postExitResolutionMode, '—') },
             { label: 'Resolution Side', value: humanizeToken(trade.postExitResolutionTargetSide, '—') },
             { label: 'Structure', value: humanizeToken(trade.structureTrend, '—') },
@@ -233,6 +236,26 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Koruma Yetkisi', value: humanizeToken(trade.runtimeLossProtectionAuthority, '—') },
             { label: 'Borsa Yetkisi', value: humanizeToken(trade.runtimeExchangeProtectionAuthority, '—') },
             { label: 'Koruma Rolü', value: humanizeToken(trade.runtimeExchangeProtectionRole, '—') },
+            { label: 'Positions Authority', value: humanizeToken(trade.positionsAuthority, '—') },
+            { label: 'Source Age', value: trade.positionsSourceAgeSec ? `${Number(trade.positionsSourceAgeSec).toFixed(1)}s` : '—' },
+            { label: 'Follow-Through', value: humanizeToken(trade.postExitFollowthroughMode, '—') },
+            { label: 'Tercih Yön', value: humanizeToken(trade.postExitPreferredSide, '—') },
+            {
+                label: 'Follow-Through Güven',
+                value: typeof trade.postExitFollowthroughConfidence === 'number' && trade.postExitFollowthroughConfidence > 0
+                    ? `${Number(trade.postExitFollowthroughConfidence).toFixed(2)}`
+                    : '—',
+            },
+            { label: 'Watch Register', value: humanizeToken(trade.postExitWatchRegisterResult, '—') },
+            { label: 'Watch Sebebi', value: humanizeToken(trade.postExitWatchRegisterReason, '—') },
+            { label: 'Thin Book Grace', value: trade.postExitThinBookGraceUsed ? 'Kullanildi' : '—' },
+            {
+                label: 'Exposure Reserve',
+                value: trade.postExitExposureReserveUsed
+                    ? humanizeToken(trade.postExitExposureReserveReason || 'POST_EXIT_EXPOSURE_RESERVE', 'Kullanildi')
+                    : '—',
+            },
+            { label: 'Opposite Reclaim Baski', value: trade.oppositeReclaimSuppressed ? 'Evet' : '—' },
             {
                 label: 'Taktik Stop',
                 value: trade.runtimeTacticalStopPrice
@@ -679,6 +702,14 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
+                                                <div className="text-slate-500 text-xs">TRAIL Fakeout</div>
+                                                <div className="font-semibold text-white">
+                                                    {replayTrade.trade.trailFakeoutGuardArmed || replayTrade.trade.trailFakeoutGuardUsed
+                                                        ? humanizeToken(replayTrade.trade.trailFakeoutGuardState || replayTrade.trade.trailFakeoutGuardReleaseReason || replayTrade.trade.trailFakeoutGuardReason, '—')
+                                                        : '—'}
+                                                </div>
+                                            </div>
+                                            <div>
                                                 <div className="text-slate-500 text-xs">Hold Reason</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.fakeoutReclaimReason, '—')}</div>
                                             </div>
@@ -689,6 +720,14 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             <div>
                                                 <div className="text-slate-500 text-xs">Post-Exit Watch</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchState, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Watch Register</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchRegisterResult, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Watch Sebebi</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchRegisterReason, '—')}</div>
                                             </div>
                                             <div>
                                                 <div className="text-slate-500 text-xs">Resolution Mode</div>
@@ -759,6 +798,18 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             <div>
                                                 <div className="text-slate-500 text-xs">Koruma Rolü</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExchangeProtectionRole, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Positions Authority</div>
+                                                <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionsAuthority, '—')}</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-slate-500 text-xs">Positions Source Age</div>
+                                                <div className="font-semibold text-white">
+                                                    {typeof replayTrade.trade.positionsSourceAgeSec === 'number' && replayTrade.trade.positionsSourceAgeSec > 0
+                                                        ? `${Number(replayTrade.trade.positionsSourceAgeSec).toFixed(1)}s`
+                                                        : '—'}
+                                                </div>
                                             </div>
                                             <div>
                                                 <div className="text-slate-500 text-xs">Taktik Stop</div>

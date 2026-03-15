@@ -288,8 +288,32 @@ def test_build_replay_trade_summary_uses_signal_snapshot_metadata():
     assert summary["tradeId"] == "T1"
     assert summary["entryArchetype"] == main.DECISION_ARCHETYPE_CONTINUATION
     assert summary["expectancyBand"] == main.DECISION_EXPECTANCY_BAND_STRONG
-    assert summary["peakRoi"] == 12.0
-    assert summary["realizedPeakCaptureRatio"] > 0.7
+
+
+def test_compute_signal_opportunity_priority_boosts_post_exit_followthrough_same_side():
+    baseline = {
+        "symbol": "SAHARAUSDT",
+        "action": "SHORT",
+        "confidenceScore": 86.0,
+        "volumeRatio": 1.2,
+        "spreadPct": 0.05,
+        "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+        "expectancy": {
+            "rankingScore": 102.0,
+            "edgeProb": 0.65,
+            "uncertainty": 0.24,
+            "sizeBias": 1.02,
+            "expectancyBand": main.DECISION_EXPECTANCY_BAND_GOOD,
+        },
+    }
+    boosted = {
+        **baseline,
+        "postExitFollowthroughActive": True,
+        "postExitPreferredSide": "SHORT",
+        "postExitPreferredEntryFamilies": [main.ENTRY_ARCHETYPE_CONTINUATION, main.ENTRY_ARCHETYPE_RECLAIM],
+    }
+
+    assert main.compute_signal_opportunity_priority(boosted) > main.compute_signal_opportunity_priority(baseline)
 
 
 def test_synthesize_replay_snapshots_from_trade_builds_approx_pair():

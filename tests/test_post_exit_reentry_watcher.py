@@ -221,6 +221,150 @@ def test_register_post_exit_reentry_watch_arms_for_profit_giveback_exit(monkeypa
     assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
 
 
+def test_register_post_exit_reentry_watch_arms_for_trail_wide_exit_and_records_registration(monkeypatch):
+    snapshots = []
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: snapshots.append(kwargs))
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
+    monkeypatch.setattr(main.global_paper_trader, "positions", [])
+    monkeypatch.setattr(main.global_paper_trader, "pending_orders", [])
+
+    watch = main.register_post_exit_reentry_watch(
+        _build_reclaim_pos(
+            symbol="AGLDUSDT",
+            side="SHORT",
+            signalId="SIG_TRAIL_AGLD",
+            entryArchetype=main.ENTRY_ARCHETYPE_CONTINUATION,
+            runnerContextResolved=main.V3_RUNNER_CONTEXT_CONTINUATION_RESCUE,
+        ),
+        _build_closed_trade(
+            symbol="AGLDUSDT",
+            side="SHORT",
+            signalId="SIG_TRAIL_AGLD",
+            positionId="POS_TRAIL_AGLD",
+            tradeId="TRD_TRAIL_AGLD",
+            reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+            entryArchetype=main.ENTRY_ARCHETYPE_CONTINUATION,
+        ),
+        original_reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+        normalized_reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+        exit_price=100.55,
+    )
+
+    assert watch is not None
+    assert watch["exitReason"] == "TRAIL_WIDE_EXIT"
+    assert watch["watchState"] == main.POST_EXIT_REENTRY_STATE_ARMED
+    register_snapshot = next(item for item in snapshots if item.get("decision", {}).get("reason") == "registered")
+    assert register_snapshot["outcome"]["watchRegisterResult"] == "REGISTERED"
+    assert register_snapshot["outcome"]["watchRegisterReason"] == "REGISTER_OK"
+
+
+def test_seed_post_exit_followthrough_memory_for_trail_wide_exit(monkeypatch):
+    monkeypatch.setattr(main, "post_exit_followthrough_memory", {})
+
+    seeded = main._seed_post_exit_followthrough_memory(
+        _build_reclaim_pos(
+            symbol="1000LUNCUSDT",
+            side="LONG",
+            entryArchetype=main.ENTRY_ARCHETYPE_CONTINUATION,
+            transitionState="BREAKOUT_RETEST",
+            dominantSide="LONG",
+            patternBias="CONTINUATION",
+            patternConfidence=0.74,
+        ),
+        _build_closed_trade(
+            symbol="1000LUNCUSDT",
+            side="LONG",
+            reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+            entryArchetype=main.ENTRY_ARCHETYPE_CONTINUATION,
+        ),
+        original_reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+        normalized_reason="SMART_V3_RUNNER__TRAIL_WIDE_EXIT",
+        watch_registration={"reason": "REGISTER_OK"},
+        watch={"watchState": main.POST_EXIT_REENTRY_STATE_ARMED},
+    )
+
+    assert seeded["followthroughMode"] == main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE
+    assert seeded["preferredSide"] == "LONG"
+    assert main.ENTRY_ARCHETYPE_CONTINUATION in seeded["preferredEntryFamilies"]
+    ctx = main.get_post_exit_followthrough_context("1000LUNCUSDT", now_ts=seeded["closeTs"] + 1.0)
+    assert ctx["active"] is True
+    assert ctx["preferredSide"] == "LONG"
+
+
+def test_apply_post_exit_followthrough_suppresses_opposite_reclaim(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "post_exit_followthrough_memory",
+        {
+            "1000LUNCUSDT": main._build_post_exit_followthrough_seed(
+                symbol="1000LUNCUSDT",
+                close_reason="TRAIL_WIDE_EXIT",
+                origin_side="LONG",
+                close_ts=1000.0,
+                close_price=0.0412,
+                mode=main.POST_EXIT_RESOLUTION_MODE_SAME_SIDE,
+                preferred_side="LONG",
+                preferred_entry_families=[main.ENTRY_ARCHETYPE_CONTINUATION, main.ENTRY_ARCHETYPE_RECLAIM],
+                confidence=0.74,
+            )
+        },
+    )
+    monkeypatch.setattr(main.time, "time", lambda: 1010.0)
+
+    payload = {
+        "symbol": "1000LUNCUSDT",
+        "side": "SHORT",
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "setupState15m": "CONTINUATION",
+        "transitionState": "BREAKOUT_RETEST",
+        "dominantSide": "LONG",
+        "stateConfidence": 0.72,
+        "patternBias": "CONTINUATION",
+        "patternConfidence": 0.81,
+        "breakoutRetestState": "BULL_RETEST_HOLD",
+        "barrierVerdict": "SUPPORTIVE",
+    }
+    resolved = {
+        "accepted": True,
+        "side": "SHORT",
+        "entryArchetype": main.ENTRY_ARCHETYPE_RECLAIM,
+        "directionOwner": "reclaim",
+        "directionConfidence": 0.66,
+        "directionReason": "RECLAIM",
+        "intentScore": 71.0,
+    }
+
+    assert main._apply_post_exit_followthrough_to_intent_candidate(payload, resolved) == {}
+
+
+def test_evaluate_post_exit_followthrough_thin_book_grace_allows_small_post_exit_notional(monkeypatch):
+    monkeypatch.setattr(main.global_paper_trader, "balance", 100.0)
+    monkeypatch.setattr(main.global_paper_trader, "risk_per_trade", 0.02)
+
+    grace = main.evaluate_post_exit_followthrough_thin_book_grace(
+        {
+            "symbol": "1000LUNCUSDT",
+            "action": "LONG",
+            "entryArchetype": main.ENTRY_ARCHETYPE_CONTINUATION,
+            "sizeMultiplier": 1.0,
+            "postExitFollowthroughActive": True,
+            "postExitPreferredSide": "LONG",
+            "postExitPreferredEntryFamilies": [main.ENTRY_ARCHETYPE_CONTINUATION, main.ENTRY_ARCHETYPE_RECLAIM],
+        },
+        total_depth_usd=13_780.0,
+        dynamic_depth_threshold=53_000.0,
+        exec_score=72.0,
+        spread_pct=0.05,
+        leverage=9,
+        bid_depth_usd=6_800.0,
+        ask_depth_usd=6_980.0,
+    )
+
+    assert grace["allow"] is True
+    assert grace["reason"] == "POST_EXIT_THIN_BOOK_GRACE"
+    assert grace["depthCoverageRatio"] < 0.01
+
+
 def test_register_post_exit_reentry_watch_ignores_current_closing_position_exposure(monkeypatch):
     monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
@@ -240,7 +384,8 @@ def test_register_post_exit_reentry_watch_ignores_current_closing_position_expos
 
 
 def test_register_post_exit_reentry_watch_skips_hard_stop_close(monkeypatch):
-    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    snapshots = []
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: snapshots.append(kwargs))
     monkeypatch.setattr(main, "post_exit_reentry_watchers", {})
     monkeypatch.setattr(main.global_paper_trader, "positions", [])
     monkeypatch.setattr(main.global_paper_trader, "pending_orders", [])
@@ -255,6 +400,9 @@ def test_register_post_exit_reentry_watch_skips_hard_stop_close(monkeypatch):
 
     assert watch is None
     assert main.post_exit_reentry_watchers == {}
+    skipped_snapshot = next(item for item in snapshots if item.get("decision", {}).get("reason") == "skipped")
+    assert skipped_snapshot["outcome"]["watchRegisterResult"] == "SKIPPED"
+    assert skipped_snapshot["outcome"]["watchRegisterReason"] == "REASON_NOT_ELIGIBLE"
 
 
 def test_resolve_reentry_cooldown_gate_allows_post_exit_override():
@@ -557,6 +705,64 @@ def test_evaluate_post_exit_reentry_watchers_can_flip_to_opposite_reversal(monke
 
     assert events == [("PEW_AEVO", main.POST_EXIT_RESOLUTION_MODE_OPPOSITE, "LONG", "LONG", "AEVOUSDT")]
     assert watch["reentryTriggered"] is True
+
+
+def test_evaluate_post_exit_reentry_watchers_refreshes_followthrough_memory(monkeypatch):
+    watch = _build_watch(
+        symbol="AEVOUSDT",
+        side="SHORT",
+        watcherId="PEW_AEVO",
+        signalId="SIG_RECLAIM_AEVO",
+        positionId="POS_RECLAIM_AEVO",
+        originalTradeId="TRD_RECLAIM_AEVO",
+        resolutionTargetSide="SHORT",
+        cooldownUntilTs=1000.0,
+    )
+    monkeypatch.setattr(main, "post_exit_reentry_watchers", {"AEVOUSDT": watch})
+    monkeypatch.setattr(main, "post_exit_followthrough_memory", {})
+    monkeypatch.setattr(main, "queue_decision_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(main, "_has_symbol_exposure", lambda symbol, exclude_position_id='': False)
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+
+    opposite_signal = _build_candidate_signal(
+        symbol="AEVOUSDT",
+        action="LONG",
+        confidenceScore=78.0,
+        currentExecScore=68.0,
+        currentVolumeRatio=1.18,
+        currentObImbalanceTrend=2.8,
+        currentImbalance=9.4,
+        patternBias="CONTINUATION",
+        patternConfidence=0.74,
+        breakoutRetestState="BULL_RETEST_HOLD",
+        entryArchetype=main.ENTRY_ARCHETYPE_RECLAIM,
+        directionOwner="reclaim",
+        runnerContextResolved=main.V3_RUNNER_CONTEXT_COUNTER,
+    )
+    opposite_opp = _build_candidate_opp(
+        symbol="AEVOUSDT",
+        signalAction="LONG",
+        signalScore=78.0,
+        price=100.85,
+        currentExecScore=68.0,
+        entryExecScore=68.0,
+        volumeRatio=1.18,
+        obImbalanceTrend=2.8,
+        imbalance=9.4,
+        patternBias="CONTINUATION",
+        patternConfidence=0.74,
+        breakoutRetestState="BULL_RETEST_HOLD",
+        transitionState="FAILED_BREAKDOWN",
+        dominantSide="LONG",
+        stateConfidence=0.76,
+        preferredExitProfile=main.V3_EXIT_PROFILE_TRANSITION_DEFENSE,
+    )
+
+    asyncio.run(main.evaluate_post_exit_reentry_watchers([opposite_opp], [opposite_signal]))
+
+    ctx = main.get_post_exit_followthrough_context("AEVOUSDT", now_ts=1000.1)
+    assert ctx["preferredSide"] == "LONG"
+    assert ctx["followthroughMode"] == main.POST_EXIT_RESOLUTION_MODE_OPPOSITE
 
 
 def test_coin_state_resolution_helper_blocks_same_side_when_opposite_side_is_dominant():

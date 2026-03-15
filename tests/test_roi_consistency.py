@@ -288,7 +288,15 @@ def test_live_ui_positions_prefer_empty_binance_snapshot_over_engine_fallback(mo
     monkeypatch.setattr(
         main,
         "live_binance_trader",
-        SimpleNamespace(enabled=True, last_positions=[], last_sync_time=123456),
+        SimpleNamespace(
+            enabled=True,
+            last_positions=[],
+            last_sync_time=123456,
+            last_positions_observed_at=1000.0,
+            last_positions_source_age_sec=0.0,
+            last_positions_is_stale=False,
+            last_positions_authority="binance_sync",
+        ),
     )
     monkeypatch.setattr(
         main,
@@ -300,6 +308,66 @@ def test_live_ui_positions_prefer_empty_binance_snapshot_over_engine_fallback(mo
 
     assert positions == []
     assert source == "binance_sync_empty"
+
+
+def test_live_ui_positions_suppress_stale_binance_snapshot_after_sync_confirmed_empty(monkeypatch):
+    monkeypatch.setattr(main, "live_close_pending_positions", {})
+    monkeypatch.setattr(
+        main,
+        "live_binance_trader",
+        SimpleNamespace(
+            enabled=True,
+            last_positions=[{"symbol": "GHOSTUSDT", "side": "LONG", "entryPrice": 1.0, "sizeUsd": 10.0, "isLive": True}],
+            last_sync_time=123456,
+            last_positions_observed_at=1000.0,
+            last_positions_source_age_sec=45.0,
+            last_positions_is_stale=True,
+            last_positions_authority="binance_api_stale",
+        ),
+    )
+    monkeypatch.setattr(main, "global_paper_trader", SimpleNamespace(positions=[]))
+
+    positions, source = main._resolve_live_positions_for_ui()
+
+    assert positions == []
+    assert source == "binance_stale_suppressed"
+
+
+def test_live_ui_positions_show_close_pending_snapshot_until_sync_confirms(monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1015.0)
+    pending_snapshot = {
+        "symbol": "EXITUSDT",
+        "side": "SHORT",
+        "entryPrice": 10.0,
+        "sizeUsd": 50.0,
+        "isLive": True,
+        "uiClosePending": True,
+        "uiClosePendingReason": "TRAIL_WIDE_EXIT",
+        "uiCloseScheduledAt": 1010.0,
+        "runtimeExchangeProtectiveMode": main.V3_EXCHANGE_PROTECTIVE_MODE_TACTICAL,
+    }
+    monkeypatch.setattr(main, "live_close_pending_positions", {"EXITUSDT": pending_snapshot})
+    monkeypatch.setattr(
+        main,
+        "live_binance_trader",
+        SimpleNamespace(
+            enabled=True,
+            last_positions=[{"symbol": "EXITUSDT", "side": "SHORT", "entryPrice": 10.0, "sizeUsd": 50.0, "isLive": True}],
+            last_sync_time=123456,
+            last_positions_observed_at=1012.0,
+            last_positions_source_age_sec=0.0,
+            last_positions_is_stale=False,
+            last_positions_authority="binance_sync",
+        ),
+    )
+    monkeypatch.setattr(main, "global_paper_trader", SimpleNamespace(positions=[]))
+
+    positions, source = main._resolve_live_positions_for_ui()
+
+    assert source == "binance_sync"
+    assert len(positions) == 1
+    assert positions[0]["uiClosePending"] is True
+    assert positions[0]["positionsAuthority"] == "close_pending"
 
 
 def test_protection_ladder_tight_and_wide_stop_behavior():
