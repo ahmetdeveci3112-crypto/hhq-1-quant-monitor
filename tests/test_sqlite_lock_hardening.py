@@ -60,3 +60,42 @@ def test_sqlite_connect_db_applies_wal_and_busy_timeout(tmp_path):
 
     if main.SQLITE_ENABLE_WAL:
         assert str(journal_mode).lower() == "wal"
+
+
+def test_sqlite_single_writer_queue_serializes_concurrent_inserts(tmp_path):
+    async def _run():
+        db_path = tmp_path / "serialized.db"
+        manager = main.SQLiteManager(db_path=str(db_path))
+        manager._busy_timeout_ms = 50
+        manager._busy_timeout_sec = 0.05
+        manager._lock_retry_attempts = 1
+        await manager.init_db()
+
+        async def writer_one():
+            async with manager._connect_db() as db:
+                await db.execute(
+                    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    ("writer_one", "1"),
+                )
+                await asyncio.sleep(0.2)
+                await db.commit()
+
+        async def writer_two():
+            await asyncio.sleep(0.01)
+            async with manager._connect_db() as db:
+                await db.execute(
+                    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    ("writer_two", "2"),
+                )
+                await db.commit()
+
+        await asyncio.gather(writer_one(), writer_two())
+
+        async with manager._connect_db() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM settings WHERE key IN ('writer_one', 'writer_two')"
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 2
+
+    asyncio.run(_run())

@@ -118,54 +118,102 @@ def _infer_task_name(coro, fallback: str = "unnamed") -> str:
     return func or fallback
 
 
+def _is_sqlite_write_sql(sql: str) -> bool:
+    """Best-effort detection for statements that need the SQLite writer lock."""
+    statement = str(sql or "").lstrip().upper()
+    if not statement:
+        return False
+    token = statement.split(None, 1)[0]
+    return token in {
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "REPLACE",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "VACUUM",
+        "ANALYZE",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "END",
+    }
+
+
 class _RetryingSQLiteConnection:
     """Proxy aiosqlite connection methods through lock-aware retries."""
 
     def __init__(self, manager: "SQLiteManager", db):
         object.__setattr__(self, "_manager", manager)
         object.__setattr__(self, "_db", db)
+        object.__setattr__(self, "_write_lock_held", False)
 
     def execute(self, sql, parameters=None):
         if parameters is None:
             return _RetryingSQLiteResult(
+                self,
                 self._manager,
                 self._manager._sql_operation_name("execute", sql),
                 self._db.execute,
+                _is_sqlite_write_sql(sql),
                 sql,
             )
         return _RetryingSQLiteResult(
+            self,
             self._manager,
             self._manager._sql_operation_name("execute", sql),
             self._db.execute,
+            _is_sqlite_write_sql(sql),
             sql,
             parameters,
         )
 
     def executemany(self, sql, seq_of_parameters):
         return _RetryingSQLiteResult(
+            self,
             self._manager,
             self._manager._sql_operation_name("executemany", sql),
             self._db.executemany,
+            _is_sqlite_write_sql(sql),
             sql,
             seq_of_parameters,
         )
 
     def executescript(self, sql_script):
         return _RetryingSQLiteResult(
+            self,
             self._manager,
             "executescript",
             self._db.executescript,
+            True,
             sql_script,
         )
 
     async def commit(self):
-        return await self._manager._call_with_retry("commit", self._db.commit)
+        result = await self._manager._call_with_retry("commit", self._db.commit)
+        self._release_write_lock()
+        return result
 
     async def rollback(self):
-        return await self._manager._call_with_retry("rollback", self._db.rollback)
+        result = await self._manager._call_with_retry("rollback", self._db.rollback)
+        self._release_write_lock()
+        return result
+
+    async def _ensure_write_lock(self):
+        if self._write_lock_held:
+            return
+        await self._manager._get_write_lock().acquire()
+        self._write_lock_held = True
+
+    def _release_write_lock(self):
+        if not self._write_lock_held:
+            return
+        self._write_lock_held = False
+        self._manager._get_write_lock().release()
 
     def __setattr__(self, name, value):
-        if name in {"_manager", "_db"}:
+        if name in {"_manager", "_db", "_write_lock_held"}:
             object.__setattr__(self, name, value)
             return
         setattr(self._db, name, value)
@@ -177,15 +225,19 @@ class _RetryingSQLiteConnection:
 class _RetryingSQLiteResult:
     """Preserve aiosqlite's await/async-with API while adding retries."""
 
-    def __init__(self, manager: "SQLiteManager", op_name: str, func, *args):
+    def __init__(self, connection: _RetryingSQLiteConnection, manager: "SQLiteManager", op_name: str, func, requires_write_lock: bool, *args):
+        self._connection = connection
         self._manager = manager
         self._op_name = op_name
         self._func = func
+        self._requires_write_lock = requires_write_lock
         self._args = args
         self._result = None
 
     async def _resolve(self):
         if self._result is None:
+            if self._requires_write_lock:
+                await self._connection._ensure_write_lock()
             self._result = await self._manager._call_with_retry(
                 self._op_name,
                 self._func,
@@ -444,6 +496,7 @@ class SQLiteManager:
         self._lock_retry_base_ms = SQLITE_LOCK_RETRY_BASE_MS
         self._enable_wal = SQLITE_ENABLE_WAL
         self._synchronous_mode = SQLITE_SYNCHRONOUS_MODE
+        self._write_locks = {}
 
     def _sql_operation_name(self, default: str, sql: str = "") -> str:
         """Create a compact label for retry logging."""
@@ -451,6 +504,15 @@ class SQLiteManager:
         if not statement:
             return default
         return f"{default}:{statement[0].upper()}"
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        """Return a loop-local writer lock so tests using multiple loops stay safe."""
+        loop = asyncio.get_running_loop()
+        lock = self._write_locks.get(id(loop))
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[id(loop)] = lock
+        return lock
 
     async def _call_with_retry(self, op_name: str, func, *args, **kwargs):
         """Retry transient SQLite lock errors with exponential backoff."""
@@ -471,11 +533,14 @@ class SQLiteManager:
         if last_exc:
             raise last_exc
 
-    async def _apply_connection_pragmas(self, db) -> None:
-        """Apply low-risk SQLite concurrency tuning to each async connection."""
+    async def _apply_persistent_pragmas(self, db) -> None:
+        """Apply DB-level pragmas once during initialization."""
         if self._enable_wal:
             await self._call_with_retry("pragma:journal_mode", db.execute, "PRAGMA journal_mode=WAL")
         await self._call_with_retry("pragma:synchronous", db.execute, f"PRAGMA synchronous={self._synchronous_mode}")
+
+    async def _apply_connection_pragmas(self, db) -> None:
+        """Apply per-connection SQLite tuning without re-triggering DB-global locks."""
         await self._call_with_retry("pragma:busy_timeout", db.execute, f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         await self._call_with_retry("pragma:temp_store", db.execute, "PRAGMA temp_store=MEMORY")
         await self._call_with_retry("pragma:foreign_keys", db.execute, "PRAGMA foreign_keys=ON")
@@ -484,10 +549,19 @@ class SQLiteManager:
     async def _connect_db(self):
         """Open an async SQLite connection with shared retry and PRAGMA settings."""
         db = await aiosqlite.connect(self.db_path, timeout=self._busy_timeout_sec)
+        proxy = _RetryingSQLiteConnection(self, db)
         try:
             await self._apply_connection_pragmas(db)
-            yield _RetryingSQLiteConnection(self, db)
+            yield proxy
         finally:
+            if proxy._write_lock_held:
+                try:
+                    if getattr(db, "in_transaction", False):
+                        await self._call_with_retry("rollback:close", db.rollback)
+                except Exception as exc:
+                    logger.warning(f"SQLite connection cleanup rollback failed: {exc}")
+                finally:
+                    proxy._release_write_lock()
             await db.close()
 
     def _archive_path_for_reset(self) -> str:
@@ -571,6 +645,7 @@ class SQLiteManager:
         await self._archive_and_reset_db_if_needed()
 
         async with self._connect_db() as db:
+            await self._apply_persistent_pragmas(db)
             # Trades table
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
