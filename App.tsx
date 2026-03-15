@@ -1010,6 +1010,7 @@ export default function App() {
   const [positionPriceFlash, setPositionPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
   // Faz 1 UI-Redesign: Track which position cards show detail drawer
   const [expandedPositions, setExpandedPositions] = useState<Set<string>>(new Set());
+  const [showWalletDetail, setShowWalletDetail] = useState(false);
   const signalPriceRef = useRef<Record<string, number>>({});
   const positionPriceRef = useRef<Record<string, number>>({});
   const signalFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2391,129 +2392,72 @@ export default function App() {
         {activeTab === 'portfolio' && (
           <div className="space-y-4">
 
-            {/* Compact Wallet Summary Bar */}
+            {/* Portföy Özeti — 4 ana metrik + Bakiye Detayı collapse */}
             <div className="bg-[#0d1117] border border-slate-800/50 rounded-lg px-4 lg:px-6 py-3 lg:py-4">
-              {/* Mobile: Grid Layout - Show loading when balance not ready */}
-              <div className="grid grid-cols-2 gap-4 lg:hidden">
-                {portfolio.balanceUsd <= 0 ? (
-                  <div className="col-span-2 grid grid-cols-2 gap-4">
-                    <div className="col-span-2">
-                      <div className="h-3 w-20 bg-slate-700/50 rounded mb-2" />
-                      <div className="h-8 w-32 bg-slate-700/50 rounded animate-pulse" />
-                    </div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="col-span-2">
-                      <div className="text-xs text-slate-500 uppercase">Marjin Bakiye</div>
-                      <div className="text-2xl font-bold text-white font-mono">
+              {portfolio.balanceUsd <= 0 ? (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="col-span-2 lg:col-span-1"><div className="h-3 w-20 bg-slate-700/50 rounded mb-2" /><div className="h-8 w-32 bg-slate-700/50 rounded animate-pulse" /></div>
+                  <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                  <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                  <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
+                </div>
+              ) : (
+                <>
+                  {/* Ana 4 Metrik */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+                    <div className="col-span-2 lg:col-span-1">
+                      <div className="text-[10px] text-slate-500 uppercase tracking-wider">Marjin Bakiye</div>
+                      <div className="text-xl lg:text-2xl font-bold text-white font-mono">
                         {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
-                        <span className="text-sm text-slate-500 ml-1">USDT</span>
+                        <span className="text-xs text-slate-500 ml-1">USDT</span>
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Cüzdan</div>
-                      <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500 uppercase">Gerçekleşmemiş</div>
+                      <div className="text-[10px] text-slate-500 uppercase tracking-wider">Gerçekleşmemiş K/Z</div>
                       <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-slate-500 uppercase">Kullanılabilir</div>
-                      <div className="text-base font-semibold text-cyan-400 font-mono">
-                        {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0)))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500 uppercase">Kullanılan Marjin</div>
-                      <div className="text-base font-semibold text-amber-400 font-mono">
-                        {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500 uppercase">Bugünkü K/Z</div>
+                      <div className="text-[10px] text-slate-500 uppercase tracking-wider">Bugünkü K/Z</div>
                       <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
                       </div>
                     </div>
-                    <div className="col-span-2">
-                      <div className="text-xs text-slate-500 uppercase">Toplam Kazanç</div>
+                    <div>
+                      <div className="text-[10px] text-slate-500 uppercase tracking-wider">Toplam Kazanç</div>
                       <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({(portfolio.stats.totalPnlPercent || 0).toFixed(2)}%)
                       </div>
                     </div>
-                  </>
-                )}
-              </div>
-              {/* Desktop: Flex Layout - Loading state when balance not ready */}
-              <div className="hidden lg:flex flex-wrap items-center justify-between gap-4">
-                {portfolio.balanceUsd <= 0 ? (
-                  <div className="flex items-center gap-8">
-                    <div><div className="h-3 w-20 bg-slate-700/50 rounded mb-2" /><div className="h-6 w-28 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div className="h-8 w-px bg-slate-800" />
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
-                    <div><div className="h-3 w-16 bg-slate-700/50 rounded mb-2" /><div className="h-5 w-20 bg-slate-700/50 rounded animate-pulse" /></div>
                   </div>
-                ) : (
-                  <>
-                    <div className="flex items-center gap-8">
-                      <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Marjin Bakiye</div>
-                        <div className="text-xl font-bold text-white font-mono">
-                          {formatCurrency((portfolio.stats as any).liveBalance?.marginBalance ?? (portfolio.balanceUsd + portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)))}
-                          <span className="text-xs text-slate-500 ml-1">USDT</span>
-                        </div>
-                      </div>
-                      <div className="h-8 w-px bg-slate-800"></div>
+                  {/* Bakiye Detayı Collapse */}
+                  <button onClick={() => setShowWalletDetail(!showWalletDetail)} className="mt-3 flex items-center gap-1 text-[10px] text-slate-500 hover:text-slate-300 transition-colors">
+                    {showWalletDetail ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                    Bakiye Detayı
+                  </button>
+                  {showWalletDetail && (
+                    <div className="mt-2 pt-2 border-t border-slate-800/50 grid grid-cols-3 gap-4">
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Cüzdan Bakiye</div>
-                        <div className="text-base font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
+                        <div className="text-sm font-semibold text-white font-mono">{formatCurrency(portfolio.balanceUsd)}</div>
                       </div>
-                      <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Gerçekleşmemiş K/Z</div>
-                        <div className={`text-base font-semibold font-mono ${((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0)) >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).liveBalance?.unrealizedPnl ?? portfolio.positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0))}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-8">
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılabilir</div>
-                        <div className="text-base font-semibold text-cyan-400 font-mono">
+                        <div className="text-sm font-semibold text-cyan-400 font-mono">
                           {formatCurrency((portfolio.stats as any).liveBalance?.availableBalance ?? (portfolio.balanceUsd - portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0)))}
                         </div>
                       </div>
                       <div>
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider">Kullanılan Marjin</div>
-                        <div className="text-base font-semibold text-amber-400 font-mono">
+                        <div className="text-sm font-semibold text-amber-400 font-mono">
                           {formatCurrency((portfolio.stats as any).liveBalance?.used ?? portfolio.positions.reduce((sum, p) => sum + getPositionMargin(p), 0))}
                         </div>
                       </div>
-                      <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Bugünkü K/Z</div>
-                        <div className={`text-base font-semibold font-mono ${(portfolio.stats as any).todayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {(portfolio.stats as any).todayPnl >= 0 ? '+' : ''}{formatCurrency((portfolio.stats as any).todayPnl || 0)} ({((portfolio.stats as any).todayPnlPercent || 0).toFixed(2)}%)
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">Toplam Kazanç</div>
-                        <div className={`text-base font-semibold font-mono ${portfolio.stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {portfolio.stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(portfolio.stats.totalPnl)} ({(portfolio.stats.totalPnlPercent || 0).toFixed(2)}%)
-                        </div>
-                      </div>
                     </div>
-                  </>
-                )}
-              </div>
+                  )}
+                </>
+              )}
             </div>
 
             {/* Open Positions */}
@@ -2631,6 +2575,13 @@ export default function App() {
                             </div>
                           )}
 
+                          {/* Durum İpucu — sadece mevcut helper çıktıları */}
+                          <div className="mb-2 text-[10px] text-slate-400">
+                            {Boolean((pos as any).uiClosePending) ? '⚠ Kapanış bekliyor'
+                              : Boolean((pos as any).positionsSourceStale) ? '⚠ Veri gecikmiş'
+                              : stageDisplay.primaryLabel}
+                          </div>
+
                           {/* Giriş/Anlık Fiyat + Süre */}
                           <div className="grid grid-cols-3 gap-2 text-[10px] mb-2">
                             <div><span className="text-slate-500">Giriş</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
@@ -2647,7 +2598,7 @@ export default function App() {
                             return marginLoss < 0 ? (
                               <div className="mb-2">
                                 <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNear ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
-                                  KS:{ksFirst.toFixed(0)} / {ksFull !== null ? ksFull.toFixed(0) : 'SL'}
+                                  Zarar Sınırı: {ksFirst.toFixed(0)} / {ksFull !== null ? ksFull.toFixed(0) : 'SL'}
                                 </span>
                               </div>
                             ) : null;
@@ -2663,9 +2614,9 @@ export default function App() {
                             className="w-full flex items-center justify-center gap-1 text-[10px] text-slate-500 hover:text-slate-300 py-1 transition-colors"
                           >
                             {expandedPositions.has(pos.id) ? (
-                              <><ChevronUp className="w-3 h-3" />Detayı Gizle</>
+                              <><ChevronUp className="w-3 h-3" /> Detay ▴</>
                             ) : (
-                              <><ChevronDown className="w-3 h-3" />Detay Göster</>
+                              <><ChevronDown className="w-3 h-3" /> Detay ▾</>
                             )}
                           </button>
                         </div>
@@ -2694,7 +2645,7 @@ export default function App() {
                               </div>
                               {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
                                 <div className="text-[10px] text-emerald-300 mt-1">
-                                  Peak {profitPeakRoiPct.toFixed(1)}% • Giveback {profitGivebackRoiPct.toFixed(1)}% • Lock {profitLockRoiPct.toFixed(1)}%
+                                  Zirve {profitPeakRoiPct.toFixed(1)}% • Geri Verme {profitGivebackRoiPct.toFixed(1)}% • Kilit {profitLockRoiPct.toFixed(1)}%
                                 </div>
                               )}
                               {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
@@ -2703,13 +2654,13 @@ export default function App() {
                                 </div>
                               )}
                               {runtimeExchangeBreakEvenPrice > 0 && (
-                                <div className="text-[10px] text-slate-500 mt-1">Exchange BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
+                                <div className="text-[10px] text-slate-500 mt-1">Borsa BE: ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
                               )}
                             </div>
 
                             {/* Accordion 2: Koruma Katmanı — uses buildProtectionStackSummary() */}
                             <div className="pt-2 border-t border-slate-800/20">
-                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Koruma Katmanı</div>
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Koruma</div>
                               <div className="text-[10px] text-slate-400 space-y-1">
                                 <div>Taktik Stop: <span className="text-slate-200">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
                                 <div>Exchange Koruma: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
@@ -2726,7 +2677,7 @@ export default function App() {
                                   <div>Yapısal İptal: <span className="text-slate-200">{protectionSummary.structuralLabel}</span>{protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}</div>
                                 )}
                                 {entryStopGateMode === 'wide_stop_soft' && (
-                                  <div className="text-amber-300">Entry Stop Gate: WIDE-SOFT</div>
+                                  <div className="text-amber-300">Geniş Stop Modu</div>
                                 )}
                               </div>
                             </div>
@@ -2750,7 +2701,7 @@ export default function App() {
 
                             {/* Accordion 4: Karar Motoru + Risk — uses PositionDecisionHUD */}
                             <div className="pt-2 border-t border-slate-800/20">
-                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Karar Özeti</div>
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Strateji</div>
                               {showThesisChip && (
                                 <span className={`text-[9px] px-1 py-0.5 rounded ${getThesisChipTone(positionSummary.positionThesisState)}`}>
                                   {humanizeDecisionToken(positionSummary.positionThesisState)}
@@ -2764,7 +2715,7 @@ export default function App() {
                               </div>
                               {(recoveryState.armed || recoveryState.stage > 0) && (
                                 <div className="text-[10px] text-sky-300 mt-1">
-                                  Recovery S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}% toparlanma • {recoveryGivebackPct.toFixed(0)}% giveback
+                                  Toparlanma S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}% toparlanma • {recoveryGivebackPct.toFixed(0)}% geri verme
                                 </div>
                               )}
                               {(lastLossGateAction || regimeFlags.length > 0 || carryCostRoiPct > 0 || exitRiskRoiPct > 0) && (
@@ -2797,7 +2748,7 @@ export default function App() {
 
                             {/* Kapat butonu */}
                             <div className="pt-2 border-t border-slate-800/20 flex justify-end">
-                              <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-3 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 transition-colors">Pozisyonu Kapat</button>
+                              <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-3 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 transition-colors">Kapat</button>
                             </div>
                           </div>
                         )}
@@ -2817,19 +2768,16 @@ export default function App() {
                       <th className="text-right py-3 px-2 font-medium">Yatırılan</th>
                       <th className="text-right py-3 px-2 font-medium">Giriş</th>
                       <th className="text-right py-3 px-2 font-medium">Anlık</th>
-                      <th className="text-right py-3 px-2 font-medium">TP/SL</th>
-                      <th className="text-center py-3 px-2 font-medium">Takip</th>
+                      <th className="text-right py-3 px-2 font-medium">TP / SL</th>
                       <th className="text-center py-3 px-2 font-medium">Süre</th>
-                      <th className="text-right py-3 px-2 font-medium">PnL</th>
-                      <th className="text-right py-3 px-2 font-medium">ROI%</th>
-                      <th className="text-center py-3 px-2 font-medium">KS</th>
+                      <th className="text-right py-3 px-2 font-medium">PnL / ROI</th>
                       <th className="text-right py-3 px-4 font-medium">İşlem</th>
                     </tr>
                   </thead>
                   <tbody>
                     {portfolio.positions.length === 0 ? (
                       <tr>
-                        <td colSpan={12} className="py-12 text-center text-slate-600">Açık pozisyon yok</td>
+                        <td colSpan={9} className="py-12 text-center text-slate-600">Açık pozisyon yok</td>
                       </tr>
                     ) : (
                       [...portfolio.positions].sort((a, b) => (a.openTime || 0) - (b.openTime || 0)).map(pos => {
@@ -2896,7 +2844,8 @@ export default function App() {
                         const protectionSummary = buildProtectionStackSummary(pos);
 
                         return (
-                          <tr key={pos.id} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
+                          <React.Fragment key={pos.id}>
+                          <tr className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
                             <td className="py-3 px-4">
                               <div className="flex items-center gap-2">
                                 <img
@@ -2910,8 +2859,7 @@ export default function App() {
                                 <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${stageDisplay.primaryTone}`}>{stageDisplay.primaryLabel}</span>
                               </div>
                               <div className="mt-1 text-[10px] text-slate-400">
-                                Aşama: <span className="text-slate-200">{stageDisplay.primaryLabel}</span>
-                              {' '}• Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
+                                Koruma: <span className="text-slate-300">{stageDisplay.protectionLabel}</span>
                               {' '}• Kâr: <span className="text-slate-300">{stageDisplay.profitLabel}</span>
                             </div>
                             {Boolean((pos as any).uiClosePending) && (
@@ -2924,63 +2872,12 @@ export default function App() {
                                 Canlı Kaynak Bayat • Yaş {Number((pos as any).positionsSourceAgeSec || 0).toFixed(0)} sn
                               </div>
                             )}
-                            {Boolean((pos as any).uiClosePending) && (
-                              <div className="mt-1 text-[11px] text-slate-500">Borsa Teyidi Bekleniyor</div>
-                            )}
-                              <div className="mt-1 text-[10px] text-cyan-300">
-                                {coinStateSummary.primaryLabel}
-                              </div>
-                              <div className="mt-1 text-[10px] text-slate-500">
-                                {coinStateSummary.detailLabel}
-                              </div>
-                              {coinStateSummary.driftLabel && (
-                                <div className={`mt-1 text-[10px] ${coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}`}>
-                                  {coinStateSummary.driftLabel}
-                                </div>
-                              )}
-                              {coinStateSummary.driftDetail && (
-                                <div className="mt-1 text-[10px] text-slate-600">
-                                  {coinStateSummary.driftDetail}
-                                </div>
-                              )}
-                              <div className="mt-1 text-[10px] text-slate-600">
-                                {coinStateSummary.footerLabel}
-                              </div>
-                              {Boolean((pos as any).postExitFollowthroughActive) && (
-                                <div className="mt-1 text-[10px] text-sky-300">
-                                  Çıkış Sonrası Takip: {humanizeDecisionToken(String((pos as any).postExitFollowthroughMode || ''))}
-                                  {String((pos as any).postExitPreferredSide || '') ? ` • Tercih ${humanizeDecisionToken(String((pos as any).postExitPreferredSide || ''))}` : ''}
-                                </div>
-                              )}
-                              {Boolean((pos as any).postExitThinBookGraceUsed) && (
-                                <div className="mt-1 text-[10px] text-cyan-300">Likidite Nedeniyle Küçültülmüş Giriş</div>
-                              )}
-                              {Boolean((pos as any).postExitExposureReserveUsed) && (
-                                <div className="mt-1 text-[10px] text-violet-300">
-                                  Portföy Rezervi Kullanıldı
-                                  {String((pos as any).postExitExposureReserveReason || '') ? ` • ${humanizeDecisionToken(String((pos as any).postExitExposureReserveReason || ''))}` : ''}
-                                </div>
-                              )}
-                              {Boolean((pos as any).oppositeReclaimSuppressed) && (
-                                <div className="mt-1 text-[10px] text-amber-300">Karşı Yön Reclaim Baskılandı</div>
-                              )}
-                              <div className="mt-1 flex flex-wrap gap-1">
-                                {(() => {
-                                  const chips = [
-                                    positionSummary.entryArchetype ? { label: humanizeDecisionToken(positionSummary.entryArchetype), className: getArchetypeChipTone(positionSummary.entryArchetype) } : null,
-                                    positionSummary.expectancyBand ? { label: humanizeDecisionToken(positionSummary.expectancyBand), className: getExpectancyChipTone(positionSummary.expectancyBand) } : null,
-                                    showThesisChip ? { label: humanizeDecisionToken(positionSummary.positionThesisState), className: getThesisChipTone(positionSummary.positionThesisState) } : null,
-                                    positionSummary.isPostExitReentry ? { label: '2. Şans', className: getReentryChipTone() } : null,
-                                    positionSummary.continuationFlowState ? { label: humanizeDecisionToken(positionSummary.continuationFlowState), className: getStateChipTone(positionSummary.continuationFlowState, 'continuation') } : null,
-                                    positionSummary.underwaterTapeState ? { label: humanizeDecisionToken(positionSummary.underwaterTapeState), className: getStateChipTone(positionSummary.underwaterTapeState, 'underwater') } : null,
-                                    coinStateSummary.driftLabel ? { label: translateDriftStateLabel((pos as any).runtimeStateDriftState), className: 'bg-sky-500/15 text-sky-300 border border-sky-500/25' } : null,
-                                  ].filter(Boolean) as Array<{ label: string; className: string }>;
-                                  return chips.map((chip) => (
-                                    <span key={`${pos.id}-${chip.label}`} className={`text-[9px] px-1 py-0.5 rounded font-semibold ${chip.className}`}>
-                                      {chip.label}
-                                    </span>
-                                  ));
-                                })()}
+
+                              {/* Durum İpucu — sadece mevcut helper çıktıları */}
+                              <div className="mt-1 text-[10px] text-slate-400">
+                                {Boolean((pos as any).uiClosePending) ? '⚠ Kapanış bekliyor'
+                                  : Boolean((pos as any).positionsSourceStale) ? '⚠ Veri gecikmiş'
+                                  : stageDisplay.primaryLabel}
                               </div>
                             </td>
                             <td className="py-3 px-2">
@@ -2993,86 +2890,11 @@ export default function App() {
                             <td className={`py-3 px-2 text-right font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-slate-300'}`}>${formatPrice(currentPrice)}</td>
                             <td className="py-3 px-2 text-right">
                               <div className="text-[10px] space-y-0.5">
-                                <div className="text-emerald-400">
-                                  TP: ${formatPrice(tp)} <span className="text-slate-500">(Hedef ROI {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%)</span>
-                                </div>
-                                <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
-                                <div className="text-rose-400">SL: ${formatPrice(activeStop)} <span className="text-slate-500">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span></div>
-                                <div className="text-slate-500">Taktik: <span className="text-slate-300">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
-                                <div className="text-slate-500">Borsa: <span className="text-slate-300">{protectionSummary.exchangeLabel}</span></div>
-                                {String((pos as any).positionsAuthority || '') && (
-                                  <div className="text-slate-500">Canlı Kaynak: <span className="text-slate-300">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>
-                                )}
-                                <div className="text-slate-500">Yetki: <span className="text-slate-300">{protectionSummary.authorityLabel}</span></div>
-                                <div className="text-slate-500">Rol: <span className="text-slate-300">{protectionSummary.roleLabel}</span></div>
-                                {protectionSummary.emergencyLabel !== '—' && (
-                                  <div className="text-slate-600">Acil: <span className="text-slate-300">{protectionSummary.emergencyLabel}</span></div>
-                                )}
-                                {protectionSummary.structuralLabel !== '—' && (
-                                  <div className="text-slate-600">
-                                    Yapısal: <span className="text-slate-300">{protectionSummary.structuralLabel}</span>
-                                    {protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}
-                                  </div>
-                                )}
+                                <div className="text-emerald-400">TP ${formatPrice(tp)} <span className="text-slate-600">({tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(0)}%)</span></div>
+                                <div className="text-rose-400">SL ${formatPrice(activeStop)} <span className="text-slate-600">({stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(0)}%)</span></div>
                               </div>
                             </td>
-                            <td className="py-3 px-2 text-center">
-                              <div className="text-[10px] space-y-0.5">
-                                {isTrailingActive ? (
-                                  <span className="inline-block bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">AÇIK</span>
-                                ) : (
-                                  <span className="inline-block bg-slate-700/50 text-slate-500 px-1.5 py-0.5 rounded">KAPALI</span>
-                                )}
-                                <div className="font-mono text-cyan-400">Mesafe ROI {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
-                                <div className="font-mono text-slate-400">Akt ROI {runtimeTrailRoiPct.toFixed(1)}%</div>
-                                <div className="font-mono text-slate-500">Çıkış x{effectiveExitTightness.toFixed(2)}</div>
-                                {entryStopGateMode === 'wide_stop_soft' && (
-                                  <div className="font-mono text-amber-300">Entry WIDE-SOFT</div>
-                                )}
-                                {(recoveryState.armed || recoveryState.stage > 0) && (
-                                  <div className="font-mono text-sky-300">Rec S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)} / {recoveryGivebackPct.toFixed(0)}</div>
-                                )}
-                                {(lastLossGateAction || regimeFlags.length > 0) && (
-                                  <div className="font-mono text-slate-500">
-                                    {lastLossGateAction ? translateReason(lastLossGateAction) : 'Gate beklemede'}
-                                  </div>
-                                )}
-                                <div className="font-mono text-slate-500">Exec {exitRiskRoiPct.toFixed(1)}% • Carry {carryCostRoiPct.toFixed(1)}%</div>
-                                {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
-                                  <div className="font-mono text-emerald-300">Peak {profitPeakRoiPct.toFixed(1)} • Giveback {profitGivebackRoiPct.toFixed(1)} • Lock {profitLockRoiPct.toFixed(1)}</div>
-                                )}
-                                {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
-                                  <div className="font-mono text-slate-400">TP {tp1RoiPct.toFixed(0)}/{tp2RoiPct.toFixed(0)}/{tp3RoiPct.toFixed(0)} • {profitOwner}</div>
-                                )}
-                                {runtimeExchangeBreakEvenPrice > 0 && (
-                                  <div className="font-mono text-slate-500">BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
-                                )}
-                                {(() => {
-                                  const line = [
-                                    positionSummary.selectedViaIntent ? `Intent ${formatSignalIntentVersion(positionSummary.signalIntentVersion, 'V1')}` : '',
-                                    positionSummary.primaryOwner ? `Owner ${positionSummary.primaryOwner}` : '',
-                                    positionSummary.exitOwnerProfile ? `Çıkış ${humanizeDecisionToken(positionSummary.exitOwnerProfile)}` : '',
-                                    positionSummary.holdProfile ? `Tutuş ${humanizeDecisionToken(positionSummary.holdProfile)}` : '',
-                                    positionSummary.isPostExitReentry ? '2. Şans Trade' : '',
-                                  ].filter(Boolean).join(' • ');
-                                  const thesisLine = [
-                                    positionSummary.reclaimRescueReason ? `Rescue ${humanizeDecisionToken(positionSummary.reclaimRescueReason)}` : '',
-                                    positionSummary.profitContinuationHoldReason ? `Kâr Tutuş ${humanizeDecisionToken(positionSummary.profitContinuationHoldReason)}` : '',
-                                    positionSummary.isPostExitReentry ? formatReentryOriginLabel(pos) : '',
-                                  ].filter(Boolean).join(' • ');
-                                  if (!line && !positionSummary.lossGateSuppressedReason && !thesisLine) return null;
-                                  return (
-                                    <div className="font-mono text-slate-500">
-                                      {line}
-                                      {line && positionSummary.lossGateSuppressedReason ? ' • ' : ''}
-                                      {positionSummary.lossGateSuppressedReason ? `Loss ${translateReason(positionSummary.lossGateSuppressedReason)}` : ''}
-                                      {(line || positionSummary.lossGateSuppressedReason) && thesisLine ? ' • ' : ''}
-                                      {thesisLine}
-                                    </div>
-                                  );
-                                })()}
-                              </div>
-                            </td>
+                            {/* Takip detayı expand'e taşındı */}
                             <td className="py-3 px-2 text-center">
                               {(() => {
                                 const openTime = (pos as any).openTime || Date.now();
@@ -3089,35 +2911,74 @@ export default function App() {
                                 );
                               })()}
                             </td>
-                            <td className={`py-3 px-2 text-right font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
+                            <td className="py-3 px-2 text-right">
+                              <div className={`font-mono font-semibold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
+                              </div>
+                              <div className={`text-[10px] font-mono ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+                              </div>
                             </td>
-                            <td className={`py-3 px-2 text-right font-mono font-semibold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
-                            </td>
-                            <td className="py-3 px-2 text-center">
-                              {(() => {
-                                const marginLoss = margin > 0 ? (pos.unrealizedPnl / margin) * 100 : 0;
-                                const isNearKS = marginLoss <= ksFirst * 0.7; // %70'ine yaklaştıysa uyar
-                                const isCritical = ksFull !== null && marginLoss <= ksFull;
-                                return (
-                                  <div className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNearKS ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
-                                    <div>{ksFirst.toFixed(0)}%</div>
-                                    <div className="text-[8px] opacity-70">{ksFull !== null ? `${ksFull.toFixed(0)}%` : 'SL'}</div>
-                                    <div className="text-[8px] opacity-70">({marginLoss.toFixed(0)}%)</div>
-                                  </div>
-                                );
-                              })()}
-                            </td>
+                            {/* KS detayı expand'e taşındı */}
                             <td className="py-3 px-4 text-right">
-                              <button
-                                onClick={() => handleManualClose(pos.id)}
-                                className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2 py-1 rounded transition-colors"
-                              >
-                                Kapat
-                              </button>
+                              <div className="flex items-center gap-2 justify-end">
+                                <button
+                                  onClick={() => setExpandedPositions(prev => { const next = new Set(prev); next.has(pos.id) ? next.delete(pos.id) : next.add(pos.id); return next; })}
+                                  className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                                >
+                                  {expandedPositions.has(pos.id) ? '▴' : '▾'}
+                                </button>
+                                <button
+                                  onClick={() => handleManualClose(pos.id)}
+                                  className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 px-2 py-1 rounded transition-colors"
+                                >
+                                  Kapat
+                                </button>
+                              </div>
                             </td>
                           </tr>
+                          {expandedPositions.has(pos.id) && (
+                            <tr className="bg-slate-900/40">
+                              <td colSpan={9} className="px-4 py-3">
+                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-[10px]">
+                                  {/* TP / SL Detay */}
+                                  <div>
+                                    <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">TP / SL</div>
+                                    <div className="space-y-1 text-slate-400">
+                                      <div>TP: <span className="text-emerald-400">${formatPrice(tp)}</span> (Hedef {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%) • Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
+                                      <div>SL: <span className="text-rose-400">${formatPrice(activeStop)}</span> (Stop {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</div>
+                                      <div>Takip: <span className="text-cyan-400">{runtimeTrailDistanceRoiPct.toFixed(1)}%</span> • x{effectiveExitTightness.toFixed(2)} • Akt {runtimeTrailRoiPct.toFixed(1)}%</div>
+                                      {runtimeExchangeBreakEvenPrice > 0 && <div>BE: ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>}
+                                      {(profitPeakRoiPct > 0) && <div className="text-emerald-300">Zirve {profitPeakRoiPct.toFixed(1)}% • Geri Verme {profitGivebackRoiPct.toFixed(1)}% • Kilit {profitLockRoiPct.toFixed(1)}%</div>}
+                                    </div>
+                                  </div>
+                                  {/* Koruma */}
+                                  <div>
+                                    <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Koruma</div>
+                                    <div className="space-y-1 text-slate-400">
+                                      <div>Taktik: <span className="text-slate-200">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
+                                      <div>Borsa: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
+                                      <div>Yetki: <span className="text-slate-200">{protectionSummary.authorityLabel}</span> • Rol: <span className="text-slate-200">{protectionSummary.roleLabel}</span></div>
+                                      {String((pos as any).positionsAuthority || '') && <div>Canlı Kaynak: <span className="text-slate-200">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>}
+                                      {protectionSummary.emergencyLabel !== '—' && <div>Acil: <span className="text-slate-200">{protectionSummary.emergencyLabel}</span></div>}
+                                      {protectionSummary.structuralLabel !== '—' && <div>Yapısal: <span className="text-slate-200">{protectionSummary.structuralLabel}</span></div>}
+                                    </div>
+                                  </div>
+                                  {/* Strateji */}
+                                  <div>
+                                    <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Strateji</div>
+                                    <div className="space-y-1 text-slate-400">
+                                      <div>{coinStateSummary.primaryLabel}</div>
+                                      {coinStateSummary.driftLabel && <div className={coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}>{coinStateSummary.driftLabel}</div>}
+                                      <PositionDecisionHUD pos={pos} compact />
+                                      {(recoveryState.armed || recoveryState.stage > 0) && <div className="text-sky-300">Toparlanma S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}%</div>}
+                                    </div>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
                         );
                       })
                     )}
@@ -3165,7 +3026,12 @@ export default function App() {
                             )}
                           </div>
                           <span className="text-[10px] text-slate-500">
-                            {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                            {(() => {
+                              const ms = Date.now() - (trade.closeTime || Date.now());
+                              const m = Math.floor(ms / 60000); const h = Math.floor(m / 60); const d = Math.floor(h / 24);
+                              const rel = d > 0 ? `${d}g önce` : h > 0 ? `${h}s önce` : `${m}dk önce`;
+                              return rel;
+                            })()}
                           </span>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-[10px]">
@@ -3244,7 +3110,14 @@ export default function App() {
                         return (
                           <tr key={trade.id || `${trade.symbol}_${trade.closeTime}_${i}`} className="border-b border-slate-800/20 hover:bg-slate-800/20 transition-colors">
                             <td className="py-3 px-4 text-slate-400 font-mono text-xs">
-                              {new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                              <div>{new Date(trade.closeTime || Date.now()).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}</div>
+                              <div className="text-[9px] text-slate-600">
+                                {(() => {
+                                  const ms = Date.now() - (trade.closeTime || Date.now());
+                                  const m = Math.floor(ms / 60000); const h = Math.floor(m / 60); const d = Math.floor(h / 24);
+                                  return d > 0 ? `${d}g önce` : h > 0 ? `${h}s önce` : `${m}dk önce`;
+                                })()}
+                              </div>
                             </td>
                             <td className="py-3 px-2 font-medium text-white">{trade.symbol?.replace('USDT', '') || 'YOK'}</td>
                             <td className="py-3 px-2">
