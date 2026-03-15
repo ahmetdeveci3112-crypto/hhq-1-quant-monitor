@@ -26,6 +26,7 @@ import uuid
 import websockets
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, Iterable, Sequence
 
 import ccxt.async_support as ccxt_async
@@ -33,7 +34,6 @@ import ccxt as ccxt_sync
 import numpy as np
 import pandas as pd
 import pytz
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -93,6 +93,116 @@ SLIPPAGE_EXIT_FALLBACK_BPS = max(0.1, float(os.environ.get("SLIPPAGE_EXIT_FALLBA
 SLIPPAGE_EXIT_MAX_VALID_TICK_BPS = max(0.5, float(os.environ.get("SLIPPAGE_EXIT_MAX_VALID_TICK_BPS", "10.0")))
 V3_THESIS_REVALIDATION_MODE = str(os.environ.get("V3_THESIS_REVALIDATION_MODE", "apply") or "apply").strip().lower()
 V3_LIVE_PROTECTION_STACK_MODE = str(os.environ.get("V3_LIVE_PROTECTION_STACK_MODE", "apply") or "apply").strip().lower()
+SQLITE_BUSY_TIMEOUT_MS = max(1000, int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "15000")))
+SQLITE_BUSY_TIMEOUT_SEC = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+SQLITE_LOCK_RETRY_ATTEMPTS = max(1, int(os.environ.get("SQLITE_LOCK_RETRY_ATTEMPTS", "4")))
+SQLITE_LOCK_RETRY_BASE_MS = max(25, int(os.environ.get("SQLITE_LOCK_RETRY_BASE_MS", "150")))
+SQLITE_ENABLE_WAL = _env_bool("SQLITE_ENABLE_WAL", True)
+SQLITE_SYNCHRONOUS_MODE = str(os.environ.get("SQLITE_SYNCHRONOUS_MODE", "NORMAL") or "NORMAL").strip().upper()
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    """Return True when SQLite reports transient lock contention."""
+    message = str(exc or "").lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def _infer_task_name(coro, fallback: str = "unnamed") -> str:
+    """Best-effort coroutine name for background task diagnostics."""
+    code = getattr(coro, "cr_code", None)
+    if code is not None:
+        qualname = getattr(code, "co_qualname", "") or getattr(code, "co_name", "")
+        if qualname:
+            return qualname
+    func = getattr(coro, "__qualname__", "") or getattr(coro, "__name__", "")
+    return func or fallback
+
+
+class _RetryingSQLiteConnection:
+    """Proxy aiosqlite connection methods through lock-aware retries."""
+
+    def __init__(self, manager: "SQLiteManager", db):
+        object.__setattr__(self, "_manager", manager)
+        object.__setattr__(self, "_db", db)
+
+    def execute(self, sql, parameters=None):
+        if parameters is None:
+            return _RetryingSQLiteResult(
+                self._manager,
+                self._manager._sql_operation_name("execute", sql),
+                self._db.execute,
+                sql,
+            )
+        return _RetryingSQLiteResult(
+            self._manager,
+            self._manager._sql_operation_name("execute", sql),
+            self._db.execute,
+            sql,
+            parameters,
+        )
+
+    def executemany(self, sql, seq_of_parameters):
+        return _RetryingSQLiteResult(
+            self._manager,
+            self._manager._sql_operation_name("executemany", sql),
+            self._db.executemany,
+            sql,
+            seq_of_parameters,
+        )
+
+    def executescript(self, sql_script):
+        return _RetryingSQLiteResult(
+            self._manager,
+            "executescript",
+            self._db.executescript,
+            sql_script,
+        )
+
+    async def commit(self):
+        return await self._manager._call_with_retry("commit", self._db.commit)
+
+    async def rollback(self):
+        return await self._manager._call_with_retry("rollback", self._db.rollback)
+
+    def __setattr__(self, name, value):
+        if name in {"_manager", "_db"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._db, name, value)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
+class _RetryingSQLiteResult:
+    """Preserve aiosqlite's await/async-with API while adding retries."""
+
+    def __init__(self, manager: "SQLiteManager", op_name: str, func, *args):
+        self._manager = manager
+        self._op_name = op_name
+        self._func = func
+        self._args = args
+        self._result = None
+
+    async def _resolve(self):
+        if self._result is None:
+            self._result = await self._manager._call_with_retry(
+                self._op_name,
+                self._func,
+                *self._args,
+            )
+        return self._result
+
+    def __await__(self):
+        return self._resolve().__await__()
+
+    async def __aenter__(self):
+        result = await self._resolve()
+        return await result.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        result = await self._resolve()
+        return await result.__aexit__(exc_type, exc, tb)
 
 
 def _reason_group_from_reason(reason: str) -> str:
@@ -328,6 +438,57 @@ class SQLiteManager:
         self._initialized = False
         self._last_archive_path = ""
         self._last_reset_reason = ""
+        self._busy_timeout_ms = SQLITE_BUSY_TIMEOUT_MS
+        self._busy_timeout_sec = SQLITE_BUSY_TIMEOUT_SEC
+        self._lock_retry_attempts = SQLITE_LOCK_RETRY_ATTEMPTS
+        self._lock_retry_base_ms = SQLITE_LOCK_RETRY_BASE_MS
+        self._enable_wal = SQLITE_ENABLE_WAL
+        self._synchronous_mode = SQLITE_SYNCHRONOUS_MODE
+
+    def _sql_operation_name(self, default: str, sql: str = "") -> str:
+        """Create a compact label for retry logging."""
+        statement = str(sql or "").strip().split(None, 1)
+        if not statement:
+            return default
+        return f"{default}:{statement[0].upper()}"
+
+    async def _call_with_retry(self, op_name: str, func, *args, **kwargs):
+        """Retry transient SQLite lock errors with exponential backoff."""
+        last_exc = None
+        for attempt in range(1, self._lock_retry_attempts + 1):
+            try:
+                return await func(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_lock_error(exc) or attempt >= self._lock_retry_attempts:
+                    raise
+                last_exc = exc
+                delay_sec = (self._lock_retry_base_ms * (2 ** (attempt - 1))) / 1000.0
+                logger.warning(
+                    f"⏳ SQLITE_BUSY_RETRY: op={op_name} attempt={attempt}/{self._lock_retry_attempts} "
+                    f"delay={delay_sec:.3f}s"
+                )
+                await asyncio.sleep(delay_sec)
+        if last_exc:
+            raise last_exc
+
+    async def _apply_connection_pragmas(self, db) -> None:
+        """Apply low-risk SQLite concurrency tuning to each async connection."""
+        if self._enable_wal:
+            await self._call_with_retry("pragma:journal_mode", db.execute, "PRAGMA journal_mode=WAL")
+        await self._call_with_retry("pragma:synchronous", db.execute, f"PRAGMA synchronous={self._synchronous_mode}")
+        await self._call_with_retry("pragma:busy_timeout", db.execute, f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+        await self._call_with_retry("pragma:temp_store", db.execute, "PRAGMA temp_store=MEMORY")
+        await self._call_with_retry("pragma:foreign_keys", db.execute, "PRAGMA foreign_keys=ON")
+
+    @asynccontextmanager
+    async def _connect_db(self):
+        """Open an async SQLite connection with shared retry and PRAGMA settings."""
+        db = await aiosqlite.connect(self.db_path, timeout=self._busy_timeout_sec)
+        try:
+            await self._apply_connection_pragmas(db)
+            yield _RetryingSQLiteConnection(self, db)
+        finally:
+            await db.close()
 
     def _archive_path_for_reset(self) -> str:
         """Return timestamped archive path for the current DB."""
@@ -342,7 +503,7 @@ class SQLiteManager:
             return 0
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=self._busy_timeout_sec)
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='db_meta'"
             ).fetchone()
@@ -368,7 +529,7 @@ class SQLiteManager:
 
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=self._busy_timeout_sec)
             tables = ("trades", "signals", "position_closes", "binance_trades")
             for table in tables:
                 row = conn.execute(
@@ -409,7 +570,7 @@ class SQLiteManager:
 
         await self._archive_and_reset_db_if_needed()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             # Trades table
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
@@ -1241,7 +1402,7 @@ class SQLiteManager:
     
     async def save_setting(self, key: str, value: any):
         """Save a setting to database."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 INSERT OR REPLACE INTO settings (key, value, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -1250,7 +1411,7 @@ class SQLiteManager:
     
     async def get_setting(self, key: str, default: any = None) -> any:
         """Get a setting from database."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             async with db.execute('SELECT value FROM settings WHERE key = ?', (key,)) as cursor:
                 row = await cursor.fetchone()
                 if row:
@@ -1274,7 +1435,7 @@ class SQLiteManager:
         """Save a completed trade — Phase 239: Merge/upsert semantics.
         Default/empty values (0, 'unknown', '') will NOT overwrite existing rich data.
         Only richer values replace existing ones."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             trade_id = trade.get('tradeId') or trade.get('trade_id') or trade.get('id')
             if not trade_id:
                 trade_id = f"TRADE_{trade.get('symbol', 'UNKNOWN')}_{trade.get('closeTime', trade.get('close_time', int(datetime.now().timestamp() * 1000)))}"
@@ -1510,7 +1671,7 @@ class SQLiteManager:
     
     async def get_recent_trades(self, limit: int = 50) -> list:
         """Get recent trades."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('''
                 SELECT * FROM trades ORDER BY close_time DESC LIMIT ?
@@ -1525,7 +1686,7 @@ class SQLiteManager:
         limit=0 means no limit (all trades).
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 if limit > 0:
                     query = 'SELECT * FROM trades ORDER BY close_time DESC LIMIT ?'
@@ -1660,7 +1821,7 @@ class SQLiteManager:
     
     async def add_log(self, time: str, message: str, ts: int):
         """Add a log entry."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 INSERT INTO logs (time, message, ts) VALUES (?, ?, ?)
             ''', (time, message, ts))
@@ -1674,7 +1835,7 @@ class SQLiteManager:
     
     async def get_recent_logs(self, limit: int = 100) -> list:
         """Get recent logs."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('''
                 SELECT time, message, ts FROM logs ORDER BY id DESC LIMIT ?
@@ -1684,7 +1845,7 @@ class SQLiteManager:
     
     async def save_equity_point(self, time: int, balance: float, drawdown: float):
         """Save an equity curve point."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 INSERT INTO equity_curve (time, balance, drawdown) VALUES (?, ?, ?)
             ''', (time, balance, drawdown))
@@ -1698,7 +1859,7 @@ class SQLiteManager:
     
     async def get_equity_curve(self, limit: int = 500) -> list:
         """Get equity curve data."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('''
                 SELECT time, balance, drawdown FROM equity_curve ORDER BY id DESC LIMIT ?
@@ -1708,7 +1869,7 @@ class SQLiteManager:
     
     async def save_signal(self, signal_data: dict):
         """Save a signal (accepted or rejected) for performance analysis."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             signal_ts = signal_data.get('timestamp', int(datetime.now().timestamp() * 1000))
             signal_id = (
                 signal_data.get('signal_id')
@@ -1829,7 +1990,7 @@ class SQLiteManager:
 
     async def save_signal_event(self, event_data: dict):
         """Append-only signal lifecycle event."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             ts = int(event_data.get('timestamp', int(datetime.now().timestamp() * 1000)))
             signal_id = str(event_data.get('signal_id') or event_data.get('signalId') or '')
             symbol = str(event_data.get('symbol') or '')
@@ -1881,7 +2042,7 @@ class SQLiteManager:
         """Persist compact decision snapshots for replay and post-mortem analysis."""
         safe_snapshot = snapshot_data if isinstance(snapshot_data, dict) else {}
         snapshot_id = str(safe_snapshot.get('snapshot_id', '') or safe_snapshot.get('snapshotId', '') or f"DS_{uuid.uuid4().hex}")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute(
                 '''
                 INSERT OR REPLACE INTO decision_snapshots (
@@ -1912,7 +2073,7 @@ class SQLiteManager:
         safe_trade_id = str(trade_id or '').strip()
         if not safe_trade_id:
             return []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''
@@ -1955,7 +2116,7 @@ class SQLiteManager:
             clauses.append('created_ts <= ?')
             params.append(int(end_ts))
         safe_limit = max(1, int(limit or 500))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             query = f'''
                 SELECT * FROM decision_snapshots
@@ -1981,7 +2142,7 @@ class SQLiteManager:
         """Drop old decision snapshots; returns deleted row count."""
         safe_days = max(1, int(retention_days or 30))
         cutoff_ms = int((datetime.now().timestamp() - (safe_days * 86400)) * 1000)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             cursor = await db.execute(
                 'DELETE FROM decision_snapshots WHERE created_ts < ?',
                 (cutoff_ms,),
@@ -2007,7 +2168,7 @@ class SQLiteManager:
         decision_trace: Optional[dict] = None,
     ):
         """Update canonical signal lifecycle state."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute(
                 '''
                 UPDATE signals
@@ -2048,7 +2209,7 @@ class SQLiteManager:
         Updates the most recent signal row for this symbol near this timestamp.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     UPDATE signals 
                     SET reject_reason = ?,
@@ -2087,7 +2248,7 @@ class SQLiteManager:
     
     async def save_open_position(self, pos: dict):
         """Save an open position to database."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             # RFX-1D: serialize truth_snapshot for position persistence
             _pos_ts_json = '{}'
             _pos_ts_raw = pos.get('truth_snapshot')
@@ -2186,7 +2347,7 @@ class SQLiteManager:
     async def close_position_in_db(self, position_id: str, symbol: str = None):
         """Mark a position as closed in database with close_time."""
         close_time = int(datetime.now().timestamp() * 1000)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             if position_id:
                 await db.execute('''
                     UPDATE positions SET status = 'CLOSED', close_time = ? WHERE id = ?
@@ -2202,7 +2363,7 @@ class SQLiteManager:
     async def get_position_open_time(self, symbol: str) -> int:
         """Get open_time for an active position by symbol from SQLite."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cursor = await db.execute(
                     "SELECT open_time FROM positions WHERE symbol=? AND status='OPEN' ORDER BY open_time DESC LIMIT 1",
                     (symbol,)
@@ -2216,7 +2377,7 @@ class SQLiteManager:
     async def get_all_open_times(self) -> dict:
         """Get open_times for ALL active positions in one query. Returns {symbol: open_time_ms}."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cursor = await db.execute(
                     "SELECT symbol, open_time FROM positions WHERE status='OPEN'"
                 )
@@ -2229,7 +2390,7 @@ class SQLiteManager:
     async def get_position_metadata(self, symbol: str, side: str = None) -> dict:
         """RHP-1A: Get metadata for an active position (restart continuity). OVP-1: hedge-safe with side."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 if side:
                     cursor = await db.execute(
                         "SELECT open_time, signal_score, signal_score_raw FROM positions "
@@ -2254,7 +2415,7 @@ class SQLiteManager:
         """Phase 239: Lookup position_closes for metadata enrichment.
         Returns dict of metadata fields or empty dict if not found."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute('''
                     SELECT * FROM position_closes 
@@ -2272,7 +2433,7 @@ class SQLiteManager:
     async def get_trade_data_quality_24h(self) -> dict:
         """Phase 239: Get trade metadata quality stats for last 24 hours."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cutoff_ms = int((datetime.now().timestamp() - 86400) * 1000)
                 async with db.execute('''
                     SELECT 
@@ -2309,7 +2470,7 @@ class SQLiteManager:
         Returns number of trades updated."""
         updated = 0
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cutoff_ms = int((datetime.now().timestamp() - hours_back * 3600) * 1000)
                 db.row_factory = aiosqlite.Row
                 # Find trades with missing metadata
@@ -2384,7 +2545,7 @@ class SQLiteManager:
 
     async def save_all_settings(self, settings: dict):
         """Save all settings to database."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             for key, value in settings.items():
                 await db.execute('''
                     INSERT OR REPLACE INTO settings (key, value, updated_at)
@@ -2402,7 +2563,7 @@ class SQLiteManager:
     ) -> bool:
         """Check whether a near-identical trade event already exists in trades table."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 if pnl is None:
                     async with db.execute(
                         '''
@@ -2441,7 +2602,7 @@ class SQLiteManager:
         """Backfill exit execution metrics to the just-closed trade record and refresh attribution."""
         try:
             target_id = trade_id
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 # Fallback: if trade_id missing or not found, pick latest live trade for symbol near close time.
                 if not target_id:
@@ -2530,7 +2691,7 @@ class SQLiteManager:
     
     async def save_position_close(self, close_data: dict):
         """Phase 187: Save position close with ALL trade data + settings."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             strategy_mode = normalize_strategy_mode(
                 close_data.get('strategyMode', close_data.get('strategy_mode', STRATEGY_MODE_LEGACY))
             )
@@ -2640,7 +2801,7 @@ class SQLiteManager:
     async def get_pending_close_reason(self, symbol: str, close_time: int, window_minutes: int = 30, close_order_id: str = None) -> dict:
         """Phase 229: Get pending close reason — order ID match first, timestamp fallback."""
         window_ms = window_minutes * 60 * 1000
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             db.row_factory = aiosqlite.Row
             
             # Step 0: Exact match by close_order_id (Phase 229)
@@ -2683,7 +2844,7 @@ class SQLiteManager:
     
     async def mark_close_matched(self, close_id: int):
         """Mark a position close as matched to Binance income."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 UPDATE position_closes SET matched_to_income = 1 WHERE id = ?
             ''', (close_id,))
@@ -2695,7 +2856,7 @@ class SQLiteManager:
         try:
             now_ms = int(datetime.now().timestamp() * 1000)
             window_ms = 5 * 60 * 1000  # 5 minutes
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cursor = await db.execute('''
                     UPDATE position_closes SET close_order_id = ?
                     WHERE symbol = ? AND (close_order_id IS NULL OR close_order_id = '')
@@ -2715,7 +2876,7 @@ class SQLiteManager:
         Phase 152 / analytics-v2: save raw Binance sync row and reconcile an
         existing canonical trade only when exact identifiers are available.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             symbol = trade_data.get('symbol')
             close_time = trade_data.get('closeTime', 0)
             close_order_id = trade_data.get('closeOrderId', trade_data.get('close_order_id', ''))
@@ -2892,7 +3053,7 @@ class SQLiteManager:
         Reads directly from binance_trades columns + enriches with position_closes.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 
                 # LEFT JOIN position_closes to get proper close reasons
@@ -2999,7 +3160,7 @@ class SQLiteManager:
     
     async def save_leverage(self, symbol: str, leverage: int):
         """Cache leverage for a symbol."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 INSERT OR REPLACE INTO leverage_cache (symbol, leverage, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -3008,7 +3169,7 @@ class SQLiteManager:
     
     async def get_leverage(self, symbol: str) -> int:
         """Get cached leverage for a symbol."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             async with db.execute('''
                 SELECT leverage FROM leverage_cache WHERE symbol = ?
             ''', (symbol,)) as cursor:
@@ -3025,7 +3186,7 @@ class SQLiteManager:
                                     activation_time: str, spread_level: str = 'Normal',
                                     order_id: str = None, contracts: float = 0.0, open_time: int = 0):
         """Save breakeven state to SQLite."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('''
                 INSERT OR REPLACE INTO breakeven_states 
                 (state_key, symbol, side, entry_price, activation_price, activation_time, spread_level, order_id, contracts, open_time)
@@ -3036,7 +3197,7 @@ class SQLiteManager:
     
     async def delete_breakeven_state(self, state_key: str):
         """Delete breakeven state from SQLite."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             await db.execute('DELETE FROM breakeven_states WHERE state_key = ?', (state_key,))
             await db.commit()
         logger.info(f"🗑️ Breakeven state deleted: {state_key}")
@@ -3045,7 +3206,7 @@ class SQLiteManager:
         """Load all breakeven states from SQLite."""
         states = {}
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level, order_id, contracts, open_time FROM breakeven_states') as cursor:
                     async for row in cursor:
                         states[row[0]] = {
@@ -3063,7 +3224,7 @@ class SQLiteManager:
         except Exception as e:
             # Fallback to old schema if new columns aren't there yet
             try:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with self._connect_db() as db:
                     async with db.execute('SELECT state_key, symbol, side, entry_price, activation_price, activation_time, spread_level FROM breakeven_states') as cursor:
                         async for row in cursor:
                             states[row[0]] = {
@@ -3089,7 +3250,7 @@ class SQLiteManager:
                                  improvement_pct: float, applied: bool, 
                                  params: list, metadata: dict = None) -> int:
         """Save an optimizer run and its parameters to SQLite."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect_db() as db:
             cursor = await db.execute('''
                 INSERT INTO optimizer_runs 
                 (optimizer_type, run_ts, trade_count, objective, score_before, score_after, improvement_pct, applied, metadata_json)
@@ -3115,7 +3276,7 @@ class SQLiteManager:
         """Load optimizer history from SQLite."""
         history = []
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 
                 query = 'SELECT * FROM optimizer_runs '
@@ -3155,7 +3316,7 @@ class SQLiteManager:
                                       trade_id: str = None):
         """Persist a single trade sample for FreqAI training (idempotent on trade_id)."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     INSERT OR IGNORE INTO ml_training_samples 
                     (ts, target, features_json, symbol, side, pnl, close_reason, trade_id)
@@ -3169,7 +3330,7 @@ class SQLiteManager:
         """Hydrate historical training samples up to limit."""
         samples = []
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 # Fix P1: Fetch latest `limit` samples by DESC, then reverse to chronological ASC
                 async with db.execute('''
@@ -3192,7 +3353,7 @@ class SQLiteManager:
                                 importance_dict: dict, metadata: dict = None) -> int:
         """Persist a model training run and its feature importance."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cursor = await db.execute('''
                     INSERT INTO ml_model_runs 
                     (run_ts, sample_count, accuracy, f1_score, train_count, model_type, metadata_json)
@@ -3216,7 +3377,7 @@ class SQLiteManager:
     async def get_latest_ml_model_run(self) -> dict:
         """Get the most recent trained ML model stats."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute('''
                     SELECT * FROM ml_model_runs ORDER BY run_ts DESC LIMIT 1
@@ -3247,7 +3408,7 @@ class SQLiteManager:
         inserted = 0
         skipped = 0
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute('''
                     SELECT id, symbol, side, entry_price, exit_price, pnl, close_time,
@@ -3330,7 +3491,7 @@ class SQLiteManager:
                                          feature_json: str):
         """Insert a new entry forecast event (idempotent on event_id)."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     INSERT OR IGNORE INTO entry_forecast_events
                     (event_id, symbol, side, created_ts, signal_price, planned_entry_price,
@@ -3350,7 +3511,7 @@ class SQLiteManager:
                                              force_market: int = 0):
         """Update a PENDING entry forecast event with its terminal outcome."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     UPDATE entry_forecast_events
                     SET status = ?, outcome_label = ?, outcome_reason = ?,
@@ -3366,7 +3527,7 @@ class SQLiteManager:
         """Get labeled entry forecast events for model training."""
         rows = []
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute('''
                     SELECT * FROM entry_forecast_events
@@ -3383,7 +3544,7 @@ class SQLiteManager:
     async def get_entry_forecast_labeled_count(self) -> int:
         """Count labeled entry forecast events."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 async with db.execute(
                     'SELECT COUNT(*) FROM entry_forecast_events WHERE outcome_label IS NOT NULL'
                 ) as cursor:
@@ -3399,7 +3560,7 @@ class SQLiteManager:
                                              model_version: str, metadata: dict = None) -> int:
         """Persist an entry forecast model training run."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 cursor = await db.execute('''
                     INSERT INTO ml_model_runs
                     (run_ts, sample_count, accuracy, f1_score, train_count, model_type, metadata_json)
@@ -3415,7 +3576,7 @@ class SQLiteManager:
     async def get_latest_entry_forecast_model_run(self) -> dict:
         """Get the most recent entry forecast model run."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute('''
                     SELECT * FROM ml_model_runs
@@ -3438,7 +3599,7 @@ class SQLiteManager:
     async def save_ml_governance_registry(self, entry: dict):
         """Persist ML model registry entry."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     INSERT OR REPLACE INTO ml_model_registry
                     (model_key, version, role, status, created_ts, metric_json, artifact_path, promoted_from, notes)
@@ -3458,7 +3619,7 @@ class SQLiteManager:
     async def save_ml_governance_eval_window(self, entry: dict):
         """Persist ML model evaluation window."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     INSERT INTO ml_model_eval_windows
                     (model_key, version, window_start, window_end, samples, pnl, winrate, f1, brier, uplift_vs_champion)
@@ -3477,7 +3638,7 @@ class SQLiteManager:
     async def save_ml_governance_event(self, ts: int, model_key: str, event_type: str, payload: dict):
         """Persist ML governance event."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect_db() as db:
                 await db.execute('''
                     INSERT INTO ml_model_events (ts, model_key, event_type, payload_json)
                     VALUES (?, ?, ?, ?)
@@ -3492,13 +3653,17 @@ sqlite_manager = SQLiteManager()
 
 def safe_create_task(coro, name="unnamed"):
     """Create an asyncio task with exception logging instead of silent swallowing."""
-    task = asyncio.create_task(coro)
+    task_name = name if name and name != "unnamed" else _infer_task_name(coro)
+    try:
+        task = asyncio.create_task(coro, name=task_name)
+    except TypeError:
+        task = asyncio.create_task(coro)
     def _handle_exception(t):
         if t.cancelled():
             return
         exc = t.exception()
         if exc:
-            logger.error(f"🔥 Background task '{name}' failed: {exc}")
+            logger.error(f"🔥 Background task '{task_name}' failed: {exc}")
     task.add_done_callback(_handle_exception)
     return task
 
@@ -7190,7 +7355,7 @@ async def lifespan(app: FastAPI):
                 if len(samples) < 30:
                     logger.warning(f"⚠️ Phase 263b: Only {len(samples)} ML samples in DB, generating in-memory fallback from trades...")
                     try:
-                        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+                        async with sqlite_manager._connect_db() as db:
                             db.row_factory = aiosqlite.Row
                             async with db.execute('''
                                 SELECT id, symbol, side, entry_price, pnl, close_time, close_reason, 
@@ -58125,7 +58290,7 @@ async def phase193_status():
     has_ml_tables = False
     ml_samples_count = 0
     try:
-        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+        async with sqlite_manager._connect_db() as db:
             async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ml_training_samples'") as cur:
                 has_ml_tables = (await cur.fetchone()) is not None
             if has_ml_tables:
@@ -58228,7 +58393,7 @@ async def phase193_entry_forecast_status():
     
     # Recent forecast telemetry (24h)
     try:
-        async with aiosqlite.connect(sqlite_manager.db_path) as db:
+        async with sqlite_manager._connect_db() as db:
             ts_24h = int(time.time()) - 86400
             async with db.execute('''
                 SELECT 
