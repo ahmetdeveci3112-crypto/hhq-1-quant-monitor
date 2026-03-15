@@ -21,11 +21,13 @@ export const TabNavigation: React.FC<TabsProps> = ({
     pendingConfirmedCount = 0
 }) => {
     const tabs = [
+        // Faz 1 UI-Redesign: Tab isimleri ürün diline çevrildi
+        // Badge kaynakları: portfolio→positions.length, signals→signalCounts.actionable, opportunities→remainingOpportunityCount
         { id: 'portfolio', label: 'Portföy', icon: Wallet, badge: positionCount > 0 ? positionCount : null },
-        { id: 'signals', label: 'Sinyaller', icon: Zap, badge: signalCount > 0 ? signalCount : null },
-        { id: 'opportunities', label: 'Adaylar', icon: TrendingUp, badge: opportunitiesCount > 0 ? opportunitiesCount : null },
-        { id: 'ai', label: 'Yapay Zeka', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
-        { id: 'workbench', label: 'Workbench', icon: Radar, badge: null },
+        { id: 'signals', label: 'Operasyon', icon: Zap, badge: signalCount > 0 ? signalCount : null },
+        { id: 'opportunities', label: 'Tarama', icon: TrendingUp, badge: opportunitiesCount > 0 ? opportunitiesCount : null },
+        { id: 'ai', label: 'Piyasa', icon: Bot, badge: aiTrackingCount > 0 ? aiTrackingCount : null, color: 'fuchsia' },
+        { id: 'workbench', label: 'Geçmiş', icon: Radar, badge: null },
         { id: 'performance', label: 'Performans', icon: BarChart3, badge: null },
         { id: 'logs', label: 'Loglar', icon: Terminal, badge: null },
     ];

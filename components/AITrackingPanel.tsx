@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bot, Clock, TrendingUp, TrendingDown, AlertTriangle, CheckCircle, Shield, Zap } from 'lucide-react';
+import { Bot, Clock, TrendingUp, TrendingDown, AlertTriangle, CheckCircle, Shield, Zap, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface PostTradeAnalysis {
     trade_id: string;
@@ -229,6 +229,9 @@ const getDecisionTone = (decision?: string) => {
 export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyses = [], onToggle, marketRegime, dcaConfig, strategyMode }) => {
     const safeTracking = tracking || [];
     const safeAnalyses = analyses || [];
+    // Faz 2: Section collapse state
+    const [showDetail, setShowDetail] = React.useState(false);
+    const [showPostTrade, setShowPostTrade] = React.useState(false);
     const rawRegime = marketRegime?.currentRegime || marketRegime?.struct?.regime || '';
     const hasRegimeSignal = Boolean(rawRegime || marketRegime?.fast || marketRegime?.struct || marketRegime?.dataFlow?.lastBtcPrice);
     const regime = rawRegime ? getRegimeLabel(rawRegime) : { icon: '🛰️', label: 'BTC REJIM', color: 'text-slate-400' };
@@ -252,7 +255,7 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                     <Bot className="w-6 h-6 text-fuchsia-400" />
-                    <h2 className="text-xl font-bold text-white">AI Trading Takip</h2>
+                    <h2 className="text-xl font-bold text-white">Piyasa Durumu</h2>
                 </div>
                 <div className="flex items-center gap-2">
                     {dcaConfig && (
@@ -362,6 +365,14 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                         </div>
                     )}
 
+                    {/* Faz 2: Rejim Detayı collapse */}
+                    <div className="border-t border-slate-800/40 pt-2 mt-2">
+                        <button onClick={() => setShowDetail(!showDetail)} className="w-full flex items-center justify-between text-[10px] text-slate-500 hover:text-slate-300 transition-colors py-1">
+                            <span className="uppercase tracking-wider font-semibold">Rejim Detayı & Veri Akışı</span>
+                            {showDetail ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                        </button>
+                    </div>
+                    {showDetail && (<>
                     {/* Dual regime windows */}
                     <div className="grid grid-cols-2 gap-2 mb-3">
                         {/* Fast */}
@@ -448,6 +459,8 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                             </div>
                         </div>
                     )}
+
+                    </>)}
 
                     {/* Strategy Mode Chip + DCA Decision */}
                     {strategyMode && (
@@ -538,104 +551,26 @@ export const AITrackingPanel: React.FC<Props> = ({ stats, tracking = [], analyse
                 </div>
             )}
 
-            {/* Currently Tracking */}
+            {/* Faz 2: Post-Trade Takip — collapse */}
             <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4">
-                <h3 className="text-xs font-semibold text-fuchsia-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5" />
-                    Şu An Takip Edilen (24 Saat)
-                </h3>
-                {safeTracking.length === 0 ? (
-                    <div className="text-center py-5">
-                        <div className="text-sm text-slate-600">Takipte işlem yok</div>
-                        <div className="text-[10px] text-slate-700 mt-1">İlk kapanan işlem sonrası otomatik dolacak</div>
-                    </div>
-                ) : (
-                    <div className="overflow-x-auto -mx-1">
-                        <table className="w-full text-xs">
-                            <thead>
-                                <tr className="text-slate-500 text-[10px] uppercase">
-                                    <th className="text-left py-1.5 px-1">Varlık</th>
-                                    <th className="text-left py-1.5 px-1">Yön</th>
-                                    <th className="text-right py-1.5 px-1">Çıkış</th>
-                                    <th className="text-right py-1.5 px-1">Max/Min</th>
-                                    <th className="text-right py-1.5 px-1">PnL</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {safeTracking.map((t, i) => (
-                                    <tr key={t.id || i} className="border-t border-slate-800/50">
-                                        <td className="py-1.5 px-1 font-medium text-white font-mono">{t.symbol.replace('USDT', '')}</td>
-                                        <td className={`py-1.5 px-1 ${t.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            {t.side === 'LONG' ? '▲' : '▼'} {t.side}
-                                        </td>
-                                        <td className="py-1.5 px-1 text-right font-mono text-slate-300">${t.exitPrice?.toFixed(4) || '0'}</td>
-                                        <td className="py-1.5 px-1 text-right font-mono">
-                                            <span className="text-emerald-400">${t.maxPriceAfter?.toFixed(4) || '0'}</span>
-                                            <span className="text-slate-700"> / </span>
-                                            <span className="text-rose-400">${t.minPriceAfter?.toFixed(4) || '0'}</span>
-                                        </td>
-                                        <td className={`py-1.5 px-1 text-right font-mono font-medium ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            ${t.pnl?.toFixed(2) || '0'}
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                )}
-            </div>
-
-            {/* Completed Analyses */}
-            <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4">
-                <h3 className="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                    <CheckCircle className="w-3.5 h-3.5" />
-                    Tamamlanan Analizler
-                </h3>
-                {safeAnalyses.length === 0 ? (
-                    <div className="text-center py-5">
-                        <div className="text-sm text-slate-600">Henüz analiz tamamlanmadı</div>
-                        <div className="text-[10px] text-slate-700 mt-1">İlk kapanan işlem sonrası otomatik dolacak</div>
-                    </div>
-                ) : (
-                    <div className="overflow-x-auto -mx-1">
-                        <table className="w-full text-xs">
-                            <thead>
-                                <tr className="text-slate-500 text-[10px] uppercase">
-                                    <th className="text-left py-1.5 px-1">Varlık</th>
-                                    <th className="text-left py-1.5 px-1">Yön</th>
-                                    <th className="text-right py-1.5 px-1">PnL</th>
-                                    <th className="text-right py-1.5 px-1">Kaçırılan</th>
-                                    <th className="text-center py-1.5 px-1">Sonuç</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {safeAnalyses.slice(-10).reverse().map((a, i) => (
-                                    <tr key={i} className="border-t border-slate-800/50">
-                                        <td className="py-1.5 px-1 font-medium text-white font-mono">{a.symbol.replace('USDT', '')}</td>
-                                        <td className={`py-1.5 px-1 ${a.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            {a.side === 'LONG' ? '▲' : '▼'}
-                                        </td>
-                                        <td className={`py-1.5 px-1 text-right font-mono ${a.actual_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            ${a.actual_pnl.toFixed(2)}
-                                        </td>
-                                        <td className="py-1.5 px-1 text-right font-mono text-amber-400">
-                                            +%{a.missed_profit_pct.toFixed(1)}
-                                        </td>
-                                        <td className="py-1.5 px-1 text-center">
-                                            {a.was_early_exit ? (
-                                                <span className="px-1.5 py-0.5 bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded text-[10px]">Erken</span>
-                                            ) : a.was_correct_exit ? (
-                                                <span className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded text-[10px]">Doğru</span>
-                                            ) : (
-                                                <span className="px-1.5 py-0.5 bg-slate-500/10 text-slate-400 border border-slate-700 rounded text-[10px]">Nötr</span>
-                                            )}
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                )}
+                <button onClick={() => setShowPostTrade(!showPostTrade)} className="w-full flex items-center justify-between">
+                    <h3 className="text-xs font-semibold text-fuchsia-400 uppercase tracking-wider flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5" />Post-Trade Takip
+                        {(stats.trackingCount > 0 || stats.completedCount > 0) && <span className="text-[10px] bg-fuchsia-500/10 text-fuchsia-400 px-1.5 py-0.5 rounded-full font-normal">{stats.trackingCount + stats.completedCount}</span>}
+                    </h3>
+                    {showPostTrade ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                </button>
+                {showPostTrade && (<div className="mt-3 space-y-4">
+                    {safeTracking.length > 0 && (<div className="overflow-x-auto -mx-1"><table className="w-full text-xs"><thead><tr className="text-slate-500 text-[10px] uppercase"><th className="text-left py-1.5 px-1">Varlık</th><th className="text-left py-1.5 px-1">Yön</th><th className="text-right py-1.5 px-1">Çıkış</th><th className="text-right py-1.5 px-1">Max/Min</th><th className="text-right py-1.5 px-1">PnL</th></tr></thead><tbody>
+                        {safeTracking.map((t, i) => (<tr key={t.id || i} className="border-t border-slate-800/50"><td className="py-1.5 px-1 font-medium text-white font-mono">{t.symbol.replace('USDT', '')}</td><td className={`py-1.5 px-1 ${t.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{t.side === 'LONG' ? '▲' : '▼'} {t.side}</td><td className="py-1.5 px-1 text-right font-mono text-slate-300">${t.exitPrice?.toFixed(4) || '0'}</td><td className="py-1.5 px-1 text-right font-mono"><span className="text-emerald-400">${t.maxPriceAfter?.toFixed(4) || '0'}</span><span className="text-slate-700"> / </span><span className="text-rose-400">${t.minPriceAfter?.toFixed(4) || '0'}</span></td><td className={`py-1.5 px-1 text-right font-mono font-medium ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>${t.pnl?.toFixed(2) || '0'}</td></tr>))}
+                    </tbody></table></div>)}
+                    {safeAnalyses.length > 0 && (<div className="border-t border-slate-800/40 pt-3">
+                        <h4 className="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-2 flex items-center gap-1.5"><CheckCircle className="w-3.5 h-3.5" />Tamamlanan Analizler</h4>
+                        <div className="overflow-x-auto -mx-1"><table className="w-full text-xs"><thead><tr className="text-slate-500 text-[10px] uppercase"><th className="text-left py-1.5 px-1">Varlık</th><th className="text-left py-1.5 px-1">Yön</th><th className="text-right py-1.5 px-1">PnL</th><th className="text-right py-1.5 px-1">Kaçırılan</th><th className="text-center py-1.5 px-1">Sonuç</th></tr></thead><tbody>
+                            {safeAnalyses.slice(-10).reverse().map((a, i) => (<tr key={i} className="border-t border-slate-800/50"><td className="py-1.5 px-1 font-medium text-white font-mono">{a.symbol.replace('USDT', '')}</td><td className={`py-1.5 px-1 ${a.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>{a.side === 'LONG' ? '▲' : '▼'}</td><td className={`py-1.5 px-1 text-right font-mono ${a.actual_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>${a.actual_pnl.toFixed(2)}</td><td className="py-1.5 px-1 text-right font-mono text-amber-400">+%{a.missed_profit_pct.toFixed(1)}</td><td className="py-1.5 px-1 text-center">{a.was_early_exit ? <span className="px-1.5 py-0.5 bg-rose-500/10 text-rose-400 border border-rose-500/20 rounded text-[10px]">Erken</span> : a.was_correct_exit ? <span className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded text-[10px]">Doğru</span> : <span className="px-1.5 py-0.5 bg-slate-500/10 text-slate-400 border border-slate-700 rounded text-[10px]">Nötr</span>}</td></tr>))}
+                        </tbody></table></div>
+                    </div>)}
+                </div>)}
             </div>
         </div>
     );

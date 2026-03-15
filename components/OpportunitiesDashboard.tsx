@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { TrendingUp, TrendingDown, Activity, Search, Layers3, Radar, ShieldAlert, Globe } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Search, Layers3, Radar, ShieldAlert, Globe, ChevronUp, ChevronDown } from 'lucide-react';
 import { CoinOpportunity, PendingEntry } from '../types';
 import { getReasonTooltip, getReasonInfo, getReasonCategoryStyle, getNextStep } from '../utils/reasonUtils';
 import { buildDecisionSummary, formatAlternateIntentLabel, formatSignalIntentVersion, humanizeDecisionToken } from '../utils/decisionUi';
+import { isGated, isEliminated, categorizeOpportunities } from '../utils/opportunityCategories';
 
 interface OpportunitiesDashboardProps {
     opportunities: CoinOpportunity[];
@@ -11,7 +12,7 @@ interface OpportunitiesDashboardProps {
     isLoading?: boolean;
 }
 
-type OpportunityTab = 'candidates' | 'gated' | 'eliminated' | 'passive';
+// Faz 2: OpportunityTab replaced by TaramaTab below
 
 const formatPrice = (price: number): string => {
     if (price >= 1000) return price.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -342,12 +343,12 @@ const PassiveCoinCard: React.FC<{ coin: CoinOpportunity }> = ({ coin }) => {
     );
 };
 
-// Phase UI-Redesign: Tab definition for the 4-tab navigation
-const TAB_CONFIG: { key: OpportunityTab; label: string; icon: React.ReactNode; emptyText: string; emptySubtext: string }[] = [
-    { key: 'candidates', label: 'Sinyal Adayları', icon: <Layers3 className="h-3.5 w-3.5" />, emptyText: 'Sinyal adayı bulunamadı', emptySubtext: 'Şu anda yön sinyali üretmiş ama işlenebilir olmayan aday yok.' },
-    { key: 'gated', label: 'Gate Bekleyenler', icon: <Globe className="h-3.5 w-3.5" />, emptyText: 'Gate bekleyen aday yok', emptySubtext: 'Makro veya mikro filtrelerde takılan sinyal bulunmuyor.' },
-    { key: 'eliminated', label: 'Şu An Elenenler', icon: <ShieldAlert className="h-3.5 w-3.5" />, emptyText: 'Şu anda elenen aday yok', emptySubtext: 'Scanner seviyesinde bloke/reject olan coin bulunmuyor.' },
-    { key: 'passive', label: 'Pasif Tarama', icon: <Radar className="h-3.5 w-3.5" />, emptyText: 'Pasif taramada coin yok', emptySubtext: 'Arka planda izlenen ama henüz yön üretmeyen coin bulunmuyor.' },
+// Faz 2 UI-Redesign: 2-tab + collapse layout
+type TaramaTab = 'active' | 'radar';
+
+const TARAMA_TABS: { key: TaramaTab; label: string; icon: React.ReactNode; emptyText: string; emptySubtext: string }[] = [
+    { key: 'active', label: 'Aktif Adaylar', icon: <Layers3 className="h-3.5 w-3.5" />, emptyText: 'Aktif aday bulunamadı', emptySubtext: 'Şu anda yön sinyali üretmiş veya gate bekleyen aday yok.' },
+    { key: 'radar', label: 'Radar', icon: <Radar className="h-3.5 w-3.5" />, emptyText: 'Radarda coin yok', emptySubtext: 'Arka planda izlenen ama henüz yön üretmeyen coin bulunmuyor.' },
 ];
 
 export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
@@ -356,7 +357,8 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
     pendingEntries = [],
     isLoading = false
 }) => {
-    const [activeTab, setActiveTab] = useState<OpportunityTab>('candidates');
+    const [activeTab, setActiveTab] = useState<TaramaTab>('active');
+    const [showEliminated, setShowEliminated] = useState(false);
     const actionableSymbols = new Set<string>([
         ...executableSignals.map(signal => String(signal.symbol || '')),
         ...pendingEntries.map(entry => String(entry.symbol || '')),
@@ -364,47 +366,25 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
 
     const remainingOpportunities = opportunities.filter(coin => !actionableSymbols.has(String(coin.symbol || '')));
 
-    // Phase UI-Redesign: 4-tab categorization
-    const candidateCoins = remainingOpportunities
-        .filter(c => c.signalAction !== 'NONE' && c.signalScore > 0 && !isGated(c) && !isEliminated(c))
-        .sort((a, b) => b.signalScore - a.signalScore)
-        .slice(0, 24);
+    // Faz 2 UI-Redesign: Use shared categorization helper — single source of truth
+    const { candidates: candidateCoins, gated: gatedCoins, eliminated: eliminatedCoins, passive: passiveCoins } = categorizeOpportunities(remainingOpportunities);
 
-    const gatedCoins = remainingOpportunities
-        .filter(c => isGated(c))
-        .sort((a, b) => b.signalScore - a.signalScore)
-        .slice(0, 24);
+    // Aktif Adaylar = candidates + gated combined
+    const activeCandidates = [...candidateCoins, ...gatedCoins];
 
-    const eliminatedCoins = remainingOpportunities
-        .filter(c => isEliminated(c))
-        .sort((a, b) => b.signalScore - a.signalScore)
-        .slice(0, 24);
-
-    const passiveCoins = remainingOpportunities
-        .filter(c => c.signalAction === 'NONE' || c.signalScore === 0)
-        .sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0))
-        .slice(0, 24);
-
-    const tabCounts: Record<OpportunityTab, number> = {
-        candidates: candidateCoins.length,
-        gated: gatedCoins.length,
-        eliminated: eliminatedCoins.length,
-        passive: passiveCoins.length,
+    const tabCounts: Record<TaramaTab, number> = {
+        active: activeCandidates.length,
+        radar: passiveCoins.length,
     };
 
-    const activeCoins = activeTab === 'candidates' ? candidateCoins
-        : activeTab === 'gated' ? gatedCoins
-            : activeTab === 'eliminated' ? eliminatedCoins
-                : passiveCoins;
-
-    const activeTabConfig = TAB_CONFIG.find(t => t.key === activeTab)!;
+    const activeTabConfig = TARAMA_TABS.find(t => t.key === activeTab)!;
 
     return (
         <div className="bg-[#151921] border border-slate-800 rounded-2xl p-6 shadow-xl">
             <div className="flex items-center justify-between mb-4">
                 <h3 className="font-bold text-white flex items-center gap-2">
                     <Search className="w-5 h-5 text-amber-500" />
-                    Adaylar
+                    Tarama
                     {remainingOpportunities.length > 0 && (
                         <span className="text-xs font-normal text-slate-500 ml-1">
                             ({remainingOpportunities.length} coin)
@@ -413,17 +393,15 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
                 </h3>
             </div>
 
-            {/* Phase UI-Redesign: 4-tab navigation with badges */}
+            {/* Faz 2: 2-tab navigation */}
             <div className="mb-4 flex items-center gap-2 overflow-x-auto pb-1">
-                {TAB_CONFIG.map(tab => (
+                {TARAMA_TABS.map(tab => (
                     <button
                         key={tab.key}
                         onClick={() => setActiveTab(tab.key)}
                         className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${activeTab === tab.key
-                            ? tab.key === 'candidates' ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
-                                : tab.key === 'gated' ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
-                                    : tab.key === 'eliminated' ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
-                                        : 'border-slate-600/40 bg-slate-700/30 text-slate-300'
+                            ? tab.key === 'active' ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                                : 'border-slate-600/40 bg-slate-700/30 text-slate-300'
                             : 'border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200'
                             }`}
                     >
@@ -444,52 +422,89 @@ export const OpportunitiesDashboard: React.FC<OpportunitiesDashboardProps> = ({
                 </div>
             )}
 
-            {activeCoins.length > 0 && (
+            {/* Main tab content */}
+            {activeTab === 'active' && activeCandidates.length > 0 && (
                 <div className="rounded-2xl border border-slate-800 bg-slate-950/30 p-4">
-                    {(activeTab === 'candidates' || activeTab === 'gated' || activeTab === 'eliminated') ? (
-                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 max-h-[720px] overflow-y-auto pr-2 custom-scrollbar">
-                            {activeCoins.map((coin) => (
-                                <CoinCard key={coin.symbol} coin={coin} />
-                            ))}
-                        </div>
-                    ) : (
-                        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 max-h-[720px] overflow-y-auto pr-2 custom-scrollbar">
-                            {activeCoins.map((coin) => (
-                                <PassiveCoinCard key={coin.symbol} coin={coin} />
-                            ))}
-                        </div>
+                    {/* Sinyal Adayları sub-section */}
+                    {candidateCoins.length > 0 && (
+                        <>
+                            <div className="text-[10px] uppercase tracking-wider text-amber-400/70 mb-2 flex items-center gap-1.5">
+                                <Layers3 className="w-3 h-3" />
+                                Sinyal Adayları
+                                <span className="text-slate-600">({candidateCoins.length})</span>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 max-h-[360px] overflow-y-auto pr-2 custom-scrollbar">
+                                {candidateCoins.map((coin) => (
+                                    <CoinCard key={coin.symbol} coin={coin} />
+                                ))}
+                            </div>
+                        </>
+                    )}
+
+                    {/* Gate Bekleyenler sub-section */}
+                    {gatedCoins.length > 0 && (
+                        <>
+                            <div className={`text-[10px] uppercase tracking-wider text-cyan-400/70 mb-2 flex items-center gap-1.5 ${candidateCoins.length > 0 ? 'mt-4 pt-3 border-t border-slate-800/40' : ''}`}>
+                                <Globe className="w-3 h-3" />
+                                Gate Bekleyenler
+                                <span className="text-slate-600">({gatedCoins.length})</span>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 max-h-[360px] overflow-y-auto pr-2 custom-scrollbar">
+                                {gatedCoins.map((coin) => (
+                                    <CoinCard key={coin.symbol} coin={coin} />
+                                ))}
+                            </div>
+                        </>
                     )}
                 </div>
             )}
 
-            {/* Phase UI-Redesign: Empty state with explanatory text */}
-            {!isLoading && activeCoins.length === 0 && (
+            {activeTab === 'radar' && passiveCoins.length > 0 && (
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/30 p-4">
+                    <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 max-h-[720px] overflow-y-auto pr-2 custom-scrollbar">
+                        {passiveCoins.map((coin) => (
+                            <PassiveCoinCard key={coin.symbol} coin={coin} />
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Empty state */}
+            {!isLoading && ((activeTab === 'active' && activeCandidates.length === 0) || (activeTab === 'radar' && passiveCoins.length === 0)) && (
                 <div className="text-center py-12 text-slate-500">
                     <Activity className="w-12 h-12 mx-auto mb-3 opacity-50" />
                     <p>{activeTabConfig.emptyText}</p>
                     <p className="text-xs mt-1">{activeTabConfig.emptySubtext}</p>
                 </div>
             )}
+
+            {/* Faz 2: Elenenler collapse section — always visible below tabs */}
+            {eliminatedCoins.length > 0 && (
+                <div className="mt-4 border-t border-slate-800/40 pt-3">
+                    <button
+                        onClick={() => setShowEliminated(!showEliminated)}
+                        className="w-full flex items-center justify-between text-xs text-slate-400 hover:text-slate-300 transition-colors py-1"
+                    >
+                        <span className="flex items-center gap-1.5">
+                            <ShieldAlert className="w-3.5 h-3.5 text-rose-400/70" />
+                            Şu An Elenenler
+                            <span className="text-[10px] bg-rose-500/10 text-rose-400 px-1.5 py-0.5 rounded-full">{eliminatedCoins.length}</span>
+                        </span>
+                        {showEliminated ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    </button>
+                    {showEliminated && (
+                        <div className="mt-2 rounded-2xl border border-slate-800 bg-slate-950/30 p-4">
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 max-h-[360px] overflow-y-auto pr-2 custom-scrollbar">
+                                {eliminatedCoins.map((coin) => (
+                                    <CoinCard key={coin.symbol} coin={coin} />
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
     );
 };
 
-// Helper: is this coin stuck at a macro/micro gate or quality gate?
-function isGated(coin: CoinOpportunity): boolean {
-    const rej = coin.executionRejectReason || '';
-    return (
-        rej.startsWith('MACRO__') ||
-        rej.startsWith('MICRO__') ||
-        rej.includes('MACRO') ||
-        rej.includes('MICRO') ||
-        !!coin.btcFilterBlocked ||
-        coin.entryQualityPass === false ||
-        coin.entryExecPassed === false
-    );
-}
-
-// Helper: is this coin currently eliminated at scanner level? (EXEC__ blocks, not lifecycle rejects)
-function isEliminated(coin: CoinOpportunity): boolean {
-    const rej = coin.executionRejectReason || '';
-    return rej.startsWith('EXEC__') && rej !== 'EXEC__EXECUTABLE_SIGNAL';
-}
+// Faz 2: isGated/isEliminated moved to utils/opportunityCategories.ts

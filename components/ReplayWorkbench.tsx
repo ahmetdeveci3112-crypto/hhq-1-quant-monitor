@@ -3,7 +3,10 @@ import {
     Activity,
     AlertTriangle,
     BarChart3,
+    ChevronDown,
     ChevronRight,
+    ChevronUp,
+    Settings,
     Layers,
     Play,
     RefreshCw,
@@ -108,6 +111,25 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
     const [replayTrade, setReplayTrade] = useState<ReplayTradeResponse | null>(null);
     const [replaySnapshots, setReplaySnapshots] = useState<ReplayDecisionSnapshot[]>([]);
     const [policyVersion, setPolicyVersion] = useState<'baseline' | 'candidate'>('candidate');
+    const [showHealth, setShowHealth] = useState(false);
+    const [showBacktest, setShowBacktest] = useState(false);
+    // Faz 3b: Detail section collapses
+    // Desktop: multiple sections open independently. Mobile: single accordion.
+    const [openSections, setOpenSections] = useState<Set<string>>(new Set());
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 1024;
+    const toggleSection = (key: string) => {
+        setOpenSections(prev => {
+            const next = new Set(prev);
+            if (next.has(key)) {
+                next.delete(key);
+            } else {
+                if (isMobile) next.clear();
+                next.add(key);
+            }
+            return next;
+        });
+    };
+    const isSectionOpen = (key: string) => openSections.has(key);
     const [health, setHealth] = useState<ReplayHealthResponse | null>(null);
     const [backtestForm, setBacktestForm] = useState(DEFAULT_BACKTEST_FORM);
     const [backtestLoading, setBacktestLoading] = useState(false);
@@ -199,28 +221,28 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
         if (!report || !replayTrade?.trade) return [];
         const trade = replayTrade.trade;
         return [
-            { label: 'Replay Türü', value: humanizeToken(replayTrade.replayFidelity), tone: toneForFidelity(replayTrade.replayFidelity) },
-            { label: 'Kapanış', value: translateReason(String(report.close_reason || trade.reason || '—')) },
+            { label: 'Veri Kalitesi', value: humanizeToken(replayTrade.replayFidelity), tone: toneForFidelity(replayTrade.replayFidelity) },
+            { label: 'Kapanış Nedeni', value: translateReason(String(report.close_reason || trade.reason || '—')) },
             { label: 'Peak ROI', value: formatPct(report.peak_roi) },
-            { label: 'Peak Yakalama', value: `${Number(report.realized_peak_capture_ratio || 0).toFixed(2)}x` },
-            { label: 'Reduce', value: String(report.reduce_count || 0) },
-            { label: 'Partial', value: String(report.partial_count || 0) },
-            { label: 'Giveback', value: formatPct(report.giveback) },
-            { label: 'Thesis', value: humanizeToken(trade.positionThesisState, '—') },
-            { label: 'Aged Guard', value: humanizeToken(trade.agedProfitGuardState, '—') },
-            { label: 'Fake-Out', value: trade.fakeoutReclaimHoldArmed || trade.fakeoutReclaimHoldUsed ? humanizeToken(trade.fakeoutReclaimReleaseReason || trade.fakeoutReclaimReason || 'ARMED') : '—' },
+            { label: 'Yakalama Oranı', value: `${Number(report.realized_peak_capture_ratio || 0).toFixed(2)}x` },
+            { label: 'Azaltma', value: String(report.reduce_count || 0) },
+            { label: 'Kısmi', value: String(report.partial_count || 0) },
+            { label: 'Geri Verme', value: formatPct(report.giveback) },
+            { label: 'Tez', value: humanizeToken(trade.positionThesisState, '—') },
+            { label: 'Yaşlı Koruma', value: humanizeToken(trade.agedProfitGuardState, '—') },
+            { label: 'Fake-Out Koruması', value: trade.fakeoutReclaimHoldArmed || trade.fakeoutReclaimHoldUsed ? humanizeToken(trade.fakeoutReclaimReleaseReason || trade.fakeoutReclaimReason || 'ARMED') : '—' },
             { label: 'Trail Fakeout', value: trade.trailFakeoutGuardArmed || trade.trailFakeoutGuardUsed ? humanizeToken(trade.trailFakeoutGuardState || trade.trailFakeoutGuardReleaseReason || trade.trailFakeoutGuardReason || 'ARMED') : '—' },
-            { label: 'Post-Exit Watch', value: humanizeToken(trade.postExitWatchState, '—') },
-            { label: 'Watch Register', value: humanizeToken(trade.postExitWatchRegisterResult, '—') },
-            { label: 'Watch Sebebi', value: humanizeToken(trade.postExitWatchRegisterReason, '—') },
-            { label: 'Resolution', value: humanizeToken(trade.postExitResolutionMode, '—') },
-            { label: 'Resolution Side', value: humanizeToken(trade.postExitResolutionTargetSide, '—') },
-            { label: 'Structure', value: humanizeToken(trade.structureTrend, '—') },
+            { label: 'Çıkış İzleme', value: humanizeToken(trade.postExitWatchState, '—') },
+            { label: 'İzleme Kaydı', value: humanizeToken(trade.postExitWatchRegisterResult, '—') },
+            { label: 'İzleme Sebebi', value: humanizeToken(trade.postExitWatchRegisterReason, '—') },
+            { label: 'Çözüm Modu', value: humanizeToken(trade.postExitResolutionMode, '—') },
+            { label: 'Çözüm Yönü', value: humanizeToken(trade.postExitResolutionTargetSide, '—') },
+            { label: 'Yapı', value: humanizeToken(trade.structureTrend, '—') },
             { label: 'Kurulum', value: humanizeToken(trade.setupState15m, '—') },
             { label: 'Arka Plan', value: humanizeToken(trade.backdropState1h, '—') },
             { label: 'Geçiş', value: humanizeToken(trade.transitionState, '—') },
-            { label: 'Retest', value: humanizeToken(trade.breakoutRetestState, '—') },
-            { label: 'Barrier', value: humanizeToken(trade.barrierVerdict, '—') },
+            { label: 'Yeniden Test', value: humanizeToken(trade.breakoutRetestState, '—') },
+            { label: 'Engel', value: humanizeToken(trade.barrierVerdict, '—') },
             {
                 label: 'Pattern',
                 value: `${humanizeToken(trade.patternBias, '—')} ${trade.patternConfidence ? `(${Number(trade.patternConfidence).toFixed(2)})` : ''}`.trim(),
@@ -228,18 +250,18 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             { label: 'Baskın Yön', value: humanizeToken(trade.dominantSide, '—') },
             { label: 'Çıkış Profili', value: humanizeToken(trade.preferredExitProfile || trade.runtimeExitProfile, '—') },
             { label: 'Çıkış Sahibi', value: humanizeToken(trade.runtimeExitOwner, '—') },
-            { label: 'Çıkış Sahibi Nedeni', value: humanizeToken(trade.runtimeExitOwnerReason, '—') },
-            { label: 'State Drift', value: humanizeToken(trade.runtimeStateDriftState, '—') },
-            { label: 'Drift Nedeni', value: humanizeToken(trade.runtimeStateDriftReason, '—') },
-            { label: 'Tez Kaybı', value: trade.runtimeIntentDecayPct ? `%${(Number(trade.runtimeIntentDecayPct) * 100).toFixed(0)}` : '—' },
+            { label: 'Çıkış Nedeni', value: humanizeToken(trade.runtimeExitOwnerReason, '—') },
+            { label: 'Durum Kayması', value: humanizeToken(trade.runtimeStateDriftState, '—') },
+            { label: 'Kayma Nedeni', value: humanizeToken(trade.runtimeStateDriftReason, '—') },
+            { label: 'Niyet Erimesi', value: trade.runtimeIntentDecayPct ? `%${(Number(trade.runtimeIntentDecayPct) * 100).toFixed(0)}` : '—' },
             { label: 'Koruma Modu', value: humanizeToken(trade.runtimeExchangeProtectiveMode, '—') },
-            { label: 'Koruma Yetkisi', value: humanizeToken(trade.runtimeLossProtectionAuthority, '—') },
-            { label: 'Borsa Yetkisi', value: humanizeToken(trade.runtimeExchangeProtectionAuthority, '—') },
+            { label: 'Kayıp Koruma', value: humanizeToken(trade.runtimeLossProtectionAuthority, '—') },
+            { label: 'Borsa Koruma', value: humanizeToken(trade.runtimeExchangeProtectionAuthority, '—') },
             { label: 'Koruma Rolü', value: humanizeToken(trade.runtimeExchangeProtectionRole, '—') },
-            { label: 'Positions Authority', value: humanizeToken(trade.positionsAuthority, '—') },
-            { label: 'Source Age', value: trade.positionsSourceAgeSec ? `${Number(trade.positionsSourceAgeSec).toFixed(1)}s` : '—' },
-            { label: 'Follow-Through', value: humanizeToken(trade.postExitFollowthroughMode, '—') },
-            { label: 'Tercih Yön', value: humanizeToken(trade.postExitPreferredSide, '—') },
+            { label: 'Pozisyon Yetkisi', value: humanizeToken(trade.positionsAuthority, '—') },
+            { label: 'Kaynak Yaşı', value: trade.positionsSourceAgeSec ? `${Number(trade.positionsSourceAgeSec).toFixed(1)}s` : '—' },
+            { label: 'Devam Takibi', value: humanizeToken(trade.postExitFollowthroughMode, '—') },
+            { label: 'Tercih Yönü', value: humanizeToken(trade.postExitPreferredSide, '—') },
             {
                 label: 'Follow-Through Güven',
                 value: typeof trade.postExitFollowthroughConfidence === 'number' && trade.postExitFollowthroughConfidence > 0
@@ -248,14 +270,14 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
             },
             { label: 'Watch Register', value: humanizeToken(trade.postExitWatchRegisterResult, '—') },
             { label: 'Watch Sebebi', value: humanizeToken(trade.postExitWatchRegisterReason, '—') },
-            { label: 'Thin Book Grace', value: trade.postExitThinBookGraceUsed ? 'Kullanildi' : '—' },
+            { label: 'İnce Defter', value: trade.postExitThinBookGraceUsed ? 'Kullanildi' : '—' },
             {
                 label: 'Exposure Reserve',
                 value: trade.postExitExposureReserveUsed
                     ? humanizeToken(trade.postExitExposureReserveReason || 'POST_EXIT_EXPOSURE_RESERVE', 'Kullanildi')
                     : '—',
             },
-            { label: 'Opposite Reclaim Baski', value: trade.oppositeReclaimSuppressed ? 'Evet' : '—' },
+            { label: 'Ters Reclaim Baskısı', value: trade.oppositeReclaimSuppressed ? 'Evet' : '—' },
             {
                 label: 'Taktik Stop',
                 value: trade.runtimeTacticalStopPrice
@@ -279,15 +301,15 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                 value: trade.postExitReentryTriggered ? 'Tetiklendi' : 'Yok',
                 tone: trade.postExitReentryTriggered ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60',
             },
-            { label: 'Re-entry Exec', value: humanizeToken(trade.postExitReentryEntryMode, '—') },
-            { label: 'Re-entry Pullback', value: trade.postExitReentryPullbackPctApplied ? `%${Number(trade.postExitReentryPullbackPctApplied).toFixed(2)}` : '—' },
-            { label: 'Reversal Exec', value: humanizeToken(trade.reversalRetestEntryMode, '—') },
-            { label: 'Reversal Pullback', value: trade.reversalRetestPullbackPctApplied ? `%${Number(trade.reversalRetestPullbackPctApplied).toFixed(2)}` : '—' },
-            { label: 'Reversal Zone', value: humanizeToken(trade.reversalRetestZoneState, '—') },
-            { label: 'Zone Güveni', value: trade.reversalRetestZoneConfidence ? `${(Number(trade.reversalRetestZoneConfidence) * 100).toFixed(0)}%` : '—' },
-            { label: 'Entry Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
+            { label: 'Giriş Modu', value: humanizeToken(trade.postExitReentryEntryMode, '—') },
+            { label: 'Giriş Pullback', value: trade.postExitReentryPullbackPctApplied ? `%${Number(trade.postExitReentryPullbackPctApplied).toFixed(2)}` : '—' },
+            { label: 'Ters Giriş Modu', value: humanizeToken(trade.reversalRetestEntryMode, '—') },
+            { label: 'Ters Pullback', value: trade.reversalRetestPullbackPctApplied ? `%${Number(trade.reversalRetestPullbackPctApplied).toFixed(2)}` : '—' },
+            { label: 'Ters Bölge', value: humanizeToken(trade.reversalRetestZoneState, '—') },
+            { label: 'Bölge Güveni', value: trade.reversalRetestZoneConfidence ? `${(Number(trade.reversalRetestZoneConfidence) * 100).toFixed(0)}%` : '—' },
+            { label: 'Giriş Değişti', value: report.entry_changed ? 'Evet' : 'Hayır', tone: report.entry_changed ? 'bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
             { label: 'Yön Değişti', value: report.side_changed ? 'Evet' : 'Hayır', tone: report.side_changed ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
-            { label: 'Owner Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
+            { label: 'Sahip Değişti', value: report.direction_owner_changed ? 'Evet' : 'Hayır', tone: report.direction_owner_changed ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25' : 'bg-slate-800/80 text-slate-300 border border-slate-700/60' },
         ];
     }, [report, replayTrade]);
 
@@ -319,7 +341,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                     <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
                         <div className="flex items-center gap-2 mb-4">
                             <Search className="w-4 h-4 text-cyan-400" />
-                            <h3 className="text-sm font-semibold text-white">Replay Arama</h3>
+                            <h3 className="text-sm font-semibold text-white">İşlem Ara</h3>
                         </div>
                         <form
                             onSubmit={(event) => {
@@ -377,7 +399,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                     className="inline-flex items-center gap-2 rounded-xl bg-slate-800/80 border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:text-white transition-colors"
                                 >
                                     <RefreshCw className="w-4 h-4" />
-                                    Health
+                                    Sistem
                                 </button>
                             </div>
                             {searchError && <div className="text-xs text-rose-400">{searchError}</div>}
@@ -385,19 +407,23 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                     </div>
 
                     <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-                        <div className="flex items-center gap-2 mb-3">
-                            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                            <h3 className="text-sm font-semibold text-white">Decision Health</h3>
-                        </div>
+                        <button onClick={() => setShowHealth(!showHealth)} className="w-full flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                                <Settings className="w-4 h-4 text-slate-500" />
+                                <h3 className="text-sm font-semibold text-slate-400">Sistem Sağlığı</h3>
+                            </div>
+                            {showHealth ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                        </button>
+                        {showHealth && (<div className="mt-3">
                         {health ? (
                             <div className="space-y-3">
                                 <div className="grid grid-cols-2 gap-2">
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
-                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Snapshot Coverage</div>
+                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Kayıt Kapsama</div>
                                         <div className="mt-1 text-lg font-bold text-cyan-300">{health.snapshotCoverage.toFixed(1)}%</div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
-                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Avg Peak Capture</div>
+                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Ort. Yakalama</div>
                                         <div className="mt-1 text-lg font-bold text-white">{health.avgRealizedPeakCaptureRatio.toFixed(2)}x</div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
@@ -405,27 +431,28 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         <div className="mt-1 text-lg font-bold text-amber-300">{health.preStopReduceCount}</div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
-                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Sideways Reclaim</div>
+                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Yatay Geri Alma</div>
                                         <div className="mt-1 text-lg font-bold text-emerald-300">{health.sidewaysReclaimCount}</div>
                                     </div>
                                 </div>
                                 <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
                                     <div className="flex items-center justify-between text-xs text-slate-400">
-                                        <span>Snapshot hazır: {health.snapshotReadyCount}</span>
+                                        <span>Kayıt hazır: {health.snapshotReadyCount}</span>
                                         <span>Yaklaşık: {health.approximateCount}</span>
                                     </div>
                                 </div>
                             </div>
                         ) : (
-                            <div className="text-xs text-slate-500">Health verisi bekleniyor.</div>
+                            <div className="text-xs text-slate-500">Sistem verisi bekleniyor.</div>
                         )}
+                        </div>)}
                     </div>
 
                     <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
                         <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-2">
                                 <Layers className="w-4 h-4 text-fuchsia-400" />
-                                <h3 className="text-sm font-semibold text-white">Replay Trade Listesi</h3>
+                                <h3 className="text-sm font-semibold text-white">İşlem Listesi</h3>
                             </div>
                             <span className="text-xs text-slate-500">{searchItems.length} trade</span>
                         </div>
@@ -466,7 +493,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                     <div className={`${item.roi >= 0 ? 'text-emerald-300' : 'text-rose-300'} font-semibold`}>{formatPct(item.roi)}</div>
                                                 </div>
                                                 <div className="text-slate-400">
-                                                    <div>Fidelity</div>
+                                                    <div>Veri Kalitesi</div>
                                                     <div className="font-semibold text-white">{humanizeToken(item.replayFidelity)}</div>
                                                 </div>
                                             </div>
@@ -488,10 +515,10 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                             <div>
                                 <div className="flex items-center gap-2">
                                     <Target className="w-4 h-4 text-cyan-400" />
-                                    <h3 className="text-sm font-semibold text-white">Replay Inspector</h3>
+                                    <h3 className="text-sm font-semibold text-white">İşlem Detayı</h3>
                                 </div>
                                 <p className="mt-1 text-xs text-slate-500">
-                                    Snapshot varsa exact yakın replay, yoksa yaklaşık OHLCV fallback gösterilir.
+                                    Kayıt varsa birebir replay, yoksa yaklaşık OHLCV fallback gösterilir.
                                 </p>
                             </div>
                             <div className="flex items-center gap-2">
@@ -500,14 +527,14 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                     onClick={() => setPolicyVersion('baseline')}
                                     className={`rounded-xl px-3 py-2 text-sm transition-colors ${policyVersion === 'baseline' ? 'bg-slate-700 text-white' : 'bg-[#0d1117] text-slate-400 border border-slate-800'}`}
                                 >
-                                    Baseline
+                                    Referans Karar
                                 </button>
                                 <button
                                     type="button"
                                     onClick={() => setPolicyVersion('candidate')}
                                     className={`rounded-xl px-3 py-2 text-sm transition-colors ${policyVersion === 'candidate' ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25' : 'bg-[#0d1117] text-slate-400 border border-slate-800'}`}
                                 >
-                                    Candidate
+                                    Güncel Karar
                                 </button>
                             </div>
                         </div>
@@ -546,7 +573,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                 </div>
 
                                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-                                    {summaryCards.map((card) => (
+                                    {summaryCards.filter(c => c.value != null && String(c.value).trim() !== '' && String(c.value).trim() !== '—').map((card) => (
                                         <div key={card.label} className={`rounded-xl p-3 ${card.tone || 'bg-[#0d1117] border border-slate-800'}`}>
                                             <div className="text-[11px] uppercase tracking-wide text-slate-500">{card.label}</div>
                                             <div className="mt-1 text-sm font-semibold text-white">{card.value}</div>
@@ -554,73 +581,89 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                     ))}
                                 </div>
 
-                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                                {/* Faz 3b: Referans vs Güncel collapse */}
+                                <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
+                                    <button onClick={() => toggleSection('comparison')} className="w-full flex items-center justify-between">
+                                        <span className="text-xs uppercase tracking-wide font-semibold text-slate-400">Referans vs Güncel</span>
+                                        {isSectionOpen('comparison') ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                                    </button>
+                                    {isSectionOpen('comparison') && (<div className="mt-3">
                                     <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
-                                        <div className="text-xs uppercase tracking-wide text-slate-500">Baseline vs Candidate</div>
+                                        <div className="text-xs uppercase tracking-wide text-slate-500">Referans vs Güncel</div>
                                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                                             <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
-                                                <div className="text-[11px] uppercase tracking-wide text-slate-500">Baseline Entry</div>
+                                                <div className="text-[11px] uppercase tracking-wide text-slate-500">Referans Giriş</div>
                                                 <div className="mt-1 text-sm font-semibold text-white">{humanizeToken(report?.baseline_vs_candidate?.baseline_entry_archetype)}</div>
                                                 <div className="mt-2 space-y-1 text-xs text-slate-400">
-                                                    <div>Side: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_side)}</span></div>
-                                                    <div>Owner: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_direction_owner)}</span></div>
+                                                    <div>Yön: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_side)}</span></div>
+                                                    <div>Sahip: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.baseline_direction_owner)}</span></div>
                                                 </div>
                                             </div>
                                             <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
-                                                <div className="text-[11px] uppercase tracking-wide text-slate-500">Candidate Entry</div>
+                                                <div className="text-[11px] uppercase tracking-wide text-slate-500">Güncel Giriş</div>
                                                 <div className="mt-1 text-sm font-semibold text-white">{humanizeToken(report?.baseline_vs_candidate?.candidate_entry_archetype)}</div>
                                                 <div className="mt-2 space-y-1 text-xs text-slate-400">
-                                                    <div>Side: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_side)}</span></div>
-                                                    <div>Owner: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_direction_owner)}</span></div>
+                                                    <div>Yön: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_side)}</span></div>
+                                                    <div>Sahip: <span className="font-semibold text-slate-200">{humanizeToken(report?.baseline_vs_candidate?.candidate_direction_owner)}</span></div>
                                                 </div>
                                             </div>
                                         </div>
                                     </div>
+                                    </div>)}
+                                </div>
+
+                                {/* Faz 3b: Piyasa Bağlamı collapse */}
+                                <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
+                                    <button onClick={() => toggleSection('market')} className="w-full flex items-center justify-between">
+                                        <span className="text-xs uppercase tracking-wide font-semibold text-slate-400">Piyasa Bağlamı</span>
+                                        {isSectionOpen('market') ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                                    </button>
+                                    {isSectionOpen('market') && (<div className="mt-3">
                                     <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
-                                        <div className="text-xs uppercase tracking-wide text-slate-500">Trade Özeti</div>
+                                        <div className="text-xs uppercase tracking-wide text-slate-500">Piyasa Bağlamı</div>
                                         <div className="mt-3 grid grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
                                             <div>
-                                                <div className="text-slate-500 text-xs">Owner</div>
+                                                <div className="text-slate-500 text-xs">Karar Sahibi</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reasonOwner)}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Hold Profile</div>
+                                                <div className="text-slate-500 text-xs">Pozisyon Profili</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.holdProfile)}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Expectancy</div>
+                                                <div className="text-slate-500 text-xs">Beklenti</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.expectancyBand)}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Runner</div>
+                                                <div className="text-slate-500 text-xs">Uzun Koşu</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runnerContextResolved)}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Structure</div>
+                                                <div className="text-slate-500 text-xs">Yapı</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.structureTrend, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Swing</div>
+                                                <div className="text-slate-500 text-xs">Salınım</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.swingState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Compression</div>
+                                                <div className="text-slate-500 text-xs">Sıkışma</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.compressionState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Retest</div>
+                                                <div className="text-slate-500 text-xs">Yeniden Test</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.breakoutRetestState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">SR Context</div>
+                                                <div className="text-slate-500 text-xs">D/D Bağlamı</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.srContext, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Pattern Bias</div>
+                                                <div className="text-slate-500 text-xs">Formasyon Eğilimi</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.patternBias, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Pattern Confidence</div>
+                                                <div className="text-slate-500 text-xs">Formasyon Güveni</div>
                                                 <div className="font-semibold text-white">
                                                     {typeof replayTrade.trade.patternConfidence === 'number'
                                                         ? Number(replayTrade.trade.patternConfidence).toFixed(2)
@@ -628,15 +671,15 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Barrier</div>
+                                                <div className="text-slate-500 text-xs">Engel</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierVerdict, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Barrier State</div>
+                                                <div className="text-slate-500 text-xs">Engel Durumu</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Adverse Level</div>
+                                                <div className="text-slate-500 text-xs">Olumsuz Seviye</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.adverseLevelType
                                                         ? `${humanizeToken(replayTrade.trade.adverseLevelType, '—')} @ ${Number(replayTrade.trade.adverseLevelPrice || 0).toFixed(6)}`
@@ -644,7 +687,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Adverse Distance</div>
+                                                <div className="text-slate-500 text-xs">Olumsuz Mesafe</div>
                                                 <div className="font-semibold text-white">
                                                     {typeof replayTrade.trade.adverseDistancePct === 'number' && replayTrade.trade.adverseDistancePct > 0
                                                         ? `%${Number(replayTrade.trade.adverseDistancePct).toFixed(2)}`
@@ -652,7 +695,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Supportive Level</div>
+                                                <div className="text-slate-500 text-xs">Destekleyici Seviye</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.supportiveLevelType
                                                         ? `${humanizeToken(replayTrade.trade.supportiveLevelType, '—')} @ ${Number(replayTrade.trade.supportiveLevelPrice || 0).toFixed(6)}`
@@ -660,49 +703,49 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Barrier Reason</div>
+                                                <div className="text-slate-500 text-xs">Engel Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.barrierReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Thesis</div>
+                                                <div className="text-slate-500 text-xs">Tez</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionThesisState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Rescue</div>
+                                                <div className="text-slate-500 text-xs">Kurtarma</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reclaimRescueReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Profit Hold</div>
+                                                <div className="text-slate-500 text-xs">Kâr Tutma</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.profitContinuationHoldReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Aged Guard</div>
+                                                <div className="text-slate-500 text-xs">Yaşlı Koruma</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.agedProfitGuardState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Guard Reason</div>
+                                                <div className="text-slate-500 text-xs">Koruma Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.agedProfitGuardReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Kârda Since</div>
+                                                <div className="text-slate-500 text-xs">Kâr Başlangıcı</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.agedProfitPositiveSinceTs ? formatTs(replayTrade.trade.agedProfitPositiveSinceTs * 1000) : '—'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Support Lost</div>
+                                                <div className="text-slate-500 text-xs">Destek Kaybı</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.agedProfitNonSupportingSinceTs ? formatTs(replayTrade.trade.agedProfitNonSupportingSinceTs * 1000) : '—'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">BE Guard Armed</div>
+                                                <div className="text-slate-500 text-xs">BE Koruma</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.agedProfitBeFloorArmedTs ? formatTs(replayTrade.trade.agedProfitBeFloorArmedTs * 1000) : 'Hayır'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Fake-Out Guard</div>
+                                                <div className="text-slate-500 text-xs">Fake-Out Koruması</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.fakeoutReclaimHoldArmed || replayTrade.trade.fakeoutReclaimHoldUsed ? 'Aktif/Used' : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">TRAIL Fakeout</div>
+                                                <div className="text-slate-500 text-xs">Trail Fakeout</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.trailFakeoutGuardArmed || replayTrade.trade.trailFakeoutGuardUsed
                                                         ? humanizeToken(replayTrade.trade.trailFakeoutGuardState || replayTrade.trade.trailFakeoutGuardReleaseReason || replayTrade.trade.trailFakeoutGuardReason, '—')
@@ -710,75 +753,75 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Hold Reason</div>
+                                                <div className="text-slate-500 text-xs">Tutma Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.fakeoutReclaimReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Hold Released</div>
+                                                <div className="text-slate-500 text-xs">Tutma Bırakıldı</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.fakeoutReclaimReleaseReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Post-Exit Watch</div>
+                                                <div className="text-slate-500 text-xs">Çıkış İzleme</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Watch Register</div>
+                                                <div className="text-slate-500 text-xs">İzleme Kaydı</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchRegisterResult, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Watch Sebebi</div>
+                                                <div className="text-slate-500 text-xs">İzleme Sebebi</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitWatchRegisterReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Resolution Mode</div>
+                                                <div className="text-slate-500 text-xs">Çözüm Modu</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitResolutionMode, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Resolution Side</div>
+                                                <div className="text-slate-500 text-xs">Çözüm Yönü</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitResolutionTargetSide, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Setup 15m</div>
+                                                <div className="text-slate-500 text-xs">Kurulum 15d</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.setupState15m, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Backdrop 1h</div>
+                                                <div className="text-slate-500 text-xs">Arka Plan 1s</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.backdropState1h, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Macro 4h</div>
+                                                <div className="text-slate-500 text-xs">Makro 4s</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.macroState4h, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Transition</div>
+                                                <div className="text-slate-500 text-xs">Geçiş</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.transitionState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Dominant Side</div>
+                                                <div className="text-slate-500 text-xs">Baskın Yön</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.dominantSide, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Preferred Exit</div>
+                                                <div className="text-slate-500 text-xs">Çıkış Profili</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.preferredExitProfile || replayTrade.trade.runtimeExitProfile, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Exit Owner</div>
+                                                <div className="text-slate-500 text-xs">Çıkış Sahibi</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExitOwner, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Exit Owner Reason</div>
+                                                <div className="text-slate-500 text-xs">Çıkış Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExitOwnerReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">State Drift</div>
+                                                <div className="text-slate-500 text-xs">Durum Kayması</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeStateDriftState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Drift Reason</div>
+                                                <div className="text-slate-500 text-xs">Kayma Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeStateDriftReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Intent Decay</div>
+                                                <div className="text-slate-500 text-xs">Niyet Erimesi</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.runtimeIntentDecayPct ? `%${(Number(replayTrade.trade.runtimeIntentDecayPct) * 100).toFixed(0)}` : '—'}
                                                 </div>
@@ -800,11 +843,11 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.runtimeExchangeProtectionRole, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Positions Authority</div>
+                                                <div className="text-slate-500 text-xs">Pozisyon Yetkisi</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.positionsAuthority, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Positions Source Age</div>
+                                                <div className="text-slate-500 text-xs">Kaynak Yaşı</div>
                                                 <div className="font-semibold text-white">
                                                     {typeof replayTrade.trade.positionsSourceAgeSec === 'number' && replayTrade.trade.positionsSourceAgeSec > 0
                                                         ? `${Number(replayTrade.trade.positionsSourceAgeSec).toFixed(1)}s`
@@ -836,29 +879,29 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">State Confidence</div>
+                                                <div className="text-slate-500 text-xs">Durum Güveni</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.stateConfidence ? `${(Number(replayTrade.trade.stateConfidence) * 100).toFixed(0)}%` : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Triggered</div>
+                                                <div className="text-slate-500 text-xs">Yeniden Giriş</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.postExitReentryTriggered ? 'Evet' : 'Hayır'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Reason</div>
+                                                <div className="text-slate-500 text-xs">Giriş Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitReentryReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Outcome</div>
+                                                <div className="text-slate-500 text-xs">Giriş Sonucu</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.postExitReentryOutcome || '—'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Exec Mode</div>
+                                                <div className="text-slate-500 text-xs">Giriş Modu</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.postExitReentryEntryMode, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Pullback</div>
+                                                <div className="text-slate-500 text-xs">Giriş Pullback</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.postExitReentryPullbackPctApplied
                                                         ? `%${Number(replayTrade.trade.postExitReentryPullbackPctApplied).toFixed(2)}`
@@ -866,23 +909,23 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Confirm Delay</div>
+                                                <div className="text-slate-500 text-xs">Onay Gecikmesi</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.postExitReentryConfirmDelaySec ? `${replayTrade.trade.postExitReentryConfirmDelaySec}s` : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Re-entry Expiry</div>
+                                                <div className="text-slate-500 text-xs">Giriş Süresi</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.postExitReentryExpiresSec ? `${replayTrade.trade.postExitReentryExpiresSec}s` : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Reversal Exec Mode</div>
+                                                <div className="text-slate-500 text-xs">Ters Giriş Modu</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestEntryMode, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Reversal Pullback</div>
+                                                <div className="text-slate-500 text-xs">Ters Pullback</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestPullbackPctApplied
                                                         ? `%${Number(replayTrade.trade.reversalRetestPullbackPctApplied).toFixed(2)}`
@@ -890,31 +933,31 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Reversal Confirm Delay</div>
+                                                <div className="text-slate-500 text-xs">Ters Gecikme</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestConfirmDelaySec ? `${replayTrade.trade.reversalRetestConfirmDelaySec}s` : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Reversal Expiry</div>
+                                                <div className="text-slate-500 text-xs">Ters Süre</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestExpiresSec ? `${replayTrade.trade.reversalRetestExpiresSec}s` : '—'}
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Reversal Zone</div>
+                                                <div className="text-slate-500 text-xs">Ters Bölge</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneState, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Zone Reason</div>
+                                                <div className="text-slate-500 text-xs">Bölge Nedeni</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneReason, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Zone Source</div>
+                                                <div className="text-slate-500 text-xs">Bölge Kaynağı</div>
                                                 <div className="font-semibold text-white">{humanizeToken(replayTrade.trade.reversalRetestZoneSource, '—')}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Zone Pocket</div>
+                                                <div className="text-slate-500 text-xs">Bölge Cebi</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestPocketPrice
                                                         ? formatLevel(replayTrade.trade.reversalRetestPocketPrice)
@@ -922,7 +965,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Retest Distance</div>
+                                                <div className="text-slate-500 text-xs">Test Mesafesi</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestRetestDistancePct
                                                         ? `%${Number(replayTrade.trade.reversalRetestRetestDistancePct).toFixed(2)}`
@@ -930,11 +973,11 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                 </div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Touch Ready</div>
+                                                <div className="text-slate-500 text-xs">Dokunma Hazır</div>
                                                 <div className="font-semibold text-white">{replayTrade.trade.reversalRetestTouchReady ? 'Evet' : 'Hayır'}</div>
                                             </div>
                                             <div>
-                                                <div className="text-slate-500 text-xs">Zone Confidence</div>
+                                                <div className="text-slate-500 text-xs">Bölge Güveni</div>
                                                 <div className="font-semibold text-white">
                                                     {replayTrade.trade.reversalRetestZoneConfidence
                                                         ? `${(Number(replayTrade.trade.reversalRetestZoneConfidence) * 100).toFixed(0)}%`
@@ -943,16 +986,24 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                             </div>
                                         </div>
                                     </div>
+                                    </div>)}
                                 </div>
 
+                                {/* Faz 3b: Karar Akışı & Timeline collapse */}
+                                <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
+                                    <button onClick={() => toggleSection('decisions')} className="w-full flex items-center justify-between">
+                                        <span className="text-xs uppercase tracking-wide font-semibold text-fuchsia-400">Karar Akışı & Timeline</span>
+                                        {isSectionOpen('decisions') ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                                    </button>
+                                    {isSectionOpen('decisions') && (<div className="mt-3 space-y-4">
                                 <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
                                     <div className="flex items-center gap-2 mb-3">
                                         <Activity className="w-4 h-4 text-fuchsia-400" />
-                                        <h4 className="text-sm font-semibold text-white">Decision Timeline</h4>
+                                        <h4 className="text-sm font-semibold text-white">Karar Zaman Çizelgesi</h4>
                                     </div>
                                     <div className="space-y-2">
                                         {replaySnapshots.length === 0 ? (
-                                            <div className="text-xs text-slate-500">Snapshot bulunamadı.</div>
+                                            <div className="text-xs text-slate-500">Karar kaydı bulunamadı.</div>
                                         ) : (
                                             replaySnapshots.map((snapshot) => {
                                                 const summaryRows = [
@@ -997,11 +1048,11 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                 <div className="rounded-2xl bg-[#0d1117] border border-slate-800 p-4">
                                     <div className="flex items-center gap-2 mb-3">
                                         <BarChart3 className="w-4 h-4 text-amber-400" />
-                                        <h4 className="text-sm font-semibold text-white">Decision Chain</h4>
+                                        <h4 className="text-sm font-semibold text-white">Karar Akışı</h4>
                                     </div>
                                     <div className="space-y-2">
                                         {decisionChain.length === 0 ? (
-                                            <div className="text-xs text-slate-500">Decision chain kaydı yok.</div>
+                                            <div className="text-xs text-slate-500">Karar akışı kaydı yok.</div>
                                         ) : (
                                             decisionChain.map((item, index) => (
                                                 <div key={`${item.stage}-${index}`} className="grid grid-cols-1 md:grid-cols-[160px_minmax(0,1fr)] gap-3 rounded-xl border border-slate-800 bg-slate-900/40 p-3">
@@ -1011,18 +1062,18 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                                     </div>
                                                     <div className="grid grid-cols-2 gap-3 text-sm">
                                                         <div>
-                                                            <div className="text-[11px] uppercase tracking-wide text-slate-500">Baseline</div>
+                                                            <div className="text-[11px] uppercase tracking-wide text-slate-500">Referans Karar</div>
                                                             <div className="font-medium text-white">{humanizeToken(item.baselineArchetype)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Rank {Number(item.baselineRankingScore || 0).toFixed(1)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Side {humanizeToken(item.baselineSide)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Owner {humanizeToken(item.baselineDirectionOwner)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Sıra {Number(item.baselineRankingScore || 0).toFixed(1)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Yön {humanizeToken(item.baselineSide)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Sahip {humanizeToken(item.baselineDirectionOwner)}</div>
                                                         </div>
                                                         <div>
-                                                            <div className="text-[11px] uppercase tracking-wide text-slate-500">Candidate</div>
+                                                            <div className="text-[11px] uppercase tracking-wide text-slate-500">Güncel Karar</div>
                                                             <div className="font-medium text-white">{humanizeToken(item.candidateArchetype)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Rank {Number(item.candidateRankingScore || 0).toFixed(1)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Side {humanizeToken(item.candidateSide)}</div>
-                                                            <div className="text-xs text-slate-500 mt-1">Owner {humanizeToken(item.candidateDirectionOwner)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Sıra {Number(item.candidateRankingScore || 0).toFixed(1)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Yön {humanizeToken(item.candidateSide)}</div>
+                                                            <div className="text-xs text-slate-500 mt-1">Sahip {humanizeToken(item.candidateDirectionOwner)}</div>
                                                         </div>
                                                     </div>
                                                 </div>
@@ -1030,22 +1081,26 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         )}
                                     </div>
                                 </div>
+                                </div>)}
+                            </div>
                             </div>
                         ) : (
                             <div className="rounded-xl border border-dashed border-slate-700 p-6 text-center text-sm text-slate-500">
-                                Soldan bir trade seçildiğinde replay inspector burada açılacak.
+                                Soldan bir işlem seçildiğinde detay burada açılacak.
                             </div>
                         )}
                     </div>
 
-                    <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl">
-                        <div className="flex items-center gap-2 mb-4">
-                            <Play className="w-4 h-4 text-emerald-400" />
-                            <div>
-                                <h3 className="text-sm font-semibold text-white">Backtest Studio</h3>
-                                <p className="text-xs text-slate-500">Bu bölüm yaklaşık OHLCV simülasyonu kullanır; exact replay değildir.</p>
+                    <div className="bg-[#151921] border border-slate-800 rounded-2xl p-4 shadow-xl hidden lg:block">
+                        <button onClick={() => setShowBacktest(!showBacktest)} className="w-full flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                                <Play className="w-4 h-4 text-emerald-400" />
+                                <h3 className="text-sm font-semibold text-white">Simülasyon</h3>
                             </div>
-                        </div>
+                            {showBacktest ? <ChevronUp className="w-3.5 h-3.5 text-slate-500" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-500" />}
+                        </button>
+                        {showBacktest && (<div className="mt-4">
+                        <p className="text-xs text-slate-500 mb-3">Bu bölüm yaklaşık OHLCV simülasyonu kullanır; birebir replay değildir.</p>
                         <form onSubmit={handleBacktestSubmit} className="space-y-3">
                             <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
                                 <label className="space-y-1">
@@ -1140,7 +1195,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         <div className="mt-1 text-lg font-bold text-white">{backtestResult.stats.totalTrades || 0}</div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
-                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Win Rate</div>
+                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Kazanma</div>
                                         <div className="mt-1 text-lg font-bold text-emerald-300">{Number(backtestResult.stats.winRate || 0).toFixed(1)}%</div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
@@ -1150,7 +1205,7 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                         </div>
                                     </div>
                                     <div className="rounded-xl bg-[#0d1117] border border-slate-800 p-3">
-                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Max DD</div>
+                                        <div className="text-[11px] uppercase tracking-wide text-slate-500">Maks Düşüş</div>
                                         <div className="mt-1 text-lg font-bold text-amber-300">{Number(backtestResult.stats.maxDrawdown || 0).toFixed(2)}%</div>
                                     </div>
                                 </div>
@@ -1158,12 +1213,13 @@ export const ReplayWorkbench: React.FC<Props> = ({ apiUrl }) => {
                                     <div className="flex items-start gap-2">
                                         <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-300 shrink-0" />
                                         <div>
-                                            Backtest Studio yalnızca OHLCV üstünden yaklaşık simülasyon verir. Microstructure, snapshot ve exact policy replay için üstteki Replay Inspector kullanılmalı.
+                                            Simülasyon yalnızca OHLCV üstünden yaklaşık sonuç verir. Birebir replay için üstteki İşlem Detayı kullanılmalıdır.
                                         </div>
                                     </div>
                                 </div>
                             </div>
                         )}
+                        </div>)}
                     </div>
                 </section>
             </div>

@@ -4,7 +4,7 @@ import {
   Play, Square, RefreshCw, Settings, Activity, Wallet,
   BarChart3, TrendingUp, TrendingDown, ArrowUpRight, ArrowDownRight,
   AlertTriangle, CheckCircle2, XCircle, Terminal, Zap, LineChart,
-  ChevronDown, Layers, Wind, ShieldAlert, Target, Info, Network,
+  ChevronDown, ChevronUp, Layers, Wind, ShieldAlert, Target, Info, Network,
   Radio, RotateCcw, Waves, Search, Radar, Lock, Brain, FlaskConical
 } from 'lucide-react';
 import {
@@ -15,6 +15,7 @@ import { formatPrice, formatCurrency, getPositionMargin } from './utils';
 import { translateReason, getCanonicalReason } from './utils/reasonUtils';
 import { buildDisplayActiveSignals } from './utils/activeSignalsUtils';
 import { buildDecisionSummary, formatSignalIntentVersion, humanizeDecisionToken } from './utils/decisionUi';
+import { getTaramaRenderedCount } from './utils/opportunityCategories';
 import { SettingsModal } from './components/SettingsModal';
 import { PnLPanel } from './components/PnLPanel';
 import { PositionPanel } from './components/PositionPanel';
@@ -1007,6 +1008,8 @@ export default function App() {
   const [headerOffsetPx, setHeaderOffsetPx] = useState<number>(104);
   const [signalPriceFlash, setSignalPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
   const [positionPriceFlash, setPositionPriceFlash] = useState<Record<string, 'up' | 'down'>>({});
+  // Faz 1 UI-Redesign: Track which position cards show detail drawer
+  const [expandedPositions, setExpandedPositions] = useState<Set<string>>(new Set());
   const signalPriceRef = useRef<Record<string, number>>({});
   const positionPriceRef = useRef<Record<string, number>>({});
   const signalFlashResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1169,8 +1172,10 @@ export default function App() {
     ...displayActiveSignals.map((signal: any) => String(signal.symbol || '')),
     ...(pendingEntries || []).map((entry: any) => String(entry.symbol || '')),
   ].filter(Boolean));
-  // Phase UI-Redesign Fix 1: Badge = all remaining (not just passive)
-  const remainingOpportunityCount = (opportunities || []).filter((opp: any) => !actionableSymbols.has(String(opp.symbol || ''))).length;
+  // Faz 2 UI-Redesign: Tarama badge uses shared helper — single source of truth
+  // See utils/opportunityCategories.ts for categorization + slice logic
+  const remainingOpportunities = (opportunities || []).filter((opp: any) => !actionableSymbols.has(String(opp.symbol || '')));
+  const remainingOpportunityCount = getTaramaRenderedCount(remainingOpportunities);
 
   const handleWsLog = useCallback((message: string) => {
     addLog(`☁️ ${message}`);
@@ -2585,166 +2590,54 @@ export default function App() {
                     const protectionSummary = buildProtectionStackSummary(pos);
 
                     return (
-                      <div key={pos.id} className={`p-3 rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
-                            <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
-                            <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${stageDisplay.primaryTone}`}>{stageDisplay.primaryLabel}</span>
-                            {showThesisChip && (
-                              <span className={`text-[9px] px-1 py-0.5 rounded ${getThesisChipTone(positionSummary.positionThesisState)}`}>
-                                {humanizeDecisionToken(positionSummary.positionThesisState)}
+                      <div key={pos.id} className={`rounded-lg border ${isLong ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-rose-500/5 border-rose-500/20'}`}>
+                        {/* ═══ Faz 1 UI-Redesign: Seviye 1 — Her Zaman Görünür ═══
+                            Field Mapping:
+                            symbol → pos.symbol | side → pos.side | leverage → resolvePositionLeverage()
+                            stage → resolveReadablePositionStage() | pnl → pos.unrealizedPnl
+                            roi → pnl/margin*100 | entry → pos.entryPrice | current → markPrice
+                            uiClosePending → pos.uiClosePending (truth-source, banner only if true)
+                        */}
+                        <div className="p-3">
+                          {/* Header: Sembol + Yön + Kaldıraç + Aşama + PnL */}
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-white text-sm">{pos.symbol.replace('USDT', '')}</span>
+                              <span className="text-[10px] text-slate-500">{Math.round(leverage)}x</span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${isLong ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>{pos.side}</span>
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${stageDisplay.primaryTone}`}>{stageDisplay.primaryLabel}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
                               </span>
-                            )}
-                            {positionSummary.isPostExitReentry && (
-                              <span className={`text-[9px] px-1 py-0.5 rounded ${getReentryChipTone()}`}>{getReentryBadgeLabel(pos)}</span>
-                            )}
+                              <span className={`text-[10px] font-mono font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+                              </span>
+                            </div>
                           </div>
-                          <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-2 py-1 rounded bg-rose-500/10">Kapat</button>
-                        </div>
-                        <div className="mb-2 rounded-lg border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
-                          <div className="text-[9px] uppercase tracking-[0.16em] text-slate-500">Pozisyon Aşaması</div>
-                          <div className="mt-1 text-xs font-semibold text-slate-100">{stageDisplay.primaryLabel}</div>
-                          <div className="mt-1 text-[10px] text-slate-400">
-                            Koruma: {stageDisplay.protectionLabel} • Kâr: {stageDisplay.profitLabel}
-                          </div>
+
+                          {/* Faz 1: uiClosePending amber banner — truth-source, sadece true ise görünür */}
                           {Boolean((pos as any).uiClosePending) && (
-                            <div className="mt-1 text-[10px] text-amber-300">
-                              Kapanış nedeni: {humanizeDecisionToken(String((pos as any).uiClosePendingReason || 'Borsa Teyidi Bekleniyor'))}
+                            <div className="mb-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] font-medium">
+                              ⚠ Kapanış Bekleniyor — {humanizeDecisionToken(String((pos as any).uiClosePendingReason || 'Borsa Teyidi Bekleniyor'))}
                             </div>
                           )}
+
+                          {/* Faz 1: positionsSourceStale tooltip — truth-source, sadece stale ise görünür */}
                           {Boolean((pos as any).positionsSourceStale) && (
-                            <div className="mt-1 text-[10px] text-amber-200">
-                              Canlı Kaynak Bayat • Yaş {Number((pos as any).positionsSourceAgeSec || 0).toFixed(0)} sn
+                            <div className="mb-2 px-2 py-1 rounded bg-amber-500/5 border border-amber-700/30 text-[10px] text-amber-200">
+                              ⚠ Veri gecikmiş — Yaş: {Number((pos as any).positionsSourceAgeSec || 0).toFixed(0)} sn
                             </div>
                           )}
-                          {Boolean((pos as any).uiClosePending) && (
-                            <div className="mt-1 text-[10px] text-slate-500">
-                              Borsa Teyidi Bekleniyor
-                            </div>
-                          )}
-                          <div className="mt-2 text-[10px] text-cyan-300">
-                            {coinStateSummary.primaryLabel}
+
+                          {/* Giriş/Anlık Fiyat + Süre */}
+                          <div className="grid grid-cols-3 gap-2 text-[10px] mb-2">
+                            <div><span className="text-slate-500">Giriş</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
+                            <div><span className="text-slate-500">Anlık</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
+                            <div><span className="text-slate-500">Süre</span><div className="text-white">{(() => { const secs = Math.floor((Date.now() / 1000) - (pos.openTime || Date.now() / 1000)); const h = Math.floor(secs / 3600); const m = Math.floor((secs % 3600) / 60); return h > 0 ? `${h}s ${m}dk` : `${m}dk`; })()}</div></div>
                           </div>
-                          <div className="mt-1 text-[10px] text-slate-400">
-                            {coinStateSummary.detailLabel}
-                          </div>
-                          {coinStateSummary.driftLabel && (
-                            <div className={`mt-1 text-[10px] ${coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}`}>
-                              {coinStateSummary.driftLabel}
-                            </div>
-                          )}
-                          {coinStateSummary.driftDetail && (
-                            <div className="mt-1 text-[10px] text-slate-500">
-                              {coinStateSummary.driftDetail}
-                            </div>
-                          )}
-                          <div className="mt-1 text-[10px] text-slate-500">
-                            {coinStateSummary.footerLabel}
-                          </div>
-                          {Boolean((pos as any).postExitFollowthroughActive) && (
-                            <div className="mt-1 text-[10px] text-sky-300">
-                              Çıkış Sonrası Takip: {humanizeDecisionToken(String((pos as any).postExitFollowthroughMode || ''))}
-                              {String((pos as any).postExitPreferredSide || '') ? ` • Tercih ${humanizeDecisionToken(String((pos as any).postExitPreferredSide || ''))}` : ''}
-                            </div>
-                          )}
-                          {Boolean((pos as any).postExitThinBookGraceUsed) && (
-                            <div className="mt-1 text-[10px] text-cyan-300">Likidite Nedeniyle Küçültülmüş Giriş</div>
-                          )}
-                          {Boolean((pos as any).postExitExposureReserveUsed) && (
-                            <div className="mt-1 text-[10px] text-violet-300">
-                              Portföy Rezervi Kullanıldı
-                              {String((pos as any).postExitExposureReserveReason || '') ? ` • ${humanizeDecisionToken(String((pos as any).postExitExposureReserveReason || ''))}` : ''}
-                            </div>
-                          )}
-                          {Boolean((pos as any).oppositeReclaimSuppressed) && (
-                            <div className="mt-1 text-[10px] text-amber-300">Karşı Yön Reclaim Baskılandı</div>
-                          )}
-                        </div>
-                        <div className="grid grid-cols-3 gap-2 text-[10px]">
-                          <div><span className="text-slate-500">Yatırılan</span><div className="font-mono text-white">{formatCurrency(margin)}</div></div>
-                          <div><span className="text-slate-500">Giriş</span><div className="font-mono text-white">${formatPrice(pos.entryPrice)}</div></div>
-                          <div><span className="text-slate-500">Anlık</span><div className={`font-mono transition-colors duration-200 ${markFlash === 'up' ? 'text-emerald-300' : markFlash === 'down' ? 'text-rose-300' : 'text-white'}`}>${formatPrice(currentPrice)}</div></div>
-                        </div>
-                        <div className="grid grid-cols-2 gap-2 text-[10px] mt-2">
-                          <div>
-                            <span className="text-emerald-400">TP: ${formatPrice(tp)}</span>{' '}
-                            <span className="text-slate-600">(Hedef ROI {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%)</span>
-                            <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
-                          </div>
-                          <div>
-                            <span className="text-rose-400">SL: ${formatPrice(activeStop)}</span>{' '}
-                            <span className="text-slate-600">(Stop ROI {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span>
-                          </div>
-                        </div>
-                        <div className="mt-2 text-[10px] text-slate-400 space-y-1">
-                          <div>Taktik Stop: <span className="text-slate-200">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
-                          <div>Exchange Koruma: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
-                          <div>Koruma Yetkisi: <span className="text-slate-200">{protectionSummary.authorityLabel}</span></div>
-                          <div>Aktif Rol: <span className="text-slate-200">{protectionSummary.roleLabel}</span></div>
-                          {String((pos as any).positionsAuthority || '') && (
-                            <div>Canlı Kaynak: <span className="text-slate-200">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>
-                          )}
-                          {protectionSummary.emergencyLabel !== '—' && (
-                            <div>Acil Taban: <span className="text-slate-200">{protectionSummary.emergencyLabel}</span></div>
-                          )}
-                          {protectionSummary.structuralLabel !== '—' && (
-                            <div>
-                              Yapısal İptal: <span className="text-slate-200">{protectionSummary.structuralLabel}</span>
-                              {protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}
-                            </div>
-                          )}
-                        </div>
-                        <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
-                          <div className="text-cyan-400">Takip ROI: {runtimeTrailDistanceRoiPct.toFixed(1)}%</div>
-                          <div className="text-slate-400">Çıkış Çarpanı: x{effectiveExitTightness.toFixed(2)}</div>
-                        </div>
-                        <div className="text-[10px] text-slate-500 mt-1">
-                          Aktivasyon ROI: {runtimeTrailRoiPct.toFixed(1)}%
-                        </div>
-                        {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
-                          <div className="text-[10px] text-emerald-300 mt-1">
-                            Peak {profitPeakRoiPct.toFixed(1)}% • Giveback {profitGivebackRoiPct.toFixed(1)}% • Lock {profitLockRoiPct.toFixed(1)}%
-                          </div>
-                        )}
-                        {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
-                          <div className="text-[10px] text-slate-400 mt-1">
-                            TP1 {tp1RoiPct.toFixed(0)} • TP2 {tp2RoiPct.toFixed(0)} • TP3 {tp3RoiPct.toFixed(0)} • {profitOwner}
-                          </div>
-                        )}
-                        {runtimeExchangeBreakEvenPrice > 0 && (
-                          <div className="text-[10px] text-slate-500 mt-1">
-                            Exchange BE ${formatPrice(runtimeExchangeBreakEvenPrice)}
-                          </div>
-                        )}
-                        {entryStopGateMode === 'wide_stop_soft' && (
-                          <div className="text-[10px] text-amber-300 mt-1">
-                            Entry Stop Gate: WIDE-SOFT
-                          </div>
-                        )}
-                        {(recoveryState.armed || recoveryState.stage > 0) && (
-                          <div className="text-[10px] text-sky-300 mt-1">
-                            Recovery S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}% toparlanma • {recoveryGivebackPct.toFixed(0)}% giveback
-                          </div>
-                        )}
-                        {(lastLossGateAction || regimeFlags.length > 0 || carryCostRoiPct > 0 || exitRiskRoiPct > 0) && (
-                          <div className="text-[10px] text-slate-400 mt-1">
-                            {lastLossGateAction ? `Gate: ${translateReason(lastLossGateAction)} • ` : ''}
-                            ExitRisk {exitRiskRoiPct.toFixed(1)}% • Carry {carryCostRoiPct.toFixed(1)}%
-                            {regimeFlags.length > 0 ? ` • ${regimeFlags.join(', ')}` : ''}
-                          </div>
-                        )}
-                        <div className="mt-2">
-                          <PositionDecisionHUD pos={pos} compact />
-                        </div>
-                        <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800/30">
-                          <span className={`text-xs font-mono font-bold ${(pos.unrealizedPnl || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {(pos.unrealizedPnl || 0) >= 0 ? '+' : ''}{formatCurrency(pos.unrealizedPnl || 0)}
-                          </span>
-                          <span className={`text-xs font-mono font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
-                          </span>
+
                           {/* Kill Switch indicator */}
                           {(() => {
                             const marginLoss = margin > 0 ? ((pos.unrealizedPnl || 0) / margin) * 100 : 0;
@@ -2752,12 +2645,162 @@ export default function App() {
                             const isCritical = ksFull !== null && marginLoss <= activeFullThreshold;
                             const isNear = marginLoss <= ksFirst * 0.7;
                             return marginLoss < 0 ? (
-                              <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNear ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
-                                KS:{ksFirst.toFixed(0)} / {ksFull !== null ? ksFull.toFixed(0) : 'SL'}
-                              </span>
+                              <div className="mb-2">
+                                <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${isCritical ? 'bg-rose-500/30 text-rose-400' : isNear ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700/50 text-slate-500'}`}>
+                                  KS:{ksFirst.toFixed(0)} / {ksFull !== null ? ksFull.toFixed(0) : 'SL'}
+                                </span>
+                              </div>
                             ) : null;
                           })()}
+
+                          {/* Detay aç/kapat butonu */}
+                          <button
+                            onClick={() => setExpandedPositions(prev => {
+                              const next = new Set(prev);
+                              next.has(pos.id) ? next.delete(pos.id) : next.add(pos.id);
+                              return next;
+                            })}
+                            className="w-full flex items-center justify-center gap-1 text-[10px] text-slate-500 hover:text-slate-300 py-1 transition-colors"
+                          >
+                            {expandedPositions.has(pos.id) ? (
+                              <><ChevronUp className="w-3 h-3" />Detayı Gizle</>
+                            ) : (
+                              <><ChevronDown className="w-3 h-3" />Detay Göster</>
+                            )}
+                          </button>
                         </div>
+
+                        {/* ═══ Faz 1 UI-Redesign: Seviye 2-4 — Detay Drawer ═══ */}
+                        {expandedPositions.has(pos.id) && (
+                          <div className="border-t border-slate-800/30 px-3 pb-3 space-y-2">
+
+                            {/* Accordion 1: TP/SL Özet */}
+                            <div className="pt-2">
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">TP / SL</div>
+                              <div className="grid grid-cols-2 gap-2 text-[10px]">
+                                <div>
+                                  <span className="text-emerald-400">TP: ${formatPrice(tp)}</span>{' '}
+                                  <span className="text-slate-600">(Hedef {tpRoi >= 0 ? '+' : ''}{tpRoi.toFixed(1)}%)</span>
+                                  <div className="text-slate-500">Kalan {tpRemainingRoi >= 0 ? '+' : ''}{tpRemainingRoi.toFixed(1)}%</div>
+                                </div>
+                                <div>
+                                  <span className="text-rose-400">SL: ${formatPrice(activeStop)}</span>{' '}
+                                  <span className="text-slate-600">(Stop {stopRoi >= 0 ? '+' : ''}{stopRoi.toFixed(1)}%)</span>
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-2 gap-2 text-[10px] mt-1">
+                                <div className="text-cyan-400">Takip: {runtimeTrailDistanceRoiPct.toFixed(1)}% • x{effectiveExitTightness.toFixed(2)}</div>
+                                <div className="text-slate-500">Aktivasyon: {runtimeTrailRoiPct.toFixed(1)}%</div>
+                              </div>
+                              {(profitPeakRoiPct > 0 || tp1RoiPct > 0) && (
+                                <div className="text-[10px] text-emerald-300 mt-1">
+                                  Peak {profitPeakRoiPct.toFixed(1)}% • Giveback {profitGivebackRoiPct.toFixed(1)}% • Lock {profitLockRoiPct.toFixed(1)}%
+                                </div>
+                              )}
+                              {(tp1RoiPct > 0 || tp2RoiPct > 0 || tp3RoiPct > 0) && (
+                                <div className="text-[10px] text-slate-400 mt-1">
+                                  TP1 {tp1RoiPct.toFixed(0)} • TP2 {tp2RoiPct.toFixed(0)} • TP3 {tp3RoiPct.toFixed(0)} • {profitOwner}
+                                </div>
+                              )}
+                              {runtimeExchangeBreakEvenPrice > 0 && (
+                                <div className="text-[10px] text-slate-500 mt-1">Exchange BE ${formatPrice(runtimeExchangeBreakEvenPrice)}</div>
+                              )}
+                            </div>
+
+                            {/* Accordion 2: Koruma Katmanı — uses buildProtectionStackSummary() */}
+                            <div className="pt-2 border-t border-slate-800/20">
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Koruma Katmanı</div>
+                              <div className="text-[10px] text-slate-400 space-y-1">
+                                <div>Taktik Stop: <span className="text-slate-200">{protectionSummary.tacticalLabel}</span> • {protectionSummary.tacticalSourceLabel}</div>
+                                <div>Exchange Koruma: <span className="text-slate-200">{protectionSummary.exchangeLabel}</span></div>
+                                <div>Koruma Yetkisi: <span className="text-slate-200">{protectionSummary.authorityLabel}</span></div>
+                                <div>Aktif Rol: <span className="text-slate-200">{protectionSummary.roleLabel}</span></div>
+                                {/* Faz 1: positionsAuthority truth-source — drawer altında erişilebilir */}
+                                {String((pos as any).positionsAuthority || '') && (
+                                  <div>Canlı Kaynak: <span className="text-slate-200">{humanizeDecisionToken(String((pos as any).positionsAuthority || ''))}</span></div>
+                                )}
+                                {protectionSummary.emergencyLabel !== '—' && (
+                                  <div>Acil Taban: <span className="text-slate-200">{protectionSummary.emergencyLabel}</span></div>
+                                )}
+                                {protectionSummary.structuralLabel !== '—' && (
+                                  <div>Yapısal İptal: <span className="text-slate-200">{protectionSummary.structuralLabel}</span>{protectionSummary.structuralDetail ? ` • ${protectionSummary.structuralDetail}` : ''}</div>
+                                )}
+                                {entryStopGateMode === 'wide_stop_soft' && (
+                                  <div className="text-amber-300">Entry Stop Gate: WIDE-SOFT</div>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Accordion 3: Piyasa Durumu — uses buildCoinStateSummary() */}
+                            <div className="pt-2 border-t border-slate-800/20">
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Piyasa Durumu</div>
+                              <div className="text-[10px] text-cyan-300">{coinStateSummary.primaryLabel}</div>
+                              <div className="mt-1 text-[10px] text-slate-400">{coinStateSummary.detailLabel}</div>
+                              {coinStateSummary.driftLabel && (
+                                <div className={`mt-1 text-[10px] ${coinStateSummary.driftSeverity >= 0.65 ? 'text-amber-300' : 'text-sky-300'}`}>{coinStateSummary.driftLabel}</div>
+                              )}
+                              {coinStateSummary.driftDetail && (
+                                <div className="mt-1 text-[10px] text-slate-500">{coinStateSummary.driftDetail}</div>
+                              )}
+                              <div className="mt-1 text-[10px] text-slate-500">{coinStateSummary.footerLabel}</div>
+                              <div className="mt-1 text-[10px] text-slate-400">
+                                Koruma: {stageDisplay.protectionLabel} • Kâr: {stageDisplay.profitLabel}
+                              </div>
+                            </div>
+
+                            {/* Accordion 4: Karar Motoru + Risk — uses PositionDecisionHUD */}
+                            <div className="pt-2 border-t border-slate-800/20">
+                              <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Karar Özeti</div>
+                              {showThesisChip && (
+                                <span className={`text-[9px] px-1 py-0.5 rounded ${getThesisChipTone(positionSummary.positionThesisState)}`}>
+                                  {humanizeDecisionToken(positionSummary.positionThesisState)}
+                                </span>
+                              )}
+                              {positionSummary.isPostExitReentry && (
+                                <span className={`text-[9px] px-1 py-0.5 rounded ml-1 ${getReentryChipTone()}`}>{getReentryBadgeLabel(pos)}</span>
+                              )}
+                              <div className="mt-1">
+                                <PositionDecisionHUD pos={pos} compact />
+                              </div>
+                              {(recoveryState.armed || recoveryState.stage > 0) && (
+                                <div className="text-[10px] text-sky-300 mt-1">
+                                  Recovery S{Number(recoveryState.stage || 0)} • {recoveryProgressPct.toFixed(0)}% toparlanma • {recoveryGivebackPct.toFixed(0)}% giveback
+                                </div>
+                              )}
+                              {(lastLossGateAction || regimeFlags.length > 0 || carryCostRoiPct > 0 || exitRiskRoiPct > 0) && (
+                                <div className="text-[10px] text-slate-400 mt-1">
+                                  {lastLossGateAction ? `Gate: ${translateReason(lastLossGateAction)} • ` : ''}
+                                  ExitRisk {exitRiskRoiPct.toFixed(1)}% • Carry {carryCostRoiPct.toFixed(1)}%
+                                  {regimeFlags.length > 0 ? ` • ${regimeFlags.join(', ')}` : ''}
+                                </div>
+                              )}
+                              {/* Faz 1: Post-exit truth-source fields — drawer altında erişilebilir */}
+                              {Boolean((pos as any).postExitFollowthroughActive) && (
+                                <div className="mt-1 text-[10px] text-sky-300">
+                                  Çıkış Sonrası Takip: {humanizeDecisionToken(String((pos as any).postExitFollowthroughMode || ''))}
+                                  {String((pos as any).postExitPreferredSide || '') ? ` • Tercih ${humanizeDecisionToken(String((pos as any).postExitPreferredSide || ''))}` : ''}
+                                </div>
+                              )}
+                              {Boolean((pos as any).postExitThinBookGraceUsed) && (
+                                <div className="mt-1 text-[10px] text-cyan-300">Likidite Nedeniyle Küçültülmüş Giriş</div>
+                              )}
+                              {Boolean((pos as any).postExitExposureReserveUsed) && (
+                                <div className="mt-1 text-[10px] text-violet-300">
+                                  Portföy Rezervi Kullanıldı
+                                  {String((pos as any).postExitExposureReserveReason || '') ? ` • ${humanizeDecisionToken(String((pos as any).postExitExposureReserveReason || ''))}` : ''}
+                                </div>
+                              )}
+                              {Boolean((pos as any).oppositeReclaimSuppressed) && (
+                                <div className="mt-1 text-[10px] text-amber-300">Karşı Yön Reclaim Baskılandı</div>
+                              )}
+                            </div>
+
+                            {/* Kapat butonu */}
+                            <div className="pt-2 border-t border-slate-800/20 flex justify-end">
+                              <button onClick={() => handleManualClose(pos.id)} className="text-[10px] text-rose-400 px-3 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 transition-colors">Pozisyonu Kapat</button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })

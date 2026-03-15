@@ -277,7 +277,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl, trades = [] }) =
                 <div className="bg-gradient-to-br from-violet-900/50 to-violet-800/30 border border-violet-700/50 rounded-xl p-2 sm:p-4">
                     <div className="flex items-center gap-1 sm:gap-2 mb-1 sm:mb-2">
                         <TrendingDown className="w-4 h-4 sm:w-5 sm:h-5 text-violet-300" />
-                        <span className="text-xs sm:text-sm text-violet-200">Expectancy</span>
+                        <span className="text-xs sm:text-sm text-violet-200">Beklenti</span>
                     </div>
                     <div className={`text-lg sm:text-2xl font-bold ${expectancy >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         ${expectancy.toFixed(2)}
@@ -607,7 +607,7 @@ export const PerformanceDashboard: React.FC<Props> = ({ apiUrl, trades = [] }) =
                             <Layers className="w-5 h-5 text-teal-400" />
                         </div>
                         <div>
-                            <h3 className="text-lg font-bold text-white">PnL Attribution</h3>
+                            <h3 className="text-lg font-bold text-white">PnL Ayrıştırma</h3>
                             <p className="text-xs text-slate-500">Son 7 gün — Sinyal / Uygulama / Zamanlama ayrıştırması</p>
                         </div>
                         <span className="ml-auto text-xs bg-teal-500/10 text-teal-400 px-2 py-1 rounded-full border border-teal-500/20">
